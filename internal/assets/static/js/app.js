@@ -279,13 +279,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     hasShownRevisionPicker = false;
   }
 
-  // Show loading
-  resultDiv.innerHTML = `
-    <div class="loading-state">
-      <div class="spinner"></div>
-      <p>Analyzing ${repo}${revision && revision !== 'main' ? ` (${revision})` : ''}...</p>
-    </div>
-  `;
+  // Show loading — build with DOM methods to avoid XSS via repo/revision values
+  {
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'loading-state';
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    const p = document.createElement('p');
+    p.textContent = `Analyzing ${repo}${revision && revision !== 'main' ? ` (${revision})` : ''}...`;
+    loadingDiv.appendChild(spinner);
+    loadingDiv.appendChild(p);
+    resultDiv.innerHTML = '';
+    resultDiv.appendChild(loadingDiv);
+  }
 
   try {
     let queryParams = [];

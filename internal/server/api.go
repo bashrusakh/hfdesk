@@ -578,6 +578,10 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/analyze/owner/name")
 		return
 	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
 
 	// Check if it's a dataset (explicit selection)
 	isDataset := r.URL.Query().Get("dataset") == "true"
@@ -624,6 +628,10 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	repo := r.PathValue("repo")
 	if repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/readme/owner/name")
+		return
+	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
 	revision := r.URL.Query().Get("revision")

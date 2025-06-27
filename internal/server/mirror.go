@@ -608,12 +608,20 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		return err
 	}
 
+	// Guard: dstPath must remain inside dstCache (no ../ traversal via relPath).
 	dstPath := filepath.Join(dstCache, relPath)
+	cleanDst := filepath.Clean(dstPath)
+	cleanDstCache := filepath.Clean(dstCache)
+	if cleanDst != cleanDstCache && !strings.HasPrefix(cleanDst+string(filepath.Separator), cleanDstCache+string(filepath.Separator)) {
+		return fmt.Errorf("path traversal: repo %q would escape destination cache", relPath)
+	}
 
 	// Create destination directory
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
+
+	cleanRepoPath := filepath.Clean(repoPath)
 
 	return filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -636,6 +644,15 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			link, err := os.Readlink(path)
 			if err != nil {
 				return err
+			}
+			// Reject absolute symlinks — they would point outside the cache.
+			if filepath.IsAbs(link) {
+				return fmt.Errorf("refusing absolute symlink %s -> %s", path, link)
+			}
+			// Reject symlinks whose resolved target escapes the source repo root.
+			resolved := filepath.Clean(filepath.Join(filepath.Dir(path), link))
+			if !strings.HasPrefix(resolved+string(filepath.Separator), cleanRepoPath+string(filepath.Separator)) {
+				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
 			os.Remove(dst)
 			return os.Symlink(link, dst)

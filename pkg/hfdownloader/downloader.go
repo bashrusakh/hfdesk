@@ -421,7 +421,16 @@ LOOP:
 			} else {
 				// Legacy mode: flat directory structure
 				base := destinationBase(job, cfg)
-				dst = filepath.Join(base, finalRel)
+				cleanBase := filepath.Clean(base)
+				cleanDst := filepath.Clean(filepath.Join(cleanBase, finalRel))
+				if cleanDst != cleanBase && !strings.HasPrefix(cleanDst+string(filepath.Separator), cleanBase+string(filepath.Separator)) {
+					select {
+					case errCh <- fmt.Errorf("path traversal: %q would escape output directory", finalRel):
+					default:
+					}
+					return
+				}
+				dst = cleanDst
 				skipCheck = func() (bool, string, error) {
 					return shouldSkipLocal(it, dst)
 				}

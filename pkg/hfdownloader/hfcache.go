@@ -117,14 +117,21 @@ type RepoDir struct {
 // repoID should be in the format "owner/name".
 func (c *HFCache) Repo(repoID string, repoType RepoType) (*RepoDir, error) {
 	parts := strings.SplitN(repoID, "/", 2)
-	if len(parts) != 2 {
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return nil, fmt.Errorf("invalid repo ID: %q (expected owner/name)", repoID)
+	}
+	owner, name := parts[0], parts[1]
+	// Reject path separators inside owner/name: dirName() joins them as a single
+	// directory component using "--", so a "/" in name would split the component
+	// and allow traversal (e.g. "owner/a/../../etc" → dirName contains a "/").
+	if strings.ContainsAny(owner, "/\\\x00") || strings.ContainsAny(name, "/\\\x00") {
+		return nil, fmt.Errorf("invalid repo ID %q: owner/name must not contain path separators", repoID)
 	}
 	return &RepoDir{
 		cache:    c,
 		repoType: repoType,
-		owner:    parts[0],
-		name:     parts[1],
+		owner:    owner,
+		name:     name,
 	}, nil
 }
 
@@ -176,13 +183,26 @@ func (r *RepoDir) IncompleteMetaPath(sha256 string) string {
 }
 
 // RefPath returns the path to a ref file (e.g., refs/main).
+// It validates that the resolved path stays inside the refs directory.
 func (r *RepoDir) RefPath(ref string) string {
-	return filepath.Join(r.RefsDir(), ref)
+	refsDir := filepath.Clean(r.RefsDir())
+	resolved := filepath.Clean(filepath.Join(refsDir, ref))
+	// Ensure resolved path is inside refsDir to prevent traversal.
+	if resolved != refsDir && !strings.HasPrefix(resolved+string(filepath.Separator), refsDir+string(filepath.Separator)) {
+		return filepath.Join(refsDir, filepath.Base(ref))
+	}
+	return resolved
 }
 
 // SnapshotDir returns the path to a snapshot directory for a given commit.
+// It validates that the resolved path stays inside the snapshots directory.
 func (r *RepoDir) SnapshotDir(commit string) string {
-	return filepath.Join(r.SnapshotsDir(), commit)
+	snapshotsDir := filepath.Clean(r.SnapshotsDir())
+	resolved := filepath.Clean(filepath.Join(snapshotsDir, commit))
+	if resolved != snapshotsDir && !strings.HasPrefix(resolved+string(filepath.Separator), snapshotsDir+string(filepath.Separator)) {
+		return filepath.Join(snapshotsDir, filepath.Base(commit))
+	}
+	return resolved
 }
 
 // EnsureDirs creates all necessary directories for this repo.
@@ -448,8 +468,12 @@ func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) err
 		return nil
 	}
 
-	snapshotDir := r.SnapshotDir(commit)
-	linkPath := filepath.Join(snapshotDir, relativePath)
+	snapshotDir := filepath.Clean(r.SnapshotDir(commit))
+	// Validate linkPath stays inside snapshotDir to prevent path traversal.
+	linkPath := filepath.Clean(filepath.Join(snapshotDir, relativePath))
+	if linkPath != snapshotDir && !strings.HasPrefix(linkPath+string(filepath.Separator), snapshotDir+string(filepath.Separator)) {
+		return fmt.Errorf("relative path %q escapes snapshot directory", relativePath)
+	}
 
 	// Create parent directories if needed (for nested paths like "subdir/file.txt")
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0755); err != nil {
@@ -516,14 +540,17 @@ func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir strin
 		return nil
 	}
 
-	friendlyBase := r.FriendlyPath()
+	cleanFriendlyBase := filepath.Clean(r.FriendlyPath())
 
-	// Determine the link path
+	// Determine the link path and validate it stays inside friendlyBase.
 	var linkPath string
 	if filterSubdir != "" {
-		linkPath = filepath.Join(friendlyBase, filterSubdir, relativePath)
+		linkPath = filepath.Clean(filepath.Join(cleanFriendlyBase, filterSubdir, relativePath))
 	} else {
-		linkPath = filepath.Join(friendlyBase, relativePath)
+		linkPath = filepath.Clean(filepath.Join(cleanFriendlyBase, relativePath))
+	}
+	if linkPath != cleanFriendlyBase && !strings.HasPrefix(linkPath+string(filepath.Separator), cleanFriendlyBase+string(filepath.Separator)) {
+		return fmt.Errorf("path %q escapes friendly view directory", relativePath)
 	}
 
 	// Create parent directories

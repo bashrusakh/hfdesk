@@ -249,9 +249,19 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid url", "")
 		return
 	}
-	if !strings.EqualFold(u.Host, readmeEndpointHost(cfg.Endpoint)) {
+	allowedHost := readmeEndpointHost(cfg.Endpoint)
+	// Use Hostname() (strips port) so ":443" variants are handled correctly.
+	if !strings.EqualFold(u.Hostname(), allowedHost) {
 		writeError(w, http.StatusForbidden, "Asset host not allowed", "")
 		return
+	}
+	// Reconstruct from the config-derived host — never forward the user-supplied
+	// host to the HTTP client (SSRF guard).
+	safeURL := &url.URL{
+		Scheme:   u.Scheme,
+		Host:     allowedHost,
+		Path:     u.Path,
+		RawQuery: u.RawQuery,
 	}
 
 	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
@@ -261,7 +271,7 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	client.Timeout = 30 * time.Second
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, safeURL.String(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Bad request", err.Error())
 		return
