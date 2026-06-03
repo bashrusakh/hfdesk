@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HFDesk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤗</text></svg>">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-emoji">🤗</span>
+          <span class="logo-text">HFDesk</span>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a href="#" class="nav-item active" data-page="models">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <span>Models</span>
+        </a>
+        <a href="#" class="nav-item" data-page="jobs">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <span>Active Jobs</span>
+          <span class="nav-badge" id="jobsBadge" style="display:none">0</span>
+        </a>
+        <a href="#" class="nav-item" data-page="cache">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          <span>Local Cache</span>
+        </a>
+        <a href="#" class="nav-item" data-page="mirror">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+            <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
+            <line x1="4" y1="4" x2="9" y2="9"/>
+          </svg>
+          <span>Mirror</span>
+        </a>
+        <a href="#" class="nav-item" data-page="history">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span>History</span>
+        </a>
+        <a href="#" class="nav-item" data-page="settings">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span>Settings</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="connection-status" id="connectionStatus">
+          <span class="status-indicator"></span>
+          <span class="status-text">Connecting...</span>
+        </div>
+        <div class="version">v1.0.0</div>
+      </div>
+      <div class="sidebar-resize-handle" id="sidebarResizeHandle"></div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main">
+      <!-- Models Page (unified Search + Analyze + Download) -->
+      <section class="page active" id="page-models">
+        <div class="models-split">
+
+          <!-- ── Left: search + compact list ── -->
+          <div class="models-list-panel">
+            <div class="models-list-header">
+              <div class="models-search-wrap">
+                <svg class="models-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                </svg>
+                <input id="analyzeInput" class="models-search-input" type="text"
+                       placeholder="Search or paste repo ID…"
+                       autocomplete="off" spellcheck="false">
+                <span id="modelsSpinner" class="models-spinner" style="display:none">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" class="spin">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                </span>
+                <button id="modelsSearchClear" class="models-search-clear" type="button"
+                        title="Clear" aria-label="Clear search" hidden>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="14" height="14">
+                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="models-filter-row">
+                <select id="modelsSortSelect" class="models-select">
+                  <option value="downloads">↓ Downloads</option>
+                  <option value="likes">♥ Likes</option>
+                  <option value="trendingScore">🔥 Trending</option>
+                  <option value="lastModified">🕐 Updated</option>
+                </select>
+                <select id="modelsTypeSelect" class="models-select">
+                  <option value="">All types</option>
+                  <option value="text-generation">Text Generation</option>
+                  <option value="text-to-image">Text to Image</option>
+                  <option value="image-to-text">Image to Text</option>
+                  <option value="automatic-speech-recognition">Speech</option>
+                  <option value="text-to-speech">TTS</option>
+                  <option value="sentence-similarity">Embeddings</option>
+                </select>
+                <label class="models-toggle"><input type="checkbox" id="modelsGguf"> GGUF</label>
+                <label class="models-toggle"><input type="checkbox" id="modelsDatasets"> DS</label>
+              </div>
+            </div>
+            <div id="modelsResultList" class="models-result-list">
+              <div class="models-list-hint">Search above or enter a repo ID</div>
+            </div>
+          </div>
+
+          <!-- ── Right: detail / analyze panel ── -->
+          <div class="models-list-resize-handle" id="modelsListResizeHandle" aria-hidden="true"></div>
+          <div class="models-detail-panel">
+            <!-- Detail header (shown when model selected) -->
+            <div id="modelsDetailHeader" class="models-detail-header" style="display:none">
+              <div class="models-detail-title-wrap">
+                <span class="models-detail-repo" id="modelsDetailRepo"></span>
+                <button id="analyzeBtn" class="btn btn-ghost btn-xs models-reanalyze-btn" title="Re-analyze">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                    <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.87"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="models-detail-header-right">
+                <div id="storageModeBadge" class="storage-mode-badge" hidden></div>
+                <div id="diskFreeIndicator" class="disk-free-indicator" hidden></div>
+                <a id="modelsHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs">HF Hub ↗</a>
+              </div>
+            </div>
+
+            <!-- Analysis result area -->
+            <div id="analyzeResult" class="models-analyze-result">
+              <!-- Initial empty state -->
+              <div class="empty-state">
+                <div class="empty-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                    <polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>
+                  </svg>
+                </div>
+                <h3>Select or search a model</h3>
+                <p>Search HuggingFace Hub on the left, or paste a repo ID and press Enter</p>
+                <div class="example-repos">
+                  <span class="example-label">GGUF:</span>
+                  <button class="example-btn" data-repo="TheBloke/Mistral-7B-Instruct-v0.2-GGUF">Mistral-7B-GGUF</button>
+                  <button class="example-btn" data-repo="bartowski/Qwen2.5-7B-Instruct-GGUF">Qwen2.5-7B-GGUF</button>
+                </div>
+                <div class="example-repos">
+                  <span class="example-label">Diffusers:</span>
+                  <button class="example-btn" data-repo="stabilityai/stable-diffusion-xl-base-1.0">SDXL-base</button>
+                  <button class="example-btn" data-repo="runwayml/stable-diffusion-v1-5">SD-v1.5</button>
+                </div>
+                <div class="example-repos">
+                  <span class="example-label">LoRA/GPTQ:</span>
+                  <button class="example-btn" data-repo="predibase/glue_stsb">LoRA-adapter</button>
+                  <button class="example-btn" data-repo="TheBloke/Llama-2-7B-Chat-GPTQ">Llama-2-GPTQ</button>
+                </div>
+                <div class="example-repos">
+                  <span class="example-label">Datasets:</span>
+                  <button class="example-btn" data-repo="HuggingFaceFW/fineweb-edu" data-type="dataset">FineWeb-Edu</button>
+                  <button class="example-btn" data-repo="OpenAssistant/oasst1" data-type="dataset">OpenAssistant</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- (legacy stubs for Analyze / Download pages — kept for JS compat, hidden) -->
+      <section class="page" id="page-analyze" style="display:none"></section>
+      <section class="page" id="page-download" style="display:none">
+        <!-- hidden form fields for backward-compat with startWizardDownload -->
+        <input type="hidden" id="modelRepo"><input type="hidden" id="datasetRepo">
+      </section>
+      <section class="page" id="page-search" style="display:none"></section>
+
+      <!-- Jobs Page -->
+      <section class="page" id="page-jobs">
+        <header class="page-header">
+          <div>
+            <h1>Active Jobs</h1>
+            <p class="page-subtitle">Monitor your downloads in real-time</p>
+          </div>
+        </header>
+
+        <div id="jobsList" class="jobs-list">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+              </svg>
+            </div>
+            <h3>No Active Downloads</h3>
+            <p>Start a download from the Download page to see progress here.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Cache Page -->
+      <section class="page" id="page-cache">
+        <header class="page-header">
+          <div>
+            <h1>Local Cache</h1>
+            <p class="page-subtitle">Browse models and datasets stored locally</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-outline" id="rebuildCacheBtn" title="Regenerate friendly view symlinks from hub cache">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M19.73 14.87A8 8 0 1 1 12 4"/>
+                <path d="M12 4V1l4 4-4 4V4"/>
+              </svg>
+              Rebuild
+            </button>
+            <button class="btn btn-secondary" id="refreshCacheBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <div id="cacheStats" class="cache-stats">
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-models">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statModels">-</div>
+              <div class="stat-label">Models</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-datasets">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statDatasets">-</div>
+              <div class="stat-label">Datasets</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-size">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                <line x1="12" y1="22.08" x2="12" y2="12"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statSize">-</div>
+              <div class="stat-label">Total Size</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                <polyline points="13 2 13 9 20 9"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statFiles">-</div>
+              <div class="stat-label">Files</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Toolbar -->
+        <div class="cache-toolbar">
+          <div class="cache-search">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input type="text" id="cacheSearch" placeholder="Search repositories..." autocomplete="off">
+          </div>
+          <div class="cache-filters">
+            <button class="filter-btn active" data-filter="all">All</button>
+            <button class="filter-btn" data-filter="model">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+              Models
+            </button>
+            <button class="filter-btn" data-filter="dataset">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+              Datasets
+            </button>
+          </div>
+          <div class="cache-sort">
+            <label for="cacheSort">Sort:</label>
+            <select id="cacheSort">
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+              <option value="date">Date</option>
+            </select>
+          </div>
+          <div class="cache-view-toggle">
+            <button class="view-btn active" data-view="grid" title="Grid view">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+              </svg>
+            </button>
+            <button class="view-btn" data-view="list" title="List view">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+                <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
+                <line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Repository List -->
+        <div id="cacheList" class="cache-list cache-grid-view">
+          <div class="loading-state">
+            <div class="spinner"></div>
+            <p>Loading cache...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Mirror Page -->
+      <section class="page" id="page-mirror">
+        <header class="page-header">
+          <div>
+            <h1>Mirror</h1>
+            <p class="page-subtitle">Sync your HuggingFace cache between locations</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary" id="refreshMirrorBtn" title="Refresh targets and status">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              Refresh
+            </button>
+            <button class="btn btn-primary" id="addTargetBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Add Target
+            </button>
+          </div>
+        </header>
+
+        <div class="page-content">
+        <!-- Stats Cards -->
+        <div id="mirrorStats" class="mirror-stats">
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-targets">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+                <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statTargets">-</div>
+              <div class="stat-label">Targets</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-online">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statOnline">-</div>
+              <div class="stat-label">Online</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-local">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                <line x1="12" y1="22.08" x2="12" y2="12"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statLocalSize">-</div>
+              <div class="stat-label">Local Cache</div>
+            </div>
+          </div>
+          <div class="stat-card stat-card-status" id="syncStatusCard">
+            <div class="stat-icon stat-icon-sync">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statSyncStatus">-</div>
+              <div class="stat-label">Sync Status</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Targets Section -->
+        <div class="mirror-section">
+          <div class="mirror-section-header">
+            <h2>Mirror Targets</h2>
+            <p class="mirror-section-subtitle">Destinations for syncing your cache (NAS, USB, office server)</p>
+          </div>
+          <div id="targetsList" class="targets-grid">
+            <div class="loading-state">
+              <div class="spinner"></div>
+              <p>Loading targets...</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sync Control Panel -->
+        <div class="mirror-section">
+          <div class="mirror-section-header">
+            <h2>Sync Control</h2>
+            <p class="mirror-section-subtitle">Compare and synchronize cache with selected target</p>
+          </div>
+          <div class="sync-control-panel">
+            <div class="sync-control-row">
+              <div class="sync-target-select">
+                <label for="syncTarget">Target</label>
+                <select id="syncTarget">
+                  <option value="">Select a target...</option>
+                </select>
+              </div>
+              <div class="sync-filter-input">
+                <label for="syncFilter">Filter repos (optional)</label>
+                <div class="input-with-icon">
+                  <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                    <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                  </svg>
+                  <input type="text" id="syncFilter" placeholder="e.g., Llama, GGUF, meta-llama/">
+                </div>
+              </div>
+            </div>
+            <div class="sync-options-row">
+              <label class="sync-option">
+                <input type="checkbox" id="syncVerify">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Verify</strong>
+                  <small>Check integrity after copy</small>
+                </span>
+              </label>
+              <label class="sync-option">
+                <input type="checkbox" id="syncForce">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Force</strong>
+                  <small>Re-copy all files</small>
+                </span>
+              </label>
+              <label class="sync-option sync-option-danger">
+                <input type="checkbox" id="syncDelete">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Delete extra</strong>
+                  <small>Remove files not in source</small>
+                </span>
+              </label>
+            </div>
+            <div class="sync-actions-row">
+              <button class="btn btn-outline btn-lg" id="mirrorDiffBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                Compare
+              </button>
+              <button class="btn btn-primary btn-lg" id="mirrorPushBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+                </svg>
+                Push to Target
+              </button>
+              <button class="btn btn-secondary btn-lg" id="mirrorPullBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>
+                </svg>
+                Pull from Target
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Diff Results Section -->
+        <div class="mirror-section" id="mirrorDiffSection" style="display: none;">
+          <div class="mirror-section-header">
+            <h2>Comparison Results</h2>
+            <div class="diff-header-actions">
+              <div class="diff-summary-badges" id="diffSummary"></div>
+            </div>
+          </div>
+          <!-- Diff Toolbar -->
+          <div class="diff-toolbar">
+            <div class="diff-search">
+              <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+              <input type="text" id="diffSearch" placeholder="Search repositories..." autocomplete="off">
+            </div>
+            <div class="diff-filters">
+              <button class="filter-btn active" data-diff-filter="all">All</button>
+              <button class="filter-btn" data-diff-filter="missing">
+                <span class="filter-dot filter-dot-warning"></span>
+                To Push
+              </button>
+              <button class="filter-btn" data-diff-filter="extra">
+                <span class="filter-dot filter-dot-info"></span>
+                Extra
+              </button>
+              <button class="filter-btn" data-diff-filter="outdated">
+                <span class="filter-dot filter-dot-muted"></span>
+                Outdated
+              </button>
+            </div>
+          </div>
+          <div id="diffResults" class="diff-results"></div>
+        </div>
+        </div><!-- end page-content -->
+      </section>
+
+      <!-- Search Page -->
+      <section class="page" id="page-search">
+        <header class="page-header">
+          <div>
+            <h1>Search</h1>
+            <p class="page-subtitle">Discover models and datasets on HuggingFace Hub</p>
+          </div>
+        </header>
+        <div class="search-controls">
+          <div class="search-input-wrap">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input id="searchInput" class="search-input" type="text" placeholder="Search models and datasets…" autocomplete="off">
+            <span class="search-spinner" id="searchSpinner" style="display:none">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" class="spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+            </span>
+          </div>
+          <select id="searchSort" class="search-select">
+            <option value="downloads">Most Downloaded</option>
+            <option value="likes">Most Liked</option>
+            <option value="trendingScore">Trending</option>
+            <option value="lastModified">Recently Updated</option>
+          </select>
+          <select id="searchType" class="search-select">
+            <option value="">All types</option>
+            <option value="text-generation">Text Generation</option>
+            <option value="text-to-image">Text to Image</option>
+            <option value="image-to-text">Image to Text</option>
+            <option value="automatic-speech-recognition">Speech Recognition</option>
+            <option value="text-to-speech">Text to Speech</option>
+            <option value="image-classification">Image Classification</option>
+            <option value="object-detection">Object Detection</option>
+            <option value="sentence-similarity">Sentence Similarity</option>
+            <option value="fill-mask">Fill Mask</option>
+            <option value="translation">Translation</option>
+          </select>
+          <label class="search-toggle">
+            <input type="checkbox" id="searchGGUF"> GGUF only
+          </label>
+          <label class="search-toggle">
+            <input type="checkbox" id="searchDatasets"> Datasets
+          </label>
+        </div>
+        <div id="searchResults" class="search-results">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+            </div>
+            <h3>Search HuggingFace Hub</h3>
+            <p>Type a model name, author, or keyword above.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- History Page -->
+      <section class="page" id="page-history">
+        <header class="page-header">
+          <div>
+            <h1>Download History</h1>
+            <p class="page-subtitle">Previously completed and failed downloads</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadHistory()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.87"/>
+              </svg>
+              Refresh
+            </button>
+          </div>
+        </header>
+        <div id="historyList">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </div>
+            <h3>No History Yet</h3>
+            <p>Completed downloads will appear here.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings Page -->
+      <section class="page" id="page-settings">
+        <header class="page-header">
+          <div>
+            <h1>Settings</h1>
+            <p class="page-subtitle">Configure your download preferences</p>
+            <p class="page-config-path" id="settingsConfigPath"></p>
+          </div>
+        </header>
+
+        <div class="settings-grid">
+          <div class="card">
+            <div class="card-header">
+              <h3>Storage</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label>HuggingFace Cache Directory</label>
+                <div id="cacheDir" class="cache-dir-display"></div>
+                <p class="form-hint">
+                  Downloads use the standard HuggingFace cache structure for Python compatibility.
+                </p>
+                <p class="form-hint" style="margin-top: 8px;">
+                  <strong>To change:</strong> Set the <code>HF_HOME</code> environment variable before starting the server,
+                  or use <code>--cache-dir</code> when launching <code>hfdesk</code>.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Authentication</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label for="hfToken">HuggingFace Token</label>
+                <div class="input-with-toggle">
+                  <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx">
+                  <button type="button" class="toggle-visibility" data-target="hfToken">
+                    <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                    </svg>
+                    <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                      <line x1="1" y1="1" x2="23" y2="23"/>
+                    </svg>
+                  </button>
+                </div>
+                <p class="form-hint">Required for private repositories and gated models</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Performance</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="connections">Connections per file</label>
+                  <input type="number" id="connections" value="8" min="1" max="32">
+                </div>
+                <div class="form-group">
+                  <label for="maxActive">Concurrent downloads</label>
+                  <input type="number" id="maxActive" value="3" min="1" max="10">
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="retries">Retry attempts</label>
+                <input type="number" id="retries" value="4" min="0" max="20">
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Verification</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label for="verify">File verification mode</label>
+                <select id="verify">
+                  <option value="size">Size only (fast)</option>
+                  <option value="sha256">SHA-256 (secure)</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Advanced</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label for="endpoint">HuggingFace Endpoint</label>
+                <input type="text" id="endpoint" placeholder="https://huggingface.co">
+                <p class="form-hint">Use a custom endpoint (e.g., https://hf-mirror.com)</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Proxy Settings</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label for="proxyUrl">Proxy URL</label>
+                <input type="text" id="proxyUrl" placeholder="http://proxy:8080 or socks5://proxy:1080">
+                <p class="form-hint">HTTP, HTTPS, or SOCKS5 proxy URL. Leave empty for direct connection or environment proxy.</p>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="proxyUsername">Username</label>
+                  <input type="text" id="proxyUsername" placeholder="(optional)">
+                </div>
+                <div class="form-group">
+                  <label for="proxyPassword">Password</label>
+                  <div class="input-with-toggle">
+                    <input type="password" id="proxyPassword" placeholder="(optional)">
+                    <button type="button" class="toggle-visibility" data-target="proxyPassword">
+                      <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                      </svg>
+                      <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                        <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
+                        <line x1="1" y1="1" x2="23" y2="23"/>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="proxyNoProxy">No Proxy</label>
+                <input type="text" id="proxyNoProxy" placeholder="localhost,.internal.com,10.0.0.0/8">
+                <p class="form-hint">Comma-separated list of hosts to bypass proxy</p>
+              </div>
+              <div class="form-group">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="proxyNoEnvProxy">
+                  <span>Ignore HTTP_PROXY/HTTPS_PROXY environment variables</span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-actions">
+          <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Modal -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modalTitle">Preview</h3>
+        <button class="modal-close" id="modalClose">&times;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer" id="modalFooter"></div>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+# Build artifacts
+/hfdownloader
+/hfdownloader.exe
+/output/
+
+# Downloaded models/data
+/Models/
+/Storage/
+/Datasets/
+
+# Environment and IDE
+.env
+.DS_Store
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.cache
+# Test artifacts
+*.test
+*.out
+coverage.txt
+test_models/
+TODO_Internal.md
+V3_SPEC_Internal.md
+V3_NewFeatures_Internal.md
+V3_Feature_Mirror_Internal.md
+V3_Feature_CacheViewer_Internal.md
+V3_Feature_SmartDownloader_Internal.md
+V3_Progress_Internal.md
