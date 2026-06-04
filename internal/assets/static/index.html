@@ -656,11 +656,28 @@
             </div>
             <div class="card-body">
               <div class="form-group">
+                <label for="downloadLayout">Default download layout</label>
+                <select id="downloadLayout">
+                  <option value="cache">HF cache layout</option>
+                  <option value="local">Local files (owner/model)</option>
+                </select>
+                <p class="form-hint">
+                  Local files use <code>&lt;folder&gt;\&lt;owner&gt;\&lt;model&gt;</code>, the same shape LM Studio expects.
+                </p>
+              </div>
+              <div class="form-group">
                 <label for="cacheDirInput">HuggingFace Cache Directory</label>
                 <input type="text" id="cacheDirInput" placeholder="Leave empty for the default HuggingFace cache">
                 <div id="cacheDir" class="cache-dir-display"></div>
                 <p class="form-hint">
                   Downloads use the standard HuggingFace cache structure for Python compatibility.
+                </p>
+              </div>
+              <div class="form-group" id="localDirGroup">
+                <label for="localDirInput">Default local download folder</label>
+                <input type="text" id="localDirInput" placeholder="D:\Models">
+                <p class="form-hint">
+                  Used when the default layout is Local files. Individual downloads can still override this folder.
                 </p>
               </div>
               <div class="form-group">

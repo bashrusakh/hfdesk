@@ -759,7 +759,7 @@
       </div>
       <div class="form-group">
         <label for="dlModalLocalDir">Save to folder <span class="form-hint-inline">(optional)</span></label>
-        <input type="text" id="dlModalLocalDir" placeholder="leave blank for default (HF cache)">
+        <input type="text" id="dlModalLocalDir" placeholder="leave blank for Settings default">
       </div>
       <div class="form-actions">
         <button class="btn btn-secondary" onclick="hideModal()">Cancel</button>
@@ -1805,6 +1805,15 @@
       if (localScanDirs) {
         localScanDirs.value = (data.localScanDirs || []).join('\n');
       }
+      const localDirInput = $('#localDirInput');
+      if (localDirInput) {
+        localDirInput.value = data.localDir || '';
+      }
+      const downloadLayout = $('#downloadLayout');
+      if (downloadLayout) {
+        downloadLayout.value = data.storageMode === 'local' ? 'local' : 'cache';
+      }
+      syncStorageFields();
 
       // Display config file paths
       const configPathEl = $('#settingsConfigPath');
@@ -1843,6 +1852,7 @@
 
   function initSettingsPage() {
     $('#saveSettingsBtn')?.addEventListener('click', saveSettings);
+    $('#downloadLayout')?.addEventListener('change', syncStorageFields);
 
     // Toggle password visibility
     $$('.toggle-visibility').forEach(btn => {
@@ -1860,9 +1870,16 @@
   }
 
   async function saveSettings() {
+    const layout = $('#downloadLayout')?.value || 'cache';
+    const defaultLocalDir = $('#localDirInput')?.value?.trim() || '';
+    if (layout === 'local' && !defaultLocalDir) {
+      showToast('Set a default local download folder first', 'error');
+      return;
+    }
     const body = {
       token: $('#hfToken')?.value || '',
       cacheDir: $('#cacheDirInput')?.value?.trim() || '',
+      localDir: layout === 'local' ? defaultLocalDir : '',
       localScanDirs: ($('#localScanDirs')?.value || '')
         .split(/\r?\n/)
         .map(v => v.trim())
@@ -1893,12 +1910,21 @@
     try {
       const result = await api('POST', '/settings', body);
       showToast(result.message || 'Settings saved', 'success');
+      await loadSettings();
       // Clear password field after save
       if ($('#proxyPassword')) {
         $('#proxyPassword').value = '';
       }
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
+    }
+  }
+
+  function syncStorageFields() {
+    const layout = $('#downloadLayout')?.value || 'cache';
+    const localGroup = $('#localDirGroup');
+    if (localGroup) {
+      localGroup.style.display = layout === 'local' ? '' : 'none';
     }
   }
 

@@ -40,6 +40,7 @@ func HistoryPath() string {
 // This matches the CLI config file format for consistency.
 type ConfigFile struct {
 	CacheDir           string       `json:"cache-dir,omitempty" yaml:"cache-dir,omitempty"`
+	LocalDir           string       `json:"local-dir,omitempty" yaml:"local-dir,omitempty"`
 	LocalScanDirs      []string     `json:"local-scan-dirs,omitempty" yaml:"local-scan-dirs,omitempty"`
 	Token              string       `json:"token,omitempty" yaml:"token,omitempty"`
 	Connections        int          `json:"connections,omitempty" yaml:"connections,omitempty"`
@@ -197,6 +198,9 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	// Only apply values that are not already set via CLI
 	if serverCfg.CacheDir == "" && fileCfg.CacheDir != "" {
 		serverCfg.CacheDir = fileCfg.CacheDir
+	}
+	if serverCfg.LocalDir == "" && fileCfg.LocalDir != "" {
+		serverCfg.LocalDir = fileCfg.LocalDir
 	}
 	if len(serverCfg.LocalScanDirs) == 0 && len(fileCfg.LocalScanDirs) > 0 {
 		serverCfg.LocalScanDirs = fileCfg.LocalScanDirs

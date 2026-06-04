@@ -36,7 +36,7 @@ HFDesk runs as a small local web server and gives you a desktop-style browser UI
 - Analyze repositories before downloading, including GGUF quantizations, file groups, RAM estimates, and recommended picks.
 - Correctly groups sharded GGUF files into one quantization option.
 - Parallel resumable downloads with retries, progress events, and active job tracking.
-- Standard Hugging Face cache layout plus optional flat `--local-dir` downloads.
+- Standard Hugging Face cache layout or LM Studio-style local files under `<folder>/<owner>/<model>`.
 - Local cache browser for HF cache, friendly folders, and user-added LM Studio-style model directories.
 - Mirror cache contents to a NAS, USB drive, or another machine.
 - Download history, disk-free indicator, proxy support, and optional basic auth.

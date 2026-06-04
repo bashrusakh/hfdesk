@@ -342,6 +342,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token              *string `json:"token,omitempty"`
 		CacheDir           *string `json:"cacheDir,omitempty"`
+		LocalDir           *string `json:"localDir,omitempty"`
 		LocalScanDirs      []string `json:"localScanDirs,omitempty"`
 		Concurrency        *int    `json:"connections,omitempty"`
 		MaxActive          *int    `json:"maxActive,omitempty"`
@@ -372,6 +373,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CacheDir != nil {
 		s.config.CacheDir = strings.TrimSpace(*req.CacheDir)
+	}
+	if req.LocalDir != nil {
+		s.config.LocalDir = strings.TrimSpace(*req.LocalDir)
 	}
 	if req.LocalScanDirs != nil {
 		s.config.LocalScanDirs = cleanPathList(req.LocalScanDirs)
@@ -430,6 +434,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Persist settings to config file
 	fileCfg := &ConfigFile{
 		CacheDir:           s.config.CacheDir,
+		LocalDir:           s.config.LocalDir,
 		LocalScanDirs:      s.config.LocalScanDirs,
 		Token:              s.config.Token,
 		Connections:        s.config.Concurrency,

@@ -135,11 +135,12 @@ Storage fields:
 ```json
 {
   "cacheDir": "I:\\huggingface",
+  "localDir": "D:\\Models",
   "localScanDirs": ["D:\\Models", "I:\\LM Studio\\models"]
 }
 ```
 
-`cacheDir` controls where HF cache-layout downloads are written. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
+`cacheDir` controls where HF cache-layout downloads are written. When `localDir` is set, downloads use real files under `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
 
 ## Cache
 
