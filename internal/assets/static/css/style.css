@@ -470,6 +470,13 @@ a {
   font-size: 12px;
   color: var(--color-text-muted);
   margin-top: 6px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.form-hint code {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .form-row {
@@ -2030,17 +2037,6 @@ a {
 
 .settings-actions {
   padding: 24px 40px 40px;
-}
-
-.cache-dir-display {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  padding: 12px 16px;
-  background: var(--color-bg-tertiary);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  color: var(--color-text-secondary);
-  word-break: break-all;
 }
 
 /* Rebuild Result Modal */

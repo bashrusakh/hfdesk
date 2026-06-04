@@ -1792,11 +1792,6 @@
       const data = await api('GET', '/settings');
       state.settings = data;
 
-      // Display cache directory (read-only)
-      const cacheDirEl = $('#cacheDir');
-      if (cacheDirEl) {
-        cacheDirEl.textContent = data.cacheDir || '~/.cache/huggingface';
-      }
       const cacheDirInput = $('#cacheDirInput');
       if (cacheDirInput) {
         cacheDirInput.value = data.cacheDir || '';
@@ -1922,7 +1917,11 @@
 
   function syncStorageFields() {
     const layout = $('#downloadLayout')?.value || 'cache';
+    const cacheGroup = $('#cacheDirGroup');
     const localGroup = $('#localDirGroup');
+    if (cacheGroup) {
+      cacheGroup.style.display = layout === 'cache' ? '' : 'none';
+    }
     if (localGroup) {
       localGroup.style.display = layout === 'local' ? '' : 'none';
     }
