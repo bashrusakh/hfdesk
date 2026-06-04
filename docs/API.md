@@ -128,7 +128,18 @@ GET  /api/settings
 POST /api/settings
 ```
 
-Settings include runtime paths, concurrency, verification, endpoint, and proxy settings. Output directories are startup/runtime-controlled and are not mutable through the settings API.
+Settings include runtime paths, concurrency, verification, endpoint, proxy settings, the HF cache directory, and extra local scan folders.
+
+Storage fields:
+
+```json
+{
+  "cacheDir": "I:\\huggingface",
+  "localScanDirs": ["D:\\Models", "I:\\LM Studio\\models"]
+}
+```
+
+`cacheDir` controls where HF cache-layout downloads are written. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
 
 ## Cache
 

@@ -116,13 +116,9 @@ func TestQuantPattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			matches := quantPattern.FindStringSubmatch(tt.input)
-			got := ""
-			if len(matches) >= 2 {
-				got = matches[1]
-			}
+			got := ggufQuantType(FileInfo{Name: tt.input, Path: tt.input})
 			if !strings.EqualFold(got, tt.expected) {
-				t.Errorf("quantPattern.FindStringSubmatch(%q) = %q, want %q", tt.input, got, tt.expected)
+				t.Errorf("ggufQuantType(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
 	}

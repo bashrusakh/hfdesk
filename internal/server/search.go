@@ -31,6 +31,9 @@ type SearchResult struct {
 	Tags         []string  `json:"tags,omitempty"`
 	LastModified time.Time `json:"lastModified,omitempty"`
 	CreatedAt    time.Time `json:"createdAt,omitempty"`
+	Cached       bool      `json:"cached,omitempty"`
+	CacheSource  string    `json:"cacheSource,omitempty"`
+	CacheStatus  string    `json:"cacheStatus,omitempty"`
 }
 
 // SearchResponse wraps a list of results and metadata.
@@ -154,6 +157,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheDir := s.config.CacheDir
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
+
 	results := make([]SearchResult, 0, len(raw))
 	for _, m := range raw {
 		gated := false
@@ -163,7 +171,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		case string:
 			gated = v != "" && v != "false"
 		}
-		results = append(results, SearchResult{
+		result := SearchResult{
 			ID:            m.ID,
 			Author:        m.Author,
 			Downloads:     m.Downloads,
@@ -176,7 +184,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			Tags:          m.Tags,
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
-		})
+		}
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, m.ID, false); localErr == nil {
+			result.Cached = true
+			result.CacheSource = localRepo.Source
+			result.CacheStatus = localRepo.DownloadStatus
+		}
+		results = append(results, result)
 	}
 
 	writeJSON(w, http.StatusOK, SearchResponse{

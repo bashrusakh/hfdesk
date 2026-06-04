@@ -263,6 +263,7 @@
       }
 
       currentAnalysis = data;
+      await syncLocalAnalysisStatus(data);
       renderAnalysisResult(data);
     } catch (e) {
       resultDiv.innerHTML = `
@@ -385,6 +386,36 @@
 
   // Make analyzeRepo available globally for type selection buttons
   window.analyzeRepo = analyzeRepo;
+
+  async function syncLocalAnalysisStatus(data) {
+    if (!data?.repo || !data.selectable_items?.length) return;
+    try {
+      const cached = await api('GET', `/cache/${data.repo}`);
+      const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+      if (!cachedFiles.size) return;
+
+      const map = getDlStatus(data.repo);
+      let changed = false;
+      data.selectable_items.forEach(item => {
+        const key = item.filter_value || item.id || '';
+        const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
+        if (!key || !files.length) return;
+        if (files.every(f => cachedFiles.has(f))) {
+          map[key] = 'done';
+          changed = true;
+        }
+      });
+      if (changed) {
+        localStorage.setItem('dlStatus:' + data.repo, JSON.stringify(map));
+      }
+    } catch {
+      // Cache lookup is best-effort; remote analysis should still render.
+    }
+  }
+
+  function normalizeRepoPath(path) {
+    return String(path || '').replace(/\\/g, '/').toLowerCase();
+  }
 
   function renderAnalysisResult(data) {
     const resultDiv = $('#analyzeResult');
@@ -571,6 +602,7 @@
     advancedOptions = { filter: '', exclude: '' };
     const input = $('#analyzeInput');
     if (input) input.value = '';
+    _syncModelsSearchClear();
 
     const resultDiv = $('#analyzeResult');
     if (resultDiv) {
@@ -1751,6 +1783,14 @@
       if (cacheDirEl) {
         cacheDirEl.textContent = data.cacheDir || '~/.cache/huggingface';
       }
+      const cacheDirInput = $('#cacheDirInput');
+      if (cacheDirInput) {
+        cacheDirInput.value = data.cacheDir || '';
+      }
+      const localScanDirs = $('#localScanDirs');
+      if (localScanDirs) {
+        localScanDirs.value = (data.localScanDirs || []).join('\n');
+      }
 
       // Display config file paths
       const configPathEl = $('#settingsConfigPath');
@@ -1808,6 +1848,11 @@
   async function saveSettings() {
     const body = {
       token: $('#hfToken')?.value || '',
+      cacheDir: $('#cacheDirInput')?.value?.trim() || '',
+      localScanDirs: ($('#localScanDirs')?.value || '')
+        .split(/\r?\n/)
+        .map(v => v.trim())
+        .filter(Boolean),
       connections: parseInt($('#connections')?.value) || 8,
       maxActive: parseInt($('#maxActive')?.value) || 3,
       retries: parseInt($('#retries')?.value) || 4,
@@ -2494,7 +2539,7 @@
         const recBadge= item.recommended ? '<span class="quant-rec">★ rec</span>' : '';
         const size    = item.size_human  ? `<span class="quant-size">${escapeHtml(item.size_human)}</span>` : '';
         const ram     = item.ram_human   ? `<span class="quant-ram">${escapeHtml(item.ram_human)} RAM</span>` : '';
-        const desc    = item.description ? `<span class="quant-desc">${escapeHtml(item.description)}</span>` : '';
+        const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
 
         const fv = item.filter_value || item.id || '';
         const dlStatus = dlMap[fv] || '';
@@ -2628,6 +2673,11 @@
     const filled = '★'.repeat(quality);
     const empty = '☆'.repeat(5 - quality);
     return `<span class="selector-stars">${filled}${empty}</span>`;
+  }
+
+  function renderQuantDescription(description) {
+    if (!description) return '';
+    return escapeHtml(description).replace(/\brecommended\b/gi, '<span class="quant-desc-rec">$&</span>');
   }
 
   /**
@@ -2780,6 +2830,7 @@
   let _modelsDebounce = null;
   let _modelsInitialized = false;
   let _currentSelectedRow = null;
+  let _syncModelsSearchClear = () => {};
 
   function initModelsPage() {
     if (_modelsInitialized) return;
@@ -2793,6 +2844,7 @@
     const syncClearBtn = () => {
       if (clearBtn) clearBtn.hidden = !(input && input.value.length > 0);
     };
+    _syncModelsSearchClear = syncClearBtn;
     syncClearBtn();
 
     // Debounced search on typing
@@ -2832,6 +2884,7 @@
     $$('.example-btn').forEach(b => {
       b.addEventListener('click', () => {
         if (input) input.value = b.dataset.repo;
+        _syncModelsSearchClear();
         analyzeRepo(b.dataset.type || null);
       });
     });
@@ -2901,6 +2954,9 @@
       : r.pipelineTag
         ? `<span class="model-row-badge">${escapeHtml(r.pipelineTag.replace(/-/g,' ').substring(0,16))}</span>`
         : '';
+    const localBadge = r.cached
+      ? `<span class="model-row-badge model-row-badge-local" title="${escapeHtml(r.cacheSource || 'Local cache')}">local</span>`
+      : '';
 
     const dl = r.downloads ? `<span class="model-row-stat">↓${formatNumber(r.downloads)}</span>` : '';
     const lk = r.likes     ? `<span class="model-row-stat">♥${formatNumber(r.likes)}</span>` : '';
@@ -2913,7 +2969,7 @@
           <div class="model-row-name">${escapeHtml(name)}</div>
           <div class="model-row-meta">${escapeHtml(author)}${dl}${lk}${gated}</div>
         </div>
-        <div class="model-row-right">${badge}</div>
+        <div class="model-row-right">${localBadge}${badge}</div>
       </div>`;
   }
 
@@ -2935,6 +2991,7 @@
     // Set analyzeInput and run analysis
     const input = $('#analyzeInput');
     if (input) input.value = repoId;
+    _syncModelsSearchClear();
     analyzeRepo();
   };
 
@@ -2964,6 +3021,7 @@
     const input = $('#analyzeInput');
     if (input) {
       input.value = repoId;
+      _syncModelsSearchClear();
       analyzeRepo();
     }
   }
@@ -3133,8 +3191,9 @@
     const list = $('.models-list-panel');
     if (!handle || !split || !list) return;
 
-    const minW = 220;
-    const preferredMaxW = 560;
+    const minW = 300;
+    const defaultW = 360;
+    const preferredMaxW = 640;
     const detailMinW = 360;
     const clampWidth = (width) => {
       const splitW = split.getBoundingClientRect().width || (preferredMaxW + detailMinW);
@@ -3146,7 +3205,18 @@
     };
 
     const saved = parseInt(localStorage.getItem('modelsListWidth') || '', 10);
-    if (Number.isFinite(saved) && saved > 0) applyWidth(saved);
+    if (Number.isFinite(saved) && saved > 0) {
+      const migrated = localStorage.getItem('modelsListWidthV2') === '1';
+      const width = !migrated && saved < defaultW ? defaultW : saved;
+      applyWidth(width);
+      if (!migrated) {
+        localStorage.setItem('modelsListWidthV2', '1');
+        localStorage.setItem('modelsListWidth', Math.round(clampWidth(width)));
+      }
+    } else {
+      applyWidth(defaultW);
+      localStorage.setItem('modelsListWidthV2', '1');
+    }
 
     let startX = 0;
     let startW = 0;

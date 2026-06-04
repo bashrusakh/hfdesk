@@ -656,14 +656,18 @@
             </div>
             <div class="card-body">
               <div class="form-group">
-                <label>HuggingFace Cache Directory</label>
+                <label for="cacheDirInput">HuggingFace Cache Directory</label>
+                <input type="text" id="cacheDirInput" placeholder="Leave empty for the default HuggingFace cache">
                 <div id="cacheDir" class="cache-dir-display"></div>
                 <p class="form-hint">
                   Downloads use the standard HuggingFace cache structure for Python compatibility.
                 </p>
-                <p class="form-hint" style="margin-top: 8px;">
-                  <strong>To change:</strong> Set the <code>HF_HOME</code> environment variable before starting the server,
-                  or use <code>--cache-dir</code> when launching <code>hfdesk</code>.
+              </div>
+              <div class="form-group">
+                <label for="localScanDirs">Local model folders</label>
+                <textarea id="localScanDirs" rows="3" placeholder="D:\Models&#10;I:\LM Studio\models"></textarea>
+                <p class="form-hint">
+                  One folder per line. HFDesk scans them as owner/model folders and marks matching Hub results as local.
                 </p>
               </div>
             </div>

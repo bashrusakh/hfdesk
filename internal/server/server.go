@@ -29,6 +29,10 @@ type Config struct {
 	// HF cache layout. Set once at startup (serve --local-dir); not changeable
 	// per request. Empty = HF cache mode.
 	LocalDir string
+	// LocalScanDirs are additional read-only roots scanned by the Cache browser
+	// as <owner>/<model> folders, e.g. LM Studio or a manually managed model
+	// library. Downloads still go to CacheDir/LocalDir unless a job overrides it.
+	LocalScanDirs       []string
 	Concurrency        int
 	MaxActive          int
 	MultipartThreshold string // Minimum size for multipart download

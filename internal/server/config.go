@@ -26,20 +26,21 @@ func RunDir() string {
 	return "."
 }
 
-// JobsStatePath returns the path to jobs_state.json in the run directory.
+// JobsStatePath returns the path to jobs_state.json in the app config directory.
 func JobsStatePath() string {
-	return filepath.Join(RunDir(), "jobs_state.json")
+	return filepath.Join(AppConfigDir(), "jobs_state.json")
 }
 
-// HistoryPath returns the path to download_history.json in the run directory.
+// HistoryPath returns the path to download_history.json in the app config directory.
 func HistoryPath() string {
-	return filepath.Join(RunDir(), "download_history.json")
+	return filepath.Join(AppConfigDir(), "download_history.json")
 }
 
 // ConfigFile represents the persistent configuration file format.
 // This matches the CLI config file format for consistency.
 type ConfigFile struct {
 	CacheDir           string       `json:"cache-dir,omitempty" yaml:"cache-dir,omitempty"`
+	LocalScanDirs      []string     `json:"local-scan-dirs,omitempty" yaml:"local-scan-dirs,omitempty"`
 	Token              string       `json:"token,omitempty" yaml:"token,omitempty"`
 	Connections        int          `json:"connections,omitempty" yaml:"connections,omitempty"`
 	MaxActive          int          `json:"max-active,omitempty" yaml:"max-active,omitempty"`
@@ -64,34 +65,58 @@ type ProxyConfig struct {
 
 var configMu sync.Mutex
 
-// ConfigPath returns the path to the config file.
-// Search order: RunDir() first (local to the run folder), then ~/.config/.
-// This way a project-local hfdesk.json takes precedence over the
-// user-wide one, and new saves go to the run folder by default.
-func ConfigPath() string {
-	runDir := RunDir()
+// AppConfigDir returns the normal per-user HFDesk configuration directory.
+func AppConfigDir() string {
+	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
+		return filepath.Join(dir, "HFDesk")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".config", "hfdesk")
+	}
+	return RunDir()
+}
 
-	// 1. Check run directory
-	for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
-		p := filepath.Join(runDir, name)
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
+func isTempDir(path string) bool {
+	path = filepath.Clean(path)
+	temp := filepath.Clean(os.TempDir())
+	lower := strings.ToLower(path)
+	if strings.HasPrefix(strings.ToLower(path), strings.ToLower(temp)) {
+		return true
+	}
+	return strings.Contains(lower, "rar$") || strings.Contains(lower, ".rartemp")
+}
+
+// ConfigPath returns the path to the config file.
+// Search order: existing config next to the current/executable folder, then the
+// normal per-user config directory. New saves go to the per-user directory so
+// running an unpacked archive does not create config in a temp extraction path.
+func ConfigPath() string {
+	dirs := []string{RunDir()}
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
 	}
 
-	// 2. Check ~/.config
-	if home, err := os.UserHomeDir(); err == nil {
-		configDir := filepath.Join(home, ".config")
+	for _, dir := range dirs {
+		if isTempDir(dir) {
+			continue
+		}
 		for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
-			p := filepath.Join(configDir, name)
+			p := filepath.Join(dir, name)
 			if _, err := os.Stat(p); err == nil {
 				return p
 			}
 		}
 	}
 
-	// 3. Default: new file in run directory
-	return filepath.Join(runDir, "hfdesk.json")
+	configDir := AppConfigDir()
+	for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
+		p := filepath.Join(configDir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	return filepath.Join(configDir, "hfdesk.json")
 }
 
 // LoadConfigFile loads configuration from the config file.
@@ -172,6 +197,9 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	// Only apply values that are not already set via CLI
 	if serverCfg.CacheDir == "" && fileCfg.CacheDir != "" {
 		serverCfg.CacheDir = fileCfg.CacheDir
+	}
+	if len(serverCfg.LocalScanDirs) == 0 && len(fileCfg.LocalScanDirs) > 0 {
+		serverCfg.LocalScanDirs = fileCfg.LocalScanDirs
 	}
 	if serverCfg.Token == "" && fileCfg.Token != "" {
 		serverCfg.Token = fileCfg.Token

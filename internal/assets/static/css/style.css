@@ -3506,9 +3506,9 @@ a {
 
 /* ── Left panel ── */
 .models-list-panel {
-  width: var(--models-list-width, 280px);
-  flex: 0 0 var(--models-list-width, 280px);
-  min-width: 220px;
+  width: var(--models-list-width, 360px);
+  flex: 0 0 var(--models-list-width, 360px);
+  min-width: 300px;
   max-width: 560px;
   display: flex;
   flex-direction: column;
@@ -3561,7 +3561,7 @@ a {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
-  padding: 7px 10px;
+  padding: 6px 8px 6px 10px;
   margin-bottom: 7px;
 }
 
@@ -3586,11 +3586,13 @@ a {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  padding: 2px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
   background: transparent;
   border: none;
   border-radius: var(--radius-full);
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   cursor: pointer;
   transition: color .12s, background .12s;
 }
@@ -3710,6 +3712,9 @@ a {
 
 .model-row-right {
   flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+  align-items: center;
 }
 
 .model-row-badge {
@@ -3723,6 +3728,10 @@ a {
 .model-row-badge-gguf {
   background: rgba(245, 158, 11, 0.15);
   color: var(--color-warning);
+}
+.model-row-badge-local {
+  background: rgba(16, 185, 129, 0.16);
+  color: var(--color-success);
 }
 
 /* ── Right / detail panel ── */
@@ -3877,6 +3886,11 @@ a {
   color: var(--color-success);
   font-weight: 500;
   white-space: nowrap;
+}
+
+.quant-desc-rec {
+  color: var(--color-success);
+  font-weight: 600;
 }
 
 .quant-size {

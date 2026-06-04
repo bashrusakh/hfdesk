@@ -317,6 +317,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		Endpoint:           s.config.Endpoint,
 		StorageMode:        storageMode,
 		LocalDir:           s.config.LocalDir,
+		LocalScanDirs:      s.config.LocalScanDirs,
 		ConfigFile:         ConfigPath(),
 		TargetsFile:        hfdownloader.DefaultTargetsPath(),
 	}
@@ -340,6 +341,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token              *string `json:"token,omitempty"`
+		CacheDir           *string `json:"cacheDir,omitempty"`
+		LocalScanDirs      []string `json:"localScanDirs,omitempty"`
 		Concurrency        *int    `json:"connections,omitempty"`
 		MaxActive          *int    `json:"maxActive,omitempty"`
 		MultipartThreshold *string `json:"multipartThreshold,omitempty"`
@@ -366,6 +369,12 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Update config (only safe fields)
 	if req.Token != nil {
 		s.config.Token = *req.Token
+	}
+	if req.CacheDir != nil {
+		s.config.CacheDir = strings.TrimSpace(*req.CacheDir)
+	}
+	if req.LocalScanDirs != nil {
+		s.config.LocalScanDirs = cleanPathList(req.LocalScanDirs)
 	}
 	if req.Concurrency != nil && *req.Concurrency > 0 {
 		s.config.Concurrency = *req.Concurrency
@@ -420,6 +429,8 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	// Persist settings to config file
 	fileCfg := &ConfigFile{
+		CacheDir:           s.config.CacheDir,
+		LocalScanDirs:      s.config.LocalScanDirs,
 		Token:              s.config.Token,
 		Connections:        s.config.Concurrency,
 		MaxActive:          s.config.MaxActive,
@@ -562,7 +573,26 @@ type localCacheRoot struct {
 	SkipSpecial bool
 }
 
-func localCacheRoots(cacheDir, localDir string) []localCacheRoot {
+func cleanPathList(paths []string) []string {
+	var cleaned []string
+	seen := make(map[string]bool)
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = filepath.Clean(path)
+		key := strings.ToLower(path)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		cleaned = append(cleaned, path)
+	}
+	return cleaned
+}
+
+func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
 	var roots []localCacheRoot
 	seen := make(map[string]bool)
 	add := func(path, source string, skipSpecial bool) {
@@ -583,6 +613,9 @@ func localCacheRoots(cacheDir, localDir string) []localCacheRoot {
 
 	add(filepath.Join(cacheDir, "models"), "Friendly view", false)
 	add(localDir, "Local", localSkipSpecial)
+	for _, dir := range localScanDirs {
+		add(dir, "Local", false)
+	}
 	add(cacheDir, "Local", true)
 	return roots
 }
@@ -664,9 +697,9 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	}, nil
 }
 
-func scanLocalCachedRepos(cacheDir, localDir string, includeFiles bool) ([]CachedRepoInfo, error) {
+func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
-	for _, root := range localCacheRoots(cacheDir, localDir) {
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
 		if _, err := os.Stat(root.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -710,17 +743,17 @@ func scanLocalCachedRepos(cacheDir, localDir string, includeFiles bool) ([]Cache
 	return repos, nil
 }
 
-func findLocalCachedRepo(cacheDir, localDir, repoID string) (*CachedRepoInfo, error) {
+func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	parts := strings.SplitN(repoID, "/", 2)
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
-	for _, root := range localCacheRoots(cacheDir, localDir) {
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
 		if !hasLocalWeightFile(repoDir) {
 			continue
 		}
-		return buildLocalCacheRepo(parts[0], parts[1], repoDir, root.Source, true)
+		return buildLocalCacheRepo(parts[0], parts[1], repoDir, root.Source, includeFiles)
 	}
 	return nil, os.ErrNotExist
 }
@@ -870,7 +903,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
 	}
 
-	localRepos, _ := scanLocalCachedRepos(cacheDir, s.config.LocalDir, false)
+	localRepos, _ := scanLocalCachedRepos(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, false)
 	for _, repo := range localRepos {
 		if repoType != "" && repoType != repo.Type {
 			continue
@@ -930,7 +963,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
-			localRepo, localErr := findLocalCachedRepo(cacheDir, s.config.LocalDir, repo)
+			localRepo, localErr := findLocalCachedRepo(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, repo, true)
 			if localErr == nil {
 				writeJSON(w, http.StatusOK, localRepo)
 				return

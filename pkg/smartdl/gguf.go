@@ -140,7 +140,7 @@ var quantDescriptions = map[string]string{
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|F(?:16|32)|BF16)`)
+	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|F(?:16|32)|BF16)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -175,8 +175,12 @@ func ggufQuantType(f FileInfo) string {
 		if candidate == "" {
 			continue
 		}
-		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 2 {
-			return strings.ToUpper(m[1])
+		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
+			quant := strings.ToUpper(m[2])
+			if m[1] != "" {
+				return "UD_" + quant
+			}
+			return quant
 		}
 	}
 	return ""
@@ -339,12 +343,13 @@ func quantizationFromGroup(files []FileInfo) *GGUFQuantization {
 		}
 	}
 
-	quality := quantQuality[quantType]
+	baseQuantType := strings.TrimPrefix(quantType, "UD_")
+	quality := quantQuality[baseQuantType]
 	if quality == 0 {
 		quality = 3 // Default to medium if not found
 	}
 
-	desc := quantDescriptions[quantType]
+	desc := quantDescriptions[baseQuantType]
 	if desc == "" {
 		desc = "Quantized model"
 	}
@@ -440,7 +445,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	// Track if we have a Q4_K_M (common recommended default)
 	hasQ4KM := false
 	for _, q := range info.Quantizations {
-		if q.Name == "Q4_K_M" {
+		if q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M" {
 			hasQ4KM = true
 			break
 		}
@@ -450,7 +455,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		// Determine if this should be recommended
 		// Q4_K_M is a good default, otherwise highest quality in 4-bit range
 		recommended := false
-		if hasQ4KM && q.Name == "Q4_K_M" {
+		if hasQ4KM && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
 			recommended = true
 		} else if !hasQ4KM && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
 			recommended = true
@@ -467,7 +472,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		// quants the quant token appears in every shard name, so the lowercased
 		// name matches the whole set. For "Unknown" groups the name won't match
 		// any filename, so use the shared base of the files instead.
-		filterValue := strings.ToLower(q.Name)
+		filterValue := strings.ToLower(strings.TrimPrefix(q.Name, "UD_"))
 		if q.Name == "Unknown" {
 			filterValue = strings.ToLower(stripSplitSuffix(filepath.Base(q.File.Name)))
 		}

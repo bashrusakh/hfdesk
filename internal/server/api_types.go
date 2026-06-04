@@ -51,6 +51,7 @@ type SettingsResponse struct {
 	// or "cache" when it uses the HF cache layout. Set at startup, read-only.
 	StorageMode string `json:"storageMode"`
 	LocalDir    string `json:"localDir,omitempty"`
+	LocalScanDirs []string `json:"localScanDirs,omitempty"`
 	// Proxy settings
 	Proxy *ProxySettingsResponse `json:"proxy,omitempty"`
 	// Config file paths

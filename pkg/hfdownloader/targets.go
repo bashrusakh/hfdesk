@@ -24,8 +24,11 @@ type TargetsConfig struct {
 
 // DefaultTargetsPath returns the default path for targets config.
 func DefaultTargetsPath() string {
+	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
+		return filepath.Join(dir, "HFDesk", "targets.yaml")
+	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "hfdownloader", "targets.yaml")
+	return filepath.Join(home, ".config", "hfdesk", "targets.yaml")
 }
 
 // LoadTargets loads targets from the config file.

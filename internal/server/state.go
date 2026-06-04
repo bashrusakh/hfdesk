@@ -39,6 +39,9 @@ func SaveJobsState(jobs []*Job) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(AppConfigDir(), 0o755); err != nil {
+		return err
+	}
 	return os.WriteFile(JobsStatePath(), data, 0o644)
 }
 
@@ -114,6 +117,9 @@ func AppendHistory(job *Job) error {
 
 	data, err := json.MarshalIndent(hf, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(AppConfigDir(), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(HistoryPath(), data, 0o644)

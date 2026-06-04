@@ -73,7 +73,7 @@ func TestScanLocalCachedRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	repos, err := scanLocalCachedRepos(cacheDir, localDir, false)
+	repos, err := scanLocalCachedRepos(cacheDir, localDir, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
