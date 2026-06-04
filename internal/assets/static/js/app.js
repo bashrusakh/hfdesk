@@ -531,8 +531,16 @@
     if (hasSelectableItems) {
       selectableItemsHtml = `
         <div class="analysis-section">
-          <h4>Select Files to Download</h4>
-          <p style="font-size: 13px; color: var(--color-text-muted); margin-bottom: 12px;">Choose which files you want to download:</p>
+          <div class="selection-toolbar">
+            <div>
+              <h4>Select Files to Download</h4>
+              <span id="selectionSummary" class="selection-summary">Choose files</span>
+            </div>
+            <div class="selection-actions">
+              <button class="btn btn-ghost btn-sm" onclick="showAdvancedOptions()">Options</button>
+              <button id="downloadSelectedBtn" class="btn btn-primary btn-sm" onclick="startWizardDownload('${escapeHtml(data.repo)}', ${data.is_dataset})">Download selected</button>
+            </div>
+          </div>
           ${renderSelectableItems(data.selectable_items, 'selectableItems')}
         </div>
       `;
@@ -690,8 +698,14 @@
   // Start download from wizard with selected options
   window.startWizardDownload = async function(repo, isDataset) {
     // Get selected items from unified selector (new) or legacy quantOptions
+    const selectableCount = document.querySelectorAll('.selectable-items input[type="checkbox"]').length;
     let selectedItems = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'))
       .map(cb => cb.value);
+
+    if (selectableCount > 0 && selectedItems.length === 0) {
+      showToast('Select at least one file option first', 'error');
+      return;
+    }
 
     // Fallback to legacy GGUF selector if no new selectable items
     if (selectedItems.length === 0) {
@@ -2732,6 +2746,27 @@
 
     // Update file list based on selections
     updateFileListFromSelections(selectedItems);
+    updateSelectionSummary();
+  }
+
+  function updateSelectionSummary() {
+    const summary = $('#selectionSummary');
+    if (!summary || !currentAnalysis) return;
+    const btn = $('#downloadSelectedBtn');
+
+    const selected = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'));
+    const total = document.querySelectorAll('.selectable-items input[type="checkbox"]').length;
+    const size = selected.reduce((sum, cb) => {
+      const item = currentAnalysis.selectable_items?.find(it => (it.filter_value || it.id || '') === cb.value);
+      return sum + (item?.size || 0);
+    }, 0);
+
+    if (selected.length === 0) {
+      summary.textContent = 'Nothing selected';
+    } else {
+      summary.textContent = `${selected.length} of ${total} selected${size ? `, ${formatBytes(size)}` : ''}`;
+    }
+    if (btn) btn.disabled = selected.length === 0;
   }
 
   /**

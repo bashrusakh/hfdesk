@@ -990,6 +990,36 @@ a {
   gap: 20px;
 }
 
+.selection-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: -2px 0 12px;
+  padding: 10px 0 12px;
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.selection-toolbar h4 {
+  margin-bottom: 2px;
+}
+
+.selection-summary {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .selector-category {
   margin-bottom: 0;
 }
