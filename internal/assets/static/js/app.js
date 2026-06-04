@@ -23,6 +23,7 @@
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
+  const isFilePreview = () => window.location.protocol === 'file:';
 
   // =========================================
   // Navigation
@@ -38,6 +39,13 @@
     });
   }
 
+  function getInitialPage() {
+    const allowed = new Set(['models', 'jobs', 'cache', 'mirror', 'history', 'settings']);
+    const params = new URLSearchParams(window.location.search);
+    const page = params.get('page') || window.location.hash.replace(/^#/, '');
+    return allowed.has(page) ? page : 'models';
+  }
+
   function navigateTo(page) {
     // Update nav
     $$('.nav-item').forEach(n => n.classList.remove('active'));
@@ -50,12 +58,17 @@
     state.currentPage = page;
 
     // Load page data
-    if (page === 'cache') loadCache();
-    if (page === 'jobs') loadJobs();
-    if (page === 'settings') loadSettings();
-    if (page === 'mirror') loadMirrorTargets();
-    if (page === 'models') { loadModelsSearch(); loadStorageModeBadge(); loadDiskFreeIndicator(); }
-    if (page === 'history') loadHistory();
+    if (isFilePreview()) {
+      if (page === 'cache') loadCache();
+      if (page === 'mirror') loadMirrorTargets();
+    } else {
+      if (page === 'cache') loadCache();
+      if (page === 'jobs') loadJobs();
+      if (page === 'settings') loadSettings();
+      if (page === 'mirror') loadMirrorTargets();
+      if (page === 'models') { loadModelsSearch(); loadStorageModeBadge(); loadDiskFreeIndicator(); }
+      if (page === 'history') loadHistory();
+    }
   }
 
   // =========================================
@@ -1237,6 +1250,13 @@
     const statsContainer = $('#cacheStats');
     if (!container) return;
 
+    if (isFilePreview()) {
+      cacheData = { repos: [], stats: {}, cacheDir: '' };
+      updateCacheStats();
+      renderCacheList();
+      return;
+    }
+
     container.innerHTML = `
       <div class="loading-state">
         <div class="spinner"></div>
@@ -1913,6 +1933,14 @@
 
   async function loadMirrorTargets() {
     const container = $('#targetsList');
+    if (isFilePreview()) {
+      mirrorData.targets = [];
+      renderMirrorTargets(mirrorData.targets);
+      updateTargetSelect(mirrorData.targets);
+      updateMirrorStats(mirrorData.targets);
+      return;
+    }
+
     if (container) {
       container.innerHTML = `
         <div class="loading-state">
@@ -3271,7 +3299,13 @@
     initNavigation();
     initSidebarResize();
     initModelsListResize();
-    initWebSocket();
+    if (!isFilePreview()) {
+      initWebSocket();
+    } else {
+      updateConnectionStatus(false);
+      const statusText = $('#connectionStatus .status-text');
+      if (statusText) statusText.textContent = 'Preview';
+    }
     initModelsPage();      // unified: analyze + search + download
     initCachePage();
     initSettingsPage();
@@ -3279,8 +3313,11 @@
     initModal();
 
     // Load initial data
-    loadJobs();
-    loadModelsSearch();    // populate models list on startup
+    if (!isFilePreview()) {
+      loadJobs();
+      loadModelsSearch();    // populate models list on startup
+    }
+    navigateTo(getInitialPage());
   }
 
   // Start

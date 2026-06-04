@@ -1,63 +1,59 @@
-<p align="center">
-  <img src="docs/screenshots/web-dashboard.png" width="640" alt="HFDesk – Analyze view" />
-</p>
-
-<h1 align="center">HFDesk</h1>
+# HFDesk
 
 <p align="center">
-  A local web dashboard for searching, analyzing, and downloading models from the Hugging Face Hub.
+  <strong>A focused local dashboard for finding, analyzing, and downloading Hugging Face models.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/bashrusakh/hfdesk/releases"><img src="https://img.shields.io/github/v/release/bashrusakh/hfdesk?style=flat-square&color=4f46e5" alt="Latest release" /></a>
-  <a href="https://pkg.go.dev/github.com/bashrusakh/hfdesk"><img src="https://img.shields.io/badge/Go-1.22+-00add8?style=flat-square&logo=go&logoColor=white" alt="Go version" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-22c55e?style=flat-square" alt="Apache 2.0" /></a>
+  <a href="https://github.com/bashrusakh/hfdesk/releases"><img src="https://img.shields.io/github/v/release/bashrusakh/hfdesk?style=for-the-badge&color=7c3aed" alt="Latest release"></a>
+  <a href="https://pkg.go.dev/github.com/bashrusakh/hfdesk"><img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.24"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="Apache 2.0"></a>
 </p>
 
----
+<p align="center">
+  <img src="docs/screenshots/hfdesk-models.png" alt="HFDesk Models view" width="900">
+</p>
 
-Run `hfdesk` and get a focused browser UI for the entire model workflow — search the Hub, inspect GGUF quantizations with RAM estimates, start parallel resumable downloads, browse your local cache, and mirror it to other drives.
+HFDesk runs as a small local web server and gives you a desktop-style browser UI for the full model workflow: search the Hub, inspect GGUF quantizations, pick files, download with resume support, browse local cache, and mirror model storage to another drive.
 
 ## Screenshots
 
-| Analyze | Local Cache |
+| Models | Active Jobs |
 |---|---|
-| ![Analyze](docs/screenshots/web-dashboard.png) | ![Local Cache](docs/screenshots/web-dashboard2.png) |
+| ![Models](docs/screenshots/hfdesk-models.png) | ![Active Jobs](docs/screenshots/hfdesk-jobs.png) |
 
-| Mirror |
+| Local Cache | Mirror |
+|---|---|
+| ![Local Cache](docs/screenshots/hfdesk-cache.png) | ![Mirror](docs/screenshots/hfdesk-mirror.png) |
+
+| Settings |
 |---|
-| ![Mirror](docs/screenshots/web-dashboar3.png) |
+| ![Settings](docs/screenshots/hfdesk-settings.png) |
 
-## Features
+## Highlights
 
-- **Search** models and datasets on the Hugging Face Hub directly from the UI.
-- **Analyze before downloading** — GGUF quantizations are listed with star ratings, RAM estimates, and a recommended pick. Sharded files are grouped as one option.
-- **Parallel resumable downloads** — multipart HTTP, configurable concurrency, retry with backoff. Downloads survive interruptions and continue where they left off.
-- **HF cache layout** — files land in the standard `~/.cache/huggingface` structure, fully compatible with `transformers`, `ollama`, and other tools.
-- **Local-dir mode** — write real files into any folder instead of the cache layout (`--local-dir`).
-- **Cache browser** — see every model and dataset stored locally, with size, commit, and download status.
-- **Mirror** — push or pull your cache to a NAS, USB drive, or second machine. Diff, verify, force-resync.
-- **Proxy support** — HTTP, HTTPS, and SOCKS5 proxies with optional auth and per-domain bypass.
-- **Download history** and disk-free indicator in the status bar.
-- **Basic auth** for the web UI when running on a shared server.
-- Single static binary — no runtime dependencies.
+- Search models and datasets directly from the Hugging Face Hub.
+- Analyze repositories before downloading, including GGUF quantizations, file groups, RAM estimates, and recommended picks.
+- Correctly groups sharded GGUF files into one quantization option.
+- Parallel resumable downloads with retries, progress events, and active job tracking.
+- Standard Hugging Face cache layout plus optional flat `--local-dir` downloads.
+- Local cache browser for HF cache, friendly folders, and LM Studio-style model directories.
+- Mirror cache contents to a NAS, USB drive, or another machine.
+- Download history, disk-free indicator, proxy support, and optional basic auth.
+- Single static binary with embedded web assets.
 
 ## Install
 
-**From source (Go 1.22+)**
+Download a prebuilt binary from [Releases](https://github.com/bashrusakh/hfdesk/releases), or install from source:
 
 ```bash
 go install github.com/bashrusakh/hfdesk/cmd/hfdesk@latest
 ```
 
-**Binary releases**
-
-Download a pre-built binary for your platform from the [Releases](https://github.com/bashrusakh/hfdesk/releases) page.
-
-**Docker**
+Docker:
 
 ```bash
-docker run -p 8080:8080 \
+docker run --rm -p 8080:8080 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/bashrusakh/hfdesk:latest
 ```
@@ -65,24 +61,23 @@ docker run -p 8080:8080 \
 ## Quick Start
 
 ```bash
-hfdesk
+hfdesk --open
 ```
 
-Open **http://localhost:8080** in your browser.
+Without `--open`, start HFDesk and open [http://localhost:8080](http://localhost:8080).
+
+Useful options:
 
 ```bash
-hfdesk --open           # launch and open the browser automatically
 hfdesk --port 9090
-hfdesk --token hf_xxx   # required for private or gated repos
+hfdesk --token hf_xxx
 hfdesk --cache-dir /mnt/ssd/huggingface
-hfdesk --local-dir /mnt/models   # flat files instead of HF cache layout
+hfdesk --local-dir /mnt/models
 ```
 
 ## Configuration
 
-HFDesk reads a config file on startup and the UI settings panel writes back to it. Supported formats: `hfdesk.json`, `hfdesk.yaml`, `hfdesk.yml`.
-
-Search order: current directory → `~/.config/`.
+HFDesk reads `hfdesk.json`, `hfdesk.yaml`, or `hfdesk.yml` from the launch directory first, then from `~/.config`. Settings saved from the UI are written back to the launch directory.
 
 ```json
 {
@@ -93,22 +88,11 @@ Search order: current directory → `~/.config/`.
   "multipart-threshold": "32MiB",
   "verify": "size",
   "retries": 4,
-  "endpoint": "https://hf-mirror.com"
+  "endpoint": "https://huggingface.co"
 }
 ```
 
-| Key | Default | Description |
-|---|---|---|
-| `token` | — | HF access token |
-| `cache-dir` | `~/.cache/huggingface` | Cache root (or `HF_HOME` env) |
-| `connections` | `8` | Parallel HTTP connections per file |
-| `max-active` | `3` | Simultaneously downloading files |
-| `multipart-threshold` | `32MiB` | Minimum size for multipart download |
-| `verify` | `size` | `none` / `size` / `sha256` |
-| `retries` | `4` | Retry attempts per request |
-| `endpoint` | `https://huggingface.co` | Custom mirror URL |
-
-### Proxy
+Proxy example:
 
 ```json
 {
@@ -121,7 +105,7 @@ Search order: current directory → `~/.config/`.
 }
 ```
 
-## Development
+## Build
 
 ```bash
 git clone https://github.com/bashrusakh/hfdesk
@@ -139,4 +123,4 @@ go test ./... -race
 
 ## Credits
 
-HFDesk is a fork of [bodaay/HuggingFaceModelDownloader](https://github.com/bodaay/HuggingFaceModelDownloader). Licensed under the [Apache License 2.0](LICENSE).
+HFDesk is a fork of [bodaay/HuggingFaceModelDownloader](https://github.com/bodaay/HuggingFaceModelDownloader). Original copyright and license notices are retained. Licensed under the [Apache License 2.0](LICENSE).
