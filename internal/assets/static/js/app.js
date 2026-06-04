@@ -180,7 +180,8 @@
     const data = await res.json();
 
     if (!res.ok) {
-      throw new Error(data.error || 'API error');
+      const message = data.error_detail?.message || data.error || 'API error';
+      throw new Error(message);
     }
     return data;
   }
@@ -509,17 +510,6 @@
     // Build related downloads section (for LoRA base models, etc.)
     const relatedDownloadsHtml = renderRelatedDownloads(data.related_downloads);
 
-    // Build the download command - prefer API-provided command, fall back to building it
-    let baseCmd = data.cli_command_full || data.cli_command || `hfdesk ${data.repo}`;
-    if (!data.cli_command) {
-      if (data.is_dataset) {
-        baseCmd += ' --dataset';
-      }
-      if (data.branch && data.branch !== 'main') {
-        baseCmd += ` -b ${data.branch}`;
-      }
-    }
-
     // Build branch/revision display
     const branchDisplay = data.branch && data.branch !== 'main'
       ? `<span class="analysis-branch" title="Revision: ${escapeHtml(data.branch)}">
@@ -571,7 +561,7 @@
     // Initialize selectable items event handlers
     if (hasSelectableItems) {
       initSelectableItems();
-      updateCLICommandFromSelections();
+      updateDownloadSelectionFromSelections();
     }
   }
 
@@ -628,51 +618,6 @@
     }
   };
 
-  // Update the download command based on selected quantizations and advanced options
-  function updateDownloadCommand() {
-    const commandEl = $('#downloadCommand');
-    if (!commandEl || !currentAnalysis) return;
-
-    const selectedQuants = Array.from(document.querySelectorAll('#quantOptions input[type="checkbox"]:checked'))
-      .map(cb => cb.dataset.filter);
-
-    let cmd = `hfdesk ${currentAnalysis.repo}`;
-
-    // Add dataset flag
-    if (currentAnalysis.is_dataset) {
-      cmd += ' -d';
-    }
-
-    // Add revision if not main (from analysis)
-    if (currentAnalysis.branch && currentAnalysis.branch !== 'main') {
-      cmd += ` -b ${currentAnalysis.branch}`;
-    }
-
-    // Add filters - either from GGUF selection or advanced options
-    if (selectedQuants.length > 0 && selectedQuants.length < (currentAnalysis.gguf?.quantizations?.length || 0)) {
-      // Specific quant selection uses exact segment matching (github issue #78)
-      cmd += ` -f "${selectedQuants.join(',')}" --exact`;
-    } else if (advancedOptions.filter) {
-      cmd += ` -f "${advancedOptions.filter}"`;
-    }
-
-    // Add excludes
-    if (advancedOptions.exclude) {
-      cmd += ` -e "${advancedOptions.exclude}"`;
-    }
-
-    commandEl.textContent = cmd;
-  }
-
-  // Copy command to clipboard
-  window.copyCommand = function() {
-    const commandEl = $('#downloadCommand');
-    if (commandEl) {
-      navigator.clipboard.writeText(commandEl.textContent);
-      showToast('Command copied to clipboard', 'success');
-    }
-  };
-
   // Store advanced options (filter/exclude only - revision comes from analysis)
   let advancedOptions = {
     filter: '',
@@ -707,7 +652,6 @@
     advancedOptions.exclude = $('#advExclude')?.value || '';
 
     hideModal();
-    updateDownloadCommand();
     showToast('Options applied', 'success');
   };
 
@@ -2687,27 +2631,6 @@
   }
 
   /**
-   * Renders CLI command box with copy button.
-   */
-  function renderCLICommandBox(command, fullCommand) {
-    const displayCmd = fullCommand || command || 'hfdesk <repo>';
-
-    return `
-      <div class="cli-command-box">
-        <div class="cli-command-header">
-          <span class="cli-command-label">CLI Command</span>
-          <button class="btn btn-ghost btn-sm" onclick="copyCliCommand()" title="Copy to clipboard">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-            </svg>
-          </button>
-        </div>
-        <code class="cli-command-text" id="cliCommandText">${escapeHtml(displayCmd)}</code>
-      </div>
-    `;
-  }
-
-  /**
    * Renders related downloads section (e.g., base model for LoRA).
    */
   function renderRelatedDownloads(downloads) {
@@ -2749,52 +2672,13 @@
   };
 
   /**
-   * Copy CLI command to clipboard.
+   * Update file list based on selected download options.
    */
-  window.copyCliCommand = function() {
-    const cmdEl = $('#cliCommandText');
-    if (cmdEl) {
-      navigator.clipboard.writeText(cmdEl.textContent);
-      showToast('Command copied to clipboard', 'success');
-    }
-  };
-
-  /**
-   * Update CLI command and file list based on selections.
-   */
-  function updateCLICommandFromSelections() {
+  function updateDownloadSelectionFromSelections() {
     if (!currentAnalysis) return;
 
     const selectedItems = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'))
       .map(cb => cb.value);
-
-    let cmd = `hfdesk ${currentAnalysis.repo}`;
-
-    if (currentAnalysis.is_dataset) {
-      cmd += ' --dataset';
-    }
-
-    if (currentAnalysis.branch && currentAnalysis.branch !== 'main') {
-      cmd += ` -b ${currentAnalysis.branch}`;
-    }
-
-    // Add filter if selections differ from "all selected" or "recommended"
-    const totalItems = document.querySelectorAll('.selectable-items input[type="checkbox"]').length;
-    if (selectedItems.length > 0 && selectedItems.length < totalItems) {
-      cmd += ` -F ${selectedItems.join(',')}`;
-    }
-
-    // Add advanced options if set
-    if (advancedOptions.exclude) {
-      cmd += ` -e "${advancedOptions.exclude}"`;
-    }
-
-    const cmdEl = $('#cliCommandText');
-    if (cmdEl) cmdEl.textContent = cmd;
-
-    // Also update the legacy download command display
-    const legacyCmd = $('#downloadCommand');
-    if (legacyCmd) legacyCmd.textContent = cmd;
 
     // Update file list based on selections
     updateFileListFromSelections(selectedItems);
@@ -2885,7 +2769,7 @@
    */
   function initSelectableItems() {
     document.querySelectorAll('.selectable-items input[type="checkbox"]').forEach(cb => {
-      cb.addEventListener('change', updateCLICommandFromSelections);
+      cb.addEventListener('change', updateDownloadSelectionFromSelections);
     });
   }
 

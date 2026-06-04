@@ -5,7 +5,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,83 +15,6 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
-
-// DownloadRequest is the request body for starting a download.
-type DownloadRequest struct {
-	Repo               string   `json:"repo"`
-	Revision           string   `json:"revision,omitempty"`
-	Dataset            bool     `json:"dataset,omitempty"`
-	Filters            []string `json:"filters,omitempty"`
-	Excludes           []string `json:"excludes,omitempty"`
-	AppendFilterSubdir bool     `json:"appendFilterSubdir,omitempty"`
-	DryRun             bool     `json:"dryRun,omitempty"`
-	// ExactMatch matches filters against whole name segments instead of
-	// substrings, so "q6_k" selects Q6_K but not Q6_K_XL (github issue #78).
-	ExactMatch bool `json:"exactMatch,omitempty"`
-	// LocalDir overrides the download destination for this specific request,
-	// writing real files (flat mode) instead of the HF cache layout.
-	// When empty, the server-global LocalDir (if set) or HF cache is used.
-	LocalDir string `json:"localDir,omitempty"`
-}
-
-// PlanResponse is the response for a dry-run/plan request.
-type PlanResponse struct {
-	Repo       string     `json:"repo"`
-	Revision   string     `json:"revision"`
-	Files      []PlanFile `json:"files"`
-	TotalSize  int64      `json:"totalSize"`
-	TotalFiles int        `json:"totalFiles"`
-}
-
-// PlanFile represents a file in the plan.
-type PlanFile struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
-	LFS  bool   `json:"lfs"`
-}
-
-// SettingsResponse represents current settings.
-type SettingsResponse struct {
-	Token              string `json:"token,omitempty"`
-	CacheDir           string `json:"cacheDir"`
-	Concurrency        int    `json:"connections"`
-	MaxActive          int    `json:"maxActive"`
-	MultipartThreshold string `json:"multipartThreshold"`
-	Verify             string `json:"verify"`
-	Retries            int    `json:"retries"`
-	Endpoint           string `json:"endpoint,omitempty"`
-	// StorageMode is "local" when the server writes real files into LocalDir,
-	// or "cache" when it uses the HF cache layout. Set at startup, read-only.
-	StorageMode string `json:"storageMode"`
-	LocalDir    string `json:"localDir,omitempty"`
-	// Proxy settings
-	Proxy *ProxySettingsResponse `json:"proxy,omitempty"`
-	// Config file paths
-	ConfigFile  string `json:"configFile,omitempty"`
-	TargetsFile string `json:"targetsFile,omitempty"`
-}
-
-// ProxySettingsResponse represents proxy configuration in API responses.
-type ProxySettingsResponse struct {
-	URL                string `json:"url,omitempty"`
-	Username           string `json:"username,omitempty"`
-	NoProxy            string `json:"noProxy,omitempty"`
-	NoEnvProxy         bool   `json:"noEnvProxy,omitempty"`
-	InsecureSkipVerify bool   `json:"insecureSkipVerify,omitempty"`
-	// Note: Password is intentionally omitted from response for security
-}
-
-// ErrorResponse represents an API error.
-type ErrorResponse struct {
-	Error   string `json:"error"`
-	Details string `json:"details,omitempty"`
-}
-
-// SuccessResponse represents a simple success message.
-type SuccessResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
-}
 
 // --- Handlers ---
 
@@ -108,7 +30,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleStartDownload starts a new download job.
 func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -167,7 +89,7 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 // handlePlan returns a download plan without starting the download.
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -436,7 +358,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		// Note: ModelsDir and DatasetsDir are NOT updatable via API for security
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -529,21 +451,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: "Settings saved",
-	})
-}
-
-// --- Helpers ---
-
-func writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-func writeError(w http.ResponseWriter, status int, message, details string) {
-	writeJSON(w, status, ErrorResponse{
-		Error:   message,
-		Details: details,
 	})
 }
 
@@ -1180,7 +1087,7 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Clean bool `json:"clean"` // Remove orphaned symlinks
 	}
-	json.NewDecoder(r.Body).Decode(&req) // Ignore errors, use defaults
+	_ = readJSON(r, &req) // Ignore errors, use defaults
 
 	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
 

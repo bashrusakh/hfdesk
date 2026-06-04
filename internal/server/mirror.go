@@ -4,7 +4,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,7 +66,7 @@ func (s *Server) handleMirrorTargetsList(w http.ResponseWriter, r *http.Request)
 // handleMirrorTargetAdd adds a new mirror target.
 func (s *Server) handleMirrorTargetAdd(w http.ResponseWriter, r *http.Request) {
 	var req MirrorTargetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -169,7 +168,7 @@ type MirrorDiffEntry struct {
 // handleMirrorDiff compares local cache with a target.
 func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 	var req MirrorDiffRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -318,7 +317,7 @@ type MirrorSyncRequest struct {
 // handleMirrorPush pushes local repos to target.
 func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 	var req MirrorSyncRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
@@ -354,7 +353,7 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 // handleMirrorPull pulls repos from target to local.
 func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 	var req MirrorSyncRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}

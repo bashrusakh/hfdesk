@@ -420,12 +420,12 @@ func preferredMMProj(files []FileInfo) (FileInfo, string) {
 }
 
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
-// This provides a unified interface for the web UI and CLI.
+// This provides a unified interface for the web UI.
 //
 // When the repo contains mmproj vision-encoder files (multimodal models),
 // an additional SelectableItem with Category="vision_encoder" is emitted
 // for the preferred mmproj file. It is Recommended=true by default so that
-// the recommended download command auto-bundles the vision encoder
+// the recommended download selection auto-bundles the vision encoder
 // alongside any selected LLM quant.
 func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	if info == nil {

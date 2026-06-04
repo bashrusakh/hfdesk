@@ -61,14 +61,15 @@ docker run --rm -p 8080:8080 \
 ## Quick Start
 
 ```bash
-hfdesk --open
+hfdesk
 ```
 
-Without `--open`, start HFDesk and open [http://localhost:8080](http://localhost:8080).
+HFDesk opens [http://localhost:8080](http://localhost:8080) automatically.
 
 Useful options:
 
 ```bash
+hfdesk --no-open
 hfdesk --port 9090
 hfdesk --token hf_xxx
 hfdesk --cache-dir /mnt/ssd/huggingface
@@ -105,13 +106,17 @@ Proxy example:
 }
 ```
 
+## API
+
+HFDesk's web UI is backed by a local JSON API. See [docs/API.md](docs/API.md) for endpoints, request shapes, and response formats.
+
 ## Build
 
 ```bash
 git clone https://github.com/bashrusakh/hfdesk
 cd hfdesk
 go build -o hfdesk ./cmd/hfdesk
-./hfdesk --open
+./hfdesk
 ```
 
 Run tests:

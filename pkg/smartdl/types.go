@@ -29,10 +29,7 @@
 //	}
 package smartdl
 
-import (
-	"strings"
-	"time"
-)
+import "time"
 
 // RepoType identifies the type of HuggingFace repository.
 type RepoType string
@@ -204,11 +201,12 @@ type RepoInfo struct {
 	// For GGUF: quantizations, for Diffusers: components/variants, for Transformers: formats, etc.
 	SelectableItems []SelectableItem `json:"selectable_items,omitempty"`
 
-	// CLICommand is the base download command without filters.
-	CLICommand string `json:"cli_command,omitempty"`
+	// RecommendedFilters are the filter values for default/recommended items.
+	RecommendedFilters []string `json:"recommended_filters,omitempty"`
 
-	// CLICommandFull is the download command with recommended filters applied.
-	CLICommandFull string `json:"cli_command_full,omitempty"`
+	// RecommendedDownload is a ready-to-send request body for /api/download
+	// using the default/recommended items.
+	RecommendedDownload *DownloadSelection `json:"recommended_download,omitempty"`
 
 	// RelatedDownloads lists related repositories (e.g., base model for LoRA).
 	RelatedDownloads []RelatedDownload `json:"related_downloads,omitempty"`
@@ -568,46 +566,39 @@ type RelatedDownload struct {
 	SizeHuman string `json:"size_human,omitempty"`
 }
 
-// GenerateCLICommand generates the CLI download command for selected items.
-// If selectedFilters is empty, returns the base command without filters.
-func (r *RepoInfo) GenerateCLICommand(selectedFilters []string) string {
-	cmd := "hfdesk download " + r.Repo
-
-	if r.IsDataset {
-		cmd += " --dataset"
-	}
-
-	// Include revision/branch if specified and not "main"
-	if r.Branch != "" && r.Branch != "main" {
-		cmd += " -b " + r.Branch
-	}
-
-	if len(selectedFilters) > 0 {
-		cmd += " -F " + strings.Join(selectedFilters, ",")
-	}
-
-	return cmd
+// DownloadSelection is the web/API representation of a repo download choice.
+type DownloadSelection struct {
+	Repo       string   `json:"repo"`
+	Dataset    bool     `json:"dataset,omitempty"`
+	Revision   string   `json:"revision,omitempty"`
+	Filters    []string `json:"filters,omitempty"`
+	ExactMatch bool     `json:"exactMatch,omitempty"`
 }
 
-// GenerateRecommendedCommand generates the CLI command with recommended selections.
-func (r *RepoInfo) GenerateRecommendedCommand() string {
+// RecommendedFilterValues returns filters for recommended selectable items.
+func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
 		if item.Recommended {
 			recommended = append(recommended, item.FilterValue)
 		}
 	}
-	return r.GenerateCLICommand(recommended)
+	return recommended
 }
 
-// PopulateCLICommands sets the CLICommand and CLICommandFull fields.
-func (r *RepoInfo) PopulateCLICommands() {
-	r.CLICommand = r.GenerateCLICommand(nil)
-	r.CLICommandFull = r.GenerateRecommendedCommand()
-
-	// If no recommended items, full command equals base command
-	if r.CLICommandFull == r.CLICommand {
-		r.CLICommandFull = ""
+// PopulateDownloadSelection sets recommended download fields for the web UI.
+func (r *RepoInfo) PopulateDownloadSelection() {
+	r.RecommendedFilters = r.RecommendedFilterValues()
+	r.RecommendedDownload = &DownloadSelection{
+		Repo:    r.Repo,
+		Dataset: r.IsDataset,
+		Filters: r.RecommendedFilters,
+	}
+	if r.Branch != "" && r.Branch != "main" {
+		r.RecommendedDownload.Revision = r.Branch
+	}
+	if len(r.RecommendedFilters) == 0 {
+		r.RecommendedDownload = nil
 	}
 }
 

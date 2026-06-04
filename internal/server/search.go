@@ -112,7 +112,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, hfURL, nil)
 	if err != nil {
-		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "Failed to build upstream request", err.Error())
 		return
 	}
 	if s.config.Token != "" {
@@ -123,21 +123,21 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	httpClient, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
 	if err != nil {
 		log.Printf("search: invalid proxy config: %v", err)
-		http.Error(w, "invalid proxy configuration", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
 	}
 	httpClient.Timeout = 20 * time.Second
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("search: upstream error: %v", err)
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, "Upstream request failed", err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 4 MiB cap
 	if err != nil {
-		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, "Failed to read upstream response", err.Error())
 		return
 	}
 
@@ -150,7 +150,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	var raw []hfAPIModel
 	if err := json.Unmarshal(body, &raw); err != nil {
-		http.Error(w, "failed to parse upstream response", http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, "Failed to parse upstream response", err.Error())
 		return
 	}
 
@@ -205,7 +205,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	}
 	free, total, err := diskFreeBytes(path)
 	if err != nil {
-		http.Error(w, "could not stat disk: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -219,7 +219,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	entries, err := LoadHistory()
 	if err != nil {
-		http.Error(w, "failed to load history: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "Failed to load history", err.Error())
 		return
 	}
 	if entries == nil {

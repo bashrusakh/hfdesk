@@ -156,7 +156,7 @@ func TestGGUFToSelectableItems_EmitsVisionEncoderItem(t *testing.T) {
 		t.Errorf("FilterValue %q matched %v, want only [mmproj-F16.gguf]", pref.FilterValue, matches)
 	}
 
-	// It should also match the corresponding LLM quant filenames? No — the
+	// It should also match the corresponding LLM quant filenames? No - the
 	// mmproj filter should match ONLY the mmproj file, not leak into LLM
 	// quants. Spot-check with a representative LLM filename.
 	if strings.Contains(strings.ToLower("gemma-3-4b-it-Q4_K_M.gguf"), strings.ToLower(pref.FilterValue)) {
@@ -164,13 +164,13 @@ func TestGGUFToSelectableItems_EmitsVisionEncoderItem(t *testing.T) {
 	}
 }
 
-// TestRepoInfo_MultimodalRecommendedCommandBundlesMMProj exercises the full
-// analysis → SelectableItems → recommended CLI command pipeline for a real
-// multimodal GGUF repo and asserts the recommended download command includes
-// BOTH the LLM quant filter and the mmproj filter in a single -F list. This
-// is the end-to-end behavior users care about in issue #76: "when I select
-// the recommended download, mmproj comes along automatically."
-func TestRepoInfo_MultimodalRecommendedCommandBundlesMMProj(t *testing.T) {
+// TestRepoInfo_MultimodalRecommendedDownloadBundlesMMProj exercises the full
+// analysis -> SelectableItems -> recommended download selection pipeline for a
+// real multimodal GGUF repo and asserts the recommended filters include BOTH
+// the LLM quant filter and the mmproj filter. This is the end-to-end behavior
+// users care about in issue #76: "when I select the recommended download,
+// mmproj comes along automatically."
+func TestRepoInfo_MultimodalRecommendedDownloadBundlesMMProj(t *testing.T) {
 	info := &RepoInfo{
 		Repo:   "unsloth/gemma-3-4b-it-GGUF",
 		Type:   TypeGGUF,
@@ -179,23 +179,19 @@ func TestRepoInfo_MultimodalRecommendedCommandBundlesMMProj(t *testing.T) {
 	}
 	info.GGUF = analyzeGGUF(info.Files)
 	populateSelectableItems(info)
-	info.PopulateCLICommands()
+	info.PopulateDownloadSelection()
 
-	cmd := info.GenerateRecommendedCommand()
-	if cmd == "" {
-		t.Fatal("expected a non-empty recommended command")
+	if info.RecommendedDownload == nil {
+		t.Fatal("expected a recommended download")
 	}
+	filters := strings.Join(info.RecommendedDownload.Filters, ",")
 	// The recommended LLM default is Q4_K_M.
-	if !strings.Contains(cmd, "q4_k_m") {
-		t.Errorf("recommended command missing q4_k_m filter: %s", cmd)
+	if !strings.Contains(filters, "q4_k_m") {
+		t.Errorf("recommended download missing q4_k_m filter: %v", info.RecommendedDownload.Filters)
 	}
 	// The recommended mmproj must also be present and narrow (f16, not bf16/f32).
-	if !strings.Contains(cmd, "mmproj-f16") {
-		t.Errorf("recommended command missing mmproj-f16 filter: %s", cmd)
-	}
-	// Both should appear in a single -F ... list.
-	if !strings.Contains(cmd, "-F ") {
-		t.Errorf("expected -F flag in recommended command: %s", cmd)
+	if !strings.Contains(filters, "mmproj-f16") {
+		t.Errorf("recommended download missing mmproj-f16 filter: %v", info.RecommendedDownload.Filters)
 	}
 }
 

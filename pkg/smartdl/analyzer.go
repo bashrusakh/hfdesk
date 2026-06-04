@@ -131,8 +131,8 @@ func (a *Analyzer) AnalyzeWithRevision(ctx context.Context, repo string, isDatas
 	// Populate SelectableItems based on type
 	populateSelectableItems(info)
 
-	// Generate CLI commands
-	info.PopulateCLICommands()
+	// Populate web/API download defaults.
+	info.PopulateDownloadSelection()
 
 	return info, nil
 }

@@ -65,65 +65,7 @@ func TestRepoType_Description(t *testing.T) {
 	}
 }
 
-func TestRepoInfo_GenerateCLICommand(t *testing.T) {
-	t.Run("basic model", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo"}
-		cmd := info.GenerateCLICommand(nil)
-		if cmd != "hfdesk download owner/repo" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-
-	t.Run("dataset", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo", IsDataset: true}
-		cmd := info.GenerateCLICommand(nil)
-		if cmd != "hfdesk download owner/repo --dataset" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-
-	t.Run("with branch", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo", Branch: "dev"}
-		cmd := info.GenerateCLICommand(nil)
-		if cmd != "hfdesk download owner/repo -b dev" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-
-	t.Run("main branch omitted", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo", Branch: "main"}
-		cmd := info.GenerateCLICommand(nil)
-		if cmd != "hfdesk download owner/repo" {
-			t.Errorf("cmd = %q, branch 'main' should be omitted", cmd)
-		}
-	})
-
-	t.Run("with filters", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo"}
-		cmd := info.GenerateCLICommand([]string{"q4_k_m"})
-		if cmd != "hfdesk download owner/repo -F q4_k_m" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-
-	t.Run("with multiple filters", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/repo"}
-		cmd := info.GenerateCLICommand([]string{"q4_k_m", "q5_k_m"})
-		if cmd != "hfdesk download owner/repo -F q4_k_m,q5_k_m" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-
-	t.Run("dataset with branch and filters", func(t *testing.T) {
-		info := &RepoInfo{Repo: "owner/dataset", IsDataset: true, Branch: "v2"}
-		cmd := info.GenerateCLICommand([]string{"train"})
-		if cmd != "hfdesk download owner/dataset --dataset -b v2 -F train" {
-			t.Errorf("cmd = %q", cmd)
-		}
-	})
-}
-
-func TestRepoInfo_GenerateRecommendedCommand(t *testing.T) {
+func TestRepoInfo_RecommendedFilterValues(t *testing.T) {
 	info := &RepoInfo{
 		Repo: "owner/repo",
 		SelectableItems: []SelectableItem{
@@ -133,28 +75,32 @@ func TestRepoInfo_GenerateRecommendedCommand(t *testing.T) {
 		},
 	}
 
-	cmd := info.GenerateRecommendedCommand()
-	// Should include both recommended filters
-	if cmd != "hfdesk download owner/repo -F q4_k_m,q5_k_m" {
-		t.Errorf("cmd = %q", cmd)
+	filters := info.RecommendedFilterValues()
+	if len(filters) != 2 || filters[0] != "q4_k_m" || filters[1] != "q5_k_m" {
+		t.Errorf("RecommendedFilterValues() = %v", filters)
 	}
 }
 
-func TestRepoInfo_PopulateCLICommands(t *testing.T) {
+func TestRepoInfo_PopulateDownloadSelection(t *testing.T) {
 	t.Run("with recommended items", func(t *testing.T) {
 		info := &RepoInfo{
-			Repo: "owner/repo",
+			Repo:      "owner/repo",
+			IsDataset: true,
+			Branch:    "dev",
 			SelectableItems: []SelectableItem{
 				{ID: "q4_k_m", FilterValue: "q4_k_m", Recommended: true},
 			},
 		}
-		info.PopulateCLICommands()
+		info.PopulateDownloadSelection()
 
-		if info.CLICommand != "hfdesk download owner/repo" {
-			t.Errorf("CLICommand = %q", info.CLICommand)
+		if len(info.RecommendedFilters) != 1 || info.RecommendedFilters[0] != "q4_k_m" {
+			t.Errorf("RecommendedFilters = %v", info.RecommendedFilters)
 		}
-		if info.CLICommandFull != "hfdesk download owner/repo -F q4_k_m" {
-			t.Errorf("CLICommandFull = %q", info.CLICommandFull)
+		if info.RecommendedDownload == nil {
+			t.Fatal("RecommendedDownload is nil")
+		}
+		if info.RecommendedDownload.Repo != "owner/repo" || !info.RecommendedDownload.Dataset || info.RecommendedDownload.Revision != "dev" {
+			t.Errorf("RecommendedDownload = %+v", info.RecommendedDownload)
 		}
 	})
 
@@ -165,14 +111,13 @@ func TestRepoInfo_PopulateCLICommands(t *testing.T) {
 				{ID: "q4_k_m", FilterValue: "q4_k_m", Recommended: false},
 			},
 		}
-		info.PopulateCLICommands()
+		info.PopulateDownloadSelection()
 
-		if info.CLICommand != "hfdesk download owner/repo" {
-			t.Errorf("CLICommand = %q", info.CLICommand)
+		if len(info.RecommendedFilters) != 0 {
+			t.Errorf("RecommendedFilters = %v, want empty", info.RecommendedFilters)
 		}
-		// CLICommandFull should be empty when same as CLICommand
-		if info.CLICommandFull != "" {
-			t.Errorf("CLICommandFull = %q, want empty", info.CLICommandFull)
+		if info.RecommendedDownload != nil {
+			t.Errorf("RecommendedDownload = %+v, want nil", info.RecommendedDownload)
 		}
 	})
 }

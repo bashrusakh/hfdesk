@@ -27,13 +27,15 @@ func main() {
 		token    string
 		localDir string
 		openUI   bool
+		noOpen   bool
 	)
 
 	flag.IntVar(&port, "port", 8080, "HTTP port")
 	flag.StringVar(&cacheDir, "cache-dir", "", "Hugging Face cache directory")
 	flag.StringVar(&token, "token", "", "Hugging Face token")
 	flag.StringVar(&localDir, "local-dir", "", "write real files into this directory instead of the HF cache layout")
-	flag.BoolVar(&openUI, "open", false, "open the web UI in the default browser")
+	flag.BoolVar(&openUI, "open", true, "open the web UI in the default browser")
+	flag.BoolVar(&noOpen, "no-open", false, "do not open the web UI automatically")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "HFDesk %s\n\nUsage: hfdesk [options]\n\nOptions:\n", Version)
 		flag.PrintDefaults()
@@ -52,7 +54,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if openUI {
+	if openUI && !noOpen {
 		go openBrowser(fmt.Sprintf("http://localhost:%d", cfg.Port))
 	}
 
