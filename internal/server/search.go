@@ -120,8 +120,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("User-Agent", "hfdesk/1")
 
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
+	httpClient, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
+	if err != nil {
+		log.Printf("search: invalid proxy config: %v", err)
+		http.Error(w, "invalid proxy configuration", http.StatusInternalServerError)
+		return
+	}
+	httpClient.Timeout = 20 * time.Second
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("search: upstream error: %v", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)

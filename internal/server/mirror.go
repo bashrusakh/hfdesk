@@ -6,6 +6,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -643,19 +644,30 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 	})
 }
 
-// copyFileForMirror copies a single file.
+// copyFileForMirror copies a single file using streaming I/O to avoid
+// loading the entire file into memory (model files can be tens of GB).
 func copyFileForMirror(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(dst, data, info.Mode())
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // verifyRepoCache verifies that a copied repo matches the source.
