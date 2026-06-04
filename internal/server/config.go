@@ -66,13 +66,13 @@ var configMu sync.Mutex
 
 // ConfigPath returns the path to the config file.
 // Search order: RunDir() first (local to the run folder), then ~/.config/.
-// This way a project-local hfdownloader.json takes precedence over the
+// This way a project-local hfdesk.json takes precedence over the
 // user-wide one, and new saves go to the run folder by default.
 func ConfigPath() string {
 	runDir := RunDir()
 
 	// 1. Check run directory
-	for _, name := range []string{"hfdownloader.json", "hfdownloader.yaml", "hfdownloader.yml"} {
+	for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
 		p := filepath.Join(runDir, name)
 		if _, err := os.Stat(p); err == nil {
 			return p
@@ -82,7 +82,7 @@ func ConfigPath() string {
 	// 2. Check ~/.config
 	if home, err := os.UserHomeDir(); err == nil {
 		configDir := filepath.Join(home, ".config")
-		for _, name := range []string{"hfdownloader.json", "hfdownloader.yaml", "hfdownloader.yml"} {
+		for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
 			p := filepath.Join(configDir, name)
 			if _, err := os.Stat(p); err == nil {
 				return p
@@ -91,7 +91,7 @@ func ConfigPath() string {
 	}
 
 	// 3. Default: new file in run directory
-	return filepath.Join(runDir, "hfdownloader.json")
+	return filepath.Join(runDir, "hfdesk.json")
 }
 
 // LoadConfigFile loads configuration from the config file.

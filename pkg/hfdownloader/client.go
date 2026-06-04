@@ -64,7 +64,7 @@ func addAuth(req *http.Request, token string) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	req.Header.Set("User-Agent", "hfdownloader/2")
+	req.Header.Set("User-Agent", "hfdesk/1")
 }
 
 // quickHeadAcceptRanges checks if a URL supports range requests.

@@ -571,7 +571,7 @@ type RelatedDownload struct {
 // GenerateCLICommand generates the CLI download command for selected items.
 // If selectedFilters is empty, returns the base command without filters.
 func (r *RepoInfo) GenerateCLICommand(selectedFilters []string) string {
-	cmd := "hfdownloader download " + r.Repo
+	cmd := "hfdesk download " + r.Repo
 
 	if r.IsDataset {
 		cmd += " --dataset"

@@ -74,8 +74,8 @@ func (c *TargetsConfig) Save(path string) error {
 		return fmt.Errorf("marshal targets: %w", err)
 	}
 
-	header := "# HFDownloader Mirror Targets\n"
-	header += "# Configure with: hfdownloader mirror target add <name> <path>\n\n"
+	header := "# HFDesk Mirror Targets\n"
+	header += "# Configure via the HFDesk web UI (Mirror tab) or the API\n\n"
 	content := header + string(data)
 
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

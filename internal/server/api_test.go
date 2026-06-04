@@ -17,7 +17,7 @@ var testCacheDir string
 
 func newTestServer() *Server {
 	if testCacheDir == "" {
-		testCacheDir = "/tmp/hfdownloader_test_cache"
+		testCacheDir = "/tmp/hfdesk_test_cache"
 	}
 	cfg := Config{
 		Addr:        "127.0.0.1",

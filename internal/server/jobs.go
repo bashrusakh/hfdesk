@@ -516,7 +516,7 @@ func (m *JobManager) runJob(job *Job) {
 	m.mu.Unlock()
 	m.notifyListeners(startSnap)
 
-	// Create hfdownloader job and settings
+	// Create download job and settings
 	dlJob := hfdownloader.Job{
 		Repo:               job.Repo,
 		Revision:           job.Revision,
