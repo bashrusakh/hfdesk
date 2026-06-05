@@ -134,6 +134,9 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	if resp.Repos[0].Repo != "Abiray/Qwen3-Coder-Next-GGUF" || resp.Repos[0].Source != "Local" {
 		t.Fatalf("unexpected repo: %#v", resp.Repos[0])
 	}
+	if len(resp.Repos[0].Quantizations) != 1 || resp.Repos[0].Quantizations[0] != "Q3_K_XL" {
+		t.Fatalf("Quantizations = %#v, want [Q3_K_XL]", resp.Repos[0].Quantizations)
+	}
 }
 
 func TestAPI_GetSettings(t *testing.T) {

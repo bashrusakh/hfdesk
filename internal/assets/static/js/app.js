@@ -1374,6 +1374,7 @@
     } else if (repo.manifest) {
       statusBadge = '<span class="cache-badge cache-badge-manifest" title="Has manifest file">Tracked</span>';
     }
+    const quantSubtitle = renderCacheQuantSubtitle(repo);
 
     return `
       <div class="cache-card" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
@@ -1387,6 +1388,7 @@
         <div class="cache-card-body">
           <div class="cache-card-owner">${escapeHtml(repo.owner)}</div>
           <div class="cache-card-name">${escapeHtml(repo.name)}</div>
+          ${quantSubtitle}
         </div>
         <div class="cache-card-meta">
           <div class="cache-card-stat">
@@ -1435,6 +1437,7 @@
     } else if (repo.manifest) {
       statusBadge = '<span class="cache-badge cache-badge-manifest">Tracked</span>';
     }
+    const quantSubtitle = renderCacheQuantSubtitle(repo);
 
     return `
       <div class="cache-table-row" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
@@ -1446,6 +1449,7 @@
         </div>
         <div class="cache-col-repo">
           <span class="cache-repo-name">${escapeHtml(repo.repo)}</span>
+          ${quantSubtitle}
           ${statusBadge}
         </div>
         <div class="cache-col-source">${sourceBadge}</div>
@@ -1461,6 +1465,14 @@
         </div>
       </div>
     `;
+  }
+
+  function renderCacheQuantSubtitle(repo) {
+    const quants = repo.quantizations || [];
+    if (!quants.length) return '';
+    const shown = quants.slice(0, 8).join(', ');
+    const more = quants.length > 8 ? ` +${quants.length - 8}` : '';
+    return `<div class="cache-quant-subtitle" title="${escapeHtml(quants.join(', '))}">${escapeHtml(shown + more)}</div>`;
   }
 
   window.showCacheDetails = async function(repo, type) {

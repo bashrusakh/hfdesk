@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -541,6 +543,7 @@ type CachedRepoInfo struct {
 	Files          []CachedFileInfo  `json:"files,omitempty"`
 	Manifest       *ManifestInfo     `json:"manifest,omitempty"`
 	Source         string            `json:"source,omitempty"` // "HF cache", "Friendly view", "Local"
+	Quantizations  []string          `json:"quantizations,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -640,6 +643,35 @@ func hasLocalWeightFile(dir string) bool {
 	return found
 }
 
+var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|F(?:16|32)|BF16)`)
+
+func cacheQuantLabel(name string) string {
+	if m := cacheQuantPattern.FindStringSubmatch(strings.ToUpper(name)); len(m) >= 3 {
+		if m[1] != "" {
+			return "UD_" + strings.ToUpper(m[2])
+		}
+		return strings.ToUpper(m[2])
+	}
+	return ""
+}
+
+func collectCacheQuantizations(dir string) []string {
+	seen := make(map[string]bool)
+	var quantizations []string
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
+			return nil
+		}
+		if q := cacheQuantLabel(info.Name()); q != "" && !seen[q] {
+			seen[q] = true
+			quantizations = append(quantizations, q)
+		}
+		return nil
+	})
+	sort.Strings(quantizations)
+	return quantizations
+}
+
 func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
 	var totalSize int64
 	var fileCount int
@@ -685,6 +717,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	if !newest.IsZero() {
 		downloaded = newest.Format("2006-01-02")
 	}
+	quantizations := collectCacheQuantizations(repoDir)
 
 	return &CachedRepoInfo{
 		Repo:           owner + "/" + name,
@@ -699,6 +732,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 		DownloadStatus: "unknown",
 		Files:          files,
 		Source:         source,
+		Quantizations:  quantizations,
 	}, nil
 }
 
@@ -903,6 +937,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			DownloadStatus: downloadStatus,
 			Manifest:       manifest,
 			Source:         "HF cache",
+			Quantizations:  collectCacheQuantizations(friendlyPath),
 		}
 		repos = append(repos, repo)
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
@@ -1098,6 +1133,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		Files:          files,
 		Manifest:       manifest,
 		Source:         "HF cache",
+		Quantizations:  collectCacheQuantizations(friendlyPath),
 	}
 
 	writeJSON(w, http.StatusOK, info)

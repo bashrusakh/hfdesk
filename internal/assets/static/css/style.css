@@ -1688,6 +1688,17 @@ a {
   word-break: break-word;
 }
 
+.cache-quant-subtitle {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cache-card-meta {
   display: flex;
   gap: 16px;
@@ -1778,6 +1789,10 @@ a {
 .cache-repo-name {
   font-weight: 500;
   margin-right: 8px;
+}
+
+.cache-col-repo .cache-quant-subtitle {
+  max-width: 100%;
 }
 
 .cache-col-size,
