@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.7] - 2026-06-05
+
+### Fixed
+
+- GitHub Release descriptions now use the matching section from `CHANGELOG.md`.
+
 ## [1.0.6] - 2026-06-05
 
 ### Fixed

@@ -52,6 +52,18 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Extract release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          awk -v version="$VERSION" '
+            /^## \[/ && index($0, "## [" version "]") == 1 { in_section=1; print; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            printf 'See CHANGELOG.md for release notes.\n' > release-notes.md
+          fi
+
       - name: Build binary
         env:
           GOOS: ${{ matrix.os }}
@@ -66,6 +78,7 @@ jobs:
       - name: Upload raw binary
         uses: softprops/action-gh-release@v3
         with:
+          body_path: release-notes.md
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
 
   checksums:
