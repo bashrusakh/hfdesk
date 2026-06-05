@@ -1,0 +1,36 @@
+# Reference label set for repository setup.
+# Apply these in GitHub manually, with a label-sync tool, or through the GitHub API.
+- name: bug
+  color: d73a4a
+  description: Something is not working.
+- name: needs-info
+  color: d876e3
+  description: More information is needed from the reporter.
+- name: confirmed
+  color: 0e8a16
+  description: The issue has enough evidence to act on.
+- name: duplicate
+  color: cfd3d7
+  description: This issue or pull request already exists.
+- name: priority-low
+  color: c5def5
+  description: Low priority work.
+- name: priority-medium
+  color: fbca04
+  description: Medium priority work.
+- name: priority-high
+  color: b60205
+  description: High priority or release-blocking work.
+- name: codex-review
+  color: 5319e7
+  description: Include this item in Codex triage.
+- name: approved-for-fix
+  color: 1d76db
+  description: Owner approved Codex or a maintainer to prepare a fix.
+- name: codex-fixing
+  color: 0052cc
+  description: Codex is actively preparing a fix.
+- name: ready-for-human-review
+  color: 0e8a16
+  description: A prepared change is ready for owner review.
+
