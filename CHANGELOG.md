@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.2] - 2026-06-05
+
+### Added
+
+- Default download layout setting: choose HF cache layout or local `owner/model` folders for LM Studio-style storage.
+- Extra local model folders in Settings for scan-only cache discovery.
+- Local cache rows now show downloaded GGUF quantization types.
+- Sticky `Download selected` action above selectable quantization lists.
+
+### Fixed
+
+- Removed the duplicate read-only HuggingFace cache directory field from Settings.
+- Fixed Storage card overflow when Local files layout is selected.
+- Preserved `UD_` quantization labels such as `UD_Q3_K_XL`.
+- Improved model search clear button visibility and default model-list column width.
+
 ## [1.0.1] - 2026-06-04
 
 ### Fixed
