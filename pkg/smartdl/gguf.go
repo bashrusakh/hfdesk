@@ -73,6 +73,16 @@ var quantQuality = map[string]int{
 
 	// Other native GGUF formats
 	"MXFP4_MOE": 4,
+
+	// APEX MoE-aware mixed precision quantization profiles
+	"APEX_QUALITY":    5,
+	"APEX_I_QUALITY":  5,
+	"APEX_BALANCED":   4,
+	"APEX_I_BALANCED": 4,
+	"APEX_COMPACT":    3,
+	"APEX_I_COMPACT":  3,
+	"APEX_MINI":       2,
+	"APEX_I_MINI":     2,
 }
 
 // quantDescriptions provides human-readable descriptions for quantization levels.
@@ -132,6 +142,16 @@ var quantDescriptions = map[string]string{
 
 	// Other native GGUF formats
 	"MXFP4_MOE": "MXFP4 MoE quantization",
+
+	// APEX MoE-aware mixed precision quantization profiles
+	"APEX_QUALITY":    "APEX Quality profile",
+	"APEX_I_QUALITY":  "APEX importance-matrix Quality profile",
+	"APEX_BALANCED":   "APEX Balanced profile",
+	"APEX_I_BALANCED": "APEX importance-matrix Balanced profile",
+	"APEX_COMPACT":    "APEX Compact profile",
+	"APEX_I_COMPACT":  "APEX importance-matrix Compact profile",
+	"APEX_MINI":       "APEX Mini profile",
+	"APEX_I_MINI":     "APEX importance-matrix Mini profile",
 }
 
 // Regex patterns for parsing GGUF filenames.
@@ -142,11 +162,12 @@ var quantDescriptions = map[string]string{
 //   - Q2..Q8 with legacy _0/_1 suffixes, plain _K, or _K with
 //     S/M/L/XL/XXL suffixes (XL/XXL are unsloth "Unsloth Dynamic" quants)
 //   - F16/F32/BF16 float precisions
+//   - MXFP4_MOE and APEX profile-style GGUF quantizations
 //
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|MXFP4_MOE|F(?:16|32)|BF16)`)
+	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -182,7 +203,7 @@ func ggufQuantType(f FileInfo) string {
 			continue
 		}
 		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
-			quant := strings.ToUpper(m[2])
+			quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
 			if m[1] != "" {
 				return "UD_" + quant
 			}
@@ -480,6 +501,9 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		// name matches the whole set. For "Unknown" groups the name won't match
 		// any filename, so use the shared base of the files instead.
 		filterValue := strings.ToLower(strings.TrimPrefix(q.Name, "UD_"))
+		if strings.HasPrefix(q.Name, "APEX_") {
+			filterValue = strings.ToLower(strings.ReplaceAll(q.Name, "_", "-"))
+		}
 		if q.Name == "Unknown" {
 			filterValue = strings.ToLower(stripSplitSuffix(filepath.Base(q.File.Name)))
 		}

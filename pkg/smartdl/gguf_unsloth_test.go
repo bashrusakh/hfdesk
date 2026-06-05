@@ -169,6 +169,75 @@ func TestAnalyzeGGUF_SortsLeastCompressedFirst(t *testing.T) {
 	}
 }
 
+func TestQuantPattern_APEXProfiles(t *testing.T) {
+	tests := []struct {
+		file string
+		want string
+	}{
+		{"Qwen3-Coder-Next-APEX-Balanced.gguf", "APEX_BALANCED"},
+		{"Qwen3-Coder-Next-APEX-Compact.gguf", "APEX_COMPACT"},
+		{"Qwen3-Coder-Next-APEX-Mini.gguf", "APEX_MINI"},
+		{"Qwen3-Coder-Next-APEX-Quality.gguf", "APEX_QUALITY"},
+		{"Qwen3-Coder-Next-APEX-I-Balanced.gguf", "APEX_I_BALANCED"},
+		{"Qwen3-Coder-Next-APEX-I-Compact.gguf", "APEX_I_COMPACT"},
+		{"Qwen3-Coder-Next-APEX-I-Mini.gguf", "APEX_I_MINI"},
+		{"Qwen3-Coder-Next-APEX-I-Quality.gguf", "APEX_I_QUALITY"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			got := ggufQuantType(FileInfo{Name: tt.file, Path: tt.file})
+			if got != tt.want {
+				t.Errorf("ggufQuantType(%q) = %q, want %q", tt.file, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzeGGUF_APEXRepoCoverage(t *testing.T) {
+	ggufNames := []string{
+		"Qwen3-Coder-Next-APEX-Balanced.gguf",
+		"Qwen3-Coder-Next-APEX-Compact.gguf",
+		"Qwen3-Coder-Next-APEX-I-Balanced.gguf",
+		"Qwen3-Coder-Next-APEX-I-Compact.gguf",
+		"Qwen3-Coder-Next-APEX-I-Mini.gguf",
+		"Qwen3-Coder-Next-APEX-I-Quality.gguf",
+		"Qwen3-Coder-Next-APEX-Quality.gguf",
+	}
+	files := make([]FileInfo, 0, len(ggufNames))
+	for i, n := range ggufNames {
+		files = append(files, FileInfo{Name: n, Path: n, Size: int64(1_000_000_000 + i)})
+	}
+
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	if got, want := len(info.Quantizations), len(ggufNames); got != want {
+		t.Fatalf("got %d quantizations, want %d: %#v", got, want, info.Quantizations)
+	}
+	for _, q := range info.Quantizations {
+		if q.Name == "Unknown" {
+			t.Fatalf("got Unknown in APEX repo coverage: %#v", info.Quantizations)
+		}
+	}
+
+	items := GGUFToSelectableItems(info)
+	var quality *SelectableItem
+	for i := range items {
+		if items[i].Label == "APEX_I_QUALITY" {
+			quality = &items[i]
+			break
+		}
+	}
+	if quality == nil {
+		t.Fatalf("APEX_I_QUALITY selectable item not found: %#v", items)
+	}
+	if quality.FilterValue != "apex-i-quality" {
+		t.Fatalf("FilterValue = %q, want apex-i-quality", quality.FilterValue)
+	}
+}
+
 func TestAnalyzeGGUF_UnslothSplitKeepsUDLabel(t *testing.T) {
 	files := []FileInfo{
 		{

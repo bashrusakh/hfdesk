@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.6] - 2026-06-05
+
+### Fixed
+
+- Recognize APEX GGUF quantization profiles (`APEX_*`, `APEX_I_*`) instead of showing them as `Unknown`.
+- Keep exact download matching working for hyphenated APEX profile filenames.
+
 ## [1.0.5] - 2026-06-05
 
 ### Removed

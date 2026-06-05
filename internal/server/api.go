@@ -643,14 +643,15 @@ func hasLocalWeightFile(dir string) bool {
 	return found
 }
 
-var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|MXFP4_MOE|F(?:16|32)|BF16)`)
+var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
 
 func cacheQuantLabel(name string) string {
 	if m := cacheQuantPattern.FindStringSubmatch(strings.ToUpper(name)); len(m) >= 3 {
+		quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
 		if m[1] != "" {
-			return "UD_" + strings.ToUpper(m[2])
+			return "UD_" + quant
 		}
-		return strings.ToUpper(m[2])
+		return quant
 	}
 	return ""
 }

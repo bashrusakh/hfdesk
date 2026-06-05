@@ -167,6 +167,23 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 			return true
 		}
 	}
+	if strings.Contains(fLower, "-") || strings.Contains(fLower, ".") || strings.Contains(fLower, " ") {
+		start := 0
+		for {
+			idx := strings.Index(nameLower[start:], fLower)
+			if idx < 0 {
+				break
+			}
+			idx += start
+			beforeOK := idx == 0 || isFilterDelimiter(rune(nameLower[idx-1]))
+			afterIdx := idx + len(fLower)
+			afterOK := afterIdx == len(nameLower) || isFilterDelimiter(rune(nameLower[afterIdx]))
+			if beforeOK && afterOK {
+				return true
+			}
+			start = idx + 1
+		}
+	}
 	return false
 }
 
@@ -212,4 +229,3 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 func Run(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
 	return Download(ctx, job, cfg, progress)
 }
-

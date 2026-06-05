@@ -39,6 +39,12 @@ func TestFilterMatches(t *testing.T) {
 		// Split files: the quant is still a whole segment.
 		{"qwen3-q6_k-00001-of-00002.gguf", "q6_k", true, true},
 
+		// APEX profile names use hyphenated multi-segment labels in filenames.
+		{"qwen3-coder-next-apex-i-quality.gguf", "apex-i-quality", true, true},
+		{"qwen3-coder-next-apex-quality.gguf", "apex-i-quality", true, false},
+		{"qwen3-coder-next-apex-quality.gguf", "apex-quality", true, true},
+		{"qwen3-coder-next-apex-i-quality.gguf", "apex-quality", true, false},
+
 		// The one coarse-prefix case exact mode intentionally drops.
 		{"qwen3-30b-a3b-q4_k_m.gguf", "q4", true, false},
 		{"qwen3-30b-a3b-q4_k_m.gguf", "q4", false, true},
