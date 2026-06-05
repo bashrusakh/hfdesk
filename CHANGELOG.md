@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.3] - 2026-06-05
+
+### Fixed
+
+- Release packaging now runs on pushed `v*` tags, so new binaries include the latest UI fixes.
+
 ## [1.0.2] - 2026-06-05
 
 ### Added
