@@ -47,6 +47,7 @@ func TestQuantPattern_UnslothDynamic(t *testing.T) {
 		{"Qwen3-30B-A3B-Q6_K.gguf", "Q6_K"},
 		{"Qwen3-30B-A3B-IQ4_NL.gguf", "IQ4_NL"},
 		{"Qwen3-30B-A3B-IQ4_XS.gguf", "IQ4_XS"},
+		{"Qwen3-Coder-Next-MXFP4_MOE.gguf", "MXFP4_MOE"},
 	}
 
 	for _, tt := range tests {
@@ -92,6 +93,7 @@ func TestAnalyzeGGUF_UnslothRepoCoverage(t *testing.T) {
 		"Qwen3-30B-A3B-UD-Q5_K_XL.gguf",
 		"Qwen3-30B-A3B-UD-Q6_K_XL.gguf",
 		"Qwen3-30B-A3B-UD-Q8_K_XL.gguf",
+		"Qwen3-Coder-Next-MXFP4_MOE.gguf",
 	}
 	files := make([]FileInfo, 0, len(ggufNames))
 	for i, n := range ggufNames {
@@ -126,6 +128,7 @@ func TestAnalyzeGGUF_UnslothRepoCoverage(t *testing.T) {
 	wantPresent := []string{
 		"UD_Q2_K_XL", "UD_Q3_K_XL", "UD_Q4_K_XL", "UD_Q5_K_XL", "UD_Q6_K_XL", "UD_Q8_K_XL",
 		"UD_IQ1_S", "UD_IQ1_M",
+		"MXFP4_MOE",
 	}
 	for _, w := range wantPresent {
 		if labels[w] == 0 {
@@ -138,6 +141,30 @@ func TestAnalyzeGGUF_UnslothRepoCoverage(t *testing.T) {
 	for _, plain := range []string{"Q2_K", "Q6_K"} {
 		if labels[plain] != 1 {
 			t.Errorf("expected exactly one %q entry, got %d; labels=%v", plain, labels[plain], labels)
+		}
+	}
+}
+
+func TestAnalyzeGGUF_SortsLeastCompressedFirst(t *testing.T) {
+	files := []FileInfo{
+		{Name: "model-Q2_K.gguf", Path: "model-Q2_K.gguf", Size: 20},
+		{Name: "model-Q8_0.gguf", Path: "model-Q8_0.gguf", Size: 80},
+		{Name: "model-Q4_K_M.gguf", Path: "model-Q4_K_M.gguf", Size: 40},
+	}
+
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	got := []string{
+		info.Quantizations[0].Name,
+		info.Quantizations[1].Name,
+		info.Quantizations[2].Name,
+	}
+	want := []string{"Q8_0", "Q4_K_M", "Q2_K"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %#v, want %#v", got, want)
 		}
 	}
 }

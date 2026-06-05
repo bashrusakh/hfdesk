@@ -70,6 +70,9 @@ var quantQuality = map[string]int{
 	"F16":  5,
 	"F32":  5,
 	"BF16": 5,
+
+	// Other native GGUF formats
+	"MXFP4_MOE": 4,
 }
 
 // quantDescriptions provides human-readable descriptions for quantization levels.
@@ -126,6 +129,9 @@ var quantDescriptions = map[string]string{
 	"F16":  "Half precision, full quality",
 	"F32":  "Full precision, original quality",
 	"BF16": "Brain float 16, full quality",
+
+	// Other native GGUF formats
+	"MXFP4_MOE": "MXFP4 MoE quantization",
 }
 
 // Regex patterns for parsing GGUF filenames.
@@ -140,7 +146,7 @@ var quantDescriptions = map[string]string{
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|F(?:16|32)|BF16)`)
+	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|MXFP4_MOE|F(?:16|32)|BF16)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -275,12 +281,13 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 		}
 	}
 
-	// Sort by quality (descending) then by size (ascending)
+	// Sort with the least-compressed / largest variants first so the list reads
+	// from full precision and heavier quants down toward smaller files.
 	sort.Slice(info.Quantizations, func(i, j int) bool {
-		if info.Quantizations[i].Quality != info.Quantizations[j].Quality {
-			return info.Quantizations[i].Quality > info.Quantizations[j].Quality
+		if info.Quantizations[i].File.Size != info.Quantizations[j].File.Size {
+			return info.Quantizations[i].File.Size > info.Quantizations[j].File.Size
 		}
-		return info.Quantizations[i].File.Size < info.Quantizations[j].File.Size
+		return info.Quantizations[i].Name < info.Quantizations[j].Name
 	})
 
 	return info

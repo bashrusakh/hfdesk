@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.4] - 2026-06-05
+
+### Fixed
+
+- Recognize `MXFP4_MOE` GGUF files instead of showing them as `Unknown`.
+- Sort GGUF quantization choices from least-compressed/largest to most-compressed/smallest.
+
 ## [1.0.3] - 2026-06-05
 
 ### Fixed
