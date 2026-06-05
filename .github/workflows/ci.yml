@@ -24,12 +24,12 @@ jobs:
           cache: true
       - name: Verify formatting
         run: |
-        files="$(gofmt -l .)"
-        if [ -n "$files" ]; then
-        echo "The following Go files are not gofmt-formatted:"
-        echo "$files"
-        exit 1
-      fi
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "The following Go files are not gofmt-formatted:"
+            echo "$files"
+            exit 1
+          fi
 
       - name: Test
         run: go test ./...
