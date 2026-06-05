@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.5] - 2026-06-05
+
+### Removed
+
+- Removed the obsolete multi-select download toolbar from analyzed model results.
+
 ## [1.0.4] - 2026-06-05
 
 ### Fixed

@@ -531,16 +531,6 @@
     if (hasSelectableItems) {
       selectableItemsHtml = `
         <div class="analysis-section">
-          <div class="selection-toolbar">
-            <div>
-              <h4>Select Files to Download</h4>
-              <span id="selectionSummary" class="selection-summary">Choose files</span>
-            </div>
-            <div class="selection-actions">
-              <button class="btn btn-ghost btn-sm" onclick="showAdvancedOptions()">Options</button>
-              <button id="downloadSelectedBtn" class="btn btn-primary btn-sm" onclick="startWizardDownload('${escapeHtml(data.repo)}', ${data.is_dataset})">Download selected</button>
-            </div>
-          </div>
           ${renderSelectableItems(data.selectable_items, 'selectableItems')}
         </div>
       `;
@@ -589,6 +579,7 @@
           <div class="analysis-actions">
             <button class="btn btn-ghost" onclick="clearAnalysis()">Clear</button>
             ${!hasSelectableItems ? `
+            <button class="btn btn-ghost" onclick="showAdvancedOptions()">Options</button>
             <button class="btn btn-primary" onclick="startWizardDownload('${escapeHtml(data.repo)}', ${data.is_dataset})">
               Download All
             </button>` : ''}
@@ -597,11 +588,6 @@
       </div>
     `;
 
-    // Initialize selectable items event handlers
-    if (hasSelectableItems) {
-      initSelectableItems();
-      updateDownloadSelectionFromSelections();
-    }
   }
 
   // Clear analysis and reset to initial state
@@ -697,32 +683,9 @@
 
   // Start download from wizard with selected options
   window.startWizardDownload = async function(repo, isDataset) {
-    // Get selected items from unified selector (new) or legacy quantOptions
-    const selectableCount = document.querySelectorAll('.selectable-items input[type="checkbox"]').length;
-    let selectedItems = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'))
-      .map(cb => cb.value);
-
-    if (selectableCount > 0 && selectedItems.length === 0) {
-      showToast('Select at least one file option first', 'error');
-      return;
-    }
-
-    // Fallback to legacy GGUF selector if no new selectable items
-    if (selectedItems.length === 0) {
-      selectedItems = Array.from(document.querySelectorAll('#quantOptions input[type="checkbox"]:checked'))
-        .map(cb => cb.dataset.filter);
-    }
-
-    // Build filters - prefer selections, fallback to advanced options
-    let filters = [];
-    const totalItems = document.querySelectorAll('.selectable-items input[type="checkbox"], #quantOptions input[type="checkbox"]').length;
-
-    // Only add filter if user selected a subset (not all)
-    if (selectedItems.length > 0 && selectedItems.length < totalItems) {
-      filters = selectedItems;
-    } else if (advancedOptions.filter) {
-      filters = advancedOptions.filter.split(',').map(s => s.trim()).filter(Boolean);
-    }
+    const filters = advancedOptions.filter
+      ? advancedOptions.filter.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
 
     // Build excludes from advanced options
     const excludes = advancedOptions.exclude
@@ -736,8 +699,8 @@
         dataset: isDataset,
         filters,
         excludes,
-        // Checkbox selections name a specific quant/variant, so match the exact
-        // name segment (q6_k must not also pull q6_k_xl) — github issue #78.
+        // Manual filters name specific quant/file segments, so keep matching
+        // exact enough that q6_k does not also pull q6_k_xl.
         exactMatch: filters.length > 0
       };
 
@@ -2526,7 +2489,7 @@
   // =========================================
 
   /**
-   * Renders selectable items with checkboxes grouped by category.
+   * Renders downloadable items grouped by category.
    * Works for all model types: GGUF quantizations, Diffusers components, etc.
    */
   // ── Quant/selectable row download status ──────────────────────────
@@ -2771,129 +2734,6 @@
     if (input) input.value = repo;
     analyzeRepo();
   };
-
-  /**
-   * Update file list based on selected download options.
-   */
-  function updateDownloadSelectionFromSelections() {
-    if (!currentAnalysis) return;
-
-    const selectedItems = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'))
-      .map(cb => cb.value);
-
-    // Update file list based on selections
-    updateFileListFromSelections(selectedItems);
-    updateSelectionSummary();
-  }
-
-  function updateSelectionSummary() {
-    const summary = $('#selectionSummary');
-    if (!summary || !currentAnalysis) return;
-    const btn = $('#downloadSelectedBtn');
-
-    const selected = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'));
-    const total = document.querySelectorAll('.selectable-items input[type="checkbox"]').length;
-    const size = selected.reduce((sum, cb) => {
-      const item = currentAnalysis.selectable_items?.find(it => (it.filter_value || it.id || '') === cb.value);
-      return sum + (item?.size || 0);
-    }, 0);
-
-    if (selected.length === 0) {
-      summary.textContent = 'Nothing selected';
-    } else {
-      summary.textContent = `${selected.length} of ${total} selected${size ? `, ${formatBytes(size)}` : ''}`;
-    }
-    if (btn) btn.disabled = selected.length === 0;
-  }
-
-  /**
-   * Update the displayed file list based on selected items.
-   */
-  function updateFileListFromSelections(selectedFilters) {
-    if (!currentAnalysis || !currentAnalysis.files) return;
-
-    const filesContainer = $('#analysisFilesList');
-    const countEl = $('#selectedFilesCount');
-    if (!filesContainer) return;
-
-    let filteredFiles = currentAnalysis.files;
-    let selectedSize = 0;
-
-    // If we have selectable items and some are selected, filter the files
-    if (currentAnalysis.selectable_items && currentAnalysis.selectable_items.length > 0 && selectedFilters.length > 0) {
-      // Build a set of filter patterns
-      const filterPatterns = new Set(selectedFilters.map(f => f.toLowerCase()));
-
-      filteredFiles = currentAnalysis.files.filter(file => {
-        const filePath = (file.path || file.name || '').toLowerCase();
-
-        // Check if file matches any of the selected filters
-        for (const pattern of filterPatterns) {
-          // Match various patterns: exact name, contains, extension
-          if (filePath.includes(pattern) ||
-              filePath.endsWith('.' + pattern) ||
-              filePath.includes('/' + pattern + '/') ||
-              filePath.includes('_' + pattern + '.') ||
-              filePath.includes('-' + pattern + '.') ||
-              filePath.includes('.' + pattern + '.')) {
-            return true;
-          }
-        }
-
-        // Also include config/metadata files that are always needed
-        const alwaysInclude = ['config.json', 'tokenizer', '.txt', 'readme', '.md', 'generation_config'];
-        for (const inc of alwaysInclude) {
-          if (filePath.includes(inc)) return true;
-        }
-
-        return false;
-      });
-
-      // Calculate selected size
-      selectedSize = filteredFiles.reduce((sum, f) => sum + (f.size || 0), 0);
-    } else if (selectedFilters.length === 0) {
-      // Nothing selected - show message
-      filesContainer.innerHTML = `<div class="analysis-file" style="justify-content: center; color: var(--color-text-muted);">
-        Select items above to see matching files
-      </div>`;
-      if (countEl) countEl.textContent = '(0 selected)';
-      return;
-    } else {
-      // All files
-      selectedSize = currentAnalysis.files.reduce((sum, f) => sum + (f.size || 0), 0);
-    }
-
-    // Render the filtered file list
-    const filesHtml = filteredFiles.slice(0, 20).map(f => `
-      <div class="analysis-file">
-        <span class="analysis-file-name">${escapeHtml(f.path || f.name)}</span>
-        <span class="analysis-file-size">${f.size_human || formatBytes(f.size)}</span>
-      </div>
-    `).join('');
-
-    const moreFiles = filteredFiles.length > 20
-      ? `<div class="analysis-file" style="justify-content: center; color: var(--color-text-muted);">
-           ... and ${filteredFiles.length - 20} more files
-         </div>`
-      : '';
-
-    filesContainer.innerHTML = filesHtml + moreFiles;
-
-    // Update the count display
-    if (countEl) {
-      const sizeHuman = formatBytes(selectedSize);
-      countEl.textContent = `(${filteredFiles.length} files, ${sizeHuman})`;
-    }
-  }
-
-  /**
-   * Initialize selectable items event handlers.
-   */
-  function initSelectableItems() {
-    document.querySelectorAll('.selectable-items input[type="checkbox"]').forEach(cb => {
-      cb.addEventListener('change', updateDownloadSelectionFromSelections);
-    });
-  }
 
   // =========================================
   // Models Page (unified Search + Analyze + Download)
