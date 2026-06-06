@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // PlanItem represents a single file in the download plan.
