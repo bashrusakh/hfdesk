@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -48,6 +49,7 @@ type Job struct {
 
 	cancel     context.CancelFunc `json:"-"`
 	generation int                `json:"-"` // Tracks which runJob instance is current
+	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
 }
 
 // JobProgress holds aggregate progress info.
@@ -244,12 +246,11 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	}
 
 	m.jobs[job.ID] = job
+	// Queue the job and let the scheduler start it only if we're under the
+	// max-active limit; otherwise it waits as 'queued'.
+	m.dispatchLocked()
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
-
-	// Start the job
-	m.runWG.Add(1)
-	go m.runJob(job)
 
 	return snapshot, false, nil
 }
@@ -356,14 +357,46 @@ func (m *JobManager) ResumeJob(id string) bool {
 	job.Progress = JobProgress{}
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
+	// Re-queue through the scheduler so resuming respects max-active.
+	m.dispatchLocked()
 	m.mu.Unlock()
 
 	// Notify listeners of status change
 	m.notifyListeners(snapshot)
 
-	// Restart the job - already downloaded files will be skipped by the downloader
-	m.runWG.Add(1)
-	go m.runJob(job)
+	return true
+}
+
+// RetryJob restarts a failed or cancelled job using its original
+// parameters. The job keeps its ID but its progress is reset and it is
+// re-queued and run again. Already-downloaded files are skipped by the
+// downloader, so a retry resumes where it left off.
+func (m *JobManager) RetryJob(id string) bool {
+	m.mu.Lock()
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+
+	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
+		m.mu.Unlock()
+		return false
+	}
+
+	job.Status = JobStatusQueued
+	job.Error = ""
+	job.EndedAt = nil
+	// Reset progress - the downloader will re-scan and report all files.
+	job.Progress = JobProgress{}
+	job.Files = nil
+	snapshot := m.cloneJobLocked(job)
+	// Re-queue through the scheduler so retrying respects max-active.
+	m.dispatchLocked()
+	m.mu.Unlock()
+
+	// Notify listeners of status change
+	m.notifyListeners(snapshot)
 
 	return true
 }
@@ -498,6 +531,99 @@ func (m *JobManager) notifyListeners(snapshot *Job) {
 	}
 }
 
+// effectiveMaxActive returns the configured limit on how many download jobs
+// may run at once, with a sane fallback when the setting is unset.
+func (m *JobManager) effectiveMaxActive() int {
+	if m.config.MaxActive > 0 {
+		return m.config.MaxActive
+	}
+	return 3
+}
+
+// dispatchLocked starts queued jobs (oldest first) until the number of
+// running-or-starting jobs reaches the max-active limit. It is the single
+// gate through which jobs become active, so the concurrent-download count
+// always respects the setting. Caller MUST hold m.mu.
+func (m *JobManager) dispatchLocked() {
+	limit := m.effectiveMaxActive()
+
+	active := 0
+	var queued []*Job
+	for _, j := range m.jobs {
+		if j.Status == JobStatusRunning || j.starting {
+			active++
+		} else if j.Status == JobStatusQueued {
+			queued = append(queued, j)
+		}
+	}
+	if active >= limit || len(queued) == 0 {
+		return
+	}
+
+	// Oldest first, so downloads start in the order they were added.
+	sort.Slice(queued, func(a, b int) bool {
+		return queued[a].CreatedAt.Before(queued[b].CreatedAt)
+	})
+
+	for _, j := range queued {
+		if active >= limit {
+			break
+		}
+		j.starting = true
+		m.runWG.Add(1)
+		go m.runJob(j)
+		active++
+	}
+}
+
+// enforceLimitLocked pauses the most-recently-started running jobs when the
+// active count exceeds a lowered max-active limit, so reducing the setting
+// actually reduces the number of concurrent downloads. Older (more-progressed)
+// downloads are kept running; paused jobs stay visible and can be resumed.
+// Caller MUST hold m.mu.
+func (m *JobManager) enforceLimitLocked() {
+	limit := m.effectiveMaxActive()
+
+	var running []*Job
+	for _, j := range m.jobs {
+		if j.Status == JobStatusRunning {
+			running = append(running, j)
+		}
+	}
+	if len(running) <= limit {
+		return
+	}
+
+	// Newest-started first, so the longest-running downloads keep going.
+	sort.Slice(running, func(a, b int) bool {
+		ta, tb := running[a].StartedAt, running[b].StartedAt
+		if ta == nil || tb == nil {
+			return false
+		}
+		return ta.After(*tb)
+	})
+
+	for i := 0; i < len(running)-limit; i++ {
+		j := running[i]
+		if j.cancel != nil {
+			j.cancel()
+		}
+		j.Status = JobStatusPaused
+		m.notifyListeners(m.cloneJobLocked(j))
+	}
+}
+
+// UpdateConfig replaces the manager's config (called when settings change),
+// pauses any running jobs above a lowered max-active limit, then starts any
+// queued jobs that a raised limit now allows.
+func (m *JobManager) UpdateConfig(cfg Config) {
+	m.mu.Lock()
+	m.config = cfg
+	m.enforceLimitLocked()
+	m.dispatchLocked()
+	m.mu.Unlock()
+}
+
 // runJob executes the download job.
 func (m *JobManager) runJob(job *Job) {
 	defer m.runWG.Done()
@@ -510,6 +636,7 @@ func (m *JobManager) runJob(job *Job) {
 	job.generation++
 	myGeneration := job.generation // Track which generation we are
 	job.Status = JobStatusRunning
+	job.starting = false
 	now := time.Now()
 	job.StartedAt = &now
 	startSnap := m.cloneJobLocked(job)
@@ -590,6 +717,12 @@ func (m *JobManager) runJob(job *Job) {
 				total += f.Downloaded
 			}
 			job.Progress.DownloadedBytes = total
+			if job.StartedAt != nil {
+				elapsed := time.Since(*job.StartedAt).Seconds()
+				if elapsed > 0 {
+					job.Progress.BytesPerSecond = int64(float64(total) / elapsed)
+				}
+			}
 
 		case "file_done":
 			for i := range job.Files {
@@ -606,6 +739,12 @@ func (m *JobManager) runJob(job *Job) {
 				total += f.Downloaded
 			}
 			job.Progress.DownloadedBytes = total
+			if job.StartedAt != nil {
+				elapsed := time.Since(*job.StartedAt).Seconds()
+				if elapsed > 0 {
+					job.Progress.BytesPerSecond = int64(float64(total) / elapsed)
+				}
+			}
 		}
 
 		progressSnap := m.cloneJobLocked(job)
@@ -622,6 +761,11 @@ func (m *JobManager) runJob(job *Job) {
 	// 1. Job was paused (user intentionally stopped it)
 	// 2. We're a stale goroutine (a newer runJob has started)
 	if job.Status == JobStatusPaused || job.generation != myGeneration {
+		// A paused job has freed its slot, so let the next queued job start.
+		// On a generation mismatch a newer runJob owns the slot — don't.
+		if job.generation == myGeneration {
+			m.dispatchLocked()
+		}
 		m.mu.Unlock()
 		return
 	}
@@ -636,6 +780,8 @@ func (m *JobManager) runJob(job *Job) {
 		job.Status = JobStatusCompleted
 	}
 	endSnap := m.cloneJobLocked(job)
+	// This job finished and freed a slot; start the next queued job.
+	m.dispatchLocked()
 	m.mu.Unlock()
 
 	m.notifyListeners(endSnap)

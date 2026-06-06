@@ -177,6 +177,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleCancelJob)
 	mux.HandleFunc("POST /api/jobs/{id}/pause", s.handlePauseJob)
 	mux.HandleFunc("POST /api/jobs/{id}/resume", s.handleResumeJob)
+	mux.HandleFunc("POST /api/jobs/{id}/retry", s.handleRetryJob)
 	mux.HandleFunc("POST /api/jobs/{id}/dismiss", s.handleDismissJob)
 
 	// Settings
@@ -188,6 +189,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 
 	// Smart Analyzer
 	mux.HandleFunc("GET /api/analyze/{repo...}", s.handleAnalyze)
+	mux.HandleFunc("GET /api/readme/{repo...}", s.handleReadme)
 
 	// Cache browser
 	mux.HandleFunc("GET /api/cache", s.handleCacheList)
