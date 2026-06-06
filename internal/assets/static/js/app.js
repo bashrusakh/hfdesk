@@ -647,9 +647,31 @@
         ? readme.html
         : renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
       section.hidden = !preview.innerHTML.trim();
+      if (!section.hidden) applyReadmeCollapse(section, preview);
     } catch (_) {
       section.hidden = true;
     }
+  }
+
+  // Clamp a long README behind a Show more / Show less toggle so the analysis
+  // panel stays compact.
+  function applyReadmeCollapse(section, preview) {
+    const old = section.querySelector('.readme-toggle');
+    if (old) old.remove();
+    preview.classList.remove('readme-clamped');
+    requestAnimationFrame(() => {
+      const CLAMP = 440;
+      if (preview.scrollHeight <= CLAMP + 80) return;
+      preview.classList.add('readme-clamped');
+      const btn = document.createElement('button');
+      btn.className = 'btn-link readme-toggle';
+      btn.textContent = 'Show more';
+      btn.addEventListener('click', () => {
+        const clamped = preview.classList.toggle('readme-clamped');
+        btn.textContent = clamped ? 'Show more' : 'Show less';
+      });
+      preview.after(btn);
+    });
   }
 
   function renderMarkdownPreview(markdown, baseRawURL) {

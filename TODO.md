@@ -1,9 +1,6 @@
 # TODO
 
-- Restore the "HF Hub" button in the found-models list (it disappeared). Place
-  it conveniently/ergonomically near the model row — not tucked far away.
-- README renderer currently clamps the Description by default (Show more). Show
-  the full description immediately instead (drop the default clamp).
+(no open items)
 
 ## Done
 
