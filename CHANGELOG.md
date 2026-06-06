@@ -6,6 +6,7 @@
 
 - Retry button on failed and cancelled downloads to restart them with their original settings.
 - Full README renderer: server-side sanitized Markdown with GitHub-Flavored tables and code, relative image/link rewriting, an authenticated image proxy for gated repos, lazy-loaded images, and a collapsible long-README toggle.
+- "Open on Hugging Face Hub" button on each model in the search results list.
 
 ### Changed
 

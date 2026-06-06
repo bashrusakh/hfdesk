@@ -395,6 +395,14 @@ LOOP:
 		return ctx.Err()
 	}
 
+	// Post-download finalization (refs, building the friendly view, rebuild
+	// script, manifest) can take a while — copying the friendly view on
+	// filesystems without symlink support is the slow part — so signal the
+	// phase to the UI instead of leaving the job stuck at 100%.
+	if useHFCache && repoDir != nil && !cfg.NoFriendlyView {
+		emit(ProgressEvent{Event: "finalizing", Message: "finalizing"})
+	}
+
 	// For HF Cache mode: write ref file and ensure friendly directory exists
 	if useHFCache && repoDir != nil {
 		// Write refs/main (or the revision used)
