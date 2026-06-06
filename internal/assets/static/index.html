@@ -68,7 +68,7 @@
           <span class="status-indicator"></span>
           <span class="status-text">Connecting...</span>
         </div>
-        <div class="version">v1.0.1</div>
+        <div class="version" id="appVersion"></div>
       </div>
       <div class="sidebar-resize-handle" id="sidebarResizeHandle"></div>
     </aside>
@@ -325,13 +325,13 @@
             </select>
           </div>
           <div class="cache-view-toggle">
-            <button class="view-btn active" data-view="grid" title="Grid view">
+            <button class="view-btn" data-view="grid" title="Grid view">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                 <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
                 <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
               </svg>
             </button>
-            <button class="view-btn" data-view="list" title="List view">
+            <button class="view-btn active" data-view="list" title="List view">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                 <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
                 <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>

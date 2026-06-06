@@ -40,6 +40,7 @@ type Job struct {
 	Flat       bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
 	ExactMatch bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
 	Status     JobStatus         `json:"status"`
+	Phase      string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
 	Progress   JobProgress       `json:"progress"`
 	Error      string            `json:"error,omitempty"`
 	CreatedAt  time.Time         `json:"createdAt"`
@@ -657,10 +658,12 @@ func updateJobSpeed(job *Job, transferred int64) {
 	if inst < 0 {
 		inst = 0
 	}
+	// Heavy EMA (mostly the previous value) so the displayed speed is steady
+	// rather than jumping with chunky per-window I/O.
 	if job.Progress.BytesPerSecond == 0 {
 		job.Progress.BytesPerSecond = int64(inst)
 	} else {
-		job.Progress.BytesPerSecond = int64(0.5*float64(job.Progress.BytesPerSecond) + 0.5*inst)
+		job.Progress.BytesPerSecond = int64(0.75*float64(job.Progress.BytesPerSecond) + 0.25*inst)
 	}
 	job.speedPrevBytes = transferred
 	job.speedPrevTime = now
@@ -679,6 +682,7 @@ func (m *JobManager) runJob(job *Job) {
 	myGeneration := job.generation // Track which generation we are
 	job.Status = JobStatusRunning
 	job.starting = false
+	job.Phase = ""
 	now := time.Now()
 	job.StartedAt = &now
 	// Reset the speed window so this run measures only its own throughput.
@@ -792,6 +796,11 @@ func (m *JobManager) runJob(job *Job) {
 				total += f.Downloaded
 			}
 			job.Progress.DownloadedBytes = total
+
+		case "finalizing":
+			// Download is done; post-processing (friendly view, manifest) runs.
+			job.Phase = "finalizing"
+			job.Progress.BytesPerSecond = 0
 		}
 
 		progressSnap := m.cloneJobLocked(job)
