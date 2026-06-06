@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -266,6 +267,25 @@ func (s *Server) handleResumeJob(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleRetryJob restarts a failed or cancelled job using its original
+// parameters, reusing the same job ID.
+func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "Missing job ID", "")
+		return
+	}
+
+	if s.jobs.RetryJob(id) {
+		writeJSON(w, http.StatusOK, SuccessResponse{
+			Success: true,
+			Message: "Job restarted",
+		})
+	} else {
+		writeError(w, http.StatusNotFound, "Job not found or not retryable", "")
+	}
+}
+
 // handleDismissJob permanently removes a finished job from the list so it
 // doesn't reappear on page refresh (github issue #68 secondary ask). Only
 // jobs in terminal states (completed, failed, cancelled, paused) can be
@@ -430,8 +450,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Also update job manager config
-	s.jobs.config = s.config
+	// Also update job manager config. UpdateConfig takes the manager lock and
+	// re-runs the scheduler, so a raised max-active starts queued jobs now.
+	s.jobs.UpdateConfig(s.config)
 
 	// Persist settings to config file
 	fileCfg := &ConfigFile{
@@ -522,6 +543,68 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
+// handleReadme returns a minimal README payload for the analysis panel.
+func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if repo == "" {
+		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/readme/owner/name")
+		return
+	}
+	revision := r.URL.Query().Get("revision")
+	if revision == "" {
+		revision = "main"
+	}
+	isDataset := strings.EqualFold(r.URL.Query().Get("dataset"), "true")
+
+	endpoint := strings.TrimRight(s.config.Endpoint, "/")
+	if endpoint == "" {
+		endpoint = "https://huggingface.co"
+	}
+	prefix := ""
+	if isDataset {
+		prefix = "datasets/"
+	}
+
+	client, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
+		return
+	}
+	client.Timeout = 20 * time.Second
+
+	candidates := []string{"README.md", "readme.md", "Readme.md"}
+	for _, name := range candidates {
+		rawURL := fmt.Sprintf("%s/%s%s/raw/%s/%s", endpoint, prefix, repo, revision, name)
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
+		if err != nil {
+			continue
+		}
+		if s.config.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+s.config.Token)
+		}
+		req.Header.Set("User-Agent", "hfdesk/1")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 768<<10))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && readErr == nil && len(body) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"repo":       repo,
+				"revision":   revision,
+				"path":       name,
+				"markdown":   string(body),
+				"baseRawURL": fmt.Sprintf("%s/%s%s/raw/%s/", endpoint, prefix, repo, revision),
+			})
+			return
+		}
+	}
+
+	writeError(w, http.StatusNotFound, "README not found", "")
+}
+
 // --- Cache Browser ---
 
 // CachedRepoInfo represents a cached repository for the API response.
@@ -544,6 +627,9 @@ type CachedRepoInfo struct {
 	Manifest       *ManifestInfo     `json:"manifest,omitempty"`
 	Source         string            `json:"source,omitempty"` // "HF cache", "Friendly view", "Local"
 	Quantizations  []string          `json:"quantizations,omitempty"`
+	HasMMProj      bool              `json:"hasMMProj,omitempty"`
+	MMProjFiles    []string          `json:"mmprojFiles,omitempty"`
+	Capabilities   []string          `json:"capabilities,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -656,21 +742,48 @@ func cacheQuantLabel(name string) string {
 	return ""
 }
 
-func collectCacheQuantizations(dir string) []string {
+func isCacheMMProjFile(name string) bool {
+	base := strings.ToLower(filepath.Base(name))
+	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
+}
+
+type cacheGGUFMetadata struct {
+	Quantizations []string
+	HasMMProj     bool
+	MMProjFiles   []string
+	Capabilities  []string
+}
+
+func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMetadata {
 	seen := make(map[string]bool)
-	var quantizations []string
+	meta := cacheGGUFMetadata{}
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
 			return nil
 		}
+		relPath, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			relPath = info.Name()
+		}
+		if isCacheMMProjFile(info.Name()) {
+			meta.HasMMProj = true
+			if includeMMProjFiles {
+				meta.MMProjFiles = append(meta.MMProjFiles, relPath)
+			}
+			return nil
+		}
 		if q := cacheQuantLabel(info.Name()); q != "" && !seen[q] {
 			seen[q] = true
-			quantizations = append(quantizations, q)
+			meta.Quantizations = append(meta.Quantizations, q)
 		}
 		return nil
 	})
-	sort.Strings(quantizations)
-	return quantizations
+	sort.Strings(meta.Quantizations)
+	sort.Strings(meta.MMProjFiles)
+	if meta.HasMMProj {
+		meta.Capabilities = append(meta.Capabilities, "vision")
+	}
+	return meta
 }
 
 func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
@@ -718,7 +831,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	if !newest.IsZero() {
 		downloaded = newest.Format("2006-01-02")
 	}
-	quantizations := collectCacheQuantizations(repoDir)
+	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles)
 
 	return &CachedRepoInfo{
 		Repo:           owner + "/" + name,
@@ -733,7 +846,10 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 		DownloadStatus: "unknown",
 		Files:          files,
 		Source:         source,
-		Quantizations:  quantizations,
+		Quantizations:  ggufMeta.Quantizations,
+		HasMMProj:      ggufMeta.HasMMProj,
+		MMProjFiles:    ggufMeta.MMProjFiles,
+		Capabilities:   ggufMeta.Capabilities,
 	}, nil
 }
 
@@ -922,6 +1038,8 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			shortCommit = shortCommit[:7]
 		}
 
+		ggufMeta := collectCacheGGUFMetadata(friendlyPath, false)
+
 		repo := CachedRepoInfo{
 			Repo:           repoID,
 			Owner:          rd.Owner(),
@@ -938,7 +1056,9 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			DownloadStatus: downloadStatus,
 			Manifest:       manifest,
 			Source:         "HF cache",
-			Quantizations:  collectCacheQuantizations(friendlyPath),
+			Quantizations:  ggufMeta.Quantizations,
+			HasMMProj:      ggufMeta.HasMMProj,
+			Capabilities:   ggufMeta.Capabilities,
 		}
 		repos = append(repos, repo)
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
@@ -1117,6 +1237,8 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		shortCommit = shortCommit[:7]
 	}
 
+	ggufMeta := collectCacheGGUFMetadata(friendlyPath, true)
+
 	info := CachedRepoInfo{
 		Repo:           repoDir.RepoID(),
 		Owner:          repoDir.Owner(),
@@ -1134,7 +1256,10 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		Files:          files,
 		Manifest:       manifest,
 		Source:         "HF cache",
-		Quantizations:  collectCacheQuantizations(friendlyPath),
+		Quantizations:  ggufMeta.Quantizations,
+		HasMMProj:      ggufMeta.HasMMProj,
+		MMProjFiles:    ggufMeta.MMProjFiles,
+		Capabilities:   ggufMeta.Capabilities,
 	}
 
 	writeJSON(w, http.StatusOK, info)

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // PlanItem represents a single file in the download plan.
@@ -60,15 +59,39 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		commitSHA = job.Revision // fallback
 	}
 
+	// Collect every file node first. We need the full list before building the
+	// plan so we can detect a GGUF-only download and skip companion files that
+	// a self-contained GGUF doesn't need.
+	var fileNodes []hfNode
 	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
-		if n.Type != "file" && n.Type != "blob" {
-			return nil
+		if n.Type == "file" || n.Type == "blob" {
+			fileNodes = append(fileNodes, n)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// GGUF-only mode: filters are set and at least one matches a .gguf file. A
+	// GGUF file embeds its own tokenizer and config, so the download should be
+	// just the chosen quant shards (plus any mmproj filter) — not the repo's
+	// config/tokenizer JSON, README, .gitattributes, or the fp16/ transformers
+	// metadata that ships alongside many GGUF repos. For non-GGUF downloads
+	// (e.g. a "safetensors" filter) those companion files are still required,
+	// so the original behavior is kept.
+	baseNames := make([]string, 0, len(fileNodes))
+	for _, n := range fileNodes {
+		baseNames = append(baseNames, strings.ToLower(filepath.Base(n.Path)))
+	}
+	ggufMode := isGGUFFilterDownload(baseNames, job.Filters, job.ExactMatch)
+
+	for _, n := range fileNodes {
 		rel := n.Path
 
 		// Deduplicate by relative path
 		if _, ok := seen[rel]; ok {
-			return nil
+			continue
 		}
 		seen[rel] = struct{}{}
 
@@ -79,17 +102,35 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 		// Check excludes first - if file matches any exclude pattern, skip it
 		// Credits: Exclude feature suggested by jeroenkroese (#41)
+		excluded := false
 		for _, ex := range job.Excludes {
 			exLower := strings.ToLower(ex)
 			if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
-				return nil // excluded
+				excluded = true
+				break
 			}
+		}
+		if excluded {
+			continue
 		}
 
 		// Determine which filter (if any) matches this file name, prefer the longest match
 		// Filter matching is case-insensitive (e.g., q4_0 matches Q4_0)
 		matchedFilter := ""
-		if isLFS && len(job.Filters) > 0 {
+		if ggufMode {
+			// Keep only files that match a filter: the selected quant's shards
+			// and any mmproj companion. Everything else is skipped.
+			for _, f := range job.Filters {
+				if filterMatches(nameLower, strings.ToLower(f), job.ExactMatch) {
+					if len(f) > len(matchedFilter) {
+						matchedFilter = f
+					}
+				}
+			}
+			if matchedFilter == "" {
+				continue
+			}
+		} else if isLFS && len(job.Filters) > 0 {
 			for _, f := range job.Filters {
 				fLower := strings.ToLower(f)
 				if filterMatches(nameLower, fLower, job.ExactMatch) {
@@ -103,7 +144,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				ln := strings.ToLower(name)
 				ext := strings.ToLower(filepath.Ext(name))
 				if ext == ".bin" || ext == ".act" || ext == ".safetensors" || ext == ".zip" || strings.HasSuffix(ln, ".gguf") || strings.HasSuffix(ln, ".ggml") {
-					return nil
+					continue
 				}
 			}
 		}
@@ -145,10 +186,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			AcceptRanges: acceptRanges,
 			Subdir:       matchedFilter, // empty when no filter matched
 		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
@@ -192,6 +229,30 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 // names contain them (e.g. Q6_K, Q4_K_M).
 func isFilterDelimiter(r rune) bool {
 	return r == '-' || r == '.' || r == ' '
+}
+
+// isGGUFFilterDownload reports whether the given filters target a .gguf file in
+// the supplied set of file base names (all expected lowercased). When true the
+// download is treated as GGUF-only: because a GGUF file is self-contained, the
+// plan keeps just the filter-matched files (the chosen quant's shards plus any
+// mmproj companion) and drops config/tokenizer JSON, README, .gitattributes and
+// fp16/ transformers metadata. For non-GGUF filters (e.g. "safetensors") this
+// returns false so those companion files are still downloaded.
+func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
+	if len(filters) == 0 {
+		return false
+	}
+	for _, base := range baseNames {
+		if !strings.HasSuffix(base, ".gguf") {
+			continue
+		}
+		for _, f := range filters {
+			if filterMatches(base, strings.ToLower(f), exact) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // destinationBase returns the base output directory for a job.
