@@ -125,6 +125,31 @@
     }
   }
 
+  // Jobs scheduled to be auto-moved into History so we don't double-schedule.
+  const completedRemovalTimers = new Set();
+
+  // When a download finishes successfully, move it out of Active Jobs into
+  // History after a short delay (long enough to see it reach 100%). Only
+  // completed jobs are auto-removed — failed/cancelled/paused stay visible
+  // so unfinished work never disappears unexpectedly. The job is already
+  // recorded in History server-side; we dismiss it so it doesn't linger.
+  function scheduleCompletedRemoval(job) {
+    if (!job || job.status !== 'completed' || completedRemovalTimers.has(job.id)) return;
+    completedRemovalTimers.add(job.id);
+    setTimeout(async () => {
+      completedRemovalTimers.delete(job.id);
+      const current = state.jobs.get(job.id);
+      if (!current || current.status !== 'completed') return;
+      try {
+        await api('POST', `/jobs/${job.id}/dismiss`);
+      } catch (e) { /* already removed server-side; ignore */ }
+      state.jobs.delete(job.id);
+      if (state.currentPage === 'jobs') renderJobs();
+      updateJobsBadge();
+      if (state.currentPage === 'history') loadHistory();
+    }, 4000);
+  }
+
   function handleWSMessage(msg) {
     if (msg.type === 'init') {
       // Initial state with all jobs
@@ -132,6 +157,7 @@
       state.jobs.clear();
       jobs.forEach(job => {
         state.jobs.set(job.id, job);
+        scheduleCompletedRemoval(job);
       });
       updateJobsBadge();
       if (state.currentPage === 'jobs') {
@@ -146,6 +172,7 @@
         if (state.currentPage === 'jobs') {
           renderJobs();
         }
+        scheduleCompletedRemoval(job);
       }
     }
   }
@@ -217,12 +244,12 @@
   let currentAnalysis = null;
   let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
 
-  async function analyzeRepo(forceType = null, revision = null) {
+  async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
     const input = $('#analyzeInput');
     const resultDiv = $('#analyzeResult');
     const isDataset = forceType === 'dataset'; // Only set if user explicitly selected dataset
 
-    const repo = input?.value.trim();
+    const repo = (repoOverride || input?.value || '').trim();
     if (!repo) {
       showToast('Please enter a repository', 'error');
       return;
@@ -258,6 +285,7 @@
       // Check if there are multiple refs and we haven't shown the picker yet
       if (data.refs && data.refs.length > 1 && !hasShownRevisionPicker && !revision) {
         hasShownRevisionPicker = true;
+        currentAnalysis = data;
         showRevisionPicker(data);
         return;
       }
@@ -292,7 +320,7 @@
           <h5>Branches</h5>
           <div class="ref-list">
             ${branches.map(b => `
-              <button class="ref-btn ${b.name === 'main' ? 'ref-default' : ''}" onclick="selectRevision('${escapeHtml(b.name)}', ${data.is_dataset})">
+              <button class="ref-btn ${b.name === 'main' ? 'ref-default' : ''}" onclick="selectRevision('${escapeHtml(b.name)}', ${data.is_dataset}, '${escapeHtml(data.repo)}')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                   <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
                 </svg>
@@ -312,7 +340,7 @@
           <h5>Tags</h5>
           <div class="ref-list">
             ${tags.slice(0, 10).map(t => `
-              <button class="ref-btn" onclick="selectRevision('${escapeHtml(t.name)}', ${data.is_dataset})">
+              <button class="ref-btn" onclick="selectRevision('${escapeHtml(t.name)}', ${data.is_dataset}, '${escapeHtml(data.repo)}')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                   <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>
                 </svg>
@@ -332,16 +360,16 @@
       ${branchesHtml}
       ${tagsHtml}
       <div class="form-actions" style="margin-top: 20px;">
-        <button class="btn btn-ghost" onclick="hideModal(); selectRevision('main', ${data.is_dataset})">Use default (main)</button>
+        <button class="btn btn-ghost" onclick="hideModal(); selectRevision('main', ${data.is_dataset}, '${escapeHtml(data.repo)}')">Use default (main)</button>
       </div>
     `);
   }
 
   // Handle revision selection
-  window.selectRevision = function(revision, isDataset) {
+  window.selectRevision = function(revision, isDataset, repoOverride = null) {
     hideModal();
     const forceType = isDataset ? 'dataset' : null;
-    analyzeRepo(forceType, revision);
+    analyzeRepo(forceType, revision, repoOverride || currentAnalysis?.repo || null);
   };
 
   // Show revision picker from analysis result (user clicked "change")
@@ -365,13 +393,13 @@
           <div class="analysis-section">
             <h4>${escapeHtml(data.message)}</h4>
             <div style="display: flex; gap: 16px; margin-top: 20px;">
-              <button class="btn btn-primary" onclick="analyzeRepo('model')">
+              <button class="btn btn-primary" onclick="analyzeRepo('model', null, '${escapeHtml(data.repo)}')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
                   <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
                 </svg>
                 Analyze as Model
               </button>
-              <button class="btn btn-secondary" onclick="analyzeRepo('dataset')">
+              <button class="btn btn-secondary" onclick="analyzeRepo('dataset', null, '${escapeHtml(data.repo)}')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
                   <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
                 </svg>
@@ -538,6 +566,12 @@
 
     // Build related downloads section (for LoRA base models, etc.)
     const relatedDownloadsHtml = renderRelatedDownloads(data.related_downloads);
+    const readmeHtml = `
+      <div class="analysis-section readme-section" id="readmeSection" hidden>
+        <h4>Description</h4>
+        <div class="readme-preview" id="readmePreview"></div>
+      </div>
+    `;
 
     // Build branch/revision display
     const branchDisplay = data.branch && data.branch !== 'main'
@@ -571,6 +605,7 @@
         </div>
         <div class="analysis-body">
           ${typeInfoHtml}
+          ${readmeHtml}
           ${selectableItemsHtml}
           ${relatedDownloadsHtml}
           ${nonSelectableFilesHtml}
@@ -588,6 +623,113 @@
       </div>
     `;
 
+    loadReadmePreview(data);
+  }
+
+  async function loadReadmePreview(data) {
+    const section = $('#readmeSection');
+    const preview = $('#readmePreview');
+    if (!section || !preview || !data?.repo) return;
+
+    const params = new URLSearchParams();
+    params.set('revision', data.branch || 'main');
+    if (data.is_dataset) params.set('dataset', 'true');
+
+    try {
+      const readme = await api('GET', `/readme/${encodeURI(data.repo)}?${params.toString()}`);
+      preview.innerHTML = renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
+      section.hidden = !preview.innerHTML.trim();
+    } catch (_) {
+      section.hidden = true;
+    }
+  }
+
+  function renderMarkdownPreview(markdown, baseRawURL) {
+    if (!markdown) return '';
+
+    let text = markdown
+      .replace(/\r\n/g, '\n')
+      .replace(/^---[\s\S]*?\n---\s*/m, '')
+      .trim();
+    if (!text) return '';
+
+    const lines = text.split('\n');
+    const html = [];
+    let inCode = false;
+    let paragraph = [];
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      html.push(`<p>${renderMarkdownInline(paragraph.join(' '), baseRawURL)}</p>`);
+      paragraph = [];
+    };
+
+    for (const rawLine of lines.slice(0, 220)) {
+      const line = rawLine.trimEnd();
+      if (line.startsWith('```')) {
+        flushParagraph();
+        inCode = !inCode;
+        if (inCode) html.push('<pre><code>');
+        else html.push('</code></pre>');
+        continue;
+      }
+      if (inCode) {
+        html.push(escapeHtml(line) + '\n');
+        continue;
+      }
+      if (!line.trim()) {
+        flushParagraph();
+        continue;
+      }
+
+      const imageMatch = line.match(/^!\[([^\]]*)\]\(([^)]+)\)/);
+      if (imageMatch) {
+        flushParagraph();
+        const src = resolveReadmeURL(imageMatch[2], baseRawURL);
+        html.push(`<img src="${escapeHtml(src)}" alt="${escapeHtml(imageMatch[1])}" loading="lazy">`);
+        continue;
+      }
+
+      const heading = line.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        flushParagraph();
+        const level = Math.min(heading[1].length + 3, 6);
+        html.push(`<h${level}>${renderMarkdownInline(heading[2], baseRawURL)}</h${level}>`);
+        continue;
+      }
+
+      if (/^[-*]\s+/.test(line)) {
+        flushParagraph();
+        html.push(`<p class="readme-bullet">${renderMarkdownInline(line.replace(/^[-*]\s+/, ''), baseRawURL)}</p>`);
+        continue;
+      }
+
+      paragraph.push(line);
+    }
+    flushParagraph();
+    if (inCode) html.push('</code></pre>');
+    return html.join('');
+  }
+
+  function renderMarkdownInline(text, baseRawURL) {
+    let html = escapeHtml(text);
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+      const url = resolveReadmeURL(href, baseRawURL);
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>`;
+    });
+    return html;
+  }
+
+  function resolveReadmeURL(url, baseRawURL) {
+    const clean = String(url || '').trim();
+    if (/^(https?:|data:)/i.test(clean)) return clean;
+    try {
+      return new URL(clean.replace(/^\.\//, ''), baseRawURL).toString();
+    } catch (_) {
+      return clean;
+    }
   }
 
   // Clear analysis and reset to initial state
@@ -941,10 +1083,15 @@
   const jobCardCache = new Map();
 
   // statusCategory groups statuses that share the same action buttons so
-  // we only swap the buttons when the category changes. Running / queued
-  // both show Cancel; paused has Resume+Cancel; terminal states show Dismiss.
+  // we only swap the buttons when the category changes (not on every
+  // progress tick). Each status with a distinct button set gets its own
+  // category: queued shows Cancel; running adds Pause; paused has
+  // Resume+Cancel; terminal states show Dismiss. queued and running must
+  // stay separate, otherwise the Pause button never appears when a job
+  // transitions queued -> running.
   function statusCategory(status) {
-    if (status === 'running' || status === 'queued') return 'active';
+    if (status === 'running') return 'running';
+    if (status === 'queued') return 'queued';
     if (status === 'paused') return 'paused';
     if (status === 'completed' || status === 'failed' || status === 'cancelled') return 'done';
     return status || 'unknown';
@@ -968,8 +1115,44 @@
     if (status === 'queued') {
       return `<button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>`;
     }
-    // completed / failed / cancelled
+    // failed / cancelled jobs can be restarted.
+    if (status === 'failed' || status === 'cancelled') {
+      return `
+          <button class="btn btn-sm btn-primary" onclick="retryJob('${id}')">Retry</button>
+          <button class="btn btn-sm btn-secondary" onclick="dismissJob('${id}')">Dismiss</button>
+      `;
+    }
+    // completed
     return `<button class="btn btn-sm btn-secondary" onclick="dismissJob('${id}')">Dismiss</button>`;
+  }
+
+  function getJobQuantLabel(job) {
+    const filters = Array.isArray(job.filters) ? job.filters : [];
+    const quant = filters.find(f => !/mmproj/i.test(f)) || '';
+    const mmproj = filters.find(f => /mmproj/i.test(f)) || '';
+    return {
+      quant: quant || (filters.length ? filters.join(', ') : ''),
+      mmproj
+    };
+  }
+
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return 'ETA --';
+    const s = Math.max(1, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `ETA ${h}h ${m}m`;
+    if (m > 0) return `ETA ${m}m ${sec}s`;
+    return `ETA ${sec}s`;
+  }
+
+  function activeJobFile(job) {
+    const files = Array.isArray(job.files) ? job.files : [];
+    return files.find(f => f.status === 'active')
+        || files.find(f => f.status === 'pending')
+        || files[files.length - 1]
+        || null;
   }
 
   function createJobCard(job) {
@@ -980,7 +1163,11 @@
         <div class="job-header">
           <div>
             <div class="job-repo"></div>
-            <div class="job-revision" style="font-size: 13px; color: var(--color-text-muted);"></div>
+            <div class="job-meta-line">
+              <span data-role="revision"></span>
+              <span data-role="quant" class="job-chip" style="display:none"></span>
+              <span data-role="mmproj" class="job-chip job-chip-vision" style="display:none">mmproj</span>
+            </div>
           </div>
           <div class="job-header-right">
             <span class="job-status" data-role="status"></span>
@@ -995,14 +1182,24 @@
         <div class="job-stats">
           <span data-role="pct">0.0%</span>
           <span data-role="speed" style="display: none"></span>
+          <span data-role="eta" style="display: none"></span>
           <span data-role="bytes"></span>
           <span data-role="files"></span>
         </div>
+        <div class="job-file-line" data-role="active-file" style="display:none"></div>
         <div class="job-error" data-role="error" style="display: none"></div>
     `;
     // Static fields (set once, never changed by progress events).
     el.querySelector('.job-repo').textContent = job.repo || '';
-    el.querySelector('.job-revision').textContent = job.revision || 'main';
+    // Only show the revision when it isn't the default "main" branch —
+    // every download is from main, so labelling it adds noise and height.
+    const revEl = el.querySelector('[data-role="revision"]');
+    if (job.revision && job.revision !== 'main') {
+      revEl.textContent = '@ ' + job.revision;
+    } else {
+      revEl.textContent = '';
+      revEl.style.display = 'none';
+    }
     return el;
   }
 
@@ -1016,6 +1213,7 @@
     const pct = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
     const speed = p.bytesPerSecond || 0;
     const status = job.status || 'queued';
+    const jobLabels = getJobQuantLabel(job);
 
     // Status badge.
     const statusEl = el.querySelector('[data-role="status"]');
@@ -1054,13 +1252,58 @@
       if (speedEl.style.display !== 'none') speedEl.style.display = 'none';
     }
 
+    const etaEl = el.querySelector('[data-role="eta"]');
+    if (speed > 0 && totalBytes > downloadedBytes) {
+      const etaText = formatDuration((totalBytes - downloadedBytes) / speed);
+      if (etaEl.textContent !== etaText) etaEl.textContent = etaText;
+      if (etaEl.style.display === 'none') etaEl.style.display = '';
+    } else if (etaEl.style.display !== 'none') {
+      etaEl.style.display = 'none';
+    }
+
     const bytesText = formatBytes(downloadedBytes) + ' / ' + formatBytes(totalBytes);
     const bytesEl = el.querySelector('[data-role="bytes"]');
     if (bytesEl.textContent !== bytesText) bytesEl.textContent = bytesText;
 
-    const filesText = (p.completedFiles || 0) + ' / ' + (p.totalFiles || 0) + ' files';
+    const filesText = 'completed: ' + (p.completedFiles || 0) + ' / ' + (p.totalFiles || 0) + ' files';
     const filesEl = el.querySelector('[data-role="files"]');
     if (filesEl.textContent !== filesText) filesEl.textContent = filesText;
+
+    const quantEl = el.querySelector('[data-role="quant"]');
+    if (jobLabels.quant) {
+      if (quantEl.textContent !== jobLabels.quant) quantEl.textContent = jobLabels.quant;
+      if (quantEl.style.display === 'none') quantEl.style.display = '';
+    } else if (quantEl.style.display !== 'none') {
+      quantEl.style.display = 'none';
+    }
+
+    const mmprojEl = el.querySelector('[data-role="mmproj"]');
+    if (jobLabels.mmproj) {
+      mmprojEl.title = jobLabels.mmproj;
+      if (mmprojEl.style.display === 'none') mmprojEl.style.display = '';
+    } else if (mmprojEl.style.display !== 'none') {
+      mmprojEl.style.display = 'none';
+    }
+
+    // Collapse the meta line entirely when it has nothing to show (no
+    // non-default revision, no quant, no mmproj) so it adds no height.
+    const revVisible = el.querySelector('[data-role="revision"]').style.display !== 'none';
+    const metaVisible = revVisible || !!jobLabels.quant || !!jobLabels.mmproj;
+    const metaLine = el.querySelector('.job-meta-line');
+    metaLine.style.display = metaVisible ? '' : 'none';
+
+    const currentFile = activeJobFile(job);
+    const fileEl = el.querySelector('[data-role="active-file"]');
+    if (currentFile?.path) {
+      const fileText = `${currentFile.status || 'file'}: ${currentFile.path}`;
+      if (fileEl.textContent !== fileText) fileEl.textContent = fileText;
+      fileEl.title = currentFile.path;
+      if (fileEl.style.display === 'none') fileEl.style.display = '';
+    } else if (fileEl.style.display !== 'none') {
+      fileEl.style.display = 'none';
+      fileEl.textContent = '';
+      fileEl.title = '';
+    }
 
     // Error.
     const errorEl = el.querySelector('[data-role="error"]');
@@ -1077,7 +1320,14 @@
     const container = $('#jobsList');
     if (!container) return;
 
-    const jobs = Array.from(state.jobs.values());
+    // Sort by date added, newest first. Fall back to id ordering when
+    // createdAt is missing or equal so the order stays stable.
+    const jobs = Array.from(state.jobs.values()).sort((a, b) => {
+      const ta = Date.parse(a.createdAt) || 0;
+      const tb = Date.parse(b.createdAt) || 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.id).localeCompare(String(a.id));
+    });
 
     if (jobs.length === 0) {
       container.innerHTML = `
@@ -1103,15 +1353,22 @@
     }
 
     const seen = new Set();
+    let prev = null;
     for (const job of jobs) {
       seen.add(job.id);
       let el = jobCardCache.get(job.id);
       if (!el) {
         el = createJobCard(job);
         jobCardCache.set(job.id, el);
-        container.appendChild(el);
       }
       updateJobCard(el, job);
+      // Keep the DOM in sorted order: place this card right after the
+      // previous one, but only touch the DOM when it is out of position.
+      const expectedNext = prev ? prev.nextSibling : container.firstChild;
+      if (el !== expectedNext) {
+        container.insertBefore(el, expectedNext);
+      }
+      prev = el;
     }
 
     // Remove stale cards for jobs that are no longer tracked (dismiss).
@@ -1172,6 +1429,25 @@
       }
     } catch (e) {
       showToast(`Failed to resume: ${e.message}`, 'error');
+    }
+  };
+
+  // Retry a failed or cancelled job. Server reuses the same job ID and
+  // restarts the download with the original parameters.
+  window.retryJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/retry`);
+      showToast('Download restarted', 'success');
+      const job = state.jobs.get(jobId);
+      if (job) {
+        job.status = 'queued';
+        job.error = '';
+        state.jobs.set(jobId, job);
+        renderJobs();
+        updateJobsBadge();
+      }
+    } catch (e) {
+      showToast(`Failed to retry: ${e.message}`, 'error');
     }
   };
 
@@ -1237,6 +1513,26 @@
     $('#statDatasets').textContent = stats.totalDatasets || 0;
     $('#statSize').textContent = stats.totalSizeHuman || '0 B';
     $('#statFiles').textContent = stats.totalFiles || 0;
+  }
+
+  function capabilityIcon(kind, title) {
+    const icons = {
+      vision: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>`,
+      tools: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M14.7 6.3a4 4 0 0 0-5.1 5.1l-6.1 6.1a2.1 2.1 0 0 0 3 3l6.1-6.1a4 4 0 0 0 5.1-5.1l-2.5 2.5-2.8-2.8 2.3-2.7z"/></svg>`,
+      reasoning: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M12 3a5 5 0 0 0-5 5v1.5L5.5 11H7v3a3 3 0 0 0 3 3h1v3h5v-4.2A6 6 0 0 0 12 3z"/><path d="M10 8h.01M14 8h.01M11 12h3"/></svg>`
+    };
+    const labels = { vision: 'Vision', tools: 'Tools', reasoning: 'Reasoning' };
+    return `<span class="capability-icon capability-${kind}" title="${escapeHtml(title || labels[kind] || kind)}" aria-label="${escapeHtml(labels[kind] || kind)}">${icons[kind] || ''}</span>`;
+  }
+
+  function renderCapabilityIcons(capabilities, titles = {}) {
+    const ordered = ['vision', 'tools', 'reasoning'];
+    const set = new Set(capabilities || []);
+    const html = ordered
+      .filter(kind => set.has(kind))
+      .map(kind => capabilityIcon(kind, titles[kind]))
+      .join('');
+    return html ? `<span class="capability-icons">${html}</span>` : '';
   }
 
   function renderCacheList() {
@@ -1326,6 +1622,9 @@
     const sourceBadge = repo.source
       ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
       : '';
+    const capabilityIcons = renderCapabilityIcons(repo.capabilities, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+    });
 
     // Build status badge based on download status
     let statusBadge = '';
@@ -1351,6 +1650,7 @@
         <div class="cache-card-body">
           <div class="cache-card-owner">${escapeHtml(repo.owner)}</div>
           <div class="cache-card-name">${escapeHtml(repo.name)}</div>
+          ${capabilityIcons}
           ${quantSubtitle}
         </div>
         <div class="cache-card-meta">
@@ -1390,6 +1690,9 @@
     const sourceBadge = repo.source
       ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
       : '';
+    const capabilityIcons = renderCapabilityIcons(repo.capabilities, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+    });
 
     // Build status badge
     let statusBadge = '';
@@ -1412,6 +1715,7 @@
         </div>
         <div class="cache-col-repo">
           <span class="cache-repo-name">${escapeHtml(repo.repo)}</span>
+          ${capabilityIcons}
           ${quantSubtitle}
           ${statusBadge}
         </div>
@@ -1483,6 +1787,9 @@
       const detailSourceBadge = data.source
         ? `<span class="cache-badge cache-source-badge">${escapeHtml(data.source)}</span>`
         : '';
+      const detailCapabilities = renderCapabilityIcons(data.capabilities, {
+        vision: data.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+      });
 
       // Build manifest info
       const manifestHtml = data.manifest
@@ -1519,6 +1826,19 @@
              </div>
            </div>` : '');
 
+      const mmprojHtml = data.mmprojFiles?.length
+        ? `<div class="cache-detail-section">
+             <h4>Vision Encoder</h4>
+             <div class="cache-files-list">
+               ${data.mmprojFiles.map(f => `
+                 <div class="cache-file-row">
+                   <span class="cache-file-name" title="${escapeHtml(f)}">${escapeHtml(f)}</span>
+                 </div>
+               `).join('')}
+             </div>
+           </div>`
+        : '';
+
       setModalContent(`
         <div class="cache-detail-modal">
           <div class="cache-detail-header">
@@ -1528,6 +1848,7 @@
             </span>
             ${statusBadgeHtml}
             ${detailSourceBadge}
+            ${detailCapabilities}
             <div class="cache-detail-repo">
               <span class="cache-detail-owner">${escapeHtml(data.owner)}/</span>
               <span class="cache-detail-name">${escapeHtml(data.name)}</span>
@@ -1556,6 +1877,7 @@
           </div>
 
           ${manifestHtml}
+          ${mmprojHtml}
 
           <div class="cache-detail-section">
             <h4>Paths</h4>
@@ -2730,9 +3052,7 @@
    * Analyze a related repo (from LoRA base model link).
    */
   window.analyzeRelatedRepo = function(repo) {
-    const input = $('#analyzeInput');
-    if (input) input.value = repo;
-    analyzeRepo();
+    analyzeRepo(null, null, repo);
   };
 
   // =========================================
@@ -2743,6 +3063,13 @@
   let _modelsInitialized = false;
   let _currentSelectedRow = null;
   let _syncModelsSearchClear = () => {};
+
+  function clearModelsSelection() {
+    if (_currentSelectedRow) {
+      _currentSelectedRow.classList.remove('model-row-active');
+      _currentSelectedRow = null;
+    }
+  }
 
   function initModelsPage() {
     if (_modelsInitialized) return;
@@ -2762,6 +3089,7 @@
     // Debounced search on typing
     input?.addEventListener('input', () => {
       syncClearBtn();
+      clearModelsSelection();
       clearTimeout(_modelsDebounce);
       _modelsDebounce = setTimeout(loadModelsSearch, 380);
     });
@@ -2771,6 +3099,7 @@
       if (!input) return;
       input.value = '';
       syncClearBtn();
+      clearModelsSelection();
       input.focus();
       clearTimeout(_modelsDebounce);
       loadModelsSearch();
@@ -2805,6 +3134,7 @@
     ['modelsSortSelect','modelsTypeSelect','modelsGguf','modelsDatasets'].forEach(id => {
       $(`#${id}`)?.addEventListener('change', () => {
         clearTimeout(_modelsDebounce);
+        clearModelsSelection();
         loadModelsSearch();
       });
     });
@@ -2859,6 +3189,7 @@
     const parts  = (r.id || '').split('/');
     const author = parts.length > 1 ? parts[0] : '';
     const name   = parts.length > 1 ? parts.slice(1).join('/') : r.id;
+    const caps = detectSearchCapabilities(r);
 
     const isGguf = (r.tags || []).includes('gguf');
     const badge  = isGguf
@@ -2873,6 +3204,7 @@
     const dl = r.downloads ? `<span class="model-row-stat">↓${formatNumber(r.downloads)}</span>` : '';
     const lk = r.likes     ? `<span class="model-row-stat">♥${formatNumber(r.likes)}</span>` : '';
     const gated = r.gated  ? `<span class="model-row-stat" title="Gated">🔒</span>` : '';
+    const capabilityIcons = renderCapabilityIcons(caps.capabilities, caps.titles);
 
     return `
       <div class="model-row" data-repo="${escapeHtml(r.id)}" onclick="modelsSelectRow(this,'${escapeHtml(r.id)}')">
@@ -2881,8 +3213,45 @@
           <div class="model-row-name">${escapeHtml(name)}</div>
           <div class="model-row-meta">${escapeHtml(author)}${dl}${lk}${gated}</div>
         </div>
-        <div class="model-row-right">${localBadge}${badge}</div>
+        <div class="model-row-right">${capabilityIcons}${localBadge}${badge}</div>
       </div>`;
+  }
+
+  function detectSearchCapabilities(result) {
+    const tags = (result.tags || []).map(t => String(t).toLowerCase());
+    const text = [
+      result.id,
+      result.pipelineTag,
+      result.libraryName,
+      ...tags
+    ].filter(Boolean).join(' ').toLowerCase();
+    const capabilities = [];
+    const titles = {};
+
+    const hasAny = (needles) => needles.some(n => text.includes(n));
+    const hasTag = (needles) => needles.some(n => tags.includes(n));
+    const pipeline = String(result.pipelineTag || '').toLowerCase();
+
+    if (
+      ['image-to-text', 'image-text-to-text', 'visual-question-answering', 'image-classification', 'object-detection'].includes(pipeline) ||
+      hasTag(['vision', 'computer-vision', 'multimodal', 'vlm']) ||
+      hasAny([' vision', 'vision-', '-vision', 'vlm', 'multimodal', 'mmproj', 'image-to-text', 'image-text-to-text'])
+    ) {
+      capabilities.push('vision');
+      titles.vision = 'Vision capability detected from HF tags/name';
+    }
+
+    if (hasTag(['tool', 'tools', 'tool-use', 'function-calling']) || hasAny(['tool-use', 'tool_use', 'function-calling', 'function_calling', 'tools', ' tool '])) {
+      capabilities.push('tools');
+      titles.tools = 'Tool-use capability detected from HF tags/name';
+    }
+
+    if (hasTag(['reasoning', 'reasoner', 'thinking']) || hasAny(['reasoning', 'reasoner', 'thinking', 'deepseek-r1', 'qwq', 'cot', 'chain-of-thought'])) {
+      capabilities.push('reasoning');
+      titles.reasoning = 'Reasoning signal detected from HF tags/name';
+    }
+
+    return { capabilities, titles };
   }
 
   // Called when a row is clicked
@@ -2900,11 +3269,8 @@
     if (repoLabel) repoLabel.textContent = repoId;
     if (hfLink) hfLink.href = `https://huggingface.co/${repoId}`;
 
-    // Set analyzeInput and run analysis
-    const input = $('#analyzeInput');
-    if (input) input.value = repoId;
-    _syncModelsSearchClear();
-    analyzeRepo();
+    // Keep the search field user-owned; analyze the clicked repo separately.
+    analyzeRepo(null, null, repoId);
   };
 
   // (legacy compat — old Search page rendered cards with Analyze button)
@@ -2930,12 +3296,7 @@
 
   function navigateToAnalyze(repoId) {
     navigateTo('models');
-    const input = $('#analyzeInput');
-    if (input) {
-      input.value = repoId;
-      _syncModelsSearchClear();
-      analyzeRepo();
-    }
+    analyzeRepo(null, null, repoId);
   }
 
   function formatNumber(n) {

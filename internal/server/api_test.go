@@ -100,6 +100,9 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoDir, "qwen-Q3_K_XL.gguf"), []byte("12345"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mmproj-F16.gguf"), []byte("vision"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	srv := New(Config{
 		Addr:        "127.0.0.1",
@@ -136,6 +139,12 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	}
 	if len(resp.Repos[0].Quantizations) != 1 || resp.Repos[0].Quantizations[0] != "Q3_K_XL" {
 		t.Fatalf("Quantizations = %#v, want [Q3_K_XL]", resp.Repos[0].Quantizations)
+	}
+	if !resp.Repos[0].HasMMProj {
+		t.Fatalf("HasMMProj = false, want true")
+	}
+	if len(resp.Repos[0].Capabilities) != 1 || resp.Repos[0].Capabilities[0] != "vision" {
+		t.Fatalf("Capabilities = %#v, want [vision]", resp.Repos[0].Capabilities)
 	}
 }
 

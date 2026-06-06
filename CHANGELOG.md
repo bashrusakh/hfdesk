@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.8] - 2026-06-06
+
+### Added
+
+- Retry button on failed and cancelled downloads to restart them with their original settings.
+
+### Changed
+
+- Active Jobs now sorts by date added (newest first); completed downloads move to History automatically, while failed, cancelled, and paused jobs stay visible.
+- Compact download rows and hide the redundant `main` revision label.
+
+### Fixed
+
+- Pause button no longer goes missing after a download starts; it now appears when a queued job begins running.
+- `max-active` now limits concurrent download jobs: jobs above the limit queue and start as slots free, and lowering the limit pauses the most-recently-started excess downloads.
+- GGUF downloads now fetch only the selected quant's files (plus any mmproj companion) instead of also pulling the repo's config/tokenizer JSON, `README`, `.gitattributes`, and `fp16/` transformers metadata. Non-GGUF downloads (e.g. safetensors) still include their required config files.
+
 ## [1.0.7] - 2026-06-05
 
 ### Fixed

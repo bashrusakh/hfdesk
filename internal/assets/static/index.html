@@ -120,6 +120,11 @@
                 <label class="models-toggle"><input type="checkbox" id="modelsGguf"> GGUF</label>
                 <label class="models-toggle"><input type="checkbox" id="modelsDatasets"> DS</label>
               </div>
+              <div class="models-storage-strip">
+                <div id="storageModeBadge" class="storage-mode-badge" hidden></div>
+                <div id="diskFreeIndicator" class="disk-free-indicator" hidden></div>
+                <a id="modelsHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs">HF Hub ↗</a>
+              </div>
             </div>
             <div id="modelsResultList" class="models-result-list">
               <div class="models-list-hint">Search above or enter a repo ID</div>
@@ -139,11 +144,7 @@
                   </svg>
                 </button>
               </div>
-              <div class="models-detail-header-right">
-                <div id="storageModeBadge" class="storage-mode-badge" hidden></div>
-                <div id="diskFreeIndicator" class="disk-free-indicator" hidden></div>
-                <a id="modelsHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs">HF Hub ↗</a>
-              </div>
+              <div class="models-detail-header-right"></div>
             </div>
 
             <!-- Analysis result area -->
