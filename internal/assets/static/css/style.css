@@ -777,6 +777,17 @@ a {
   line-height: 1.6;
 }
 
+.readme-preview.readme-clamped {
+  max-height: 440px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
+}
+
+.readme-toggle {
+  margin-top: 8px;
+}
+
 .readme-preview h4,
 .readme-preview h5,
 .readme-preview h6 {
