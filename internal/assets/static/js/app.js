@@ -605,10 +605,10 @@
         </div>
         <div class="analysis-body">
           ${typeInfoHtml}
-          ${readmeHtml}
           ${selectableItemsHtml}
           ${relatedDownloadsHtml}
           ${nonSelectableFilesHtml}
+          ${readmeHtml}
         </div>
         <div class="analysis-actions-wrapper">
           <div class="analysis-actions">
@@ -637,11 +637,37 @@
 
     try {
       const readme = await api('GET', `/readme/${encodeURI(data.repo)}?${params.toString()}`);
-      preview.innerHTML = renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
+      // The server returns sanitized HTML; fall back to the lightweight client
+      // renderer only when it's missing (older server build).
+      preview.innerHTML = readme.html
+        ? readme.html
+        : renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
       section.hidden = !preview.innerHTML.trim();
+      if (!section.hidden) applyReadmeCollapse(section, preview);
     } catch (_) {
       section.hidden = true;
     }
+  }
+
+  // Clamp a long README behind a Show more / Show less toggle so the analysis
+  // panel stays compact.
+  function applyReadmeCollapse(section, preview) {
+    const old = section.querySelector('.readme-toggle');
+    if (old) old.remove();
+    preview.classList.remove('readme-clamped');
+    requestAnimationFrame(() => {
+      const CLAMP = 440;
+      if (preview.scrollHeight <= CLAMP + 80) return;
+      preview.classList.add('readme-clamped');
+      const btn = document.createElement('button');
+      btn.className = 'btn-link readme-toggle';
+      btn.textContent = 'Show more';
+      btn.addEventListener('click', () => {
+        const clamped = preview.classList.toggle('readme-clamped');
+        btn.textContent = clamped ? 'Show more' : 'Show less';
+      });
+      preview.after(btn);
+    });
   }
 
   function renderMarkdownPreview(markdown, baseRawURL) {
@@ -1622,8 +1648,15 @@
     const sourceBadge = repo.source
       ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
       : '';
-    const capabilityIcons = renderCapabilityIcons(repo.capabilities, {
-      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+    // Merge server-provided capabilities (e.g. vision from an mmproj encoder)
+    // with ones detected from the repo name/tags so tools/reasoning badges
+    // also show for cached models.
+    const detectedCaps = detectSearchCapabilities({ id: repo.repo, tags: repo.tags });
+    const mergedCaps = Array.from(new Set([...(repo.capabilities || []), ...detectedCaps.capabilities]));
+    const capabilityIcons = renderCapabilityIcons(mergedCaps, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : detectedCaps.titles.vision,
+      tools: detectedCaps.titles.tools,
+      reasoning: detectedCaps.titles.reasoning
     });
 
     // Build status badge based on download status
@@ -1690,8 +1723,15 @@
     const sourceBadge = repo.source
       ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
       : '';
-    const capabilityIcons = renderCapabilityIcons(repo.capabilities, {
-      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+    // Merge server-provided capabilities (e.g. vision from an mmproj encoder)
+    // with ones detected from the repo name/tags so tools/reasoning badges
+    // also show for cached models.
+    const detectedCaps = detectSearchCapabilities({ id: repo.repo, tags: repo.tags });
+    const mergedCaps = Array.from(new Set([...(repo.capabilities || []), ...detectedCaps.capabilities]));
+    const capabilityIcons = renderCapabilityIcons(mergedCaps, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : detectedCaps.titles.vision,
+      tools: detectedCaps.titles.tools,
+      reasoning: detectedCaps.titles.reasoning
     });
 
     // Build status badge

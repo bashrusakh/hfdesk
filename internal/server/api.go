@@ -591,12 +591,15 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 768<<10))
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && readErr == nil && len(body) > 0 {
+			baseRaw := fmt.Sprintf("%s/%s%s/raw/%s/", endpoint, prefix, repo, revision)
+			baseBlob := fmt.Sprintf("%s/%s%s/blob/%s/", endpoint, prefix, repo, revision)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"repo":       repo,
 				"revision":   revision,
 				"path":       name,
 				"markdown":   string(body),
-				"baseRawURL": fmt.Sprintf("%s/%s%s/raw/%s/", endpoint, prefix, repo, revision),
+				"baseRawURL": baseRaw,
+				"html":       renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointHost(s.config.Endpoint)),
 			})
 			return
 		}

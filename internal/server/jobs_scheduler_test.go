@@ -55,10 +55,11 @@ func TestJobManager_DispatchRespectsMaxActive(t *testing.T) {
 	}
 }
 
-// TestJobManager_LoweringMaxActivePausesExcess verifies that reducing the
-// max-active setting pauses the most-recently-started running jobs so the
-// active count drops to the new limit, keeping the oldest downloads running.
-func TestJobManager_LoweringMaxActivePausesExcess(t *testing.T) {
+// TestJobManager_LoweringMaxActiveRequeuesExcess verifies that reducing the
+// max-active setting re-queues the most-recently-started running jobs so the
+// active count drops to the new limit, keeping the oldest downloads running and
+// letting the dispatcher restart the rest later.
+func TestJobManager_LoweringMaxActiveRequeuesExcess(t *testing.T) {
 	cfg := Config{CacheDir: t.TempDir(), MaxActive: 4}
 	hub := NewWSHub()
 	go hub.Run()
@@ -74,17 +75,17 @@ func TestJobManager_LoweringMaxActivePausesExcess(t *testing.T) {
 	// Lower the limit to 2 via the same path the settings API uses.
 	mgr.UpdateConfig(Config{CacheDir: cfg.CacheDir, MaxActive: 2})
 
-	running, paused := 0, 0
+	running, queued := 0, 0
 	for _, j := range mgr.ListJobs() {
 		switch j.Status {
 		case JobStatusRunning:
 			running++
-		case JobStatusPaused:
-			paused++
+		case JobStatusQueued:
+			queued++
 		}
 	}
-	if running != 2 || paused != 2 {
-		t.Fatalf("expected 2 running / 2 paused after lowering limit, got %d running / %d paused", running, paused)
+	if running != 2 || queued != 2 {
+		t.Fatalf("expected 2 running / 2 queued after lowering limit, got %d running / %d queued", running, queued)
 	}
 
 	// The two oldest-started jobs should keep running.
@@ -93,5 +94,30 @@ func TestJobManager_LoweringMaxActivePausesExcess(t *testing.T) {
 		if j == nil || j.Status != JobStatusRunning {
 			t.Errorf("expected oldest job %s to stay running", id)
 		}
+	}
+}
+
+func TestUpdateJobSpeed(t *testing.T) {
+	job := &Job{}
+
+	// First sample only establishes a baseline; no speed yet.
+	updateJobSpeed(job, 1000)
+	if job.Progress.BytesPerSecond != 0 {
+		t.Fatalf("first sample should not set speed, got %d", job.Progress.BytesPerSecond)
+	}
+
+	// Simulate ~1s elapsed and 2 MB transferred since the baseline.
+	job.speedPrevTime = time.Now().Add(-1 * time.Second)
+	job.speedPrevBytes = 1000
+	updateJobSpeed(job, 1000+2_000_000)
+	if job.Progress.BytesPerSecond < 1_500_000 || job.Progress.BytesPerSecond > 2_500_000 {
+		t.Fatalf("expected ~2 MB/s, got %d", job.Progress.BytesPerSecond)
+	}
+
+	// A sample taken too soon (< 0.5s) is ignored, leaving the speed unchanged.
+	prev := job.Progress.BytesPerSecond
+	updateJobSpeed(job, 1000+2_000_000+9_000_000)
+	if job.Progress.BytesPerSecond != prev {
+		t.Fatalf("sub-window sample changed speed: %d -> %d", prev, job.Progress.BytesPerSecond)
 	}
 }

@@ -1,14 +1,12 @@
 # TODO
 
-## README rendering
-
-- Implement the full Hugging Face README renderer after the minimal version:
-  server-side README fetching for all analyzable repo types, sanitized Markdown,
-  relative image/link rewriting, optional authenticated asset proxy for gated
-  repos, lazy-loaded images, collapsible long sections, and polished table/code
-  styling.
+(no open items)
 
 ## Done
+
+- Full README renderer: server-side sanitized Markdown (goldmark + bluemonday,
+  GFM tables/code), relative image/link rewriting, authenticated image proxy
+  for gated repos, lazy images, and a collapsible long-README toggle.
 
 - Sort Active Jobs / downloads list by date added, newest first.
 - Auto-move completed downloads out of Active Jobs into History (failed/
