@@ -17,10 +17,15 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
-// Version is set at build time via ldflags.
-var Version = "1.0.1"
+// Version is set at build time via ldflags (-X main.Version=...) from the
+// VERSION file. Defaults to "dev" for un-flagged local builds.
+var Version = "dev"
 
 func main() {
+	// Surface the build version to the API/UI so the displayed version tracks
+	// the binary instead of a hardcoded string.
+	server.Version = Version
+
 	var (
 		port     int
 		cacheDir string

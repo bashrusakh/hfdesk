@@ -596,6 +596,10 @@
     resultDiv.innerHTML = `
       <div class="analysis-card">
         <div class="analysis-header">
+          <a class="analysis-hub" href="https://huggingface.co/${data.is_dataset ? 'datasets/' : ''}${escapeHtml(data.repo)}" target="_blank" rel="noopener" title="Open on Hugging Face Hub">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            HF Hub
+          </a>
           <div class="analysis-repo">${escapeHtml(data.repo)}${branchDisplay}${changeRevisionLink}</div>
           <span class="analysis-type">${escapeHtml(data.type_description || data.type)}</span>
           <div class="analysis-meta">
@@ -643,31 +647,9 @@
         ? readme.html
         : renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
       section.hidden = !preview.innerHTML.trim();
-      if (!section.hidden) applyReadmeCollapse(section, preview);
     } catch (_) {
       section.hidden = true;
     }
-  }
-
-  // Clamp a long README behind a Show more / Show less toggle so the analysis
-  // panel stays compact.
-  function applyReadmeCollapse(section, preview) {
-    const old = section.querySelector('.readme-toggle');
-    if (old) old.remove();
-    preview.classList.remove('readme-clamped');
-    requestAnimationFrame(() => {
-      const CLAMP = 440;
-      if (preview.scrollHeight <= CLAMP + 80) return;
-      preview.classList.add('readme-clamped');
-      const btn = document.createElement('button');
-      btn.className = 'btn-link readme-toggle';
-      btn.textContent = 'Show more';
-      btn.addEventListener('click', () => {
-        const clamped = preview.classList.toggle('readme-clamped');
-        btn.textContent = clamped ? 'Show more' : 'Show less';
-      });
-      preview.after(btn);
-    });
   }
 
   function renderMarkdownPreview(markdown, baseRawURL) {
@@ -1241,11 +1223,14 @@
     const status = job.status || 'queued';
     const jobLabels = getJobQuantLabel(job);
 
-    // Status badge.
+    // Status badge. While running, a "finalizing" phase (post-download
+    // friendly-view/manifest work) is surfaced so the job doesn't look stuck
+    // at 100%.
     const statusEl = el.querySelector('[data-role="status"]');
-    if (statusEl.textContent !== status) {
-      statusEl.textContent = status;
-      statusEl.className = 'job-status ' + status;
+    const displayStatus = (status === 'running' && job.phase === 'finalizing') ? 'finalizing' : status;
+    if (statusEl.textContent !== displayStatus) {
+      statusEl.textContent = displayStatus;
+      statusEl.className = 'job-status ' + displayStatus;
     }
 
     // Action buttons — only swap when the category changes, to avoid
@@ -1497,7 +1482,7 @@
   let cacheData = { repos: [], stats: {}, cacheDir: '' };
   let cacheFilter = 'all';
   let cacheSort = 'name';
-  let cacheView = 'grid';
+  let cacheView = 'list';
   let cacheSearch = '';
 
   async function loadCache() {
@@ -2924,15 +2909,17 @@
                          : dlStatus === 'queued'   ? `<span class="quant-dl-status quant-dl-queued" title="Queued">…</span>`
                          : '';
 
-        const dlBtn = dlStatus === 'done'
-          ? `<button class="quant-dl-btn quant-dl-btn-done" disabled title="Already downloaded">✓</button>`
-          : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(repo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">
-               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
+        const dlActive = dlStatus === 'running' || dlStatus === 'queued';
+        const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                  <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-               </svg>
-             </button>`;
+               </svg>`;
+        const dlBtn = dlStatus === 'done'
+          ? `<button class="quant-dl-btn quant-dl-btn-done" disabled title="Already downloaded">✓</button>`
+          : dlActive
+            ? `<button class="quant-dl-btn" disabled title="${dlStatus === 'queued' ? 'Queued' : 'Downloading…'}">${dlIcon}</button>`
+            : `<button class="quant-dl-btn" title="Download this quantization"
+               onclick="downloadQuant('${escapeHtml(repo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">${dlIcon}</button>`;
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
@@ -3562,6 +3549,18 @@
   // Initialize
   // =========================================
 
+  // Show the build version (from /api/health) in the sidebar, so the UI tracks
+  // the binary instead of a hardcoded number.
+  async function loadAppVersion() {
+    try {
+      const res = await fetch('/api/health');
+      if (!res.ok) return;
+      const data = await res.json();
+      const el = $('#appVersion');
+      if (el && data.version) el.textContent = 'v' + data.version;
+    } catch (_) { /* leave blank if unavailable */ }
+  }
+
   function init() {
     initNavigation();
     initSidebarResize();
@@ -3578,6 +3577,7 @@
     initSettingsPage();
     initMirrorPage();
     initModal();
+    loadAppVersion();
 
     // Load initial data
     if (!isFilePreview()) {

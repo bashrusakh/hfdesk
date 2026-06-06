@@ -21,11 +21,16 @@ import (
 
 // --- Handlers ---
 
+// Version is the application version reported by the API and shown in the web
+// UI. main() sets it from the build-time version, so bumping VERSION and
+// rebuilding updates the UI automatically — no hardcoded numbers to edit.
+var Version = "dev"
+
 // handleHealth returns server health status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
-		"version": "1.0.1",
+		"version": Version,
 		"time":    time.Now().UTC().Format(time.RFC3339),
 	})
 }
