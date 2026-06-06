@@ -50,6 +50,12 @@ type Job struct {
 	cancel     context.CancelFunc `json:"-"`
 	generation int                `json:"-"` // Tracks which runJob instance is current
 	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
+
+	// Speed is measured over a short sliding window from bytes actually
+	// transferred this run (see the file_progress handler), so resuming a
+	// partially-downloaded repo doesn't count already-present bytes.
+	speedPrevBytes int64     `json:"-"`
+	speedPrevTime  time.Time `json:"-"`
 }
 
 // JobProgress holds aggregate progress info.
@@ -67,6 +73,9 @@ type JobFileProgress struct {
 	TotalBytes int64  `json:"totalBytes"`
 	Downloaded int64  `json:"downloaded"`
 	Status     string `json:"status"` // pending, active, complete, skipped, error
+
+	progressed     bool  `json:"-"` // saw a real file_progress event for this file
+	baseDownloaded int64 `json:"-"` // bytes already on disk at first progress (resume position), excluded from speed
 }
 
 // JobManager manages download jobs.
@@ -576,11 +585,11 @@ func (m *JobManager) dispatchLocked() {
 	}
 }
 
-// enforceLimitLocked pauses the most-recently-started running jobs when the
+// enforceLimitLocked re-queues the most-recently-started running jobs when the
 // active count exceeds a lowered max-active limit, so reducing the setting
 // actually reduces the number of concurrent downloads. Older (more-progressed)
-// downloads are kept running; paused jobs stay visible and can be resumed.
-// Caller MUST hold m.mu.
+// downloads are kept running; the rest go back to 'queued' and the dispatcher
+// restarts them automatically as slots free up. Caller MUST hold m.mu.
 func (m *JobManager) enforceLimitLocked() {
 	limit := m.effectiveMaxActive()
 
@@ -608,13 +617,18 @@ func (m *JobManager) enforceLimitLocked() {
 		if j.cancel != nil {
 			j.cancel()
 		}
-		j.Status = JobStatusPaused
+		// Re-queue (not pause) so the dispatcher auto-starts it again once a
+		// slot frees. Bump the generation so the in-flight runJob recognizes
+		// it has been superseded and stops without marking a terminal status.
+		j.generation++
+		j.starting = false
+		j.Status = JobStatusQueued
 		m.notifyListeners(m.cloneJobLocked(j))
 	}
 }
 
 // UpdateConfig replaces the manager's config (called when settings change),
-// pauses any running jobs above a lowered max-active limit, then starts any
+// re-queues any running jobs above a lowered max-active limit, then starts any
 // queued jobs that a raised limit now allows.
 func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Lock()
@@ -622,6 +636,34 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.enforceLimitLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
+}
+
+// updateJobSpeed recomputes BytesPerSecond over a short sliding window of bytes
+// transferred this run, smoothed with a simple EMA so the reading reflects
+// current throughput instead of a cumulative average. Samples are taken at most
+// twice a second; the window never includes skipped/already-present bytes.
+func updateJobSpeed(job *Job, transferred int64) {
+	now := time.Now()
+	if job.speedPrevTime.IsZero() {
+		job.speedPrevBytes = transferred
+		job.speedPrevTime = now
+		return
+	}
+	dt := now.Sub(job.speedPrevTime).Seconds()
+	if dt < 0.5 {
+		return
+	}
+	inst := float64(transferred-job.speedPrevBytes) / dt
+	if inst < 0 {
+		inst = 0
+	}
+	if job.Progress.BytesPerSecond == 0 {
+		job.Progress.BytesPerSecond = int64(inst)
+	} else {
+		job.Progress.BytesPerSecond = int64(0.5*float64(job.Progress.BytesPerSecond) + 0.5*inst)
+	}
+	job.speedPrevBytes = transferred
+	job.speedPrevTime = now
 }
 
 // runJob executes the download job.
@@ -639,6 +681,9 @@ func (m *JobManager) runJob(job *Job) {
 	job.starting = false
 	now := time.Now()
 	job.StartedAt = &now
+	// Reset the speed window so this run measures only its own throughput.
+	job.speedPrevBytes = 0
+	job.speedPrevTime = time.Time{}
 	startSnap := m.cloneJobLocked(job)
 	m.mu.Unlock()
 	m.notifyListeners(startSnap)
@@ -707,22 +752,28 @@ func (m *JobManager) runJob(job *Job) {
 		case "file_progress":
 			for i := range job.Files {
 				if job.Files[i].Path == evt.Path {
+					if !job.Files[i].progressed {
+						// First real progress for this file: record the bytes
+						// already on disk (resume position) so they aren't
+						// counted toward the live transfer speed.
+						job.Files[i].progressed = true
+						job.Files[i].baseDownloaded = evt.Downloaded
+					}
 					job.Files[i].Downloaded = evt.Downloaded
 					break
 				}
 			}
-			// Update aggregate
-			var total int64
+			// total drives the progress bar (includes skipped/already-present
+			// bytes); transferred drives the speed (only bytes moved this run).
+			var total, transferred int64
 			for _, f := range job.Files {
 				total += f.Downloaded
-			}
-			job.Progress.DownloadedBytes = total
-			if job.StartedAt != nil {
-				elapsed := time.Since(*job.StartedAt).Seconds()
-				if elapsed > 0 {
-					job.Progress.BytesPerSecond = int64(float64(total) / elapsed)
+				if f.progressed {
+					transferred += f.Downloaded - f.baseDownloaded
 				}
 			}
+			job.Progress.DownloadedBytes = total
+			updateJobSpeed(job, transferred)
 
 		case "file_done":
 			for i := range job.Files {
@@ -733,18 +784,14 @@ func (m *JobManager) runJob(job *Job) {
 				}
 			}
 			job.Progress.CompletedFiles++
-			// Recalculate total downloaded
+			// Recalculate total downloaded (skipped/completed files included).
+			// Speed is intentionally not updated here: a skipped file emits only
+			// file_done, and counting its full size would spike the reading.
 			var total int64
 			for _, f := range job.Files {
 				total += f.Downloaded
 			}
 			job.Progress.DownloadedBytes = total
-			if job.StartedAt != nil {
-				elapsed := time.Since(*job.StartedAt).Seconds()
-				if elapsed > 0 {
-					job.Progress.BytesPerSecond = int64(float64(total) / elapsed)
-				}
-			}
 		}
 
 		progressSnap := m.cloneJobLocked(job)

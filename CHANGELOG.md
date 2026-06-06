@@ -5,16 +5,20 @@
 ### Added
 
 - Retry button on failed and cancelled downloads to restart them with their original settings.
+- Full README renderer: server-side sanitized Markdown with GitHub-Flavored tables and code, relative image/link rewriting, an authenticated image proxy for gated repos, lazy-loaded images, and a collapsible long-README toggle.
 
 ### Changed
 
 - Active Jobs now sorts by date added (newest first); completed downloads move to History automatically, while failed, cancelled, and paused jobs stay visible.
 - Compact download rows and hide the redundant `main` revision label.
+- Model analysis panel now shows the Description (README) below the quantizations list.
 
 ### Fixed
 
 - Pause button no longer goes missing after a download starts; it now appears when a queued job begins running.
-- `max-active` now limits concurrent download jobs: jobs above the limit queue and start as slots free, and lowering the limit pauses the most-recently-started excess downloads.
+- `max-active` now limits concurrent download jobs: jobs above the limit queue and start as slots free, and lowering the limit re-queues the most-recently-started excess downloads so they auto-resume as slots free.
+- Download speed now reflects current transfer throughput over a short window; resuming a partial download no longer shows an inflated speed from already-downloaded bytes.
+- tools/reasoning capability badges now also show for cached models, detected from the repo name and tags.
 - GGUF downloads now fetch only the selected quant's files (plus any mmproj companion) instead of also pulling the repo's config/tokenizer JSON, `README`, `.gitattributes`, and `fp16/` transformers metadata. Non-GGUF downloads (e.g. safetensors) still include their required config files.
 
 ## [1.0.7] - 2026-06-05
