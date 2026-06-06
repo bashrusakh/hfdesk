@@ -362,16 +362,16 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 // Note: Output directories cannot be changed via API for security.
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token              *string `json:"token,omitempty"`
-		CacheDir           *string `json:"cacheDir,omitempty"`
-		LocalDir           *string `json:"localDir,omitempty"`
+		Token              *string  `json:"token,omitempty"`
+		CacheDir           *string  `json:"cacheDir,omitempty"`
+		LocalDir           *string  `json:"localDir,omitempty"`
 		LocalScanDirs      []string `json:"localScanDirs,omitempty"`
-		Concurrency        *int    `json:"connections,omitempty"`
-		MaxActive          *int    `json:"maxActive,omitempty"`
-		MultipartThreshold *string `json:"multipartThreshold,omitempty"`
-		Verify             *string `json:"verify,omitempty"`
-		Retries            *int    `json:"retries,omitempty"`
-		Endpoint           *string `json:"endpoint,omitempty"`
+		Concurrency        *int     `json:"connections,omitempty"`
+		MaxActive          *int     `json:"maxActive,omitempty"`
+		MultipartThreshold *string  `json:"multipartThreshold,omitempty"`
+		Verify             *string  `json:"verify,omitempty"`
+		Retries            *int     `json:"retries,omitempty"`
+		Endpoint           *string  `json:"endpoint,omitempty"`
 		// Proxy settings
 		Proxy *struct {
 			URL                *string `json:"url,omitempty"`
@@ -609,27 +609,27 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 
 // CachedRepoInfo represents a cached repository for the API response.
 type CachedRepoInfo struct {
-	Repo           string            `json:"repo"`
-	Owner          string            `json:"owner"`
-	Name           string            `json:"name"`
-	Type           string            `json:"type"` // "model" or "dataset"
-	Path           string            `json:"path"`
-	FriendlyPath   string            `json:"friendlyPath,omitempty"`
-	Size           int64             `json:"size"`
-	SizeHuman      string            `json:"sizeHuman"`
-	FileCount      int               `json:"fileCount"`
-	Branch         string            `json:"branch,omitempty"`
-	Commit         string            `json:"commit,omitempty"`
-	Downloaded     string            `json:"downloaded,omitempty"`
-	DownloadStatus string            `json:"downloadStatus,omitempty"` // "complete", "filtered", "unknown"
-	Snapshots      []string          `json:"snapshots,omitempty"`
-	Files          []CachedFileInfo  `json:"files,omitempty"`
-	Manifest       *ManifestInfo     `json:"manifest,omitempty"`
-	Source         string            `json:"source,omitempty"` // "HF cache", "Friendly view", "Local"
-	Quantizations  []string          `json:"quantizations,omitempty"`
-	HasMMProj      bool              `json:"hasMMProj,omitempty"`
-	MMProjFiles    []string          `json:"mmprojFiles,omitempty"`
-	Capabilities   []string          `json:"capabilities,omitempty"`
+	Repo           string           `json:"repo"`
+	Owner          string           `json:"owner"`
+	Name           string           `json:"name"`
+	Type           string           `json:"type"` // "model" or "dataset"
+	Path           string           `json:"path"`
+	FriendlyPath   string           `json:"friendlyPath,omitempty"`
+	Size           int64            `json:"size"`
+	SizeHuman      string           `json:"sizeHuman"`
+	FileCount      int              `json:"fileCount"`
+	Branch         string           `json:"branch,omitempty"`
+	Commit         string           `json:"commit,omitempty"`
+	Downloaded     string           `json:"downloaded,omitempty"`
+	DownloadStatus string           `json:"downloadStatus,omitempty"` // "complete", "filtered", "unknown"
+	Snapshots      []string         `json:"snapshots,omitempty"`
+	Files          []CachedFileInfo `json:"files,omitempty"`
+	Manifest       *ManifestInfo    `json:"manifest,omitempty"`
+	Source         string           `json:"source,omitempty"` // "HF cache", "Friendly view", "Local"
+	Quantizations  []string         `json:"quantizations,omitempty"`
+	HasMMProj      bool             `json:"hasMMProj,omitempty"`
+	MMProjFiles    []string         `json:"mmprojFiles,omitempty"`
+	Capabilities   []string         `json:"capabilities,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -642,23 +642,23 @@ type CachedFileInfo struct {
 
 // ManifestInfo contains manifest data if available.
 type ManifestInfo struct {
-	Branch      string `json:"branch"`
-	Commit      string `json:"commit"`
-	Downloaded  string `json:"downloaded"`
-	Command     string `json:"command,omitempty"`
-	TotalSize   int64  `json:"totalSize"`
-	TotalFiles  int    `json:"totalFiles"`
-	IsFiltered  bool   `json:"isFiltered"`  // True if download used filters
-	Filters     string `json:"filters,omitempty"` // The filter string if used
+	Branch     string `json:"branch"`
+	Commit     string `json:"commit"`
+	Downloaded string `json:"downloaded"`
+	Command    string `json:"command,omitempty"`
+	TotalSize  int64  `json:"totalSize"`
+	TotalFiles int    `json:"totalFiles"`
+	IsFiltered bool   `json:"isFiltered"`        // True if download used filters
+	Filters    string `json:"filters,omitempty"` // The filter string if used
 }
 
 // CacheStats contains aggregate statistics about the cache.
 type CacheStats struct {
-	TotalModels   int    `json:"totalModels"`
-	TotalDatasets int    `json:"totalDatasets"`
-	TotalSize     int64  `json:"totalSize"`
+	TotalModels    int    `json:"totalModels"`
+	TotalDatasets  int    `json:"totalDatasets"`
+	TotalSize      int64  `json:"totalSize"`
 	TotalSizeHuman string `json:"totalSizeHuman"`
-	TotalFiles    int    `json:"totalFiles"`
+	TotalFiles     int    `json:"totalFiles"`
 }
 
 type localCacheRoot struct {

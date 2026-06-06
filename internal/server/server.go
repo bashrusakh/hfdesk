@@ -18,12 +18,12 @@ import (
 
 // Config holds server configuration.
 type Config struct {
-	Addr               string
-	Port               int
-	Token              string // HuggingFace token
-	ModelsDir          string // Output directory for models (not configurable via API)
-	DatasetsDir        string // Output directory for datasets (not configurable via API)
-	CacheDir           string // HuggingFace cache directory for v3 mode
+	Addr        string
+	Port        int
+	Token       string // HuggingFace token
+	ModelsDir   string // Output directory for models (not configurable via API)
+	DatasetsDir string // Output directory for datasets (not configurable via API)
+	CacheDir    string // HuggingFace cache directory for v3 mode
 	// LocalDir, when set, puts the whole server in flat/local-file mode: every
 	// download writes real files into <LocalDir>/<owner>/<repo> instead of the
 	// HF cache layout. Set once at startup (serve --local-dir); not changeable
@@ -32,12 +32,12 @@ type Config struct {
 	// LocalScanDirs are additional read-only roots scanned by the Cache browser
 	// as <owner>/<model> folders, e.g. LM Studio or a manually managed model
 	// library. Downloads still go to CacheDir/LocalDir unless a job overrides it.
-	LocalScanDirs       []string
+	LocalScanDirs      []string
 	Concurrency        int
 	MaxActive          int
-	MultipartThreshold string // Minimum size for multipart download
-	Verify             string // Verification mode: none, size, sha256
-	Retries            int    // Number of retry attempts
+	MultipartThreshold string   // Minimum size for multipart download
+	Verify             string   // Verification mode: none, size, sha256
+	Retries            int      // Number of retry attempts
 	AllowedOrigins     []string // CORS origins
 	Endpoint           string   // Custom HuggingFace endpoint (e.g., for mirrors)
 
