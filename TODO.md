@@ -16,6 +16,7 @@
 - Finalizing status on the job card during post-download processing.
 - Quant download buttons disable while that download is active/queued.
 - Web UI version read from the build automatically.
+
 - Sort Active Jobs / downloads list by date added, newest first.
 - Auto-move completed downloads out of Active Jobs into History (failed/
   cancelled/paused stay visible).

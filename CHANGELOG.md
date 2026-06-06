@@ -9,7 +9,6 @@
 - "Open on Hugging Face Hub" button in the model detail panel.
 - Finalizing status on the job card while post-download processing (friendly view, manifest) runs, so a finished download no longer looks stuck at 100%.
 
-
 ### Changed
 
 - Active Jobs now sorts by date added (newest first); completed downloads move to History automatically, while failed, cancelled, and paused jobs stay visible.
@@ -17,7 +16,6 @@
 - Model analysis panel now shows the Description (README) below the quantizations list.
 - Local cache page now defaults to the list view.
 - Web UI version is read from the build automatically (no hardcoded number to edit each release).
-
 
 ### Fixed
 
