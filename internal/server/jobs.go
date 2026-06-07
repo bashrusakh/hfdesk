@@ -52,11 +52,17 @@ type Job struct {
 	generation int                `json:"-"` // Tracks which runJob instance is current
 	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
 
-	// Speed is measured over a short sliding window from bytes actually
-	// transferred this run (see the file_progress handler), so resuming a
-	// partially-downloaded repo doesn't count already-present bytes.
-	speedPrevBytes int64     `json:"-"`
-	speedPrevTime  time.Time `json:"-"`
+	// Speed is a moving average over a short window of bytes actually
+	// transferred this run (see the file_progress handler), so the reading is
+	// steady and resuming a partial repo doesn't count already-present bytes.
+	speedSamples []speedSample `json:"-"`
+}
+
+// speedSample is one (time, cumulative-transferred-bytes) point in a job's
+// speed window.
+type speedSample struct {
+	t     time.Time
+	bytes int64
 }
 
 // JobProgress holds aggregate progress info.
@@ -643,30 +649,39 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 // transferred this run, smoothed with a simple EMA so the reading reflects
 // current throughput instead of a cumulative average. Samples are taken at most
 // twice a second; the window never includes skipped/already-present bytes.
-func updateJobSpeed(job *Job, transferred int64) {
-	now := time.Now()
-	if job.speedPrevTime.IsZero() {
-		job.speedPrevBytes = transferred
-		job.speedPrevTime = now
+// speedWindow is how far back the moving average looks. A few seconds keeps
+// the displayed speed steady while still tracking real changes.
+const speedWindow = 4 * time.Second
+
+// updateJobSpeed sets BytesPerSecond to the average rate over the last
+// speedWindow seconds, computed from the cumulative bytes transferred this run
+// (skipped/already-present bytes excluded). Samples are throttled so the window
+// stays small. now is passed in for deterministic testing.
+func updateJobSpeed(job *Job, transferred int64, now time.Time) {
+	// Throttle to a few samples per second.
+	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
-	dt := now.Sub(job.speedPrevTime).Seconds()
-	if dt < 0.5 {
-		return
+	// Drop samples older than the window, then add the current one.
+	cutoff := now.Add(-speedWindow)
+	kept := make([]speedSample, 0, len(job.speedSamples)+1)
+	for _, s := range job.speedSamples {
+		if s.t.After(cutoff) {
+			kept = append(kept, s)
+		}
 	}
-	inst := float64(transferred-job.speedPrevBytes) / dt
-	if inst < 0 {
-		inst = 0
+	kept = append(kept, speedSample{t: now, bytes: transferred})
+	job.speedSamples = kept
+
+	oldest := kept[0]
+	span := now.Sub(oldest.t).Seconds()
+	if span >= 1.0 {
+		rate := float64(transferred-oldest.bytes) / span
+		if rate < 0 {
+			rate = 0
+		}
+		job.Progress.BytesPerSecond = int64(rate)
 	}
-	// Heavy EMA (mostly the previous value) so the displayed speed is steady
-	// rather than jumping with chunky per-window I/O.
-	if job.Progress.BytesPerSecond == 0 {
-		job.Progress.BytesPerSecond = int64(inst)
-	} else {
-		job.Progress.BytesPerSecond = int64(0.75*float64(job.Progress.BytesPerSecond) + 0.25*inst)
-	}
-	job.speedPrevBytes = transferred
-	job.speedPrevTime = now
 }
 
 // runJob executes the download job.
@@ -686,8 +701,7 @@ func (m *JobManager) runJob(job *Job) {
 	now := time.Now()
 	job.StartedAt = &now
 	// Reset the speed window so this run measures only its own throughput.
-	job.speedPrevBytes = 0
-	job.speedPrevTime = time.Time{}
+	job.speedSamples = nil
 	startSnap := m.cloneJobLocked(job)
 	m.mu.Unlock()
 	m.notifyListeners(startSnap)
@@ -777,7 +791,7 @@ func (m *JobManager) runJob(job *Job) {
 				}
 			}
 			job.Progress.DownloadedBytes = total
-			updateJobSpeed(job, transferred)
+			updateJobSpeed(job, transferred, time.Now())
 
 		case "file_done":
 			for i := range job.Files {

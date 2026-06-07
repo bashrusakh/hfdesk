@@ -532,23 +532,39 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		items = append(items, item)
 	}
 
-	// Append a vision-encoder companion item when mmproj files are present.
-	// This is what makes multimodal GGUF downloads actually work end-to-end
-	// (github issue #76) — the user picks a quant and the mmproj tags along
-	// via the comma-separated -F filter list.
+	// Append a vision-encoder companion item for EVERY mmproj file present, so
+	// the user can pick the precision they want (f16 / bf16 / f32 / …) instead
+	// of being limited to one. The preferred file (preferredMMProj precedence)
+	// is marked Recommended so the recommended selection still auto-bundles a
+	// sensible mmproj alongside the chosen quant (github issue #76). Each item
+	// gets a filter derived from its own filename so it matches exactly one
+	// file via the comma-separated -F filter list.
 	if len(info.MMProjFiles) > 0 {
-		chosen, filter := preferredMMProj(info.MMProjFiles)
-		items = append(items, SelectableItem{
-			ID:          "mmproj",
-			Label:       filepath.Base(chosen.Name),
-			Description: "Multimodal projector; required alongside the LLM quant for vision/multimodal models",
-			Size:        chosen.Size,
-			SizeHuman:   chosen.SizeHuman,
-			Recommended: true,
-			Category:    "vision_encoder",
-			FilterValue: filter,
-			Files:       []string{chosen.Path},
-		})
+		preferred, _ := preferredMMProj(info.MMProjFiles)
+		// Emit the preferred file first (default/recommended pick), then the
+		// rest, so the recommended mmproj appears at the top of the list.
+		ordered := make([]FileInfo, 0, len(info.MMProjFiles))
+		ordered = append(ordered, preferred)
+		for _, f := range info.MMProjFiles {
+			if f.Name != preferred.Name {
+				ordered = append(ordered, f)
+			}
+		}
+		for _, f := range ordered {
+			base := filepath.Base(f.Name)
+			filter := strings.ToLower(strings.TrimSuffix(base, ".gguf"))
+			items = append(items, SelectableItem{
+				ID:          "mmproj-" + filter,
+				Label:       base,
+				Description: "Multimodal projector; required alongside the LLM quant for vision/multimodal models",
+				Size:        f.Size,
+				SizeHuman:   f.SizeHuman,
+				Recommended: f.Name == preferred.Name,
+				Category:    "vision_encoder",
+				FilterValue: filter,
+				Files:       []string{f.Path},
+			})
+		}
 	}
 
 	return items

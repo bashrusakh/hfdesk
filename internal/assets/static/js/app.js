@@ -647,31 +647,9 @@
         ? readme.html
         : renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
       section.hidden = !preview.innerHTML.trim();
-      if (!section.hidden) applyReadmeCollapse(section, preview);
     } catch (_) {
       section.hidden = true;
     }
-  }
-
-  // Clamp a long README behind a Show more / Show less toggle so the analysis
-  // panel stays compact.
-  function applyReadmeCollapse(section, preview) {
-    const old = section.querySelector('.readme-toggle');
-    if (old) old.remove();
-    preview.classList.remove('readme-clamped');
-    requestAnimationFrame(() => {
-      const CLAMP = 440;
-      if (preview.scrollHeight <= CLAMP + 80) return;
-      preview.classList.add('readme-clamped');
-      const btn = document.createElement('button');
-      btn.className = 'btn-link readme-toggle';
-      btn.textContent = 'Show more';
-      btn.addEventListener('click', () => {
-        const clamped = preview.classList.toggle('readme-clamped');
-        btn.textContent = clamped ? 'Show more' : 'Show less';
-      });
-      preview.after(btn);
-    });
   }
 
   function renderMarkdownPreview(markdown, baseRawURL) {
@@ -2872,16 +2850,32 @@
     localStorage.setItem('dlStatus:' + repo, JSON.stringify(map));
   }
   function refreshDlStatusFromJobs(repo) {
-    // Sync localStorage status from live job list
-    const jobs = Array.from(state.jobs.values());
-    jobs.forEach(j => {
+    // Reconcile per-quant status with the live job list. Active jobs set
+    // running/queued/done; stale running/queued entries (job gone, cancelled or
+    // failed) are cleared so the Download button reappears. 'done' is kept.
+    const map = getDlStatus(repo);
+    const active = {};
+    Array.from(state.jobs.values()).forEach(j => {
       if (j.repo !== repo) return;
       const f = (j.filters || []).join(',') || '__all__';
-      const s = j.status === 'completed' ? 'done'
-              : (j.status === 'running' || j.status === 'queued') ? 'running'
-              : null;
-      if (s) setDlStatus(repo, f, s);
+      if (j.status === 'completed') active[f] = 'done';
+      else if (j.status === 'running') active[f] = 'running';
+      else if (j.status === 'queued') active[f] = 'queued';
     });
+    let changed = false;
+    Object.keys(map).forEach(f => {
+      if ((map[f] === 'running' || map[f] === 'queued') && !active[f]) {
+        delete map[f];
+        changed = true;
+      }
+    });
+    Object.keys(active).forEach(f => {
+      if (map[f] !== active[f]) {
+        map[f] = active[f];
+        changed = true;
+      }
+    });
+    if (changed) localStorage.setItem('dlStatus:' + repo, JSON.stringify(map));
   }
 
   function renderSelectableItems(items, containerId) {
@@ -2926,21 +2920,21 @@
 
         const fv = item.filter_value || item.id || '';
         const dlStatus = dlMap[fv] || '';
-        const statusHtml = dlStatus === 'done'    ? `<span class="quant-dl-status quant-dl-done" title="Downloaded">✓</span>`
-                         : dlStatus === 'running'  ? `<span class="quant-dl-status quant-dl-running" title="Downloading…">⟳</span>`
-                         : dlStatus === 'queued'   ? `<span class="quant-dl-status quant-dl-queued" title="Queued">…</span>`
-                         : '';
 
-        const dlActive = dlStatus === 'running' || dlStatus === 'queued';
+        // Left control: a Download button when idle; otherwise it is REPLACED by
+        // a status chip reflecting the quant's state in the download queue
+        // (done / downloading / queued) so it can't be started twice.
         const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                  <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
                </svg>`;
         const dlBtn = dlStatus === 'done'
-          ? `<button class="quant-dl-btn quant-dl-btn-done" disabled title="Already downloaded">✓</button>`
-          : dlActive
-            ? `<button class="quant-dl-btn" disabled title="${dlStatus === 'queued' ? 'Queued' : 'Downloading…'}">${dlIcon}</button>`
-            : `<button class="quant-dl-btn" title="Download this quantization"
+          ? `<span class="quant-dl-btn quant-dl-btn-done" title="Already downloaded">✓</span>`
+          : dlStatus === 'queued'
+            ? `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`
+          : dlStatus === 'running'
+            ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
+          : `<button class="quant-dl-btn" title="Download this quantization"
                onclick="downloadQuant('${escapeHtml(repo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">${dlIcon}</button>`;
 
         html += `
@@ -2952,7 +2946,6 @@
             ${ram}
             ${stars}
             ${desc}
-            ${statusHtml}
           </div>`;
       });
 
@@ -2983,11 +2976,11 @@
       await api('POST', '/download', body);
 
       setDlStatus(repo, filterValue, 'queued');
-      // Update button in DOM
+      // Replace the download button with the queued chip immediately.
       const row = document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
       if (row) {
         const btn = row.querySelector('.quant-dl-btn');
-        if (btn) btn.outerHTML = `<span class="quant-dl-status quant-dl-queued" title="Queued">…</span>`;
+        if (btn) btn.outerHTML = `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;
       }
 
       showToast(`Queued: ${label || repo}`, 'success');
