@@ -777,17 +777,6 @@ a {
   line-height: 1.6;
 }
 
-.readme-preview.readme-clamped {
-  max-height: 440px;
-  overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
-}
-
-.readme-toggle {
-  margin-top: 8px;
-}
-
 .readme-preview h4,
 .readme-preview h5,
 .readme-preview h6 {
@@ -3963,7 +3952,7 @@ a {
   padding: 0;
 }
 
-.quant-dl-btn:hover {
+button.quant-dl-btn:hover {
   background: var(--color-primary);
   color: #fff;
   border-color: var(--color-primary);
@@ -3974,6 +3963,30 @@ a {
   border-color: rgba(16, 185, 129, 0.3);
   color: var(--color-success);
   cursor: default;
+}
+
+.quant-dl-btn-queued {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: var(--color-warning);
+  cursor: default;
+  font-weight: 700;
+}
+
+.quant-dl-btn-running {
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: var(--color-info);
+  cursor: default;
+}
+
+.quant-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
 }
 
 .quant-label {
