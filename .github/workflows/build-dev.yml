@@ -1,8 +1,16 @@
 name: Build dev
 
+# Builds a test binary for every pushed branch (not just main) so a change
+# can be smoke-tested from the workflow-run artifact before merging. A
+# pull_request trigger is deliberately omitted: branches live in this repo,
+# so it would only duplicate the push run.
 on:
   push:
-    branches: [main]
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-windows:
