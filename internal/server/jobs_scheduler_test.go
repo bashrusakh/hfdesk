@@ -147,3 +147,33 @@ func TestUpdateJobSpeed(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateJobETA(t *testing.T) {
+	job := &Job{}
+	job.Progress.TotalBytes = 100_000_000
+	start := time.Now()
+
+	// Nothing transferred yet — no estimate.
+	updateJobSpeed(job, 0, start)
+	if job.Progress.EtaSeconds != 0 {
+		t.Fatalf("ETA before any transfer should be 0, got %d", job.Progress.EtaSeconds)
+	}
+
+	// Steady 2 MB/s fresh download: DownloadedBytes mirrors transferred.
+	for i := 1; i <= 10; i++ {
+		transferred := int64(i) * 1_000_000
+		job.Progress.DownloadedBytes = transferred
+		updateJobSpeed(job, transferred, start.Add(time.Duration(i)*500*time.Millisecond))
+	}
+	// 10 MB moved in 5s, 90 MB remaining → ≈45s.
+	if eta := job.Progress.EtaSeconds; eta < 40 || eta > 50 {
+		t.Fatalf("expected ETA ≈45s, got %d", eta)
+	}
+
+	// Everything downloaded — the estimate clears.
+	job.Progress.DownloadedBytes = job.Progress.TotalBytes
+	updateJobSpeed(job, job.Progress.TotalBytes, start.Add(60*time.Second))
+	if job.Progress.EtaSeconds != 0 {
+		t.Fatalf("ETA after completion should be 0, got %d", job.Progress.EtaSeconds)
+	}
+}

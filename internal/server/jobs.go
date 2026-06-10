@@ -56,6 +56,9 @@ type Job struct {
 	// transferred this run (see the file_progress handler), so the reading is
 	// steady and resuming a partial repo doesn't count already-present bytes.
 	speedSamples []speedSample `json:"-"`
+	// speedRunStart is when this run's first speed sample was taken; the
+	// whole-run average rate measured from it anchors the ETA estimate.
+	speedRunStart time.Time `json:"-"`
 }
 
 // speedSample is one (time, cumulative-transferred-bytes) point in a job's
@@ -72,6 +75,11 @@ type JobProgress struct {
 	TotalBytes      int64 `json:"totalBytes"`
 	DownloadedBytes int64 `json:"downloadedBytes"`
 	BytesPerSecond  int64 `json:"bytesPerSecond"`
+	// EtaSeconds is the server-computed remaining-time estimate; 0 means
+	// unknown. It is anchored to the whole-run average rate rather than the
+	// displayed speed, because remaining/currentSpeed multiplies any speed
+	// wobble by the bytes left and makes the ETA jump.
+	EtaSeconds int64 `json:"etaSeconds"`
 }
 
 // JobFileProgress holds per-file progress.
@@ -663,6 +671,9 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
+	if len(job.speedSamples) == 0 {
+		job.speedRunStart = now
+	}
 	// Drop samples older than the window, then add the current one.
 	cutoff := now.Add(-speedWindow)
 	kept := make([]speedSample, 0, len(job.speedSamples)+1)
@@ -686,6 +697,28 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 		}
 		job.Progress.BytesPerSecond = int64(rate)
 	}
+	updateJobETA(job, transferred, now)
+}
+
+// updateJobETA recomputes EtaSeconds. The predictor is mostly the whole-run
+// average rate (transferred / elapsed) — for remaining-time estimation the
+// long-run average is far steadier than the displayed speed, the way curl and
+// rsync compute their ETAs — blended with a little of the current smoothed
+// speed so a genuine, lasting throughput change still pulls the estimate over.
+func updateJobETA(job *Job, transferred int64, now time.Time) {
+	remaining := job.Progress.TotalBytes - job.Progress.DownloadedBytes
+	elapsed := now.Sub(job.speedRunStart).Seconds()
+	if remaining <= 0 || elapsed < 1.0 || transferred <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	runAvg := float64(transferred) / elapsed
+	predictor := 0.7*runAvg + 0.3*float64(job.Progress.BytesPerSecond)
+	if predictor <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	job.Progress.EtaSeconds = int64(float64(remaining)/predictor + 0.5)
 }
 
 // runJob executes the download job.
@@ -819,6 +852,7 @@ func (m *JobManager) runJob(job *Job) {
 			// Download is done; post-processing (friendly view, manifest) runs.
 			job.Phase = "finalizing"
 			job.Progress.BytesPerSecond = 0
+			job.Progress.EtaSeconds = 0
 		}
 
 		progressSnap := m.cloneJobLocked(job)

@@ -1144,14 +1144,23 @@
     };
   }
 
+  // formatDuration renders an ETA the way browser download managers do:
+  // the longer the estimate, the coarser the unit. Second-level precision is
+  // only meaningful (and only shown) under two minutes — beyond that it just
+  // exposes estimator noise as flicker.
   function formatDuration(seconds) {
     if (!Number.isFinite(seconds) || seconds <= 0) return 'ETA --';
     const s = Math.max(1, Math.round(seconds));
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
     if (h > 0) return `ETA ${h}h ${m}m`;
-    if (m > 0) return `ETA ${m}m ${sec}s`;
+    if (m >= 2) return `ETA ${m}m`;
+    const sec = Math.max(5, Math.round(s / 5) * 5);
+    if (sec >= 60) {
+      const mm = Math.floor(sec / 60);
+      const ss = sec % 60;
+      return ss > 0 ? `ETA ${mm}m ${ss}s` : `ETA ${mm}m`;
+    }
     return `ETA ${sec}s`;
   }
 
@@ -1264,7 +1273,8 @@
     }
 
     const etaEl = el.querySelector('[data-role="eta"]');
-    if (speed > 0 && totalBytes > downloadedBytes) {
+    const eta = p.etaSeconds || 0;
+    if (eta > 0 && totalBytes > downloadedBytes) {
       // Progress frames arrive ~4x per second; rewriting the ETA on every
       // frame makes the trailing seconds flicker. Refresh it at most once a
       // second — well within how fast a remaining-time estimate can
@@ -1272,7 +1282,7 @@
       const now = Date.now();
       const lastEta = Number(etaEl.dataset.lastUpdate || 0);
       if (etaEl.style.display === 'none' || now - lastEta >= 1000) {
-        const etaText = formatDuration((totalBytes - downloadedBytes) / speed);
+        const etaText = formatDuration(eta);
         if (etaEl.textContent !== etaText) etaEl.textContent = etaText;
         etaEl.dataset.lastUpdate = String(now);
       }
