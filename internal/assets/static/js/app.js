@@ -1265,8 +1265,17 @@
 
     const etaEl = el.querySelector('[data-role="eta"]');
     if (speed > 0 && totalBytes > downloadedBytes) {
-      const etaText = formatDuration((totalBytes - downloadedBytes) / speed);
-      if (etaEl.textContent !== etaText) etaEl.textContent = etaText;
+      // Progress frames arrive ~4x per second; rewriting the ETA on every
+      // frame makes the trailing seconds flicker. Refresh it at most once a
+      // second — well within how fast a remaining-time estimate can
+      // meaningfully change.
+      const now = Date.now();
+      const lastEta = Number(etaEl.dataset.lastUpdate || 0);
+      if (etaEl.style.display === 'none' || now - lastEta >= 1000) {
+        const etaText = formatDuration((totalBytes - downloadedBytes) / speed);
+        if (etaEl.textContent !== etaText) etaEl.textContent = etaText;
+        etaEl.dataset.lastUpdate = String(now);
+      }
       if (etaEl.style.display === 'none') etaEl.style.display = '';
     } else if (etaEl.style.display !== 'none') {
       etaEl.style.display = 'none';

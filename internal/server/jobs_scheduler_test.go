@@ -99,25 +99,51 @@ func TestJobManager_LoweringMaxActiveRequeuesExcess(t *testing.T) {
 
 func TestUpdateJobSpeed(t *testing.T) {
 	job := &Job{}
+	start := time.Now()
 
 	// First sample only establishes a baseline; no speed yet.
-	updateJobSpeed(job, 1000)
+	updateJobSpeed(job, 0, start)
 	if job.Progress.BytesPerSecond != 0 {
 		t.Fatalf("first sample should not set speed, got %d", job.Progress.BytesPerSecond)
 	}
 
-	// Simulate ~1s elapsed and 2 MB transferred since the baseline.
-	job.speedPrevTime = time.Now().Add(-1 * time.Second)
-	job.speedPrevBytes = 1000
-	updateJobSpeed(job, 1000+2_000_000)
+	// A sample arriving sooner than the 400ms throttle is ignored entirely.
+	updateJobSpeed(job, 50_000_000, start.Add(200*time.Millisecond))
+	if got := len(job.speedSamples); got != 1 {
+		t.Fatalf("throttled sample was recorded: %d samples", got)
+	}
+	if job.Progress.BytesPerSecond != 0 {
+		t.Fatalf("throttled sample changed speed: %d", job.Progress.BytesPerSecond)
+	}
+
+	// Steady 2 MB/s for a few seconds settles the reading at ~2 MB/s.
+	for i := 1; i <= 6; i++ {
+		now := start.Add(time.Duration(i) * 500 * time.Millisecond)
+		updateJobSpeed(job, int64(i)*1_000_000, now)
+	}
 	if job.Progress.BytesPerSecond < 1_500_000 || job.Progress.BytesPerSecond > 2_500_000 {
 		t.Fatalf("expected ~2 MB/s, got %d", job.Progress.BytesPerSecond)
 	}
 
-	// A sample taken too soon (< 0.5s) is ignored, leaving the speed unchanged.
+	// The rate suddenly doubles to 4 MB/s. The EMA blend keeps the very next
+	// reading between the old rate and the raw windowed rate instead of
+	// snapping to it.
 	prev := job.Progress.BytesPerSecond
-	updateJobSpeed(job, 1000+2_000_000+9_000_000)
-	if job.Progress.BytesPerSecond != prev {
-		t.Fatalf("sub-window sample changed speed: %d -> %d", prev, job.Progress.BytesPerSecond)
+	updateJobSpeed(job, 6_000_000+2_000_000, start.Add(3500*time.Millisecond))
+	got := job.Progress.BytesPerSecond
+	if got <= prev {
+		t.Fatalf("speed did not rise after a faster sample: %d -> %d", prev, got)
+	}
+	if got >= 4_000_000 {
+		t.Fatalf("speed snapped to the raw rate instead of smoothing: %d -> %d", prev, got)
+	}
+
+	// Samples older than speedWindow fall out of the window.
+	later := start.Add(speedWindow + 4*time.Second)
+	updateJobSpeed(job, 9_000_000, later)
+	for _, s := range job.speedSamples {
+		if age := later.Sub(s.t); age > speedWindow {
+			t.Fatalf("stale sample kept: age %v", age)
+		}
 	}
 }

@@ -645,18 +645,19 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Unlock()
 }
 
-// updateJobSpeed recomputes BytesPerSecond over a short sliding window of bytes
-// transferred this run, smoothed with a simple EMA so the reading reflects
-// current throughput instead of a cumulative average. Samples are taken at most
-// twice a second; the window never includes skipped/already-present bytes.
-// speedWindow is how far back the moving average looks. A few seconds keeps
-// the displayed speed steady while still tracking real changes.
-const speedWindow = 4 * time.Second
+// speedWindow is how far back the windowed average looks. Progress at the
+// application level is bursty (part-file stats, chunked reads), so the window
+// must be long enough to average the bursts out, the way the OS smooths its
+// network-adapter graph.
+const speedWindow = 10 * time.Second
 
-// updateJobSpeed sets BytesPerSecond to the average rate over the last
-// speedWindow seconds, computed from the cumulative bytes transferred this run
-// (skipped/already-present bytes excluded). Samples are throttled so the window
-// stays small. now is passed in for deterministic testing.
+// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes
+// transferred this run (skipped/already-present bytes excluded). The rate is
+// averaged over a sliding speedWindow, then blended into the previous reading
+// with a mild EMA — the windowed average alone still jitters as old samples
+// fall off the window, and that jitter makes the displayed speed (and any ETA
+// derived from it) jump around. Samples are throttled to a few per second so
+// the window stays small. now is passed in for deterministic testing.
 func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 	// Throttle to a few samples per second.
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
@@ -679,6 +680,9 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 		rate := float64(transferred-oldest.bytes) / span
 		if rate < 0 {
 			rate = 0
+		}
+		if prev := job.Progress.BytesPerSecond; prev > 0 {
+			rate = 0.7*float64(prev) + 0.3*rate
 		}
 		job.Progress.BytesPerSecond = int64(rate)
 	}
