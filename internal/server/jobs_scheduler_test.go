@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // TestJobManager_DispatchRespectsMaxActive verifies that no more than
@@ -145,6 +147,52 @@ func TestUpdateJobSpeed(t *testing.T) {
 		if age := later.Sub(s.t); age > speedWindow {
 			t.Fatalf("stale sample kept: age %v", age)
 		}
+	}
+}
+
+// TestApplyJobProgress_FileFinalizingPhase verifies that the job only enters
+// the finalizing phase once nothing is left downloading: a file finishing its
+// transfer while another is still active must not flip the phase, and once
+// the last transfer ends the stale speed/ETA readings are cleared.
+func TestApplyJobProgress_FileFinalizingPhase(t *testing.T) {
+	job := &Job{}
+	now := time.Now()
+
+	apply := func(evt hfdownloader.ProgressEvent) {
+		applyJobProgress(job, evt, now)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "b.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "b.gguf"})
+
+	// a finishes its transfer while b is still active: no job-level phase.
+	apply(hfdownloader.ProgressEvent{Event: "file_finalizing", Path: "a.gguf"})
+	if job.Files[0].Status != "finalizing" {
+		t.Fatalf("file a status = %q, want finalizing", job.Files[0].Status)
+	}
+	if job.Phase != "" {
+		t.Fatalf("phase flipped to %q while b is still downloading", job.Phase)
+	}
+
+	// b finishes its transfer too: the whole job is now local post-processing.
+	job.Progress.BytesPerSecond = 1_000_000
+	job.Progress.EtaSeconds = 42
+	apply(hfdownloader.ProgressEvent{Event: "file_finalizing", Path: "b.gguf"})
+	if job.Phase != "finalizing" {
+		t.Fatalf("phase = %q, want finalizing", job.Phase)
+	}
+	if job.Progress.BytesPerSecond != 0 || job.Progress.EtaSeconds != 0 {
+		t.Fatalf("stale speed/ETA not cleared: %d B/s, %d s",
+			job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "b.gguf"})
+	if job.Files[0].Status != "complete" || job.Files[1].Status != "complete" {
+		t.Fatalf("files not complete after file_done: %q, %q",
+			job.Files[0].Status, job.Files[1].Status)
 	}
 }
 

@@ -315,6 +315,14 @@ LOOP:
 				return
 			}
 
+			// The bytes are on disk, but SHA-256 verification rereads the
+			// whole file and storing it into the cache may copy it again —
+			// minutes of local I/O for a large model, during which no
+			// file_progress arrives. Mark the file as finalizing so the job
+			// doesn't look stuck at 100% (the post-loop "finalizing" event
+			// only covers work after every file is done).
+			emit(ProgressEvent{Event: "file_finalizing", Path: finalRel, Message: "verifying"})
+
 			// Verify after download
 			if it.LFS && it.SHA256 != "" {
 				if err := verifySHA256(dst, it.SHA256); err != nil {
@@ -756,6 +764,11 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// file_progress value is the full byte count, regardless of when the
 	// ticker happened to last fire.
 	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
+
+	// Everything past this point is local disk I/O: stitching the part files
+	// back into one rewrites the entire payload, which takes real time for
+	// multi-GB files. Signal it so the UI doesn't sit silently at 100%.
+	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "assembling parts"})
 
 	// Assemble parts
 	out, err := os.Create(dst + ".part")

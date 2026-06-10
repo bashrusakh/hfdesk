@@ -1167,6 +1167,7 @@
   function activeJobFile(job) {
     const files = Array.isArray(job.files) ? job.files : [];
     return files.find(f => f.status === 'active')
+        || files.find(f => f.status === 'finalizing')
         || files.find(f => f.status === 'pending')
         || files[files.length - 1]
         || null;

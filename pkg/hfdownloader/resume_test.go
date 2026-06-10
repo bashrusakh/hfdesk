@@ -286,3 +286,68 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 		}
 	}
 }
+
+// TestDownloadMultipart_EmitsFileFinalizing verifies that once all parts are
+// transferred, downloadMultipart announces the local post-processing window
+// (part assembly, then verify/store in the caller) with a file_finalizing
+// event after the explicit 100% progress reading. Without it the UI sits at
+// 100% with no status while multi-GB files are stitched and hashed.
+func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
+	tmpDir := t.TempDir()
+	full := make([]byte, 10000)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	dst := filepath.Join(tmpDir, "fin.bin")
+	it := PlanItem{
+		RelativePath: "fin.bin",
+		URL:          srv.URL + "/fin.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: true,
+	}
+
+	// The progress ticker emits from its own goroutine, so guard the slice.
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	emit := func(ev ProgressEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, emit); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+
+	fullProgressAt, finalizingAt := -1, -1
+	for i, ev := range events {
+		switch {
+		case ev.Event == "file_progress" && ev.Downloaded == ev.Total:
+			fullProgressAt = i
+		case ev.Event == "file_finalizing":
+			finalizingAt = i
+		}
+	}
+	if finalizingAt == -1 {
+		t.Fatal("no file_finalizing event emitted")
+	}
+	if fullProgressAt == -1 {
+		t.Fatal("no 100% file_progress event emitted")
+	}
+	if finalizingAt < fullProgressAt {
+		t.Errorf("file_finalizing (index %d) emitted before the 100%% progress reading (index %d)", finalizingAt, fullProgressAt)
+	}
+}

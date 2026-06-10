@@ -80,6 +80,7 @@ The ProgressFunc callback receives events throughout the download:
   - plan_item: A file has been added to the download plan
   - file_start: Download of a file has started
   - file_progress: Periodic progress update during download
+  - file_finalizing: Transfer finished; local post-processing (part assembly, hash verification, cache store) is running
   - file_done: File download complete (or skipped)
   - retry: A retry attempt is being made
   - error: An error occurred
