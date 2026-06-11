@@ -2155,9 +2155,11 @@
       // Display config file paths
       const configPathEl = $('#settingsConfigPath');
       if (configPathEl && data.configFile) {
-        configPathEl.innerHTML = `Config: <code>${escapeHtml(data.configFile)}</code>`;
+        const fileName = path => String(path || '').split(/[\\/]/).pop() || path;
+        const escapeAttr = value => escapeHtml(value).replace(/"/g, '&quot;');
+        configPathEl.innerHTML = `<span class="config-chip" title="${escapeAttr(data.configFile)}">Config: <code>${escapeHtml(fileName(data.configFile))}</code></span>`;
         if (data.targetsFile) {
-          configPathEl.innerHTML += ` &nbsp;|&nbsp; Targets: <code>${escapeHtml(data.targetsFile)}</code>`;
+          configPathEl.innerHTML += `<span class="config-chip" title="${escapeAttr(data.targetsFile)}">Targets: <code>${escapeHtml(fileName(data.targetsFile))}</code></span>`;
         }
       }
 
@@ -2189,6 +2191,7 @@
 
   function initSettingsPage() {
     $('#saveSettingsBtn')?.addEventListener('click', saveSettings);
+    $('#resetSettingsBtn')?.addEventListener('click', resetSettings);
     $('#downloadLayout')?.addEventListener('change', syncStorageFields);
 
     // Toggle password visibility
@@ -2267,6 +2270,31 @@
     if (localGroup) {
       localGroup.style.display = layout === 'local' ? '' : 'none';
     }
+  }
+
+  function resetSettings() {
+    if (!confirm('Reset all settings to defaults? This cannot be undone.')) return;
+
+    const setVal = (id, val) => { const el = $(id); if (el) el.value = val; };
+    const setChecked = (id, checked) => { const el = $(id); if (el) el.checked = checked; };
+
+    setVal('#cacheDirInput', '');
+    setVal('#localDirInput', '');
+    setVal('#localScanDirs', '');
+    setVal('#downloadLayout', 'cache');
+    setVal('#hfToken', '');
+    setVal('#connections', '8');
+    setVal('#maxActive', '3');
+    setVal('#retries', '4');
+    setVal('#verify', 'size');
+    setVal('#endpoint', '');
+    setVal('#proxyUrl', '');
+    setVal('#proxyUsername', '');
+    setVal('#proxyPassword', '');
+    setVal('#proxyNoProxy', '');
+    setChecked('#proxyNoEnvProxy', false);
+    syncStorageFields();
+    showToast('Settings reset to defaults — save to apply', 'info');
   }
 
   // =========================================

@@ -648,167 +648,175 @@
             <p class="page-subtitle">Configure your download preferences</p>
             <p class="page-config-path" id="settingsConfigPath"></p>
           </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost btn-sm" id="resetSettingsBtn">Reset defaults</button>
+            <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+          </div>
         </header>
 
-        <div class="settings-grid">
-          <div class="card">
-            <div class="card-header">
-              <h3>Storage</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-group">
-                <label for="downloadLayout">Default download layout</label>
-                <select id="downloadLayout">
-                  <option value="cache">HF cache layout</option>
-                  <option value="local">Local files (owner/model)</option>
-                </select>
-                <p class="form-hint">Local files use owner/model folders, the same shape LM Studio expects.</p>
+        <div class="settings-body">
+          <div class="settings-layout">
+            <div class="card settings-card">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                </svg>
+                <h3>Storage</h3>
               </div>
-              <div class="form-group" id="cacheDirGroup">
-                <label for="cacheDirInput">HuggingFace Cache Directory</label>
-                <input type="text" id="cacheDirInput" placeholder="Leave empty for the default HuggingFace cache">
-                <p class="form-hint">
-                  Downloads use the standard HuggingFace cache structure for Python compatibility.
-                </p>
-              </div>
-              <div class="form-group" id="localDirGroup">
-                <label for="localDirInput">Default local download folder</label>
-                <input type="text" id="localDirInput" placeholder="D:\Models">
-                <p class="form-hint">Downloads go to this folder as owner/model/files. Individual downloads can override it.</p>
-              </div>
-              <div class="form-group">
-                <label for="localScanDirs">Local model folders</label>
-                <textarea id="localScanDirs" rows="3" placeholder="D:\Models&#10;I:\LM Studio\models"></textarea>
-                <p class="form-hint">
-                  One folder per line. HFDesk scans them as owner/model folders and marks matching Hub results as local.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3>Authentication</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-group">
-                <label for="hfToken">HuggingFace Token</label>
-                <div class="input-with-toggle">
-                  <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx">
-                  <button type="button" class="toggle-visibility" data-target="hfToken">
-                    <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
-                    </svg>
-                    <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
-                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
-                      <line x1="1" y1="1" x2="23" y2="23"/>
-                    </svg>
-                  </button>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="downloadLayout" title="Choose cache-compatible or LM Studio-style folders.">Download layout</label>
+                  <div class="settings-control settings-control-sm">
+                    <select id="downloadLayout">
+                      <option value="cache">HF cache</option>
+                      <option value="local">Local folders</option>
+                    </select>
+                  </div>
                 </div>
-                <p class="form-hint">Required for private repositories and gated models</p>
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3>Performance</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-row">
-                <div class="form-group">
-                  <label for="connections">Connections per file</label>
-                  <input type="number" id="connections" value="8" min="1" max="32">
+                <div class="settings-row" id="cacheDirGroup">
+                  <label for="cacheDirInput" title="Leave empty to use the standard HuggingFace cache.">HF cache directory</label>
+                  <div class="settings-control">
+                    <input type="text" id="cacheDirInput" class="path-input" placeholder="Default HuggingFace cache" spellcheck="false">
+                  </div>
                 </div>
-                <div class="form-group">
-                  <label for="maxActive">Concurrent downloads</label>
-                  <input type="number" id="maxActive" value="3" min="1" max="10">
+                <div class="settings-row" id="localDirGroup">
+                  <label for="localDirInput" title="Files go to owner/model folders.">Local download folder</label>
+                  <div class="settings-control">
+                    <input type="text" id="localDirInput" class="path-input" placeholder="D:\Models" spellcheck="false">
+                  </div>
                 </div>
-              </div>
-              <div class="form-group">
-                <label for="retries">Retry attempts</label>
-                <input type="number" id="retries" value="4" min="0" max="20">
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3>Verification</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-group">
-                <label for="verify">File verification mode</label>
-                <select id="verify">
-                  <option value="size">Size only (fast)</option>
-                  <option value="sha256">SHA-256 (secure)</option>
-                  <option value="none">None</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3>Advanced</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-group">
-                <label for="endpoint">HuggingFace Endpoint</label>
-                <input type="text" id="endpoint" placeholder="https://huggingface.co">
-                <p class="form-hint">Use a custom endpoint (e.g., https://hf-mirror.com)</p>
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3>Proxy Settings</h3>
-            </div>
-            <div class="card-body">
-              <div class="form-group">
-                <label for="proxyUrl">Proxy URL</label>
-                <input type="text" id="proxyUrl" placeholder="http://proxy:8080 or socks5://proxy:1080">
-                <p class="form-hint">HTTP, HTTPS, or SOCKS5 proxy URL. Leave empty for direct connection or environment proxy.</p>
-              </div>
-              <div class="form-row">
-                <div class="form-group">
-                  <label for="proxyUsername">Username</label>
-                  <input type="text" id="proxyUsername" placeholder="(optional)">
-                </div>
-                <div class="form-group">
-                  <label for="proxyPassword">Password</label>
-                  <div class="input-with-toggle">
-                    <input type="password" id="proxyPassword" placeholder="(optional)">
-                    <button type="button" class="toggle-visibility" data-target="proxyPassword">
-                      <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
-                      </svg>
-                      <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
-                        <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
-                        <line x1="1" y1="1" x2="23" y2="23"/>
-                      </svg>
-                    </button>
+                <div class="settings-row settings-row-top">
+                  <label for="localScanDirs" title="One folder per line. Matching Hub results are marked as local.">Local model folders</label>
+                  <div class="settings-control">
+                    <textarea id="localScanDirs" rows="2" class="path-input" placeholder="D:\Models&#10;I:\LM Studio\models" spellcheck="false"></textarea>
                   </div>
                 </div>
               </div>
-              <div class="form-group">
-                <label for="proxyNoProxy">No Proxy</label>
-                <input type="text" id="proxyNoProxy" placeholder="localhost,.internal.com,10.0.0.0/8">
-                <p class="form-hint">Comma-separated list of hosts to bypass proxy</p>
+            </div>
+
+            <div class="card settings-card">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                </svg>
+                <h3>Transfer</h3>
               </div>
-              <div class="form-group">
-                <label class="checkbox-label">
-                  <input type="checkbox" id="proxyNoEnvProxy">
-                  <span>Ignore HTTP_PROXY/HTTPS_PROXY environment variables</span>
-                </label>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="connections">Connections per file</label>
+                  <div class="settings-control settings-control-xs">
+                    <input type="number" id="connections" value="8" min="1" max="32">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="maxActive">Concurrent downloads</label>
+                  <div class="settings-control settings-control-xs">
+                    <input type="number" id="maxActive" value="3" min="1" max="10">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="retries">Retry attempts</label>
+                  <div class="settings-control settings-control-xs">
+                    <input type="number" id="retries" value="4" min="0" max="20">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="verify" title="SHA-256 is slower but verifies file integrity.">Verification mode</label>
+                  <div class="settings-control settings-control-md">
+                    <select id="verify">
+                      <option value="size">Size only</option>
+                      <option value="sha256">SHA-256</option>
+                      <option value="none">None</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card settings-card settings-card-wide">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+                </svg>
+                <h3>Hub Access</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="endpoint" title="Use a mirror endpoint when needed.">HuggingFace Endpoint</label>
+                  <div class="settings-control">
+                    <input type="text" id="endpoint" placeholder="https://huggingface.co" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="hfToken" title="Required for private repositories and gated models.">HuggingFace Token</label>
+                  <div class="settings-control">
+                    <div class="input-with-toggle">
+                      <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx">
+                      <button type="button" class="toggle-visibility" data-target="hfToken">
+                        <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                        </svg>
+                        <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                          <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card settings-card settings-card-wide">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                </svg>
+                <h3>Proxy</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="proxyUrl" title="HTTP, HTTPS, or SOCKS5 proxy. Leave empty for direct connection or environment proxy.">Proxy URL</label>
+                  <div class="settings-control">
+                    <input type="text" id="proxyUrl" class="path-input" placeholder="http://proxy:8080 or socks5://proxy:1080" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label>Credentials</label>
+                  <div class="settings-control settings-pair-control">
+                    <input type="text" id="proxyUsername" placeholder="Username (optional)" spellcheck="false">
+                    <div class="input-with-toggle">
+                      <input type="password" id="proxyPassword" placeholder="(optional)" spellcheck="false">
+                      <button type="button" class="toggle-visibility" data-target="proxyPassword">
+                        <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                        </svg>
+                        <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                          <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
+                          <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="proxyNoProxy" title="Comma-separated hosts, domains, or CIDR ranges to bypass.">No Proxy</label>
+                  <div class="settings-control">
+                    <input type="text" id="proxyNoProxy" class="path-input" placeholder="localhost,.internal.com,10.0.0.0/8" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-label-spacer"></span>
+                  <div class="settings-control">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="proxyNoEnvProxy">
+                      <span>Ignore <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> environment variables</span>
+                    </label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-
-        <div class="settings-actions">
-          <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
         </div>
       </section>
     </main>
