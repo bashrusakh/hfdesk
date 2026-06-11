@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // TestJobManager_DispatchRespectsMaxActive verifies that no more than
@@ -99,25 +101,127 @@ func TestJobManager_LoweringMaxActiveRequeuesExcess(t *testing.T) {
 
 func TestUpdateJobSpeed(t *testing.T) {
 	job := &Job{}
+	start := time.Now()
 
 	// First sample only establishes a baseline; no speed yet.
-	updateJobSpeed(job, 1000)
+	updateJobSpeed(job, 0, start)
 	if job.Progress.BytesPerSecond != 0 {
 		t.Fatalf("first sample should not set speed, got %d", job.Progress.BytesPerSecond)
 	}
 
-	// Simulate ~1s elapsed and 2 MB transferred since the baseline.
-	job.speedPrevTime = time.Now().Add(-1 * time.Second)
-	job.speedPrevBytes = 1000
-	updateJobSpeed(job, 1000+2_000_000)
+	// A sample arriving sooner than the 400ms throttle is ignored entirely.
+	updateJobSpeed(job, 50_000_000, start.Add(200*time.Millisecond))
+	if got := len(job.speedSamples); got != 1 {
+		t.Fatalf("throttled sample was recorded: %d samples", got)
+	}
+	if job.Progress.BytesPerSecond != 0 {
+		t.Fatalf("throttled sample changed speed: %d", job.Progress.BytesPerSecond)
+	}
+
+	// Steady 2 MB/s for a few seconds settles the reading at ~2 MB/s.
+	for i := 1; i <= 6; i++ {
+		now := start.Add(time.Duration(i) * 500 * time.Millisecond)
+		updateJobSpeed(job, int64(i)*1_000_000, now)
+	}
 	if job.Progress.BytesPerSecond < 1_500_000 || job.Progress.BytesPerSecond > 2_500_000 {
 		t.Fatalf("expected ~2 MB/s, got %d", job.Progress.BytesPerSecond)
 	}
 
-	// A sample taken too soon (< 0.5s) is ignored, leaving the speed unchanged.
+	// The rate suddenly doubles to 4 MB/s. The EMA blend keeps the very next
+	// reading between the old rate and the raw windowed rate instead of
+	// snapping to it.
 	prev := job.Progress.BytesPerSecond
-	updateJobSpeed(job, 1000+2_000_000+9_000_000)
-	if job.Progress.BytesPerSecond != prev {
-		t.Fatalf("sub-window sample changed speed: %d -> %d", prev, job.Progress.BytesPerSecond)
+	updateJobSpeed(job, 6_000_000+2_000_000, start.Add(3500*time.Millisecond))
+	got := job.Progress.BytesPerSecond
+	if got <= prev {
+		t.Fatalf("speed did not rise after a faster sample: %d -> %d", prev, got)
+	}
+	if got >= 4_000_000 {
+		t.Fatalf("speed snapped to the raw rate instead of smoothing: %d -> %d", prev, got)
+	}
+
+	// Samples older than speedWindow fall out of the window.
+	later := start.Add(speedWindow + 4*time.Second)
+	updateJobSpeed(job, 9_000_000, later)
+	for _, s := range job.speedSamples {
+		if age := later.Sub(s.t); age > speedWindow {
+			t.Fatalf("stale sample kept: age %v", age)
+		}
+	}
+}
+
+// TestApplyJobProgress_FileFinalizingPhase verifies that the job only enters
+// the finalizing phase once nothing is left downloading: a file finishing its
+// transfer while another is still active must not flip the phase, and once
+// the last transfer ends the stale speed/ETA readings are cleared.
+func TestApplyJobProgress_FileFinalizingPhase(t *testing.T) {
+	job := &Job{}
+	now := time.Now()
+
+	apply := func(evt hfdownloader.ProgressEvent) {
+		applyJobProgress(job, evt, now)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "b.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "b.gguf"})
+
+	// a finishes its transfer while b is still active: no job-level phase.
+	apply(hfdownloader.ProgressEvent{Event: "file_finalizing", Path: "a.gguf"})
+	if job.Files[0].Status != "finalizing" {
+		t.Fatalf("file a status = %q, want finalizing", job.Files[0].Status)
+	}
+	if job.Phase != "" {
+		t.Fatalf("phase flipped to %q while b is still downloading", job.Phase)
+	}
+
+	// b finishes its transfer too: the whole job is now local post-processing.
+	job.Progress.BytesPerSecond = 1_000_000
+	job.Progress.EtaSeconds = 42
+	apply(hfdownloader.ProgressEvent{Event: "file_finalizing", Path: "b.gguf"})
+	if job.Phase != "finalizing" {
+		t.Fatalf("phase = %q, want finalizing", job.Phase)
+	}
+	if job.Progress.BytesPerSecond != 0 || job.Progress.EtaSeconds != 0 {
+		t.Fatalf("stale speed/ETA not cleared: %d B/s, %d s",
+			job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "b.gguf"})
+	if job.Files[0].Status != "complete" || job.Files[1].Status != "complete" {
+		t.Fatalf("files not complete after file_done: %q, %q",
+			job.Files[0].Status, job.Files[1].Status)
+	}
+}
+
+func TestUpdateJobETA(t *testing.T) {
+	job := &Job{}
+	job.Progress.TotalBytes = 100_000_000
+	start := time.Now()
+
+	// Nothing transferred yet — no estimate.
+	updateJobSpeed(job, 0, start)
+	if job.Progress.EtaSeconds != 0 {
+		t.Fatalf("ETA before any transfer should be 0, got %d", job.Progress.EtaSeconds)
+	}
+
+	// Steady 2 MB/s fresh download: DownloadedBytes mirrors transferred.
+	for i := 1; i <= 10; i++ {
+		transferred := int64(i) * 1_000_000
+		job.Progress.DownloadedBytes = transferred
+		updateJobSpeed(job, transferred, start.Add(time.Duration(i)*500*time.Millisecond))
+	}
+	// 10 MB moved in 5s, 90 MB remaining → ≈45s.
+	if eta := job.Progress.EtaSeconds; eta < 40 || eta > 50 {
+		t.Fatalf("expected ETA ≈45s, got %d", eta)
+	}
+
+	// Everything downloaded — the estimate clears.
+	job.Progress.DownloadedBytes = job.Progress.TotalBytes
+	updateJobSpeed(job, job.Progress.TotalBytes, start.Add(60*time.Second))
+	if job.Progress.EtaSeconds != 0 {
+		t.Fatalf("ETA after completion should be 0, got %d", job.Progress.EtaSeconds)
 	}
 }

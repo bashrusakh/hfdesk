@@ -334,8 +334,10 @@ func TestAnalyzeGGUF(t *testing.T) {
 			t.Fatalf("expected 1 quantization, got %d", len(result.Quantizations))
 		}
 		quant := result.Quantizations[0]
-		if quant.Name != "Q3_K_XL" {
-			t.Errorf("Name = %q, want Q3_K_XL", quant.Name)
+		// Unsloth Dynamic quants keep their UD_ prefix so they are not
+		// conflated with the plain K-quant of the same bit budget (2e75528).
+		if quant.Name != "UD_Q3_K_XL" {
+			t.Errorf("Name = %q, want UD_Q3_K_XL", quant.Name)
 		}
 		if quant.File.Size != 2500 {
 			t.Errorf("File.Size = %d, want 2500", quant.File.Size)

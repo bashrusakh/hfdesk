@@ -4,6 +4,8 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -248,21 +250,34 @@ func TestJobManager_ListJobs(t *testing.T) {
 }
 
 func TestJobManager_CancelJob(t *testing.T) {
-	cacheDir := t.TempDir()
-	t.Cleanup(func() {
-		time.Sleep(100 * time.Millisecond)
-		os.RemoveAll(cacheDir)
-	})
+	// Stand-in hub endpoint that hangs every request until the job's context
+	// is cancelled. Hitting the real huggingface.co here made the test flaky:
+	// on fast CI runners the fake repo was rejected within the startup sleep,
+	// so the job was already failed (terminal) by the time it was cancelled.
+	stall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer stall.Close()
 
-	cfg := Config{CacheDir: cacheDir}
+	cfg := Config{CacheDir: t.TempDir(), Endpoint: stall.URL}
 	hub := NewWSHub()
 	go hub.Run()
 	mgr := NewJobManager(cfg, hub)
+	t.Cleanup(func() { mgr.WaitAll(5 * time.Second) })
 
 	job, _, _ := mgr.CreateJob(DownloadRequest{Repo: "cancel/test"})
 
-	// Wait a bit for job to start
-	time.Sleep(50 * time.Millisecond)
+	// Wait until the job is actually running (dispatch is asynchronous).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if j, _ := mgr.GetJob(job.ID); j != nil && j.Status == JobStatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("job never reached running status")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	t.Run("cancels running job", func(t *testing.T) {
 		ok := mgr.CancelJob(job.ID)

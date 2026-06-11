@@ -56,6 +56,9 @@ type Job struct {
 	// transferred this run (see the file_progress handler), so the reading is
 	// steady and resuming a partial repo doesn't count already-present bytes.
 	speedSamples []speedSample `json:"-"`
+	// speedRunStart is when this run's first speed sample was taken; the
+	// whole-run average rate measured from it anchors the ETA estimate.
+	speedRunStart time.Time `json:"-"`
 }
 
 // speedSample is one (time, cumulative-transferred-bytes) point in a job's
@@ -72,6 +75,11 @@ type JobProgress struct {
 	TotalBytes      int64 `json:"totalBytes"`
 	DownloadedBytes int64 `json:"downloadedBytes"`
 	BytesPerSecond  int64 `json:"bytesPerSecond"`
+	// EtaSeconds is the server-computed remaining-time estimate; 0 means
+	// unknown. It is anchored to the whole-run average rate rather than the
+	// displayed speed, because remaining/currentSpeed multiplies any speed
+	// wobble by the bytes left and makes the ETA jump.
+	EtaSeconds int64 `json:"etaSeconds"`
 }
 
 // JobFileProgress holds per-file progress.
@@ -645,22 +653,26 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Unlock()
 }
 
-// updateJobSpeed recomputes BytesPerSecond over a short sliding window of bytes
-// transferred this run, smoothed with a simple EMA so the reading reflects
-// current throughput instead of a cumulative average. Samples are taken at most
-// twice a second; the window never includes skipped/already-present bytes.
-// speedWindow is how far back the moving average looks. A few seconds keeps
-// the displayed speed steady while still tracking real changes.
-const speedWindow = 4 * time.Second
+// speedWindow is how far back the windowed average looks. Progress at the
+// application level is bursty (part-file stats, chunked reads), so the window
+// must be long enough to average the bursts out, the way the OS smooths its
+// network-adapter graph.
+const speedWindow = 10 * time.Second
 
-// updateJobSpeed sets BytesPerSecond to the average rate over the last
-// speedWindow seconds, computed from the cumulative bytes transferred this run
-// (skipped/already-present bytes excluded). Samples are throttled so the window
-// stays small. now is passed in for deterministic testing.
+// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes
+// transferred this run (skipped/already-present bytes excluded). The rate is
+// averaged over a sliding speedWindow, then blended into the previous reading
+// with a mild EMA — the windowed average alone still jitters as old samples
+// fall off the window, and that jitter makes the displayed speed (and any ETA
+// derived from it) jump around. Samples are throttled to a few per second so
+// the window stays small. now is passed in for deterministic testing.
 func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 	// Throttle to a few samples per second.
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
+	}
+	if len(job.speedSamples) == 0 {
+		job.speedRunStart = now
 	}
 	// Drop samples older than the window, then add the current one.
 	cutoff := now.Add(-speedWindow)
@@ -680,7 +692,132 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 		if rate < 0 {
 			rate = 0
 		}
+		if prev := job.Progress.BytesPerSecond; prev > 0 {
+			rate = 0.7*float64(prev) + 0.3*rate
+		}
 		job.Progress.BytesPerSecond = int64(rate)
+	}
+	updateJobETA(job, transferred, now)
+}
+
+// updateJobETA recomputes EtaSeconds. The predictor is mostly the whole-run
+// average rate (transferred / elapsed) — for remaining-time estimation the
+// long-run average is far steadier than the displayed speed, the way curl and
+// rsync compute their ETAs — blended with a little of the current smoothed
+// speed so a genuine, lasting throughput change still pulls the estimate over.
+func updateJobETA(job *Job, transferred int64, now time.Time) {
+	remaining := job.Progress.TotalBytes - job.Progress.DownloadedBytes
+	elapsed := now.Sub(job.speedRunStart).Seconds()
+	if remaining <= 0 || elapsed < 1.0 || transferred <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	runAvg := float64(transferred) / elapsed
+	predictor := 0.7*runAvg + 0.3*float64(job.Progress.BytesPerSecond)
+	if predictor <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	job.Progress.EtaSeconds = int64(float64(remaining)/predictor + 0.5)
+}
+
+// applyJobProgress folds one downloader progress event into the job's
+// aggregate state. The caller must hold the manager lock. now feeds the
+// speed/ETA estimators and is passed in for deterministic testing.
+func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
+	switch evt.Event {
+	case "plan_item":
+		job.Progress.TotalFiles++
+		job.Progress.TotalBytes += evt.Total
+		job.Files = append(job.Files, JobFileProgress{
+			Path:       evt.Path,
+			TotalBytes: evt.Total,
+			Status:     "pending",
+		})
+
+	case "file_start":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "active"
+				break
+			}
+		}
+
+	case "file_progress":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				if !job.Files[i].progressed {
+					// First real progress for this file: record the bytes
+					// already on disk (resume position) so they aren't
+					// counted toward the live transfer speed.
+					job.Files[i].progressed = true
+					job.Files[i].baseDownloaded = evt.Downloaded
+				}
+				job.Files[i].Downloaded = evt.Downloaded
+				break
+			}
+		}
+		// total drives the progress bar (includes skipped/already-present
+		// bytes); transferred drives the speed (only bytes moved this run).
+		var total, transferred int64
+		for _, f := range job.Files {
+			total += f.Downloaded
+			if f.progressed {
+				transferred += f.Downloaded - f.baseDownloaded
+			}
+		}
+		job.Progress.DownloadedBytes = total
+		updateJobSpeed(job, transferred, now)
+
+	case "file_finalizing":
+		// The file's bytes are all on disk; part assembly, hash verification
+		// and the cache store are running — minutes of local I/O for a large
+		// model, with no further file_progress events.
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "finalizing"
+				break
+			}
+		}
+		// Once no file is left downloading, the whole job is in local
+		// post-processing: surface the phase and stop showing the stale
+		// speed/ETA from the last transfer window.
+		downloading := false
+		for _, f := range job.Files {
+			if f.Status == "active" || f.Status == "pending" {
+				downloading = true
+				break
+			}
+		}
+		if !downloading {
+			job.Phase = "finalizing"
+			job.Progress.BytesPerSecond = 0
+			job.Progress.EtaSeconds = 0
+		}
+
+	case "file_done":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "complete"
+				job.Files[i].Downloaded = job.Files[i].TotalBytes
+				break
+			}
+		}
+		job.Progress.CompletedFiles++
+		// Recalculate total downloaded (skipped/completed files included).
+		// Speed is intentionally not updated here: a skipped file emits only
+		// file_done, and counting its full size would spike the reading.
+		var total int64
+		for _, f := range job.Files {
+			total += f.Downloaded
+		}
+		job.Progress.DownloadedBytes = total
+
+	case "finalizing":
+		// Download is done; post-processing (friendly view, manifest) runs.
+		job.Phase = "finalizing"
+		job.Progress.BytesPerSecond = 0
+		job.Progress.EtaSeconds = 0
 	}
 }
 
@@ -748,75 +885,7 @@ func (m *JobManager) runJob(job *Job) {
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
 		m.mu.Lock()
-
-		switch evt.Event {
-		case "plan_item":
-			job.Progress.TotalFiles++
-			job.Progress.TotalBytes += evt.Total
-			job.Files = append(job.Files, JobFileProgress{
-				Path:       evt.Path,
-				TotalBytes: evt.Total,
-				Status:     "pending",
-			})
-
-		case "file_start":
-			for i := range job.Files {
-				if job.Files[i].Path == evt.Path {
-					job.Files[i].Status = "active"
-					break
-				}
-			}
-
-		case "file_progress":
-			for i := range job.Files {
-				if job.Files[i].Path == evt.Path {
-					if !job.Files[i].progressed {
-						// First real progress for this file: record the bytes
-						// already on disk (resume position) so they aren't
-						// counted toward the live transfer speed.
-						job.Files[i].progressed = true
-						job.Files[i].baseDownloaded = evt.Downloaded
-					}
-					job.Files[i].Downloaded = evt.Downloaded
-					break
-				}
-			}
-			// total drives the progress bar (includes skipped/already-present
-			// bytes); transferred drives the speed (only bytes moved this run).
-			var total, transferred int64
-			for _, f := range job.Files {
-				total += f.Downloaded
-				if f.progressed {
-					transferred += f.Downloaded - f.baseDownloaded
-				}
-			}
-			job.Progress.DownloadedBytes = total
-			updateJobSpeed(job, transferred, time.Now())
-
-		case "file_done":
-			for i := range job.Files {
-				if job.Files[i].Path == evt.Path {
-					job.Files[i].Status = "complete"
-					job.Files[i].Downloaded = job.Files[i].TotalBytes
-					break
-				}
-			}
-			job.Progress.CompletedFiles++
-			// Recalculate total downloaded (skipped/completed files included).
-			// Speed is intentionally not updated here: a skipped file emits only
-			// file_done, and counting its full size would spike the reading.
-			var total int64
-			for _, f := range job.Files {
-				total += f.Downloaded
-			}
-			job.Progress.DownloadedBytes = total
-
-		case "finalizing":
-			// Download is done; post-processing (friendly view, manifest) runs.
-			job.Phase = "finalizing"
-			job.Progress.BytesPerSecond = 0
-		}
-
+		applyJobProgress(job, evt, time.Now())
 		progressSnap := m.cloneJobLocked(job)
 		m.mu.Unlock() // Unlock BEFORE notifying to avoid deadlock
 		m.notifyListeners(progressSnap)

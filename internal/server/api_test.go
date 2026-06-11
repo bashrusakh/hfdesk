@@ -216,21 +216,34 @@ func TestAPI_UpdateSettings(t *testing.T) {
 	}
 }
 
-func TestAPI_UpdateSettings_CantChangeCacheDir(t *testing.T) {
+func TestAPI_UpdateSettings_UpdatesCacheDir(t *testing.T) {
 	srv := newTestServer()
-	originalCache := srv.config.CacheDir
 
-	// Try to inject a different cache path (should be ignored)
-	body := `{"cacheDir": "/etc/passwd"}`
+	// Storage settings are editable via the API (see 2e75528); the value is
+	// trimmed before being applied.
+	body := `{"cacheDir": "  /data/hf-cache  "}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
 	srv.handleUpdateSettings(w, req)
 
-	// Path should NOT have changed
-	if srv.config.CacheDir != originalCache {
-		t.Errorf("CacheDir should not be changeable via API! Got %s", srv.config.CacheDir)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected 200, got %d", w.Code)
+	}
+	if srv.config.CacheDir != "/data/hf-cache" {
+		t.Errorf("Expected trimmed cacheDir to be applied, got %q", srv.config.CacheDir)
+	}
+
+	// Omitting the field leaves the configured path untouched.
+	req = httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(`{"connections": 4}`))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+
+	srv.handleUpdateSettings(w, req)
+
+	if srv.config.CacheDir != "/data/hf-cache" {
+		t.Errorf("CacheDir changed by unrelated update: %q", srv.config.CacheDir)
 	}
 }
 
