@@ -168,6 +168,35 @@ func TestAPI_GetSettings(t *testing.T) {
 	}
 }
 
+func TestAPI_DiskFreeDefaultsToLocalDir(t *testing.T) {
+	root := t.TempDir()
+	localDir := filepath.Join(root, "local")
+	cacheDir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(Config{CacheDir: cacheDir, LocalDir: localDir})
+	req := httptest.NewRequest("GET", "/api/diskfree", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleDiskFree(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp["path"]; got != localDir {
+		t.Fatalf("path = %v, want localDir %s", got, localDir)
+	}
+}
+
 func TestAPI_GetSettings_TokenMasked(t *testing.T) {
 	cfg := Config{
 		CacheDir: "/tmp/test_cache",

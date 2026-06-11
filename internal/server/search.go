@@ -201,16 +201,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDiskFree returns free/total disk space for a given path.
-// Query param: path (optional — defaults to CacheDir or RunDir).
+// Query param: path (optional — defaults to LocalDir, CacheDir, or RunDir).
 func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
+		path = s.config.LocalDir
+	}
+	if path == "" {
 		path = s.config.CacheDir
 	}
-	// Resolve the same way the storage badge does: when CacheDir is unset, fall
-	// back to the default HF cache location (HF_HOME/HF_HUB_CACHE/~), not the run
-	// directory — otherwise the disk indicator reports the exe's drive while the
-	// badge shows the cache drive (bug: cache on I:, size from C:).
+	// Match the effective download destination: local files first, then the HF
+	// cache. If CacheDir is unset, use the default HF cache location instead of
+	// the run directory so the indicator does not report the exe's drive.
 	if path == "" {
 		path = hfdownloader.DefaultCacheDir()
 	}
