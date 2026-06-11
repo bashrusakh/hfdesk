@@ -2236,6 +2236,8 @@ a {
 }
 
 .settings-card .checkbox-label {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
   font-size: 13px;
   line-height: 1.35;
