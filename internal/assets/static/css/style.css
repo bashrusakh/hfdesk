@@ -2169,7 +2169,7 @@ a {
 }
 
 .settings-control-xs {
-  max-width: 128px;
+  max-width: 96px;
 }
 
 .settings-control-sm {
@@ -2177,7 +2177,7 @@ a {
 }
 
 .settings-control-md {
-  max-width: 190px;
+  max-width: 180px;
 }
 
 .settings-pair-control {
@@ -2189,9 +2189,28 @@ a {
 .settings-card input:not([type="checkbox"]),
 .settings-card select,
 .settings-card textarea {
+  width: 100%;
   min-height: 36px;
   padding: 8px 12px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
   font-size: 13px;
+  transition: all var(--transition-fast);
+}
+
+.settings-card input:not([type="checkbox"]):focus,
+.settings-card select:focus,
+.settings-card textarea:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+
+.settings-card input::placeholder,
+.settings-card textarea::placeholder {
+  color: var(--color-text-muted);
 }
 
 .settings-card textarea {
@@ -2206,6 +2225,10 @@ a {
 
 .settings-card .input-with-toggle input {
   padding-right: 42px;
+}
+
+.settings-control .input-with-toggle {
+  width: 100%;
 }
 
 .settings-card .toggle-visibility {
