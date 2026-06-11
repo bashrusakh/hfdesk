@@ -2155,9 +2155,11 @@
       // Display config file paths
       const configPathEl = $('#settingsConfigPath');
       if (configPathEl && data.configFile) {
-        configPathEl.innerHTML = `Config: <code>${escapeHtml(data.configFile)}</code>`;
+        const fileName = path => String(path || '').split(/[\\/]/).pop() || path;
+        const escapeAttr = value => escapeHtml(value).replace(/"/g, '&quot;');
+        configPathEl.innerHTML = `<span class="config-chip" title="${escapeAttr(data.configFile)}">Config: <code>${escapeHtml(fileName(data.configFile))}</code></span>`;
         if (data.targetsFile) {
-          configPathEl.innerHTML += ` &nbsp;|&nbsp; Targets: <code>${escapeHtml(data.targetsFile)}</code>`;
+          configPathEl.innerHTML += `<span class="config-chip" title="${escapeAttr(data.targetsFile)}">Targets: <code>${escapeHtml(fileName(data.targetsFile))}</code></span>`;
         }
       }
 

@@ -286,6 +286,9 @@ a {
 }
 
 .page-config-path {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   font-size: 12px;
   color: var(--color-text-muted);
   font-family: var(--font-mono);
@@ -296,6 +299,23 @@ a {
   background: var(--color-bg-secondary);
   padding: 2px 6px;
   border-radius: var(--radius-sm);
+}
+
+.config-chip {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 4px;
+  max-width: 260px;
+}
+
+.config-chip code {
+  display: inline-block;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
 }
 
 /* ============================================
@@ -2072,7 +2092,6 @@ a {
    Settings Page
    ============================================ */
 
-/* Scroll container */
 .settings-body {
   flex: 1;
   min-height: 0;
@@ -2080,83 +2099,117 @@ a {
   padding: 0 40px 40px;
 }
 
-/* Card overrides for settings */
 .settings-card {
   overflow: visible;
 }
 
 .settings-card .card-header {
-  padding: 14px 18px;
+  padding: 12px 16px;
 }
 
 .settings-card .card-header h3 {
-  font-size: 15px;
+  font-size: 14px;
 }
 
 .settings-card .card-icon {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
 }
 
 .settings-card .card-body {
-  padding: 18px;
+  padding: 14px 16px 16px;
 }
 
-/* Compact forms inside settings cards */
 .settings-card .form-group {
   margin-bottom: 0;
 }
 
-.settings-card .form-hint {
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-/* Mono font for path-like inputs */
-.settings-card .path-input {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-}
-
-/* Compact dashboard layout */
 .settings-layout {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 20px;
-  max-width: 1360px;
-}
-
-.settings-column {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
+  gap: 18px;
+  max-width: 1420px;
   min-width: 0;
 }
 
-.settings-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 16px;
-}
-
-.settings-fields-single,
-.settings-wide-field {
+.settings-card-wide {
   grid-column: 1 / -1;
 }
 
-.settings-fields-quad {
+.settings-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+}
+
+.settings-row-top {
   align-items: start;
 }
 
-/* Link inside hints */
-.hint-link {
-  color: var(--color-primary);
-  text-decoration: underline;
-  text-underline-offset: 2px;
+.settings-row label,
+.settings-label-spacer {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin: 0;
+  min-width: 0;
 }
 
-.hint-link:hover {
-  color: var(--color-primary-hover);
+.settings-control {
+  min-width: 0;
+  width: 100%;
+}
+
+.settings-control-xs {
+  max-width: 128px;
+}
+
+.settings-control-sm {
+  max-width: 170px;
+}
+
+.settings-control-md {
+  max-width: 190px;
+}
+
+.settings-pair-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.settings-card input:not([type="checkbox"]),
+.settings-card select,
+.settings-card textarea {
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.settings-card textarea {
+  min-height: 58px;
+  resize: vertical;
+}
+
+.settings-card .path-input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.settings-card .input-with-toggle input {
+  padding-right: 42px;
+}
+
+.settings-card .toggle-visibility {
+  right: 10px;
 }
 
 /* Rebuild Result Modal */
@@ -2491,8 +2544,8 @@ a {
     padding: 0 20px 20px;
   }
 
-  .settings-fields {
-    grid-template-columns: 1fr;
+  .settings-row {
+    grid-template-columns: 170px minmax(0, 1fr);
   }
 
   .cache-stats {
@@ -2535,6 +2588,21 @@ a {
   #page-settings .page-actions {
     width: 100%;
     justify-content: flex-end;
+  }
+
+  .settings-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .settings-control-xs,
+  .settings-control-sm,
+  .settings-control-md {
+    max-width: none;
+  }
+
+  .settings-pair-control {
+    grid-template-columns: 1fr;
   }
 }
 
