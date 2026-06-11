@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-06-11
+
 ### Fixed
 
 - Download speed reading is steadier: averaged over a longer window with EMA smoothing instead of a raw 4-second window.
