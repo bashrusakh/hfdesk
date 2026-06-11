@@ -225,7 +225,7 @@ func TestAPI_UpdateSettings(t *testing.T) {
 	srv := newTestServer()
 
 	// Update concurrency
-	body := `{"connections": 16, "maxActive": 8}`
+	body := `{"connections": 16, "maxActive": 8, "retries": 0, "verify": "sha256"}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -242,6 +242,12 @@ func TestAPI_UpdateSettings(t *testing.T) {
 	}
 	if srv.config.MaxActive != 8 {
 		t.Errorf("Expected maxActive 8, got %d", srv.config.MaxActive)
+	}
+	if srv.config.Retries != 0 {
+		t.Errorf("Expected retries 0, got %d", srv.config.Retries)
+	}
+	if srv.config.Verify != "sha256" {
+		t.Errorf("Expected verify sha256, got %s", srv.config.Verify)
 	}
 }
 

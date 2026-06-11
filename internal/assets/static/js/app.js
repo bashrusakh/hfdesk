@@ -2164,9 +2164,9 @@
       }
 
       $('#hfToken').value = data.token || '';
-      $('#connections').value = data.connections || 8;
-      $('#maxActive').value = data.maxActive || 3;
-      $('#retries').value = data.retries || 4;
+      $('#connections').value = data.connections ?? 8;
+      $('#maxActive').value = data.maxActive ?? 3;
+      $('#retries').value = data.retries ?? 4;
       $('#verify').value = data.verify || 'size';
       $('#endpoint').value = data.endpoint || '';
 
@@ -2216,6 +2216,7 @@
       showToast('Set a default local download folder first', 'error');
       return;
     }
+    const retries = parseInt($('#retries')?.value);
     const body = {
       token: $('#hfToken')?.value || '',
       cacheDir: $('#cacheDirInput')?.value?.trim() || '',
@@ -2226,7 +2227,7 @@
         .filter(Boolean),
       connections: parseInt($('#connections')?.value) || 8,
       maxActive: parseInt($('#maxActive')?.value) || 3,
-      retries: parseInt($('#retries')?.value) || 4,
+      retries: Number.isNaN(retries) ? 4 : retries,
       verify: $('#verify')?.value || 'size',
       endpoint: $('#endpoint')?.value || ''
     };
