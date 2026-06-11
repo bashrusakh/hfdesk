@@ -2235,6 +2235,44 @@ a {
   right: 10px;
 }
 
+.settings-card .checkbox-label {
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.settings-card .checkbox-label input[type="checkbox"] {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  min-height: 14px;
+  border: 1px solid var(--color-border-light);
+  border-radius: 4px;
+  background: var(--color-bg-tertiary);
+  display: grid;
+  place-content: center;
+}
+
+.settings-card .checkbox-label input[type="checkbox"]::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  transform: scale(0);
+  transition: transform var(--transition-fast);
+  clip-path: polygon(14% 44%, 0 62%, 40% 100%, 100% 16%, 82% 0, 36% 66%);
+  background: white;
+}
+
+.settings-card .checkbox-label input[type="checkbox"]:checked {
+  background: var(--gradient-primary);
+  border-color: var(--color-primary);
+}
+
+.settings-card .checkbox-label input[type="checkbox"]:checked::before {
+  transform: scale(1);
+}
+
 /* Rebuild Result Modal */
 .rebuild-result {
   text-align: center;
