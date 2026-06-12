@@ -12,9 +12,10 @@
   --color-border: #2a2a3a;
   --color-border-light: #3a3a4a;
 
-  --color-text: #ffffff;
-  --color-text-secondary: #b4b4c4;
-  --color-text-muted: #8a8a9c;
+  --color-text: #c8c8d0;
+  --color-text-secondary: #a0a0b0;
+  --color-text-muted: #6a6a7a;
+  --color-text-like: #c9a0a0;
 
   --color-primary: #6366f1;
   --color-primary-hover: #7c7ff7;
@@ -1739,7 +1740,12 @@ a {
 }
 
 .cache-quant-subtitle {
+  display: inline-block;
   margin-top: 4px;
+  padding: 2px 8px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.35;
@@ -1838,11 +1844,15 @@ a {
 
 .cache-repo-name {
   font-weight: 500;
+  color: var(--color-text);
   margin-right: 8px;
 }
 
 .cache-col-repo .cache-quant-subtitle {
   max-width: 100%;
+  margin-top: 0;
+  margin-left: 4px;
+  vertical-align: middle;
 }
 
 .cache-col-size,
@@ -3404,6 +3414,8 @@ a {
 
 .diff-status {
   display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 4px 8px;
   border-radius: var(--radius-sm);
   font-size: 12px;
@@ -3682,7 +3694,7 @@ a {
 
 .model-card-author {
   font-size: 12px;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   margin-top: 1px;
 }
 
@@ -4048,7 +4060,7 @@ a {
 
 .model-row-stat {
   font-size: 10px;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
 }
 
 .model-row-right {
@@ -4266,7 +4278,7 @@ button.quant-dl-btn:hover {
 .quant-label {
   font-size: 13px;
   font-weight: 500;
-  color: #e0e0e0;
+  color: var(--color-text);
   white-space: nowrap;
   min-width: 100px;
 }
@@ -4286,19 +4298,19 @@ button.quant-dl-btn:hover {
 .quant-size {
   font-size: 12px;
   font-family: var(--font-mono);
-  color: #b0b8c8;
+  color: var(--color-text-secondary);
   white-space: nowrap;
 }
 
 .quant-ram {
   font-size: 11px;
-  color: #8899aa;
+  color: var(--color-text-muted);
   white-space: nowrap;
 }
 
 .quant-desc {
   font-size: 11px;
-  color: #9aa7ba;
+  color: var(--color-text-muted);
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -4324,4 +4336,9 @@ button.quant-dl-btn:hover {
   font-size: 11px;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+/* Like accent for social signals */
+.like-accent {
+  color: var(--color-text-like);
 }
