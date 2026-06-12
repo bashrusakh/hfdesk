@@ -650,22 +650,24 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     `;
 
     loadReadmePreview(data);
-    updateScrollArrows();
   }
+
+  let _scrollArrowUp = null;
+  let _scrollArrowDown = null;
 
   function updateScrollArrows() {
     const scroller = $('#analyzeResult');
-    const arrowUp = $('#scrollArrowUp');
-    const arrowDown = $('#scrollArrowDown');
-    if (!scroller || !arrowUp || !arrowDown) return;
+    if (!_scrollArrowUp) _scrollArrowUp = $('#scrollArrowUp');
+    if (!_scrollArrowDown) _scrollArrowDown = $('#scrollArrowDown');
+    if (!scroller || !_scrollArrowUp || !_scrollArrowDown) return;
 
     const top = scroller.scrollTop;
     const maxScroll = scroller.scrollHeight - scroller.clientHeight;
     const atTop = top < 20;
     const atBottom = maxScroll <= 0 || top >= maxScroll - 20;
 
-    arrowUp.classList.toggle('visible', !atTop);
-    arrowDown.classList.toggle('visible', !atBottom);
+    _scrollArrowUp.classList.toggle('visible', !atTop);
+    _scrollArrowDown.classList.toggle('visible', !atBottom);
   }
 
   async function loadReadmePreview(data) {
@@ -688,6 +690,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     } catch (_) {
       section.hidden = true;
     }
+    updateScrollArrows();
   }
 
   function renderMarkdownPreview(markdown, baseRawURL) {
@@ -783,10 +786,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     currentAnalysis = null;
     currentSelectedRepo = null;
     currentSelectedIsDataset = false;
-    const arrowUp = $('#scrollArrowUp');
-    const arrowDown = $('#scrollArrowDown');
-    if (arrowUp) arrowUp.classList.remove('visible');
-    if (arrowDown) arrowDown.classList.remove('visible');
+    if (_scrollArrowUp) _scrollArrowUp.classList.remove('visible');
+    if (_scrollArrowDown) _scrollArrowDown.classList.remove('visible');
     currentSelectedBranch = 'main';
     const header = $('#modelsDetailHeader');
     const hfLink = $('#modelsDetailHFLink');

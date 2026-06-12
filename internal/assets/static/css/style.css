@@ -780,7 +780,7 @@ a {
   position: sticky;
   top: 0;
   z-index: 3;
-  background: #1a1a26;
+  background: var(--color-bg);
   margin-left: -24px;
   margin-right: -24px;
   padding: 10px 24px 8px;
@@ -4192,6 +4192,7 @@ a {
   border: none;
   border-radius: 0;
   margin: 0;
+  overflow: visible;
 }
 
 /* btn-xs variant */
