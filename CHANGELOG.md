@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-06-12
+
+### Added
+
+- Repository names in Active Jobs are now clickable and jump straight back to model analysis.
+
+### Changed
+
+- Redesigned the Settings page layout with proper scrolling, clearer section grouping, and a sticky save action.
+- Refined the dark theme typography and text hierarchy, increased model row readability, and widened the analysis panel.
+
+### Fixed
+
+- Download deduplication is now filter-aware, so downloading a quant and its `mmproj` companion creates separate jobs instead of silently collapsing into one.
+- Newly created queued jobs are broadcast to the UI immediately, so they appear in Active Jobs without waiting for a later state change.
+- The refresh action now reloads the selected model reliably, and the Hugging Face Hub button lives in the model detail header.
+- GGUF detection now recognizes more quant names correctly, handles `BF16` files properly, and filters out `*imatrix.gguf` companion files from quant lists.
+
 ## [1.0.9] - 2026-06-11
 
 ### Fixed
