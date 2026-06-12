@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Model detail panel now uses a single scroll instead of two nested scrolls (quantization list + README preview). Section headers stick to the top while scrolling. Contextual floating arrows appear: down-arrow at the bottom when scrolled to top, up-arrow at the top when scrolled down, both arrows visible in the middle.
+
 ## [1.0.10] - 2026-06-12
 
 ### Added
