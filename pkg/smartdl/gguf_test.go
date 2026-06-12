@@ -32,6 +32,7 @@ func TestQuantQualityMappings(t *testing.T) {
 		{"Q4_0", 3},
 		{"Q4_1", 3},
 		{"Q4_K_S", 3},
+		{"Q4_K_L", 4},
 		{"IQ4_NL", 3},
 		{"IQ4_XS", 3},
 
@@ -40,10 +41,12 @@ func TestQuantQualityMappings(t *testing.T) {
 		{"Q5_0", 4},
 		{"Q5_1", 4},
 		{"Q5_K_S", 4},
+		{"Q5_K_L", 5},
 
 		// Quality 5 (highest)
 		{"Q5_K_M", 5},
 		{"Q6_K", 5},
+		{"Q6_K_L", 5},
 		{"Q8_0", 5},
 		{"F16", 5},
 		{"F32", 5},
@@ -101,6 +104,10 @@ func TestQuantPattern(t *testing.T) {
 		{"model-F16.gguf", "F16"},
 		{"model-F32.gguf", "F32"},
 		{"model-BF16.gguf", "BF16"},
+		{"Tesslate_OmniCoder-9B-bf16.gguf", "BF16"},
+
+		// Companion GGUF files that are not selectable model quants
+		{"Tesslate_OmniCoder-9B-imatrix.gguf", ""},
 
 		// Case insensitivity
 		{"model.q4_k_m.gguf", "q4_k_m"},
@@ -284,6 +291,42 @@ func TestAnalyzeGGUF(t *testing.T) {
 		}
 	})
 
+	t.Run("ignores imatrix GGUF companion files", func(t *testing.T) {
+		files := []FileInfo{
+			{Name: "Tesslate_OmniCoder-9B-imatrix.gguf", Path: "Tesslate_OmniCoder-9B-imatrix.gguf", Size: 4000000},
+			{Name: "Tesslate_OmniCoder-9B-Q4_K_M.gguf", Path: "Tesslate_OmniCoder-9B-Q4_K_M.gguf", Size: 4000000000},
+		}
+
+		result := analyzeGGUF(files)
+		if result == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if len(result.Quantizations) != 1 {
+			t.Fatalf("expected 1 quantization, got %d", len(result.Quantizations))
+		}
+		if result.Quantizations[0].Name != "Q4_K_M" {
+			t.Errorf("Name = %q, want Q4_K_M", result.Quantizations[0].Name)
+		}
+	})
+
+	t.Run("recognizes observed OmniCoder GGUF names", func(t *testing.T) {
+		files := []FileInfo{
+			{Name: "OmniCoder-9B-Claude-Opus-High-Reasoning-Distill.i1-IQ1_M.gguf", Path: "OmniCoder-9B-Claude-Opus-High-Reasoning-Distill.i1-IQ1_M.gguf", Size: 2000000000},
+			{Name: "OmniCoder-9B-Claude-Opus-High-Reasoning-Distill.imatrix.gguf", Path: "OmniCoder-9B-Claude-Opus-High-Reasoning-Distill.imatrix.gguf", Size: 4000000},
+		}
+
+		result := analyzeGGUF(files)
+		if result == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if len(result.Quantizations) != 1 {
+			t.Fatalf("expected 1 quantization, got %d", len(result.Quantizations))
+		}
+		if result.Quantizations[0].Name != "IQ1_M" {
+			t.Errorf("Name = %q, want IQ1_M", result.Quantizations[0].Name)
+		}
+	})
+
 	t.Run("split GGUF shards are merged by quantization", func(t *testing.T) {
 		files := []FileInfo{
 			{Name: "model-Q4_K_M-00002-of-00002.gguf", Path: "model-Q4_K_M-00002-of-00002.gguf", Size: 3000, SizeHuman: "2.9 KiB"},
@@ -413,7 +456,7 @@ func TestParseGGUFQuantization(t *testing.T) {
 func TestRecommendGGUF(t *testing.T) {
 	info := &GGUFInfo{
 		Quantizations: []GGUFQuantization{
-			{Name: "Q8_0", Quality: 5, EstimatedRAM: 10 * 1024 * 1024 * 1024}, // 10GB
+			{Name: "Q8_0", Quality: 5, EstimatedRAM: 10 * 1024 * 1024 * 1024},  // 10GB
 			{Name: "Q5_K_M", Quality: 5, EstimatedRAM: 6 * 1024 * 1024 * 1024}, // 6GB
 			{Name: "Q4_K_M", Quality: 4, EstimatedRAM: 5 * 1024 * 1024 * 1024}, // 5GB
 			{Name: "Q2_K", Quality: 1, EstimatedRAM: 2 * 1024 * 1024 * 1024},   // 2GB

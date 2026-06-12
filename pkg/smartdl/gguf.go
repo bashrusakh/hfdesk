@@ -46,6 +46,7 @@ var quantQuality = map[string]int{
 	"Q4_0":    3,
 	"Q4_1":    3,
 	"Q4_K_S":  3,
+	"Q4_K_L":  4,
 	"Q4_K_M":  4,
 	"Q4_K_XL": 4, // unsloth dynamic, comparable to Q4_K_M
 	"IQ4_NL":  3,
@@ -55,11 +56,13 @@ var quantQuality = map[string]int{
 	"Q5_0":    4,
 	"Q5_1":    4,
 	"Q5_K_S":  4,
+	"Q5_K_L":  5,
 	"Q5_K_M":  5,
 	"Q5_K_XL": 5, // unsloth dynamic
 
 	// 6-bit
 	"Q6_K":    5,
+	"Q6_K_L":  5,
 	"Q6_K_XL": 5, // unsloth dynamic
 
 	// 8-bit
@@ -115,6 +118,7 @@ var quantDescriptions = map[string]string{
 	"Q4_0":    "Legacy 4-bit, good balance",
 	"Q4_1":    "Legacy 4-bit with scales",
 	"Q4_K_S":  "Small 4-bit, good quality",
+	"Q4_K_L":  "Large 4-bit, recommended",
 	"Q4_K_M":  "Medium 4-bit, recommended",
 	"Q4_K_XL": "Unsloth dynamic 4-bit, recommended",
 	"IQ4_NL":  "Importance matrix 4-bit, non-linear",
@@ -124,11 +128,13 @@ var quantDescriptions = map[string]string{
 	"Q5_0":    "Legacy 5-bit, very good quality",
 	"Q5_1":    "Legacy 5-bit with scales",
 	"Q5_K_S":  "Small 5-bit, excellent quality",
+	"Q5_K_L":  "Large 5-bit, excellent quality",
 	"Q5_K_M":  "Medium 5-bit, excellent quality",
 	"Q5_K_XL": "Unsloth dynamic 5-bit, excellent quality",
 
 	// 6-bit
 	"Q6_K":    "6-bit, near-lossless",
+	"Q6_K_L":  "Large 6-bit, near-lossless",
 	"Q6_K_XL": "Unsloth dynamic 6-bit, near-lossless",
 
 	// 8-bit
@@ -167,13 +173,13 @@ var quantDescriptions = map[string]string{
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
+	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32))`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
 
 	// Match model name from filename (before quant type).
-	modelNamePattern = regexp.MustCompile(`^(.+?)[-._](?:IQ|Q|F|BF)\d`)
+	modelNamePattern = regexp.MustCompile(`^(.+?)[-._](?:IQ|Q|BF|F)\d`)
 
 	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003" optionally
 	// followed by ".gguf". HuggingFace/llama.cpp use 5-digit indices; allow 4-5
@@ -222,6 +228,11 @@ func isMMProjFile(name string) bool {
 	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
 }
 
+func isGGUFImatrixFile(name string) bool {
+	base := strings.ToLower(filepath.Base(name))
+	return base == "imatrix.gguf" || strings.HasSuffix(base, "-imatrix.gguf") || strings.HasSuffix(base, ".imatrix.gguf")
+}
+
 // analyzeGGUF analyzes GGUF files and extracts quantization information.
 // Multimodal projector ("mmproj") files are detected and kept separate from
 // LLM quantizations so the picker shows clean quant options while still
@@ -237,6 +248,9 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 		}
 		if isMMProjFile(f.Name) {
 			info.MMProjFiles = append(info.MMProjFiles, f)
+			continue
+		}
+		if isGGUFImatrixFile(f.Name) {
 			continue
 		}
 		llmFiles = append(llmFiles, f)

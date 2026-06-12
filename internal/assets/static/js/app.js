@@ -240,73 +240,99 @@
     });
   }
 
-  // Store current analysis for wizard
-  let currentAnalysis = null;
-  let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
+// Store current analysis for wizard
+let currentAnalysis = null;
+let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
+let currentSelectedRepo = null;
+let currentSelectedIsDataset = false;
+let currentSelectedBranch = 'main';
+let analyzeRequestId = 0;
 
-  async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
-    const input = $('#analyzeInput');
-    const resultDiv = $('#analyzeResult');
-    const isDataset = forceType === 'dataset'; // Only set if user explicitly selected dataset
+function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
+  const header = $('#modelsDetailHeader');
+  const repoLabel = $('#modelsDetailRepo');
+  const hfLink = $('#modelsDetailHFLink');
 
-    const repo = (repoOverride || input?.value || '').trim();
-    if (!repo) {
-      showToast('Please enter a repository', 'error');
+  if (header) header.style.display = '';
+  if (repoLabel && repoId) repoLabel.textContent = repoId;
+  if (hfLink && repoId) {
+    hfLink.href = `https://huggingface.co/${isDataset ? 'datasets/' : ''}${repoId}`;
+    hfLink.hidden = false;
+  }
+}
+
+async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
+  const input = $('#analyzeInput');
+  const resultDiv = $('#analyzeResult');
+  const isDataset = forceType === 'dataset'; // Only set if user explicitly selected dataset
+
+  const repo = (repoOverride || input?.value || '').trim();
+  if (!repo) {
+    showToast('Please enter a repository', 'error');
+    return;
+  }
+
+  const requestId = ++analyzeRequestId;
+
+  // Reset revision picker flag when analyzing a new repo
+  if (!revision) {
+    hasShownRevisionPicker = false;
+  }
+
+  // Show loading
+  resultDiv.innerHTML = `
+    <div class="loading-state">
+      <div class="spinner"></div>
+      <p>Analyzing ${repo}${revision && revision !== 'main' ? ` (${revision})` : ''}...</p>
+    </div>
+  `;
+
+  try {
+    let queryParams = [];
+    if (forceType) queryParams.push(`dataset=${forceType === 'dataset'}`);
+    if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
+    const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
+
+    const data = await api('GET', `/analyze/${repo}${queryString}`);
+
+    if (requestId !== analyzeRequestId) return;
+
+    // Check if we need user to select model vs dataset
+    if (data.needsSelection) {
+      renderTypeSelection(data);
       return;
     }
 
-    // Reset revision picker flag when analyzing a new repo
-    if (!revision) {
-      hasShownRevisionPicker = false;
+    // Check if there are multiple refs and we haven't shown the picker yet
+    if (data.refs && data.refs.length > 1 && !hasShownRevisionPicker && !revision) {
+      hasShownRevisionPicker = true;
+      currentAnalysis = data;
+      showRevisionPicker(data);
+      return;
     }
 
-    // Show loading
+    currentAnalysis = data;
+    currentSelectedRepo = data.repo;
+    currentSelectedIsDataset = !!data.is_dataset;
+    currentSelectedBranch = data.branch || 'main';
+    syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
+    await syncLocalAnalysisStatus(data);
+    renderAnalysisResult(data);
+  } catch (e) {
+    if (requestId !== analyzeRequestId) return;
     resultDiv.innerHTML = `
-      <div class="loading-state">
-        <div class="spinner"></div>
-        <p>Analyzing ${repo}${revision && revision !== 'main' ? ` (${revision})` : ''}...</p>
+      <div class="empty-state">
+        <div class="empty-icon" style="color: var(--color-error);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+            <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+          </svg>
+        </div>
+        <h3>Analysis Failed</h3>
+        <p>${escapeHtml(e.message)}</p>
       </div>
     `;
-
-    try {
-      let queryParams = [];
-      if (forceType) queryParams.push(`dataset=${forceType === 'dataset'}`);
-      if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
-      const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
-
-      const data = await api('GET', `/analyze/${repo}${queryString}`);
-
-      // Check if we need user to select model vs dataset
-      if (data.needsSelection) {
-        renderTypeSelection(data);
-        return;
-      }
-
-      // Check if there are multiple refs and we haven't shown the picker yet
-      if (data.refs && data.refs.length > 1 && !hasShownRevisionPicker && !revision) {
-        hasShownRevisionPicker = true;
-        currentAnalysis = data;
-        showRevisionPicker(data);
-        return;
-      }
-
-      currentAnalysis = data;
-      await syncLocalAnalysisStatus(data);
-      renderAnalysisResult(data);
-    } catch (e) {
-      resultDiv.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-icon" style="color: var(--color-error);">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
-              <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
-            </svg>
-          </div>
-          <h3>Analysis Failed</h3>
-          <p>${escapeHtml(e.message)}</p>
-        </div>
-      `;
-    }
   }
+}
 
   // Show revision picker when multiple refs exist
   function showRevisionPicker(data) {
@@ -596,10 +622,6 @@
     resultDiv.innerHTML = `
       <div class="analysis-card">
         <div class="analysis-header">
-          <a class="analysis-hub" href="https://huggingface.co/${data.is_dataset ? 'datasets/' : ''}${escapeHtml(data.repo)}" target="_blank" rel="noopener" title="Open on Hugging Face Hub">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-            HF Hub
-          </a>
           <div class="analysis-repo">${escapeHtml(data.repo)}${branchDisplay}${changeRevisionLink}</div>
           <span class="analysis-type">${escapeHtml(data.type_description || data.type)}</span>
           <div class="analysis-meta">
@@ -743,6 +765,13 @@
   // Clear analysis and reset to initial state
   window.clearAnalysis = function() {
     currentAnalysis = null;
+    currentSelectedRepo = null;
+    currentSelectedIsDataset = false;
+    currentSelectedBranch = 'main';
+    const header = $('#modelsDetailHeader');
+    const hfLink = $('#modelsDetailHFLink');
+    if (header) header.style.display = 'none';
+    if (hfLink) hfLink.hidden = true;
     advancedOptions = { filter: '', exclude: '' };
     const input = $('#analyzeInput');
     if (input) input.value = '';
@@ -3209,8 +3238,20 @@
       }
     });
 
-    // Analyze button
-    btn?.addEventListener('click', analyzeRepo);
+    // Analyze/refresh button. On the unified Models page this refreshes the
+    // selected repo, not whatever text happens to be in the search field.
+    btn?.addEventListener('click', () => {
+      const repo = currentSelectedRepo || currentAnalysis?.repo || input?.value?.trim();
+      if (!repo) {
+        analyzeRepo();
+        return;
+      }
+      analyzeRepo(
+        currentSelectedIsDataset || currentAnalysis?.is_dataset ? 'dataset' : null,
+        currentSelectedBranch || currentAnalysis?.branch || 'main',
+        repo
+      );
+    });
 
     // Example buttons
     $$('.example-btn').forEach(b => {
@@ -3353,12 +3394,10 @@
     _currentSelectedRow = el;
 
     // Update detail header
-    const header = $('#modelsDetailHeader');
-    const repoLabel = $('#modelsDetailRepo');
-    const hfLink = $('#modelsHFLink');
-    if (header) header.style.display = '';
-    if (repoLabel) repoLabel.textContent = repoId;
-    if (hfLink) hfLink.href = `https://huggingface.co/${repoId}`;
+    currentSelectedRepo = repoId;
+    currentSelectedIsDataset = false;
+    currentSelectedBranch = 'main';
+    syncModelsDetailHeader(repoId, false, currentSelectedBranch);
 
     // Keep the search field user-owned; analyze the clicked repo separately.
     analyzeRepo(null, null, repoId);

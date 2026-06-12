@@ -117,13 +117,12 @@
                   <option value="text-to-speech">TTS</option>
                   <option value="sentence-similarity">Embeddings</option>
                 </select>
-                <label class="models-toggle"><input type="checkbox" id="modelsGguf"> GGUF</label>
-                <label class="models-toggle"><input type="checkbox" id="modelsDatasets"> DS</label>
+                <label class="checkbox-label checkbox-label-sm" title="Filter to GGUF models only"><input type="checkbox" id="modelsGguf"><span>GGUF</span></label>
+                <label class="checkbox-label checkbox-label-sm" title="Search datasets instead of models"><input type="checkbox" id="modelsDatasets"><span>DS</span></label>
               </div>
               <div class="models-storage-strip">
                 <div id="storageModeBadge" class="storage-mode-badge" hidden></div>
                 <div id="diskFreeIndicator" class="disk-free-indicator" hidden></div>
-                <a id="modelsHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs">HF Hub ↗</a>
               </div>
             </div>
             <div id="modelsResultList" class="models-result-list">
@@ -138,13 +137,15 @@
             <div id="modelsDetailHeader" class="models-detail-header" style="display:none">
               <div class="models-detail-title-wrap">
                 <span class="models-detail-repo" id="modelsDetailRepo"></span>
-                <button id="analyzeBtn" class="btn btn-ghost btn-xs models-reanalyze-btn" title="Re-analyze">
+              </div>
+              <div class="models-detail-header-right">
+                <a id="modelsDetailHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" hidden>HF Hub ↗</a>
+                <button id="analyzeBtn" class="btn btn-ghost btn-xs models-reanalyze-btn" title="Refresh selected model" aria-label="Refresh selected model">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
                     <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.87"/>
                   </svg>
                 </button>
               </div>
-              <div class="models-detail-header-right"></div>
             </div>
 
             <!-- Analysis result area -->
