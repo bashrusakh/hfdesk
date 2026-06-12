@@ -3595,7 +3595,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (!handle || !split || !list) return;
 
     const minW = 300;
-    const defaultW = 360;
+    const defaultW = 400;
     const preferredMaxW = 640;
     const detailMinW = 360;
     const clampWidth = (width) => {
