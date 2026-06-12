@@ -1265,6 +1265,17 @@ a {
   line-height: 1.3;
 }
 
+.job-repo-clickable {
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+
+.job-repo-clickable:hover {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .job-status {
   display: inline-flex;
   align-items: center;
