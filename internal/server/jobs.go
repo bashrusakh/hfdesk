@@ -211,8 +211,32 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	return &clone
 }
 
+// stringSlicesEqual reports whether two string slices contain the same
+// elements regardless of order.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, s := range a {
+		seen[s]++
+	}
+	for _, s := range b {
+		seen[s]--
+		if seen[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // CreateJob creates a new download job.
-// Returns existing job if same repo+revision+dataset is already in progress.
+// Returns existing job only when repo, revision, dataset AND filters match
+// an active job. Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16)
+// create independent jobs.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	revision := req.Revision
 	if revision == "" {
@@ -238,15 +262,18 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		outputDir = effectiveLocalDir
 	}
 
-	// Check for existing active job with same repo+revision+type.
-	// Returning a clone prevents the caller's JSON encoder from racing
-	// against runJob's in-place mutations of the live job.
+	// Check for existing active job with identical parameters.
+	// Deduplication is filter-aware: only match when filters and excludes
+	// are also identical, so the user can download a quantization and a
+	// vision encoder (mmproj) for the same repo at the same time.
 	m.mu.Lock()
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
-			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) {
+			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+			stringSlicesEqual(existing.Filters, req.Filters) &&
+			stringSlicesEqual(existing.Excludes, req.Excludes) {
 			snapshot := m.cloneJobLocked(existing)
 			m.mu.Unlock()
 			return snapshot, true, nil
@@ -275,6 +302,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	m.dispatchLocked()
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.notifyListeners(snapshot)
 
 	return snapshot, false, nil
 }

@@ -3051,8 +3051,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         filters: filterValue ? [filterValue] : [],
         exactMatch: !!filterValue
       };
-      await api('POST', '/download', body);
+      const data = await api('POST', '/download', body);
 
+      if (data.message) {
+        showToast(data.message, 'info');
+        return;
+      }
+
+      state.jobs.set(data.id, data);
       setDlStatus(repo, filterValue, 'queued');
       // Replace the download button with the queued chip immediately.
       const row = document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
