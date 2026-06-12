@@ -168,6 +168,35 @@ func TestAPI_GetSettings(t *testing.T) {
 	}
 }
 
+func TestAPI_DiskFreeDefaultsToLocalDir(t *testing.T) {
+	root := t.TempDir()
+	localDir := filepath.Join(root, "local")
+	cacheDir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(Config{CacheDir: cacheDir, LocalDir: localDir})
+	req := httptest.NewRequest("GET", "/api/diskfree", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleDiskFree(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp["path"]; got != localDir {
+		t.Fatalf("path = %v, want localDir %s", got, localDir)
+	}
+}
+
 func TestAPI_GetSettings_TokenMasked(t *testing.T) {
 	cfg := Config{
 		CacheDir: "/tmp/test_cache",
@@ -196,7 +225,7 @@ func TestAPI_UpdateSettings(t *testing.T) {
 	srv := newTestServer()
 
 	// Update concurrency
-	body := `{"connections": 16, "maxActive": 8}`
+	body := `{"connections": 16, "maxActive": 8, "retries": 0, "verify": "sha256"}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -213,6 +242,12 @@ func TestAPI_UpdateSettings(t *testing.T) {
 	}
 	if srv.config.MaxActive != 8 {
 		t.Errorf("Expected maxActive 8, got %d", srv.config.MaxActive)
+	}
+	if srv.config.Retries != 0 {
+		t.Errorf("Expected retries 0, got %d", srv.config.Retries)
+	}
+	if srv.config.Verify != "sha256" {
+		t.Errorf("Expected verify sha256, got %s", srv.config.Verify)
 	}
 }
 

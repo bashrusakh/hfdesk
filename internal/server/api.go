@@ -419,7 +419,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.Verify != nil && *req.Verify != "" {
 		s.config.Verify = *req.Verify
 	}
-	if req.Retries != nil && *req.Retries > 0 {
+	if req.Retries != nil && *req.Retries >= 0 {
 		s.config.Retries = *req.Retries
 	}
 	if req.Endpoint != nil {
@@ -460,6 +460,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	s.jobs.UpdateConfig(s.config)
 
 	// Persist settings to config file
+	retries := s.config.Retries
 	fileCfg := &ConfigFile{
 		CacheDir:           s.config.CacheDir,
 		LocalDir:           s.config.LocalDir,
@@ -469,7 +470,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		MaxActive:          s.config.MaxActive,
 		MultipartThreshold: s.config.MultipartThreshold,
 		Verify:             s.config.Verify,
-		Retries:            s.config.Retries,
+		Retries:            &retries,
 		Endpoint:           s.config.Endpoint,
 	}
 	// Add proxy to config file if set

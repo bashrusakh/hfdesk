@@ -47,7 +47,7 @@ type ConfigFile struct {
 	MaxActive          int          `json:"max-active,omitempty" yaml:"max-active,omitempty"`
 	MultipartThreshold string       `json:"multipart-threshold,omitempty" yaml:"multipart-threshold,omitempty"`
 	Verify             string       `json:"verify,omitempty" yaml:"verify,omitempty"`
-	Retries            int          `json:"retries,omitempty" yaml:"retries,omitempty"`
+	Retries            *int         `json:"retries,omitempty" yaml:"retries,omitempty"`
 	Endpoint           string       `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
 	BackoffInitial     string       `json:"backoff-initial,omitempty" yaml:"backoff-initial,omitempty"`
 	BackoffMax         string       `json:"backoff-max,omitempty" yaml:"backoff-max,omitempty"`
@@ -208,20 +208,20 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	if serverCfg.Token == "" && fileCfg.Token != "" {
 		serverCfg.Token = fileCfg.Token
 	}
-	if serverCfg.Concurrency == 0 && fileCfg.Connections > 0 {
+	if fileCfg.Connections > 0 {
 		serverCfg.Concurrency = fileCfg.Connections
 	}
-	if serverCfg.MaxActive == 0 && fileCfg.MaxActive > 0 {
+	if fileCfg.MaxActive > 0 {
 		serverCfg.MaxActive = fileCfg.MaxActive
 	}
 	if serverCfg.MultipartThreshold == "" && fileCfg.MultipartThreshold != "" {
 		serverCfg.MultipartThreshold = fileCfg.MultipartThreshold
 	}
-	if serverCfg.Verify == "" && fileCfg.Verify != "" {
+	if fileCfg.Verify != "" {
 		serverCfg.Verify = fileCfg.Verify
 	}
-	if serverCfg.Retries == 0 && fileCfg.Retries > 0 {
-		serverCfg.Retries = fileCfg.Retries
+	if fileCfg.Retries != nil && *fileCfg.Retries >= 0 {
+		serverCfg.Retries = *fileCfg.Retries
 	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint
