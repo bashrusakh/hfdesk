@@ -650,6 +650,22 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     `;
 
     loadReadmePreview(data);
+    updateScrollArrows();
+  }
+
+  function updateScrollArrows() {
+    const scroller = $('#analyzeResult');
+    const arrowUp = $('#scrollArrowUp');
+    const arrowDown = $('#scrollArrowDown');
+    if (!scroller || !arrowUp || !arrowDown) return;
+
+    const top = scroller.scrollTop;
+    const maxScroll = scroller.scrollHeight - scroller.clientHeight;
+    const atTop = top < 20;
+    const atBottom = maxScroll <= 0 || top >= maxScroll - 20;
+
+    arrowUp.classList.toggle('visible', !atTop);
+    arrowDown.classList.toggle('visible', !atBottom);
   }
 
   async function loadReadmePreview(data) {
@@ -767,6 +783,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     currentAnalysis = null;
     currentSelectedRepo = null;
     currentSelectedIsDataset = false;
+    const arrowUp = $('#scrollArrowUp');
+    const arrowDown = $('#scrollArrowDown');
+    if (arrowUp) arrowUp.classList.remove('visible');
+    if (arrowDown) arrowDown.classList.remove('visible');
     currentSelectedBranch = 'main';
     const header = $('#modelsDetailHeader');
     const hfLink = $('#modelsDetailHFLink');
@@ -3282,6 +3302,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         loadModelsSearch();
       });
     });
+
+    // Scroll arrows: contextual top/bottom
+    const scroller = $('#analyzeResult');
+    const arrowUp = $('#scrollArrowUp');
+    const arrowDown = $('#scrollArrowDown');
+
+    arrowUp?.addEventListener('click', () => {
+      if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    arrowDown?.addEventListener('click', () => {
+      if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+    });
+    scroller?.addEventListener('scroll', updateScrollArrows);
   }
 
   async function loadModelsSearch() {

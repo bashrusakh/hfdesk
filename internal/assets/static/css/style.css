@@ -774,9 +774,18 @@ a {
   font-size: 14px;
   font-weight: 600;
   color: var(--color-text-secondary);
-  margin-bottom: 12px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  margin-bottom: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: #1a1a26;
+  margin-left: -24px;
+  margin-right: -24px;
+  padding: 10px 24px 8px;
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.04);
 }
 
 .analysis-grid {
@@ -791,8 +800,6 @@ a {
 }
 
 .readme-preview {
-  max-height: 75vh;
-  overflow: auto;
   padding-right: 6px;
   color: var(--color-text-secondary);
   line-height: 1.6;
@@ -4121,6 +4128,7 @@ a {
 
 /* ── Right / detail panel ── */
 .models-detail-panel {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -4352,4 +4360,55 @@ button.quant-dl-btn:hover {
 /* Like accent for social signals */
 .like-accent {
   color: var(--color-text-like);
+}
+
+/* ============================================
+   Scroll arrows — contextual top/bottom
+   ============================================ */
+
+.scroll-arrow {
+  position: absolute;
+  left: 50%;
+  z-index: 10;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(30, 30, 40, 0.82);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: var(--radius-full);
+  color: #fff;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) scale(1);
+  transition: opacity .3s ease, background .15s ease, transform .3s cubic-bezier(0.34,1.56,0.64,1);
+  font-family: inherit;
+}
+
+.scroll-arrow.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.scroll-arrow:hover {
+  background: var(--color-primary);
+  transform: translateX(-50%) scale(1.15);
+}
+
+.scroll-arrow:active {
+  transform: translateX(-50%) scale(0.92);
+  transition: transform .1s ease;
+}
+
+.scroll-arrow-up {
+  top: 56px;
+}
+
+.scroll-arrow-down {
+  bottom: 20px;
 }
