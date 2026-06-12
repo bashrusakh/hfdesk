@@ -3372,9 +3372,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const isGguf = (r.tags || []).includes('gguf');
     const badge  = isGguf
       ? `<span class="model-row-badge model-row-badge-gguf">GGUF</span>`
-      : r.pipelineTag
-        ? `<span class="model-row-badge">${escapeHtml(r.pipelineTag.replace(/-/g,' ').substring(0,16))}</span>`
-        : '';
+      : '';
     const localBadge = r.cached
       ? `<span class="model-row-badge model-row-badge-local" title="${escapeHtml(r.cacheSource || 'Local cache')}">local</span>`
       : '';
