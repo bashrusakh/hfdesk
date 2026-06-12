@@ -1237,7 +1237,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         <div class="job-error" data-role="error" style="display: none"></div>
     `;
     // Static fields (set once, never changed by progress events).
-    el.querySelector('.job-repo').textContent = job.repo || '';
+    const repoEl = el.querySelector('.job-repo');
+    repoEl.textContent = job.repo || '';
+    if (job.repo) {
+      repoEl.title = 'View model details';
+      repoEl.classList.add('job-repo-clickable');
+      repoEl.onclick = () => navigateToAnalyze(job.repo);
+    }
     // Only show the revision when it isn't the default "main" branch —
     // every download is from main, so labelling it adds noise and height.
     const revEl = el.querySelector('[data-role="revision"]');
