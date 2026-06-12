@@ -3334,7 +3334,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       : '';
 
     const dl = r.downloads ? `<span class="model-row-stat">↓${formatNumber(r.downloads)}</span>` : '';
-    const lk = r.likes     ? `<span class="model-row-stat">♥${formatNumber(r.likes)}</span>` : '';
+    const lk = r.likes     ? `<span class="model-row-stat like-accent">♥${formatNumber(r.likes)}</span>` : '';
     const gated = r.gated  ? `<span class="model-row-stat" title="Gated">🔒</span>` : '';
     const capabilityIcons = renderCapabilityIcons(caps.capabilities, caps.titles);
 
