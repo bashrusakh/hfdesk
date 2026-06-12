@@ -128,6 +128,55 @@ func TestJobManager_Deduplication(t *testing.T) {
 	}
 }
 
+func TestJobManager_DifferentFiltersNotDeduplicated(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{
+		CacheDir: cacheDir,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := NewJobManager(cfg, hub)
+
+	// Create first job with filter q4_k_m
+	job1, _, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"q4_k_m"},
+	})
+
+	// Different filter (mmproj-f16) — should NOT be deduped
+	job2, wasExisting, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"mmproj-f16"},
+	})
+	if wasExisting {
+		t.Error("Different filters (q4_k_m vs mmproj-f16) should create different jobs")
+	}
+	if job1.ID == job2.ID {
+		t.Error("Different filters should have different IDs")
+	}
+
+	// Same filter (q4_k_m) — should BE deduped
+	job3, wasExisting3, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"q4_k_m"},
+	})
+	if !wasExisting3 {
+		t.Error("Same filters should be deduped")
+	}
+	if job1.ID != job3.ID {
+		t.Errorf("Same filters should return same job, got %s vs %s", job1.ID, job3.ID)
+	}
+}
+
 func TestJobManager_DifferentRevisionsNotDeduplicated(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Cleanup(func() {
