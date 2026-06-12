@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Pipeline tag text is no longer shown as a badge on model list rows; the full pipeline is still visible in the model detail panel. GGUF and local-cache badges are unchanged. This removes a source of visual noise and inconsistent truncation (e.g. "feature extracti" cut off at 16 characters).
+- README links in the model description now underline on hover, making them easier to discover as interactive without adding visual weight at rest.
+- Improved contrast of model detail tag chips (e.g. `pytorch`, `safetensors`) by raising the text color from muted to secondary.
+
 ## [1.0.11] - 2026-06-12
 
 ### Changed
