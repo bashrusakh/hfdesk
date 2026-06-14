@@ -11,8 +11,47 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          awk -v version="$VERSION" '
+            /^## \[/ && index($0, "## [" version "]") == 1 { in_section=1; print; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            printf 'See CHANGELOG.md for release notes.\n' > release-notes.md
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -45,24 +84,10 @@ jobs:
       - name: Get version
         id: version
         run: |
-          # Use git tag for filenames (e.g., v1.0.0)
           TAG="${GITHUB_REF_NAME}"
-          # Strip 'v' prefix for version number in binary
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Extract release notes
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          awk -v version="$VERSION" '
-            /^## \[/ && index($0, "## [" version "]") == 1 { in_section=1; print; next }
-            in_section && /^## \[/ { exit }
-            in_section { print }
-          ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            printf 'See CHANGELOG.md for release notes.\n' > release-notes.md
-          fi
 
       - name: Build binary
         env:
@@ -70,7 +95,6 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 0
         run: |
-          # Build with version injected
           go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" \
             -o hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
             ./cmd/hfdesk
@@ -78,7 +102,7 @@ jobs:
       - name: Upload raw binary
         uses: softprops/action-gh-release@v3
         with:
-          body_path: release-notes.md
+          tag_name: ${{ steps.version.outputs.tag }}
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
 
   checksums:
@@ -102,4 +126,5 @@ jobs:
       - name: Upload checksums
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_name }}
           files: release-files/checksums.txt
