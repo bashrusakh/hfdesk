@@ -822,6 +822,12 @@ a {
 
 .readme-preview a {
   color: var(--color-primary-hover);
+  text-decoration: none;
+  transition: text-decoration 0.15s;
+}
+.readme-preview a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .readme-preview code {
@@ -3755,7 +3761,7 @@ a {
   padding: 2px 7px;
   border-radius: var(--radius-full);
   background: rgba(160, 160, 176, 0.12);
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   font-family: var(--font-mono);
 }
 
