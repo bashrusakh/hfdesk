@@ -212,6 +212,9 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
+		t.Fatal(err)
+	}
 	// Parts 2, 3: missing
 
 	var (
@@ -284,6 +287,80 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("part file %s should be removed, stat err: %v", p, err)
 		}
+	}
+}
+
+// TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts verifies that part
+// files from a previous run are not reused when the multipart layout changes.
+// Reusing part-XX by index is unsafe because changing the connection count
+// changes each part's byte range; the final file can have the right size but
+// wrong bytes and fail SHA-256 verification.
+func TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts(t *testing.T) {
+	tmpDir := t.TempDir()
+	const totalSize = 16000
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-change-concurrency")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an interrupted previous run with 8 connections. The next run
+	// below uses 4 connections, so these part files have incompatible ranges.
+	const oldParts = 8
+	oldChunk := totalSize / oldParts
+	for i := 0; i < oldParts; i++ {
+		start := i * oldChunk
+		end := start + oldChunk
+		if i == oldParts-1 {
+			end = totalSize
+		}
+		if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, i), full[start:end], 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	it := PlanItem{
+		RelativePath: "change.bin",
+		URL:          srv.URL + "/change.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: true,
+	}
+	cfg := Settings{Concurrency: 4, Retries: 0}
+
+	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Errorf("final content mismatch after concurrency change")
+	}
+	parts, err := multipartPartFiles(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 0 {
+		t.Errorf("stale part files were not cleaned up: %v", parts)
+	}
+	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
+		t.Errorf("multipart layout metadata should be removed after success, stat err: %v", err)
 	}
 }
 
