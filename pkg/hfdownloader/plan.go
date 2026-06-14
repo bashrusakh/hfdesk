@@ -5,11 +5,35 @@ package hfdownloader
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// unsafeRepoPath reports whether a relative path returned by the repo tree API
+// would escape the repository root if joined onto a local directory. The path
+// list is remote-controlled (and the endpoint is operator-configurable via
+// --endpoint, so a malicious or MITM'd mirror can return anything), and the
+// path flows unchecked into file writes (filepath.Join(base, rel)) and symlink
+// creation. Anything absolute, containing a "\\" (Windows separator / drive
+// escape), or normalising to "" / "." / ".." / a "../" prefix is rejected to
+// prevent arbitrary-file-write.
+func unsafeRepoPath(rel string) bool {
+	if rel == "" {
+		return true
+	}
+	if strings.ContainsRune(rel, '\\') || strings.HasPrefix(rel, "/") || filepath.IsAbs(rel) {
+		return true
+	}
+	cleaned := path.Clean(rel)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return true
+	}
+	return false
+}
 
 // PlanItem represents a single file in the download plan.
 type PlanItem struct {
@@ -66,6 +90,12 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	var fileNodes []hfNode
 	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
 		if n.Type == "file" || n.Type == "blob" {
+			// Reject path-traversal entries before they reach any filesystem
+			// operation downstream. Fail the whole plan rather than silently
+			// skipping so a tampered tree is loud, not partial.
+			if unsafeRepoPath(n.Path) {
+				return fmt.Errorf("refusing unsafe path from repo tree: %q", n.Path)
+			}
 			fileNodes = append(fileNodes, n)
 		}
 		return nil
