@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,6 +56,152 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 		}
 	}
 	return n, err
+}
+
+type multipartResumeLayout struct {
+	Size        int64                `json:"size"`
+	Concurrency int                  `json:"concurrency"`
+	Parts       []multipartPartRange `json:"parts"`
+}
+
+type multipartPartRange struct {
+	Index int   `json:"index"`
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+func multipartLayoutMetaPath(dst string) string {
+	return dst + ".parts.json"
+}
+
+func buildMultipartResumeLayout(size int64, n int, chunk int64) multipartResumeLayout {
+	layout := multipartResumeLayout{
+		Size:        size,
+		Concurrency: n,
+		Parts:       make([]multipartPartRange, n),
+	}
+	for i := 0; i < n; i++ {
+		start := int64(i) * chunk
+		end := start + chunk - 1
+		if i == n-1 {
+			end = size - 1
+		}
+		layout.Parts[i] = multipartPartRange{Index: i, Start: start, End: end}
+	}
+	return layout
+}
+
+func multipartPartFiles(dst string) ([]string, error) {
+	dir := filepath.Dir(dst)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	prefix := filepath.Base(dst) + ".part-"
+	files := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		files = append(files, filepath.Join(dir, entry.Name()))
+	}
+	return files, nil
+}
+
+func removeMultipartResumeFiles(dst string) error {
+	files, err := multipartPartFiles(dst)
+	if err != nil {
+		return err
+	}
+	for _, p := range files {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.Remove(multipartLayoutMetaPath(dst)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func removeUnexpectedMultipartPartFiles(dst string, layout multipartResumeLayout) error {
+	files, err := multipartPartFiles(dst)
+	if err != nil {
+		return err
+	}
+	expected := make(map[string]struct{}, len(layout.Parts))
+	for _, part := range layout.Parts {
+		expected[fmt.Sprintf("%s.part-%02d", dst, part.Index)] = struct{}{}
+	}
+	for _, p := range files {
+		if _, ok := expected[p]; ok {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeMultipartResumeLayout(dst string, layout multipartResumeLayout) error {
+	data, err := json.Marshal(layout)
+	if err != nil {
+		return err
+	}
+	metaPath := multipartLayoutMetaPath(dst)
+	tmpPath := metaPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, metaPath)
+}
+
+func prepareMultipartResume(dst string, layout multipartResumeLayout) error {
+	files, err := multipartPartFiles(dst)
+	if err != nil {
+		return err
+	}
+	if len(files) > 0 {
+		data, err := os.ReadFile(multipartLayoutMetaPath(dst))
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+			if err := removeMultipartResumeFiles(dst); err != nil {
+				return err
+			}
+			return writeMultipartResumeLayout(dst, layout)
+		}
+
+		var existing multipartResumeLayout
+		if err := json.Unmarshal(data, &existing); err != nil || !multipartLayoutsEqual(existing, layout) {
+			if err := removeMultipartResumeFiles(dst); err != nil {
+				return err
+			}
+			return writeMultipartResumeLayout(dst, layout)
+		}
+		if err := removeUnexpectedMultipartPartFiles(dst, layout); err != nil {
+			return err
+		}
+	}
+
+	return writeMultipartResumeLayout(dst, layout)
+}
+
+func multipartLayoutsEqual(a, b multipartResumeLayout) bool {
+	if a.Size != b.Size || a.Concurrency != b.Concurrency || len(a.Parts) != len(b.Parts) {
+		return false
+	}
+	for i := range a.Parts {
+		if a.Parts[i] != b.Parts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Download scans and downloads files from a HuggingFace repo.
@@ -588,6 +735,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		chunk = it.Size
 		n = 1
 	}
+	layout := buildMultipartResumeLayout(it.Size, n, chunk)
+	if err := prepareMultipartResume(dst, layout); err != nil {
+		return err
+	}
 
 	tmpParts := make([]string, n)
 	for i := 0; i < n; i++ {
@@ -799,6 +950,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	for _, p := range tmpParts {
 		_ = os.Remove(p)
 	}
+	_ = os.Remove(multipartLayoutMetaPath(dst))
 
 	return nil
 }
