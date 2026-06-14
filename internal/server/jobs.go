@@ -243,15 +243,19 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		revision = "main"
 	}
 
+	// Snapshot config under the lock so a concurrent settings update can't race
+	// these reads (UpdateConfig replaces m.config under the write lock).
+	cfg := m.snapshotConfig()
+
 	// Use HuggingFace cache directory (v3 mode)
-	cacheDir := m.config.CacheDir
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
 	// Determine effective local-dir: per-request overrides server-global.
 	// If either is set, use flat/real-file mode; otherwise use HF cache layout.
-	effectiveLocalDir := m.config.LocalDir
+	effectiveLocalDir := cfg.LocalDir
 	if req.LocalDir != "" {
 		effectiveLocalDir = req.LocalDir
 	}
@@ -681,6 +685,18 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Unlock()
 }
 
+// snapshotConfig returns a copy of the manager's config taken under the read
+// lock. Job runners use this instead of touching m.config directly: a settings
+// update (UpdateConfig) replaces m.config under the write lock, so an unguarded
+// read from a runJob goroutine would be a data race. The copy shares the
+// *ProxyConfig pointer, which is safe because handleUpdateSettings replaces that
+// pointer (copy-on-write) rather than mutating its target.
+func (m *JobManager) snapshotConfig() Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
 // speedWindow is how far back the windowed average looks. Progress at the
 // application level is bursty (part-file stats, chunked reads), so the window
 // must be long enough to average the bursts out, the way the OS smooths its
@@ -882,24 +898,29 @@ func (m *JobManager) runJob(job *Job) {
 		AppendFilterSubdir: false,
 	}
 
+	// Snapshot the manager config under the lock: a concurrent POST /api/settings
+	// (UpdateConfig) replaces m.config, so reading the fields directly here would
+	// be a data race.
+	cfg := m.snapshotConfig()
+
 	// Use HuggingFace cache structure (v3 mode) instead of legacy OutputDir
-	cacheDir := m.config.CacheDir
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
 	settings := hfdownloader.Settings{
 		CacheDir:           cacheDir, // Use HF cache structure
-		Concurrency:        m.config.Concurrency,
-		MaxActiveDownloads: m.config.MaxActive,
-		Token:              m.config.Token,
-		MultipartThreshold: m.config.MultipartThreshold,
-		Verify:             m.config.Verify,
-		Retries:            m.config.Retries,
+		Concurrency:        cfg.Concurrency,
+		MaxActiveDownloads: cfg.MaxActive,
+		Token:              cfg.Token,
+		MultipartThreshold: cfg.MultipartThreshold,
+		Verify:             cfg.Verify,
+		Retries:            cfg.Retries,
 		BackoffInitial:     "400ms",
 		BackoffMax:         "10s",
-		Endpoint:           m.config.Endpoint,
-		Proxy:              m.config.Proxy,
+		Endpoint:           cfg.Endpoint,
+		Proxy:              cfg.Proxy,
 	}
 
 	// Local mode: write real files into job.LocalDir instead of the HF cache

@@ -7,20 +7,41 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for development
-		// In production, you'd want to check the Origin header
+// isAllowedWSOrigin decides whether a WebSocket upgrade request may proceed.
+// Browsers attach an Origin header to cross-site WebSocket handshakes but —
+// unlike fetch/XHR — they do NOT enforce the CORS response on the connection,
+// so the server itself must reject disallowed origins or any web page the user
+// visits could open a socket to a locally-bound server and stream job state
+// (cross-site WebSocket hijacking). Policy:
+//   - No Origin header (native clients such as curl/websocat): allow.
+//   - Same-origin (Origin host == request host): allow.
+//   - Otherwise: allow only if the origin is in AllowedOrigins (or it is "*").
+//
+// With no AllowedOrigins configured this is default-deny for cross-origin, the
+// safe expectation for a tool bound to localhost/0.0.0.0. Note this is stricter
+// than corsMiddleware on purpose: CORS is browser-enforced for XHR, WS is not.
+func (s *Server) isAllowedWSOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client; no Origin to forge or hijack.
 		return true
-	},
+	}
+	if u, err := url.Parse(origin); err == nil && u.Host != "" && u.Host == r.Host {
+		return true
+	}
+	for _, o := range s.config.AllowedOrigins {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // WSMessage represents a message sent over WebSocket.
@@ -131,6 +152,11 @@ func (h *WSHub) ClientCount() int {
 
 // handleWebSocket handles WebSocket connections.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     s.isAllowedWSOrigin,
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[WS] Upgrade failed: %v", err)

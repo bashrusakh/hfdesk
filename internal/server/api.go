@@ -426,32 +426,40 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		s.config.Endpoint = *req.Endpoint
 	}
 
-	// Update proxy settings
+	// Update proxy settings. Build a fresh ProxyConfig (copy-on-write) instead of
+	// mutating the existing struct in place: the current *ProxyConfig pointer is
+	// shared with the JobManager's config and any in-flight job runner reading it
+	// (snapshotConfig copies the pointer, not the struct), so an in-place write
+	// would be a data race on the pointed-to struct. Replacing the pointer leaves
+	// the old struct immutable for existing readers.
 	if req.Proxy != nil {
-		if s.config.Proxy == nil {
-			s.config.Proxy = &hfdownloader.ProxyConfig{}
+		var newProxy hfdownloader.ProxyConfig
+		if s.config.Proxy != nil {
+			newProxy = *s.config.Proxy
 		}
 		if req.Proxy.URL != nil {
-			s.config.Proxy.URL = *req.Proxy.URL
+			newProxy.URL = *req.Proxy.URL
 		}
 		if req.Proxy.Username != nil {
-			s.config.Proxy.Username = *req.Proxy.Username
+			newProxy.Username = *req.Proxy.Username
 		}
 		if req.Proxy.Password != nil {
-			s.config.Proxy.Password = *req.Proxy.Password
+			newProxy.Password = *req.Proxy.Password
 		}
 		if req.Proxy.NoProxy != nil {
-			s.config.Proxy.NoProxy = *req.Proxy.NoProxy
+			newProxy.NoProxy = *req.Proxy.NoProxy
 		}
 		if req.Proxy.NoEnvProxy != nil {
-			s.config.Proxy.NoEnvProxy = *req.Proxy.NoEnvProxy
+			newProxy.NoEnvProxy = *req.Proxy.NoEnvProxy
 		}
 		if req.Proxy.InsecureSkipVerify != nil {
-			s.config.Proxy.InsecureSkipVerify = *req.Proxy.InsecureSkipVerify
+			newProxy.InsecureSkipVerify = *req.Proxy.InsecureSkipVerify
 		}
-		// Clear proxy if URL is empty
-		if s.config.Proxy.URL == "" {
+		// Clear proxy if URL is empty, otherwise swap in the new struct.
+		if newProxy.URL == "" {
 			s.config.Proxy = nil
+		} else {
+			s.config.Proxy = &newProxy
 		}
 	}
 

@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io/fs"
 	"log"
@@ -277,7 +278,11 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		user, pass, ok := r.BasicAuth()
-		if !ok || user != s.config.AuthUser || pass != s.config.AuthPass {
+		// Constant-time comparison avoids leaking the configured credentials
+		// through response-timing differences. Both comparisons always run.
+		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(s.config.AuthUser)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(s.config.AuthPass)) == 1
+		if !ok || !userOK || !passOK {
 			w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
