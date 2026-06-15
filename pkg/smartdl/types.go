@@ -212,6 +212,21 @@ type RepoInfo struct {
 	RelatedDownloads []RelatedDownload `json:"related_downloads,omitempty"`
 }
 
+// ModelChainEntry is one node in the provenance chain from base model to the
+// analyzed repo. The chain is ordered root-first (oldest ancestor at index 0,
+// current repo at the last index).
+type ModelChainEntry struct {
+	// Repo is the "owner/name" repository identifier.
+	Repo string `json:"repo"`
+
+	// Relation describes how this node relates to its parent in the chain:
+	// "finetune", "quantized", "merge", "adapter", or "" for the root.
+	Relation string `json:"relation,omitempty"`
+
+	// IsCurrent marks the repo that was analyzed (always the last entry).
+	IsCurrent bool `json:"is_current,omitempty"`
+}
+
 // GGUFInfo contains GGUF-specific analysis results.
 type GGUFInfo struct {
 	// ModelName is the base model name extracted from filenames.
@@ -227,7 +242,19 @@ type GGUFInfo struct {
 	// that must accompany an LLM quantization download for vision-language
 	// models. Populated when .gguf files whose basename starts with "mmproj"
 	// are present in the repo (e.g. gemma-3, llava, qwen2.5-vl in GGUF form).
+	// For repos without local mmproj, this may be populated from an upstream
+	// base-model repo discovered via the HF model card metadata.
 	MMProjFiles []FileInfo `json:"mmproj_files,omitempty"`
+
+	// MMProjUpstreamRepo is the "owner/name" of the repo from which mmproj
+	// files were sourced when they are not present in the current repo.
+	// Empty when mmproj files come from the current repo itself.
+	MMProjUpstreamRepo string `json:"mmproj_upstream_repo,omitempty"`
+
+	// ModelChain is the provenance chain from the oldest known ancestor down
+	// to the current repo. Built from HF model card base_model metadata.
+	// Only populated when the repo declares a base_model in its card data.
+	ModelChain []ModelChainEntry `json:"model_chain,omitempty"`
 }
 
 // GGUFQuantization represents a single GGUF quantization option.
@@ -539,6 +566,12 @@ type SelectableItem struct {
 
 	// RAMHuman is the human-readable RAM estimate.
 	RAMHuman string `json:"ram_human,omitempty"`
+
+	// UpstreamRepo is the "owner/name" of a different repository from which
+	// this item's files should be downloaded. Set only for vision_encoder items
+	// sourced from an upstream base-model repo (i.e. when MMProjUpstreamRepo is
+	// set). Empty means the download targets the current repo.
+	UpstreamRepo string `json:"upstream_repo,omitempty"`
 }
 
 // RelatedDownload represents a related repository that may be needed.

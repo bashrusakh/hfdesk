@@ -224,8 +224,7 @@ func ggufQuantType(f FileInfo) string {
 // multimodal GGUF repos and must be downloaded as a companion to the chosen
 // LLM quant — they are not user-selectable quantizations themselves.
 func isMMProjFile(name string) bool {
-	base := strings.ToLower(filepath.Base(name))
-	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
+	return strings.Contains(strings.ToLower(filepath.Base(name)), "mmproj")
 }
 
 func isGGUFImatrixFile(name string) bool {
@@ -564,19 +563,27 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 				ordered = append(ordered, f)
 			}
 		}
+
+		// Build the description once; it is shared across all mmproj items.
+		mmDesc := "Multimodal projector"
+		if info.MMProjUpstreamRepo != "" {
+			mmDesc += " · upstream: " + info.MMProjUpstreamRepo
+		}
+
 		for _, f := range ordered {
 			base := filepath.Base(f.Name)
 			filter := strings.ToLower(strings.TrimSuffix(base, ".gguf"))
 			items = append(items, SelectableItem{
-				ID:          "mmproj-" + filter,
-				Label:       base,
-				Description: "Multimodal projector; required alongside the LLM quant for vision/multimodal models",
-				Size:        f.Size,
-				SizeHuman:   f.SizeHuman,
-				Recommended: f.Name == preferred.Name,
-				Category:    "vision_encoder",
-				FilterValue: filter,
-				Files:       []string{f.Path},
+				ID:           "mmproj-" + filter,
+				Label:        base,
+				Description:  mmDesc,
+				Size:         f.Size,
+				SizeHuman:    f.SizeHuman,
+				Recommended:  f.Name == preferred.Name,
+				Category:     "vision_encoder",
+				FilterValue:  filter,
+				Files:        []string{f.Path},
+				UpstreamRepo: info.MMProjUpstreamRepo,
 			})
 		}
 	}
