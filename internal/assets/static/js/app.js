@@ -3081,7 +3081,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           : dlStatus === 'running'
             ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
           : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">${dlIcon}</button>`;
+               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}','${item.upstream_repo ? escapeHtml(repo) : ''}')">${dlIcon}</button>`;
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
@@ -3103,7 +3103,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo) {
     try {
       // Disk-free guard
       const df = await fetch('/api/diskfree').then(r => r.json()).catch(() => null);
@@ -3125,6 +3125,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         filters: filterValue ? [filterValue] : [],
         exactMatch: !!filterValue
       };
+      // When downloading from an upstream repo (e.g. mmproj from a base model),
+      // tell the server to store the file under the current model's folder.
+      if (localRepo) body.localRepo = localRepo;
       const data = await api('POST', '/download', body);
 
       if (data.message) {

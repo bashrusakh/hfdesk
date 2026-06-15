@@ -86,6 +86,13 @@ type Job struct {
 	// Instead of:
 	//   <output>/<repo>/<filename>
 	AppendFilterSubdir bool
+
+	// LocalRepo overrides the destination folder path when set.
+	// Files are fetched from Repo but stored as if they belong to LocalRepo.
+	// Use when downloading from an upstream repo (e.g. mmproj from a base
+	// model) but wanting the files saved alongside a different model's files.
+	// When empty, Repo is used for the destination path (default behaviour).
+	LocalRepo string
 }
 
 // Settings configures download behavior.
