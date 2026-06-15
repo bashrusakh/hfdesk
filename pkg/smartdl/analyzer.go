@@ -128,6 +128,12 @@ func (a *Analyzer) AnalyzeWithRevision(ctx context.Context, repo string, isDatas
 	// Run type-specific analysis
 	a.analyzeTypeSpecific(info)
 
+	// For GGUF repos: build the model-provenance chain and, when no local
+	// mmproj files exist, search upstream repos for them.
+	if info.Type == TypeGGUF && info.GGUF != nil {
+		a.buildModelChain(ctx, info)
+	}
+
 	// Populate SelectableItems based on type
 	populateSelectableItems(info)
 
@@ -628,6 +634,189 @@ func humanSize(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// hfModelInfo holds the fields from GET /api/models/{repo} that we need for
+// upstream-mmproj discovery and model-chain building.
+type hfModelInfo struct {
+	ID       string                 `json:"id"`
+	Tags     []string               `json:"tags"`
+	CardData map[string]interface{} `json:"cardData"`
+}
+
+// fetchModelInfo calls GET /api/models/{repo} and returns the relevant fields.
+// Non-fatal: callers should treat errors as "no metadata available".
+func (a *Analyzer) fetchModelInfo(ctx context.Context, repo string) (*hfModelInfo, error) {
+	reqURL := fmt.Sprintf("%s/api/models/%s", a.endpoint, repo)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	a.addAuth(req)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("fetchModelInfo %s: %s", repo, resp.Status)
+	}
+
+	var info hfModelInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("decode model info %s: %w", repo, err)
+	}
+	return &info, nil
+}
+
+// baseModelsFrom extracts base_model string(s) from HF card data.
+// The field may be a bare string or a JSON array of strings.
+func baseModelsFrom(cardData map[string]interface{}) []string {
+	if cardData == nil {
+		return nil
+	}
+	v, ok := cardData["base_model"]
+	if !ok {
+		return nil
+	}
+	switch bm := v.(type) {
+	case string:
+		if bm != "" {
+			return []string{bm}
+		}
+	case []interface{}:
+		var out []string
+		for _, item := range bm {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// relationFromTags extracts the relationship type of a repo to its base model
+// from its HF tags (e.g. "base_model:finetune:..." → "finetune").
+func relationFromTags(tags []string) string {
+	for _, tag := range tags {
+		switch {
+		case strings.HasPrefix(tag, "base_model:finetune:"):
+			return "finetune"
+		case strings.HasPrefix(tag, "base_model:quantized:"):
+			return "quantized"
+		case strings.HasPrefix(tag, "base_model:merge:"):
+			return "merge"
+		case strings.HasPrefix(tag, "base_model:adapter:"):
+			return "adapter"
+		}
+	}
+	return ""
+}
+
+// fetchMMProjFromRepo fetches the file tree of repo and returns any mmproj
+// GGUF files it contains. Returns nil when the repo doesn't exist or has none.
+func (a *Analyzer) fetchMMProjFromRepo(ctx context.Context, repo string) []FileInfo {
+	files, _, err := a.fetchFileTree(ctx, repo, false, "main")
+	if err != nil {
+		return nil
+	}
+	var out []FileInfo
+	for _, f := range files {
+		if strings.HasSuffix(strings.ToLower(f.Name), ".gguf") && isMMProjFile(f.Name) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// buildModelChain populates GGUFInfo.ModelChain and, when the current repo has
+// no local mmproj files, searches upstream repos for them (up to maxDepth
+// base_model hops). Errors are non-fatal; partial results are used as-is.
+func (a *Analyzer) buildModelChain(ctx context.Context, info *RepoInfo) {
+	if info.Type != TypeGGUF || info.GGUF == nil {
+		return
+	}
+
+	modelInfo, err := a.fetchModelInfo(ctx, info.Repo)
+	if err != nil {
+		return
+	}
+
+	baseModels := baseModelsFrom(modelInfo.CardData)
+	if len(baseModels) == 0 {
+		return // no lineage declared
+	}
+
+	// Build the chain backwards (current repo first, oldest ancestor last),
+	// then reverse at the end. This makes the recursion natural.
+	currentRelation := relationFromTags(modelInfo.Tags)
+	chain := []ModelChainEntry{{Repo: info.Repo, Relation: currentRelation, IsCurrent: true}}
+
+	needMMProj := len(info.GGUF.MMProjFiles) == 0
+	const maxDepth = 2
+
+	a.traverseUpstream(ctx, baseModels[0], maxDepth, &chain, needMMProj, info.GGUF)
+
+	// Reverse so the chain reads oldest-ancestor → current.
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	info.GGUF.ModelChain = chain
+}
+
+// traverseUpstream walks one hop up the base_model chain. It adds the repo to
+// the (reversed) chain slice, tries the "{repo}-GGUF" heuristic for mmproj
+// files when needMMProj is true, and recurses if depth > 0.
+func (a *Analyzer) traverseUpstream(
+	ctx context.Context,
+	repo string,
+	depth int,
+	chain *[]ModelChainEntry,
+	needMMProj bool,
+	gguf *GGUFInfo,
+) {
+	if repo == "" {
+		return
+	}
+
+	// Try the "{owner}/{name}-GGUF" heuristic for the current base repo when
+	// it doesn't already look like a GGUF repo. This is where most mmproj
+	// files live (e.g. unsloth/Qwen3.5-9B → unsloth/Qwen3.5-9B-GGUF).
+	if needMMProj && !strings.HasSuffix(strings.ToLower(repo), "-gguf") {
+		candidate := repo + "-GGUF"
+		if mmprojs := a.fetchMMProjFromRepo(ctx, candidate); len(mmprojs) > 0 {
+			gguf.MMProjFiles = mmprojs
+			gguf.MMProjUpstreamRepo = candidate
+			needMMProj = false
+			// Don't add the -GGUF heuristic repo to the chain; add the
+			// safetensors repo that we actually followed the link to.
+		}
+	}
+
+	// Fetch the model info for this base repo so we can get its relation tag
+	// and potentially recurse further.
+	ancestorInfo, err := a.fetchModelInfo(ctx, repo)
+
+	relation := ""
+	if err == nil {
+		relation = relationFromTags(ancestorInfo.Tags)
+	}
+
+	*chain = append(*chain, ModelChainEntry{Repo: repo, Relation: relation})
+
+	if depth <= 0 || err != nil {
+		return
+	}
+
+	nextBases := baseModelsFrom(ancestorInfo.CardData)
+	if len(nextBases) == 0 {
+		return
+	}
+
+	a.traverseUpstream(ctx, nextBases[0], depth-1, chain, needMMProj, gguf)
 }
 
 // populateSelectableItems converts type-specific data to unified SelectableItems.

@@ -510,6 +510,42 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     if (data.gguf) {
       const g = data.gguf;
+
+      // Model lineage tree — Option B (indented tree, like HF card).
+      // Only rendered when there are at least 2 nodes (i.e. chain has a parent).
+      let chainHtml = '';
+      if (g.model_chain && g.model_chain.length > 1) {
+        const nodeHtml = g.model_chain.map((node, i) => {
+          const isCurrent = !!node.is_current;
+          const isRoot    = i === 0;
+          const indent    = i * 14;
+          const connector = i > 0 ? `<span style="color:var(--color-text-muted);font-size:11px;opacity:.6;flex-shrink:0">└─</span>` : '';
+          const icon      = isCurrent ? '◉' : isRoot ? '◈' : '⚙';
+          const relLabel  = isCurrent
+            ? (node.relation ? node.relation + ' · this' : 'this')
+            : isRoot
+              ? 'base model'
+              : (node.relation || '');
+          const nameStyle = isCurrent
+            ? 'font-size:11px;font-family:var(--font-mono);color:var(--color-text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0'
+            : 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0';
+          const tagStyle = isCurrent
+            ? 'font-size:10px;color:var(--color-info);flex-shrink:0;margin-left:2px'
+            : 'font-size:10px;color:var(--color-text-muted);flex-shrink:0;margin-left:2px';
+          return `<div style="display:flex;align-items:center;gap:5px;padding:2px 0;padding-left:${indent}px">
+            ${connector}
+            <span style="font-size:11px;opacity:.7;flex-shrink:0">${icon}</span>
+            <span style="${nameStyle}">${escapeHtml(node.repo)}</span>
+            ${relLabel ? `<span style="${tagStyle}">${escapeHtml(relLabel)}</span>` : ''}
+          </div>`;
+        }).join('');
+        chainHtml = `
+          <div style="margin-top:12px">
+            <div class="analysis-stat-label" style="margin-bottom:6px">Model lineage</div>
+            ${nodeHtml}
+          </div>`;
+      }
+
       typeInfoHtml = `
         <div class="analysis-section">
           <h4>GGUF Information</h4>
@@ -517,6 +553,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             ${g.model_name ? `<div class="analysis-stat"><div class="analysis-stat-label">Model</div><div class="analysis-stat-value">${escapeHtml(g.model_name)}</div></div>` : ''}
             ${g.parameter_count ? `<div class="analysis-stat"><div class="analysis-stat-label">Parameters</div><div class="analysis-stat-value">${escapeHtml(g.parameter_count)}</div></div>` : ''}
           </div>
+          ${chainHtml}
         </div>
       `;
     }
@@ -3004,6 +3041,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       'split': 'Dataset Splits',
       'format': 'Weight Format',
       'precision': 'Precision',
+      'vision_encoder': 'Vision Encoder',
       'default': 'Options'
     };
 
@@ -3025,6 +3063,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
         const fv = item.filter_value || item.id || '';
         const dlStatus = dlMap[fv] || '';
+        // upstream_repo is set for vision_encoder items sourced from a base-model
+        // repo; in that case the download must target that repo, not the current one.
+        const dlRepo = item.upstream_repo || repo;
 
         // Left control: a Download button when idle; otherwise it is REPLACED by
         // a status chip reflecting the quant's state in the download queue
@@ -3040,7 +3081,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           : dlStatus === 'running'
             ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
           : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(repo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">${dlIcon}</button>`;
+               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}')">${dlIcon}</button>`;
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
@@ -3071,9 +3112,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         return;
       }
 
+      // When downloading from an upstream repo (e.g. mmproj from base model),
+      // always use "main" — the current analysis revision applies only to
+      // the repo being analyzed, not to its ancestors.
+      const revision = (repo === currentAnalysis?.repo)
+        ? (currentAnalysis?.branch || 'main')
+        : 'main';
       const body = {
         repo,
-        revision: currentAnalysis?.branch || 'main',
+        revision,
         dataset: isDataset,
         filters: filterValue ? [filterValue] : [],
         exactMatch: !!filterValue

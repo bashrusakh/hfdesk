@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [1.0.13] - 2026-06-15
+
+### Added
+
+- Upstream mmproj discovery: when a GGUF repo has no local multimodal projector files, hfdesk now traverses the HF model card `base_model` chain (up to two hops) and checks the `{owner}/{name}-GGUF` sibling repo at each level. If found, the mmproj files are listed in the Vision Encoder section with a note showing the source repo (e.g. `Multimodal projector · upstream: unsloth/Qwen3.5-9B-GGUF`). The download button targets the upstream repo automatically.
+- Model lineage tree in the GGUF Information panel. When a repo declares a `base_model` in its HF card, the provenance chain is shown as an indented tree (base model → finetune → quantized → this), matching the style of the HF model card. Built from the HF `/api/models` metadata; only shown when at least one ancestor is known.
+
+### Changed
+
+- Vision Encoder items now appear under a "Vision Encoder" section heading in the quantization list (previously fell back to the raw `vision_encoder` string).
+
+### Fixed
+
+- `isMMProjFile` now detects the mradermacher naming convention (`model.mmproj-f16.gguf`, `model.mmproj-Q8_0.gguf`) where the `mmproj` token is dot-separated rather than a leading prefix. Previously these files were misclassified as LLM quantizations (e.g. `F16`, `Q8_0`) and polluted the quant picker.
+
 ## [1.0.12] - 2026-06-14
 
 ### Changed

@@ -52,6 +52,85 @@ func gemma3MultimodalFiles() []FileInfo {
 	return files
 }
 
+// mradermacherFiles returns a file list that mimics mradermacher's naming
+// convention where the mmproj uses a dot-separated ".mmproj-" segment rather
+// than the leading "mmproj-" prefix used by unsloth and others.
+func mradermacherFiles() []FileInfo {
+	names := []string{
+		"Qwopus3.5-9B-v3.5.Q4_K_M.gguf",
+		"Qwopus3.5-9B-v3.5.Q8_0.gguf",
+		"Qwopus3.5-9B-v3.5.mmproj-f16.gguf",
+		"Qwopus3.5-9B-v3.5.mmproj-Q8_0.gguf",
+	}
+	files := make([]FileInfo, 0, len(names))
+	for i, n := range names {
+		files = append(files, FileInfo{
+			Name: n, Path: n, Size: int64(5_000_000_000 + i*100_000_000),
+		})
+	}
+	return files
+}
+
+// TestIsMMProjFile_Patterns verifies that isMMProjFile recognises every known
+// naming convention: leading "mmproj-", dot-separated ".mmproj-", and the
+// "-mmproj" suffix forms, while not matching ordinary LLM quant files.
+func TestIsMMProjFile_Patterns(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		// Standard unsloth/llama.cpp prefix form
+		{"mmproj-F16.gguf", true},
+		{"mmproj-BF16.gguf", true},
+		{"mmproj-F32.gguf", true},
+		// mradermacher dot-separator form
+		{"Qwopus3.5-9B-v3.5.mmproj-f16.gguf", true},
+		{"Qwopus3.5-9B-v3.5.mmproj-Q8_0.gguf", true},
+		// Hypothetical infix form
+		{"model-mmproj-f16.gguf", true},
+		// Plain LLM quants — must NOT match
+		{"gemma-3-4b-it-Q4_K_M.gguf", false},
+		{"Qwopus3.5-9B-v3.5.Q8_0.gguf", false},
+		{"model.gguf", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isMMProjFile(c.name); got != c.want {
+				t.Errorf("isMMProjFile(%q) = %v, want %v", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAnalyzeGGUF_MradermacherMMProjStyle verifies that the dot-separator
+// ".mmproj-" naming used by mradermacher repos is correctly partitioned into
+// MMProjFiles (not Quantizations).
+func TestAnalyzeGGUF_MradermacherMMProjStyle(t *testing.T) {
+	info := analyzeGGUF(mradermacherFiles())
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	if got := len(info.Quantizations); got != 2 {
+		names := []string{}
+		for _, q := range info.Quantizations {
+			names = append(names, q.File.Name)
+		}
+		t.Errorf("got %d quantizations, want 2; quants=%v", got, names)
+	}
+	if got := len(info.MMProjFiles); got != 2 {
+		names := []string{}
+		for _, f := range info.MMProjFiles {
+			names = append(names, f.Name)
+		}
+		t.Errorf("got %d MMProjFiles, want 2; files=%v", got, names)
+	}
+	for _, q := range info.Quantizations {
+		if strings.Contains(strings.ToLower(q.File.Name), "mmproj") {
+			t.Errorf("mmproj file %q leaked into Quantizations", q.File.Name)
+		}
+	}
+}
+
 // TestAnalyzeGGUF_MMProjExcludedFromQuantizations verifies that mmproj vision
 // encoder files are NOT listed alongside LLM quantizations. Before the fix,
 // mmproj-F16.gguf was parsed as an "F16" quant, mmproj-BF16.gguf as "BF16",
