@@ -19,6 +19,10 @@ type DownloadRequest struct {
 	// writing real files (flat mode) instead of the HF cache layout.
 	// When empty, the server-global LocalDir (if set) or HF cache is used.
 	LocalDir string `json:"localDir,omitempty"`
+	// LocalRepo overrides the folder name used for storing downloaded files.
+	// When set, files fetched from Repo are stored as if they belong to LocalRepo.
+	// Used when downloading upstream mmproj files alongside the current model's quants.
+	LocalRepo string `json:"localRepo,omitempty"`
 }
 
 // PlanResponse is the response for a dry-run/plan request.

@@ -288,8 +288,14 @@ func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
 
 // destinationBase returns the base output directory for a job.
 func destinationBase(job Job, cfg Settings) string {
-	// Always OutputDir/<repo>; per-file filter subdirs are applied in Download().
-	return filepath.Join(cfg.OutputDir, job.Repo)
+	// LocalRepo overrides the folder name: use it when the files are fetched
+	// from an upstream repo but should be stored alongside another model's files
+	// (e.g. mmproj from a base model saved next to the current model's quants).
+	repoForPath := job.Repo
+	if job.LocalRepo != "" {
+		repoForPath = job.LocalRepo
+	}
+	return filepath.Join(cfg.OutputDir, repoForPath)
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

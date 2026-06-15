@@ -251,7 +251,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if job.IsDataset {
 			repoType = RepoTypeDataset
 		}
-		repoDir, err = hfCache.Repo(job.Repo, repoType)
+		// LocalRepo overrides the cache folder name: files fetched from an
+		// upstream repo are stored under the target model's cache directory
+		// instead of the upstream repo's own directory.
+		cacheRepoID := job.Repo
+		if job.LocalRepo != "" {
+			cacheRepoID = job.LocalRepo
+		}
+		repoDir, err = hfCache.Repo(cacheRepoID, repoType)
 		if err != nil {
 			return fmt.Errorf("create repo dir: %w", err)
 		}

@@ -37,6 +37,7 @@ type Job struct {
 	Excludes   []string          `json:"excludes,omitempty"`
 	OutputDir  string            `json:"outputDir"`
 	LocalDir   string            `json:"localDir,omitempty"`   // Effective local-dir for this job (per-request or server-global)
+	LocalRepo  string            `json:"localRepo,omitempty"`  // Override destination folder name (used for upstream mmproj)
 	Flat       bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
 	ExactMatch bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
 	Status     JobStatus         `json:"status"`
@@ -293,6 +294,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		Excludes:   req.Excludes,
 		OutputDir:  outputDir,
 		LocalDir:   effectiveLocalDir,
+		LocalRepo:  req.LocalRepo,
 		Flat:       flat,
 		ExactMatch: req.ExactMatch,
 		Status:     JobStatusQueued,
@@ -896,6 +898,7 @@ func (m *JobManager) runJob(job *Job) {
 		Excludes:           job.Excludes,
 		ExactMatch:         job.ExactMatch,
 		AppendFilterSubdir: false,
+		LocalRepo:          job.LocalRepo,
 	}
 
 	// Snapshot the manager config under the lock: a concurrent POST /api/settings
