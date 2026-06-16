@@ -281,3 +281,62 @@ func TestAnalyzeGGUF_UnslothSplitKeepsUDLabel(t *testing.T) {
 		t.Fatalf("filter = %q, want q3_k_xl", items[0].FilterValue)
 	}
 }
+
+// TestAnalyzeGGUF_MTPCompanionFiltered simulates the file layout of
+// unsloth/gemma-4-26B-A4B-it-qat-GGUF and verifies that the root-level MTP
+// companion file (mtp-gemma-4-26B-A4B-it.gguf) is filtered out rather than
+// appearing as an "Unknown" quantization alongside the correctly-labeled MTP
+// quant files from the MTP/ subdirectory.
+func TestAnalyzeGGUF_MTPCompanionFiltered(t *testing.T) {
+	files := []FileInfo{
+		{Name: "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", Path: "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", Size: 14249045120},
+		{Name: "mtp-gemma-4-26B-A4B-it.gguf", Path: "mtp-gemma-4-26B-A4B-it.gguf", Size: 251937728},
+		{Name: "mmproj-BF16.gguf", Path: "mmproj-BF16.gguf", Size: 1194828256},
+		{Name: "mmproj-F16.gguf", Path: "mmproj-F16.gguf", Size: 1193058784},
+		{Name: "mmproj-F32.gguf", Path: "mmproj-F32.gguf", Size: 2291200480},
+		{Name: "gemma-4-26B-A4B-it-BF16-MTP.gguf", Path: "MTP/gemma-4-26B-A4B-it-BF16-MTP.gguf", Size: 855245760},
+		{Name: "gemma-4-26B-A4B-it-F16-MTP.gguf", Path: "MTP/gemma-4-26B-A4B-it-F16-MTP.gguf", Size: 855245760},
+		{Name: "gemma-4-26B-A4B-it-Q4_0-MTP.gguf", Path: "MTP/gemma-4-26B-A4B-it-Q4_0-MTP.gguf", Size: 251937728},
+		{Name: "gemma-4-26B-A4B-it-Q8_0-MTP.gguf", Path: "MTP/gemma-4-26B-A4B-it-Q8_0-MTP.gguf", Size: 461784000},
+	}
+
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+
+	// Assert no "Unknown" quantization slipped through from the mtp- file.
+	for _, q := range info.Quantizations {
+		if q.Name == "Unknown" {
+			t.Errorf("got Unknown quantization from mtp companion file; quantizations=%v", info.Quantizations)
+		}
+	}
+
+	// Expected: UD_Q4_K_XL, BF16, F16, Q8_0, Q4_0 = 5 quantizations.
+	if got := len(info.Quantizations); got != 5 {
+		t.Errorf("got %d quantizations, want 5; quantizations=%v", got, info.Quantizations)
+	}
+
+	// Confirm the mtp- file did not generate a quantization of its own.
+	for _, q := range info.Quantizations {
+		if q.File.Size == 251937728 && q.Name != "Q4_0" {
+			t.Errorf("file with MTP size 251937728 got quant name %q instead of Q4_0", q.Name)
+		}
+	}
+
+	// MMProj files must be unaffected.
+	if got := len(info.MMProjFiles); got != 3 {
+		t.Errorf("got %d mmproj files, want 3", got)
+	}
+
+	// Verify the recognizable MTP quant files are still present.
+	labels := make(map[string]bool)
+	for _, q := range info.Quantizations {
+		labels[q.Name] = true
+	}
+	for _, want := range []string{"UD_Q4_K_XL", "BF16", "F16", "Q8_0", "Q4_0"} {
+		if !labels[want] {
+			t.Errorf("expected quantization %q not found", want)
+		}
+	}
+}

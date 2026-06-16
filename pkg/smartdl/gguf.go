@@ -232,10 +232,22 @@ func isGGUFImatrixFile(name string) bool {
 	return base == "imatrix.gguf" || strings.HasSuffix(base, "-imatrix.gguf") || strings.HasSuffix(base, ".imatrix.gguf")
 }
 
+// isGGUFMTPFile reports whether a GGUF filename is a Multi-Token Prediction
+// (MTP) head companion file. These files sit alongside LLM quantizations in
+// GGUF repos (e.g. mtp-gemma-4-26B-A4B-it.gguf) but are not user-selectable
+// quantizations themselves. MTP files that carry a recognized quantization
+// token (e.g. gemma-4-26B-A4B-it-BF16-MTP.gguf) are not caught here — they
+// have proper quant labels and will still appear as quantization options.
+func isGGUFMTPFile(name string) bool {
+	return strings.HasPrefix(strings.ToLower(filepath.Base(name)), "mtp-")
+}
+
 // analyzeGGUF analyzes GGUF files and extracts quantization information.
 // Multimodal projector ("mmproj") files are detected and kept separate from
 // LLM quantizations so the picker shows clean quant options while still
-// knowing to bundle the vision encoder with any quant download.
+// knowing to bundle the vision encoder with any quant download. MTP
+// (Multi-Token Prediction) companion files without a recognized quantization
+// token are filtered out alongside imatrix files.
 func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	info := &GGUFInfo{}
 
@@ -250,6 +262,9 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 			continue
 		}
 		if isGGUFImatrixFile(f.Name) {
+			continue
+		}
+		if isGGUFMTPFile(f.Name) {
 			continue
 		}
 		llmFiles = append(llmFiles, f)

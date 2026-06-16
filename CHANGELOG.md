@@ -16,6 +16,7 @@
 ### Fixed
 
 - `isMMProjFile` now detects the mradermacher naming convention (`model.mmproj-f16.gguf`, `model.mmproj-Q8_0.gguf`) where the `mmproj` token is dot-separated rather than a leading prefix. Previously these files were misclassified as LLM quantizations (e.g. `F16`, `Q8_0`) and polluted the quant picker.
+- Upstream mmproj downloads are now stored under the current model's folder instead of the upstream repo's own folder, so the on-disk cache layout matches the model selected in the UI. Previously a click on an upstream multimodal projector entry (one discovered on a base model's `-GGUF` sibling) saved the file under the upstream repo id and split the local layout between two owners.
 
 ## [1.0.12] - 2026-06-14
 
