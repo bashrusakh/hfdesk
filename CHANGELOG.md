@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.0.14] - 2026-06-18
+
+### Fixed
+
+- MTP (Multi-Token Prediction) companion GGUF files without a recognized quantization token are now filtered out of quantization lists. Files starting with `mtp-` (e.g. `mtp-gemma-4-26B-A4B-it.gguf`) are excluded unless they carry a proper quant label (e.g. `-BF16-MTP.gguf`), which still appear as selectable options.
+
 ## [1.0.13] - 2026-06-15
 
 ### Added
