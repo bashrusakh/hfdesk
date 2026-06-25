@@ -242,6 +242,27 @@ func isGGUFMTPFile(name string) bool {
 	return strings.HasPrefix(strings.ToLower(filepath.Base(name)), "mtp-")
 }
 
+// hasMTPMarker reports whether a GGUF filename carries an "MTP" segment marking
+// it as a Multi-Token Prediction variant of an otherwise normal quantization
+// (e.g. model-MTP-Q4_K_M.gguf or model-Q4_K_M-MTP.gguf). Unlike isGGUFMTPFile,
+// which catches headless "mtp-*" companion files with no quant token, these
+// files are full models that carry a recognized quantization token and must
+// appear as their own quantization options — separate from the non-MTP twin
+// that shares the same token. The marker is matched as a delimiter-bounded
+// segment so it never trips on substrings inside other tokens.
+func hasMTPMarker(name string) bool {
+	base := strings.ToLower(filepath.Base(name))
+	base = strings.TrimSuffix(base, ".gguf")
+	for _, seg := range strings.FieldsFunc(base, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.'
+	}) {
+		if seg == "mtp" {
+			return true
+		}
+	}
+	return false
+}
+
 // analyzeGGUF analyzes GGUF files and extracts quantization information.
 // Multimodal projector ("mmproj") files are detected and kept separate from
 // LLM quantizations so the picker shows clean quant options while still
@@ -308,11 +329,20 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 		// is recognized, group by it (all shards of Q4_K_M merge). When it is not,
 		// group by the filename with its shard suffix removed, so multi-shard
 		// "unknown" files still merge while genuinely different files stay apart.
+		//
+		// MTP (Multi-Token Prediction) variants carry the same quant token as
+		// their non-MTP twin (model-MTP-Q4_K_M.gguf vs model-Q4_K_M.gguf) but are
+		// distinct downloadable models, so they get a separate key — otherwise
+		// the two would merge into one row with a bogus summed size. MTP-ness is
+		// uniform across a quant's shards, so this still merges shards correctly.
 		var key string
 		if quantType != "" {
 			key = quantType
 		} else {
 			key = "unknown:" + strings.ToLower(stripSplitSuffix(filepath.Base(f.Name)))
+		}
+		if hasMTPMarker(f.Name) {
+			key += "|MTP"
 		}
 
 		g := groups[key]
@@ -384,6 +414,9 @@ func quantizationFromGroup(files []FileInfo) *GGUFQuantization {
 
 	ram := estimateRAM(totalSize)
 
+	// MTP-ness is uniform across a group's shards; the representative carries it.
+	isMTP := hasMTPMarker(rep.Name)
+
 	if quantType == "" {
 		// No recognized quantization (split file or unknown format).
 		return &GGUFQuantization{
@@ -396,6 +429,7 @@ func quantizationFromGroup(files []FileInfo) *GGUFQuantization {
 			Description:       "Unknown quantization format",
 			Parts:             len(files),
 			Files:             paths,
+			IsMTP:             isMTP,
 		}
 	}
 
@@ -409,6 +443,9 @@ func quantizationFromGroup(files []FileInfo) *GGUFQuantization {
 	if desc == "" {
 		desc = "Quantized model"
 	}
+	if isMTP {
+		desc += " · MTP (multi-token prediction) variant"
+	}
 
 	return &GGUFQuantization{
 		Name:              quantType,
@@ -420,6 +457,7 @@ func quantizationFromGroup(files []FileInfo) *GGUFQuantization {
 		Description:       desc,
 		Parts:             len(files),
 		Files:             paths,
+		IsMTP:             isMTP,
 	}
 }
 
@@ -498,20 +536,30 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	items := make([]SelectableItem, 0, len(info.Quantizations)+1)
 
-	// Track if we have a Q4_K_M (common recommended default)
+	// Track if we have a (non-MTP) Q4_K_M (common recommended default).
 	hasQ4KM := false
+	// Track whether any MTP variant is present. When it is, the bare quant token
+	// is no longer a unique download filter (model-Q4_K_M.gguf and
+	// model-MTP-Q4_K_M.gguf both contain "q4_k_m"), so every quant row falls back
+	// to its full base filename as the filter to keep selections unambiguous.
+	repoHasMTP := false
 	for _, q := range info.Quantizations {
-		if q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M" {
+		if (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") && !q.IsMTP {
 			hasQ4KM = true
-			break
+		}
+		if q.IsMTP {
+			repoHasMTP = true
 		}
 	}
 
 	for _, q := range info.Quantizations {
-		// Determine if this should be recommended
-		// Q4_K_M is a good default, otherwise highest quality in 4-bit range
+		// Determine if this should be recommended. Q4_K_M is a good default,
+		// otherwise highest quality in 4-bit range. MTP variants are a
+		// specialist option (speculative decoding) and are never auto-recommended.
 		recommended := false
-		if hasQ4KM && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+		if q.IsMTP {
+			recommended = false
+		} else if hasQ4KM && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
 			recommended = true
 		} else if !hasQ4KM && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
 			recommended = true
@@ -535,6 +583,13 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		if q.Name == "Unknown" {
 			filterValue = strings.ToLower(stripSplitSuffix(filepath.Base(q.File.Name)))
 		}
+		// When MTP twins exist, the bare quant token matches both the MTP and
+		// non-MTP file. Use the representative file's full base name (shard suffix
+		// stripped so every shard still matches) as the filter - it uniquely
+		// identifies this quant's files because the "-MTP-" segment is part of it.
+		if repoHasMTP {
+			filterValue = strings.ToLower(stripSplitSuffix(filepath.Base(q.File.Name)))
+		}
 
 		// Annotate multi-part quants so the user sees they are sharded.
 		desc := q.Description
@@ -542,9 +597,18 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			desc = fmt.Sprintf("%s · %d files", desc, q.Parts)
 		}
 
+		// MTP variants share a quant token with their non-MTP twin, so give them
+		// a distinct label and ID; otherwise the picker shows two identical rows.
+		label := q.Name
+		id := strings.ToLower(q.Name)
+		if q.IsMTP {
+			label = q.Name + " (MTP)"
+			id = strings.ToLower(q.Name) + "-mtp"
+		}
+
 		item := SelectableItem{
-			ID:           strings.ToLower(q.Name),
-			Label:        q.Name,
+			ID:           id,
+			Label:        label,
 			Description:  desc,
 			Size:         q.File.Size,
 			SizeHuman:    q.File.SizeHuman,
