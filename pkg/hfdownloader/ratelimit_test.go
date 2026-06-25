@@ -173,8 +173,19 @@ func TestRateLimiterContextCancellationAfterWakeup(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- l.WaitN(ctx, 10<<20) }()
 
-		// Give the goroutine a moment to register a waiter.
-		time.Sleep(time.Millisecond)
+		// Wait until the goroutine has actually registered a waiter,
+		// so SetLimit(0) below can't win the race and let WaitN return
+		// a legitimate nil via the unlimited fast-path. A fixed
+		// time.Sleep is flaky under CI scheduling pressure.
+		for {
+			l.mu.Lock()
+			registered := len(l.waiters) > 0
+			l.mu.Unlock()
+			if registered {
+				break
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
 
 		// Cancel the context FIRST, then raise the rate. The previous
 		// bug: when SetLimit closes the wakeup channel and ctx is
