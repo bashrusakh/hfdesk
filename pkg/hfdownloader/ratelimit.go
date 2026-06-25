@@ -162,12 +162,23 @@ func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 // removeWaiter removes ch from the waiters list if present. Called by a
 // WaitN caller when its ctx is cancelled so the list doesn't grow with
 // dangling channels.
+// removeWaiter removes ch from the waiters list if present. Called by a
+// WaitN caller when its ctx is cancelled (or its timer fires) so the
+// list doesn't grow with dangling channels.
 func (l *RateLimiter) removeWaiter(ch chan struct{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for i, w := range l.waiters {
 		if w == ch {
-			l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+			// Shift the tail left, then nil the obsolete last slot
+			// before truncating. The plain `append(s[:i], s[i+1:]...)`
+			// pattern would leave the old channel pointer at the
+			// truncated position, pinning it in the underlying array
+			// and preventing garbage collection. See
+			// https://github.com/golang/go/wiki/SliceTricks#delete
+			copy(l.waiters[i:], l.waiters[i+1:])
+			l.waiters[len(l.waiters)-1] = nil
+			l.waiters = l.waiters[:len(l.waiters)-1]
 			return
 		}
 	}
