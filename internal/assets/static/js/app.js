@@ -14,7 +14,8 @@
     settings: {},
     wsConnected: false,
     ws: null,
-    currentPage: 'analyze'
+    currentPage: 'analyze',
+    speedLimitLoaded: false
   };
 
   // =========================================
@@ -1503,6 +1504,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         jobCardCache.delete(id);
       }
     }
+
+    // Update aggregate speed gauge after jobs change
+    updateSpeedGauge();
   }
 
   // Cancel a running/queued job
@@ -2281,6 +2285,47 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (field) field.addEventListener('input', syncSpeedPresets);
   }
 
+  // updateSpeedGauge aggregates the speed of all running jobs and renders
+  // the usage gauge in the speed bar. Called from renderJobs and after
+  // any speed-limit change so the gauge always reflects live state.
+  function updateSpeedGauge() {
+    const gaugeFill = document.getElementById('speedGaugeFill');
+    const gaugeText = document.getElementById('speedGaugeText');
+    if (!gaugeFill || !gaugeText) return;
+    if (!state.speedLimitLoaded) return;
+
+    // Sum bytesPerSecond from all running jobs
+    let totalBps = 0;
+    for (const job of state.jobs.values()) {
+      if (job.status === 'running') {
+        totalBps += (job.progress && job.progress.bytesPerSecond) || 0;
+      }
+    }
+
+    // Convert to Mbit/s (1 Mbit/s = 125000 bytes/s)
+    const totalMbit = totalBps / 125000;
+
+    // Get current limit from the field
+    const field = document.getElementById('maxSpeedJobs');
+    const limitMbit = field ? (parseFloat(field.value) || 0) : 0;
+
+    if (limitMbit > 0) {
+      const pct = Math.min((totalMbit / limitMbit) * 100, 100);
+      gaugeFill.style.width = pct + '%';
+      gaugeFill.classList.remove('critical', 'warning');
+      if (pct > 95) {
+        gaugeFill.classList.add('critical');
+      } else if (pct > 80) {
+        gaugeFill.classList.add('warning');
+      }
+      gaugeText.textContent = totalMbit.toFixed(1) + ' / ' + limitMbit.toFixed(1) + ' Mbit/s';
+    } else {
+      gaugeFill.style.width = '0';
+      gaugeFill.classList.remove('warning', 'critical');
+      gaugeText.textContent = totalMbit.toFixed(1) + ' Mbit/s (unlimited)';
+    }
+  }
+
   // Downloads-tab speed cap: same presets, but applied live. Saving posts to
   // /api/settings, which calls JobManager.UpdateConfig -> RateLimiter.SetLimit,
   // so the new cap takes effect on in-flight downloads without a restart.
@@ -2301,7 +2346,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
     const field = $('#maxSpeedJobs');
     if (field) {
-      field.addEventListener('input', () => syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs'));
+      field.addEventListener('input', () => { syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs'); updateSpeedGauge(); });
       field.addEventListener('change', apply);
     }
   }
@@ -2325,16 +2370,27 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
         syncPresetGroup('#speedPresets', '#maxSpeed');
         syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
-      } catch (_) { /* resync best-effort */ }
+        state.speedLimitLoaded = true;
+        updateSpeedGauge();
+      } catch (_) {
+        /* resync best-effort */
+        // Even if the revert GET fails, ensure the gauge is not stuck.
+        state.speedLimitLoaded = true;
+        updateSpeedGauge();
+      }
       return;
     }
+    state.speedLimitLoaded = true;
     if ($('#maxSpeed')) $('#maxSpeed').value = mbitStr;
     if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbitStr;
     syncPresetGroup('#speedPresets', '#maxSpeed');
     syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+    updateSpeedGauge();
   }
 
   // loadSpeedCap fetches the current cap and fills the Downloads-tab control.
+  // Sets state.speedLimitLoaded regardless of fetch success so the gauge
+  // doesn't get stuck if settings are temporarily unreachable.
   async function loadSpeedCap() {
     try {
       const data = await api('GET', '/settings');
@@ -2342,6 +2398,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
       syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
     } catch (e) { /* non-fatal */ }
+    state.speedLimitLoaded = true;
+    updateSpeedGauge();
   }
 
   async function loadSettings() {
