@@ -113,6 +113,90 @@ func TestRateLimiterSetLimitWakesWaiters(t *testing.T) {
 	}
 }
 
+// TestRateLimiterWaitersDoNotLeak guards against an earlier bug where the
+// normal-timer wakeup branch did not remove its entry from the waiters
+// slice: SetLimit only clears the slice wholesale, so without the per-wakeup
+// removal a long-lived rate-limited transfer would accumulate one stale
+// channel per timer wakeup per goroutine.
+//
+// Each call below exercises the timer-fire path (no SetLimit, no ctx cancel):
+// 1 KiB/s rate with an empty bucket means the 1 KiB request waits ~1 s for
+// the timer to fire and refill. With the bug, the waiter entry would be
+// left behind on every iteration.
+func TestRateLimiterWaitersDoNotLeak(t *testing.T) {
+	l := NewRateLimiter(1024) // 1 KiB/s
+	// Drain the bucket so the next WaitN has to wait for the timer.
+	if err := l.WaitN(context.Background(), minBurst); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	const iters = 2
+	for i := 0; i < iters; i++ {
+		if err := l.WaitN(context.Background(), 1024); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+
+	l.mu.Lock()
+	waiters := len(l.waiters)
+	l.mu.Unlock()
+	if waiters != 0 {
+		t.Errorf("after %d successful WaitN calls, waiters slice has %d entries; want 0", iters, waiters)
+	}
+}
+
+// TestRateLimiterContextCancellationAfterWakeup guards against a select
+// race: when SetLimit closes the wakeup channel at the same instant the
+// caller's context is cancelled, Go's select picks one ready case
+// non-deterministically. If the wakeup case wins, the goroutine must still
+// honor the cancellation before returning nil.
+func TestRateLimiterContextCancellationAfterWakeup(t *testing.T) {
+	const initialRate = 1024
+	l := NewRateLimiter(initialRate)
+	// Drain the bucket so the next WaitN has to block.
+	if err := l.WaitN(context.Background(), minBurst); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	// Run the race many times to make the non-deterministic path
+	// likely. The previous bug silently returned nil on every iteration
+	// where the select happened to pick <-wakeup while ctx was already
+	// cancelled.
+	const iters = 50
+	for i := 0; i < iters; i++ {
+		// Reset to the slow rate so WaitN actually blocks this iteration
+		// (the previous iteration ended with rate=0 from the
+		// SetLimit(unlimited) call below).
+		l.SetLimit(initialRate)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- l.WaitN(ctx, 10<<20) }()
+
+		// Give the goroutine a moment to register a waiter.
+		time.Sleep(time.Millisecond)
+
+		// Cancel the context FIRST, then raise the rate. The previous
+		// bug: when SetLimit closes the wakeup channel and ctx is
+		// already cancelled, the select picks one of <wakeup> or
+		// <ctx.Done> at random; if <wakeup> wins, WaitN must still
+		// honor the cancellation. (If SetLimit runs first, the wakeup
+		// fires before ctx is cancelled and the goroutine returns nil
+		// legitimately — there is no race to catch in that order.)
+		cancel()
+		l.SetLimit(0)
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("iter %d: WaitN returned nil despite ctx cancellation racing SetLimit wakeup", i)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: WaitN did not return within 2s", i)
+		}
+	}
+}
+
 func TestParseSizeStrict(t *testing.T) {
 	cases := []struct {
 		in      string

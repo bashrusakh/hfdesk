@@ -135,9 +135,22 @@ func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 			return ctx.Err()
 		case <-wakeup:
 			timer.Stop()
-			// SetLimit was called; loop and recompute against the new rate.
+			// SetLimit was called; the waiters slice has been cleared, so
+			// our entry is already gone. Just loop and recompute.
 		case <-timer.C:
-			// Normal wakeup; loop and try to acquire tokens.
+			// Normal wakeup. Drop our entry from the waiters slice: SetLimit
+			// only clears the whole slice, so without this removal every
+			// repeated timer wakeup would append a fresh channel and the
+			// slice would grow unboundedly over a long-lived transfer.
+			l.removeWaiter(wakeup)
+		}
+		// Re-check the context after any non-cancellation wakeup. If the
+		// ctx was cancelled at the same instant the wakeup or timer fired,
+		// Go's select picks one of the ready cases non-deterministically;
+		// honoring ctx here prevents WaitN from returning nil when the
+		// caller has actually asked to stop.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	}
 }
