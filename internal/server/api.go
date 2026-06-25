@@ -339,6 +339,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		Concurrency:        s.config.Concurrency,
 		MaxActive:          s.config.MaxActive,
 		MultipartThreshold: s.config.MultipartThreshold,
+		MaxSpeed:           s.config.MaxSpeed,
 		Verify:             s.config.Verify,
 		Retries:            s.config.Retries,
 		Endpoint:           s.config.Endpoint,
@@ -374,6 +375,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Concurrency        *int    `json:"connections,omitempty"`
 		MaxActive          *int    `json:"maxActive,omitempty"`
 		MultipartThreshold *string `json:"multipartThreshold,omitempty"`
+		MaxSpeed           *string `json:"maxSpeed,omitempty"`
 		Verify             *string `json:"verify,omitempty"`
 		Retries            *int    `json:"retries,omitempty"`
 		Endpoint           *string `json:"endpoint,omitempty"`
@@ -415,6 +417,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
 		s.config.MultipartThreshold = *req.MultipartThreshold
+	}
+	if req.MaxSpeed != nil {
+		s.config.MaxSpeed = strings.TrimSpace(*req.MaxSpeed)
 	}
 	if req.Verify != nil && *req.Verify != "" {
 		s.config.Verify = *req.Verify
@@ -477,6 +482,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Connections:        s.config.Concurrency,
 		MaxActive:          s.config.MaxActive,
 		MultipartThreshold: s.config.MultipartThreshold,
+		MaxSpeed:           s.config.MaxSpeed,
 		Verify:             s.config.Verify,
 		Retries:            &retries,
 		Endpoint:           s.config.Endpoint,

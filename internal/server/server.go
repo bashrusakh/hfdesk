@@ -37,6 +37,7 @@ type Config struct {
 	Concurrency        int
 	MaxActive          int
 	MultipartThreshold string // Minimum size for multipart download
+	MaxSpeed           string // Global download speed cap, e.g. "2MB" (empty/"0" = unlimited)
 	Verify             string // Verification mode: none, size, sha256
 	Retries            int    // Number of retry attempts
 	AllowedOrigins     []string // CORS origins
