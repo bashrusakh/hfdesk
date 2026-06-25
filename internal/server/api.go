@@ -396,7 +396,32 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update config (only safe fields)
+	// Phase 1: validate every field that can fail with 400. No s.config
+	// mutations happen here, so a 400 leaves in-memory state consistent with
+	// the persisted file.
+	var (
+		newMultipartThreshold string
+		newMaxSpeed           string
+	)
+	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
+		trimmed := strings.TrimSpace(*req.MultipartThreshold)
+		if _, err := hfdownloader.ParseSizeStrict(trimmed); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid multipartThreshold", err.Error())
+			return
+		}
+		newMultipartThreshold = trimmed
+	}
+	if req.MaxSpeed != nil {
+		trimmed := strings.TrimSpace(*req.MaxSpeed)
+		if _, err := hfdownloader.ParseSizeStrict(trimmed); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid maxSpeed", err.Error())
+			return
+		}
+		newMaxSpeed = trimmed
+	}
+
+	// Phase 2: apply all updates. After this block we either commit
+	// everything to s.config and the file, or fail before doing so.
 	if req.Token != nil {
 		s.config.Token = *req.Token
 	}
@@ -415,21 +440,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.MaxActive != nil && *req.MaxActive > 0 {
 		s.config.MaxActive = *req.MaxActive
 	}
-	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
-		trimmed := strings.TrimSpace(*req.MultipartThreshold)
-		if _, err := hfdownloader.ParseSizeStrict(trimmed); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid multipartThreshold", err.Error())
-			return
-		}
-		s.config.MultipartThreshold = trimmed
+	if newMultipartThreshold != "" {
+		s.config.MultipartThreshold = newMultipartThreshold
 	}
 	if req.MaxSpeed != nil {
-		trimmed := strings.TrimSpace(*req.MaxSpeed)
-		if _, err := hfdownloader.ParseSizeStrict(trimmed); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid maxSpeed", err.Error())
-			return
-		}
-		s.config.MaxSpeed = trimmed
+		s.config.MaxSpeed = newMaxSpeed
 	}
 	if req.Verify != nil && *req.Verify != "" {
 		s.config.Verify = *req.Verify

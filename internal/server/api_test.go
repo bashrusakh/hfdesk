@@ -353,6 +353,54 @@ func TestAPI_UpdateSettings_ValidatesMultipartThreshold(t *testing.T) {
 	}
 }
 
+// TestAPI_UpdateSettings_AtomicValidation guards the trust-boundary
+// invariant: a request that combines valid fields with an invalid
+// size-string field must NOT partially apply the valid fields. Otherwise
+// s.config diverges from the persisted file (in-memory updated, file
+// unchanged) and a subsequent GET /api/settings returns a value the server
+// can't survive a restart with.
+func TestAPI_UpdateSettings_AtomicValidation(t *testing.T) {
+	t.Run("invalid maxSpeed does not apply concurrency", func(t *testing.T) {
+		srv := newTestServer()
+		origConcurrency := srv.config.Concurrency
+		origCacheDir := srv.config.CacheDir
+
+		body := `{"connections": 16, "cacheDir": "/data/hf", "maxSpeed": "abc"}`
+		req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.handleUpdateSettings(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d. body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+		if srv.config.Concurrency != origConcurrency {
+			t.Errorf("Concurrency = %d, want %d (must not be partially applied)", srv.config.Concurrency, origConcurrency)
+		}
+		if srv.config.CacheDir != origCacheDir {
+			t.Errorf("CacheDir = %q, want %q (must not be partially applied)", srv.config.CacheDir, origCacheDir)
+		}
+	})
+
+	t.Run("invalid multipartThreshold does not apply maxActive", func(t *testing.T) {
+		srv := newTestServer()
+		origMaxActive := srv.config.MaxActive
+
+		body := `{"maxActive": 8, "multipartThreshold": "xyz"}`
+		req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.handleUpdateSettings(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d. body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+		if srv.config.MaxActive != origMaxActive {
+			t.Errorf("MaxActive = %d, want %d (must not be partially applied)", srv.config.MaxActive, origMaxActive)
+		}
+	})
+}
+
 func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {
 	srv := newTestServer()
 
