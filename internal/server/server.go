@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/assets"
@@ -19,12 +20,12 @@ import (
 
 // Config holds server configuration.
 type Config struct {
-	Addr               string
-	Port               int
-	Token              string // HuggingFace token
-	ModelsDir          string // Output directory for models (not configurable via API)
-	DatasetsDir        string // Output directory for datasets (not configurable via API)
-	CacheDir           string // HuggingFace cache directory for v3 mode
+	Addr        string
+	Port        int
+	Token       string // HuggingFace token
+	ModelsDir   string // Output directory for models (not configurable via API)
+	DatasetsDir string // Output directory for datasets (not configurable via API)
+	CacheDir    string // HuggingFace cache directory for v3 mode
 	// LocalDir, when set, puts the whole server in flat/local-file mode: every
 	// download writes real files into <LocalDir>/<owner>/<repo> instead of the
 	// HF cache layout. Set once at startup (serve --local-dir); not changeable
@@ -33,13 +34,13 @@ type Config struct {
 	// LocalScanDirs are additional read-only roots scanned by the Cache browser
 	// as <owner>/<model> folders, e.g. LM Studio or a manually managed model
 	// library. Downloads still go to CacheDir/LocalDir unless a job overrides it.
-	LocalScanDirs       []string
+	LocalScanDirs      []string
 	Concurrency        int
 	MaxActive          int
-	MultipartThreshold string // Minimum size for multipart download
-	MaxSpeed           string // Global download speed cap, e.g. "2MB" (empty/"0" = unlimited)
-	Verify             string // Verification mode: none, size, sha256
-	Retries            int    // Number of retry attempts
+	MultipartThreshold string   // Minimum size for multipart download
+	MaxSpeed           string   // Global download speed cap, e.g. "2MB" (empty/"0" = unlimited)
+	Verify             string   // Verification mode: none, size, sha256
+	Retries            int      // Number of retry attempts
 	AllowedOrigins     []string // CORS origins
 	Endpoint           string   // Custom HuggingFace endpoint (e.g., for mirrors)
 
@@ -68,10 +69,35 @@ func DefaultConfig() Config {
 
 // Server is the HTTP server for HFDesk.
 type Server struct {
+	configMu   sync.RWMutex
 	config     Config
 	httpServer *http.Server
 	jobs       *JobManager
 	wsHub      *WSHub
+}
+
+// snapshotConfig returns a value copy of the current server config taken
+// under the read lock. Handlers should call this once at the top and use
+// the returned copy; that way a concurrent UpdateConfig (which takes the
+// write lock for the whole mutation) cannot tear the read.
+//
+// This mirrors snapshotConfig on JobManager and is the read side of the
+// config race fix: writes go through withConfig under the write lock.
+func (s *Server) snapshotConfig() Config {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.config
+}
+
+// withConfig runs fn under the write lock with a fresh value copy of the
+// current config. The copy fn receives is private to the call; once fn
+// returns, the copy is stored back into s.config atomically. The returned
+// Config is the new effective value (the same pointer fn mutated).
+func (s *Server) withConfig(fn func(*Config)) Config {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	fn(&s.config)
+	return s.config
 }
 
 // New creates a new server with the given configuration.
@@ -236,15 +262,16 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
+		cfg := s.snapshotConfig()
 
 		// Allow same-origin and configured origins
 		if origin != "" {
 			allowed := false
-			if len(s.config.AllowedOrigins) == 0 {
+			if len(cfg.AllowedOrigins) == 0 {
 				// Default: allow same host
 				allowed = true
 			} else {
-				for _, o := range s.config.AllowedOrigins {
+				for _, o := range cfg.AllowedOrigins {
 					if o == "*" || o == origin {
 						allowed = true
 						break
@@ -272,8 +299,10 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 // basicAuthMiddleware provides HTTP Basic Authentication.
 func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.snapshotConfig()
+
 		// Skip auth if not configured
-		if s.config.AuthUser == "" {
+		if cfg.AuthUser == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -281,8 +310,8 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		user, pass, ok := r.BasicAuth()
 		// Constant-time comparison avoids leaking the configured credentials
 		// through response-timing differences. Both comparisons always run.
-		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(s.config.AuthUser)) == 1
-		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(s.config.AuthPass)) == 1
+		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AuthUser)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AuthPass)) == 1
 		if !ok || !userOK || !passOK {
 			w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)

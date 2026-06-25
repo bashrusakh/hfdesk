@@ -75,8 +75,8 @@ type HistoryEntry struct {
 	StartedAt time.Time `json:"startedAt"`
 	EndedAt   time.Time `json:"endedAt"`
 	// Aggregate totals at end of run
-	TotalFiles     int   `json:"totalFiles"`
-	TotalBytes     int64 `json:"totalBytes"`
+	TotalFiles int   `json:"totalFiles"`
+	TotalBytes int64 `json:"totalBytes"`
 }
 
 type historyFile struct {

@@ -215,6 +215,7 @@ func readmeEndpointHost(endpoint string) string {
 // token so gated/private repo assets load. It only fetches URLs on the
 // configured HF endpoint host to avoid being an open proxy (SSRF).
 func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig()
 	raw := r.URL.Query().Get("url")
 	if raw == "" {
 		writeError(w, http.StatusBadRequest, "Missing url", "")
@@ -225,12 +226,12 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid url", "")
 		return
 	}
-	if !strings.EqualFold(u.Host, readmeEndpointHost(s.config.Endpoint)) {
+	if !strings.EqualFold(u.Host, readmeEndpointHost(cfg.Endpoint)) {
 		writeError(w, http.StatusForbidden, "Asset host not allowed", "")
 		return
 	}
 
-	client, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
+	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
@@ -242,8 +243,8 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Bad request", err.Error())
 		return
 	}
-	if s.config.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+s.config.Token)
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
 	req.Header.Set("User-Agent", "hfdesk/1")
 

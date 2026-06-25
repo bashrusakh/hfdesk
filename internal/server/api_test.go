@@ -6,10 +6,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -860,4 +862,66 @@ func TestIsValidRepoComponent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAPI_ConcurrentSettingsAccess stresses the new s.configMu by racing
+// concurrent UpdateSettings writers against handleGetSettings, handleCacheList
+// and other read paths. Run with `go test -race` to catch any lock the
+// refactor missed: the test is meaningless without the race detector.
+func TestAPI_ConcurrentSettingsAccess(t *testing.T) {
+	srv := newTestServer()
+
+	const writers = 4
+	const readers = 8
+	const iterations = 50
+
+	var wg sync.WaitGroup
+
+	// Writers: cycle through POST /api/settings with varying fields.
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				body := fmt.Sprintf(`{"connections": %d, "maxActive": %d, "maxSpeed": "%dKB"}`,
+					(id+1)*4, (id+1)*2, 256+(id*64)+(j%4)*32)
+				req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				srv.handleUpdateSettings(w, req)
+				if w.Code != http.StatusOK {
+					t.Errorf("writer %d iter %d: status = %d", id, j, w.Code)
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Readers: hit every read handler that touches s.config.
+	readHandlers := []func(http.ResponseWriter, *http.Request){
+		func(w http.ResponseWriter, r *http.Request) { srv.handleGetSettings(w, r) },
+		func(w http.ResponseWriter, r *http.Request) { srv.handleCacheList(w, r) },
+		func(w http.ResponseWriter, r *http.Request) { srv.handleDiskFree(w, r) },
+		func(w http.ResponseWriter, r *http.Request) {
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+			srv.corsMiddleware(inner).ServeHTTP(w, r)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+			srv.basicAuthMiddleware(inner).ServeHTTP(w, r)
+		},
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			h := readHandlers[id%len(readHandlers)]
+			for j := 0; j < iterations; j++ {
+				w := httptest.NewRecorder()
+				h(w, httptest.NewRequest("GET", "/", nil))
+			}
+		}(i)
+	}
+
+	wg.Wait()
 }
