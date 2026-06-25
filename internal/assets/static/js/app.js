@@ -1163,6 +1163,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       });
       renderJobs();
       updateJobsBadge();
+      loadSpeedCap();
     } catch (e) {
       console.error('Failed to load jobs:', e);
     }
@@ -2252,13 +2253,17 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return Math.max(1, Math.round(v * 125)) + 'KB';
   }
 
-  function syncSpeedPresets() {
-    const raw = ($('#maxSpeed')?.value ?? '').toString().trim();
+  function syncPresetGroup(presetsSel, fieldSel) {
+    const raw = ($(fieldSel)?.value ?? '').toString().trim();
     const v = raw === '' ? 0 : parseFloat(raw);
-    $$('#speedPresets .speed-btn').forEach(b => {
+    $$(presetsSel + ' .speed-btn').forEach(b => {
       const pv = parseFloat(b.dataset.mbit);
       b.classList.toggle('active', !isNaN(v) && pv === v);
     });
+  }
+
+  function syncSpeedPresets() {
+    syncPresetGroup('#speedPresets', '#maxSpeed');
   }
 
   function bindSpeedPresets() {
@@ -2274,6 +2279,60 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
     const field = $('#maxSpeed');
     if (field) field.addEventListener('input', syncSpeedPresets);
+  }
+
+  // Downloads-tab speed cap: same presets, but applied live. Saving posts to
+  // /api/settings, which calls JobManager.UpdateConfig -> RateLimiter.SetLimit,
+  // so the new cap takes effect on in-flight downloads without a restart.
+  function bindJobsSpeed() {
+    const presets = document.getElementById('speedPresetsJobs');
+    if (!presets || presets.dataset.bound) return;
+    presets.dataset.bound = '1';
+    const apply = () => {
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+      applySpeedLimitLive($('#maxSpeedJobs')?.value);
+    };
+    presets.querySelectorAll('.speed-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mbit = parseFloat(btn.dataset.mbit) || 0;
+        $('#maxSpeedJobs').value = mbit > 0 ? String(mbit) : '';
+        apply();
+      });
+    });
+    const field = $('#maxSpeedJobs');
+    if (field) {
+      field.addEventListener('input', () => syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs'));
+      field.addEventListener('change', apply);
+    }
+  }
+
+  // applySpeedLimitLive pushes a new cap to the server immediately and mirrors
+  // the value into both speed controls so Settings and Downloads stay in sync.
+  async function applySpeedLimitLive(mbitVal) {
+    const v = parseFloat(mbitVal);
+    const mbitStr = isFinite(v) && v > 0 ? String(v) : '';
+    const maxSpeed = mbitToMaxSpeedStr(mbitVal);
+    try {
+      await api('POST', '/settings', { maxSpeed });
+      showToast(maxSpeed ? `Speed limit: ${mbitStr} Mbit/s` : 'Speed limit: unlimited', 'success');
+    } catch (e) {
+      showToast(`Failed to set speed: ${e.message}`, 'error');
+      return;
+    }
+    if ($('#maxSpeed')) $('#maxSpeed').value = mbitStr;
+    if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbitStr;
+    syncPresetGroup('#speedPresets', '#maxSpeed');
+    syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+  }
+
+  // loadSpeedCap fetches the current cap and fills the Downloads-tab control.
+  async function loadSpeedCap() {
+    try {
+      const data = await api('GET', '/settings');
+      const mbit = maxSpeedToMbit(data.maxSpeed);
+      if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+    } catch (e) { /* non-fatal */ }
   }
 
   async function loadSettings() {
@@ -2316,6 +2375,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       $('#maxSpeed').value = maxSpeedToMbit(data.maxSpeed);
       bindSpeedPresets();
       syncSpeedPresets();
+      if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = maxSpeedToMbit(data.maxSpeed);
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
       $('#retries').value = data.retries ?? 4;
       $('#verify').value = data.verify || 'size';
       $('#endpoint').value = data.endpoint || '';
@@ -3832,6 +3893,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     initModelsPage();      // unified: analyze + search + download
     initCachePage();
     initSettingsPage();
+    bindJobsSpeed();
     initMirrorPage();
     initModal();
     loadAppVersion();
