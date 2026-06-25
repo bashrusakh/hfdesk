@@ -201,16 +201,26 @@ func TestApplyJobProgress_FileFinalizingPhase(t *testing.T) {
 // file_progress event after resume would recalculate DownloadedBytes
 // from a partially-populated job.Files list and overwrite the value
 // ResumeJob preserved from the pre-pause state. The preserved value is
-// the floor: it stays on screen until the sum of all file progress
-// catches up to it.
+// the floor for the recovery window only: once the running sum catches
+// up to it, the floor clears and a real drop (e.g. a 200 fallback
+// truncating a .part file) is reflected immediately.
 func TestApplyJobProgress_DownloadedBytesMonotonic(t *testing.T) {
 	now := time.Now()
+
+	// resumedJob mirrors what ResumeJob leaves behind: DownloadedBytes
+	// preserved from the pre-pause state and resumeFloor armed at the
+	// same value so the monotonic guard in applyJobProgress fires.
+	resumedJob := func(downloadedBytes int64) *Job {
+		job := &Job{Progress: JobProgress{DownloadedBytes: downloadedBytes}}
+		job.resumeFloor = downloadedBytes
+		return job
+	}
 
 	t.Run("file_done after resume does not drop the preserved total", func(t *testing.T) {
 		// 6000 of 10000 bytes were downloaded before pause; ResumeJob
 		// preserved DownloadedBytes=6000 and nilled job.Files. The
 		// downloader will now replay the plan and process files.
-		job := &Job{Progress: JobProgress{DownloadedBytes: 6000}}
+		job := resumedJob(6000)
 		apply := func(evt hfdownloader.ProgressEvent) {
 			applyJobProgress(job, evt, now)
 		}
@@ -224,17 +234,23 @@ func TestApplyJobProgress_DownloadedBytesMonotonic(t *testing.T) {
 		if got := job.Progress.DownloadedBytes; got != 6000 {
 			t.Fatalf("DownloadedBytes dropped after first file_done: got %d, want 6000", got)
 		}
+		if job.resumeFloor != 6000 {
+			t.Fatalf("resumeFloor cleared too early: got %d, want 6000", job.resumeFloor)
+		}
 
 		// Once all files report done the sum catches up and growth
-		// resumes normally.
+		// resumes normally — the floor is also released here.
 		apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "big.bin"})
 		if got := job.Progress.DownloadedBytes; got != 10000 {
 			t.Fatalf("DownloadedBytes after both file_done: got %d, want 10000", got)
 		}
+		if job.resumeFloor != 0 {
+			t.Fatalf("resumeFloor not cleared after catch-up: got %d, want 0", job.resumeFloor)
+		}
 	})
 
 	t.Run("file_progress after resume does not drop the preserved total", func(t *testing.T) {
-		job := &Job{Progress: JobProgress{DownloadedBytes: 6000}}
+		job := resumedJob(6000)
 		apply := func(evt hfdownloader.ProgressEvent) {
 			applyJobProgress(job, evt, now)
 		}
@@ -247,12 +263,40 @@ func TestApplyJobProgress_DownloadedBytesMonotonic(t *testing.T) {
 		if got := job.Progress.DownloadedBytes; got != 6000 {
 			t.Fatalf("DownloadedBytes dropped after first file_progress: got %d, want 6000", got)
 		}
+		if job.resumeFloor != 6000 {
+			t.Fatalf("resumeFloor cleared too early: got %d, want 6000", job.resumeFloor)
+		}
 
 		// Once the partial file's progress exceeds the floor, total
-		// growth resumes from the new (larger) value.
+		// growth resumes from the new (larger) value and the floor
+		// is released.
 		apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "partial.bin", Downloaded: 7000})
 		if got := job.Progress.DownloadedBytes; got != 7000 {
 			t.Fatalf("DownloadedBytes after surpassing floor: got %d, want 7000", got)
+		}
+		if job.resumeFloor != 0 {
+			t.Fatalf("resumeFloor not cleared after catch-up: got %d, want 0", job.resumeFloor)
+		}
+	})
+
+	t.Run("drop is reflected after the resume floor clears", func(t *testing.T) {
+		// A job that has fully recovered from a previous resume: the
+		// floor is 0 (no longer active), and DownloadedBytes is at
+		// the genuine 10000. A file rolling back — e.g.
+		// downloadSingle's 200 fallback truncating the .part file
+		// and emitting a file_progress with Downloaded=0 — must
+		// propagate the drop to the displayed total. The previous
+		// (permanent) guard would have kept the UI at 10000 and lied
+		// about the actual on-disk state.
+		job := &Job{Progress: JobProgress{DownloadedBytes: 10000}}
+		apply := func(evt hfdownloader.ProgressEvent) {
+			applyJobProgress(job, evt, now)
+		}
+
+		apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "big.bin", Total: 10000})
+		apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "big.bin", Downloaded: 0})
+		if got := job.Progress.DownloadedBytes; got != 0 {
+			t.Fatalf("post-recovery rollback not reflected: got %d, want 0", got)
 		}
 	})
 }

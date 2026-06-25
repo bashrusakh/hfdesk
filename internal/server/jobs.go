@@ -53,6 +53,17 @@ type Job struct {
 	generation int                `json:"-"` // Tracks which runJob instance is current
 	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
 
+	// resumeFloor is the monotonic floor on Progress.DownloadedBytes
+	// during the recovery window that starts when ResumeJob re-queues a
+	// paused job. While set, applyJobProgress only updates
+	// DownloadedBytes when the freshly summed total exceeds the current
+	// value, and clears the floor once the sum catches up. This keeps
+	// the UI from dropping while the partial sum is dominated by files
+	// the downloader has not yet processed, and is then released so a
+	// genuine rollback (e.g. downloadSingle's 200 fallback truncating
+	// the .part file) is reflected in real time. 0 means no floor.
+	resumeFloor int64 `json:"-"`
+
 	// Speed is a moving average over a short window of bytes actually
 	// transferred this run (see the file_progress handler), so the reading is
 	// steady and resuming a partial repo doesn't count already-present bytes.
@@ -422,10 +433,13 @@ func (m *JobManager) ResumeJob(id string) bool {
 	// the live job.Files list as soon as files are processed (skipped
 	// blob → immediate file_done; partial → file_progress at the on-disk
 	// position from the .part file), so the estimate corrects itself
-	// within a second or two.
+	// within a second or two. resumeFloor arms the monotonic guard in
+	// applyJobProgress for this recovery window and is cleared by
+	// applyJobProgress once the running sum catches up.
 	oldBytes := job.Progress.DownloadedBytes
 	job.Progress = JobProgress{}
 	job.Progress.DownloadedBytes = oldBytes
+	job.resumeFloor = oldBytes
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
 	// Re-queue through the scheduler so resuming respects max-active.
@@ -459,7 +473,10 @@ func (m *JobManager) RetryJob(id string) bool {
 	job.Error = ""
 	job.EndedAt = nil
 	// Reset progress - the downloader will re-scan and report all files.
+	// No resume floor: a retry is a clean restart from zero, so the
+	// running sum drives DownloadedBytes directly.
 	job.Progress = JobProgress{}
+	job.resumeFloor = 0
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
 	// Re-queue through the scheduler so retrying respects max-active.
@@ -821,11 +838,14 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		}
 		// total drives the progress bar (includes skipped/already-present
 		// bytes); transferred drives the speed (only bytes moved this run).
-		// DownloadedBytes is treated as monotonic: right after resume the
-		// sum is taken over a freshly-rebuilt job.Files where only the one
-		// processed file has Downloaded > 0, so it would under-count and
-		// clobber the value ResumeJob preserved from the pre-pause state.
-		// The preserved value stays on screen until the sum catches up.
+		// During the resume-recovery window (resumeFloor > 0) the running
+		// sum under-counts because plan_item has already added the full
+		// file list but only the one processed file has Downloaded > 0,
+		// which would clobber the value ResumeJob preserved. The
+		// monotonic guard keeps the preserved value on screen until the
+		// sum catches up, at which point the floor is released and a
+		// genuine rollback (e.g. downloadSingle's 200 fallback on a
+		// range request truncating the .part file) propagates immediately.
 		var total, transferred int64
 		for _, f := range job.Files {
 			total += f.Downloaded
@@ -833,7 +853,14 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				transferred += f.Downloaded - f.baseDownloaded
 			}
 		}
-		if total > job.Progress.DownloadedBytes {
+		if job.resumeFloor > 0 {
+			if total > job.Progress.DownloadedBytes {
+				job.Progress.DownloadedBytes = total
+			}
+			if total >= job.resumeFloor {
+				job.resumeFloor = 0
+			}
+		} else {
 			job.Progress.DownloadedBytes = total
 		}
 		updateJobSpeed(job, transferred, now)
@@ -876,12 +903,20 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		// Recalculate total downloaded (skipped/completed files included).
 		// Speed is intentionally not updated here: a skipped file emits only
 		// file_done, and counting its full size would spike the reading.
-		// DownloadedBytes is monotonic — see file_progress for the rationale.
+		// Monotonic guard is scoped to the resume-recovery window — see
+		// file_progress for the rationale.
 		var total int64
 		for _, f := range job.Files {
 			total += f.Downloaded
 		}
-		if total > job.Progress.DownloadedBytes {
+		if job.resumeFloor > 0 {
+			if total > job.Progress.DownloadedBytes {
+				job.Progress.DownloadedBytes = total
+			}
+			if total >= job.resumeFloor {
+				job.resumeFloor = 0
+			}
+		} else {
 			job.Progress.DownloadedBytes = total
 		}
 
