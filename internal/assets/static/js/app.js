@@ -14,7 +14,8 @@
     settings: {},
     wsConnected: false,
     ws: null,
-    currentPage: 'analyze'
+    currentPage: 'analyze',
+    speedLimitLoaded: false
   };
 
   // =========================================
@@ -2291,6 +2292,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const gaugeFill = document.getElementById('speedGaugeFill');
     const gaugeText = document.getElementById('speedGaugeText');
     if (!gaugeFill || !gaugeText) return;
+    if (!state.speedLimitLoaded) return;
 
     // Sum bytesPerSecond from all running jobs
     let totalBps = 0;
@@ -2316,7 +2318,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       } else if (pct > 80) {
         gaugeFill.classList.add('warning');
       }
-      gaugeText.textContent = totalMbit.toFixed(1) + ' / ' + limitMbit.toFixed(0) + ' Mbit/s';
+      gaugeText.textContent = totalMbit.toFixed(1) + ' / ' + limitMbit.toFixed(1) + ' Mbit/s';
     } else {
       gaugeFill.style.width = '0';
       gaugeFill.classList.remove('warning', 'critical');
@@ -2364,6 +2366,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       try {
         const data = await api('GET', '/settings');
         const mbit = maxSpeedToMbit(data.maxSpeed);
+        state.speedLimitLoaded = true;
         if ($('#maxSpeed')) $('#maxSpeed').value = mbit;
         if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
         syncPresetGroup('#speedPresets', '#maxSpeed');
@@ -2372,6 +2375,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       } catch (_) { /* resync best-effort */ }
       return;
     }
+    state.speedLimitLoaded = true;
     if ($('#maxSpeed')) $('#maxSpeed').value = mbitStr;
     if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbitStr;
     syncPresetGroup('#speedPresets', '#maxSpeed');
@@ -2384,6 +2388,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     try {
       const data = await api('GET', '/settings');
       const mbit = maxSpeedToMbit(data.maxSpeed);
+      state.speedLimitLoaded = true;
       if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
       syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
       updateSpeedGauge();
