@@ -726,6 +726,9 @@ func compareRepoIntegrity(srcPath, dstPath string) (needsUpdate bool, reason str
 	return false, ""
 }
 
+// countBlobs returns the number of regular files under a repo's blobs
+// directory. Used for mirror diffs where the blob count is a cheap
+// proxy for size.
 func countBlobs(repoPath string) int {
 	blobsDir := filepath.Join(repoPath, "blobs")
 	count := 0

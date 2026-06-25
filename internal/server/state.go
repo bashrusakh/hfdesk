@@ -15,6 +15,8 @@ type jobsStateFile struct {
 	Jobs []*Job `json:"jobs"`
 }
 
+// stateMu serializes reads and writes of jobs_state.json so
+// concurrent SaveJobsState / LoadJobsState calls don't tear the file.
 var stateMu sync.Mutex
 
 // SaveJobsState writes all jobs to jobs_state.json in the run directory.
@@ -79,10 +81,13 @@ type HistoryEntry struct {
 	TotalBytes int64 `json:"totalBytes"`
 }
 
+// historyFile is the on-disk shape of download_history.json: a flat
+// list of HistoryEntry records, one per completed or failed job.
 type historyFile struct {
 	Entries []HistoryEntry `json:"entries"`
 }
 
+// historyMu serializes reads and writes of download_history.json.
 var historyMu sync.Mutex
 
 // AppendHistory appends a completed/failed job to download_history.json.
@@ -136,6 +141,9 @@ func LoadHistory() ([]HistoryEntry, error) {
 	return hf.Entries, nil
 }
 
+// loadHistoryLocked reads download_history.json. Caller MUST hold
+// historyMu. Returns an empty historyFile if the file does not yet
+// exist.
 func loadHistoryLocked() (*historyFile, error) {
 	data, err := os.ReadFile(HistoryPath())
 	if err != nil {

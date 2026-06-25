@@ -36,6 +36,8 @@ var readmeMarkdown = goldmark.New(
 	goldmark.WithRendererOptions(goldmarkhtml.WithUnsafe()),
 )
 
+// readmePolicy is the HTML sanitizer policy applied to rendered
+// README content. See buildReadmePolicy for what it permits.
 var readmePolicy = buildReadmePolicy()
 
 // buildReadmePolicy returns the HTML sanitizer policy applied to rendered
@@ -105,6 +107,10 @@ func renderReadmeHTML(markdown, baseRawURL, baseBlobURL, endpointHost string) st
 	return readmePolicy.Sanitize(out.String())
 }
 
+// findReadmeBody walks an xhtml tree and returns the first <body>
+// element it finds, or nil if none. The goldmark renderer wraps the
+// document in <html><head>…</head><body>…</body></html> and we want
+// the body to run rewriting on.
 func findReadmeBody(n *xhtml.Node) *xhtml.Node {
 	if n.Type == xhtml.ElementNode && n.Data == "body" {
 		return n
@@ -117,6 +123,12 @@ func findReadmeBody(n *xhtml.Node) *xhtml.Node {
 	return nil
 }
 
+// rewriteReadmeNodes walks an xhtml subtree rewriting relative
+// asset URLs to point through our /api/readme-asset proxy so the
+// browser fetches them with the server's auth token. baseRaw and
+// baseBlob are the upstream raw/blob URL prefixes for the repo;
+// endpointHost is the configured HF host (used to leave absolute
+// external URLs alone).
 func rewriteReadmeNodes(n *xhtml.Node, baseRaw, baseBlob, endpointHost string) {
 	if n.Type == xhtml.ElementNode {
 		switch n.Data {
@@ -164,6 +176,10 @@ func resolveReadmeURL(ref, base string) string {
 	return b.ResolveReference(r).String()
 }
 
+// isHostURL reports whether raw (an absolute or relative URL) parses
+// to the same host as the given host string. Used to decide whether
+// a <img src> in a rendered README is hosted on the configured HF
+// endpoint (proxy it) or somewhere else (leave it alone).
 func isHostURL(raw, host string) bool {
 	if host == "" {
 		return false
@@ -175,6 +191,8 @@ func isHostURL(raw, host string) bool {
 	return strings.EqualFold(u.Host, host)
 }
 
+// getNodeAttr returns the value of the named attribute on n and its
+// index in n.Attr, or ("", -1) if not present.
 func getNodeAttr(n *xhtml.Node, key string) (string, int) {
 	for i, a := range n.Attr {
 		if a.Key == key {
@@ -184,6 +202,8 @@ func getNodeAttr(n *xhtml.Node, key string) (string, int) {
 	return "", -1
 }
 
+// setNodeAttr sets the named attribute on n to val, replacing it if
+// it already exists or appending a new attribute otherwise.
 func setNodeAttr(n *xhtml.Node, key, val string) {
 	if _, i := getNodeAttr(n, key); i >= 0 {
 		n.Attr[i].Val = val
@@ -192,6 +212,9 @@ func setNodeAttr(n *xhtml.Node, key, val string) {
 	n.Attr = append(n.Attr, xhtml.Attribute{Key: key, Val: val})
 }
 
+// rewriteAttr applies fn to the value of the named attribute on n
+// if the attribute is present, leaving it unchanged otherwise. Used
+// to rewrite src / href URLs in rendered READMEs.
 func rewriteAttr(n *xhtml.Node, key string, fn func(string) string) {
 	if v, i := getNodeAttr(n, key); i >= 0 {
 		n.Attr[i].Val = fn(v)
