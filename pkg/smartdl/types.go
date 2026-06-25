@@ -291,6 +291,13 @@ type GGUFQuantization struct {
 	// Files holds the repo-relative paths of every file in this quantization
 	// (all shards for a split GGUF). Used so the downloader pulls the whole set.
 	Files []string `json:"files,omitempty"`
+
+	// IsMTP reports whether this quantization is a Multi-Token Prediction
+	// variant — a full model that bakes in an MTP head, named with an "-MTP-"
+	// segment (e.g. model-MTP-Q4_K_M.gguf). It shares a quantization token with
+	// its non-MTP twin but is a distinct, separately downloadable option, so it
+	// must not be merged into the same row as the plain quant.
+	IsMTP bool `json:"is_mtp,omitempty"`
 }
 
 // DiffusersInfo contains Diffusers-specific analysis results.
