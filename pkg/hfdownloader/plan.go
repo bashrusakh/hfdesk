@@ -35,6 +35,32 @@ func unsafeRepoPath(rel string) bool {
 	return false
 }
 
+// PathInside reports whether target resolves to base itself or to a location
+// nested within base. Both paths are cleaned first, so "../" segments are
+// resolved before the comparison. This is the single home for the containment
+// guard that the cache, mirror, and downloader call sites previously
+// open-coded as inline strings.HasPrefix checks.
+func PathInside(base, target string) bool {
+	base = filepath.Clean(base)
+	target = filepath.Clean(target)
+	if target == base {
+		return true
+	}
+	return strings.HasPrefix(target+string(filepath.Separator), base+string(filepath.Separator))
+}
+
+// SafeJoin joins rel onto base and verifies the result stays within base,
+// returning an error if rel would escape (via "../", an absolute component,
+// etc.). Use this instead of a bare filepath.Join wherever rel is remote- or
+// user-influenced.
+func SafeJoin(base, rel string) (string, error) {
+	dst := filepath.Clean(filepath.Join(base, rel))
+	if !PathInside(base, dst) {
+		return "", fmt.Errorf("path %q escapes %q", rel, base)
+	}
+	return dst, nil
+}
+
 // PlanItem represents a single file in the download plan.
 type PlanItem struct {
 	RelativePath string `json:"path"`

@@ -421,16 +421,17 @@ LOOP:
 			} else {
 				// Legacy mode: flat directory structure
 				base := destinationBase(job, cfg)
-				cleanBase := filepath.Clean(base)
-				cleanDst := filepath.Clean(filepath.Join(cleanBase, finalRel))
-				if cleanDst != cleanBase && !strings.HasPrefix(cleanDst+string(filepath.Separator), cleanBase+string(filepath.Separator)) {
+				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
+				// output directory via path traversal.
+				safeDst, err := SafeJoin(base, finalRel)
+				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("path traversal: %q would escape output directory", finalRel):
 					default:
 					}
 					return
 				}
-				dst = cleanDst
+				dst = safeDst
 				skipCheck = func() (bool, string, error) {
 					return shouldSkipLocal(it, dst)
 				}

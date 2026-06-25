@@ -185,11 +185,12 @@ func (r *RepoDir) IncompleteMetaPath(sha256 string) string {
 // RefPath returns the path to a ref file (e.g., refs/main).
 // It validates that the resolved path stays inside the refs directory.
 func (r *RepoDir) RefPath(ref string) string {
-	refsDir := filepath.Clean(r.RefsDir())
-	resolved := filepath.Clean(filepath.Join(refsDir, ref))
-	// Ensure resolved path is inside refsDir to prevent traversal.
-	if resolved != refsDir && !strings.HasPrefix(resolved+string(filepath.Separator), refsDir+string(filepath.Separator)) {
-		return filepath.Join(refsDir, filepath.Base(ref))
+	refsDir := r.RefsDir()
+	resolved, err := SafeJoin(refsDir, ref)
+	if err != nil {
+		// Defensive fallback: collapse to the base name so a crafted ref cannot
+		// escape refs/.
+		return filepath.Join(filepath.Clean(refsDir), filepath.Base(ref))
 	}
 	return resolved
 }
@@ -197,10 +198,10 @@ func (r *RepoDir) RefPath(ref string) string {
 // SnapshotDir returns the path to a snapshot directory for a given commit.
 // It validates that the resolved path stays inside the snapshots directory.
 func (r *RepoDir) SnapshotDir(commit string) string {
-	snapshotsDir := filepath.Clean(r.SnapshotsDir())
-	resolved := filepath.Clean(filepath.Join(snapshotsDir, commit))
-	if resolved != snapshotsDir && !strings.HasPrefix(resolved+string(filepath.Separator), snapshotsDir+string(filepath.Separator)) {
-		return filepath.Join(snapshotsDir, filepath.Base(commit))
+	snapshotsDir := r.SnapshotsDir()
+	resolved, err := SafeJoin(snapshotsDir, commit)
+	if err != nil {
+		return filepath.Join(filepath.Clean(snapshotsDir), filepath.Base(commit))
 	}
 	return resolved
 }
@@ -468,11 +469,10 @@ func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) err
 		return nil
 	}
 
-	snapshotDir := filepath.Clean(r.SnapshotDir(commit))
-	// Validate linkPath stays inside snapshotDir to prevent path traversal.
-	linkPath := filepath.Clean(filepath.Join(snapshotDir, relativePath))
-	if linkPath != snapshotDir && !strings.HasPrefix(linkPath+string(filepath.Separator), snapshotDir+string(filepath.Separator)) {
-		return fmt.Errorf("relative path %q escapes snapshot directory", relativePath)
+	// Validate linkPath stays inside the snapshot dir to prevent path traversal.
+	linkPath, err := SafeJoin(r.SnapshotDir(commit), relativePath)
+	if err != nil {
+		return fmt.Errorf("symlink path %q would escape snapshot directory: %w", relativePath, err)
 	}
 
 	// Create parent directories if needed (for nested paths like "subdir/file.txt")
@@ -540,17 +540,16 @@ func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir strin
 		return nil
 	}
 
-	cleanFriendlyBase := filepath.Clean(r.FriendlyPath())
+	friendlyBase := r.FriendlyPath()
 
 	// Determine the link path and validate it stays inside friendlyBase.
-	var linkPath string
+	rel := relativePath
 	if filterSubdir != "" {
-		linkPath = filepath.Clean(filepath.Join(cleanFriendlyBase, filterSubdir, relativePath))
-	} else {
-		linkPath = filepath.Clean(filepath.Join(cleanFriendlyBase, relativePath))
+		rel = filepath.Join(filterSubdir, relativePath)
 	}
-	if linkPath != cleanFriendlyBase && !strings.HasPrefix(linkPath+string(filepath.Separator), cleanFriendlyBase+string(filepath.Separator)) {
-		return fmt.Errorf("path %q escapes friendly view directory", relativePath)
+	linkPath, err := SafeJoin(friendlyBase, rel)
+	if err != nil {
+		return fmt.Errorf("symlink path %q would escape friendly view base: %w", relativePath, err)
 	}
 
 	// Create parent directories

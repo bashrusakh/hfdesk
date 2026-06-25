@@ -12,12 +12,27 @@ import (
 )
 
 // IsValidModelName checks if the model name is in "owner/name" format.
+//
+// Beyond the structural check it rejects path-traversal and separator
+// characters: a real HF repo ID never contains a "." or ".." path segment,
+// a backslash, or a NUL. Allowing them here would let a crafted "owner/name"
+// traverse the filesystem or the HF Hub URL path in the handlers and cache
+// code that forward the value downstream, so this is the single chokepoint
+// that all repo-accepting callers rely on.
 func IsValidModelName(modelName string) bool {
 	if modelName == "" || !strings.Contains(modelName, "/") {
 		return false
 	}
 	parts := strings.Split(modelName, "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	for _, seg := range parts {
+		if seg == "." || seg == ".." || strings.ContainsAny(seg, "\\\x00") {
+			return false
+		}
+	}
+	return true
 }
 
 // validate checks that the job and settings are valid.
@@ -116,4 +131,3 @@ func defaultString(s string, def string) string {
 	}
 	return s
 }
-

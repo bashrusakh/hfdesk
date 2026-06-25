@@ -1245,6 +1245,10 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/cache/owner/name")
 		return
 	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
 
 	cfg := s.snapshotConfig()
 	cacheDir := cfg.CacheDir
