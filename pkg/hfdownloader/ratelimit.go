@@ -69,10 +69,14 @@ func (l *RateLimiter) SetLimit(bytesPerSec int64) {
 	// Close every waiter's channel and clear the list. Each waiter selects
 	// on its channel in WaitN; closing wakes it without losing the signal
 	// (a subsequent select on a closed channel always returns immediately).
+	// Setting waiters to nil (not [:0]) releases the underlying array so
+	// the now-closed channels can be garbage-collected; a long-lived
+	// process calling SetLimit repeatedly would otherwise pin an
+	// ever-growing backing array of dead channel pointers.
 	for _, ch := range l.waiters {
 		close(ch)
 	}
-	l.waiters = l.waiters[:0]
+	l.waiters = nil
 }
 
 // Limit reports the current cap in bytes per second (0 = unlimited).

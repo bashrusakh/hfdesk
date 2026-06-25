@@ -89,14 +89,25 @@ func (s *Server) snapshotConfig() Config {
 	return s.config
 }
 
-// withConfig runs fn under the write lock with a fresh value copy of the
-// current config. The copy fn receives is private to the call; once fn
-// returns, the copy is stored back into s.config atomically. The returned
-// Config is the new effective value (the same pointer fn mutated).
+// withConfig runs fn under the write lock on a private copy of the
+// current config. The copy is stored back into s.config atomically when
+// fn returns, so a panic inside fn leaves s.config in its pre-call
+// state (no partially-updated corruption) and concurrent readers that
+// hold a pre-call snapshotConfig() copy are unaffected.
+//
+// fn must REPLACE (not mutate in place) any slice or pointer fields:
+// s.config holds e.g. *ProxyConfig and []string LocalScanDirs whose
+// backing memory is shared with the copy. handleUpdateSettings handles
+// this with copy-on-write for Proxy and cleanPathList for LocalScanDirs.
+//
+// The returned Config is the new effective value (a copy of the same
+// struct fn mutated).
 func (s *Server) withConfig(fn func(*Config)) Config {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
-	fn(&s.config)
+	c := s.config
+	fn(&c)
+	s.config = c
 	return s.config
 }
 

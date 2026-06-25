@@ -432,7 +432,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// either the pre- or post-state, never a torn mix). The lock is released
 	// before we touch the job manager or the file, so the critical section
 	// stays short.
-	newCfg := s.withConfig(func(c *Config) {
+	s.withConfig(func(c *Config) {
 		if req.Token != nil {
 			c.Token = *req.Token
 		}
@@ -505,34 +505,42 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
+	// Re-snapshot under the read lock to feed the post-lock side effects.
+	// Using newCfg (captured inside withConfig) is a lost-update hazard: a
+	// concurrent handleUpdateSettings that runs its own withConfig between
+	// the lock release and these side effects would leave the job manager
+	// and the persisted file behind the latest in-memory state. The fresh
+	// snapshot is the narrowest possible window.
+	finalCfg := s.snapshotConfig()
+
 	// Also update job manager config. UpdateConfig takes the manager lock and
 	// re-runs the scheduler, so a raised max-active starts queued jobs now.
-	s.jobs.UpdateConfig(newCfg)
+	s.jobs.UpdateConfig(finalCfg)
 
 	// Persist settings to config file
-	retries := newCfg.Retries
+	retries := finalCfg.Retries
 	fileCfg := &ConfigFile{
-		CacheDir:           newCfg.CacheDir,
-		LocalDir:           newCfg.LocalDir,
-		LocalScanDirs:      newCfg.LocalScanDirs,
-		Token:              newCfg.Token,
-		Connections:        newCfg.Concurrency,
-		MaxActive:          newCfg.MaxActive,
-		MultipartThreshold: newCfg.MultipartThreshold,
-		MaxSpeed:           newCfg.MaxSpeed,
-		Verify:             newCfg.Verify,
+		CacheDir:           finalCfg.CacheDir,
+		LocalDir:           finalCfg.LocalDir,
+		LocalScanDirs:      finalCfg.LocalScanDirs,
+		Token:              finalCfg.Token,
+		Connections:        finalCfg.Concurrency,
+		MaxActive:          finalCfg.MaxActive,
+		MultipartThreshold: finalCfg.MultipartThreshold,
+		MaxSpeed:           finalCfg.MaxSpeed,
+		Verify:             finalCfg.Verify,
 		Retries:            &retries,
-		Endpoint:           newCfg.Endpoint,
+		Endpoint:           finalCfg.Endpoint,
 	}
 	// Add proxy to config file if set
-	if newCfg.Proxy != nil {
+	if finalCfg.Proxy != nil {
 		fileCfg.Proxy = &ProxyConfig{
-			URL:                newCfg.Proxy.URL,
-			Username:           newCfg.Proxy.Username,
-			Password:           newCfg.Proxy.Password,
-			NoProxy:            newCfg.Proxy.NoProxy,
-			NoEnvProxy:         newCfg.Proxy.NoEnvProxy,
-			InsecureSkipVerify: newCfg.Proxy.InsecureSkipVerify,
+			URL:                finalCfg.Proxy.URL,
+			Username:           finalCfg.Proxy.Username,
+			Password:           finalCfg.Proxy.Password,
+			NoProxy:            finalCfg.Proxy.NoProxy,
+			NoEnvProxy:         finalCfg.Proxy.NoEnvProxy,
+			InsecureSkipVerify: finalCfg.Proxy.InsecureSkipVerify,
 		}
 	}
 	if err := SaveConfigFile(fileCfg); err != nil {
