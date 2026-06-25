@@ -282,6 +282,77 @@ func TestAPI_UpdateSettings_UpdatesCacheDir(t *testing.T) {
 	}
 }
 
+func TestAPI_UpdateSettings_ValidatesMaxSpeed(t *testing.T) {
+	// Speed cap is a trust-boundary input: invalid values must surface as
+	// 400 and must not be persisted into srv.config (otherwise a follow-up
+	// download would silently run uncapped).
+	tests := []struct {
+		name      string
+		body      string
+		wantCode  int
+		wantSpeed string // expected srv.config.MaxSpeed after the request
+	}{
+		{"valid", `{"maxSpeed":"2MB"}`, http.StatusOK, "2MB"},
+		{"empty means unlimited", `{"maxSpeed":""}`, http.StatusOK, ""},
+		{"zero means unlimited", `{"maxSpeed":"0"}`, http.StatusOK, "0"},
+		{"trimmed and stored", `{"maxSpeed":"  4MB  "}`, http.StatusOK, "4MB"},
+		{"invalid word", `{"maxSpeed":"abc"}`, http.StatusBadRequest, ""},
+		{"invalid number+unit", `{"maxSpeed":"5xyz"}`, http.StatusBadRequest, ""},
+		{"unit only", `{"maxSpeed":"KB"}`, http.StatusBadRequest, ""},
+		{"negative", `{"maxSpeed":"-1MB"}`, http.StatusBadRequest, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer()
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+			if w.Code != tt.wantCode {
+				t.Errorf("%s: status = %d, want %d. body=%s", tt.name, w.Code, tt.wantCode, w.Body.String())
+			}
+			if srv.config.MaxSpeed != tt.wantSpeed {
+				t.Errorf("%s: srv.config.MaxSpeed = %q, want %q", tt.name, srv.config.MaxSpeed, tt.wantSpeed)
+			}
+		})
+	}
+}
+
+func TestAPI_UpdateSettings_ValidatesMultipartThreshold(t *testing.T) {
+	// MultipartThreshold shares the same silent-fallthrough pattern as
+	// MaxSpeed did before: an invalid size would only fail at the next
+	// download attempt, far from the source. Validation must surface as
+	// 400 and the field must not be persisted.
+	tests := []struct {
+		name      string
+		body      string
+		wantCode  int
+		wantStore string // expected srv.config.MultipartThreshold after the request
+	}{
+		{"valid", `{"multipartThreshold":"16MiB"}`, http.StatusOK, "16MiB"},
+		{"empty is skipped (default applies)", `{"multipartThreshold":""}`, http.StatusOK, ""},
+		{"trimmed and stored", `{"multipartThreshold":"  32MiB  "}`, http.StatusOK, "32MiB"},
+		{"invalid word", `{"multipartThreshold":"xyz"}`, http.StatusBadRequest, ""},
+		{"invalid number+unit", `{"multipartThreshold":"5xyz"}`, http.StatusBadRequest, ""},
+		{"unit only", `{"multipartThreshold":"MB"}`, http.StatusBadRequest, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer()
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+			if w.Code != tt.wantCode {
+				t.Errorf("%s: status = %d, want %d. body=%s", tt.name, w.Code, tt.wantCode, w.Body.String())
+			}
+			if srv.config.MultipartThreshold != tt.wantStore {
+				t.Errorf("%s: srv.config.MultipartThreshold = %q, want %q", tt.name, srv.config.MultipartThreshold, tt.wantStore)
+			}
+		})
+	}
+}
+
 func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {
 	srv := newTestServer()
 

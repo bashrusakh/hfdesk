@@ -5,7 +5,9 @@ package hfdownloader
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -156,13 +158,37 @@ func (rr *rateLimitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ParseSpeed parses a human-readable bytes-per-second string ("2MB", "500KB",
-// "1.5MiB", "0") into a byte count. Empty, "0", or malformed input yields 0,
-// meaning unlimited.
-func ParseSpeed(s string) int64 {
+// ParseSize parses a human-readable byte-size string ("2MB", "500KB",
+// "1.5MiB", "0") into a byte count. Empty, "0", or malformed input yields 0.
+// The semantics of "0" are determined by the caller: the speed-cap path
+// treats 0 as "unlimited", while MultipartThreshold relies on the
+// downloader's own default (256 MiB passed to parseSizeString's def
+// argument) — it never reaches this function with a 0 fallback.
+//
+// Prefer ParseSizeStrict at trust boundaries (e.g. the settings API): this
+// helper silently turns invalid input into 0, which is the right fallback for
+// already-validated config but the wrong behavior for raw user input.
+func ParseSize(s string) int64 {
 	n, err := parseSizeString(s, 0)
 	if err != nil || n < 0 {
 		return 0
 	}
 	return n
+}
+
+// ParseSizeStrict is the validating variant of ParseSize for use at trust
+// boundaries. Empty input and "0" (with or without a unit) yield (0, nil);
+// the caller decides what 0 means in context. Any other unparseable input
+// returns a non-nil error so the caller can reject it with 400 instead of
+// silently storing garbage.
+func ParseSizeStrict(s string) (int64, error) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || trimmed == "0" {
+		return 0, nil
+	}
+	n, err := parseSizeString(trimmed, 0)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return n, nil
 }

@@ -2245,8 +2245,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
   function mbitToMaxSpeedStr(mbit) {
     const v = parseFloat(mbit);
-    if (!isFinite(v) || v <= 0) return ''; // unlimited
-    return Math.round(v * 125) + 'KB';
+    if (!isFinite(v) || v <= 0) return ''; // empty = unlimited
+    // Floor at 1 KB/s so a positive Mbit value (e.g. 0.003) never rounds down
+    // to 0 KB on the wire — 0 KB is parsed by the server as "unlimited" and
+    // would silently disable the cap the user just set.
+    return Math.max(1, Math.round(v * 125)) + 'KB';
   }
 
   function syncSpeedPresets() {

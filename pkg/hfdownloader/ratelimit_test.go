@@ -70,3 +70,39 @@ func TestRateLimiterReaderNilPassthrough(t *testing.T) {
 		t.Fatal("nil limiter Reader should return the original reader unchanged")
 	}
 }
+
+func TestParseSizeStrict(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		// Unlimited / unset.
+		{"", 0, false},
+		{"   ", 0, false},
+		{"0", 0, false},
+		{"0KB", 0, false},
+		{"0  ", 0, false},
+		// Valid sizes.
+		{"500", 500, false},
+		{"500B", 500, false},
+		{"2KB", 2000, false},
+		{"2MB", 2_000_000, false},
+		{"1.5MiB", 1_572_864, false},
+		{"  1GB  ", 1_000_000_000, false},
+		// Invalid.
+		{"abc", 0, true},
+		{"5xyz", 0, true},
+		{"MB", 0, true},
+		{"-1", 0, true},
+	}
+	for _, c := range cases {
+		got, err := ParseSizeStrict(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ParseSizeStrict(%q) err=%v, wantErr=%v", c.in, err, c.wantErr)
+		}
+		if !c.wantErr && got != c.want {
+			t.Errorf("ParseSizeStrict(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}

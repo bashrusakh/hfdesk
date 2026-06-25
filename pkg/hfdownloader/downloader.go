@@ -238,7 +238,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// from MaxSpeed. When neither is set, cfg.SpeedLimiter stays nil and the
 	// copy sites read at full speed.
 	if cfg.SpeedLimiter == nil {
-		if bps, err := parseSizeString(cfg.MaxSpeed, 0); err == nil && bps > 0 {
+		if bps := ParseSize(cfg.MaxSpeed); bps > 0 {
 			cfg.SpeedLimiter = NewRateLimiter(bps)
 		}
 	}

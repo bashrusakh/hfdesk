@@ -128,7 +128,7 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 		jobs:         make(map[string]*Job),
 		config:       cfg,
 		wsHub:        wsHub,
-		speedLimiter: hfdownloader.NewRateLimiter(hfdownloader.ParseSpeed(cfg.MaxSpeed)),
+		speedLimiter: hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -688,7 +688,7 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Lock()
 	m.config = cfg
 	if m.speedLimiter != nil {
-		m.speedLimiter.SetLimit(hfdownloader.ParseSpeed(cfg.MaxSpeed))
+		m.speedLimiter.SetLimit(hfdownloader.ParseSize(cfg.MaxSpeed))
 	}
 	m.enforceLimitLocked()
 	m.dispatchLocked()
