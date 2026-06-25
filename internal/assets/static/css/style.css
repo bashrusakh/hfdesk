@@ -1630,6 +1630,24 @@ a {
   white-space: nowrap;
 }
 
+/* Downloads-tab inline speed cap */
+.jobs-speed {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.jobs-speed-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.jobs-speed .speed-field {
+  max-width: 130px;
+}
+
 /* Cache List */
 .cache-list {
   flex: 1;

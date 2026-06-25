@@ -209,6 +209,20 @@
             <h1>Active Jobs</h1>
             <p class="page-subtitle">Monitor your downloads in real-time</p>
           </div>
+          <div class="jobs-speed" title="Total download speed cap across all jobs. Applies instantly.">
+            <span class="jobs-speed-label">Speed cap</span>
+            <div class="speed-presets" id="speedPresetsJobs">
+              <button type="button" class="speed-btn" data-mbit="2">2</button>
+              <button type="button" class="speed-btn" data-mbit="4">4</button>
+              <button type="button" class="speed-btn" data-mbit="6">6</button>
+              <button type="button" class="speed-btn" data-mbit="10">10</button>
+              <button type="button" class="speed-btn" data-mbit="0">&infin;</button>
+            </div>
+            <div class="speed-field">
+              <input type="number" id="maxSpeedJobs" min="0" step="0.5" placeholder="&infin;">
+              <span class="speed-unit">Mbit/s</span>
+            </div>
+          </div>
         </header>
 
         <div id="jobsList" class="jobs-list">
