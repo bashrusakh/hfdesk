@@ -20,13 +20,16 @@ import (
 //
 // A rate of 0 (or negative) means unlimited: WaitN returns immediately. The
 // limit can be changed at runtime with SetLimit, so the server can apply a new
-// setting without restarting in-flight downloads.
+// setting without restarting in-flight downloads. SetLimit also wakes any
+// goroutine currently blocked in WaitN so a rate increase takes effect
+// immediately instead of after the originally-computed wait time elapses.
 type RateLimiter struct {
-	mu     sync.Mutex
-	rate   float64   // bytes per second; <= 0 means unlimited
-	burst  float64   // bucket capacity in bytes
-	tokens float64   // currently available tokens (bytes)
-	last   time.Time // last time tokens were refilled
+	mu      sync.Mutex
+	rate    float64         // bytes per second; <= 0 means unlimited
+	burst   float64         // bucket capacity in bytes
+	tokens  float64         // currently available tokens (bytes)
+	last    time.Time       // last time tokens were refilled
+	waiters []chan struct{} // closed by SetLimit to wake blocked WaitN callers; protected by mu
 }
 
 // minBurst keeps the bucket large enough to admit a full read chunk even when
@@ -46,7 +49,8 @@ func NewRateLimiter(bytesPerSec int64) *RateLimiter {
 }
 
 // SetLimit changes the throughput cap to bytesPerSec (0 = unlimited). It is
-// safe to call concurrently with active transfers.
+// safe to call concurrently with active transfers, and any goroutine blocked
+// in WaitN is woken so it can re-evaluate against the new rate.
 func (l *RateLimiter) SetLimit(bytesPerSec int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -62,6 +66,13 @@ func (l *RateLimiter) SetLimit(bytesPerSec int64) {
 	if l.tokens > l.burst {
 		l.tokens = l.burst
 	}
+	// Close every waiter's channel and clear the list. Each waiter selects
+	// on its channel in WaitN; closing wakes it without losing the signal
+	// (a subsequent select on a closed channel always returns immediately).
+	for _, ch := range l.waiters {
+		close(ch)
+	}
+	l.waiters = l.waiters[:0]
 }
 
 // Limit reports the current cap in bytes per second (0 = unlimited).
@@ -73,6 +84,10 @@ func (l *RateLimiter) Limit() int64 {
 
 // WaitN blocks until n bytes' worth of tokens are available and consumes them,
 // or until ctx is cancelled. When the limiter is unlimited it returns at once.
+//
+// If SetLimit is called while WaitN is blocked, WaitN is woken immediately
+// rather than waiting out the originally-computed timer; it then re-evaluates
+// against the new rate.
 func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 	if n <= 0 {
 		return nil
@@ -102,6 +117,11 @@ func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 		}
 		deficit := need - l.tokens
 		wait := time.Duration(deficit / l.rate * float64(time.Second))
+		// Register a wakeup channel so SetLimit can short-circuit our wait.
+		// The channel is closed by SetLimit; a closed channel in a select
+		// always returns immediately, which is the desired signal.
+		wakeup := make(chan struct{})
+		l.waiters = append(l.waiters, wakeup)
 		l.mu.Unlock()
 
 		if wait <= 0 {
@@ -111,8 +131,27 @@ func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			l.removeWaiter(wakeup)
 			return ctx.Err()
+		case <-wakeup:
+			timer.Stop()
+			// SetLimit was called; loop and recompute against the new rate.
 		case <-timer.C:
+			// Normal wakeup; loop and try to acquire tokens.
+		}
+	}
+}
+
+// removeWaiter removes ch from the waiters list if present. Called by a
+// WaitN caller when its ctx is cancelled so the list doesn't grow with
+// dangling channels.
+func (l *RateLimiter) removeWaiter(ch chan struct{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, w := range l.waiters {
+		if w == ch {
+			l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+			return
 		}
 	}
 }

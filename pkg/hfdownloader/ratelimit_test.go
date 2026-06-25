@@ -71,6 +71,48 @@ func TestRateLimiterReaderNilPassthrough(t *testing.T) {
 	}
 }
 
+// TestRateLimiterSetLimitWakesWaiters verifies that a goroutine blocked in
+// WaitN is woken by a concurrent SetLimit, instead of having to wait out the
+// originally-computed deficit/rate timer.
+func TestRateLimiterSetLimitWakesWaiters(t *testing.T) {
+	const initialRate = 1024 // 1 KiB/s
+	l := NewRateLimiter(initialRate)
+	// Drain the bucket so the next WaitN has to block.
+	if err := l.WaitN(context.Background(), minBurst); err != nil {
+		t.Fatalf("drain WaitN: %v", err)
+	}
+
+	// Try to wait for 10 MiB at 1 KiB/s. At the old rate that would take
+	// ~10000 seconds; we expect SetLimit(unlimited) to wake us in well
+	// under a second.
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = l.WaitN(context.Background(), 10<<20)
+		done <- time.Since(start)
+	}()
+
+	// Give the goroutine a moment to register as a waiter and start
+	// blocking on the timer.
+	time.Sleep(50 * time.Millisecond)
+	l.SetLimit(0) // unlimited — must wake the blocked WaitN.
+
+	select {
+	case elapsed := <-done:
+		if elapsed > 500*time.Millisecond {
+			t.Errorf("WaitN took %v after SetLimit(unlimited); should be woken near-instantly", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitN did not return within 2s after SetLimit — wakeup is not working")
+	}
+
+	// And a follow-up WaitN should now return immediately, since the rate
+	// is unlimited.
+	if err := l.WaitN(context.Background(), 10<<20); err != nil {
+		t.Errorf("post-wakeup WaitN: %v", err)
+	}
+}
+
 func TestParseSizeStrict(t *testing.T) {
 	cases := []struct {
 		in      string
