@@ -431,8 +431,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// takes the write lock for the whole mutation, so a concurrent read sees
 	// either the pre- or post-state, never a torn mix). The lock is released
 	// before we touch the job manager or the file, so the critical section
-	// stays short.
-	s.withConfig(func(c *Config) {
+	// stays short. myGen is the generation we just produced; the side
+	// effects below drop themselves if a newer commit landed in between.
+	_, myGen := s.withConfig(func(c *Config) {
 		if req.Token != nil {
 			c.Token = *req.Token
 		}
@@ -506,12 +507,19 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Re-snapshot under the read lock to feed the post-lock side effects.
-	// Using newCfg (captured inside withConfig) is a lost-update hazard: a
-	// concurrent handleUpdateSettings that runs its own withConfig between
-	// the lock release and these side effects would leave the job manager
-	// and the persisted file behind the latest in-memory state. The fresh
-	// snapshot is the narrowest possible window.
-	finalCfg := s.snapshotConfig()
+	// If the generation has moved past myGen, a concurrent writer has
+	// already committed a newer view; s.config is already correct, but
+	// running UpdateConfig / SaveConfigFile with this stale snapshot would
+	// roll the job manager and the persisted file back. Drop the side
+	// effects so the in-memory state stays the authoritative one.
+	finalCfg, currentGen := s.snapshotConfigWithGen()
+	if currentGen != myGen {
+		writeJSON(w, http.StatusOK, SuccessResponse{
+			Success: true,
+			Message: "Settings updated (a newer update was applied concurrently; this request's job-manager and file persistence were skipped to preserve the latest state)",
+		})
+		return
+	}
 
 	// Also update job manager config. UpdateConfig takes the manager lock and
 	// re-runs the scheduler, so a raised max-active starts queued jobs now.
@@ -731,12 +739,19 @@ type CacheStats struct {
 	TotalFiles     int    `json:"totalFiles"`
 }
 
+// localCacheRoot describes a single directory to scan for cached
+// repos, with the Source label to display in the UI and a flag for
+// whether to skip the HF-cache special subdirectories (hub, blobs,
+// etc.) that aren't user-visible repos.
 type localCacheRoot struct {
 	Path        string
 	Source      string
 	SkipSpecial bool
 }
 
+// cleanPathList trims whitespace, filepath.Cleans each path, drops
+// empties, and de-duplicates case-insensitively. Used to normalize
+// the user-supplied LocalScanDirs list before it lands in s.config.
 func cleanPathList(paths []string) []string {
 	var cleaned []string
 	seen := make(map[string]bool)
@@ -756,6 +771,11 @@ func cleanPathList(paths []string) []string {
 	return cleaned
 }
 
+// localCacheRoots builds the list of directories to scan for cached
+// repos: the Friendly-view <cache>/models tree, the user-supplied
+// localDir, the user-supplied localScanDirs, and the raw cache dir
+// (with SkipSpecial because its hub/blobs layout is internal). The
+// returned slice is deduped by absolute path.
 func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
 	var roots []localCacheRoot
 	seen := make(map[string]bool)
@@ -784,6 +804,10 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localC
 	return roots
 }
 
+// hasLocalWeightFile reports whether dir (or any subdirectory) contains
+// at least one .gguf or .safetensors file. Used to decide whether an
+// owner/name folder under a cache root is a real repo worth listing
+// vs. an unrelated directory.
 func hasLocalWeightFile(dir string) bool {
 	found := false
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -799,8 +823,17 @@ func hasLocalWeightFile(dir string) bool {
 	return found
 }
 
+// cacheQuantPattern matches a GGUF quantisation token inside a filename
+// (e.g. "Q4_K_M", "UD_Q6_K", "BF16", "APEX-BALANCED"). The optional
+// "UD[-_]" prefix is captured separately so the result can be
+// returned as "UD_Q4_K" rather than "UD_ Q4_K" or similar. The
+// pattern is case-insensitive.
 var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
 
+// cacheQuantLabel extracts the quantisation token from a GGUF filename
+// (e.g. "Q4_K_M" from "model-Q4_K_M.gguf") and returns it in a
+// canonical, dash-free uppercase form ("Q4_K_M", or "UD_Q4_K_M" for
+// un-distilled variants). Returns "" if no quant token is present.
 func cacheQuantLabel(name string) string {
 	if m := cacheQuantPattern.FindStringSubmatch(strings.ToUpper(name)); len(m) >= 3 {
 		quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
@@ -812,11 +845,19 @@ func cacheQuantLabel(name string) string {
 	return ""
 }
 
+// isCacheMMProjFile reports whether a GGUF filename looks like an
+// mmproj companion (clip/projector for multimodal models). Detected
+// by an "mmproj" prefix or a "-mmproj" substring in the basename.
 func isCacheMMProjFile(name string) bool {
 	base := strings.ToLower(filepath.Base(name))
 	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
 }
 
+// cacheGGUFMetadata summarises the GGUF content of a cached repo:
+// the set of distinct quantisation labels, whether any mmproj
+// companion file is present, the relative paths of those companions
+// (when includeMMProjFiles is true), and any inferred capabilities
+// (e.g. "vision" for multimodal).
 type cacheGGUFMetadata struct {
 	Quantizations []string
 	HasMMProj     bool
@@ -824,6 +865,10 @@ type cacheGGUFMetadata struct {
 	Capabilities  []string
 }
 
+// collectCacheGGUFMetadata walks dir and gathers the GGUF quantisation
+// summary (distinct labels, mmproj presence, capabilities) for the
+// repo rooted there. When includeMMProjFiles is true, the relative
+// paths of mmproj companions are also recorded.
 func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMetadata {
 	seen := make(map[string]bool)
 	meta := cacheGGUFMetadata{}
@@ -856,6 +901,12 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMeta
 	return meta
 }
 
+// buildLocalCacheRepo builds a CachedRepoInfo for a single owner/name
+// folder under a local cache root. It walks the directory, computes
+// total size / file count, gathers GGUF metadata, and (when
+// includeFiles is true) enumerates the files. The source label
+// (e.g. "HF cache", "Friendly view", "Local") is propagated to the
+// result so the UI can group repos by origin.
 func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
 	var totalSize int64
 	var fileCount int
@@ -923,6 +974,11 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	}, nil
 }
 
+// scanLocalCachedRepos walks every local cache root (Friendly view,
+// localDir, localScanDirs, raw cache) and returns the list of
+// discovered repos. When includeFiles is true, each result includes
+// the per-file list. Repos that look like HF-cache internals
+// (hub/blobs/snapshots/refs) are skipped.
 func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
@@ -969,6 +1025,10 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 	return repos, nil
 }
 
+// findLocalCachedRepo resolves a single owner/name repo across every
+// local cache root and returns its CachedRepoInfo. Returns
+// os.ErrNotExist if the repo is not present in any root. The
+// includeFiles flag controls whether the per-file list is filled in.
 func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	parts := strings.SplitN(repoID, "/", 2)
 	if len(parts) != 2 {

@@ -69,8 +69,15 @@ func DefaultConfig() Config {
 
 // Server is the HTTP server for HFDesk.
 type Server struct {
-	configMu   sync.RWMutex
-	config     Config
+	configMu sync.RWMutex
+	config   Config
+	// configGen is bumped on every successful withConfig. Callers
+	// capture the value before releasing the lock and re-snapshot it
+	// after the lock to detect whether a concurrent update committed
+	// in between: if so, they drop the post-lock side effects so the
+	// in-memory config stays the authoritative one and the job
+	// manager / persisted file are not rolled back.
+	configGen  uint64
 	httpServer *http.Server
 	jobs       *JobManager
 	wsHub      *WSHub
@@ -89,6 +96,18 @@ func (s *Server) snapshotConfig() Config {
 	return s.config
 }
 
+// snapshotConfigWithGen is snapshotConfig plus the current generation
+// counter. Callers that need to do post-lock side effects (UpdateConfig,
+// SaveConfigFile) use this to detect whether a newer write committed
+// between the write lock release and the side-effect phase; if so, the
+// in-memory config is already the newer one and the side effects would
+// otherwise roll the job manager and the file back to an older state.
+func (s *Server) snapshotConfigWithGen() (Config, uint64) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.config, s.configGen
+}
+
 // withConfig runs fn under the write lock on a private copy of the
 // current config. The copy is stored back into s.config atomically when
 // fn returns, so a panic inside fn leaves s.config in its pre-call
@@ -101,14 +120,18 @@ func (s *Server) snapshotConfig() Config {
 // this with copy-on-write for Proxy and cleanPathList for LocalScanDirs.
 //
 // The returned Config is the new effective value (a copy of the same
-// struct fn mutated).
-func (s *Server) withConfig(fn func(*Config)) Config {
+// struct fn mutated) and the returned uint64 is the post-mutation
+// generation. Callers doing post-lock side effects re-snapshot the
+// generation via snapshotConfigWithGen and drop the side effects if
+// it has moved.
+func (s *Server) withConfig(fn func(*Config)) (Config, uint64) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	c := s.config
 	fn(&c)
 	s.config = c
-	return s.config
+	s.configGen++
+	return s.config, s.configGen
 }
 
 // New creates a new server with the given configuration.
