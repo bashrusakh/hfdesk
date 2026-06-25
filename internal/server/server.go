@@ -77,7 +77,12 @@ type Server struct {
 	// in between: if so, they drop the post-lock side effects so the
 	// in-memory config stays the authoritative one and the job
 	// manager / persisted file are not rolled back.
-	configGen  uint64
+	configGen uint64
+	// persistMu serializes the post-lock side effects of handleUpdateSettings
+	// (jobs.UpdateConfig + SaveConfigFile). The generation re-check is taken
+	// under this lock so that only the latest committed writer persists, and
+	// an older writer cannot clobber a newer one's job-manager/file state.
+	persistMu  sync.Mutex
 	httpServer *http.Server
 	jobs       *JobManager
 	wsHub      *WSHub

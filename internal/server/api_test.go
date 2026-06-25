@@ -935,11 +935,6 @@ func TestAPI_ConcurrentSettingsAccess(t *testing.T) {
 func TestAPI_UpdateSettings_DropsStalePostLockSideEffects(t *testing.T) {
 	srv := newTestServer()
 
-	// Pre-load a known token so we can detect a rollback in the file
-	// (we don't unwrap the encrypted file here, so we instead assert on
-	// srv.config which is the authoritative in-memory state, and on
-	// s.jobs.config which is what the job manager ended up with after
-	// the dust settled).
 	srv.config.MaxSpeed = "0"
 
 	var wg sync.WaitGroup
@@ -959,24 +954,79 @@ func TestAPI_UpdateSettings_DropsStalePostLockSideEffects(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Authoritative in-memory state must reflect the last successful
-	// withConfig (always 200). We don't assert on the exact MaxSpeed
-	// value because the goroutine scheduling is non-deterministic, but
-	// it must be one of the values the writers tried to set.
 	wantPattern := regexp.MustCompile(`^(10|20|30|40)MB$`)
-	if !wantPattern.MatchString(srv.config.MaxSpeed) {
-		t.Errorf("srv.config.MaxSpeed = %q; want one of the writers' values", srv.config.MaxSpeed)
+	cfg := srv.snapshotConfig()
+	if !wantPattern.MatchString(cfg.MaxSpeed) {
+		t.Errorf("srv.config.MaxSpeed = %q; want one of the writers' values", cfg.MaxSpeed)
 	}
-
-	// Every response should be 200 (the server is always happy: the
-	// in-memory update always succeeds; only the side effects are
-	// sometimes skipped). At most writers-1 should carry the
-	// "newer update was applied concurrently" skip message.
-	skips := 0
+	// Job manager must converge on the same committed value — it must
+	// NOT have been rolled back by a stale post-lock side effect.
+	if srv.jobs.snapshotConfig().MaxSpeed != cfg.MaxSpeed {
+		t.Errorf("srv.jobs.config.MaxSpeed = %q; want committed %q", srv.jobs.snapshotConfig().MaxSpeed, cfg.MaxSpeed)
+	}
 	for i, code := range results {
 		if code != http.StatusOK {
 			t.Errorf("writer %d: status = %d, want 200", i, code)
 		}
 	}
-	_ = skips // count check is informational only; the test passes regardless
+}
+
+// TestAPI_UpdateSettings_PersistedFileMatchesLatest guards the persistMu fix:
+// concurrent POST /api/settings writers must leave the persisted config file
+// in a state consistent with the authoritative in-memory config. Before the
+// fix, two concurrent writes could interleave so that the older writer's
+// SaveConfigFile executed after the newer writer's, rolling the file back.
+func TestAPI_UpdateSettings_PersistedFileMatchesLatest(t *testing.T) {
+	// Backup any existing config file; restore at end.
+	cfgPath := ConfigPath()
+	var origData []byte
+	if data, err := os.ReadFile(cfgPath); err == nil {
+		origData = data
+	}
+	// Remove so we start clean (save will create a fresh file).
+	os.Remove(cfgPath)
+	defer func() {
+		if origData != nil {
+			os.WriteFile(cfgPath, origData, 0o644)
+		} else {
+			os.Remove(cfgPath)
+		}
+	}()
+
+	srv := newTestServer()
+	const writers = 4
+	var wg sync.WaitGroup
+
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"maxSpeed": "%dMB"}`, (id+1)*10)
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+		}(i)
+	}
+	wg.Wait()
+
+	// Read the config file through the same path the server uses.
+	fileCfg, err := LoadConfigFile()
+	if err != nil {
+		t.Fatalf("failed to load config file: %v", err)
+	}
+
+	// The file's MaxSpeed must match the authoritative in-memory config.
+	if fileCfg.MaxSpeed != srv.config.MaxSpeed {
+		t.Errorf("config file MaxSpeed = %q, want %q (in-memory)", fileCfg.MaxSpeed, srv.config.MaxSpeed)
+	}
+
+	// Both must be one of the writers' values.
+	wantPattern := regexp.MustCompile(`^(10|20|30|40)MB$`)
+	if !wantPattern.MatchString(srv.config.MaxSpeed) {
+		t.Errorf("srv.config.MaxSpeed = %q; want one of the writers' values", srv.config.MaxSpeed)
+	}
+	if !wantPattern.MatchString(fileCfg.MaxSpeed) {
+		t.Errorf("config file MaxSpeed = %q; want one of the writers' values", fileCfg.MaxSpeed)
+	}
 }

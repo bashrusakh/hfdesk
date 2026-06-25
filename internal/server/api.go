@@ -506,12 +506,14 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	// Re-snapshot under the read lock to feed the post-lock side effects.
-	// If the generation has moved past myGen, a concurrent writer has
-	// already committed a newer view; s.config is already correct, but
-	// running UpdateConfig / SaveConfigFile with this stale snapshot would
-	// roll the job manager and the persisted file back. Drop the side
-	// effects so the in-memory state stays the authoritative one.
+	// Side effects (job-manager update + file persistence) are serialized
+	// under persistMu, and the generation is re-checked *after* acquiring it.
+	// That ordering guarantees the snapshot sees every earlier commit, so
+	// only the writer whose generation is still current persists; an older
+	// writer drops its side effects instead of rolling state back.
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
 	finalCfg, currentGen := s.snapshotConfigWithGen()
 	if currentGen != myGen {
 		writeJSON(w, http.StatusOK, SuccessResponse{
