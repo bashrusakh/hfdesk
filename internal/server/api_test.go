@@ -977,21 +977,10 @@ func TestAPI_UpdateSettings_DropsStalePostLockSideEffects(t *testing.T) {
 // fix, two concurrent writes could interleave so that the older writer's
 // SaveConfigFile executed after the newer writer's, rolling the file back.
 func TestAPI_UpdateSettings_PersistedFileMatchesLatest(t *testing.T) {
-	// Backup any existing config file; restore at end.
+	// Keep this test isolated from the caller's real config file.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	cfgPath := ConfigPath()
-	var origData []byte
-	if data, err := os.ReadFile(cfgPath); err == nil {
-		origData = data
-	}
-	// Remove so we start clean (save will create a fresh file).
-	os.Remove(cfgPath)
-	defer func() {
-		if origData != nil {
-			os.WriteFile(cfgPath, origData, 0o644)
-		} else {
-			os.Remove(cfgPath)
-		}
-	}()
+	_ = os.Remove(cfgPath)
 
 	srv := newTestServer()
 	const writers = 4
