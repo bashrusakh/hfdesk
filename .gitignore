@@ -25,6 +25,7 @@
 /Datasets/
 
 # Environment and IDE
+.graymatter/
 .env
 .DS_Store
 .idea/

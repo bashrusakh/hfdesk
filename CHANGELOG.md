@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-26
+
+### Added
+
+- Download speed limit feature with configurable cap
+- Inline speed cap display on Downloads tab
+
+### Fixed
+
+- Pre-existing concurrency bugs in Server.config and RateLimiter
+- MTP (Multi-Token Prediction) variants are now treated as separate GGUF quantizations
+
+### Changed
+
+- Upgraded GitHub Actions to Node.js 24 compatible versions
+- Updated workflow actions (checkout v7, upload-artifact v7)
+- Added .graymatter to .gitignore
+
 ## [1.0.14] - 2026-06-18
 
 ### Fixed

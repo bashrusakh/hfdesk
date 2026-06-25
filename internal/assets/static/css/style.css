@@ -1630,6 +1630,78 @@ a {
   white-space: nowrap;
 }
 
+/* Speed bar — downloads page */
+.speed-bar {
+  padding: 12px 40px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.speed-bar-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.speed-bar-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.speed-bar-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--color-border);
+  flex-shrink: 0;
+}
+
+.speed-bar .speed-field {
+  max-width: 130px;
+}
+
+/* Aggregate usage gauge */
+.speed-bar-aggregate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.speed-gauge-track {
+  flex: 1;
+  max-width: 400px;
+  height: 4px;
+  background: var(--color-border);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.speed-gauge-fill {
+  height: 100%;
+  background: var(--color-primary);
+  border-radius: var(--radius-full);
+  transition: width 0.2s ease;
+}
+
+.speed-gauge-fill.warning {
+  background: var(--color-warning);
+}
+
+.speed-gauge-fill.critical {
+  background: var(--color-error);
+}
+
+.speed-gauge-text {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  min-width: 120px;
+}
+
 /* Cache List */
 .cache-list {
   flex: 1;
@@ -2734,6 +2806,10 @@ a {
 
   .page-header {
     padding: 24px 20px;
+  }
+
+  .speed-bar {
+    padding: 12px 20px;
   }
 
   .analyze-container,
