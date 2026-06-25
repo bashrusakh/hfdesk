@@ -103,6 +103,10 @@ type JobManager struct {
 	listenerMu  sync.RWMutex
 	wsHub       *WSHub
 	wsCoalescer *jobCoalescer
+	// speedLimiter is the process-wide token bucket shared by every running
+	// job so the configured cap limits total bandwidth, not per-job. Always
+	// non-nil; a 0 limit means unlimited.
+	speedLimiter *hfdownloader.RateLimiter
 	// runWG tracks in-flight runJob goroutines so shutdown paths (and
 	// tests) can wait for every download to actually unwind — not just
 	// for Status to flip to Cancelled. Without this a t.TempDir cleanup
@@ -121,9 +125,10 @@ const wsBroadcastMinGap = 250 * time.Millisecond
 // NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 	m := &JobManager{
-		jobs:   make(map[string]*Job),
-		config: cfg,
-		wsHub:  wsHub,
+		jobs:         make(map[string]*Job),
+		config:       cfg,
+		wsHub:        wsHub,
+		speedLimiter: hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -682,6 +687,9 @@ func (m *JobManager) enforceLimitLocked() {
 func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Lock()
 	m.config = cfg
+	if m.speedLimiter != nil {
+		m.speedLimiter.SetLimit(hfdownloader.ParseSize(cfg.MaxSpeed))
+	}
 	m.enforceLimitLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
@@ -924,6 +932,8 @@ func (m *JobManager) runJob(job *Job) {
 		BackoffMax:         "10s",
 		Endpoint:           cfg.Endpoint,
 		Proxy:              cfg.Proxy,
+		MaxSpeed:           cfg.MaxSpeed,
+		SpeedLimiter:       m.speedLimiter,
 	}
 
 	// Local mode: write real files into job.LocalDir instead of the HF cache

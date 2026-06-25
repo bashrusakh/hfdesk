@@ -48,6 +48,7 @@ type SettingsResponse struct {
 	Concurrency        int    `json:"connections"`
 	MaxActive          int    `json:"maxActive"`
 	MultipartThreshold string `json:"multipartThreshold"`
+	MaxSpeed           string `json:"maxSpeed"`
 	Verify             string `json:"verify"`
 	Retries            int    `json:"retries"`
 	Endpoint           string `json:"endpoint,omitempty"`

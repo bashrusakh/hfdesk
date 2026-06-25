@@ -723,6 +723,22 @@
                     <input type="number" id="maxActive" value="3" min="1" max="10">
                   </div>
                 </div>
+                <div class="settings-row settings-row-top">
+                  <label for="maxSpeed" title="Total download speed cap across all files and connections. Pick a preset or type a value in megabits per second. Empty = unlimited.">Max speed</label>
+                  <div class="settings-control speed-control">
+                    <div class="speed-presets" id="speedPresets">
+                      <button type="button" class="speed-btn" data-mbit="2">2</button>
+                      <button type="button" class="speed-btn" data-mbit="4">4</button>
+                      <button type="button" class="speed-btn" data-mbit="6">6</button>
+                      <button type="button" class="speed-btn" data-mbit="10">10</button>
+                      <button type="button" class="speed-btn" data-mbit="0">Unlim</button>
+                    </div>
+                    <div class="speed-field">
+                      <input type="number" id="maxSpeed" min="0" step="0.5" placeholder="unlimited">
+                      <span class="speed-unit">Mbit/s</span>
+                    </div>
+                  </div>
+                </div>
                 <div class="settings-row">
                   <label for="retries">Retry attempts</label>
                   <div class="settings-control settings-control-xs">

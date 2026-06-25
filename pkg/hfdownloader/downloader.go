@@ -233,6 +233,16 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.MaxActiveDownloads = runtime.GOMAXPROCS(0)
 	}
 
+	// Resolve the shared speed limiter. A caller-supplied SpeedLimiter (the
+	// server's process-wide limiter) wins; otherwise build a per-download one
+	// from MaxSpeed. When neither is set, cfg.SpeedLimiter stays nil and the
+	// copy sites read at full speed.
+	if cfg.SpeedLimiter == nil {
+		if bps := ParseSize(cfg.MaxSpeed); bps > 0 {
+			cfg.SpeedLimiter = NewRateLimiter(bps)
+		}
+	}
+
 	// Determine storage mode: HF cache (new) vs flat directory (legacy)
 	// Use HF cache mode when:
 	// 1. --cache-dir is explicitly set, OR
@@ -686,7 +696,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				lastErr = fmt.Errorf("bad status: %s", resp.Status)
 				resp.Body.Close()
 			} else {
-				pr := newProgressReader(resp.Body, it.Size, it.RelativePath, emit)
+				pr := newProgressReader(cfg.SpeedLimiter.Reader(ctx, resp.Body), it.Size, it.RelativePath, emit)
 				pr.downloaded = pos // emitted progress reflects cumulative bytes
 				_, cerr := io.Copy(out, pr)
 				resp.Body.Close()
@@ -835,7 +845,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
 					rs.Body.Close()
 				} else {
-					_, cerr := io.Copy(out, rs.Body)
+					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(ctx, rs.Body))
 					rs.Body.Close()
 					if cerr == nil {
 						return

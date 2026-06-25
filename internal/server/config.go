@@ -46,6 +46,7 @@ type ConfigFile struct {
 	Connections        int          `json:"connections,omitempty" yaml:"connections,omitempty"`
 	MaxActive          int          `json:"max-active,omitempty" yaml:"max-active,omitempty"`
 	MultipartThreshold string       `json:"multipart-threshold,omitempty" yaml:"multipart-threshold,omitempty"`
+	MaxSpeed           string       `json:"max-speed,omitempty" yaml:"max-speed,omitempty"`
 	Verify             string       `json:"verify,omitempty" yaml:"verify,omitempty"`
 	Retries            *int         `json:"retries,omitempty" yaml:"retries,omitempty"`
 	Endpoint           string       `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
@@ -216,6 +217,9 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	}
 	if serverCfg.MultipartThreshold == "" && fileCfg.MultipartThreshold != "" {
 		serverCfg.MultipartThreshold = fileCfg.MultipartThreshold
+	}
+	if serverCfg.MaxSpeed == "" && fileCfg.MaxSpeed != "" {
+		serverCfg.MaxSpeed = fileCfg.MaxSpeed
 	}
 	if fileCfg.Verify != "" {
 		serverCfg.Verify = fileCfg.Verify

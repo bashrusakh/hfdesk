@@ -2222,6 +2222,60 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Settings Page
   // =========================================
 
+  // The Max speed control is shown in megabits per second, but the backend
+  // stores a byte-rate string ("250KB"). These helpers convert between the two.
+  // 1 Mbit/s = 125000 bytes/s = 125 KB (decimal KB matches the server parser).
+  function parseHumanBytes(s) {
+    if (!s) return 0;
+    const m = String(s).trim().match(/^([\d.]+)\s*([KMGT]?i?B)?$/i);
+    if (!m) return 0;
+    const n = parseFloat(m[1]);
+    if (!isFinite(n)) return 0;
+    const u = (m[2] || 'B').toUpperCase();
+    const map = { B: 1, KB: 1e3, MB: 1e6, GB: 1e9, TB: 1e12,
+                  KIB: 1024, MIB: 1048576, GIB: 1073741824, TIB: 1099511627776 };
+    return n * (map[u] || 1);
+  }
+
+  function maxSpeedToMbit(s) {
+    const b = parseHumanBytes(s);
+    if (!b) return '';
+    return String(Math.round((b * 8 / 1e6) * 100) / 100); // 2 decimals
+  }
+
+  function mbitToMaxSpeedStr(mbit) {
+    const v = parseFloat(mbit);
+    if (!isFinite(v) || v <= 0) return ''; // empty = unlimited
+    // Floor at 1 KB/s so a positive Mbit value (e.g. 0.003) never rounds down
+    // to 0 KB on the wire — 0 KB is parsed by the server as "unlimited" and
+    // would silently disable the cap the user just set.
+    return Math.max(1, Math.round(v * 125)) + 'KB';
+  }
+
+  function syncSpeedPresets() {
+    const raw = ($('#maxSpeed')?.value ?? '').toString().trim();
+    const v = raw === '' ? 0 : parseFloat(raw);
+    $$('#speedPresets .speed-btn').forEach(b => {
+      const pv = parseFloat(b.dataset.mbit);
+      b.classList.toggle('active', !isNaN(v) && pv === v);
+    });
+  }
+
+  function bindSpeedPresets() {
+    const presets = document.getElementById('speedPresets');
+    if (!presets || presets.dataset.bound) return;
+    presets.dataset.bound = '1';
+    presets.querySelectorAll('.speed-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mbit = parseFloat(btn.dataset.mbit) || 0;
+        $('#maxSpeed').value = mbit > 0 ? String(mbit) : '';
+        syncSpeedPresets();
+      });
+    });
+    const field = $('#maxSpeed');
+    if (field) field.addEventListener('input', syncSpeedPresets);
+  }
+
   async function loadSettings() {
     try {
       const data = await api('GET', '/settings');
@@ -2259,6 +2313,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       $('#hfToken').value = data.token || '';
       $('#connections').value = data.connections ?? 8;
       $('#maxActive').value = data.maxActive ?? 3;
+      $('#maxSpeed').value = maxSpeedToMbit(data.maxSpeed);
+      bindSpeedPresets();
+      syncSpeedPresets();
       $('#retries').value = data.retries ?? 4;
       $('#verify').value = data.verify || 'size';
       $('#endpoint').value = data.endpoint || '';
@@ -2320,6 +2377,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         .filter(Boolean),
       connections: parseInt($('#connections')?.value) || 8,
       maxActive: parseInt($('#maxActive')?.value) || 3,
+      maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
       retries: Number.isNaN(retries) ? 4 : retries,
       verify: $('#verify')?.value || 'size',
       endpoint: $('#endpoint')?.value || ''
@@ -2379,6 +2437,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     setVal('#hfToken', '');
     setVal('#connections', '8');
     setVal('#maxActive', '3');
+    setVal('#maxSpeed', '');
+    syncSpeedPresets();
     setVal('#retries', '4');
     setVal('#verify', 'size');
     setVal('#endpoint', '');

@@ -222,6 +222,19 @@ type Settings struct {
 	//   - With auth: &ProxyConfig{URL: "http://proxy:8080", Username: "user", Password: "pass"}
 	//   - Disable env proxy: &ProxyConfig{NoEnvProxy: true}
 	Proxy *ProxyConfig
+
+	// MaxSpeed caps the aggregate download throughput, as a human-readable
+	// bytes-per-second value: "2MB", "500KB", "1.5MiB", etc. Empty or "0"
+	// means unlimited. The cap is global across every file and connection in
+	// the download, so concurrent transfers share the budget instead of each
+	// getting the full rate.
+	MaxSpeed string
+
+	// SpeedLimiter, when non-nil, is the shared token-bucket used to pace
+	// downloads, taking precedence over MaxSpeed. The server sets this to a
+	// single process-wide limiter so the cap applies across all running jobs;
+	// library callers can leave it nil and just set MaxSpeed.
+	SpeedLimiter *RateLimiter
 }
 
 // ProgressEvent represents a progress update during download.
