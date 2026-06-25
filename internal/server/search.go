@@ -186,7 +186,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, m.ID, false); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
