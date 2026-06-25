@@ -2808,6 +2808,10 @@ a {
     padding: 24px 20px;
   }
 
+  .speed-bar {
+    padding: 12px 20px;
+  }
+
   .analyze-container,
   .jobs-list,
   .cache-list {

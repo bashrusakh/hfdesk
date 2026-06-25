@@ -2366,13 +2366,18 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       try {
         const data = await api('GET', '/settings');
         const mbit = maxSpeedToMbit(data.maxSpeed);
-        state.speedLimitLoaded = true;
         if ($('#maxSpeed')) $('#maxSpeed').value = mbit;
         if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
         syncPresetGroup('#speedPresets', '#maxSpeed');
         syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+        state.speedLimitLoaded = true;
         updateSpeedGauge();
-      } catch (_) { /* resync best-effort */ }
+      } catch (_) {
+        /* resync best-effort */
+        // Even if the revert GET fails, ensure the gauge is not stuck.
+        state.speedLimitLoaded = true;
+        updateSpeedGauge();
+      }
       return;
     }
     state.speedLimitLoaded = true;
@@ -2384,15 +2389,17 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   // loadSpeedCap fetches the current cap and fills the Downloads-tab control.
+  // Sets state.speedLimitLoaded regardless of fetch success so the gauge
+  // doesn't get stuck if settings are temporarily unreachable.
   async function loadSpeedCap() {
     try {
       const data = await api('GET', '/settings');
       const mbit = maxSpeedToMbit(data.maxSpeed);
-      state.speedLimitLoaded = true;
       if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
       syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
-      updateSpeedGauge();
     } catch (e) { /* non-fatal */ }
+    state.speedLimitLoaded = true;
+    updateSpeedGauge();
   }
 
   async function loadSettings() {
