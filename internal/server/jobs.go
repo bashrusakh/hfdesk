@@ -414,10 +414,18 @@ func (m *JobManager) ResumeJob(id string) bool {
 	}
 
 	job.Status = JobStatusQueued
-	// Reset progress - the downloader will re-scan and report all files.
-	// Already-downloaded files will be skipped during actual download but
-	// reported in plan.
+	// Reset progress totals — the downloader will re-scan the repo and
+	// emit fresh plan_item events that rebuild TotalFiles / TotalBytes.
+	// Preserve DownloadedBytes as an initial estimate so the UI doesn't
+	// jump from e.g. 60% to 0% while the scan runs. The downloader's
+	// file_progress and file_done events recompute DownloadedBytes from
+	// the live job.Files list as soon as files are processed (skipped
+	// blob → immediate file_done; partial → file_progress at the on-disk
+	// position from the .part file), so the estimate corrects itself
+	// within a second or two.
+	oldBytes := job.Progress.DownloadedBytes
 	job.Progress = JobProgress{}
+	job.Progress.DownloadedBytes = oldBytes
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
 	// Re-queue through the scheduler so resuming respects max-active.
