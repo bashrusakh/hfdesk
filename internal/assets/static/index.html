@@ -209,8 +209,11 @@
             <h1>Active Jobs</h1>
             <p class="page-subtitle">Monitor your downloads in real-time</p>
           </div>
-          <div class="jobs-speed" title="Total download speed cap across all jobs. Applies instantly.">
-            <span class="jobs-speed-label">Speed cap</span>
+        </header>
+
+        <div class="speed-bar" id="speedBar">
+          <div class="speed-bar-main">
+            <span class="speed-bar-label">Speed limit</span>
             <div class="speed-presets" id="speedPresetsJobs">
               <button type="button" class="speed-btn" data-mbit="2">2</button>
               <button type="button" class="speed-btn" data-mbit="4">4</button>
@@ -218,12 +221,19 @@
               <button type="button" class="speed-btn" data-mbit="10">10</button>
               <button type="button" class="speed-btn" data-mbit="0">&infin;</button>
             </div>
+            <div class="speed-bar-divider"></div>
             <div class="speed-field">
               <input type="number" id="maxSpeedJobs" min="0" step="0.5" placeholder="&infin;">
               <span class="speed-unit">Mbit/s</span>
             </div>
           </div>
-        </header>
+          <div class="speed-bar-aggregate">
+            <div class="speed-gauge-track">
+              <div class="speed-gauge-fill" id="speedGaugeFill"></div>
+            </div>
+            <span class="speed-gauge-text" id="speedGaugeText">0 / &infin; Mbit/s</span>
+          </div>
+        </div>
 
         <div id="jobsList" class="jobs-list">
           <div class="empty-state">
@@ -737,8 +747,8 @@
                     <input type="number" id="maxActive" value="3" min="1" max="10">
                   </div>
                 </div>
-                <div class="settings-row settings-row-top">
-                  <label for="maxSpeed" title="Total download speed cap across all files and connections. Pick a preset or type a value in megabits per second. Empty = unlimited.">Max speed</label>
+                <div class="settings-row">
+                  <label for="maxSpeed" title="Total download speed cap across all files and connections. Pick a preset or type a value. Empty = unlimited.">Max speed</label>
                   <div class="settings-control speed-control">
                     <div class="speed-presets" id="speedPresets">
                       <button type="button" class="speed-btn" data-mbit="2">2</button>
