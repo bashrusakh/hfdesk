@@ -2317,6 +2317,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       showToast(maxSpeed ? `Speed limit: ${mbitStr} Mbit/s` : 'Speed limit: unlimited', 'success');
     } catch (e) {
       showToast(`Failed to set speed: ${e.message}`, 'error');
+      // Revert both controls to server state so UI doesn't drift
+      try {
+        const data = await api('GET', '/settings');
+        const mbit = maxSpeedToMbit(data.maxSpeed);
+        if ($('#maxSpeed')) $('#maxSpeed').value = mbit;
+        if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
+        syncPresetGroup('#speedPresets', '#maxSpeed');
+        syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+      } catch (_) { /* resync best-effort */ }
       return;
     }
     if ($('#maxSpeed')) $('#maxSpeed').value = mbitStr;
