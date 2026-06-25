@@ -821,6 +821,11 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		}
 		// total drives the progress bar (includes skipped/already-present
 		// bytes); transferred drives the speed (only bytes moved this run).
+		// DownloadedBytes is treated as monotonic: right after resume the
+		// sum is taken over a freshly-rebuilt job.Files where only the one
+		// processed file has Downloaded > 0, so it would under-count and
+		// clobber the value ResumeJob preserved from the pre-pause state.
+		// The preserved value stays on screen until the sum catches up.
 		var total, transferred int64
 		for _, f := range job.Files {
 			total += f.Downloaded
@@ -828,7 +833,9 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				transferred += f.Downloaded - f.baseDownloaded
 			}
 		}
-		job.Progress.DownloadedBytes = total
+		if total > job.Progress.DownloadedBytes {
+			job.Progress.DownloadedBytes = total
+		}
 		updateJobSpeed(job, transferred, now)
 
 	case "file_finalizing":
@@ -869,11 +876,14 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		// Recalculate total downloaded (skipped/completed files included).
 		// Speed is intentionally not updated here: a skipped file emits only
 		// file_done, and counting its full size would spike the reading.
+		// DownloadedBytes is monotonic — see file_progress for the rationale.
 		var total int64
 		for _, f := range job.Files {
 			total += f.Downloaded
 		}
-		job.Progress.DownloadedBytes = total
+		if total > job.Progress.DownloadedBytes {
+			job.Progress.DownloadedBytes = total
+		}
 
 	case "finalizing":
 		// Download is done; post-processing (friendly view, manifest) runs.

@@ -196,6 +196,67 @@ func TestApplyJobProgress_FileFinalizingPhase(t *testing.T) {
 	}
 }
 
+// TestApplyJobProgress_DownloadedBytesMonotonic guards against the
+// regression where, on a paused/resumed job, the first file_done or
+// file_progress event after resume would recalculate DownloadedBytes
+// from a partially-populated job.Files list and overwrite the value
+// ResumeJob preserved from the pre-pause state. The preserved value is
+// the floor: it stays on screen until the sum of all file progress
+// catches up to it.
+func TestApplyJobProgress_DownloadedBytesMonotonic(t *testing.T) {
+	now := time.Now()
+
+	t.Run("file_done after resume does not drop the preserved total", func(t *testing.T) {
+		// 6000 of 10000 bytes were downloaded before pause; ResumeJob
+		// preserved DownloadedBytes=6000 and nilled job.Files. The
+		// downloader will now replay the plan and process files.
+		job := &Job{Progress: JobProgress{DownloadedBytes: 6000}}
+		apply := func(evt hfdownloader.ProgressEvent) {
+			applyJobProgress(job, evt, now)
+		}
+
+		apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "small.bin", Total: 100})
+		apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "big.bin", Total: 9900})
+		// First skipped file emits file_done: the recalculated sum is
+		// only 100 (other file still has Downloaded=0). Without the
+		// monotonic guard this would drop 6000 -> 100.
+		apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "small.bin"})
+		if got := job.Progress.DownloadedBytes; got != 6000 {
+			t.Fatalf("DownloadedBytes dropped after first file_done: got %d, want 6000", got)
+		}
+
+		// Once all files report done the sum catches up and growth
+		// resumes normally.
+		apply(hfdownloader.ProgressEvent{Event: "file_done", Path: "big.bin"})
+		if got := job.Progress.DownloadedBytes; got != 10000 {
+			t.Fatalf("DownloadedBytes after both file_done: got %d, want 10000", got)
+		}
+	})
+
+	t.Run("file_progress after resume does not drop the preserved total", func(t *testing.T) {
+		job := &Job{Progress: JobProgress{DownloadedBytes: 6000}}
+		apply := func(evt hfdownloader.ProgressEvent) {
+			applyJobProgress(job, evt, now)
+		}
+
+		apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "small.bin", Total: 100})
+		apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "partial.bin", Total: 5000})
+		// First progress for the partial file: 3000 on disk, the
+		// recalculated sum is just 3000 (small.bin still Downloaded=0).
+		apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "partial.bin", Downloaded: 3000})
+		if got := job.Progress.DownloadedBytes; got != 6000 {
+			t.Fatalf("DownloadedBytes dropped after first file_progress: got %d, want 6000", got)
+		}
+
+		// Once the partial file's progress exceeds the floor, total
+		// growth resumes from the new (larger) value.
+		apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "partial.bin", Downloaded: 7000})
+		if got := job.Progress.DownloadedBytes; got != 7000 {
+			t.Fatalf("DownloadedBytes after surpassing floor: got %d, want 7000", got)
+		}
+	})
+}
+
 func TestUpdateJobETA(t *testing.T) {
 	job := &Job{}
 	job.Progress.TotalBytes = 100_000_000
