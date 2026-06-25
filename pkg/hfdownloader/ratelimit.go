@@ -160,9 +160,6 @@ func (l *RateLimiter) WaitN(ctx context.Context, n int) error {
 }
 
 // removeWaiter removes ch from the waiters list if present. Called by a
-// WaitN caller when its ctx is cancelled so the list doesn't grow with
-// dangling channels.
-// removeWaiter removes ch from the waiters list if present. Called by a
 // WaitN caller when its ctx is cancelled (or its timer fires) so the
 // list doesn't grow with dangling channels.
 func (l *RateLimiter) removeWaiter(ch chan struct{}) {
