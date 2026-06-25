@@ -71,7 +71,8 @@ func PlanRepo(ctx context.Context, job Job, cfg Settings) (*Plan, error) {
 // scanRepo walks the repo tree and builds a download plan.
 func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings) (*Plan, error) {
 	var items []PlanItem
-	seen := make(map[string]struct{}) // ensure each relative path appears once in the plan
+	seen := make(map[string]struct{})      // ensure each relative path appears once in the plan
+	seenLower := make(map[string]struct{}) // ensure each path appears at most once modulo case
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
@@ -207,6 +208,18 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				sha = n.LFS.Oid
 			}
 		}
+
+		// Case-insensitive dedup: filterMatches is intentionally case-insensitive
+		// (q4_k_m matches Q4_K_M), so two files that differ only in case both
+		// pass the same filter and would otherwise both end up in the plan.
+		// Treat them as the same logical file and keep the first occurrence,
+		// matching what the HF API returns first. The exact-path dedup above
+		// doesn't catch this because the two paths differ only in case.
+		key := strings.ToLower(rel)
+		if _, dup := seenLower[key]; dup {
+			continue
+		}
+		seenLower[key] = struct{}{}
 
 		items = append(items, PlanItem{
 			RelativePath: rel,
