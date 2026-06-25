@@ -19,21 +19,21 @@ import (
 
 // SearchResult is one model returned by /api/search.
 type SearchResult struct {
-	ID           string    `json:"id"`
-	Author       string    `json:"author,omitempty"`
-	Downloads    int64     `json:"downloads"`
-	Likes        int       `json:"likes"`
-	TrendingScore float64  `json:"trendingScore,omitempty"`
-	Private      bool      `json:"private,omitempty"`
-	Gated        bool      `json:"gated,omitempty"`
-	PipelineTag  string    `json:"pipelineTag,omitempty"`
-	LibraryName  string    `json:"libraryName,omitempty"`
-	Tags         []string  `json:"tags,omitempty"`
-	LastModified time.Time `json:"lastModified,omitempty"`
-	CreatedAt    time.Time `json:"createdAt,omitempty"`
-	Cached       bool      `json:"cached,omitempty"`
-	CacheSource  string    `json:"cacheSource,omitempty"`
-	CacheStatus  string    `json:"cacheStatus,omitempty"`
+	ID            string    `json:"id"`
+	Author        string    `json:"author,omitempty"`
+	Downloads     int64     `json:"downloads"`
+	Likes         int       `json:"likes"`
+	TrendingScore float64   `json:"trendingScore,omitempty"`
+	Private       bool      `json:"private,omitempty"`
+	Gated         bool      `json:"gated,omitempty"`
+	PipelineTag   string    `json:"pipelineTag,omitempty"`
+	LibraryName   string    `json:"libraryName,omitempty"`
+	Tags          []string  `json:"tags,omitempty"`
+	LastModified  time.Time `json:"lastModified,omitempty"`
+	CreatedAt     time.Time `json:"createdAt,omitempty"`
+	Cached        bool      `json:"cached,omitempty"`
+	CacheSource   string    `json:"cacheSource,omitempty"`
+	CacheStatus   string    `json:"cacheStatus,omitempty"`
 }
 
 // SearchResponse wraps a list of results and metadata.
@@ -45,18 +45,18 @@ type SearchResponse struct {
 
 // hfAPIModel is the raw shape returned by huggingface.co/api/models.
 type hfAPIModel struct {
-	ID           string    `json:"id"`
-	Author       string    `json:"author"`
-	Downloads    int64     `json:"downloads"`
-	Likes        int       `json:"likes"`
-	TrendingScore float64  `json:"trendingScore"`
-	Private      bool      `json:"private"`
-	Gated        any       `json:"gated"` // bool or string ("auto","manual")
-	PipelineTag  string    `json:"pipeline_tag"`
-	LibraryName  string    `json:"library_name"`
-	Tags         []string  `json:"tags"`
-	LastModified time.Time `json:"lastModified"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID            string    `json:"id"`
+	Author        string    `json:"author"`
+	Downloads     int64     `json:"downloads"`
+	Likes         int       `json:"likes"`
+	TrendingScore float64   `json:"trendingScore"`
+	Private       bool      `json:"private"`
+	Gated         any       `json:"gated"` // bool or string ("auto","manual")
+	PipelineTag   string    `json:"pipeline_tag"`
+	LibraryName   string    `json:"library_name"`
+	Tags          []string  `json:"tags"`
+	LastModified  time.Time `json:"lastModified"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // handleSearch proxies model search to the HuggingFace Hub API.
@@ -88,7 +88,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	isDataset := strings.EqualFold(q.Get("datasets"), "true")
 
 	// Build HF API URL
-	endpoint := s.config.Endpoint
+	cfg := s.snapshotConfig()
+	endpoint := cfg.Endpoint
 	if endpoint == "" {
 		endpoint = "https://huggingface.co"
 	}
@@ -118,12 +119,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to build upstream request", err.Error())
 		return
 	}
-	if s.config.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+s.config.Token)
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
 	req.Header.Set("User-Agent", "hfdesk/1")
 
-	httpClient, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
+	httpClient, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
 		log.Printf("search: invalid proxy config: %v", err)
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
@@ -157,7 +158,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheDir := s.config.CacheDir
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -185,7 +186,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepo(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, m.ID, false); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
@@ -203,12 +204,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // handleDiskFree returns free/total disk space for a given path.
 // Query param: path (optional — defaults to LocalDir, CacheDir, or RunDir).
 func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig()
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		path = s.config.LocalDir
+		path = cfg.LocalDir
 	}
 	if path == "" {
-		path = s.config.CacheDir
+		path = cfg.CacheDir
 	}
 	// Match the effective download destination: local files first, then the HF
 	// cache. If CacheDir is unset, use the default HF cache location instead of

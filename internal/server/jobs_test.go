@@ -363,4 +363,3 @@ func TestJobStatus_Values(t *testing.T) {
 		}
 	}
 }
-

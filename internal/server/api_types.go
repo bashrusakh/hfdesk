@@ -54,8 +54,8 @@ type SettingsResponse struct {
 	Endpoint           string `json:"endpoint,omitempty"`
 	// StorageMode is "local" when the server writes real files into LocalDir,
 	// or "cache" when it uses the HF cache layout. Set at startup, read-only.
-	StorageMode string `json:"storageMode"`
-	LocalDir    string `json:"localDir,omitempty"`
+	StorageMode   string   `json:"storageMode"`
+	LocalDir      string   `json:"localDir,omitempty"`
 	LocalScanDirs []string `json:"localScanDirs,omitempty"`
 	// Proxy settings
 	Proxy *ProxySettingsResponse `json:"proxy,omitempty"`

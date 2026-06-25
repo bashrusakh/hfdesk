@@ -142,16 +142,21 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		AppendFilterSubdir: req.AppendFilterSubdir,
 	}
 
+	// Take a snapshot of the server config; every read below uses it
+	// instead of touching s.config directly to avoid racing a concurrent
+	// settings update.
+	cfg := s.snapshotConfig()
+
 	// Use server-configured output directory (not from request for security)
-	outputDir := s.config.ModelsDir
+	outputDir := cfg.ModelsDir
 	if req.Dataset {
-		outputDir = s.config.DatasetsDir
+		outputDir = cfg.DatasetsDir
 	}
 
 	settings := hfdownloader.Settings{
 		OutputDir: outputDir,
-		Token:     s.config.Token,
-		Endpoint:  s.config.Endpoint,
+		Token:     cfg.Token,
+		Endpoint:  cfg.Endpoint,
 	}
 
 	// Collect plan items
@@ -317,47 +322,49 @@ func (s *Server) handleDismissJob(w http.ResponseWriter, r *http.Request) {
 
 // handleGetSettings returns current settings.
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig()
+
 	// Don't expose full token, just indicate if set
 	tokenStatus := ""
-	if s.config.Token != "" {
-		tokenStatus = "********" + s.config.Token[max(0, len(s.config.Token)-4):]
+	if cfg.Token != "" {
+		tokenStatus = "********" + cfg.Token[max(0, len(cfg.Token)-4):]
 	}
 
-	cacheDir := s.config.CacheDir
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
 	storageMode := "cache"
-	if s.config.LocalDir != "" {
+	if cfg.LocalDir != "" {
 		storageMode = "local"
 	}
 
 	resp := SettingsResponse{
 		Token:              tokenStatus,
 		CacheDir:           cacheDir,
-		Concurrency:        s.config.Concurrency,
-		MaxActive:          s.config.MaxActive,
-		MultipartThreshold: s.config.MultipartThreshold,
-		MaxSpeed:           s.config.MaxSpeed,
-		Verify:             s.config.Verify,
-		Retries:            s.config.Retries,
-		Endpoint:           s.config.Endpoint,
+		Concurrency:        cfg.Concurrency,
+		MaxActive:          cfg.MaxActive,
+		MultipartThreshold: cfg.MultipartThreshold,
+		MaxSpeed:           cfg.MaxSpeed,
+		Verify:             cfg.Verify,
+		Retries:            cfg.Retries,
+		Endpoint:           cfg.Endpoint,
 		StorageMode:        storageMode,
-		LocalDir:           s.config.LocalDir,
-		LocalScanDirs:      s.config.LocalScanDirs,
+		LocalDir:           cfg.LocalDir,
+		LocalScanDirs:      cfg.LocalScanDirs,
 		ConfigFile:         ConfigPath(),
 		TargetsFile:        hfdownloader.DefaultTargetsPath(),
 	}
 
 	// Add proxy settings (without password for security)
-	if s.config.Proxy != nil && s.config.Proxy.URL != "" {
+	if cfg.Proxy != nil && cfg.Proxy.URL != "" {
 		resp.Proxy = &ProxySettingsResponse{
-			URL:                s.config.Proxy.URL,
-			Username:           s.config.Proxy.Username,
-			NoProxy:            s.config.Proxy.NoProxy,
-			NoEnvProxy:         s.config.Proxy.NoEnvProxy,
-			InsecureSkipVerify: s.config.Proxy.InsecureSkipVerify,
+			URL:                cfg.Proxy.URL,
+			Username:           cfg.Proxy.Username,
+			NoProxy:            cfg.Proxy.NoProxy,
+			NoEnvProxy:         cfg.Proxy.NoEnvProxy,
+			InsecureSkipVerify: cfg.Proxy.InsecureSkipVerify,
 		}
 	}
 
@@ -420,107 +427,130 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		newMaxSpeed = trimmed
 	}
 
-	// Phase 2: apply all updates. After this block we either commit
-	// everything to s.config and the file, or fail before doing so.
-	if req.Token != nil {
-		s.config.Token = *req.Token
-	}
-	if req.CacheDir != nil {
-		s.config.CacheDir = strings.TrimSpace(*req.CacheDir)
-	}
-	if req.LocalDir != nil {
-		s.config.LocalDir = strings.TrimSpace(*req.LocalDir)
-	}
-	if req.LocalScanDirs != nil {
-		s.config.LocalScanDirs = cleanPathList(req.LocalScanDirs)
-	}
-	if req.Concurrency != nil && *req.Concurrency > 0 {
-		s.config.Concurrency = *req.Concurrency
-	}
-	if req.MaxActive != nil && *req.MaxActive > 0 {
-		s.config.MaxActive = *req.MaxActive
-	}
-	if newMultipartThreshold != "" {
-		s.config.MultipartThreshold = newMultipartThreshold
-	}
-	if req.MaxSpeed != nil {
-		s.config.MaxSpeed = newMaxSpeed
-	}
-	if req.Verify != nil && *req.Verify != "" {
-		s.config.Verify = *req.Verify
-	}
-	if req.Retries != nil && *req.Retries >= 0 {
-		s.config.Retries = *req.Retries
-	}
-	if req.Endpoint != nil {
-		s.config.Endpoint = *req.Endpoint
-	}
+	// Phase 2: build the new config on a local copy under withConfig (which
+	// takes the write lock for the whole mutation, so a concurrent read sees
+	// either the pre- or post-state, never a torn mix). The lock is released
+	// before we touch the job manager or the file, so the critical section
+	// stays short. myGen is the generation we just produced; the side
+	// effects below drop themselves if a newer commit landed in between.
+	_, myGen := s.withConfig(func(c *Config) {
+		if req.Token != nil {
+			c.Token = *req.Token
+		}
+		if req.CacheDir != nil {
+			c.CacheDir = strings.TrimSpace(*req.CacheDir)
+		}
+		if req.LocalDir != nil {
+			c.LocalDir = strings.TrimSpace(*req.LocalDir)
+		}
+		if req.LocalScanDirs != nil {
+			c.LocalScanDirs = cleanPathList(req.LocalScanDirs)
+		}
+		if req.Concurrency != nil && *req.Concurrency > 0 {
+			c.Concurrency = *req.Concurrency
+		}
+		if req.MaxActive != nil && *req.MaxActive > 0 {
+			c.MaxActive = *req.MaxActive
+		}
+		if newMultipartThreshold != "" {
+			c.MultipartThreshold = newMultipartThreshold
+		}
+		if req.MaxSpeed != nil {
+			c.MaxSpeed = newMaxSpeed
+		}
+		if req.Verify != nil && *req.Verify != "" {
+			c.Verify = *req.Verify
+		}
+		if req.Retries != nil && *req.Retries >= 0 {
+			c.Retries = *req.Retries
+		}
+		if req.Endpoint != nil {
+			c.Endpoint = *req.Endpoint
+		}
 
-	// Update proxy settings. Build a fresh ProxyConfig (copy-on-write) instead of
-	// mutating the existing struct in place: the current *ProxyConfig pointer is
-	// shared with the JobManager's config and any in-flight job runner reading it
-	// (snapshotConfig copies the pointer, not the struct), so an in-place write
-	// would be a data race on the pointed-to struct. Replacing the pointer leaves
-	// the old struct immutable for existing readers.
-	if req.Proxy != nil {
-		var newProxy hfdownloader.ProxyConfig
-		if s.config.Proxy != nil {
-			newProxy = *s.config.Proxy
+		// Update proxy settings. Build a fresh ProxyConfig (copy-on-write)
+		// rather than mutating the existing struct in place: the current
+		// *ProxyConfig pointer is shared with the JobManager's config and
+		// any in-flight job runner reading it, so an in-place write would
+		// race with them. Replacing the pointer leaves the old struct
+		// immutable for existing readers.
+		if req.Proxy != nil {
+			var newProxy hfdownloader.ProxyConfig
+			if c.Proxy != nil {
+				newProxy = *c.Proxy
+			}
+			if req.Proxy.URL != nil {
+				newProxy.URL = *req.Proxy.URL
+			}
+			if req.Proxy.Username != nil {
+				newProxy.Username = *req.Proxy.Username
+			}
+			if req.Proxy.Password != nil {
+				newProxy.Password = *req.Proxy.Password
+			}
+			if req.Proxy.NoProxy != nil {
+				newProxy.NoProxy = *req.Proxy.NoProxy
+			}
+			if req.Proxy.NoEnvProxy != nil {
+				newProxy.NoEnvProxy = *req.Proxy.NoEnvProxy
+			}
+			if req.Proxy.InsecureSkipVerify != nil {
+				newProxy.InsecureSkipVerify = *req.Proxy.InsecureSkipVerify
+			}
+			// Clear proxy if URL is empty, otherwise swap in the new struct.
+			if newProxy.URL == "" {
+				c.Proxy = nil
+			} else {
+				c.Proxy = &newProxy
+			}
 		}
-		if req.Proxy.URL != nil {
-			newProxy.URL = *req.Proxy.URL
-		}
-		if req.Proxy.Username != nil {
-			newProxy.Username = *req.Proxy.Username
-		}
-		if req.Proxy.Password != nil {
-			newProxy.Password = *req.Proxy.Password
-		}
-		if req.Proxy.NoProxy != nil {
-			newProxy.NoProxy = *req.Proxy.NoProxy
-		}
-		if req.Proxy.NoEnvProxy != nil {
-			newProxy.NoEnvProxy = *req.Proxy.NoEnvProxy
-		}
-		if req.Proxy.InsecureSkipVerify != nil {
-			newProxy.InsecureSkipVerify = *req.Proxy.InsecureSkipVerify
-		}
-		// Clear proxy if URL is empty, otherwise swap in the new struct.
-		if newProxy.URL == "" {
-			s.config.Proxy = nil
-		} else {
-			s.config.Proxy = &newProxy
-		}
+	})
+
+	// Side effects (job-manager update + file persistence) are serialized
+	// under persistMu, and the generation is re-checked *after* acquiring it.
+	// That ordering guarantees the snapshot sees every earlier commit, so
+	// only the writer whose generation is still current persists; an older
+	// writer drops its side effects instead of rolling state back.
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	finalCfg, currentGen := s.snapshotConfigWithGen()
+	if currentGen != myGen {
+		writeJSON(w, http.StatusOK, SuccessResponse{
+			Success: true,
+			Message: "Settings updated (a newer update was applied concurrently; this request's job-manager and file persistence were skipped to preserve the latest state)",
+		})
+		return
 	}
 
 	// Also update job manager config. UpdateConfig takes the manager lock and
 	// re-runs the scheduler, so a raised max-active starts queued jobs now.
-	s.jobs.UpdateConfig(s.config)
+	s.jobs.UpdateConfig(finalCfg)
 
 	// Persist settings to config file
-	retries := s.config.Retries
+	retries := finalCfg.Retries
 	fileCfg := &ConfigFile{
-		CacheDir:           s.config.CacheDir,
-		LocalDir:           s.config.LocalDir,
-		LocalScanDirs:      s.config.LocalScanDirs,
-		Token:              s.config.Token,
-		Connections:        s.config.Concurrency,
-		MaxActive:          s.config.MaxActive,
-		MultipartThreshold: s.config.MultipartThreshold,
-		MaxSpeed:           s.config.MaxSpeed,
-		Verify:             s.config.Verify,
+		CacheDir:           finalCfg.CacheDir,
+		LocalDir:           finalCfg.LocalDir,
+		LocalScanDirs:      finalCfg.LocalScanDirs,
+		Token:              finalCfg.Token,
+		Connections:        finalCfg.Concurrency,
+		MaxActive:          finalCfg.MaxActive,
+		MultipartThreshold: finalCfg.MultipartThreshold,
+		MaxSpeed:           finalCfg.MaxSpeed,
+		Verify:             finalCfg.Verify,
 		Retries:            &retries,
-		Endpoint:           s.config.Endpoint,
+		Endpoint:           finalCfg.Endpoint,
 	}
 	// Add proxy to config file if set
-	if s.config.Proxy != nil {
+	if finalCfg.Proxy != nil {
 		fileCfg.Proxy = &ProxyConfig{
-			URL:                s.config.Proxy.URL,
-			Username:           s.config.Proxy.Username,
-			Password:           s.config.Proxy.Password,
-			NoProxy:            s.config.Proxy.NoProxy,
-			NoEnvProxy:         s.config.Proxy.NoEnvProxy,
-			InsecureSkipVerify: s.config.Proxy.InsecureSkipVerify,
+			URL:                finalCfg.Proxy.URL,
+			Username:           finalCfg.Proxy.Username,
+			Password:           finalCfg.Proxy.Password,
+			NoProxy:            finalCfg.Proxy.NoProxy,
+			NoEnvProxy:         finalCfg.Proxy.NoEnvProxy,
+			InsecureSkipVerify: finalCfg.Proxy.InsecureSkipVerify,
 		}
 	}
 	if err := SaveConfigFile(fileCfg); err != nil {
@@ -559,9 +589,10 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create analyzer
+	cfg := s.snapshotConfig()
 	opts := smartdl.AnalyzerOptions{
-		Token:    s.config.Token,
-		Endpoint: s.config.Endpoint,
+		Token:    cfg.Token,
+		Endpoint: cfg.Endpoint,
 	}
 	analyzer := smartdl.NewAnalyzer(opts)
 
@@ -601,7 +632,8 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	}
 	isDataset := strings.EqualFold(r.URL.Query().Get("dataset"), "true")
 
-	endpoint := strings.TrimRight(s.config.Endpoint, "/")
+	cfg := s.snapshotConfig()
+	endpoint := strings.TrimRight(cfg.Endpoint, "/")
 	if endpoint == "" {
 		endpoint = "https://huggingface.co"
 	}
@@ -610,7 +642,7 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 		prefix = "datasets/"
 	}
 
-	client, err := hfdownloader.BuildHTTPClient(s.config.Proxy)
+	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
@@ -624,8 +656,8 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		if s.config.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+s.config.Token)
+		if cfg.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.Token)
 		}
 		req.Header.Set("User-Agent", "hfdesk/1")
 
@@ -644,7 +676,7 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 				"path":       name,
 				"markdown":   string(body),
 				"baseRawURL": baseRaw,
-				"html":       renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointHost(s.config.Endpoint)),
+				"html":       renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointHost(cfg.Endpoint)),
 			})
 			return
 		}
@@ -709,12 +741,19 @@ type CacheStats struct {
 	TotalFiles     int    `json:"totalFiles"`
 }
 
+// localCacheRoot describes a single directory to scan for cached
+// repos, with the Source label to display in the UI and a flag for
+// whether to skip the HF-cache special subdirectories (hub, blobs,
+// etc.) that aren't user-visible repos.
 type localCacheRoot struct {
 	Path        string
 	Source      string
 	SkipSpecial bool
 }
 
+// cleanPathList trims whitespace, filepath.Cleans each path, drops
+// empties, and de-duplicates case-insensitively. Used to normalize
+// the user-supplied LocalScanDirs list before it lands in s.config.
 func cleanPathList(paths []string) []string {
 	var cleaned []string
 	seen := make(map[string]bool)
@@ -734,6 +773,11 @@ func cleanPathList(paths []string) []string {
 	return cleaned
 }
 
+// localCacheRoots builds the list of directories to scan for cached
+// repos: the Friendly-view <cache>/models tree, the user-supplied
+// localDir, the user-supplied localScanDirs, and the raw cache dir
+// (with SkipSpecial because its hub/blobs layout is internal). The
+// returned slice is deduped by absolute path.
 func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
 	var roots []localCacheRoot
 	seen := make(map[string]bool)
@@ -762,6 +806,10 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localC
 	return roots
 }
 
+// hasLocalWeightFile reports whether dir (or any subdirectory) contains
+// at least one .gguf or .safetensors file. Used to decide whether an
+// owner/name folder under a cache root is a real repo worth listing
+// vs. an unrelated directory.
 func hasLocalWeightFile(dir string) bool {
 	found := false
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -777,8 +825,17 @@ func hasLocalWeightFile(dir string) bool {
 	return found
 }
 
+// cacheQuantPattern matches a GGUF quantisation token inside a filename
+// (e.g. "Q4_K_M", "UD_Q6_K", "BF16", "APEX-BALANCED"). The optional
+// "UD[-_]" prefix is captured separately so the result can be
+// returned as "UD_Q4_K" rather than "UD_ Q4_K" or similar. The
+// pattern is case-insensitive.
 var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
 
+// cacheQuantLabel extracts the quantisation token from a GGUF filename
+// (e.g. "Q4_K_M" from "model-Q4_K_M.gguf") and returns it in a
+// canonical, dash-free uppercase form ("Q4_K_M", or "UD_Q4_K_M" for
+// un-distilled variants). Returns "" if no quant token is present.
 func cacheQuantLabel(name string) string {
 	if m := cacheQuantPattern.FindStringSubmatch(strings.ToUpper(name)); len(m) >= 3 {
 		quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
@@ -790,11 +847,19 @@ func cacheQuantLabel(name string) string {
 	return ""
 }
 
+// isCacheMMProjFile reports whether a GGUF filename looks like an
+// mmproj companion (clip/projector for multimodal models). Detected
+// by an "mmproj" prefix or a "-mmproj" substring in the basename.
 func isCacheMMProjFile(name string) bool {
 	base := strings.ToLower(filepath.Base(name))
 	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
 }
 
+// cacheGGUFMetadata summarises the GGUF content of a cached repo:
+// the set of distinct quantisation labels, whether any mmproj
+// companion file is present, the relative paths of those companions
+// (when includeMMProjFiles is true), and any inferred capabilities
+// (e.g. "vision" for multimodal).
 type cacheGGUFMetadata struct {
 	Quantizations []string
 	HasMMProj     bool
@@ -802,6 +867,10 @@ type cacheGGUFMetadata struct {
 	Capabilities  []string
 }
 
+// collectCacheGGUFMetadata walks dir and gathers the GGUF quantisation
+// summary (distinct labels, mmproj presence, capabilities) for the
+// repo rooted there. When includeMMProjFiles is true, the relative
+// paths of mmproj companions are also recorded.
 func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMetadata {
 	seen := make(map[string]bool)
 	meta := cacheGGUFMetadata{}
@@ -834,6 +903,12 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMeta
 	return meta
 }
 
+// buildLocalCacheRepo builds a CachedRepoInfo for a single owner/name
+// folder under a local cache root. It walks the directory, computes
+// total size / file count, gathers GGUF metadata, and (when
+// includeFiles is true) enumerates the files. The source label
+// (e.g. "HF cache", "Friendly view", "Local") is propagated to the
+// result so the UI can group repos by origin.
 func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
 	var totalSize int64
 	var fileCount int
@@ -901,6 +976,11 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	}, nil
 }
 
+// scanLocalCachedRepos walks every local cache root (Friendly view,
+// localDir, localScanDirs, raw cache) and returns the list of
+// discovered repos. When includeFiles is true, each result includes
+// the per-file list. Repos that look like HF-cache internals
+// (hub/blobs/snapshots/refs) are skipped.
 func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
@@ -947,6 +1027,10 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 	return repos, nil
 }
 
+// findLocalCachedRepo resolves a single owner/name repo across every
+// local cache root and returns its CachedRepoInfo. Returns
+// os.ErrNotExist if the repo is not present in any root. The
+// includeFiles flag controls whether the per-file list is filled in.
 func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	parts := strings.SplitN(repoID, "/", 2)
 	if len(parts) != 2 {
@@ -964,7 +1048,8 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repo
 
 // handleCacheList lists all cached repositories with rich metadata.
 func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -1112,7 +1197,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
 	}
 
-	localRepos, _ := scanLocalCachedRepos(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, false)
+	localRepos, _ := scanLocalCachedRepos(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, false)
 	for _, repo := range localRepos {
 		if repoType != "" && repoType != repo.Type {
 			continue
@@ -1153,7 +1238,8 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -1172,7 +1258,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
-			localRepo, localErr := findLocalCachedRepo(cacheDir, s.config.LocalDir, s.config.LocalScanDirs, repo, true)
+			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, repo, true)
 			if localErr == nil {
 				writeJSON(w, http.StatusOK, localRepo)
 				return
@@ -1326,7 +1412,8 @@ type RebuildResponse struct {
 
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -1418,7 +1505,8 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		repoType = hfdownloader.RepoTypeDataset
 	}
 
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}

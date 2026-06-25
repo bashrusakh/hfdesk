@@ -187,7 +187,8 @@ func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 	targetPath := targetsCfg.ResolvePath(req.Target)
 
 	// Local cache
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -294,12 +295,12 @@ func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 		"localPath":  cacheDir,
 		"targetPath": targetPath,
 		"summary": map[string]any{
-			"missing":       missingCount,
+			"missing":          missingCount,
 			"missingSizeHuman": humanSizeBytes(missingSize),
-			"extra":         extraCount,
+			"extra":            extraCount,
 			"extraSizeHuman":   humanSizeBytes(extraSize),
-			"outdated":      outdatedCount,
-			"inSync":        len(diffs) == 0,
+			"outdated":         outdatedCount,
+			"inSync":           len(diffs) == 0,
 		},
 	})
 }
@@ -336,7 +337,8 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 	targetPath := targetsCfg.ResolvePath(req.Target)
 
 	// Local cache
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -372,7 +374,8 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 	targetPath := targetsCfg.ResolvePath(req.Target)
 
 	// Local cache
-	cacheDir := s.config.CacheDir
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -464,17 +467,17 @@ func scanCacheForMirror(cacheDir string) ([]mirrorEntry, error) {
 
 // MirrorSyncResult represents the result of a sync operation.
 type MirrorSyncResult struct {
-	Success     bool     `json:"success"`
-	DryRun      bool     `json:"dryRun"`
-	Copied      int      `json:"copied"`
-	CopiedSize  int64    `json:"copiedSize"`
-	CopiedSizeHuman string `json:"copiedSizeHuman"`
-	Deleted     int      `json:"deleted"`
-	DeletedSize int64    `json:"deletedSize"`
-	DeletedSizeHuman string `json:"deletedSizeHuman"`
-	Repos       []string `json:"repos,omitempty"`
-	Errors      []string `json:"errors,omitempty"`
-	Message     string   `json:"message"`
+	Success          bool     `json:"success"`
+	DryRun           bool     `json:"dryRun"`
+	Copied           int      `json:"copied"`
+	CopiedSize       int64    `json:"copiedSize"`
+	CopiedSizeHuman  string   `json:"copiedSizeHuman"`
+	Deleted          int      `json:"deleted"`
+	DeletedSize      int64    `json:"deletedSize"`
+	DeletedSizeHuman string   `json:"deletedSizeHuman"`
+	Repos            []string `json:"repos,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
+	Message          string   `json:"message"`
 }
 
 // mirrorSync copies repos from source to destination.
@@ -723,6 +726,9 @@ func compareRepoIntegrity(srcPath, dstPath string) (needsUpdate bool, reason str
 	return false, ""
 }
 
+// countBlobs returns the number of regular files under a repo's blobs
+// directory. Used for mirror diffs where the blob count is a cheap
+// proxy for size.
 func countBlobs(repoPath string) int {
 	blobsDir := filepath.Join(repoPath, "blobs")
 	count := 0

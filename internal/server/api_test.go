@@ -6,10 +6,13 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sync"
 	"testing"
 )
 
@@ -859,5 +862,160 @@ func TestIsValidRepoComponent(t *testing.T) {
 				t.Errorf("isValidRepoComponent(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAPI_ConcurrentSettingsAccess stresses the new s.configMu by racing
+// concurrent UpdateSettings writers against handleGetSettings, handleCacheList
+// and other read paths. Run with `go test -race` to catch any lock the
+// refactor missed: the test is meaningless without the race detector.
+func TestAPI_ConcurrentSettingsAccess(t *testing.T) {
+	srv := newTestServer()
+
+	const writers = 4
+	const readers = 8
+	const iterations = 50
+
+	var wg sync.WaitGroup
+
+	// Writers: cycle through POST /api/settings with varying fields.
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				body := fmt.Sprintf(`{"connections": %d, "maxActive": %d, "maxSpeed": "%dKB"}`,
+					(id+1)*4, (id+1)*2, 256+(id*64)+(j%4)*32)
+				req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				srv.handleUpdateSettings(w, req)
+				if w.Code != http.StatusOK {
+					t.Errorf("writer %d iter %d: status = %d", id, j, w.Code)
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Readers: hit every read handler that touches s.config.
+	readHandlers := []func(http.ResponseWriter, *http.Request){
+		func(w http.ResponseWriter, r *http.Request) { srv.handleGetSettings(w, r) },
+		func(w http.ResponseWriter, r *http.Request) { srv.handleCacheList(w, r) },
+		func(w http.ResponseWriter, r *http.Request) { srv.handleDiskFree(w, r) },
+		func(w http.ResponseWriter, r *http.Request) {
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+			srv.corsMiddleware(inner).ServeHTTP(w, r)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+			srv.basicAuthMiddleware(inner).ServeHTTP(w, r)
+		},
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			h := readHandlers[id%len(readHandlers)]
+			for j := 0; j < iterations; j++ {
+				w := httptest.NewRecorder()
+				h(w, httptest.NewRequest("GET", "/", nil))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// TestAPI_UpdateSettings_DropsStalePostLockSideEffects guards the
+// generation-counter fix: when two handleUpdateSettings calls commit
+// back-to-back, the loser's post-lock side effects (UpdateConfig and
+// SaveConfigFile) must be dropped so the job manager and the persisted
+// file are not rolled back to the loser's older snapshot.
+func TestAPI_UpdateSettings_DropsStalePostLockSideEffects(t *testing.T) {
+	srv := newTestServer()
+
+	srv.config.MaxSpeed = "0"
+
+	var wg sync.WaitGroup
+	const writers = 4
+	results := make([]int, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"maxSpeed": "%dMB"}`, (id+1)*10)
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+			results[id] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	wantPattern := regexp.MustCompile(`^(10|20|30|40)MB$`)
+	cfg := srv.snapshotConfig()
+	if !wantPattern.MatchString(cfg.MaxSpeed) {
+		t.Errorf("srv.config.MaxSpeed = %q; want one of the writers' values", cfg.MaxSpeed)
+	}
+	// Job manager must converge on the same committed value — it must
+	// NOT have been rolled back by a stale post-lock side effect.
+	if srv.jobs.snapshotConfig().MaxSpeed != cfg.MaxSpeed {
+		t.Errorf("srv.jobs.config.MaxSpeed = %q; want committed %q", srv.jobs.snapshotConfig().MaxSpeed, cfg.MaxSpeed)
+	}
+	for i, code := range results {
+		if code != http.StatusOK {
+			t.Errorf("writer %d: status = %d, want 200", i, code)
+		}
+	}
+}
+
+// TestAPI_UpdateSettings_PersistedFileMatchesLatest guards the persistMu fix:
+// concurrent POST /api/settings writers must leave the persisted config file
+// in a state consistent with the authoritative in-memory config. Before the
+// fix, two concurrent writes could interleave so that the older writer's
+// SaveConfigFile executed after the newer writer's, rolling the file back.
+func TestAPI_UpdateSettings_PersistedFileMatchesLatest(t *testing.T) {
+	// Keep this test isolated from the caller's real config file.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfgPath := ConfigPath()
+	_ = os.Remove(cfgPath)
+
+	srv := newTestServer()
+	const writers = 4
+	var wg sync.WaitGroup
+
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"maxSpeed": "%dMB"}`, (id+1)*10)
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+		}(i)
+	}
+	wg.Wait()
+
+	// Read the config file through the same path the server uses.
+	fileCfg, err := LoadConfigFile()
+	if err != nil {
+		t.Fatalf("failed to load config file: %v", err)
+	}
+
+	// The file's MaxSpeed must match the authoritative in-memory config.
+	if fileCfg.MaxSpeed != srv.config.MaxSpeed {
+		t.Errorf("config file MaxSpeed = %q, want %q (in-memory)", fileCfg.MaxSpeed, srv.config.MaxSpeed)
+	}
+
+	// Both must be one of the writers' values.
+	wantPattern := regexp.MustCompile(`^(10|20|30|40)MB$`)
+	if !wantPattern.MatchString(srv.config.MaxSpeed) {
+		t.Errorf("srv.config.MaxSpeed = %q; want one of the writers' values", srv.config.MaxSpeed)
+	}
+	if !wantPattern.MatchString(fileCfg.MaxSpeed) {
+		t.Errorf("config file MaxSpeed = %q; want one of the writers' values", fileCfg.MaxSpeed)
 	}
 }

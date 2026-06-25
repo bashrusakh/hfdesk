@@ -36,7 +36,8 @@ func (s *Server) isAllowedWSOrigin(r *http.Request) bool {
 	if u, err := url.Parse(origin); err == nil && u.Host != "" && u.Host == r.Host {
 		return true
 	}
-	for _, o := range s.config.AllowedOrigins {
+	cfg := s.snapshotConfig()
+	for _, o := range cfg.AllowedOrigins {
 		if o == "*" || o == origin {
 			return true
 		}
@@ -119,7 +120,7 @@ func (h *WSHub) Broadcast(msgType string, data any) {
 		Type: msgType,
 		Data: data,
 	}
-	
+
 	jsonData, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("[WS] Failed to marshal message: %v", err)
@@ -182,7 +183,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // sendInitialState sends current job state to newly connected client.
 func (s *Server) sendInitialState(client *WSClient) {
 	jobs := s.jobs.ListJobs()
-	
+
 	msg := WSMessage{
 		Type: "init",
 		Data: map[string]any{
@@ -190,7 +191,7 @@ func (s *Server) sendInitialState(client *WSClient) {
 			"version": "1.0.1",
 		},
 	}
-	
+
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
