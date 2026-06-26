@@ -608,7 +608,11 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		return err
 	}
 
-	dstPath := filepath.Join(dstCache, relPath)
+	// Guard: dstPath must remain inside dstCache (no ../ traversal via relPath).
+	dstPath, err := hfdownloader.SafeJoin(dstCache, relPath)
+	if err != nil {
+		return fmt.Errorf("path traversal: repo %q would escape destination cache: %w", relPath, err)
+	}
 
 	// Create destination directory
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
@@ -636,6 +640,15 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			link, err := os.Readlink(path)
 			if err != nil {
 				return err
+			}
+			// Reject absolute symlinks — they would point outside the cache.
+			if filepath.IsAbs(link) {
+				return fmt.Errorf("refusing absolute symlink %s -> %s", path, link)
+			}
+			// Reject symlinks whose resolved target escapes the source repo root.
+			resolved := filepath.Join(filepath.Dir(path), link)
+			if !hfdownloader.PathInside(repoPath, resolved) {
+				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
 			os.Remove(dst)
 			return os.Symlink(link, dst)

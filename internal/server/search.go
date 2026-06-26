@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -202,24 +203,37 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDiskFree returns free/total disk space for a given path.
-// Query param: path (optional — defaults to LocalDir, CacheDir, or RunDir).
+// The path is always derived from server configuration — the "path" query
+// param is accepted for UI compatibility but is validated against configured
+// directories to prevent arbitrary filesystem stat via the API.
 func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		path = cfg.LocalDir
-	}
-	if path == "" {
-		path = cfg.CacheDir
-	}
-	// Match the effective download destination: local files first, then the HF
-	// cache. If CacheDir is unset, use the default HF cache location instead of
-	// the run directory so the indicator does not report the exe's drive.
-	if path == "" {
-		path = hfdownloader.DefaultCacheDir()
-	}
-	if path == "" {
-		path = RunDir()
+
+	// Build the ordered list of configured candidate paths.
+	configured := []string{cfg.LocalDir, cfg.CacheDir, hfdownloader.DefaultCacheDir(), RunDir()}
+
+	// If the caller provides an explicit path, only honour it when it matches
+	// one of the configured directories (prevents arbitrary fs-stat via the API).
+	var path string
+	if requested := r.URL.Query().Get("path"); requested != "" {
+		for _, c := range configured {
+			if c != "" && filepath.Clean(requested) == filepath.Clean(c) {
+				path = c
+				break
+			}
+		}
+		if path == "" {
+			writeError(w, http.StatusBadRequest, "Invalid path", "path must be one of the configured directories")
+			return
+		}
+	} else {
+		// No explicit path: fall back to the first non-empty configured directory.
+		for _, c := range configured {
+			if c != "" {
+				path = c
+				break
+			}
+		}
 	}
 	free, total, err := diskFreeBytes(path)
 	if err != nil {

@@ -578,6 +578,10 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/analyze/owner/name")
 		return
 	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
 
 	// Check if it's a dataset (explicit selection)
 	isDataset := r.URL.Query().Get("dataset") == "true"
@@ -624,6 +628,10 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	repo := r.PathValue("repo")
 	if repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/readme/owner/name")
+		return
+	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
 	revision := r.URL.Query().Get("revision")
@@ -1237,6 +1245,10 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/cache/owner/name")
 		return
 	}
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
 
 	cfg := s.snapshotConfig()
 	cacheDir := cfg.CacheDir
@@ -1279,7 +1291,11 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	// If we have snapshots, walk the latest one to get file names
 	if len(snapshots) > 0 {
 		// Use the first snapshot (usually the most recent)
-		snapshotDir := repoDir.SnapshotDir(snapshots[0])
+		snapshotDir, sderr := repoDir.SnapshotDir(snapshots[0])
+		if sderr != nil {
+			writeError(w, http.StatusBadRequest, "Invalid snapshot", sderr.Error())
+			return
+		}
 		filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() {
 				return nil

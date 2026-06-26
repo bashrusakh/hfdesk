@@ -208,14 +208,14 @@ func TestRepoDir_Paths(t *testing.T) {
 	t.Run("ref and snapshot paths", func(t *testing.T) {
 		repo, _ := cache.Repo("owner/name", RepoTypeModel)
 
-		if repo.RefPath("main") != "/root/hub/models--owner--name/refs/main" {
-			t.Errorf("RefPath() = %q", repo.RefPath("main"))
+		if rp, err := repo.RefPath("main"); err != nil || rp != "/root/hub/models--owner--name/refs/main" {
+			t.Errorf("RefPath() = %q, err=%v", rp, err)
 		}
-		if repo.SnapshotDir("commit123") != "/root/hub/models--owner--name/snapshots/commit123" {
-			t.Errorf("SnapshotDir() = %q", repo.SnapshotDir("commit123"))
+		if sd, err := repo.SnapshotDir("commit123"); err != nil || sd != "/root/hub/models--owner--name/snapshots/commit123" {
+			t.Errorf("SnapshotDir() = %q, err=%v", sd, err)
 		}
-		if repo.SnapshotPath("commit123", "config.json") != "/root/hub/models--owner--name/snapshots/commit123/config.json" {
-			t.Errorf("SnapshotPath() = %q", repo.SnapshotPath("commit123", "config.json"))
+		if sp, err := repo.SnapshotPath("commit123", "config.json"); err != nil || sp != "/root/hub/models--owner--name/snapshots/commit123/config.json" {
+			t.Errorf("SnapshotPath() = %q, err=%v", sp, err)
 		}
 	})
 }
@@ -467,8 +467,10 @@ func TestRepoDir_ListSnapshots(t *testing.T) {
 
 	t.Run("with snapshots", func(t *testing.T) {
 		// Create some snapshot directories
-		os.MkdirAll(repo.SnapshotDir("commit1"), 0755)
-		os.MkdirAll(repo.SnapshotDir("commit2"), 0755)
+		sd1, _ := repo.SnapshotDir("commit1")
+		sd2, _ := repo.SnapshotDir("commit2")
+		os.MkdirAll(sd1, 0755)
+		os.MkdirAll(sd2, 0755)
 
 		snapshots, err := repo.ListSnapshots()
 		if err != nil {
