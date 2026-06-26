@@ -370,6 +370,8 @@ func (m *JobManager) CancelJob(id string) bool {
 		return false
 	}
 
+	wasPaused := job.Status == JobStatusPaused
+
 	if job.cancel != nil {
 		job.cancel()
 	}
@@ -378,6 +380,14 @@ func (m *JobManager) CancelJob(id string) bool {
 	job.EndedAt = &now
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+
+	// If the job was paused, the download goroutine has already exited and
+	// won't run its cleanup callback. Clean up partial .part files here so
+	// pause → cancel does not leak disk space. Direct-cancel jobs are
+	// already handled by the in-flight callback in runJob.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(job)
+	}
 
 	m.notifyListeners(snapshot)
 	go m.saveState()
@@ -557,16 +567,29 @@ func (m *JobManager) DismissJob(id string) bool {
 // reason a dismissal failed, for use by the HTTP handler.
 func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	job, ok := m.jobs[id]
 	if !ok {
+		m.mu.Unlock()
 		return DismissJobNotFound, nil
 	}
 	if !isTerminalJobStatus(job.Status) {
+		m.mu.Unlock()
 		return DismissJobStillActive, job
 	}
+	wasPaused := job.Status == JobStatusPaused
+	snapshot := m.cloneJobLocked(job)
 	delete(m.jobs, id)
-	return DismissJobOK, job
+	m.mu.Unlock()
+
+	// A dismissed paused job is a pure data-loss event: the runJob goroutine
+	// has already exited, so no in-flight cleanup will run, and the user
+	// can't resume a job that's no longer in the map. Remove partial
+	// files now so they don't pile up across many dismissed jobs.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(snapshot)
+	}
+
+	return DismissJobOK, snapshot
 }
 
 // Subscribe adds a listener for job updates.
@@ -1059,5 +1082,36 @@ func (m *JobManager) runJob(job *Job) {
 				log.Printf("warning: could not append history: %v", err)
 			}
 		}()
+	}
+}
+
+// cleanupPausedJobPartFiles removes partial .part files for a job whose
+// runJob goroutine has already exited (paused jobs whose downloader
+// goroutine returned without doing cleanup). The downloader's in-flight
+// cleanup callback cannot reach these files because the goroutine is
+// gone, so the server performs the cleanup itself using the same path
+// resolution the downloader would have used.
+//
+// Used by CancelJob (pause → cancel) and DismissJobResult (pause →
+// dismiss). All errors are best-effort: missing directories and per-file
+// removal failures are logged and skipped inside CleanupJobPartFiles.
+func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
+	cfg := m.snapshotConfig()
+	dlJob := hfdownloader.Job{
+		Repo:      job.Repo,
+		IsDataset: job.IsDataset,
+		LocalRepo: job.LocalRepo,
+	}
+	settings := hfdownloader.Settings{
+		CacheDir: cfg.CacheDir,
+	}
+	if job.LocalDir != "" {
+		settings.OutputDir = job.LocalDir
+		settings.CacheDir = ""
+	} else if settings.CacheDir == "" {
+		settings.CacheDir = hfdownloader.DefaultCacheDir()
+	}
+	if err := hfdownloader.CleanupJobPartFiles(settings, dlJob); err != nil {
+		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, err)
 	}
 }

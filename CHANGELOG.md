@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Delete stale `.part` files when a paused job is cancelled or dismissed, preventing disk leak from the pause → cancel and pause → dismiss sequences (#49)
+
 ## [1.2.0] - 2026-06-26
 
 ### Added

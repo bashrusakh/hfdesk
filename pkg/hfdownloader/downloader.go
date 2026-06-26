@@ -645,6 +645,153 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	}
 }
 
+// CleanupJobPartFiles removes all partial download artifacts (.part,
+// .part-NN, .parts.json) associated with a specific job's repo. It is
+// intended for server-side use when the download goroutine has already
+// exited (e.g. pause → cancel, or pause → dismiss) and the in-flight
+// cleanup callback in cleanupPartialsOnCancel will not run.
+//
+// The function reuses the same path-resolution logic as Download():
+//   - HF cache mode: scans only the repo's BlobsDir() for tmp-* partial
+//     files; safe to call while another concurrent download is using a
+//     different repo, because each repo's blobs directory is distinct.
+//   - Legacy mode (settings.OutputDir set, settings.CacheDir empty):
+//     walks the per-repo output subtree under OutputDir/<repo>/ and
+//     removes any .part/.part-NN/.parts.json files found there.
+//
+// All operations are best-effort: missing directories are not an error,
+// and individual file removal failures are logged and skipped.
+func CleanupJobPartFiles(settings Settings, job Job) error {
+	// Match the mode-detection in Download(): legacy mode is selected
+	// when CacheDir is empty (OutputDir may be set or defaulted to
+	// "Storage" by Download itself, so we accept either signal here).
+	if settings.CacheDir == "" {
+		return cleanupLegacyPartFiles(settings, job)
+	}
+	return cleanupHFCachePartFiles(settings, job)
+}
+
+func cleanupHFCachePartFiles(settings Settings, job Job) error {
+	cacheDir := settings.CacheDir
+	if cacheDir == "" {
+		cacheDir = DefaultCacheDir()
+	}
+	// LocalRepo can reroute the destination folder (e.g. mmproj from an
+	// upstream repo saved under the target model's directory); use it when
+	// present so we look in the same place the downloader wrote to.
+	repoID := job.Repo
+	if job.LocalRepo != "" {
+		repoID = job.LocalRepo
+	}
+	cache := NewHFCache(cacheDir, 0)
+	repoDir, err := cache.Repo(repoID, RepoTypeFromJob(job))
+	if err != nil {
+		// Invalid repo ID — nothing to clean up.
+		return nil
+	}
+	blobsDir := repoDir.BlobsDir()
+	entries, err := os.ReadDir(blobsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "tmp-") {
+			continue
+		}
+		if !isPartialFileName(name) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(blobsDir, name)); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup partial file %s: %v", filepath.Join(blobsDir, name), err)
+		}
+	}
+	return nil
+}
+
+func cleanupLegacyPartFiles(settings Settings, job Job) error {
+	repoForPath := job.Repo
+	if job.LocalRepo != "" {
+		repoForPath = job.LocalRepo
+	}
+	// SafeJoin is the same guard Download() uses; replicate it so a
+	// symlink can't be used to escape OutputDir during the walk.
+	safeRoot, err := SafeJoin(settings.OutputDir, repoForPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(safeRoot); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return filepath.WalkDir(safeRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Skip files we can't stat; continue with the walk.
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isPartialFileName(d.Name()) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup partial file %s: %v", path, err)
+		}
+		return nil
+	})
+}
+
+// isPartialFileName reports whether name is one of the partial-file
+// suffixes produced by downloadSingle / downloadMultipart: .part,
+// .part-NN (e.g. .part-00), and .parts.json.
+func isPartialFileName(name string) bool {
+	if name == "" {
+		return false
+	}
+	// .parts.json is the multipart layout metadata file.
+	if strings.HasSuffix(name, ".parts.json") {
+		return true
+	}
+	// Bare .part (single-part download / multipart assembly staging).
+	if strings.HasSuffix(name, ".part") {
+		return true
+	}
+	// .part-NN where NN is a zero-padded two-digit number, matching the
+	// fmt.Sprintf("%s.part-%02d", dst, i) format used in
+	// downloadMultipart.
+	if !strings.Contains(name, ".part-") {
+		return false
+	}
+	idx := strings.LastIndex(name, ".part-")
+	suffix := name[idx+len(".part-"):]
+	if len(suffix) != 2 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// RepoTypeFromJob returns the RepoType matching job.IsDataset.
+func RepoTypeFromJob(job Job) RepoType {
+	if job.IsDataset {
+		return RepoTypeDataset
+	}
+	return RepoTypeModel
+}
+
 // downloadSingle downloads a file in a single request.
 //
 // Resume behavior: if a .part file already exists from a previous interrupted
