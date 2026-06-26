@@ -207,7 +207,7 @@
         <header class="page-header">
           <div>
             <h1>Active Jobs</h1>
-            <p class="page-subtitle">Monitor your downloads in real-time</p>
+            <p class="page-subtitle"><span class="live-dot"></span> Monitor your downloads in real-time</p>
           </div>
         </header>
 
@@ -227,12 +227,7 @@
               <span class="speed-unit">Mbit/s</span>
             </div>
           </div>
-          <div class="speed-bar-aggregate">
-            <div class="speed-gauge-track">
-              <div class="speed-gauge-fill" id="speedGaugeFill"></div>
-            </div>
-            <span class="speed-gauge-text" id="speedGaugeText">0.0 Mbit/s (unlimited)</span>
-          </div>
+          <span class="speed-bar-current">Current: <strong id="speedGaugeText">0.0 Mbit/s</strong></span>
         </div>
 
         <div id="jobsList" class="jobs-list">

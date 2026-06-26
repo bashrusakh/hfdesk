@@ -283,7 +283,23 @@ a {
 
 .page-subtitle {
   color: var(--color-text-secondary);
-  font-size: 15px;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-success);
+  animation: pulse-live 2s infinite;
+}
+
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 .page-config-path {
@@ -1254,8 +1270,14 @@ a {
   background: var(--gradient-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  padding: 12px 16px;
-  margin-bottom: 10px;
+  padding: 20px 24px;
+  margin-bottom: 14px;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.job-card:hover {
+  border-color: var(--color-border-light);
+  box-shadow: var(--shadow-md);
 }
 
 .job-header {
@@ -1351,24 +1373,54 @@ a {
 }
 
 .progress-bar {
-  height: 6px;
-  background: var(--color-bg-tertiary);
+  height: 8px;
+  background: var(--color-bg);
   border-radius: var(--radius-full);
   overflow: hidden;
+  margin: 12px 0;
 }
 
 .progress-fill {
   height: 100%;
-  background: var(--gradient-primary);
+  background: linear-gradient(90deg, var(--color-primary) 0%, #8b5cf6 50%, #a78bfa 100%);
   border-radius: var(--radius-full);
   transition: width var(--transition-fast);
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.4);
 }
 
 .job-stats {
   display: flex;
-  gap: 24px;
-  font-size: 13px;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.job-stats > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-family: var(--font-mono);
   color: var(--color-text-secondary);
+}
+
+.job-stats > [data-role="speed"] {
+  background: rgba(99, 102, 241, 0.08);
+  border-color: rgba(99, 102, 241, 0.25);
+  color: var(--color-primary-hover);
+}
+
+.job-stats > [data-role="pct"] {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  background: transparent;
+  border: none;
+  padding: 0 4px;
 }
 
 .job-meta-line {
@@ -1401,13 +1453,25 @@ a {
 }
 
 .job-file-line {
-  margin-top: 6px;
+  margin-top: 10px;
+  padding: 7px 10px;
+  background: var(--color-bg);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11px;
   color: var(--color-text-muted);
-  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-file-line::before {
+  content: '📄';
+  font-size: 13px;
+  flex-shrink: 0;
 }
 
 /* ============================================
@@ -1597,13 +1661,15 @@ a {
 }
 
 .speed-btn {
-  padding: 6px 12px;
-  background: var(--color-surface);
+  padding: 5px 10px;
+  background: var(--color-bg-tertiary);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-muted);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
+  min-width: 32px;
+  text-align: center;
   transition: all var(--transition-fast);
 }
 
@@ -1632,9 +1698,15 @@ a {
 
 /* Speed bar — downloads page */
 .speed-bar {
-  padding: 12px 40px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
   background: var(--color-surface);
-  border-bottom: 1px solid var(--color-border);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+  flex-wrap: wrap;
 }
 
 .speed-bar-main {
@@ -1653,8 +1725,8 @@ a {
 
 .speed-bar-divider {
   width: 1px;
-  height: 22px;
-  background: var(--color-border);
+  height: 20px;
+  background: var(--color-border-light);
   flex-shrink: 0;
 }
 
@@ -1662,44 +1734,20 @@ a {
   max-width: 130px;
 }
 
-/* Aggregate usage gauge */
-.speed-bar-aggregate {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-}
-
-.speed-gauge-track {
-  flex: 1;
-  max-width: 400px;
-  height: 4px;
-  background: var(--color-border);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.speed-gauge-fill {
-  height: 100%;
-  background: var(--color-primary);
-  border-radius: var(--radius-full);
-  transition: width 0.2s ease;
-}
-
-.speed-gauge-fill.warning {
-  background: var(--color-warning);
-}
-
-.speed-gauge-fill.critical {
-  background: var(--color-error);
-}
-
-.speed-gauge-text {
-  font-size: 11px;
-  font-family: var(--font-mono, monospace);
+.speed-bar-current {
+  margin-left: auto;
+  font-size: 12px;
+  font-family: var(--font-mono);
   color: var(--color-text-muted);
   white-space: nowrap;
-  min-width: 120px;
+  padding-left: 10px;
+  border-left: 1px solid var(--color-border-light);
+  margin-left: 2px;
+}
+
+.speed-bar-current strong {
+  color: var(--color-primary-hover);
+  font-weight: 600;
 }
 
 /* Cache List */

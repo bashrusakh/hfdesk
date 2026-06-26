@@ -2292,12 +2292,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   // updateSpeedGauge aggregates the speed of all running jobs and renders
-  // the usage gauge in the speed bar. Called from renderJobs and after
-  // any speed-limit change so the gauge always reflects live state.
+  // the current speed in the speed bar. Called from renderJobs and after
+  // any speed-limit change so the display always reflects live state.
   function updateSpeedGauge() {
-    const gaugeFill = document.getElementById('speedGaugeFill');
     const gaugeText = document.getElementById('speedGaugeText');
-    if (!gaugeFill || !gaugeText) return;
+    if (!gaugeText) return;
     if (!state.speedLimitLoaded) return;
 
     // Sum bytesPerSecond from all running jobs
@@ -2316,19 +2315,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const limitMbit = field ? (parseFloat(field.value) || 0) : 0;
 
     if (limitMbit > 0) {
-      const pct = Math.min((totalMbit / limitMbit) * 100, 100);
-      gaugeFill.style.width = pct + '%';
-      gaugeFill.classList.remove('critical', 'warning');
-      if (pct > 95) {
-        gaugeFill.classList.add('critical');
-      } else if (pct > 80) {
-        gaugeFill.classList.add('warning');
-      }
       gaugeText.textContent = totalMbit.toFixed(1) + ' / ' + limitMbit.toFixed(1) + ' Mbit/s';
     } else {
-      gaugeFill.style.width = '0';
-      gaugeFill.classList.remove('warning', 'critical');
-      gaugeText.textContent = totalMbit.toFixed(1) + ' Mbit/s (unlimited)';
+      gaugeText.textContent = totalMbit.toFixed(1) + ' Mbit/s';
     }
   }
 
