@@ -85,6 +85,40 @@ func TestDismissJob_SurvivesPageRefresh(t *testing.T) {
 	}
 }
 
+// TestDismissJobResult_ActiveJobReturnsSnapshot ensures the rejection
+// path follows the JobManager snapshot contract instead of returning
+// the live mutable job pointer.
+func TestDismissJobResult_ActiveJobReturnsSnapshot(t *testing.T) {
+	m := NewJobManager(Config{}, nil)
+	m.jobs["live"] = &Job{
+		ID:        "live",
+		Status:    JobStatusRunning,
+		CreatedAt: time.Now(),
+		Files: []JobFileProgress{{
+			Path:   "model.bin",
+			Status: "active",
+		}},
+	}
+
+	res, snapshot := m.DismissJobResult("live")
+	if res != DismissJobStillActive {
+		t.Fatalf("DismissJobResult = %v, want DismissJobStillActive", res)
+	}
+	if snapshot == nil {
+		t.Fatal("snapshot is nil")
+	}
+	snapshot.Status = JobStatusCancelled
+	snapshot.Files[0].Status = "mutated"
+
+	live := m.jobs["live"]
+	if live.Status != JobStatusRunning {
+		t.Errorf("live status mutated through returned snapshot: %s", live.Status)
+	}
+	if live.Files[0].Status != "active" {
+		t.Errorf("live file status mutated through returned snapshot: %s", live.Files[0].Status)
+	}
+}
+
 // TestHandleDismissJob_EndToEnd drives the HTTP endpoint, asserts the
 // dismissed job is gone, and confirms the response envelope. Exercises
 // the full route wiring so we catch regressions in server.go registration.

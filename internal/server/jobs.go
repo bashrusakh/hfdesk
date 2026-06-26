@@ -662,8 +662,9 @@ func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 		return DismissJobNotFound, nil
 	}
 	if !isTerminalJobStatus(job.Status) {
+		snapshot := m.cloneJobLocked(job)
 		m.mu.Unlock()
-		return DismissJobStillActive, job
+		return DismissJobStillActive, snapshot
 	}
 	wasPaused := job.Status == JobStatusPaused
 	snapshot := m.cloneJobLocked(job)

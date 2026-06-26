@@ -174,6 +174,36 @@ func TestCleanupJobPartFiles_HFCacheMissing(t *testing.T) {
 	}
 }
 
+// TestCleanupJobPartFiles_HFCacheRejectsOutOfRootDst verifies that
+// the delete primitive refuses tracked paths outside the configured HF
+// cache hub root before touching any suffix artifacts.
+func TestCleanupJobPartFiles_HFCacheRejectsOutOfRootDst(t *testing.T) {
+	baseDir := t.TempDir()
+	cacheDir := filepath.Join(baseDir, "cache")
+	if err := os.MkdirAll(filepath.Join(cacheDir, "hub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideDst := filepath.Join(outsideDir, "tmp-outside")
+	for _, path := range []string{outsideDst, outsideDst + ".part", outsideDst + ".part-00", outsideDst + ".parts.json"} {
+		if err := os.WriteFile(path, []byte("must survive"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{outsideDst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	for _, path := range []string{outsideDst, outsideDst + ".part", outsideDst + ".part-00", outsideDst + ".parts.json"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("out-of-root path %s should survive cleanup: %v", path, err)
+		}
+	}
+}
+
 // TestCleanupJobPartFiles_LegacyDst verifies that the legacy path
 // removes the partials for exactly the dsts in the input list:
 // dst+".part", any dst+".part-NN", and dst+".parts.json". A
@@ -280,6 +310,34 @@ func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
 		full := filepath.Join(repoDir, path)
 		if _, err := os.Stat(full); err != nil {
 			t.Errorf("user file %q was removed (body=%q): %v", path, body, err)
+		}
+	}
+}
+
+// TestCleanupJobPartFiles_LegacyRejectsOutOfRootDst verifies that
+// legacy cleanup also refuses dsts outside OutputDir.
+func TestCleanupJobPartFiles_LegacyRejectsOutOfRootDst(t *testing.T) {
+	baseDir := t.TempDir()
+	outputDir := filepath.Join(baseDir, "output")
+	outsideDir := filepath.Join(baseDir, "outside")
+	for _, dir := range []string{outputDir, outsideDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outsideDst := filepath.Join(outsideDir, "model.bin")
+	for _, path := range []string{outsideDst + ".part", outsideDst + ".part-00", outsideDst + ".parts.json"} {
+		if err := os.WriteFile(path, []byte("must survive"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := CleanupJobPartFiles(Settings{OutputDir: outputDir}, []string{outsideDst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	for _, path := range []string{outsideDst + ".part", outsideDst + ".part-00", outsideDst + ".parts.json"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("out-of-root path %s should survive cleanup: %v", path, err)
 		}
 	}
 }

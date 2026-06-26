@@ -687,7 +687,12 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 // individual file removal failures are logged and skipped.
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
+	root := cleanupRoot(settings, useHFCache)
 	for _, dst := range dsts {
+		if !pathWithinRoot(root, dst) {
+			log.Printf("warning: skip cleanup for out-of-root partial dst %s", dst)
+			continue
+		}
 		if err := removePartialArtifacts(dst); err != nil {
 			log.Printf("warning: cleanup partials for %s: %v", dst, err)
 		}
@@ -696,6 +701,38 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 		}
 	}
 	return nil
+}
+
+func cleanupRoot(settings Settings, useHFCache bool) string {
+	if useHFCache {
+		return NewHFCache(settings.CacheDir, 0).HubDir()
+	}
+	return settings.OutputDir
+}
+
+func pathWithinRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	if resolvedRoot, err := filepath.EvalSymlinks(absRoot); err == nil {
+		absRoot = resolvedRoot
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absPath)); err == nil {
+		absPath = filepath.Join(resolvedParent, filepath.Base(absPath))
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // removeHFCacheTemp removes the completed-but-not-yet-stored tmp-<sha>
