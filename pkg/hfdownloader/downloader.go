@@ -634,6 +634,9 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
 	}
+	// dst is already guarded by SafeJoin for local mode and SHA256/BlobsDir
+	// derivation for HF cache mode upstream in Download().
+	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
 	}
