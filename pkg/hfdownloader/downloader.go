@@ -688,6 +688,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	for attempt := 0; attempt <= cfg.Retries; attempt++ {
 		select {
 		case <-ctx.Done():
+			out.Close()
 			cleanupPartialsOnCancel(cfg, dst)
 			return ctx.Err()
 		default:
@@ -744,9 +745,14 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if attempt < cfg.Retries {
 			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
 			if d := retry.Next(); !sleepCtx(ctx, d) {
+				out.Close()
 				cleanupPartialsOnCancel(cfg, dst)
 				return ctx.Err()
 			}
+		} else if ctx.Err() != nil {
+			out.Close()
+			cleanupPartialsOnCancel(cfg, dst)
+			return ctx.Err()
 		}
 	}
 	return lastErr
