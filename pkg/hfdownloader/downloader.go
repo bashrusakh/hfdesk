@@ -755,6 +755,36 @@ func cleanupLegacyPartFiles(settings Settings, job Job) error {
 		if !isPartialFileName(d.Name()) {
 			return nil
 		}
+		// Defensive: a partial-file suffix can also be a legitimate user
+		// file name (e.g. a repo with files literally named
+		// "weights.part" or "data.parts.json"). The downloader always
+		// appends the suffix to a non-empty dst (downloadSingle /
+		// downloadMultipart never produce ".part" or ".parts.json" with
+		// an empty base), so a partial with an empty base is by
+		// definition not a downloader artifact — skip it.
+		//
+		// When the base is non-empty, stat the corresponding "final" file
+		// (the name with the partial suffix stripped). If it exists
+		// alongside the partial, the partial is almost certainly stale
+		// downloader output that the rename failed to clean up; skip it
+		// rather than risk deleting data we don't understand. If the
+		// final is not present, the partial is either in-flight
+		// (paused mid-download — the bug this fix targets) or a
+		// standalone user file with no final; the in-flight case is the
+		// common one, and the standalone case is rare enough to accept
+		// the small data-loss risk in exchange for cleaning up the
+		// partials that the downloader would have cleaned up itself if
+		// the goroutine were still running.
+		base := stripPartialSuffix(d.Name())
+		if base == "" {
+			return nil
+		}
+		finalPath := filepath.Join(filepath.Dir(path), base)
+		if _, err := os.Stat(finalPath); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			log.Printf("warning: stat %s: %v", finalPath, err)
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			log.Printf("warning: cleanup partial file %s: %v", path, err)
 		}
@@ -788,6 +818,32 @@ func isPartialFileName(name string) bool {
 	}
 	idx := strings.LastIndex(name, ".part-")
 	return isAllDigits(name[idx+len(".part-"):])
+}
+
+// stripPartialSuffix returns name with the trailing partial-file
+// suffix removed, or name unchanged if no recognized suffix is
+// present. Used by the legacy walker to look up the corresponding
+// "final" file path before deciding whether to delete a partial.
+//
+// Returns name unchanged (and lets the caller detect that no strip
+// happened by comparing the result to the input) when the suffix is
+// ambiguous or absent, so the caller's stat-then-skip logic falls
+// through to the default delete path.
+func stripPartialSuffix(name string) string {
+	if name == "" {
+		return name
+	}
+	if strings.HasSuffix(name, ".parts.json") {
+		return strings.TrimSuffix(name, ".parts.json")
+	}
+	if strings.HasSuffix(name, ".part") {
+		return strings.TrimSuffix(name, ".part")
+	}
+	if strings.Contains(name, ".part-") {
+		idx := strings.LastIndex(name, ".part-")
+		return name[:idx]
+	}
+	return name
 }
 
 // isAllDigits reports whether s is a non-empty run of ASCII digits.

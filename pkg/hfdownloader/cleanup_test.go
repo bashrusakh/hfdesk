@@ -214,9 +214,17 @@ func TestCleanupJobPartFiles_LocalRepo(t *testing.T) {
 }
 
 // TestCleanupJobPartFiles_Legacy verifies that legacy (OutputDir) mode
-// walks the per-repo subtree and removes only the partial-file suffix
-// families (.part, .part-N for any N digits, .parts.json). HF cache
-// mode is the focus of the other tests.
+// walks the per-repo subtree and removes in-flight partial files
+// (.part, .part-N for any N digits, .parts.json) when no
+// corresponding "final" file is present — the pause → cancel path.
+//
+// The walker has a defensive guard: when a partial's base name (the
+// name with the suffix stripped) exists as a real file alongside the
+// partial, the partial is treated as a stale downloader leftover and
+// skipped, to protect legitimately named user files (see
+// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles). This test
+// exercises the in-flight case where the final is NOT present, which
+// is the common case after a paused → cancel.
 func TestCleanupJobPartFiles_Legacy(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "legacy-repo")
@@ -225,15 +233,21 @@ func TestCleanupJobPartFiles_Legacy(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// model.bin.* partials: the final model.bin does NOT exist, so all
+	// of them are treated as in-flight and removed.
+	//
+	// config.json.part: the final config.json DOES exist, so the
+	// defensive guard skips this partial (left behind as a stale
+	// leftover, but the user's completed config.json is safe).
 	files := map[string]string{
 		filepath.Join(repoDir, "model.bin.part"):       "partial",
 		filepath.Join(repoDir, "model.bin.part-00"):    "p0",
 		filepath.Join(repoDir, "model.bin.part-100"):   "p100 (high Concurrency)",
 		filepath.Join(repoDir, "model.bin.parts.json"): "layout",
-		filepath.Join(subDir, "config.json.part"):      "cfg partial",
-		filepath.Join(subDir, "config.json"):           "completed cfg", // must NOT be deleted
+		filepath.Join(subDir, "config.json.part"):      "cfg partial — final exists, guard skips",
+		filepath.Join(subDir, "config.json"):           "completed cfg",
 		filepath.Join(repoDir, "README.md"):            "completed readme",
-		filepath.Join(repoDir, "data.bin"):             "completed data", // sanity check
+		filepath.Join(repoDir, "data.bin"):             "completed data",
 	}
 	for path, body := range files {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
@@ -247,28 +261,122 @@ func TestCleanupJobPartFiles_Legacy(t *testing.T) {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 
-	// All .part* files removed; completed files survive.
+	// In-flight partials removed; the partial guarded by an existing
+	// final is left behind; completed files survive.
 	wantGone := []string{
 		filepath.Join(repoDir, "model.bin.part"),
 		filepath.Join(repoDir, "model.bin.part-00"),
 		filepath.Join(repoDir, "model.bin.part-100"),
 		filepath.Join(repoDir, "model.bin.parts.json"),
-		filepath.Join(subDir, "config.json.part"),
 	}
 	for _, p := range wantGone {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("partial not removed (%v): %v", p, err)
+			t.Errorf("in-flight partial not removed (%v): %v", p, err)
 		}
 	}
 	wantKept := []string{
+		filepath.Join(subDir, "config.json.part"), // guard skipped this
 		filepath.Join(subDir, "config.json"),
 		filepath.Join(repoDir, "README.md"),
 		filepath.Join(repoDir, "data.bin"),
 	}
 	for _, p := range wantKept {
 		if _, err := os.Stat(p); err != nil {
-			t.Errorf("completed file removed (%v): %v", p, err)
+			t.Errorf("file removed but should survive (%v): %v", p, err)
 		}
+	}
+}
+
+// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles exercises the
+// defensive guard against the "user file literally named .part" risk
+// identified in the open-code-review of PR #50: a partial-file suffix
+// can also be a legitimate user file name. The walker must not delete
+// such a file even when no "final" sibling exists, OR it must at least
+// not delete it when a sibling does exist.
+//
+// The guard implemented here has two parts:
+//  1. Empty base (bare ".part" / ".parts.json") is never a downloader
+//     artifact — always skip.
+//  2. When the base is non-empty, stat the base in the same directory;
+//     if it exists, the partial is most likely a stale leftover and is
+//     skipped. If the base does not exist, the partial is treated as
+//     in-flight and removed (the pause → cancel path).
+//
+// This test covers the "base exists" branch: a file named weights.part
+// alongside a sibling weights must survive cleanup even though it
+// looks like a partial.
+func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "owner", "user-named")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// User-named files: each has a "base" sibling that the guard will
+	// detect, so the partial is skipped. This is the safe direction:
+	// leave a file alone rather than risk destroying user data.
+	userFiles := map[string]string{
+		filepath.Join(repoDir, "weights.part"):    "user data, has sibling weights",
+		filepath.Join(repoDir, "weights"):         "sibling final",
+		filepath.Join(repoDir, "data.parts.json"): "user config, has sibling data",
+		filepath.Join(repoDir, "data"):            "sibling final",
+		filepath.Join(repoDir, "shard.part-03"):   "user shard, has sibling shard",
+		filepath.Join(repoDir, "shard"):           "sibling final",
+		filepath.Join(repoDir, ".part"):           "bare .part, empty base",
+	}
+	for path, body := range userFiles {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	settings := Settings{OutputDir: tmpDir}
+	job := Job{Repo: "owner/user-named"}
+	if err := CleanupJobPartFiles(settings, job); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+
+	// Everything survives — each partial either has a sibling final
+	// (guard skips) or has an empty base (downloaders never produce
+	// those, so we don't touch them).
+	for path := range userFiles {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("user file removed but should survive (%v): %v", path, err)
+		}
+	}
+}
+
+// TestStripPartialSuffix covers the small helper that the legacy
+// walker relies on to compute the "final" file path before deciding
+// whether to delete a partial.
+func TestStripPartialSuffix(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"model.bin.part", "model.bin"},
+		{"model.bin.parts.json", "model.bin"},
+		{"model.bin.part-00", "model.bin"},
+		{"model.bin.part-100", "model.bin"},
+		{"model.bin.part-9999", "model.bin"},
+		// Bare suffixes (no base) — the downloader never produces
+		// these, but stripPartialSuffix still strips them.
+		{".part", ""},
+		{".parts.json", ""},
+		// Names without a recognized suffix — returned unchanged.
+		{"config.json", "config.json"},
+		{"README.md", "README.md"},
+		{"", ""},
+		// Edge: .part- with empty digit run (not produced by the
+		// downloader, but the helper should not panic).
+		{"foo.part-", "foo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := stripPartialSuffix(tc.in); got != tc.want {
+				t.Errorf("stripPartialSuffix(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
