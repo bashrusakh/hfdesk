@@ -24,21 +24,21 @@ func ptrOf[K comparable, V any](m map[K]V) *map[K]V {
 // drive a real download and then cancel it.
 //
 // dsts is the set the downloader would have called OnPartialFile
-// with: for HF cache mode the dst IS the in-flight tmp-<sha> file
-// (the downloader writes directly to that path), so the dst matches
-// the file we create.
+// with: for HF cache mode the dst is the tmp-<sha> path under blobs/,
+// and the incomplete bytes live in dst+".part" until the file is fully
+// assembled.
 func pausedJobWithPartialFiles(t *testing.T, mgr *JobManager, repo string) (*Job, string) {
 	t.Helper()
 	blobsDir := filepath.Join(mgr.config.CacheDir, "hub", "models--owner--"+repo, "blobs")
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// In-flight HF cache files: the dst IS the tmp-<sha> file the
-	// downloader writes to directly. Two dsts in the tracker.
+	// In-flight HF cache files. Two dsts are in the tracker; each has
+	// real downloader partial artifacts on disk.
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
 	dst2 := filepath.Join(blobsDir, "tmp-cafebabe00000000")
-	for _, dst := range []string{dst1, dst2} {
-		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+	for _, path := range []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"} {
+		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -83,9 +83,9 @@ func TestCancelJob_PausedCleansUpPartialFiles(t *testing.T) {
 	job, blobsDir := pausedJobWithPartialFiles(t, mgr, "pausecancel")
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
 	dst2 := filepath.Join(blobsDir, "tmp-cafebabe00000000")
-	for _, dst := range []string{dst1, dst2} {
-		if _, err := os.Stat(dst); err != nil {
-			t.Fatalf("precondition: %s should exist: %v", dst, err)
+	for _, path := range []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("precondition: %s should exist: %v", path, err)
 		}
 	}
 
@@ -96,9 +96,9 @@ func TestCancelJob_PausedCleansUpPartialFiles(t *testing.T) {
 		t.Errorf("status = %s, want cancelled", j.Status)
 	}
 
-	for _, dst := range []string{dst1, dst2} {
-		if _, err := os.Stat(dst); !os.IsNotExist(err) {
-			t.Errorf("in-flight dst %s was not cleaned up (err=%v)", dst, err)
+	for _, path := range []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("partial artifact %s was not cleaned up (err=%v)", path, err)
 		}
 	}
 	// Completed blob survives.
@@ -129,9 +129,9 @@ func TestDismissJob_PausedCleansUpPartialFiles(t *testing.T) {
 		t.Fatalf("snapshot = %+v, want paused", snapshot)
 	}
 
-	for _, dst := range []string{dst1, dst2} {
-		if _, err := os.Stat(dst); !os.IsNotExist(err) {
-			t.Errorf("in-flight dst %s survived dismiss (err=%v)", dst, err)
+	for _, path := range []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("partial artifact %s survived dismiss (err=%v)", path, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(blobsDir, "completed-blob")); err != nil {
@@ -158,7 +158,7 @@ func TestCancelJob_RunningDoesNotTouchFiles(t *testing.T) {
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	partPath := filepath.Join(blobsDir, "tmp-running")
+	partPath := filepath.Join(blobsDir, "tmp-running.part")
 	if err := os.WriteFile(partPath, []byte("in-flight"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -246,8 +246,8 @@ func TestCancelJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	// Job B's in-flight files (must survive A's cancel).
 	jobBDst1 := filepath.Join(blobsDir, "tmp-jobB-file1")
 	jobBDst2 := filepath.Join(blobsDir, "tmp-jobB-file2")
-	for _, dst := range []string{jobADst1, jobADst2, jobBDst1, jobBDst2} {
-		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+	for _, path := range []string{jobADst1 + ".part", jobADst2 + ".part", jobBDst1 + ".part", jobBDst2 + ".part"} {
+		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -289,16 +289,16 @@ func TestCancelJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	}
 
 	// Job A's in-flight files removed.
-	for _, dst := range []string{jobADst1, jobADst2} {
-		if _, err := os.Stat(dst); !os.IsNotExist(err) {
-			t.Errorf("Job A dst %s should be cleaned up (err=%v)", dst, err)
+	for _, path := range []string{jobADst1 + ".part", jobADst2 + ".part"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("Job A partial %s should be cleaned up (err=%v)", path, err)
 		}
 	}
 	// Job B's in-flight files UNTOUCHED. This is the regression
 	// guard for the high-priority finding.
-	for _, dst := range []string{jobBDst1, jobBDst2} {
-		if _, err := os.Stat(dst); err != nil {
-			t.Errorf("Job B dst %s was removed by Job A's cancel — concurrent-job data loss: %v", dst, err)
+	for _, path := range []string{jobBDst1 + ".part", jobBDst2 + ".part"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("Job B partial %s was removed by Job A's cancel — concurrent-job data loss: %v", path, err)
 		}
 	}
 	// Job B still running.
@@ -323,8 +323,8 @@ func TestDismissJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	}
 	jobADst := filepath.Join(blobsDir, "tmp-jobA-only")
 	jobBDst := filepath.Join(blobsDir, "tmp-jobB-only")
-	for _, dst := range []string{jobADst, jobBDst} {
-		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+	for _, path := range []string{jobADst + ".part", jobBDst + ".part"} {
+		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -354,10 +354,10 @@ func TestDismissJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 		t.Fatalf("DismissJobResult = %v, want DismissJobOK", res)
 	}
 
-	if _, err := os.Stat(jobADst); !os.IsNotExist(err) {
+	if _, err := os.Stat(jobADst + ".part"); !os.IsNotExist(err) {
 		t.Errorf("Job A dst should be cleaned up: %v", err)
 	}
-	if _, err := os.Stat(jobBDst); err != nil {
+	if _, err := os.Stat(jobBDst + ".part"); err != nil {
 		t.Errorf("Job B dst was removed by Job A's dismiss: %v", err)
 	}
 }

@@ -672,10 +672,12 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 // output subtree is not disturbed.
 //
 // For each dst, the helper removes the partial files the downloader
-// would have produced for that dst:
-//   - HF cache: dst itself (the in-flight tmp-<sha> file).
-//   - Legacy: dst+".part", dst+".part-NN" (any digit run),
-//     dst+".parts.json".
+// would have produced for that dst: dst+".part", dst+".part-NN"
+// (any digit run), and dst+".parts.json". In HF cache mode, dst is
+// the temporary tmp-<sha> path under blobs/, so the helper also removes
+// dst itself for the window after the single/multipart downloader has
+// renamed the completed bytes to tmp-<sha> but before StoreDownloadedFile
+// has moved them into the final blob.
 //
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor
@@ -685,37 +687,35 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 // individual file removal failures are logged and skipped.
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
-	if useHFCache {
-		for _, dst := range dsts {
-			removeHFCachePartial(dst)
-		}
-		return nil
-	}
 	for _, dst := range dsts {
-		if err := removeLegacyPartials(dst); err != nil {
+		if err := removePartialArtifacts(dst); err != nil {
 			log.Printf("warning: cleanup partials for %s: %v", dst, err)
+		}
+		if useHFCache {
+			removeHFCacheTemp(dst)
 		}
 	}
 	return nil
 }
 
-// removeHFCachePartial removes the in-flight tmp-<sha> file at dst.
-// The downloader writes the in-flight bytes to dst directly (the
-// "tmp-" prefix is the in-flight marker in the blobs dir), so a
-// remove of dst is the right primitive. dst is already validated as
-// residing inside the blobs dir at allocation time in Download().
-func removeHFCachePartial(dst string) {
+// removeHFCacheTemp removes the completed-but-not-yet-stored tmp-<sha>
+// file at dst. The downloader normally writes partial bytes to
+// dst+".part" / dst+".part-NN" first, then renames assembled bytes to
+// dst before StoreDownloadedFile moves them into the final blob. dst is
+// already validated as residing inside the blobs dir at allocation time
+// in Download().
+func removeHFCacheTemp(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst, err)
 	}
 }
 
-// removeLegacyPartials removes all partial-file artifacts associated
-// with a single legacy-mode dst: the single-part partial
-// (dst+".part"), any multipart parts (dst+".part-NN" for N being any
-// non-empty run of digits, to match the downloader's %02d / %d
-// format), and the multipart layout metadata (dst+".parts.json").
+// removePartialArtifacts removes all partial-file artifacts associated
+// with a single downloader dst: the single-part partial (dst+".part"),
+// any multipart parts (dst+".part-NN" for N being any non-empty run of
+// digits, to match the downloader's %02d / %d format), and the
+// multipart layout metadata (dst+".parts.json").
 //
 // dst is already validated as residing inside the output subtree at
 // allocation time in Download() (via SafeJoin), so removing the
@@ -724,7 +724,7 @@ func removeHFCachePartial(dst string) {
 // recognized suffix family and a digit run, so a coincidentally
 // named "weights.part" or similar user file with a different base
 // (which would not appear in dsts) is not touched.
-func removeLegacyPartials(dst string) error {
+func removePartialArtifacts(dst string) error {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)

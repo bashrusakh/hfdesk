@@ -51,10 +51,10 @@ func TestCleanupJobPartFiles_HFCache_Empty(t *testing.T) {
 }
 
 // TestCleanupJobPartFiles_HFCacheDst verifies that the HF cache path
-// removes exactly the dsts in the input list (the in-flight tmp-<sha>
-// files) and nothing else. The blobs dir may contain other repos'
-// tmp- files, completed blobs, and .incomplete files from the cache
-// layer's separate scheme — none of those should be touched.
+// removes exactly the partial artifacts for the dsts in the input list
+// and nothing else. In HF cache mode dst is the tmp-<sha> path; the
+// downloader writes incomplete bytes to dst+".part" / dst+".part-NN"
+// before the completed temporary file reaches dst itself.
 func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 	cacheDir := t.TempDir()
 	hubDir := filepath.Join(cacheDir, "hub")
@@ -66,11 +66,14 @@ func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 		}
 	}
 
-	// In repoA: two tmp- partials (dsts to be removed) plus a
-	// completed blob and a .incomplete file (must survive).
+	// In repoA: partial artifacts for two tracked dsts plus a completed
+	// blob and a .incomplete file (must survive).
 	filesA := map[string]string{
-		"tmp-shaA":              "partial A — owned by Job A",
-		"tmp-shaB":              "partial B — owned by Job A (different file)",
+		"tmp-shaA.part":         "single-part partial A — owned by Job A",
+		"tmp-shaA.part-00":      "multipart partial A — owned by Job A",
+		"tmp-shaA.part-100":     "multipart partial A — high index",
+		"tmp-shaA.parts.json":   "multipart layout A",
+		"tmp-shaB.part":         "single-part partial B — owned by Job A",
 		"deadbeef00000000":      "completed blob A",
 		"other-file.incomplete": "incomplete A",
 	}
@@ -79,10 +82,12 @@ func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// In repoB: a tmp- file owned by a different (concurrent) job
-	// that must NOT be touched by Job A's cleanup.
+	// In repoB: partial artifacts owned by a different (concurrent)
+	// job that must NOT be touched by Job A's cleanup.
 	filesB := map[string]string{
-		"tmp-shaC": "partial C — owned by concurrent Job B",
+		"tmp-shaC.part":       "single-part partial C — owned by concurrent Job B",
+		"tmp-shaC.part-00":    "multipart partial C — owned by concurrent Job B",
+		"tmp-shaC.parts.json": "multipart layout C",
 	}
 	for name, body := range filesB {
 		if err := os.WriteFile(filepath.Join(blobsB, name), []byte(body), 0o644); err != nil {
@@ -99,8 +104,8 @@ func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 
-	// repoA: only the two listed dsts were removed; completed blob
-	// and .incomplete file survive.
+	// repoA: only artifacts for the two listed dsts were removed;
+	// completed blob and .incomplete file survive.
 	for name, body := range filesA {
 		full := filepath.Join(blobsA, name)
 		shouldExist := name == "deadbeef00000000" || name == "other-file.incomplete"
@@ -118,6 +123,35 @@ func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 		if _, err := os.Stat(full); err != nil {
 			t.Errorf("repoB: %q was removed but should survive (body=%q): %v", name, body, err)
 		}
+	}
+}
+
+// TestCleanupJobPartFiles_HFCacheCompletedTemp verifies the narrow HF
+// cache window where the downloader has renamed complete bytes to the
+// tmp-<sha> dst but StoreDownloadedFile has not yet moved them into the
+// final blob.
+func TestCleanupJobPartFiles_HFCacheCompletedTemp(t *testing.T) {
+	cacheDir := t.TempDir()
+	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--repo", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(blobsDir, "tmp-shaA")
+	if err := os.WriteFile(dst, []byte("complete temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blobsDir, "deadbeef00000000"), []byte("final blob"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("completed temp dst should be removed (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(blobsDir, "deadbeef00000000")); err != nil {
+		t.Errorf("final blob should survive cleanup: %v", err)
 	}
 }
 
