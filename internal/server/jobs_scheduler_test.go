@@ -5,6 +5,7 @@ package server
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,7 +32,13 @@ func TestJobManager_DispatchRespectsMaxActive(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("q%d", i)
 		ct := now.Add(time.Duration(i) * time.Second)
-		mgr.jobs[id] = &Job{ID: id, Repo: "x/y", Status: JobStatusQueued, CreatedAt: ct}
+		mgr.jobs[id] = &Job{
+			ID:             id,
+			Repo:           "x/y",
+			Status:         JobStatusQueued,
+			CreatedAt:      ct,
+			partialFilesMu: &sync.Mutex{}, // mirror CreateJob so runJob can use it
+		}
 	}
 	mgr.dispatchLocked()
 

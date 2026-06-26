@@ -6,73 +6,13 @@ package hfdownloader
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
-// TestIsPartialFileName exercises the suffix matcher used by the
-// legacy-mode walker. The HF cache mode doesn't call this function —
-// its in-flight files all share the "tmp-" prefix and are identified
-// on that basis (see cleanupHFCachePartFiles).
-//
-// The matcher accepts three suffix families that downloadSingle and
-// downloadMultipart produce: .parts.json, .part, and .part-N where N
-// is any non-empty run of digits (matching fmt.Sprintf("%s.part-%02d",
-// dst, i) for Concurrency<100 and the wider %d form for
-// Concurrency>=100).
-func TestIsPartialFileName(t *testing.T) {
-	cases := []struct {
-		name string
-		want bool
-	}{
-		// Real partial-file names.
-		{"tmp-abc123def456.part", true},
-		{"tmp-abc123def456.part-00", true},
-		{"tmp-abc123def456.part-01", true},
-		{"tmp-abc123def456.part-99", true},
-		{"tmp-abc123def456.parts.json", true},
-		// Multipart with 3+ digits — Concurrency>=100 produces these
-		// because fmt %02d grows past two digits rather than truncating.
-		{"tmp-abc123def456.part-100", true},
-		{"tmp-abc123def456.part-127", true},
-		{"model.bin.part-9999", true},
-		// Multipart with a long path before (e.g. sanitized repo-relative
-		// name when SHA256 is empty).
-		{"tmp-config_json.part-00", true},
-		// Generic legacy-mode names.
-		{"model.bin.part", true},
-		{"model.bin.part-00", true},
-		{"model.bin.parts.json", true},
-		// Should NOT match: completed blobs, metadata, symlinks, dirs.
-		{"abc123def456", false},
-		{"abc123def456.incomplete", false},
-		{"abc123def456.incomplete.meta", false},
-		{"refs", false},
-		{"snapshots", false},
-		// Should NOT match: .part- where the suffix is not a digit run.
-		{"tmp-abc.part-", false},   // empty suffix
-		{"tmp-abc.part-0a", false}, // non-digit character
-		{"tmp-abc.part-a0", false}, // leading non-digit
-		{"tmp-abc.part--0", false}, // double dash
-		// Should NOT match: .part followed by something other than a
-		// digit run (e.g. part-xyz from a totally different scheme).
-		{"foo.part-xyz", false},
-		{"foo.part-", false},
-		// Edge cases.
-		{"", false},
-		{".part", true},       // bare suffix is allowed (defensive)
-		{".part.json", false}, // unrelated JSON
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isPartialFileName(tc.name); got != tc.want {
-				t.Errorf("isPartialFileName(%q) = %v, want %v", tc.name, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestIsAllDigits covers the small helper that the partial-name matcher
-// relies on for the .part-N family.
+// TestIsAllDigits covers the small helper that the legacy
+// per-dst cleanup uses to recognize the multipart part-N suffix
+// (matching fmt's %02d / %d output).
 func TestIsAllDigits(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -102,51 +42,47 @@ func TestIsAllDigits(t *testing.T) {
 	}
 }
 
-// TestCleanupJobPartFiles_HFCache verifies that the HF-cache variant
-// removes every tmp-* file in the repo's blobs directory and leaves
-// other repos' blobs alone.
-//
-// The HF cache mode identifies in-flight files by the "tmp-" prefix
-// alone (set by Download() at the per-file dst assignment). The
-// downloader never writes a real blob to a tmp-*-named file and never
-// writes a tmp-*-named file outside this prefix scheme, so suffix
-// matching is unnecessary.
-func TestCleanupJobPartFiles_HFCache(t *testing.T) {
+// TestCleanupJobPartFiles_HFCache_Empty exercises the no-op path
+// when the dst list is empty: nothing to do, no error.
+func TestCleanupJobPartFiles_HFCache_Empty(t *testing.T) {
+	if err := CleanupJobPartFiles(Settings{CacheDir: t.TempDir()}, nil); err != nil {
+		t.Errorf("CleanupJobPartFiles with empty dsts returned err: %v", err)
+	}
+}
+
+// TestCleanupJobPartFiles_HFCacheDst verifies that the HF cache path
+// removes exactly the dsts in the input list (the in-flight tmp-<sha>
+// files) and nothing else. The blobs dir may contain other repos'
+// tmp- files, completed blobs, and .incomplete files from the cache
+// layer's separate scheme — none of those should be touched.
+func TestCleanupJobPartFiles_HFCacheDst(t *testing.T) {
 	cacheDir := t.TempDir()
 	hubDir := filepath.Join(cacheDir, "hub")
 	blobsA := filepath.Join(hubDir, "models--owner--repoA", "blobs")
 	blobsB := filepath.Join(hubDir, "models--owner--repoB", "blobs")
-	if err := os.MkdirAll(blobsA, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(blobsB, 0o755); err != nil {
-		t.Fatal(err)
+	for _, d := range []string{blobsA, blobsB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// In repoA: a mix of tmp-* partials (including a 3-digit part index
-	// for Concurrency>=100), a non-tmp file that should be left alone,
-	// and an .incomplete file from the cache layer's separate scheme.
+	// In repoA: two tmp- partials (dsts to be removed) plus a
+	// completed blob and a .incomplete file (must survive).
 	filesA := map[string]string{
-		"tmp-shaA.part":         "partial A",
-		"tmp-shaA.part-00":      "part 0 A",
-		"tmp-shaA.part-01":      "part 1 A",
-		"tmp-shaA.part-100":     "part 100 A (high Concurrency)",
-		"tmp-shaA.parts.json":   `{"layout":"v1"}`,
-		"tmp-pathA.part":        "synth path A",
-		"deadbeef00000000":      "completed blob A", // real blob, must NOT be deleted
-		"other-file.incomplete": "incomplete A",     // belongs to .incomplete scheme, not us
+		"tmp-shaA":              "partial A — owned by Job A",
+		"tmp-shaB":              "partial B — owned by Job A (different file)",
+		"deadbeef00000000":      "completed blob A",
+		"other-file.incomplete": "incomplete A",
 	}
 	for name, body := range filesA {
 		if err := os.WriteFile(filepath.Join(blobsA, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	// In repoB: a partial file that must be left alone when we only
-	// clean repoA.
+	// In repoB: a tmp- file owned by a different (concurrent) job
+	// that must NOT be touched by Job A's cleanup.
 	filesB := map[string]string{
-		"tmp-shaB.part":    "partial B",
-		"tmp-shaB.part-00": "part 0 B",
+		"tmp-shaC": "partial C — owned by concurrent Job B",
 	}
 	for name, body := range filesB {
 		if err := os.WriteFile(filepath.Join(blobsB, name), []byte(body), 0o644); err != nil {
@@ -155,156 +91,127 @@ func TestCleanupJobPartFiles_HFCache(t *testing.T) {
 	}
 
 	settings := Settings{CacheDir: cacheDir}
-	job := Job{Repo: "owner/repoA"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
+	dsts := []string{
+		filepath.Join(blobsA, "tmp-shaA"),
+		filepath.Join(blobsA, "tmp-shaB"),
+	}
+	if err := CleanupJobPartFiles(settings, dsts); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 
-	// repoA: tmp-* partials gone (including the 3-digit one), completed
-	// blob and .incomplete file remain.
-	for name := range filesA {
-		_, err := os.Stat(filepath.Join(blobsA, name))
+	// repoA: only the two listed dsts were removed; completed blob
+	// and .incomplete file survive.
+	for name, body := range filesA {
+		full := filepath.Join(blobsA, name)
 		shouldExist := name == "deadbeef00000000" || name == "other-file.incomplete"
+		_, err := os.Stat(full)
 		switch {
 		case shouldExist && err != nil:
 			t.Errorf("repoA: %q was removed but should survive: %v", name, err)
 		case !shouldExist && err == nil:
-			t.Errorf("repoA: %q survived cleanup but should have been removed", name)
+			t.Errorf("repoA: %q survived cleanup but should have been removed (body=%q)", name, body)
 		}
 	}
-
-	// repoB: nothing changed.
-	for name := range filesB {
-		if _, err := os.Stat(filepath.Join(blobsB, name)); err != nil {
-			t.Errorf("repoB: %q was removed but should survive: %v", name, err)
+	// repoB: nothing changed (concurrent job's partial is safe).
+	for name, body := range filesB {
+		full := filepath.Join(blobsB, name)
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("repoB: %q was removed but should survive (body=%q): %v", name, body, err)
 		}
 	}
 }
 
-// TestCleanupJobPartFiles_LocalRepo verifies that LocalRepo reroutes
-// the cleanup target to the destination folder, not the source repo.
-func TestCleanupJobPartFiles_LocalRepo(t *testing.T) {
+// TestCleanupJobPartFiles_HFCacheMissing verifies that missing dsts
+// (e.g. the downloader already removed the tmp- file as part of its
+// own finalization between allocate and finalize) are not an error.
+func TestCleanupJobPartFiles_HFCacheMissing(t *testing.T) {
 	cacheDir := t.TempDir()
-	hubDir := filepath.Join(cacheDir, "hub")
-	blobsLocal := filepath.Join(hubDir, "models--target--final", "blobs")
-	blobsUpstream := filepath.Join(hubDir, "models--upstream--mmproj", "blobs")
-	for _, d := range []string{blobsLocal, blobsUpstream} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(blobsLocal, "tmp-ll.part"), []byte("x"), 0o644); err != nil {
+	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--r", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(blobsUpstream, "tmp-up.part"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
+	// dsts point at files that don't exist on disk.
+	dsts := []string{
+		filepath.Join(blobsDir, "tmp-nope1"),
+		filepath.Join(blobsDir, "tmp-nope2"),
 	}
-
-	settings := Settings{CacheDir: cacheDir}
-	job := Job{Repo: "upstream/mmproj", LocalRepo: "target/final"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Fatalf("CleanupJobPartFiles: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(blobsLocal, "tmp-ll.part")); !os.IsNotExist(err) {
-		t.Errorf("local repo partial not removed: stat err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(blobsUpstream, "tmp-up.part")); err != nil {
-		t.Errorf("upstream repo partial was removed but should survive: %v", err)
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, dsts); err != nil {
+		t.Errorf("CleanupJobPartFiles with missing dsts returned err: %v", err)
 	}
 }
 
-// TestCleanupJobPartFiles_Legacy verifies that legacy (OutputDir) mode
-// walks the per-repo subtree and removes in-flight partial files
-// (.part, .part-N for any N digits, .parts.json) when no
-// corresponding "final" file is present — the pause → cancel path.
-//
-// The walker has a defensive guard: when a partial's base name (the
-// name with the suffix stripped) exists as a real file alongside the
-// partial, the partial is treated as a stale downloader leftover and
-// skipped, to protect legitimately named user files (see
-// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles). This test
-// exercises the in-flight case where the final is NOT present, which
-// is the common case after a paused → cancel.
-func TestCleanupJobPartFiles_Legacy(t *testing.T) {
+// TestCleanupJobPartFiles_LegacyDst verifies that the legacy path
+// removes the partials for exactly the dsts in the input list:
+// dst+".part", any dst+".part-NN", and dst+".parts.json". A
+// concurrent job's partials in the same per-repo subtree are not
+// touched.
+func TestCleanupJobPartFiles_LegacyDst(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "legacy-repo")
-	subDir := filepath.Join(repoDir, "sub", "deeper")
-	if err := os.MkdirAll(subDir, 0o755); err != nil {
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// model.bin.* partials: the final model.bin does NOT exist, so all
-	// of them are treated as in-flight and removed.
-	//
-	// config.json.part: the final config.json DOES exist, so the
-	// defensive guard skips this partial (left behind as a stale
-	// leftover, but the user's completed config.json is safe).
+	// Job A owns "model.bin" and "config.json". Their partials
+	// (the dsts we're cleaning up) and the multipart layout
+	// metadata should be removed.
 	files := map[string]string{
-		filepath.Join(repoDir, "model.bin.part"):       "partial",
-		filepath.Join(repoDir, "model.bin.part-00"):    "p0",
-		filepath.Join(repoDir, "model.bin.part-100"):   "p100 (high Concurrency)",
-		filepath.Join(repoDir, "model.bin.parts.json"): "layout",
-		filepath.Join(subDir, "config.json.part"):      "cfg partial — final exists, guard skips",
-		filepath.Join(subDir, "config.json"):           "completed cfg",
-		filepath.Join(repoDir, "README.md"):            "completed readme",
-		filepath.Join(repoDir, "data.bin"):             "completed data",
+		"model.bin.part":       "A/model.bin partial",
+		"model.bin.part-00":    "A/model.bin multipart part 0",
+		"model.bin.part-100":   "A/model.bin multipart part 100",
+		"model.bin.parts.json": "A/model.bin layout",
+		"config.json.part":     "A/config.json partial",
+		// Concurrent Job B owns "weights.bin" — must not be touched.
+		"weights.bin.part":    "B/weights.bin partial",
+		"weights.bin.part-00": "B/weights.bin multipart part 0",
+		// Completed files must not be touched.
+		"model.bin":   "A/model.bin completed",
+		"config.json": "A/config.json completed",
+		"weights.bin": "B/weights.bin completed",
+		"README.md":   "completed readme",
 	}
-	for path, body := range files {
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	settings := Settings{OutputDir: tmpDir}
-	job := Job{Repo: "owner/legacy-repo"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
+	dsts := []string{
+		filepath.Join(repoDir, "model.bin"),
+		filepath.Join(repoDir, "config.json"),
+	}
+	if err := CleanupJobPartFiles(settings, dsts); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 
-	// In-flight partials removed; the partial guarded by an existing
-	// final is left behind; completed files survive.
-	wantGone := []string{
-		filepath.Join(repoDir, "model.bin.part"),
-		filepath.Join(repoDir, "model.bin.part-00"),
-		filepath.Join(repoDir, "model.bin.part-100"),
-		filepath.Join(repoDir, "model.bin.parts.json"),
-	}
-	for _, p := range wantGone {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("in-flight partial not removed (%v): %v", p, err)
-		}
-	}
-	wantKept := []string{
-		filepath.Join(subDir, "config.json.part"), // guard skipped this
-		filepath.Join(subDir, "config.json"),
-		filepath.Join(repoDir, "README.md"),
-		filepath.Join(repoDir, "data.bin"),
-	}
-	for _, p := range wantKept {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("file removed but should survive (%v): %v", p, err)
+	// Job A's partials gone; Job B's partials and all completed
+	// files survive.
+	for name, body := range files {
+		full := filepath.Join(repoDir, name)
+		isPartialForA := name == "model.bin.part" || name == "model.bin.part-00" ||
+			name == "model.bin.part-100" || name == "model.bin.parts.json" ||
+			name == "config.json.part"
+		_, err := os.Stat(full)
+		switch {
+		case isPartialForA && err == nil:
+			t.Errorf("partial %q survived cleanup but should have been removed (body=%q)", name, body)
+		case !isPartialForA && err != nil:
+			t.Errorf("file %q was removed but should survive (body=%q): %v", name, body, err)
 		}
 	}
 }
 
-// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles exercises the
-// defensive guard against the "user file literally named .part" risk
-// identified in the open-code-review of PR #50: a partial-file suffix
-// can also be a legitimate user file name. The walker must not delete
-// such a file even when no "final" sibling exists, OR it must at least
-// not delete it when a sibling does exist.
+// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles covers the
+// "user file literally named .part" defensive concern: the helper
+// only touches files matching one of the dsts in the input list.
+// A user file `weights.part` that does not correspond to any tracked
+// dst is left alone, even when no other files are present.
 //
-// The guard implemented here has two parts:
-//  1. Empty base (bare ".part" / ".parts.json") is never a downloader
-//     artifact — always skip.
-//  2. When the base is non-empty, stat the base in the same directory;
-//     if it exists, the partial is most likely a stale leftover and is
-//     skipped. If the base does not exist, the partial is treated as
-//     in-flight and removed (the pause → cancel path).
-//
-// This test covers the "base exists" branch: a file named weights.part
-// alongside a sibling weights must survive cleanup even though it
-// looks like a partial.
+// The previous scan-based implementation could have deleted a
+// "weights.part" file with a coincidental name; the per-dst list
+// makes the cleanup strictly scoped to the job's own in-flight
+// files and the standalone case is structurally impossible.
 func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "user-named")
@@ -312,166 +219,106 @@ func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// User-named files: each has a "base" sibling that the guard will
-	// detect, so the partial is skipped. This is the safe direction:
-	// leave a file alone rather than risk destroying user data.
+	// User-named files that should never be deleted by cleanup.
+	// None of them correspond to the dsts in the input list.
 	userFiles := map[string]string{
-		filepath.Join(repoDir, "weights.part"):    "user data, has sibling weights",
-		filepath.Join(repoDir, "weights"):         "sibling final",
-		filepath.Join(repoDir, "data.parts.json"): "user config, has sibling data",
-		filepath.Join(repoDir, "data"):            "sibling final",
-		filepath.Join(repoDir, "shard.part-03"):   "user shard, has sibling shard",
-		filepath.Join(repoDir, "shard"):           "sibling final",
-		filepath.Join(repoDir, ".part"):           "bare .part, empty base",
+		"weights.part":    "user data, has no partial counterpart",
+		"data.parts.json": "user config, has no multipart counterpart",
+		"shard.part-03":   "user shard, has no multipart counterpart",
+		".part":           "bare .part, empty base",
+		"somefile":        "random file",
 	}
 	for path, body := range userFiles {
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(repoDir, path), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
+	// Job A only had model.bin as an in-flight file; it completed
+	// successfully and the dst is no longer in the tracking set.
+	// Cleanup is invoked with an empty dst list, so nothing is
+	// removed. The user files must survive regardless.
 	settings := Settings{OutputDir: tmpDir}
-	job := Job{Repo: "owner/user-named"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Fatalf("CleanupJobPartFiles: %v", err)
+	if err := CleanupJobPartFiles(settings, nil); err != nil {
+		t.Fatalf("CleanupJobPartFiles with empty dsts: %v", err)
 	}
-
-	// Everything survives — each partial either has a sibling final
-	// (guard skips) or has an empty base (downloaders never produce
-	// those, so we don't touch them).
-	for path := range userFiles {
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("user file removed but should survive (%v): %v", path, err)
+	for path, body := range userFiles {
+		full := filepath.Join(repoDir, path)
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("user file %q was removed (body=%q): %v", path, body, err)
 		}
 	}
 }
 
-// TestStripPartialSuffix covers the small helper that the legacy
-// walker relies on to compute the "final" file path before deciding
-// whether to delete a partial.
-func TestStripPartialSuffix(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"model.bin.part", "model.bin"},
-		{"model.bin.parts.json", "model.bin"},
-		{"model.bin.part-00", "model.bin"},
-		{"model.bin.part-100", "model.bin"},
-		{"model.bin.part-9999", "model.bin"},
-		// Bare suffixes (no base) — the downloader never produces
-		// these, but stripPartialSuffix still strips them.
-		{".part", ""},
-		{".parts.json", ""},
-		// Names without a recognized suffix — returned unchanged.
-		{"config.json", "config.json"},
-		{"README.md", "README.md"},
-		{"", ""},
-		// Edge: .part- with empty digit run (not produced by the
-		// downloader, but the helper should not panic).
-		{"foo.part-", "foo"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			if got := stripPartialSuffix(tc.in); got != tc.want {
-				t.Errorf("stripPartialSuffix(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestCleanupJobPartFiles_DefaultIsHFCache locks in the fix for the
-// mode-detection review issue: when neither CacheDir nor OutputDir is
-// set, Download() defaults to HF cache mode, so CleanupJobPartFiles
-// must do the same.
-func TestCleanupJobPartFiles_DefaultIsHFCache(t *testing.T) {
-	// Point CacheDir at a temp dir so the test can use it as the HF
-	// cache root; then call CleanupJobPartFiles with an empty Settings
-	// while overriding DefaultCacheDir via the local CacheDir path.
-	//
-	// We can't change DefaultCacheDir() (it's a function, not a
-	// variable), so we set CacheDir on the Settings and assert that the
-	// legacy path is NOT taken when OutputDir is empty. The clean way
-	// to check that is to give the test a fake legacy output dir and
-	// a fake HF cache dir, then verify which one is touched.
-	cacheDir := t.TempDir()
-	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--default-mode", "blobs")
-	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(blobsDir, "tmp-x.part"), []byte("p"), 0o644); err != nil {
-		t.Fatal(err)
+// TestOnPartialFile_TracksLifecycle is a unit test of the
+// per-file tracker wiring used by JobManager.runJob. The downloader
+// fires the callback with finalize=false on allocate and finalize=true
+// on success; a concurrent reader (representing cleanupPausedJobPartFiles)
+// must see exactly the dsts that are still partial after a run.
+func TestOnPartialFile_TracksLifecycle(t *testing.T) {
+	var mu sync.Mutex
+	partial := make(map[string]struct{})
+	// cleared mirrors the real callback's nil-map guard: a callback
+	// fired after cleanup nilled the map must not panic and must
+	// not resurrect the dst.
+	var cleared bool
+	callback := func(dst string, finalize bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cleared {
+			return
+		}
+		if finalize {
+			delete(partial, dst)
+		} else {
+			partial[dst] = struct{}{}
+		}
 	}
 
-	// A separate tree that must NOT be touched if the helper correctly
-	// picks HF cache mode (because legacy would walk OutputDir/<repo>).
-	legacyRoot := t.TempDir()
-	legacyRepo := filepath.Join(legacyRoot, "owner", "default-mode")
-	if err := os.MkdirAll(legacyRepo, 0o755); err != nil {
-		t.Fatal(err)
+	// Simulate the downloader lifecycle for three files.
+	callback("/dst/a", false)
+	callback("/dst/b", false)
+	callback("/dst/c", false)
+	mu.Lock()
+	if got := len(partial); got != 3 {
+		t.Errorf("after 3 allocates: len(partial) = %d, want 3", got)
 	}
-	if err := os.WriteFile(filepath.Join(legacyRepo, "stale.part"), []byte("p"), 0o644); err != nil {
-		t.Fatal(err)
+	mu.Unlock()
+
+	// File b completes; c is finalized; a is left partial.
+	callback("/dst/b", true)
+	callback("/dst/c", true)
+	mu.Lock()
+	if _, ok := partial["/dst/a"]; !ok {
+		t.Errorf("a should still be in partial set")
+	}
+	if _, ok := partial["/dst/b"]; ok {
+		t.Errorf("b should be removed from partial set")
+	}
+	if _, ok := partial["/dst/c"]; ok {
+		t.Errorf("c should be removed from partial set")
+	}
+	mu.Unlock()
+
+	// Cleanup snapshots the remaining in-flight dsts and clears the
+	// map so a late callback from a goroutine that started before
+	// the snapshot cannot add the dst back.
+	mu.Lock()
+	snapshot := make([]string, 0, len(partial))
+	for dst := range partial {
+		snapshot = append(snapshot, dst)
+	}
+	cleared = true
+	mu.Unlock()
+	if len(snapshot) != 1 || snapshot[0] != "/dst/a" {
+		t.Errorf("snapshot = %v, want [/dst/a]", snapshot)
 	}
 
-	settings := Settings{CacheDir: cacheDir, OutputDir: ""}
-	job := Job{Repo: "owner/default-mode"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Fatalf("CleanupJobPartFiles: %v", err)
+	// Stale callback after cleanup: ignored (no panic, no mutation).
+	callback("/dst/a", false)
+	mu.Lock()
+	if !cleared {
+		t.Errorf("cleared flag flipped back to false")
 	}
-
-	// HF cache: tmp-* partial removed.
-	if _, err := os.Stat(filepath.Join(blobsDir, "tmp-x.part")); !os.IsNotExist(err) {
-		t.Errorf("HF cache partial not removed: %v", err)
-	}
-	// Legacy tree: untouched (because OutputDir is empty → HF cache branch).
-	if _, err := os.Stat(filepath.Join(legacyRepo, "stale.part")); err != nil {
-		t.Errorf("legacy tree was touched despite empty OutputDir: %v", err)
-	}
-}
-
-// TestCleanupJobPartFiles_LegacyDefaultsOutputDir mirrors the way
-// Download() defaults OutputDir to "Storage" in legacy mode. A caller
-// that builds a minimal Settings (no OutputDir) should still see
-// cleanup find files at <cwd>/Storage/<repo>/.
-func TestCleanupJobPartFiles_LegacyDefaultsOutputDir(t *testing.T) {
-	// We can't change the working directory of the test process
-	// safely, but we can verify the helper's behaviour by exercising
-	// it with an OutputDir already set: this asserts the helper
-	// delegates to the SafeJoin path with whatever OutputDir it
-	// received. The actual "Storage" default is exercised in the
-	// surrounding call site; here we just confirm the no-OutputDir
-	// path resolves to "Storage" without panicking.
-	settings := Settings{OutputDir: ""}
-	job := Job{Repo: "owner/never-touched"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Errorf("CleanupJobPartFiles with empty OutputDir returned err: %v", err)
-	}
-	// Nothing on disk to assert: a missing "Storage" directory is the
-	// expected outcome (best-effort no-op).
-}
-
-// TestCleanupJobPartFiles_NoBlobsDir is best-effort: the function must
-// not return an error when the repo's blobs directory does not exist
-// yet (e.g. a job that was paused before the first download was
-// scheduled).
-func TestCleanupJobPartFiles_NoBlobsDir(t *testing.T) {
-	cacheDir := t.TempDir()
-	settings := Settings{CacheDir: cacheDir}
-	job := Job{Repo: "owner/never-touched"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Errorf("CleanupJobPartFiles on missing blobs dir returned err: %v", err)
-	}
-}
-
-// TestCleanupJobPartFiles_BadRepo ensures that an invalid repo ID is a
-// no-op rather than an error — callers must not be punished for a
-// config that we couldn't have written to disk in the first place.
-func TestCleanupJobPartFiles_BadRepo(t *testing.T) {
-	cacheDir := t.TempDir()
-	settings := Settings{CacheDir: cacheDir}
-	job := Job{Repo: "no-slash"}
-	if err := CleanupJobPartFiles(settings, job); err != nil {
-		t.Errorf("CleanupJobPartFiles on bad repo ID returned err: %v", err)
-	}
+	mu.Unlock()
 }

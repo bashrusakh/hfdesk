@@ -469,6 +469,15 @@ LOOP:
 				return
 			}
 
+			// Register the per-file destination with the caller's in-flight
+			// tracker before any bytes hit disk. If the goroutine exits
+			// (cancel, pause, error) before the matching finalize call below,
+			// the dst stays in the caller's set and is the exact set of
+			// partial files the caller may safely remove.
+			if cfg.OnPartialFile != nil {
+				cfg.OnPartialFile(dst, false)
+			}
+
 			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
 
 			// Create a copy with updated RelativePath for progress display
@@ -544,6 +553,15 @@ LOOP:
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			} else {
 				finalSHA256 = it.SHA256
+			}
+
+			// File is now at its final location; the partial (dst in HF
+			// cache, dst+".part*" in legacy) is gone. Deregister so the
+			// caller's in-flight set reflects "this dst is no longer
+			// partial". Errors below this point do not un-finalize; the
+			// file is on disk and the only thing at risk is metadata.
+			if cfg.OnPartialFile != nil {
+				cfg.OnPartialFile(dst, true)
 			}
 
 			// Add to manifest with actual LFS info from API and final SHA256
@@ -645,53 +663,79 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	}
 }
 
-// CleanupJobPartFiles removes all partial download artifacts (.part,
-// .part-NN, .parts.json) associated with a specific job's repo. It is
-// intended for server-side use when the download goroutine has already
-// exited (e.g. pause → cancel, or pause → dismiss) and the in-flight
-// cleanup callback in cleanupPartialsOnCancel will not run.
+// CleanupJobPartFiles removes the partial download artifacts
+// associated with the given list of per-file destinations. The
+// caller is responsible for tracking which dsts belong to a given
+// run via Settings.OnPartialFile; this helper then removes exactly
+// those dsts' partial files without scanning the repo, so a
+// concurrent job downloading into the same blobs directory or
+// output subtree is not disturbed.
 //
-// The function reuses the same path-resolution logic as Download():
-//   - HF cache mode: scans only the repo's BlobsDir() for tmp-* partial
-//     files; safe to call while another concurrent download is using a
-//     different repo, because each repo's blobs directory is distinct.
-//   - Legacy mode (OutputDir set, CacheDir empty): walks the per-repo
-//     output subtree under OutputDir/<repo>/ and removes any
-//     .part/.part-N/.parts.json files found there.
+// For each dst, the helper removes the partial files the downloader
+// would have produced for that dst:
+//   - HF cache: dst itself (the in-flight tmp-<sha> file).
+//   - Legacy: dst+".part", dst+".part-NN" (any digit run),
+//     dst+".parts.json".
 //
-// All operations are best-effort: missing directories are not an error,
-// and individual file removal failures are logged and skipped.
-func CleanupJobPartFiles(settings Settings, job Job) error {
-	// Match Download()'s mode detection exactly (downloader's useHFCache
-	// rule at the top of this file): HF cache is the default when neither
-	// flag is set explicitly.
+// settings determines the mode (HF cache vs legacy) the same way
+// Download() does: HF cache is the default when neither CacheDir nor
+// OutputDir is set.
+//
+// All operations are best-effort: missing files are not an error, and
+// individual file removal failures are logged and skipped.
+func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
-	if !useHFCache {
-		return cleanupLegacyPartFiles(settings, job)
-	}
-	return cleanupHFCachePartFiles(settings, job)
-}
-
-func cleanupHFCachePartFiles(settings Settings, job Job) error {
-	cacheDir := settings.CacheDir
-	if cacheDir == "" {
-		cacheDir = DefaultCacheDir()
-	}
-	// LocalRepo can reroute the destination folder (e.g. mmproj from an
-	// upstream repo saved under the target model's directory); use it when
-	// present so we look in the same place the downloader wrote to.
-	repoID := job.Repo
-	if job.LocalRepo != "" {
-		repoID = job.LocalRepo
-	}
-	cache := NewHFCache(cacheDir, 0)
-	repoDir, err := cache.Repo(repoID, RepoTypeFromJob(job))
-	if err != nil {
-		// Invalid repo ID — nothing to clean up.
+	if useHFCache {
+		for _, dst := range dsts {
+			removeHFCachePartial(dst)
+		}
 		return nil
 	}
-	blobsDir := repoDir.BlobsDir()
-	entries, err := os.ReadDir(blobsDir)
+	for _, dst := range dsts {
+		if err := removeLegacyPartials(dst); err != nil {
+			log.Printf("warning: cleanup partials for %s: %v", dst, err)
+		}
+	}
+	return nil
+}
+
+// removeHFCachePartial removes the in-flight tmp-<sha> file at dst.
+// The downloader writes the in-flight bytes to dst directly (the
+// "tmp-" prefix is the in-flight marker in the blobs dir), so a
+// remove of dst is the right primitive. dst is already validated as
+// residing inside the blobs dir at allocation time in Download().
+func removeHFCachePartial(dst string) {
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst, err)
+	}
+}
+
+// removeLegacyPartials removes all partial-file artifacts associated
+// with a single legacy-mode dst: the single-part partial
+// (dst+".part"), any multipart parts (dst+".part-NN" for N being any
+// non-empty run of digits, to match the downloader's %02d / %d
+// format), and the multipart layout metadata (dst+".parts.json").
+//
+// dst is already validated as residing inside the output subtree at
+// allocation time in Download() (via SafeJoin), so removing the
+// derived partial paths cannot escape the output directory. The
+// glob-style match for .part-NN is intentionally narrow: only the
+// recognized suffix family and a digit run, so a coincidentally
+// named "weights.part" or similar user file with a different base
+// (which would not appear in dsts) is not touched.
+func removeLegacyPartials(dst string) error {
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
+	}
+	// Multipart parts: glob the dst's directory for files matching
+	// dst+".part-NNN" pattern. This matches what downloadMultipart
+	// produced (the parts have indices 0..n-1).
+	dir := filepath.Dir(dst)
+	base := filepath.Base(dst)
+	prefix := base + ".part-"
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -703,147 +747,23 @@ func cleanupHFCachePartFiles(settings Settings, job Job) error {
 			continue
 		}
 		name := entry.Name()
-		// The downloader writes in-flight bytes to tmp-<sha256> (or
-		// tmp-<sanitized path> when no SHA is known) — see Download() at
-		// the per-file dst assignment. Completed blobs use the raw SHA256
-		// as their name (no prefix), and the cache layer's .incomplete
-		// scheme uses a different convention. So the "tmp-" prefix is the
-		// in-flight marker in this directory and is sufficient on its own
-		// to identify a partial file — no suffix parsing needed.
-		if !strings.HasPrefix(name, "tmp-") {
+		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
-		if err := os.Remove(filepath.Join(blobsDir, name)); err != nil && !os.IsNotExist(err) {
-			log.Printf("warning: cleanup partial file %s: %v", filepath.Join(blobsDir, name), err)
+		suffix := name[len(prefix):]
+		if !isAllDigits(suffix) {
+			continue
 		}
+		full := filepath.Join(dir, name)
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup partial file %s: %v", full, err)
+		}
+	}
+	// Multipart layout metadata.
+	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".parts.json", err)
 	}
 	return nil
-}
-
-func cleanupLegacyPartFiles(settings Settings, job Job) error {
-	// Default OutputDir the same way Download() does, so callers that
-	// pass an empty OutputDir (e.g. server callers that built a minimal
-	// Settings) get the same path the downloader would have written to.
-	outputDir := settings.OutputDir
-	if outputDir == "" {
-		outputDir = "Storage"
-	}
-	repoForPath := job.Repo
-	if job.LocalRepo != "" {
-		repoForPath = job.LocalRepo
-	}
-	// SafeJoin is the same guard Download() uses; replicate it so a
-	// symlink can't be used to escape OutputDir during the walk.
-	safeRoot, err := SafeJoin(outputDir, repoForPath)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(safeRoot); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return filepath.WalkDir(safeRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// Skip files we can't stat; continue with the walk.
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !isPartialFileName(d.Name()) {
-			return nil
-		}
-		// Defensive: a partial-file suffix can also be a legitimate user
-		// file name (e.g. a repo with files literally named
-		// "weights.part" or "data.parts.json"). The downloader always
-		// appends the suffix to a non-empty dst (downloadSingle /
-		// downloadMultipart never produce ".part" or ".parts.json" with
-		// an empty base), so a partial with an empty base is by
-		// definition not a downloader artifact — skip it.
-		//
-		// When the base is non-empty, stat the corresponding "final" file
-		// (the name with the partial suffix stripped). If it exists
-		// alongside the partial, the partial is almost certainly stale
-		// downloader output that the rename failed to clean up; skip it
-		// rather than risk deleting data we don't understand. If the
-		// final is not present, the partial is either in-flight
-		// (paused mid-download — the bug this fix targets) or a
-		// standalone user file with no final; the in-flight case is the
-		// common one, and the standalone case is rare enough to accept
-		// the small data-loss risk in exchange for cleaning up the
-		// partials that the downloader would have cleaned up itself if
-		// the goroutine were still running.
-		base := stripPartialSuffix(d.Name())
-		if base == "" {
-			return nil
-		}
-		finalPath := filepath.Join(filepath.Dir(path), base)
-		if _, err := os.Stat(finalPath); err == nil {
-			return nil
-		} else if !os.IsNotExist(err) {
-			log.Printf("warning: stat %s: %v", finalPath, err)
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			log.Printf("warning: cleanup partial file %s: %v", path, err)
-		}
-		return nil
-	})
-}
-
-// isPartialFileName matches the partial-file suffixes produced by
-// downloadSingle and downloadMultipart in legacy (OutputDir) mode. The
-// downloader uses three suffix families: .part (single-part download /
-// multipart assembly staging), .parts.json (multipart layout metadata),
-// and .part-N where N is any non-empty run of digits (matching
-// fmt.Sprintf("%s.part-%02d", dst, i) for Concurrency<100 and the wider
-// %d form for Concurrency>=100).
-//
-// Used by the legacy-mode walker only — the HF cache mode doesn't need
-// suffix parsing because its in-flight files all share the "tmp-" prefix
-// (see cleanupHFCachePartFiles).
-func isPartialFileName(name string) bool {
-	if name == "" {
-		return false
-	}
-	if strings.HasSuffix(name, ".parts.json") {
-		return true
-	}
-	if strings.HasSuffix(name, ".part") {
-		return true
-	}
-	if !strings.Contains(name, ".part-") {
-		return false
-	}
-	idx := strings.LastIndex(name, ".part-")
-	return isAllDigits(name[idx+len(".part-"):])
-}
-
-// stripPartialSuffix returns name with the trailing partial-file
-// suffix removed, or name unchanged if no recognized suffix is
-// present. Used by the legacy walker to look up the corresponding
-// "final" file path before deciding whether to delete a partial.
-//
-// Returns name unchanged (and lets the caller detect that no strip
-// happened by comparing the result to the input) when the suffix is
-// ambiguous or absent, so the caller's stat-then-skip logic falls
-// through to the default delete path.
-func stripPartialSuffix(name string) string {
-	if name == "" {
-		return name
-	}
-	if strings.HasSuffix(name, ".parts.json") {
-		return strings.TrimSuffix(name, ".parts.json")
-	}
-	if strings.HasSuffix(name, ".part") {
-		return strings.TrimSuffix(name, ".part")
-	}
-	if strings.Contains(name, ".part-") {
-		idx := strings.LastIndex(name, ".part-")
-		return name[:idx]
-	}
-	return name
 }
 
 // isAllDigits reports whether s is a non-empty run of ASCII digits.

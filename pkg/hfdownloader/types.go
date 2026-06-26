@@ -242,6 +242,28 @@ type Settings struct {
 	// When nil (default), partial files are preserved for resume (useful
 	// for pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
+
+	// OnPartialFile, when non-nil, is called for every per-file
+	// destination the downloader touches during a run. The downloader
+	// calls it with finalize=false once a per-file goroutine has
+	// computed its destination path and decided to download (not
+	// skip), and again with finalize=true once the file is fully
+	// assembled and renamed to its final location. A cancel/pause that
+	// lands between those two calls leaves the dst in the caller's
+	// tracking set, which is exactly the set of partial files that
+	// belong to this run and are safe to remove if the run ends in a
+	// terminal non-resumable state.
+	//
+	// The callback runs from per-file downloader goroutines. Callers
+	// are responsible for serializing access to whatever state they
+	// maintain.
+	//
+	// The downloader does not interpret the callback's return; it is
+	// fire-and-forget. The downloader still calls
+	// CleanupPartialsOnCancel for the in-flight direct-cancel cleanup
+	// path; OnPartialFile is for callers that need per-job scoping
+	// after the run ends (e.g. the server's pause → cancel cleanup).
+	OnPartialFile func(dst string, finalize bool)
 }
 
 // ProgressEvent represents a progress update during download.

@@ -5,6 +5,7 @@
 ### Fixed
 
 - Delete stale `.part` files when a paused job is cancelled or dismissed, preventing disk leak from the pause → cancel and pause → dismiss sequences (#49)
+- Scope partial-file cleanup to per-job in-flight files so a pause → cancel / pause → dismiss never touches a concurrent job's partials in the same repo (e.g. model + mmproj downloaded in parallel)
 
 ## [1.2.0] - 2026-06-26
 
