@@ -71,6 +71,25 @@ type Job struct {
 	// speedRunStart is when this run's first speed sample was taken; the
 	// whole-run average rate measured from it anchors the ETA estimate.
 	speedRunStart time.Time `json:"-"`
+
+	// partialFilesPtr is a pointer to the per-job in-flight file
+	// tracker map. The downloader callback updates the map through
+	// the pointer; the pointer itself is only reassigned by runJob
+	// (which holds m.mu) and by cleanupPausedJobPartFiles (which
+	// also holds the per-job partialFilesMu). The pointer
+	// indirection lets cloneJobLocked take a m.mu-protected
+	// snapshot of the pointer (no race on the pointer word
+	// itself) and then deep-copy the pointed-to map under
+	// partialFilesMu.
+	//
+	// partialFilesMu is a *sync.Mutex (not a value) so that
+	// cloneJobLocked's shallow copy reads a single pointer word
+	// instead of the mutex's internal state, which the runtime
+	// mutates with atomics. Reading the mutex's internal state
+	// concurrently with a Lock/Unlock would race with those
+	// atomics; reading the pointer does not.
+	partialFilesPtr *map[string]struct{}
+	partialFilesMu  *sync.Mutex `json:"-"`
 }
 
 // speedSample is one (time, cumulative-transferred-bytes) point in a job's
@@ -167,6 +186,15 @@ func (m *JobManager) LoadState() {
 		if j.Status == JobStatusRunning || j.Status == JobStatusQueued {
 			j.Status = JobStatusPaused
 		}
+		// Allocate the in-flight tracker mutex. It isn't serialized
+		// to JSON (json:"-") so it comes back nil after a round trip;
+		// without this, cloneJobLocked would panic when listing or
+		// cloning a restored job. The tracker map itself stays nil
+		// — restored jobs have no live downloader goroutine that
+		// would populate it.
+		if j.partialFilesMu == nil {
+			j.partialFilesMu = &sync.Mutex{}
+		}
 		m.jobs[j.ID] = j
 	}
 	m.mu.Unlock()
@@ -202,12 +230,48 @@ func generateID() string {
 // of the live Job stored in m.jobs. Slice fields are deep-copied so that
 // subsequent mutations of the live job's slices can't leak through a shared
 // backing array.
+//
+// The in-flight partial-file tracker is held via partialFilesPtr, a
+// pointer that the downloader callback reassigns atomically (under
+// partialFilesMu) when starting a new run. The clone reads
+// partialFilesPtr under partialFilesMu to avoid racing the
+// downloader callback, then deep-copies the pointed-to map under
+// the same lock. The downloader can keep mutating the live map
+// concurrently; the clone gets an independent snapshot.
 func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j == nil {
 		return nil
 	}
+
+	// Step 1: read partialFilesPtr under partialFilesMu so the
+	// downloader callback's reassignment of the pointer can't race
+	// with our read. We then drop the lock and do the rest of the
+	// shallow copy under m.mu. The pointed-to map is what mutates
+	// concurrently; we won't touch it until step 3, when we re-acquire
+	// the lock for the deep copy. partialFilesMu can be nil for
+	// jobs constructed in tests via &Job{...} without going through
+	// CreateJob; in that case there's no tracker to snapshot.
+	var trackerPtr *map[string]struct{}
+	if j.partialFilesMu != nil {
+		j.partialFilesMu.Lock()
+		trackerPtr = j.partialFilesPtr
+		j.partialFilesMu.Unlock()
+	}
+
+	// Now safe to do the shallow copy under m.mu: the only field
+	// we read that mutates outside m.mu is partialFilesPtr, and
+	// we've snapshotted it.
 	clone := *j
 	clone.cancel = nil
+	clone.partialFilesPtr = nil
+	if j.partialFilesMu != nil {
+		// Leave clone.partialFilesMu pointing at the same mutex the
+		// live job uses; the clone has no need to acquire it.
+	} else {
+		clone.partialFilesMu = nil
+	}
+
+	// Step 2: deep-copy slices/pointers.
 	if j.Filters != nil {
 		clone.Filters = append([]string(nil), j.Filters...)
 	}
@@ -224,6 +288,27 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j.EndedAt != nil {
 		t := *j.EndedAt
 		clone.EndedAt = &t
+	}
+
+	// Step 3: deep-copy the in-flight tracker under partialFilesMu.
+	// The downloader callback may swap the underlying map between
+	// the read in step 1 and now; we re-read under the lock and
+	// fall back to the snapshot if it changed. If the mutex was
+	// never allocated, the tracker is empty.
+	if j.partialFilesMu != nil {
+		j.partialFilesMu.Lock()
+		ptr := j.partialFilesPtr
+		if ptr == nil {
+			ptr = trackerPtr
+		}
+		if ptr != nil {
+			cloneMap := make(map[string]struct{}, len(*ptr))
+			for dst := range *ptr {
+				cloneMap[dst] = struct{}{}
+			}
+			clone.partialFilesPtr = &cloneMap
+		}
+		j.partialFilesMu.Unlock()
 	}
 	return &clone
 }
@@ -316,6 +401,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		Status:     JobStatusQueued,
 		CreatedAt:  time.Now(),
 		Progress:   JobProgress{},
+		// partialFilesMu is allocated at job creation so cloneJobLocked
+		// can read it without a nil check; the tracker map is left
+		// nil until runJob wires it.
+		partialFilesMu: &sync.Mutex{},
 	}
 
 	m.jobs[job.ID] = job
@@ -370,6 +459,8 @@ func (m *JobManager) CancelJob(id string) bool {
 		return false
 	}
 
+	wasPaused := job.Status == JobStatusPaused
+
 	if job.cancel != nil {
 		job.cancel()
 	}
@@ -378,6 +469,14 @@ func (m *JobManager) CancelJob(id string) bool {
 	job.EndedAt = &now
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+
+	// If the job was paused, the download goroutine has already exited and
+	// won't run its cleanup callback. Clean up partial .part files here so
+	// pause → cancel does not leak disk space. Direct-cancel jobs are
+	// already handled by the in-flight callback in runJob.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(job)
+	}
 
 	m.notifyListeners(snapshot)
 	go m.saveState()
@@ -557,16 +656,30 @@ func (m *JobManager) DismissJob(id string) bool {
 // reason a dismissal failed, for use by the HTTP handler.
 func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	job, ok := m.jobs[id]
 	if !ok {
+		m.mu.Unlock()
 		return DismissJobNotFound, nil
 	}
 	if !isTerminalJobStatus(job.Status) {
-		return DismissJobStillActive, job
+		snapshot := m.cloneJobLocked(job)
+		m.mu.Unlock()
+		return DismissJobStillActive, snapshot
 	}
+	wasPaused := job.Status == JobStatusPaused
+	snapshot := m.cloneJobLocked(job)
 	delete(m.jobs, id)
-	return DismissJobOK, job
+	m.mu.Unlock()
+
+	// A dismissed paused job is a pure data-loss event: the runJob goroutine
+	// has already exited, so no in-flight cleanup will run, and the user
+	// can't resume a job that's no longer in the map. Remove partial
+	// files now so they don't pile up across many dismissed jobs.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(snapshot)
+	}
+
+	return DismissJobOK, snapshot
 }
 
 // Subscribe adds a listener for job updates.
@@ -1000,6 +1113,51 @@ func (m *JobManager) runJob(job *Job) {
 		return job.Status == JobStatusCancelled || !active
 	}
 
+	// Reset the per-job in-flight file set for this run. The downloader
+	// calls this back from per-file goroutines to register every dst it
+	// touches and to deregister each one once the file is finalized.
+	// After Download() returns, the set contains exactly the dsts of
+	// files that are still partial on disk for this job — which is the
+	// set cleanupPausedJobPartFiles needs to remove precisely, without
+	// disturbing a concurrent job that is downloading into the same
+	// blobs directory or output subtree.
+	//
+	// We lock partialFilesMu (not m.mu) to swap the pointer, because
+	// the callback captures the same mutex and any concurrent
+	// allocate or finalize call from a still-running per-file
+	// goroutine is using the same lock. The pointer indirection
+	// (partialFilesPtr) lets cloneJobLocked snapshot the pointer
+	// under partialFilesMu and then deep-copy the pointed-to map
+	// under the same lock, while the downloader callback can
+	// continue to mutate the same map through the pointer.
+	//
+	// partialFilesMu is allocated in CreateJob and in the
+	// state-restore path, so by the time runJob runs the pointer
+	// is stable — we don't write it here. The callback (and the
+	// cleanupPausedJobPartFiles path) treat a nil pointer as
+	// "stale, ignore", so a race where the cleanup runs after
+	// runJob has finished is benign.
+	newMap := make(map[string]struct{})
+	job.partialFilesMu.Lock()
+	job.partialFilesPtr = &newMap
+	job.partialFilesMu.Unlock()
+	settings.OnPartialFile = func(dst string, finalize bool) {
+		job.partialFilesMu.Lock()
+		defer job.partialFilesMu.Unlock()
+		if job.partialFilesPtr == nil {
+			// Defensive: if a stale callback fires after the pointer
+			// was cleared (e.g. cleanupPausedJobPartFiles nilled it,
+			// or a goroutine that started before this run's reset
+			// finishes its allocate/finalize call), ignore it.
+			return
+		}
+		if finalize {
+			delete(*job.partialFilesPtr, dst)
+		} else {
+			(*job.partialFilesPtr)[dst] = struct{}{}
+		}
+	}
+
 	// Local mode: write real files into job.LocalDir instead of the HF cache
 	// layout. job.LocalDir is already resolved (per-request or server-global).
 	// Clearing CacheDir forces flat-file output.
@@ -1060,4 +1218,76 @@ func (m *JobManager) runJob(job *Job) {
 			}
 		}()
 	}
+}
+
+// cleanupPausedJobPartFiles removes partial .part files for a job whose
+// runJob goroutine has already exited (paused jobs whose downloader
+// goroutine returned without doing cleanup). The downloader's in-flight
+// cleanup callback cannot reach these files because the goroutine is
+// gone, so the server performs the cleanup itself using the same path
+// resolution the downloader would have used.
+//
+// Used by CancelJob (pause → cancel) and DismissJobResult (pause →
+// dismiss). All errors are best-effort: missing directories and per-file
+// removal failures are logged and skipped inside CleanupJobPartFiles.
+//
+// dsts comes from the per-job in-flight tracker populated by
+// Settings.OnPartialFile during the most recent runJob. If the
+// tracker is empty (e.g. the run was short and the downloader
+// never got to register any dsts, or every dst was finalized
+// successfully), cleanup is a no-op.
+func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
+	dsts := m.snapshotPartialFiles(job)
+	// Clear the tracker before deleting the files so a stale callback
+	// (one that fires from a goroutine that was still mid-call when we
+	// snapshotted) cannot add the dst back to the map after we've
+	// already decided to delete it. The downloader guard inside the
+	// callback treats a nil pointer as "stale, ignore". nil
+	// partialFilesMu (e.g. for jobs constructed in tests without
+	// going through CreateJob) is a no-op.
+	if job.partialFilesMu != nil {
+		job.partialFilesMu.Lock()
+		job.partialFilesPtr = nil
+		job.partialFilesMu.Unlock()
+	}
+	if len(dsts) == 0 {
+		return
+	}
+	cfg := m.snapshotConfig()
+	settings := hfdownloader.Settings{
+		CacheDir: cfg.CacheDir,
+	}
+	if job.LocalDir != "" {
+		settings.OutputDir = job.LocalDir
+		settings.CacheDir = ""
+	} else if settings.CacheDir == "" {
+		settings.CacheDir = hfdownloader.DefaultCacheDir()
+	}
+	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
+		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, err)
+	}
+}
+
+// snapshotPartialFiles returns a stable copy of the job's in-flight
+// dst set under the per-job mutex. Callers (cleanupPausedJobPartFiles)
+// use this to capture the set at the moment of cancel/dismiss, so the
+// downloader can keep mutating the set on a future resume without
+// racing the cleanup.
+func (m *JobManager) snapshotPartialFiles(job *Job) []string {
+	if job.partialFilesMu == nil {
+		return nil
+	}
+	job.partialFilesMu.Lock()
+	defer job.partialFilesMu.Unlock()
+	if job.partialFilesPtr == nil {
+		return nil
+	}
+	if len(*job.partialFilesPtr) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(*job.partialFilesPtr))
+	for dst := range *job.partialFilesPtr {
+		out = append(out, dst)
+	}
+	return out
 }

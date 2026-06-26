@@ -469,6 +469,15 @@ LOOP:
 				return
 			}
 
+			// Register the per-file destination with the caller's in-flight
+			// tracker before any bytes hit disk. If the goroutine exits
+			// (cancel, pause, error) before the matching finalize call below,
+			// the dst stays in the caller's set and is the exact set of
+			// partial files the caller may safely remove.
+			if cfg.OnPartialFile != nil {
+				cfg.OnPartialFile(dst, false)
+			}
+
 			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
 
 			// Create a copy with updated RelativePath for progress display
@@ -544,6 +553,15 @@ LOOP:
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			} else {
 				finalSHA256 = it.SHA256
+			}
+
+			// File is now at its final location; the partial (dst in HF
+			// cache, dst+".part*" in legacy) is gone. Deregister so the
+			// caller's in-flight set reflects "this dst is no longer
+			// partial". Errors below this point do not un-finalize; the
+			// file is on disk and the only thing at risk is metadata.
+			if cfg.OnPartialFile != nil {
+				cfg.OnPartialFile(dst, true)
 			}
 
 			// Add to manifest with actual LFS info from API and final SHA256
@@ -643,6 +661,167 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	if err := removeMultipartResumeFiles(dst); err != nil {
 		log.Printf("warning: cleanup multipart resume files for %s: %v", dst, err)
 	}
+}
+
+// CleanupJobPartFiles removes the partial download artifacts
+// associated with the given list of per-file destinations. The
+// caller is responsible for tracking which dsts belong to a given
+// run via Settings.OnPartialFile; this helper then removes exactly
+// those dsts' partial files without scanning the repo, so a
+// concurrent job downloading into the same blobs directory or
+// output subtree is not disturbed.
+//
+// For each dst, the helper removes the partial files the downloader
+// would have produced for that dst: dst+".part", dst+".part-NN"
+// (any digit run), and dst+".parts.json". In HF cache mode, dst is
+// the temporary tmp-<sha> path under blobs/, so the helper also removes
+// dst itself for the window after the single/multipart downloader has
+// renamed the completed bytes to tmp-<sha> but before StoreDownloadedFile
+// has moved them into the final blob.
+//
+// settings determines the mode (HF cache vs legacy) the same way
+// Download() does: HF cache is the default when neither CacheDir nor
+// OutputDir is set.
+//
+// All operations are best-effort: missing files are not an error, and
+// individual file removal failures are logged and skipped.
+func CleanupJobPartFiles(settings Settings, dsts []string) error {
+	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
+	root := cleanupRoot(settings, useHFCache)
+	for _, dst := range dsts {
+		if !pathWithinRoot(root, dst) {
+			log.Printf("warning: skip cleanup for out-of-root partial dst %s", dst)
+			continue
+		}
+		if err := removePartialArtifacts(dst); err != nil {
+			log.Printf("warning: cleanup partials for %s: %v", dst, err)
+		}
+		if useHFCache {
+			removeHFCacheTemp(dst)
+		}
+	}
+	return nil
+}
+
+func cleanupRoot(settings Settings, useHFCache bool) string {
+	if useHFCache {
+		return NewHFCache(settings.CacheDir, 0).HubDir()
+	}
+	return settings.OutputDir
+}
+
+func pathWithinRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	if resolvedRoot, err := filepath.EvalSymlinks(absRoot); err == nil {
+		absRoot = resolvedRoot
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absPath)); err == nil {
+		absPath = filepath.Join(resolvedParent, filepath.Base(absPath))
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// removeHFCacheTemp removes the completed-but-not-yet-stored tmp-<sha>
+// file at dst. The downloader normally writes partial bytes to
+// dst+".part" / dst+".part-NN" first, then renames assembled bytes to
+// dst before StoreDownloadedFile moves them into the final blob. dst is
+// already validated as residing inside the blobs dir at allocation time
+// in Download().
+func removeHFCacheTemp(dst string) {
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst, err)
+	}
+}
+
+// removePartialArtifacts removes all partial-file artifacts associated
+// with a single downloader dst: the single-part partial (dst+".part"),
+// any multipart parts (dst+".part-NN" for N being any non-empty run of
+// digits, to match the downloader's %02d / %d format), and the
+// multipart layout metadata (dst+".parts.json").
+//
+// dst is already validated as residing inside the output subtree at
+// allocation time in Download() (via SafeJoin), so removing the
+// derived partial paths cannot escape the output directory. The
+// glob-style match for .part-NN is intentionally narrow: only the
+// recognized suffix family and a digit run, so a coincidentally
+// named "weights.part" or similar user file with a different base
+// (which would not appear in dsts) is not touched.
+func removePartialArtifacts(dst string) error {
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
+	}
+	// Multipart parts: glob the dst's directory for files matching
+	// dst+".part-NNN" pattern. This matches what downloadMultipart
+	// produced (the parts have indices 0..n-1).
+	dir := filepath.Dir(dst)
+	base := filepath.Base(dst)
+	prefix := base + ".part-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		suffix := name[len(prefix):]
+		if !isAllDigits(suffix) {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup partial file %s: %v", full, err)
+		}
+	}
+	// Multipart layout metadata.
+	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".parts.json", err)
+	}
+	return nil
+}
+
+// isAllDigits reports whether s is a non-empty run of ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// RepoTypeFromJob returns the RepoType matching job.IsDataset.
+func RepoTypeFromJob(job Job) RepoType {
+	if job.IsDataset {
+		return RepoTypeDataset
+	}
+	return RepoTypeModel
 }
 
 // downloadSingle downloads a file in a single request.
