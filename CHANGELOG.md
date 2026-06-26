@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-26
+
+### Added
+
+- Download deduplication is now case-insensitive: files differing only by case are merged in the plan to prevent duplicate jobs (#46)
+- Speed bar with live usage gauge on the Downloads tab: shows current transfer throughput and cap utilization (#43)
+- Active Jobs page redesigned — Clean Monitor layout with Compact Strip for finished, paused, and cancelled jobs
+- Speed presets: 5, 15, 25, 50 MB/s, and unlimited
+
+### Fixed
+
+- Preserve `DownloadedBytes` on job resume so progress does not drop back to zero after a pause, retry, or server restart (#42)
+- Align speed bar with the combined redesign layout; fix pause freeze that stopped live speed updates
+- Constrain speed bar max-width to prevent overflow on narrow viewports
+- Match speed bar width to downloads section via shared `.jobs-page` container; fix overlap with app footer, white input background, and hidden spinner elements
+- Speed bar now uses variable width matching the downloads section, removing the previous fixed max-width
+- Delete stale `.part` files on explicit download cancel (#47)
+
+### Security
+
+- Fix CodeQL P0-P5 alerts across the codebase; path-safety hardening in `pkg/hfdownloader` (#45)
+
 ## [1.1.0] - 2026-06-26
 
 ### Added
