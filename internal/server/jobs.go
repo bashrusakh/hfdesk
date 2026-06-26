@@ -989,6 +989,16 @@ func (m *JobManager) runJob(job *Job) {
 		SpeedLimiter:       m.speedLimiter,
 	}
 
+	// When the downloader's context is cancelled, check whether this was
+	// an explicit cancel (user clicked Cancel) vs a pause or limit-enforce.
+	// Only explicit cancels should delete partial .part files; pauses and
+	// re-queues must preserve them for resume.
+	settings.CleanupPartialsOnCancel = func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return job.Status == JobStatusCancelled
+	}
+
 	// Local mode: write real files into job.LocalDir instead of the HF cache
 	// layout. job.LocalDir is already resolved (per-request or server-global).
 	// Clearing CacheDir forces flat-file output.
