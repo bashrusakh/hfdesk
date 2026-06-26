@@ -655,17 +655,18 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 //   - HF cache mode: scans only the repo's BlobsDir() for tmp-* partial
 //     files; safe to call while another concurrent download is using a
 //     different repo, because each repo's blobs directory is distinct.
-//   - Legacy mode (settings.OutputDir set, settings.CacheDir empty):
-//     walks the per-repo output subtree under OutputDir/<repo>/ and
-//     removes any .part/.part-NN/.parts.json files found there.
+//   - Legacy mode (OutputDir set, CacheDir empty): walks the per-repo
+//     output subtree under OutputDir/<repo>/ and removes any
+//     .part/.part-N/.parts.json files found there.
 //
 // All operations are best-effort: missing directories are not an error,
 // and individual file removal failures are logged and skipped.
 func CleanupJobPartFiles(settings Settings, job Job) error {
-	// Match the mode-detection in Download(): legacy mode is selected
-	// when CacheDir is empty (OutputDir may be set or defaulted to
-	// "Storage" by Download itself, so we accept either signal here).
-	if settings.CacheDir == "" {
+	// Match Download()'s mode detection exactly (downloader's useHFCache
+	// rule at the top of this file): HF cache is the default when neither
+	// flag is set explicitly.
+	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
+	if !useHFCache {
 		return cleanupLegacyPartFiles(settings, job)
 	}
 	return cleanupHFCachePartFiles(settings, job)
@@ -702,10 +703,14 @@ func cleanupHFCachePartFiles(settings Settings, job Job) error {
 			continue
 		}
 		name := entry.Name()
+		// The downloader writes in-flight bytes to tmp-<sha256> (or
+		// tmp-<sanitized path> when no SHA is known) — see Download() at
+		// the per-file dst assignment. Completed blobs use the raw SHA256
+		// as their name (no prefix), and the cache layer's .incomplete
+		// scheme uses a different convention. So the "tmp-" prefix is the
+		// in-flight marker in this directory and is sufficient on its own
+		// to identify a partial file — no suffix parsing needed.
 		if !strings.HasPrefix(name, "tmp-") {
-			continue
-		}
-		if !isPartialFileName(name) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(blobsDir, name)); err != nil && !os.IsNotExist(err) {
@@ -716,13 +721,20 @@ func cleanupHFCachePartFiles(settings Settings, job Job) error {
 }
 
 func cleanupLegacyPartFiles(settings Settings, job Job) error {
+	// Default OutputDir the same way Download() does, so callers that
+	// pass an empty OutputDir (e.g. server callers that built a minimal
+	// Settings) get the same path the downloader would have written to.
+	outputDir := settings.OutputDir
+	if outputDir == "" {
+		outputDir = "Storage"
+	}
 	repoForPath := job.Repo
 	if job.LocalRepo != "" {
 		repoForPath = job.LocalRepo
 	}
 	// SafeJoin is the same guard Download() uses; replicate it so a
 	// symlink can't be used to escape OutputDir during the walk.
-	safeRoot, err := SafeJoin(settings.OutputDir, repoForPath)
+	safeRoot, err := SafeJoin(outputDir, repoForPath)
 	if err != nil {
 		return err
 	}
@@ -750,34 +762,41 @@ func cleanupLegacyPartFiles(settings Settings, job Job) error {
 	})
 }
 
-// isPartialFileName reports whether name is one of the partial-file
-// suffixes produced by downloadSingle / downloadMultipart: .part,
-// .part-NN (e.g. .part-00), and .parts.json.
+// isPartialFileName matches the partial-file suffixes produced by
+// downloadSingle and downloadMultipart in legacy (OutputDir) mode. The
+// downloader uses three suffix families: .part (single-part download /
+// multipart assembly staging), .parts.json (multipart layout metadata),
+// and .part-N where N is any non-empty run of digits (matching
+// fmt.Sprintf("%s.part-%02d", dst, i) for Concurrency<100 and the wider
+// %d form for Concurrency>=100).
+//
+// Used by the legacy-mode walker only — the HF cache mode doesn't need
+// suffix parsing because its in-flight files all share the "tmp-" prefix
+// (see cleanupHFCachePartFiles).
 func isPartialFileName(name string) bool {
 	if name == "" {
 		return false
 	}
-	// .parts.json is the multipart layout metadata file.
 	if strings.HasSuffix(name, ".parts.json") {
 		return true
 	}
-	// Bare .part (single-part download / multipart assembly staging).
 	if strings.HasSuffix(name, ".part") {
 		return true
 	}
-	// .part-NN where NN is a zero-padded two-digit number, matching the
-	// fmt.Sprintf("%s.part-%02d", dst, i) format used in
-	// downloadMultipart.
 	if !strings.Contains(name, ".part-") {
 		return false
 	}
 	idx := strings.LastIndex(name, ".part-")
-	suffix := name[idx+len(".part-"):]
-	if len(suffix) != 2 {
+	return isAllDigits(name[idx+len(".part-"):])
+}
+
+// isAllDigits reports whether s is a non-empty run of ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
 		return false
 	}
-	for i := 0; i < 2; i++ {
-		if suffix[i] < '0' || suffix[i] > '9' {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
 	}
