@@ -235,6 +235,13 @@ type Settings struct {
 	// single process-wide limiter so the cap applies across all running jobs;
 	// library callers can leave it nil and just set MaxSpeed.
 	SpeedLimiter *RateLimiter
+
+	// CleanupPartialsOnCancel, when non-nil, is called when the download
+	// context is cancelled. If it returns true, the downloader deletes any
+	// partial .part files (.part, .part-NN, .parts.json) before returning.
+	// When nil (default), partial files are preserved for resume (useful
+	// for pause/resume workflows).
+	CleanupPartialsOnCancel func() bool
 }
 
 // ProgressEvent represents a progress update during download.

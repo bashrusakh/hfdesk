@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -625,6 +626,25 @@ LOOP:
 	return nil
 }
 
+// cleanupPartialsOnCancel removes partial download artifacts (.part,
+// .part-NN, .parts.json) for dst when the caller's cancel-cleanup
+// callback reports that the context was cancelled for a non-resumable
+// reason (explicit cancel, not pause).
+func cleanupPartialsOnCancel(cfg Settings, dst string) {
+	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
+		return
+	}
+	// dst is already guarded by SafeJoin for local mode and SHA256/BlobsDir
+	// derivation for HF cache mode upstream in Download().
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
+	}
+	if err := removeMultipartResumeFiles(dst); err != nil {
+		log.Printf("warning: cleanup multipart resume files for %s: %v", dst, err)
+	}
+}
+
 // downloadSingle downloads a file in a single request.
 //
 // Resume behavior: if a .part file already exists from a previous interrupted
@@ -671,6 +691,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	for attempt := 0; attempt <= cfg.Retries; attempt++ {
 		select {
 		case <-ctx.Done():
+			out.Close()
+			cleanupPartialsOnCancel(cfg, dst)
 			return ctx.Err()
 		default:
 		}
@@ -726,8 +748,14 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if attempt < cfg.Retries {
 			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
 			if d := retry.Next(); !sleepCtx(ctx, d) {
+				out.Close()
+				cleanupPartialsOnCancel(cfg, dst)
 				return ctx.Err()
 			}
+		} else if ctx.Err() != nil {
+			out.Close()
+			cleanupPartialsOnCancel(cfg, dst)
+			return ctx.Err()
 		}
 	}
 	return lastErr
@@ -929,6 +957,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// assembly loop from stitching an incomplete part set into a corrupt
 	// final file and deleting the partial bytes the next resume needs.
 	if ctx.Err() != nil {
+		cleanupPartialsOnCancel(cfg, dst)
 		return ctx.Err()
 	}
 
