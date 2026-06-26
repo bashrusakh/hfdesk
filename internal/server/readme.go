@@ -249,9 +249,28 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid url", "")
 		return
 	}
-	if !strings.EqualFold(u.Host, readmeEndpointHost(cfg.Endpoint)) {
+	// Derive BOTH scheme and host (with port) from the configured endpoint, not
+	// from the user-supplied URL. Forwarding the user's scheme could downgrade
+	// to plain HTTP and leak the bearer token, and comparing only the hostname
+	// breaks endpoints that use an explicit port. (SSRF guard.)
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = "https://huggingface.co"
+	}
+	ep, err := url.Parse(endpoint)
+	if err != nil || ep.Host == "" {
+		writeError(w, http.StatusInternalServerError, "Invalid endpoint configuration", "")
+		return
+	}
+	if !strings.EqualFold(u.Host, ep.Host) {
 		writeError(w, http.StatusForbidden, "Asset host not allowed", "")
 		return
+	}
+	safeURL := &url.URL{
+		Scheme:   ep.Scheme,
+		Host:     ep.Host,
+		Path:     u.Path,
+		RawQuery: u.RawQuery,
 	}
 
 	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
@@ -261,7 +280,7 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	client.Timeout = 30 * time.Second
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, safeURL.String(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Bad request", err.Error())
 		return
