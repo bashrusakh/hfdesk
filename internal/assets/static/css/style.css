@@ -1262,7 +1262,7 @@ a {
 
 .jobs-list {
   flex: 1;
-  padding: 0 0 40px;
+  padding: 0 40px 40px;
   overflow-y: auto;
 }
 
@@ -1697,19 +1697,12 @@ a {
 }
 
 /* Speed bar — downloads page */
-.jobs-page {
-  max-width: 820px;
-  margin: 0 auto;
-  padding: 0;
-  width: 100%;
-}
-
 .speed-bar {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 16px;
-  margin-bottom: 20px;
+  margin: 0 40px 20px;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -2884,15 +2877,14 @@ a {
   }
 
   .speed-bar {
+    margin: 0 20px 16px;
     padding: 12px 20px;
   }
 
   .analyze-container,
+  .jobs-list,
   .cache-list {
     padding: 0 20px 20px;
-  }
-  .jobs-list {
-    padding: 0 0 20px;
   }
 
   .download-grid {
