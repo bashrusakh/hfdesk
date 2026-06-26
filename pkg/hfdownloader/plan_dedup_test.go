@@ -73,10 +73,10 @@ func TestPlanRepo_CaseDuplicateMMProj(t *testing.T) {
 	}
 	got := plan.Items[0].RelativePath
 	// The first occurrence (what the HF API returns first) is the F16 variant;
-	// that one wins the case-insensitive dedup. Either F16 or f16 is acceptable
-	// here — the test only requires that we keep one of them.
-	if got != "mmproj-Qwythos-9B-Claude-Mythos-5-1M-F16.gguf" && got != "mmproj-Qwythos-9B-Claude-Mythos-5-1M-f16.gguf" {
-		t.Errorf("plan kept unexpected path %q", got)
+	// pin the "first wins" contract so a regression to "last wins" fails.
+	const want = "mmproj-Qwythos-9B-Claude-Mythos-5-1M-F16.gguf"
+	if got != want {
+		t.Errorf("plan kept %q, want first case-variant %q", got, want)
 	}
 }
 

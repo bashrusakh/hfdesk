@@ -215,11 +215,10 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// Treat them as the same logical file and keep the first occurrence,
 		// matching what the HF API returns first. The exact-path dedup above
 		// doesn't catch this because the two paths differ only in case.
-		key := strings.ToLower(rel)
-		if _, dup := seenLower[key]; dup {
+		if _, dup := seenLower[relLower]; dup {
 			continue
 		}
-		seenLower[key] = struct{}{}
+		seenLower[relLower] = struct{}{}
 
 		items = append(items, PlanItem{
 			RelativePath: rel,
