@@ -1330,8 +1330,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const totalBytes = p.totalBytes || 0;
     const downloadedBytes = p.downloadedBytes || 0;
     const pct = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
-    const speed = p.bytesPerSecond || 0;
     const status = job.status || 'queued';
+    const speed = (status === 'running' && p.bytesPerSecond) || 0;
     const jobLabels = getJobQuantLabel(job);
 
     // Status badge. While running, a "finalizing" phase (post-download

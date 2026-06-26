@@ -212,22 +212,20 @@
         </header>
 
         <div class="speed-bar" id="speedBar" title="Total download speed cap across all jobs. Applies instantly.">
-          <div class="speed-bar-main">
-            <label class="speed-bar-label" for="maxSpeedJobs">Speed limit</label>
-            <div class="speed-presets" id="speedPresetsJobs">
-              <button type="button" class="speed-btn" data-mbit="2">2</button>
-              <button type="button" class="speed-btn" data-mbit="4">4</button>
-              <button type="button" class="speed-btn" data-mbit="6">6</button>
-              <button type="button" class="speed-btn" data-mbit="10">10</button>
-              <button type="button" class="speed-btn" data-mbit="0">&infin;</button>
-            </div>
-            <div class="speed-bar-divider"></div>
-            <div class="speed-field">
-              <input type="number" id="maxSpeedJobs" min="0" step="0.5" placeholder="&infin;">
-              <span class="speed-unit">Mbit/s</span>
-            </div>
+          <span class="speed-label">Speed limit</span>
+          <div class="speed-presets" id="speedPresetsJobs">
+            <button type="button" class="speed-btn" data-mbit="2">2</button>
+            <button type="button" class="speed-btn" data-mbit="4">4</button>
+            <button type="button" class="speed-btn" data-mbit="6">6</button>
+            <button type="button" class="speed-btn" data-mbit="10">10</button>
+            <button type="button" class="speed-btn" data-mbit="0">&infin;</button>
           </div>
-          <span class="speed-bar-current">Current: <strong id="speedGaugeText">0.0 Mbit/s</strong></span>
+          <div class="speed-divider"></div>
+          <div class="speed-input">
+            <input type="number" id="maxSpeedJobs" min="0" step="0.5" placeholder="&infin;">
+            <span class="speed-unit">Mbit/s</span>
+          </div>
+          <span class="speed-current">Current: <strong id="speedGaugeText">0.0 Mbit/s</strong></span>
         </div>
 
         <div id="jobsList" class="jobs-list">
