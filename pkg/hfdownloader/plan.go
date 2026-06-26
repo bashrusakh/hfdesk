@@ -54,6 +54,12 @@ func PathInside(base, target string) bool {
 // etc.). Use this instead of a bare filepath.Join wherever rel is remote- or
 // user-influenced.
 func SafeJoin(base, rel string) (string, error) {
+	// Reject absolute or volume-qualified rel: filepath.Join would otherwise
+	// silently rewrite them under base (or, on Windows, splice in a drive
+	// letter), hiding what is really an absolute-path input.
+	if filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" {
+		return "", fmt.Errorf("path %q must be relative", rel)
+	}
 	dst := filepath.Clean(filepath.Join(base, rel))
 	if !PathInside(base, dst) {
 		return "", fmt.Errorf("path %q escapes %q", rel, base)

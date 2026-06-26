@@ -214,7 +214,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 
 	// If the caller provides an explicit path, only honour it when it matches
 	// one of the configured directories (prevents arbitrary fs-stat via the API).
-	path := ""
+	var path string
 	if requested := r.URL.Query().Get("path"); requested != "" {
 		for _, c := range configured {
 			if c != "" && filepath.Clean(requested) == filepath.Clean(c) {
@@ -222,9 +222,12 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-	}
-	// Fall back to the first non-empty configured directory.
-	if path == "" {
+		if path == "" {
+			writeError(w, http.StatusBadRequest, "Invalid path", "path must be one of the configured directories")
+			return
+		}
+	} else {
+		// No explicit path: fall back to the first non-empty configured directory.
 		for _, c := range configured {
 			if c != "" {
 				path = c

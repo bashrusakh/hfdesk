@@ -1291,7 +1291,11 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	// If we have snapshots, walk the latest one to get file names
 	if len(snapshots) > 0 {
 		// Use the first snapshot (usually the most recent)
-		snapshotDir := repoDir.SnapshotDir(snapshots[0])
+		snapshotDir, sderr := repoDir.SnapshotDir(snapshots[0])
+		if sderr != nil {
+			writeError(w, http.StatusBadRequest, "Invalid snapshot", sderr.Error())
+			return
+		}
 		filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() {
 				return nil

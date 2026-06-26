@@ -116,22 +116,17 @@ type RepoDir struct {
 // Repo returns a RepoDir for the given repository.
 // repoID should be in the format "owner/name".
 func (c *HFCache) Repo(repoID string, repoType RepoType) (*RepoDir, error) {
-	parts := strings.SplitN(repoID, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	// Reuse the single repo-ID validator so cache lookups reject the same
+	// traversal/separator inputs as the HTTP handlers (e.g. "../foo").
+	if !IsValidModelName(repoID) {
 		return nil, fmt.Errorf("invalid repo ID: %q (expected owner/name)", repoID)
 	}
-	owner, name := parts[0], parts[1]
-	// Reject path separators inside owner/name: dirName() joins them as a single
-	// directory component using "--", so a "/" in name would split the component
-	// and allow traversal (e.g. "owner/a/../../etc" → dirName contains a "/").
-	if strings.ContainsAny(owner, "/\\\x00") || strings.ContainsAny(name, "/\\\x00") {
-		return nil, fmt.Errorf("invalid repo ID %q: owner/name must not contain path separators", repoID)
-	}
+	parts := strings.SplitN(repoID, "/", 2)
 	return &RepoDir{
 		cache:    c,
 		repoType: repoType,
-		owner:    owner,
-		name:     name,
+		owner:    parts[0],
+		name:     parts[1],
 	}, nil
 }
 
@@ -184,26 +179,14 @@ func (r *RepoDir) IncompleteMetaPath(sha256 string) string {
 
 // RefPath returns the path to a ref file (e.g., refs/main).
 // It validates that the resolved path stays inside the refs directory.
-func (r *RepoDir) RefPath(ref string) string {
-	refsDir := r.RefsDir()
-	resolved, err := SafeJoin(refsDir, ref)
-	if err != nil {
-		// Defensive fallback: collapse to the base name so a crafted ref cannot
-		// escape refs/.
-		return filepath.Join(filepath.Clean(refsDir), filepath.Base(ref))
-	}
-	return resolved
+func (r *RepoDir) RefPath(ref string) (string, error) {
+	return SafeJoin(r.RefsDir(), ref)
 }
 
 // SnapshotDir returns the path to a snapshot directory for a given commit.
 // It validates that the resolved path stays inside the snapshots directory.
-func (r *RepoDir) SnapshotDir(commit string) string {
-	snapshotsDir := r.SnapshotsDir()
-	resolved, err := SafeJoin(snapshotsDir, commit)
-	if err != nil {
-		return filepath.Join(filepath.Clean(snapshotsDir), filepath.Base(commit))
-	}
-	return resolved
+func (r *RepoDir) SnapshotDir(commit string) (string, error) {
+	return SafeJoin(r.SnapshotsDir(), commit)
 }
 
 // EnsureDirs creates all necessary directories for this repo.
@@ -409,7 +392,10 @@ func (r *RepoDir) Type() RepoType {
 // WriteRef writes a commit hash to a ref file.
 // Example: WriteRef("main", "a1b2c3d4...") writes to refs/main
 func (r *RepoDir) WriteRef(ref, commit string) error {
-	refPath := r.RefPath(ref)
+	refPath, err := r.RefPath(ref)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(refPath), 0755); err != nil {
 		return fmt.Errorf("create refs directory: %w", err)
 	}
@@ -419,7 +405,10 @@ func (r *RepoDir) WriteRef(ref, commit string) error {
 // ReadRef reads the commit hash from a ref file.
 // Returns empty string if the ref doesn't exist.
 func (r *RepoDir) ReadRef(ref string) (string, error) {
-	refPath := r.RefPath(ref)
+	refPath, err := r.RefPath(ref)
+	if err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(refPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
@@ -443,7 +432,10 @@ type SnapshotFile struct {
 // CreateSnapshot creates or updates a snapshot directory with symlinks to blobs.
 // Uses relative symlinks for portability.
 func (r *RepoDir) CreateSnapshot(commit string, files []SnapshotFile) error {
-	snapshotDir := r.SnapshotDir(commit)
+	snapshotDir, err := r.SnapshotDir(commit)
+	if err != nil {
+		return err
+	}
 
 	// Create snapshot directory
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
@@ -470,7 +462,7 @@ func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) err
 	}
 
 	// Validate linkPath stays inside the snapshot dir to prevent path traversal.
-	linkPath, err := SafeJoin(r.SnapshotDir(commit), relativePath)
+	linkPath, err := r.SnapshotPath(commit, relativePath)
 	if err != nil {
 		return fmt.Errorf("symlink path %q would escape snapshot directory: %w", relativePath, err)
 	}
@@ -504,8 +496,12 @@ func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) err
 }
 
 // SnapshotPath returns the path to a file within a snapshot.
-func (r *RepoDir) SnapshotPath(commit, relativePath string) string {
-	return filepath.Join(r.SnapshotDir(commit), relativePath)
+func (r *RepoDir) SnapshotPath(commit, relativePath string) (string, error) {
+	dir, err := r.SnapshotDir(commit)
+	if err != nil {
+		return "", err
+	}
+	return SafeJoin(dir, relativePath)
 }
 
 // ListSnapshots returns all commit hashes that have snapshots.
@@ -540,14 +536,18 @@ func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir strin
 		return nil
 	}
 
-	friendlyBase := r.FriendlyPath()
-
-	// Determine the link path and validate it stays inside friendlyBase.
-	rel := relativePath
+	// Build the (optionally filtered) base safely first, THEN join relativePath
+	// onto it. Joining filterSubdir and relativePath together first would let a
+	// "../" in relativePath cancel the filter subdir before validation.
+	base := r.FriendlyPath()
 	if filterSubdir != "" {
-		rel = filepath.Join(filterSubdir, relativePath)
+		filtered, err := SafeJoin(base, filterSubdir)
+		if err != nil {
+			return fmt.Errorf("invalid filter subdir %q: %w", filterSubdir, err)
+		}
+		base = filtered
 	}
-	linkPath, err := SafeJoin(friendlyBase, rel)
+	linkPath, err := SafeJoin(base, relativePath)
 	if err != nil {
 		return fmt.Errorf("symlink path %q would escape friendly view base: %w", relativePath, err)
 	}
@@ -560,7 +560,10 @@ func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir strin
 	// Calculate relative path from link location to snapshot
 	// Need to go from: models/{owner}/{name}/[filterSubdir/]{relativePath}
 	// To:              hub/models--{owner}--{name}/snapshots/{commit}/{relativePath}
-	snapshotPath := r.SnapshotPath(commit, relativePath)
+	snapshotPath, err := r.SnapshotPath(commit, relativePath)
+	if err != nil {
+		return fmt.Errorf("resolve snapshot path: %w", err)
+	}
 	target, err := filepath.Rel(filepath.Dir(linkPath), snapshotPath)
 	if err != nil {
 		return fmt.Errorf("calculate relative path: %w", err)
@@ -652,9 +655,13 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 		}
 	}
 
+	snapPath, err := r.SnapshotPath(commit, relativePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve snapshot path: %w", err)
+	}
 	result := &StoreFileResult{
 		BlobPath:     blobPath,
-		SnapshotPath: r.SnapshotPath(commit, relativePath),
+		SnapshotPath: snapPath,
 		SHA256:       sha256,
 	}
 	if !noFriendly {

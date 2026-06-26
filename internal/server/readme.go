@@ -249,17 +249,26 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid url", "")
 		return
 	}
-	allowedHost := readmeEndpointHost(cfg.Endpoint)
-	// Use Hostname() (strips port) so ":443" variants are handled correctly.
-	if !strings.EqualFold(u.Hostname(), allowedHost) {
+	// Derive BOTH scheme and host (with port) from the configured endpoint, not
+	// from the user-supplied URL. Forwarding the user's scheme could downgrade
+	// to plain HTTP and leak the bearer token, and comparing only the hostname
+	// breaks endpoints that use an explicit port. (SSRF guard.)
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = "https://huggingface.co"
+	}
+	ep, err := url.Parse(endpoint)
+	if err != nil || ep.Host == "" {
+		writeError(w, http.StatusInternalServerError, "Invalid endpoint configuration", "")
+		return
+	}
+	if !strings.EqualFold(u.Host, ep.Host) {
 		writeError(w, http.StatusForbidden, "Asset host not allowed", "")
 		return
 	}
-	// Reconstruct from the config-derived host — never forward the user-supplied
-	// host to the HTTP client (SSRF guard).
 	safeURL := &url.URL{
-		Scheme:   u.Scheme,
-		Host:     allowedHost,
+		Scheme:   ep.Scheme,
+		Host:     ep.Host,
 		Path:     u.Path,
 		RawQuery: u.RawQuery,
 	}

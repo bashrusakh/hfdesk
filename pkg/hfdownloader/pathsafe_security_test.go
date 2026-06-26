@@ -32,15 +32,41 @@ func TestSafeJoin(t *testing.T) {
 	if _, err := SafeJoin(base, filepath.Join("a", "b.txt")); err != nil {
 		t.Errorf("expected ok, got %v", err)
 	}
-	for _, rel := range []string{"../escape", "a/../../escape", "../../etc/passwd"} {
+	// Note: "C:\\win" is only rejected on Windows (filepath.VolumeName is
+	// OS-specific), so it is not part of this cross-platform list.
+	for _, rel := range []string{"../escape", "a/../../escape", "../../etc/passwd", "/abs/escape"} {
 		if _, err := SafeJoin(base, rel); err == nil {
 			t.Errorf("SafeJoin(%q,%q) expected error, got nil", base, rel)
 		}
 	}
-	// An absolute-looking rel is absorbed by filepath.Join into base, so it
-	// stays contained rather than escaping.
-	if got, err := SafeJoin(base, "/abs/escape"); err != nil {
-		t.Errorf("SafeJoin abs rel: unexpected error %v (got %q)", err, got)
+}
+
+func TestRepoRejectsTraversal(t *testing.T) {
+	c := NewHFCache("/root", 0)
+	for _, bad := range []string{"../foo", "foo/..", "owner/..", "a/b/c", ""} {
+		if _, err := c.Repo(bad, RepoTypeModel); err == nil {
+			t.Errorf("Repo(%q) expected error, got nil", bad)
+		}
+	}
+	if _, err := c.Repo("owner/name", RepoTypeModel); err != nil {
+		t.Errorf("Repo(owner/name) unexpected error: %v", err)
+	}
+}
+
+func TestRefAndSnapshotPropagateError(t *testing.T) {
+	c := NewHFCache("/root", 0)
+	r, err := c.Repo("owner/name", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.RefPath("../escape"); err == nil {
+		t.Error("RefPath traversal: expected error, got nil")
+	}
+	if _, err := r.SnapshotDir("../escape"); err == nil {
+		t.Error("SnapshotDir traversal: expected error, got nil")
+	}
+	if _, err := r.SnapshotPath("commit", "../escape"); err == nil {
+		t.Error("SnapshotPath traversal: expected error, got nil")
 	}
 }
 

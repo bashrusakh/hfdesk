@@ -145,7 +145,10 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	}
 
 	// Get snapshot directory
-	snapshotDir := repoDir.SnapshotDir(commit)
+	snapshotDir, err := repoDir.SnapshotDir(commit)
+	if err != nil {
+		return 0, 0, err
+	}
 	if _, err := os.Stat(snapshotDir); errors.Is(err, os.ErrNotExist) {
 		return 0, 0, nil // Snapshot doesn't exist
 	}
@@ -156,7 +159,7 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	}
 
 	// Walk snapshot and create friendly symlinks
-	err := filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -176,7 +179,10 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		friendlyPath := filepath.Join(repoDir.FriendlyPath(), relPath)
 		existingTarget, err := os.Readlink(friendlyPath)
 
-		snapshotPath := repoDir.SnapshotPath(commit, relPath)
+		snapshotPath, perr := repoDir.SnapshotPath(commit, relPath)
+		if perr != nil {
+			return perr
+		}
 		expectedTarget, _ := filepath.Rel(filepath.Dir(friendlyPath), snapshotPath)
 
 		if err == nil && existingTarget == expectedTarget {

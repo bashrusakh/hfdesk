@@ -20,9 +20,6 @@ import (
 // code that forward the value downstream, so this is the single chokepoint
 // that all repo-accepting callers rely on.
 func IsValidModelName(modelName string) bool {
-	if modelName == "" || !strings.Contains(modelName, "/") {
-		return false
-	}
 	parts := strings.Split(modelName, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return false
