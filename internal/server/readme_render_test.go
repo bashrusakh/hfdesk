@@ -85,9 +85,9 @@ func TestNormalizeReadmeImageURL(t *testing.T) {
 }
 
 func TestHandleReadmeAsset_NormalizesSameHostRawToResolve(t *testing.T) {
-	var gotPath string
+	gotPath := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
+		gotPath <- r.URL.Path
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write([]byte("png-bytes"))
 	}))
@@ -103,8 +103,8 @@ func TestHandleReadmeAsset_NormalizesSameHostRawToResolve(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
 	}
-	if gotPath != "/owner/model/resolve/main/assets/logo.png" {
-		t.Fatalf("upstream path = %q, want %q", gotPath, "/owner/model/resolve/main/assets/logo.png")
+	if path := <-gotPath; path != "/owner/model/resolve/main/assets/logo.png" {
+		t.Fatalf("upstream path = %q, want %q", path, "/owner/model/resolve/main/assets/logo.png")
 	}
 	if ct := w.Header().Get("Content-Type"); ct != "image/png" {
 		t.Fatalf("content-type = %q, want %q", ct, "image/png")
