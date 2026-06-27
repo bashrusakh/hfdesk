@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
+	"github.com/microcosm-cc/bluemonday/css"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	goldmarkhtml "github.com/yuin/goldmark/renderer/html"
@@ -40,10 +42,14 @@ var readmeMarkdown = goldmark.New(
 // README content. See buildReadmePolicy for what it permits.
 var readmePolicy = buildReadmePolicy()
 
+var readmeGapLength = regexp.MustCompile(`^(?:0(?:\.0+)?|[0-9]+(?:\.[0-9]+)?(?:px|em|rem|%|vh|vw|cm|mm|in|pt|pc|ex|ch|vmin|vmax))$`)
+var readmeBackgroundValue = regexp.MustCompile(`^[a-zA-Z0-9 #()%,.\-_/]+$`)
+
 // buildReadmePolicy returns the HTML sanitizer policy applied to rendered
 // README content. It starts from bluemonday's user-generated-content policy and
-// additionally permits tables, lazy-loaded images, collapsible <details>, and
-// the relative asset-proxy URLs we inject during rewriting.
+// additionally permits tables, lazy-loaded images, collapsible <details>, the
+// relative asset-proxy URLs we inject during rewriting, and a broad set of
+// safe display-oriented CSS properties used by Hugging Face model cards.
 func buildReadmePolicy() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
 	p.AllowAttrs("loading", "width", "height", "align", "title").OnElements("img")
@@ -54,7 +60,107 @@ func buildReadmePolicy() *bluemonday.Policy {
 	// Image src may be a relative "/api/readme-asset?url=..." after rewriting.
 	p.AllowRelativeURLs(true)
 	p.AddTargetBlankToFullyQualifiedLinks(true)
+
+	// Allow safe CSS properties commonly used in Hugging Face model cards
+	// (border-box cards, flex/grid layouts, typography, etc.).
+	// Each property uses bluemonday's built-in safe default handler unless
+	// otherwise noted.
+	p.AllowStyles(
+		// Colors.
+		"color", "background-color",
+
+		// Typography
+		"font-family", "font-size", "font-weight", "line-height",
+		"letter-spacing", "text-align", "text-transform", "text-decoration",
+		"white-space", "word-break", "word-spacing",
+
+		// Sizing and spacing
+		"width", "min-width", "max-width",
+		"height", "min-height", "max-height",
+		"padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
+		"margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
+
+		// Layout — safe display values (block, inline, flex, grid, etc.)
+		"display", "flex-direction", "flex-wrap", "flex",
+		"align-items", "align-self", "align-content",
+		"justify-content",
+		"grid-template-columns", "grid-template-rows", "grid-gap", "grid-column", "grid-row",
+		"order",
+		"float", "clear",
+		"overflow", "overflow-x", "overflow-y",
+		"vertical-align",
+
+		// Borders and visual appearance
+		"border", "border-collapse", "border-spacing",
+		"border-top", "border-right", "border-bottom", "border-left",
+		"border-color", "border-style", "border-width",
+		"border-radius",
+		"opacity",
+		"cursor",
+	).Globally()
+
+	// The following properties need custom validation because bluemonday's
+	// built-in handlers are missing or too restrictive for common HF model-card
+	// values:
+	//
+	//   - gap:                no default handler in v1.0.27
+	//   - box-shadow:          default handler splits by space and rejects rgba(...)
+	//   - background/image:    allow gradients, reject url(...)
+	cssDisplay := regexp.MustCompile(`^[a-zA-Z0-9 #()%,.\-]+$`)
+	p.AllowStyles("gap").MatchingHandler(readmeGapHandler).Globally()
+	p.AllowStyles("box-shadow").Matching(cssDisplay).Globally()
+	p.AllowStyles("background", "background-image").MatchingHandler(readmeBackgroundHandler).Globally()
+
 	return p
+}
+
+// readmeGapHandler allows the CSS gap shorthand with one or two length values
+// (e.g. 12px or 12px 1rem) plus the common global keywords accepted by the
+// other README style handlers.
+func readmeGapHandler(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "normal", "initial", "inherit":
+		return true
+	}
+
+	parts := strings.Fields(value)
+	if len(parts) == 0 || len(parts) > 2 {
+		return false
+	}
+
+	for _, part := range parts {
+		if strings.EqualFold(part, "normal") {
+			continue
+		}
+		if !readmeGapLength.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// readmeBackgroundHandler allows common HF card backgrounds such as solid
+// colors and gradients, while rejecting URL-bearing values.
+func readmeBackgroundHandler(value string) bool {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return false
+	}
+
+	switch strings.ToLower(v) {
+	case "normal", "initial", "inherit", "unset", "revert", "revert-layer", "none", "transparent", "currentcolor":
+		return true
+	}
+	if strings.Contains(strings.ToLower(v), "url(") {
+		return false
+	}
+	if css.ColorHandler(v) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(v), "gradient(") && readmeBackgroundValue.MatchString(v) {
+		return true
+	}
+	return false
 }
 
 // stripFrontmatter removes a leading YAML frontmatter block (--- ... ---) that
