@@ -144,8 +144,11 @@ a {
   gap: 12px;
 }
 
-.logo-emoji {
-  font-size: 28px;
+.logo-icon {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 6px;
 }
 
 .logo-text {
