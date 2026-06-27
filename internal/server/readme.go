@@ -78,7 +78,7 @@ func stripFrontmatter(md string) string {
 
 // renderReadmeHTML converts README markdown into sanitized HTML ready to drop
 // into the analysis panel. Relative image and link URLs are resolved against
-// the repo's raw/blob bases; images hosted on the HF endpoint are routed
+// the repo's asset/blob bases; images hosted on the HF endpoint are routed
 // through the local asset proxy (so gated repos load with the server token),
 // while external images (badges, etc.) keep their original URL.
 func renderReadmeHTML(markdown, baseRawURL, baseBlobURL, endpointHost string) string {
@@ -126,7 +126,7 @@ func findReadmeBody(n *xhtml.Node) *xhtml.Node {
 // rewriteReadmeNodes walks an xhtml subtree rewriting relative
 // asset URLs to point through our /api/readme-asset proxy so the
 // browser fetches them with the server's auth token. baseRaw and
-// baseBlob are the upstream raw/blob URL prefixes for the repo;
+// baseBlob are the upstream asset/blob URL prefixes for the repo;
 // endpointHost is the configured HF host (used to leave absolute
 // external URLs alone).
 func rewriteReadmeNodes(n *xhtml.Node, baseRaw, baseBlob, endpointHost string) {
@@ -135,6 +135,7 @@ func rewriteReadmeNodes(n *xhtml.Node, baseRaw, baseBlob, endpointHost string) {
 		case "img":
 			rewriteAttr(n, "src", func(v string) string {
 				abs := resolveReadmeURL(v, baseRaw)
+				abs = normalizeReadmeImageURL(abs, endpointHost)
 				if isHostURL(abs, endpointHost) {
 					return readmeAssetPath + "?url=" + url.QueryEscape(abs)
 				}
@@ -174,6 +175,37 @@ func resolveReadmeURL(ref, base string) string {
 		return ref
 	}
 	return b.ResolveReference(r).String()
+}
+
+// normalizeReadmeImageURL rewrites same-host Hugging Face image URLs from
+// /raw/... to /resolve/... so Git LFS-backed assets fetch actual bytes instead
+// of pointer files. Non-HF URLs and already-resolved paths are returned
+// unchanged.
+func normalizeReadmeImageURL(raw, endpointHost string) string {
+	if !isHostURL(raw, endpointHost) {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) < 4 {
+		return raw
+	}
+	rawIdx := 2
+	if parts[0] == "datasets" {
+		if len(parts) < 5 {
+			return raw
+		}
+		rawIdx = 3
+	}
+	if parts[rawIdx] != "raw" {
+		return raw
+	}
+	parts[rawIdx] = "resolve"
+	u.Path = "/" + strings.Join(parts, "/")
+	return u.String()
 }
 
 // isHostURL reports whether raw (an absolute or relative URL) parses
@@ -264,6 +296,12 @@ func (s *Server) handleReadmeAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	if !strings.EqualFold(u.Host, ep.Host) {
 		writeError(w, http.StatusForbidden, "Asset host not allowed", "")
+		return
+	}
+	raw = normalizeReadmeImageURL(raw, ep.Host)
+	u, err = url.Parse(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid url", "")
 		return
 	}
 	safeURL := &url.URL{
