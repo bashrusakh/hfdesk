@@ -127,6 +127,7 @@ func TestReadmeHTML_StylesPreserved(t *testing.T) {
 		"  <div style=\"display: flex; gap: 12px 1rem; align-items: center; background: linear-gradient(135deg, #16a34a 0%, #047857 100%);\">\n" +
 		"    <span style=\"font-size: 14px; line-height: 1.6;\">text</span>\n" +
 		"  </div>\n" +
+		"  <script>alert('xss')</script>\n" +
 		"</div>\n"
 	html := renderReadmeHTML(md,
 		"https://huggingface.co/owner/model/resolve/main/",
