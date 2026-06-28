@@ -1,6 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.2] - 2026-06-29
+
+### Fixed
+
+- Tighten README sanitizer allowlist to only allow safe HTML tags and attributes, fixing CodeQL alerts and preventing XSS via malformed README markdown (#52)
+- Resolve README image assets through LFS URLs for gated/private repositories, fixing broken images in model cards for gated repos (#51)
+
+### Changed
+
+- Refine HFDesk icon and add Apple touch icons for better home screen/PWA experience (#53)
 
 ## [1.2.1] - 2026-06-27
 
