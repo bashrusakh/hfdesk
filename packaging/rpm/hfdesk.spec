@@ -6,11 +6,16 @@
 #     --define "_sourcedir $(pwd)" \
 #     --define "_rpmdir $(pwd)/RPMS"
 #
-# Requires: the pre-built hfdesk_linux_amd64 binary in _sourcedir.
+# Requires the following files in _sourcedir:
+#   hfdesk_linux_amd64  — pre-built binary (Source0)
+#   hfdesk.desktop      — Freedesktop entry (Source1)
+#   hfdesk.svg          — scalable icon (Source2)
+#   LICENSE             — Apache-2.0 license (Source3)
+#   README.md           — project readme (Source4)
 
 %global appname hfdesk
 %global appdesc HuggingFace Model Downloader
-%global appversion %{!?appversion:1.2.1}
+%{!?appversion:%global appversion 1.2.1}
 
 Name:           %{appname}
 Version:        %{appversion}
