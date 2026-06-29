@@ -29,9 +29,10 @@ func main() {
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 
-	// Convert to RGBA (straight alpha, not premultiplied)
-	rgba := image.NewRGBA(bounds)
-	draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
+	// Convert to NRGBA (straight alpha — NewRGBA would premultiply, darkening
+	// transparent edges in the ICO output).
+	nrgba := image.NewNRGBA(bounds)
+	draw.Draw(nrgba, bounds, img, bounds.Min, draw.Src)
 
 	// Build BMP pixel data (BGRA, bottom-up, no compression)
 	// Each row must be 4-byte aligned
@@ -40,8 +41,8 @@ func main() {
 	for y := 0; y < h; y++ {
 		dstRow := (h - 1 - y) * rowSize // bottom-up
 		for x := 0; x < w; x++ {
-			off := rgba.PixOffset(x, y)
-			r, g, b, a := rgba.Pix[off], rgba.Pix[off+1], rgba.Pix[off+2], rgba.Pix[off+3]
+			off := nrgba.PixOffset(x, y)
+			r, g, b, a := nrgba.Pix[off], nrgba.Pix[off+1], nrgba.Pix[off+2], nrgba.Pix[off+3]
 			// BGRA order
 			bmpPixels[dstRow+x*4] = b
 			bmpPixels[dstRow+x*4+1] = g

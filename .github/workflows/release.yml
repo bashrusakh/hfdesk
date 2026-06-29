@@ -184,6 +184,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd release-files
+          # Remove any previously published checksums.txt to avoid self-referential hashes
+          rm -f checksums.txt
           sha256sum * > checksums.txt
           cat checksums.txt
 
