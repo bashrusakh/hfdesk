@@ -27,7 +27,7 @@ jobs:
           go-version: '1.24'
 
       - name: Install rsrc
-        run: go install github.com/akavel/rsrc@latest
+        run: go install github.com/akavel/rsrc@v0.10.2
 
       - name: Generate Windows icon resource
         run: |

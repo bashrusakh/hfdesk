@@ -95,7 +95,7 @@ jobs:
 
       - name: Install rsrc (Windows only)
         if: ${{ matrix.os == 'windows' }}
-        run: go install github.com/akavel/rsrc@latest
+        run: go install github.com/akavel/rsrc@v0.10.2
 
       - name: Generate Windows icon resource (Windows only)
         if: ${{ matrix.os == 'windows' }}
