@@ -115,8 +115,9 @@ jobs:
 
       - name: Get version
         id: version
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
-          TAG="${{ needs.create-release.outputs.tag }}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -124,25 +125,29 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm
 
       - name: Stage sources
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/rpm-sources
           # Download linux amd64 binary from release assets
-          gh release download ${{ needs.create-release.outputs.tag }} \
+          gh release download "$TAG" \
             -p "hfdesk_linux_amd64_*" \
             -D /tmp/rpm-sources \
-            -R ${{ github.repository }}
+            -R "${{ github.repository }}"
+          # Rename to the exact Source0 name expected by the spec
+          mv /tmp/rpm-sources/hfdesk_linux_amd64_* /tmp/rpm-sources/hfdesk_linux_amd64
           # Copy packaging files
           cp packaging/rpm/hfdesk.desktop /tmp/rpm-sources/
           cp packaging/rpm/hfdesk.svg /tmp/rpm-sources/
           cp LICENSE /tmp/rpm-sources/
           cp README.md /tmp/rpm-sources/
           ls -la /tmp/rpm-sources/
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Build RPM
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           rpmbuild -ba packaging/rpm/hfdesk.spec \
             --define "_sourcedir /tmp/rpm-sources" \
             --define "_rpmdir /tmp/rpm-output" \
