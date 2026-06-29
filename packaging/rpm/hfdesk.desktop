@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=HFDesk
+Comment=HuggingFace Model Downloader — search, analyze, and download models from HuggingFace Hub
+Exec=hfdesk
+Icon=hfdesk
+Terminal=false
+Categories=Utility;Network;FileTransfer;
+Keywords=huggingface;model;download;ai;ml;
+StartupNotify=true

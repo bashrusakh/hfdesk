@@ -105,6 +105,32 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
 
+  linux-desktop:
+    name: Upload Linux desktop files
+    runs-on: ubuntu-latest
+    needs: create-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Upload .desktop file
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: packaging/rpm/hfdesk.desktop
+
+      - name: Upload icon
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: packaging/rpm/hfdesk.svg
+
+      - name: Upload RPM spec
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: packaging/rpm/hfdesk.spec
+
   checksums:
     name: Generate checksums
     runs-on: ubuntu-latest

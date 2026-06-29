@@ -193,9 +193,15 @@ if [ "$HAS_VERSIONINFO" = true ]; then
     cleanup_windows_versioninfo
 fi
 
+# Copy Linux desktop integration files
+echo ""
+echo "Copying Linux desktop files..."
+cp packaging/rpm/hfdesk.desktop "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.desktop" || echo "  (desktop file not found)"
+cp packaging/rpm/hfdesk.svg "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.svg" || echo "  (icon not found)"
+
 echo "================================"
 echo ""
-echo "Build complete! Binaries are in: ${OUTPUT_DIR}/"
+echo "Build complete! Artifacts are in: ${OUTPUT_DIR}/"
 echo ""
 ls -lh "${OUTPUT_DIR}"/hfdesk_*_${VERSION}* 2>/dev/null || true
 
