@@ -41,6 +41,32 @@ TARGETS=(
     "windows_amd64"
 )
 
+# Generate Windows .ico from the apple-touch-icon PNG.
+# Always regenerates — stale files from previous builds are not reused.
+generate_windows_icon() {
+    local ico_path="${MAIN_PKG}/hfdesk.ico"
+    local png_src="internal/assets/static/apple-touch-icon-180x180.png"
+
+    if [ ! -f "$png_src" ]; then
+        echo "  Error: $png_src not found — cannot generate Windows icon"
+        exit 1
+    fi
+
+    # Remove any stale .ico from a previous run
+    rm -f "$ico_path"
+
+    echo "  Generating Windows icon from $png_src..."
+    (cd "$SCRIPT_DIR" && go run "${MAIN_PKG}/genico.go") || {
+        echo "  Error: icon generation failed"
+        exit 1
+    }
+
+    if [ ! -f "$ico_path" ]; then
+        echo "  Error: $ico_path was not created after generation"
+        exit 1
+    fi
+}
+
 # Generate Windows version info if goversioninfo is available
 generate_windows_versioninfo() {
     if ! command -v goversioninfo &> /dev/null; then
@@ -48,6 +74,9 @@ generate_windows_versioninfo() {
         echo "  Install with: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
         return 1
     fi
+    
+    # Generate .ico first
+    generate_windows_icon
     
     # Parse version components (handle -dev suffix)
     local ver_clean="${VERSION%-*}"  # Remove -dev or similar suffix
@@ -99,7 +128,7 @@ generate_windows_versioninfo() {
 EOF
     
     echo "  Generating Windows version resource..."
-    (cd "${MAIN_PKG}" && goversioninfo -o resource_windows_amd64.syso)
+    (cd "${MAIN_PKG}" && goversioninfo -icon hfdesk.ico -o resource_windows_amd64.syso)
     return 0
 }
 
@@ -107,6 +136,7 @@ EOF
 cleanup_windows_versioninfo() {
     rm -f "${MAIN_PKG}/versioninfo.json"
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+    rm -f "${MAIN_PKG}/hfdesk.ico"
 }
 
 # Build function
@@ -148,10 +178,15 @@ echo ""
 echo "Starting builds..."
 echo "================================"
 
-# Generate Windows version info before building
+# Generate Windows version info before building.
+# If goversioninfo is available, this step is mandatory.
 HAS_VERSIONINFO=false
-if generate_windows_versioninfo; then
+if command -v goversioninfo &> /dev/null; then
+    generate_windows_versioninfo
     HAS_VERSIONINFO=true
+else
+    echo "  Note: goversioninfo not found, skipping Windows metadata"
+    echo "  Install with: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
 fi
 
 for target in "${TARGETS[@]}"; do
@@ -163,9 +198,15 @@ if [ "$HAS_VERSIONINFO" = true ]; then
     cleanup_windows_versioninfo
 fi
 
+# Copy Linux desktop integration files
+echo ""
+echo "Copying Linux desktop files..."
+cp packaging/rpm/hfdesk.desktop "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.desktop" || echo "  (desktop file not found)"
+cp packaging/rpm/hfdesk.svg "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.svg" || echo "  (icon not found)"
+
 echo "================================"
 echo ""
-echo "Build complete! Binaries are in: ${OUTPUT_DIR}/"
+echo "Build complete! Artifacts are in: ${OUTPUT_DIR}/"
 echo ""
 ls -lh "${OUTPUT_DIR}"/hfdesk_*_${VERSION}* 2>/dev/null || true
 
