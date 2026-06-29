@@ -41,6 +41,27 @@ TARGETS=(
     "windows_amd64"
 )
 
+# Generate Windows .ico from the apple-touch-icon PNG
+generate_windows_icon() {
+    local ico_path="${MAIN_PKG}/hfdesk.ico"
+    if [ -f "$ico_path" ]; then
+        echo "  Windows icon already exists: $ico_path"
+        return 0
+    fi
+    # Generate .ico from the 180x180 apple-touch-icon PNG
+    local png_src="internal/assets/static/apple-touch-icon-180x180.png"
+    if [ ! -f "$png_src" ]; then
+        echo "  Warning: $png_src not found, skipping icon generation"
+        return 1
+    fi
+    echo "  Generating Windows icon from $png_src..."
+    (cd "$SCRIPT_DIR" && go run "${MAIN_PKG}/genico.go") 2>/dev/null || {
+        echo "  Warning: icon generation failed, continuing without icon"
+        return 1
+    }
+    return 0
+}
+
 # Generate Windows version info if goversioninfo is available
 generate_windows_versioninfo() {
     if ! command -v goversioninfo &> /dev/null; then
@@ -48,6 +69,9 @@ generate_windows_versioninfo() {
         echo "  Install with: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
         return 1
     fi
+    
+    # Generate .ico first
+    generate_windows_icon
     
     # Parse version components (handle -dev suffix)
     local ver_clean="${VERSION%-*}"  # Remove -dev or similar suffix
@@ -98,8 +122,13 @@ generate_windows_versioninfo() {
 }
 EOF
     
+    local ico_flag=""
+    if [ -f "${MAIN_PKG}/hfdesk.ico" ]; then
+        ico_flag="-icon hfdesk.ico"
+    fi
+    
     echo "  Generating Windows version resource..."
-    (cd "${MAIN_PKG}" && goversioninfo -o resource_windows_amd64.syso)
+    (cd "${MAIN_PKG}" && goversioninfo $ico_flag -o resource_windows_amd64.syso)
     return 0
 }
 
@@ -107,6 +136,7 @@ EOF
 cleanup_windows_versioninfo() {
     rm -f "${MAIN_PKG}/versioninfo.json"
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+    rm -f "${MAIN_PKG}/hfdesk.ico"
 }
 
 # Build function
