@@ -167,10 +167,11 @@ jobs:
     steps:
       - name: Download release assets
         env:
+          TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release-files
-          gh release download ${{ github.ref_name }} -D release-files -R ${{ github.repository }}
+          gh release download "$TAG" -D release-files -R "${{ github.repository }}"
 
       - name: Generate checksums
         run: |
