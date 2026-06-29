@@ -737,13 +737,21 @@
                 <div class="settings-row">
                   <label for="connections">Connections per file</label>
                   <div class="settings-control settings-control-xs">
-                    <input type="number" id="connections" value="8" min="1" max="32">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease connections per file" aria-controls="connections">−</button>
+                      <input type="number" id="connections" value="8" min="1" max="32" data-default="8">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase connections per file" aria-controls="connections">+</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-row">
                   <label for="maxActive">Concurrent downloads</label>
                   <div class="settings-control settings-control-xs">
-                    <input type="number" id="maxActive" value="3" min="1" max="10">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease concurrent downloads" aria-controls="maxActive">−</button>
+                      <input type="number" id="maxActive" value="3" min="1" max="10" data-default="3">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase concurrent downloads" aria-controls="maxActive">+</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-row">
@@ -765,7 +773,11 @@
                 <div class="settings-row">
                   <label for="retries">Retry attempts</label>
                   <div class="settings-control settings-control-xs">
-                    <input type="number" id="retries" value="4" min="0" max="20">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease retry attempts" aria-controls="retries">−</button>
+                      <input type="number" id="retries" value="4" min="0" max="20" data-default="4">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase retry attempts" aria-controls="retries">+</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-row">

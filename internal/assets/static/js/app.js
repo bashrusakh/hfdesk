@@ -2480,6 +2480,72 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         }
       });
     });
+
+    // Initialize stepper controls
+    initStepperControls();
+  }
+
+  function initStepperControls() {
+    $$('.stepper-control').forEach(control => {
+      const input = control.querySelector('input[type="number"]');
+      const decreaseBtn = control.querySelector('[data-action="decrease"]');
+      const increaseBtn = control.querySelector('[data-action="increase"]');
+
+      if (!input || !decreaseBtn || !increaseBtn) return;
+
+      const parseBound = (val, fallback) => {
+        const n = parseInt(val);
+        return Number.isNaN(n) ? fallback : n;
+      };
+
+      const updateButtons = () => {
+        const val = parseInt(input.value) || 0;
+        const min = parseBound(input.min, -Infinity);
+        const max = parseBound(input.max, Infinity);
+        decreaseBtn.disabled = val <= min;
+        increaseBtn.disabled = val >= max;
+      };
+
+      const clampValue = (value) => {
+        const min = parseBound(input.min, -Infinity);
+        const max = parseBound(input.max, Infinity);
+        return Math.max(min, Math.min(max, value));
+      };
+
+      decreaseBtn.addEventListener('click', () => {
+        const current = parseInt(input.value) || 0;
+        input.value = clampValue(current - 1);
+        updateButtons();
+      });
+
+      increaseBtn.addEventListener('click', () => {
+        const current = parseInt(input.value) || 0;
+        input.value = clampValue(current + 1);
+        updateButtons();
+      });
+
+      input.addEventListener('input', () => {
+        // Allow empty value during typing, clamp on blur
+        if (input.value === '') return;
+        updateButtons();
+      });
+
+      input.addEventListener('blur', () => {
+        if (input.value === '' || Number.isNaN(parseInt(input.value))) {
+          // Restore default if empty/invalid
+          const defaultVal = input.dataset.default || input.min || '0';
+          input.value = defaultVal;
+        } else {
+          // Clamp to bounds on blur
+          const val = parseInt(input.value);
+          input.value = clampValue(val);
+        }
+        updateButtons();
+      });
+
+      // Initialize button states
+      updateButtons();
+    });
   }
 
   async function saveSettings() {

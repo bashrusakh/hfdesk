@@ -2561,6 +2561,79 @@ a {
   transform: scale(1);
 }
 
+/* ============================================
+   Stepper Control (custom number input)
+   ============================================ */
+
+.stepper-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stepper-control input[type="number"] {
+  width: 60px;
+  height: 36px;
+  text-align: center;
+  padding: 8px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  -moz-appearance: textfield;
+}
+
+.stepper-control input[type="number"]:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+
+.stepper-control input[type="number"]::-webkit-outer-spin-button,
+.stepper-control input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.stepper-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  user-select: none;
+}
+
+.stepper-btn:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  border-color: var(--color-border-light);
+  color: var(--color-text);
+}
+
+.stepper-btn:active:not(:disabled) {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: white;
+  transform: scale(0.95);
+}
+
+.stepper-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  color: var(--color-text-muted);
+}
+
 /* Rebuild Result Modal */
 .rebuild-result {
   text-align: center;
