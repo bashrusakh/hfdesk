@@ -5,6 +5,8 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"image"
+	"image/draw"
 	"image/png"
 	"os"
 )
@@ -23,12 +25,48 @@ func main() {
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 
-	// Re-encode PNG data
-	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, img); err != nil {
-		panic(err)
+	// Convert to RGBA (straight alpha, not premultiplied)
+	rgba := image.NewRGBA(bounds)
+	draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
+
+	// Build BMP pixel data (BGRA, bottom-up, no compression)
+	// Each row must be 4-byte aligned
+	rowSize := (w*4 + 3) & ^3
+	bmpPixels := make([]byte, rowSize*h)
+	for y := 0; y < h; y++ {
+		dstRow := (h - 1 - y) * rowSize // bottom-up
+		for x := 0; x < w; x++ {
+			off := rgba.PixOffset(x, y)
+			r, g, b, a := rgba.Pix[off], rgba.Pix[off+1], rgba.Pix[off+2], rgba.Pix[off+3]
+			// BGRA order
+			bmpPixels[dstRow+x*4] = b
+			bmpPixels[dstRow+x*4+1] = g
+			bmpPixels[dstRow+x*4+2] = r
+			bmpPixels[dstRow+x*4+3] = a
+		}
 	}
-	pngData := pngBuf.Bytes()
+
+	// BITMAPINFOHEADER (40 bytes)
+	bmpHeader := make([]byte, 40)
+	binary.LittleEndian.PutUint32(bmpHeader[0:4], 40)           // header size
+	binary.LittleEndian.PutUint32(bmpHeader[4:8], uint32(w))     // width
+	binary.LittleEndian.PutUint32(bmpHeader[8:12], uint32(h*2))  // height (doubled for ICO)
+	binary.LittleEndian.PutUint16(bmpHeader[12:14], 1)          // planes
+	binary.LittleEndian.PutUint16(bmpHeader[14:16], 32)         // bpp
+	binary.LittleEndian.PutUint32(bmpHeader[16:20], 0)           // compression (BI_RGB)
+	binary.LittleEndian.PutUint32(bmpHeader[20:24], 0)                       // image size (0 for BI_RGB)
+	binary.LittleEndian.PutUint32(bmpHeader[24:28], 0)           // x pixels per meter
+	binary.LittleEndian.PutUint32(bmpHeader[28:32], 0)           // y pixels per meter
+	binary.LittleEndian.PutUint32(bmpHeader[32:36], 0)           // colors used
+	binary.LittleEndian.PutUint32(bmpHeader[36:40], 0)           // important colors
+
+	// ICO data: AND mask (1 bit per pixel, row-aligned to 4 bytes) — all zeros for 32bpp
+	andRowSize := (w + 31) / 32 * 4
+	andMask := make([]byte, andRowSize*h)
+
+	// Assemble ICO
+	icoData := append(bmpHeader, bmpPixels...)
+	icoData = append(icoData, andMask...)
 
 	// ICO header: reserved(2) + type(2) + count(2)
 	// Entry: w(1) + h(1) + colors(1) + reserved(1) + planes(2) + bpp(2) + size(4) + offset(4)
@@ -51,12 +89,12 @@ func main() {
 	header[9] = 0  // reserved
 	binary.LittleEndian.PutUint16(header[10:12], 1)        // planes
 	binary.LittleEndian.PutUint16(header[12:14], 32)       // bpp
-	binary.LittleEndian.PutUint32(header[14:18], uint32(len(pngData))) // size
+	binary.LittleEndian.PutUint32(header[14:18], uint32(len(icoData))) // size
 	binary.LittleEndian.PutUint32(header[18:22], 22)       // offset (6+16)
 
-	out := append(header, pngData...)
+	out := append(header, icoData...)
 	if err := os.WriteFile("cmd/hfdesk/hfdesk.ico", out, 0644); err != nil {
 		panic(err)
 	}
-	println("Created cmd/hfdesk/hfdesk.ico")
+	println("Created cmd/hfdesk/hfdesk.ico (BMP format)")
 }

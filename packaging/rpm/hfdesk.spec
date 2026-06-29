@@ -10,7 +10,7 @@
 
 %global appname hfdesk
 %global appdesc HuggingFace Model Downloader
-%global appversion %{!?appversion:1.2.1}
+%{!?appversion:%global appversion 1.2.1}
 
 Name:           %{appname}
 Version:        %{appversion}
