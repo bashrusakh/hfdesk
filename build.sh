@@ -49,7 +49,7 @@ generate_windows_icon() {
 
     if [ ! -f "$png_src" ]; then
         echo "  Error: $png_src not found — cannot generate Windows icon"
-        exit 1
+        return 1
     fi
 
     # Remove any stale .ico from a previous run
@@ -58,83 +58,33 @@ generate_windows_icon() {
     echo "  Generating Windows icon from $png_src..."
     (cd "$SCRIPT_DIR" && go run "${MAIN_PKG}/genico.go") || {
         echo "  Error: icon generation failed"
-        exit 1
+        return 1
     }
 
     if [ ! -f "$ico_path" ]; then
         echo "  Error: $ico_path was not created after generation"
-        exit 1
+        return 1
     fi
 }
 
-# Generate Windows version info if goversioninfo is available
+# Generate Windows icon and version resources.
+# Uses rsrc for icon embedding (goversioninfo corrupts ICO directory entries).
+# Version metadata is set via ldflags (-X main.Version=...) at build time.
 generate_windows_versioninfo() {
-    if ! command -v goversioninfo &> /dev/null; then
-        echo "  Note: goversioninfo not found, skipping Windows metadata"
-        echo "  Install with: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
-        return 1
-    fi
-    
+    # Remove any stale .syso from a previous run before regenerating
+    rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+
     # Generate .ico first
-    generate_windows_icon
-    
-    # Parse version components (handle -dev suffix)
-    local ver_clean="${VERSION%-*}"  # Remove -dev or similar suffix
-    local major minor patch
-    IFS='.' read -r major minor patch <<< "$ver_clean"
-    major=${major:-0}
-    minor=${minor:-0}
-    patch=${patch:-0}
-    
-    cat > "${MAIN_PKG}/versioninfo.json" << EOF
-{
-    "FixedFileInfo": {
-        "FileVersion": {
-            "Major": ${major},
-            "Minor": ${minor},
-            "Patch": ${patch},
-            "Build": 0
-        },
-        "ProductVersion": {
-            "Major": ${major},
-            "Minor": ${minor},
-            "Patch": ${patch},
-            "Build": 0
-        },
-        "FileFlagsMask": "3f",
-        "FileFlags": "00",
-        "FileOS": "040004",
-        "FileType": "01",
-        "FileSubType": "00"
-    },
-    "StringFileInfo": {
-        "Comments": "HuggingFace Model Downloader - Download models from HuggingFace Hub",
-        "CompanyName": "Open Source",
-        "FileDescription": "HuggingFace Model Downloader",
-        "FileVersion": "${VERSION}",
-        "InternalName": "hfdesk",
-        "LegalCopyright": "Apache-2.0 License",
-        "OriginalFilename": "hfdesk.exe",
-        "ProductName": "HuggingFace Model Downloader",
-        "ProductVersion": "${VERSION}"
-    },
-    "VarFileInfo": {
-        "Translation": {
-            "LangID": "0409",
-            "CharsetID": "04B0"
-        }
-    }
-}
-EOF
-    
-    echo "  Generating Windows version resource..."
-    (cd "${MAIN_PKG}" && goversioninfo -icon hfdesk.ico -o resource_windows_amd64.syso)
+    generate_windows_icon || return 1
+
+    echo "  Generating Windows icon resource..."
+    (cd "${MAIN_PKG}" && rsrc -ico hfdesk.ico -o resource_windows_amd64.syso)
+
     return 0
 }
 
-# Cleanup Windows version info files
+# Cleanup Windows resource files
 cleanup_windows_versioninfo() {
-    rm -f "${MAIN_PKG}/versioninfo.json"
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
     rm -f "${MAIN_PKG}/hfdesk.ico"
 }
@@ -178,15 +128,17 @@ echo ""
 echo "Starting builds..."
 echo "================================"
 
-# Generate Windows version info before building.
-# If goversioninfo is available, this step is mandatory.
+# Generate Windows icon resource before building.
+# Requires rsrc for icon embedding.
 HAS_VERSIONINFO=false
-if command -v goversioninfo &> /dev/null; then
+if command -v rsrc &> /dev/null; then
     generate_windows_versioninfo
     HAS_VERSIONINFO=true
 else
-    echo "  Note: goversioninfo not found, skipping Windows metadata"
-    echo "  Install with: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
+    echo "  Note: rsrc not found, skipping Windows icon"
+    echo "  Install with: go install github.com/akavel/rsrc@latest"
+    # Remove stale .syso so go build doesn't embed old resources
+    rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
 fi
 
 for target in "${TARGETS[@]}"; do
@@ -201,8 +153,16 @@ fi
 # Copy Linux desktop integration files
 echo ""
 echo "Copying Linux desktop files..."
-cp packaging/rpm/hfdesk.desktop "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.desktop" || echo "  (desktop file not found)"
-cp packaging/rpm/hfdesk.svg "${OUTPUT_DIR}/" 2>/dev/null && echo "  -> hfdesk.svg" || echo "  (icon not found)"
+if [ -f "${SCRIPT_DIR}/packaging/rpm/hfdesk.desktop" ]; then
+    cp "${SCRIPT_DIR}/packaging/rpm/hfdesk.desktop" "${OUTPUT_DIR}/" && echo "  -> hfdesk.desktop"
+else
+    echo "  (desktop file not found)"
+fi
+if [ -f "${SCRIPT_DIR}/packaging/rpm/hfdesk.svg" ]; then
+    cp "${SCRIPT_DIR}/packaging/rpm/hfdesk.svg" "${OUTPUT_DIR}/" && echo "  -> hfdesk.svg"
+else
+    echo "  (icon not found)"
+fi
 
 echo "================================"
 echo ""

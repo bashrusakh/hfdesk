@@ -43,7 +43,7 @@ jobs:
           fi
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
@@ -93,6 +93,16 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Install rsrc (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: go install github.com/akavel/rsrc@v0.10.2
+
+      - name: Generate Windows icon resource (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+
       - name: Build binary
         env:
           GOOS: ${{ matrix.os }}
@@ -103,8 +113,13 @@ jobs:
             -o hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
             ./cmd/hfdesk
 
+      - name: Cleanup Windows resources (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
+
       - name: Upload raw binary
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
@@ -133,6 +148,7 @@ jobs:
       - name: Stage sources
         env:
           TAG: ${{ needs.create-release.outputs.tag }}
+          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/rpm-sources
@@ -140,7 +156,7 @@ jobs:
           gh release download "$TAG" \
             -p "hfdesk_linux_amd64_*" \
             -D /tmp/rpm-sources \
-            -R "${{ github.repository }}"
+            -R "$REPO"
           # Rename to the exact Source0 name expected by the spec
           mv /tmp/rpm-sources/hfdesk_linux_amd64_* /tmp/rpm-sources/hfdesk_linux_amd64
           # Copy packaging files
@@ -161,7 +177,7 @@ jobs:
             --define "appversion ${VERSION}"
 
       - name: Upload RPM
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: /tmp/rpm-output/**/*.rpm
@@ -169,24 +185,27 @@ jobs:
   checksums:
     name: Generate checksums
     runs-on: ubuntu-latest
-    needs: build
+    needs: [create-release, build, linux-desktop]
     steps:
       - name: Download release assets
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release-files
-          gh release download "$TAG" -D release-files -R "${{ github.repository }}"
+          gh release download "$TAG" -D release-files -R "$REPO"
 
       - name: Generate checksums
         run: |
           cd release-files
+          # Remove any previously published checksums.txt to avoid self-referential hashes
+          rm -f checksums.txt
           sha256sum * > checksums.txt
           cat checksums.txt
 
       - name: Upload checksums
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.create-release.outputs.tag }}
           files: release-files/checksums.txt
