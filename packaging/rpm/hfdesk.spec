@@ -10,9 +10,10 @@
 
 %global appname hfdesk
 %global appdesc HuggingFace Model Downloader
+%global appversion %{!?appversion:1.2.1}
 
 Name:           %{appname}
-Version:        1.2.1
+Version:        %{appversion}
 Release:        1%{?dist}
 Summary:        Desktop-style web UI for HuggingFace model downloads
 
@@ -21,6 +22,8 @@ URL:            https://github.com/bashrusakh/hfdesk
 Source0:        hfdesk_linux_amd64
 Source1:        hfdesk.desktop
 Source2:        hfdesk.svg
+Source3:        LICENSE
+Source4:        README.md
 
 BuildArch:      x86_64
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root
@@ -39,6 +42,8 @@ operations.
 cp %{SOURCE0} .
 cp %{SOURCE1} .
 cp %{SOURCE2} .
+cp %{SOURCE3} .
+cp %{SOURCE4} .
 
 %build
 # Binary is pre-built; nothing to compile.
@@ -64,9 +69,8 @@ rm -rf %{buildroot}
 %{_datadir}/applications/hfdesk.desktop
 %{_datadir}/icons/hicolor/scalable/apps/hfdesk.svg
 
-%doc
 %license LICENSE
-%{_defaultdocdir}/%{name}/README.md
+%doc README.md
 
 %changelog
 * Mon Jun 29 2026 HFDesk Maintainer <https://github.com/bashrusakh/hfdesk> - 1.2.1-1
