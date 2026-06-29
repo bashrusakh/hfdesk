@@ -26,6 +26,14 @@ jobs:
         with:
           go-version: '1.24'
 
+      - name: Install rsrc
+        run: go install github.com/akavel/rsrc@latest
+
+      - name: Generate Windows icon resource
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+
       - name: Build
         env:
           GOOS: windows
@@ -37,6 +45,10 @@ jobs:
             -trimpath \
             -o hfdesk_windows_amd64_${VERSION}.exe \
             ./cmd/hfdesk
+
+      - name: Cleanup Windows resources
+        run: |
+          rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

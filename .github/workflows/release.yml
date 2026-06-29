@@ -93,6 +93,16 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Install rsrc (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: go install github.com/akavel/rsrc@latest
+
+      - name: Generate Windows icon resource (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+
       - name: Build binary
         env:
           GOOS: ${{ matrix.os }}
@@ -102,6 +112,11 @@ jobs:
           go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" \
             -o hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
             ./cmd/hfdesk
+
+      - name: Cleanup Windows resources (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
 
       - name: Upload raw binary
         uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
