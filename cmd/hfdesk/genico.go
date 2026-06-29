@@ -11,6 +11,10 @@ import (
 	"os"
 )
 
+// main reads the 180×180 apple-touch-icon PNG, converts it to a BMP-format
+// .ico file (BITMAPINFOHEADER + 32-bit BGRA pixels + zero AND mask), and
+// writes it to cmd/hfdesk/hfdesk.ico for embedding into the Windows binary
+// via rsrc.
 func main() {
 	src, err := os.ReadFile("internal/assets/static/apple-touch-icon-180x180.png")
 	if err != nil {
