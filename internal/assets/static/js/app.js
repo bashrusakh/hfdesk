@@ -451,23 +451,46 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   async function syncLocalAnalysisStatus(data) {
     if (!data?.repo || !data.selectable_items?.length) return;
     try {
-      const cached = await api('GET', `/cache/${data.repo}`);
-      const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
-      if (!cachedFiles.size) return;
-
       const map = getDlStatus(data.repo);
+      const resp = await fetch(`/api/cache/${data.repo}`);
       let changed = false;
-      data.selectable_items.forEach(item => {
-        const key = item.filter_value || item.id || '';
-        const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
-        if (!key || !files.length) return;
-        if (files.every(f => cachedFiles.has(f))) {
-          map[key] = 'done';
+
+      if (resp.status === 404) {
+        data.selectable_items.forEach(item => {
+          const key = item.filter_value || item.id || '';
+          if (!key || map[key] !== 'done') return;
+          delete map[key];
           changed = true;
-        }
-      });
+        });
+      } else {
+        if (!resp.ok) throw new Error(`cache lookup failed: ${resp.status}`);
+
+        const cached = await resp.json();
+        const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+
+        data.selectable_items.forEach(item => {
+          const key = item.filter_value || item.id || '';
+          const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
+          if (!key || !files.length) return;
+
+          const isPresent = files.every(f => cachedFiles.has(f));
+          const isActive = map[key] === 'running' || map[key] === 'queued';
+          if (isPresent) {
+            if (map[key] !== 'done' && !isActive) {
+              map[key] = 'done';
+              changed = true;
+            }
+          } else if (map[key] === 'done') {
+            delete map[key];
+            changed = true;
+          }
+        });
+      }
+
       if (changed) {
-        localStorage.setItem('dlStatus:' + data.repo, JSON.stringify(map));
+        const storageKey = 'dlStatus:' + data.repo;
+        if (Object.keys(map).length === 0) localStorage.removeItem(storageKey);
+        else localStorage.setItem(storageKey, JSON.stringify(map));
       }
     } catch {
       // Cache lookup is best-effort; remote analysis should still render.
