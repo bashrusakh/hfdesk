@@ -3270,7 +3270,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const map = getDlStatus(repo);
     const active = {};
     Array.from(state.jobs.values()).forEach(j => {
-      if (j.repo !== repo) return;
+      const visibleRepo = j.localRepo || j.repo;
+      if (visibleRepo !== repo) return;
       const f = (j.filters || []).join(',') || '__all__';
       if (j.status === 'completed') active[f] = 'done';
       else if (j.status === 'running') active[f] = 'running';
@@ -3338,6 +3339,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         // upstream_repo is set for vision_encoder items sourced from a base-model
         // repo; in that case the download must target that repo, not the current one.
         const dlRepo = item.upstream_repo || repo;
+        const statusRepo = repo;
 
         // Left control: a Download button when idle; otherwise it is REPLACED by
         // a status chip reflecting the quant's state in the download queue
@@ -3353,7 +3355,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           : dlStatus === 'running'
             ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
           : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}','${item.upstream_repo ? escapeHtml(repo) : ''}')">${dlIcon}</button>`;
+               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}','${item.upstream_repo ? escapeHtml(repo) : ''}','${escapeHtml(statusRepo)}')">${dlIcon}</button>`;
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
@@ -3375,7 +3377,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo) {
     try {
       // Disk-free guard
       const df = await fetch('/api/diskfree').then(r => r.json()).catch(() => null);
@@ -3408,7 +3410,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       }
 
       state.jobs.set(data.id, data);
-      setDlStatus(repo, filterValue, 'queued');
+      setDlStatus(statusRepo || repo, filterValue, 'queued');
       // Replace the download button with the queued chip immediately.
       const row = document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
       if (row) {
