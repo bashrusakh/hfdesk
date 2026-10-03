@@ -55,9 +55,13 @@ Docker:
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v hfdesk-data:/data \
   ghcr.io/bashrusakh/hfdesk:latest
 ```
+
+HFDesk keeps all writable state (settings, jobs, history, HF cache, and local
+models) under a single `/data` root. Mount one volume at `/data` to persist
+everything. See [Docker](#docker) for UID/GID options.
 
 ## Quick Start
 
@@ -162,6 +166,80 @@ Run tests:
 ```bash
 go test ./...
 go test ./... -race
+```
+
+## Docker
+
+The image keeps every writable path under one mounted data root, `/data`:
+
+| Path | Contents |
+|---|---|
+| `/data/.config/HFDesk` | Settings and job/history state |
+| `/data/.cache/huggingface` | Hugging Face cache (`HF_HOME`) |
+| `/data/Models`, `/data/Datasets` | LM Studio-style local downloads |
+
+Run it with a single volume:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v hfdesk-data:/data \
+  ghcr.io/bashrusakh/hfdesk:latest
+```
+
+### Run as a specific UID/GID (NAS/homelab)
+
+The default image user is UID/GID `1000`. To run as another user and keep
+files owned by that user, set `PUID`/`PGID`:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e PUID=1026 -e PGID=100 -e UMASK=002 \
+  -v /mnt/user/appdata/hfdesk:/data \
+  ghcr.io/bashrusakh/hfdesk:latest
+```
+
+- `PUID` / `PGID` — UID/GID the app process runs as (default `1000`).
+- `UMASK` — file creation mask (default `022`).
+
+The container starts as root only so the entrypoint can apply these values,
+then drops privileges; the app always runs non-root.
+
+### Run as an arbitrary UID (enterprise / Kubernetes)
+
+Pass `--user` (or set `securityContext.runAsUser`/`fsGroup`) and the entrypoint
+skips user/ownership changes entirely. Because all state lives under `/data`,
+no image user or `/etc/passwd` entry is required:
+
+```bash
+docker run --rm --user 568:568 -p 8080:8080 \
+  -v hfdesk-data:/data \
+  ghcr.io/bashrusakh/hfdesk:latest
+```
+
+```yaml
+securityContext:
+  runAsUser: 568
+  runAsGroup: 568
+  fsGroup: 568
+```
+
+### Build your own
+
+Match the image user to your host user at build time:
+
+```bash
+docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
+```
+
+### Migrating from the old cache path
+
+Older images stored the cache at `/home/hfdesk/.cache/huggingface`, so the
+documented `-v ~/.cache/huggingface:/root/.cache/huggingface` mount never
+persisted anything. The cache now lives at `/data/.cache/huggingface`. Point
+your volume at `/data` (recommended), or move existing data:
+
+```bash
+mv ~/.cache/huggingface /path/to/your/data/.cache/huggingface
 ```
 
 ## Credits

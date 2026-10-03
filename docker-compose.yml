@@ -1,0 +1,19 @@
+# Example docker-compose.yml for HFDesk.
+#
+# All writable state lives under the single /data volume. Set PUID/PGID to
+# your host user so downloaded models are owned by you (find them with
+# `id -u` / `id -g`).
+services:
+  hfdesk:
+    image: ghcr.io/bashrusakh/hfdesk:latest
+    container_name: hfdesk
+    ports:
+      - "8080:8080"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      UMASK: "022"
+      # HF_TOKEN: hf_xxx   # for private/gated models
+    volumes:
+      - ./hfdesk-data:/data
+    restart: unless-stopped

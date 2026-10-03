@@ -6,10 +6,15 @@
 
 - Route downloads into optional per-type folders (LLM/GGUF, LLM/Safetensors, LLM, Audio, Diffusion, Embedding) via opt-in type routes (#62)
 - `HF_TOKEN` environment variable support: the token is now resolved as `--token` flag, then `HF_TOKEN` env, then the config file token (#72)
+- Docker: `PUID`/`PGID`/`UMASK` environment variables let NAS/homelab users run the container as their own UID/GID and control the file creation mask (#61)
+- Docker: build args `UID`/`GID` create the image user with a custom UID/GID (`docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`) (#61)
+- Docker: arbitrary-UID support — `docker run --user 568:568` and Kubernetes `securityContext.runAsUser`/`fsGroup` now work without the image user or an `/etc/passwd` entry (#61)
 
 ### Changed
 
 - Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
+- Docker: all writable state (settings, jobs, history, HF cache, local models) now lives under a single `/data` root, so one volume persists everything; `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, `HF_HOME=/data/.cache/huggingface`, and `WORKDIR /data` (#61)
+- Docker: the container starts as root only to apply PUID/PGID, then drops privileges; the app process still runs non-root (default UID/GID 1000) (#61)
 
 ### Fixed
 
@@ -17,6 +22,7 @@
 - Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
 - Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
 - Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
+- Docker: the README example mounted the host cache to `/root/.cache/huggingface` while the image used `/home/hfdesk/.cache/huggingface`, so the Hugging Face cache was never persisted. Existing users must update their volume mount to `/data` (#61)
 
 ## [1.2.2] - 2026-06-29
 
