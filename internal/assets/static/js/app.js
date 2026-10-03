@@ -27,6 +27,88 @@
   const isFilePreview = () => window.location.protocol === 'file:';
 
   // =========================================
+  // Download route labels
+  // =========================================
+  //
+  // The server owns a closed set of internal route keys. The user must never
+  // see those keys, so the dashboard maps each label to its key in this single
+  // fixed table (mirrors plans/download-type-folders/plan.md §2.3). Field ids
+  // and labels are the only route-facing surface; keys are sent to the API but
+  // never rendered into the DOM.
+  const ROUTE_LABELS = [
+    { key: 'llm/gguf',        label: 'GGUF models',       fieldId: 'routeLlmGguf',        preset: ['LLM', 'GGUF'] },
+    { key: 'llm/safetensors', label: 'Safetensors / LLM', fieldId: 'routeLlmSafetensors', preset: ['LLM', 'Safetensors'] },
+    { key: 'audio',           label: 'Audio',             fieldId: 'routeAudio',          preset: ['Audio'] },
+    { key: 'diffusion',       label: 'Diffusion',         fieldId: 'routeDiffusion',      preset: ['Diffusion'] },
+    { key: 'embedding',       label: 'Embedding',         fieldId: 'routeEmbedding',      preset: ['Embedding'] }
+  ];
+
+  // getConfiguredRouteOptions returns the labeled options for routes that have
+  // a non-empty destination configured, in the fixed table order.
+  function getConfiguredRouteOptions() {
+    const routes = state.settings?.downloadRoutes || {};
+    return ROUTE_LABELS
+      .filter(r => String(routes[r.key] || '').trim() !== '')
+      .map(r => ({ key: r.key, label: r.label }));
+  }
+
+  // routeKeyForAnalysis derives the internal route key from an existing
+  // /api/analyze result (plan §3). Returns '' when no route applies; callers
+  // only ever send keys that are actually configured.
+  function routeKeyForAnalysis(analysis) {
+    if (!analysis || analysis.is_dataset) return '';
+    switch (analysis.type) {
+      case 'gguf':
+        return 'llm/gguf';
+      case 'transformers':
+        return analysis.transformers?.task === 'feature-extraction'
+          ? 'embedding'
+          : 'llm/safetensors';
+      case 'diffusers':
+        return 'diffusion';
+      case 'audio':
+        return 'audio';
+      default:
+        return '';
+    }
+  }
+
+  // renderRouteSelect builds a labeled destination <select>. Option values are
+  // indexes into the fixed option list, never raw keys, so keys stay out of the
+  // rendered markup. An empty selection means "Default (server setting)".
+  function renderRouteSelect(id, { className = '', style = '', ariaLabel = '' } = {}) {
+    const opts = getConfiguredRouteOptions();
+    const prefill = routeKeyForAnalysis(currentAnalysis);
+    const selIdx = opts.findIndex(o => o.key === prefill);
+    const rows = opts.map((o, i) =>
+      `<option value="${i}"${i === selIdx ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+    const cls = className ? ` class="${escapeHtml(className)}"` : '';
+    const styleAttr = style ? ` style="${escapeHtml(style)}"` : '';
+    const aria = ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : '';
+    // data-option-count records how many configured routes this select was
+    // built from. routeSelectValue refuses to interpret an index if the live
+    // count drifted, so a changed route set can never map to the wrong key.
+    return `<select id="${escapeHtml(id)}"${cls}${styleAttr}${aria} data-option-count="${opts.length}">
+      <option value="-1"${selIdx < 0 ? ' selected' : ''}>Default (server setting)</option>
+      ${rows}
+    </select>`;
+  }
+
+  // routeSelectValue maps the selected index back to a configured key, or ''
+  // for the default option / an absent or stale select.
+  function routeSelectValue(id) {
+    const el = $(`#${id}`);
+    if (!el) return '';
+    const idx = parseInt(el.value, 10);
+    if (!Number.isInteger(idx) || idx < 0) return '';
+    const opts = getConfiguredRouteOptions();
+    const rendered = parseInt(el.dataset.optionCount, 10);
+    if (opts.length !== rendered) return '';
+    return idx < opts.length ? opts[idx].key : '';
+  }
+
+  // =========================================
   // Navigation
   // =========================================
 
@@ -982,11 +1064,21 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // downloadFromAnalysis: show a simple download modal in the unified Models page
   window.downloadFromAnalysis = function(repo, isDataset) {
     const rev = currentAnalysis?.branch || 'main';
+    // Offer a labeled destination choice only when type folders are configured;
+    // otherwise the modal is exactly as before.
+    const routeOptions = getConfiguredRouteOptions();
+    const routeGroup = routeOptions.length ? `
+      <div class="form-group">
+        <label for="dlModalRoute">Save to</label>
+        ${renderRouteSelect('dlModalRoute')}
+        <p class="form-hint">Choose a configured type folder, or keep the server default.</p>
+      </div>` : '';
     showModal('Download', `
       <div class="form-group">
         <label>Repository</label>
         <div style="font-weight:600; padding: 6px 0;">${escapeHtml(repo)}</div>
       </div>
+      ${routeGroup}
       <div class="form-group">
         <label for="dlModalLocalDir">Save to folder <span class="form-hint-inline">(optional)</span></label>
         <input type="text" id="dlModalLocalDir" placeholder="leave blank for Settings default">
@@ -1003,6 +1095,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   window.confirmDirectDownload = async function(repo, isDataset, revision) {
     hideModal();
     const localDir = $('#dlModalLocalDir')?.value?.trim() || '';
+    const routeKey = routeSelectValue('dlModalRoute');
     try {
       const df = await fetch('/api/diskfree' + (localDir ? `?path=${encodeURIComponent(localDir)}` : '')).then(r => r.json()).catch(() => null);
       if (df && df.free < 100 * 1024 * 1024) {
@@ -1011,6 +1104,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       }
       const body = { repo, revision: revision || 'main', dataset: isDataset };
       if (localDir) body.localDir = localDir;
+      if (routeKey) body.routeKey = routeKey;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -1071,6 +1165,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (!badge) return;
     try {
       const s = await api('GET', '/settings');
+      // Keep the route map available to the download/quant modals, which can be
+      // opened from the Models page without visiting Settings first.
+      state.settings = s;
       if (s.storageMode === 'local') {
         badge.textContent = `Storage: local files → ${s.localDir}`;
         badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
@@ -2441,6 +2538,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (downloadLayout) {
         downloadLayout.value = data.storageMode === 'local' ? 'local' : 'cache';
       }
+      // Populate the labeled type-folder fields from the keyed route map. The
+      // label<->key mapping lives only in ROUTE_LABELS; the user never sees a
+      // raw key.
+      const routes = data.downloadRoutes || {};
+      ROUTE_LABELS.forEach(r => {
+        const el = $(`#${r.fieldId}`);
+        if (el) el.value = routes[r.key] || '';
+      });
       syncStorageFields();
 
       // Display config file paths
@@ -2489,6 +2594,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     $('#saveSettingsBtn')?.addEventListener('click', saveSettings);
     $('#resetSettingsBtn')?.addEventListener('click', resetSettings);
     $('#downloadLayout')?.addEventListener('change', syncStorageFields);
+    $('#fillRoutePresetBtn')?.addEventListener('click', fillRoutePreset);
 
     // Toggle password visibility
     $$('.toggle-visibility').forEach(btn => {
@@ -2579,6 +2685,17 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       return;
     }
     const retries = parseInt($('#retries')?.value);
+
+    // Build the route map from the labeled fields. Keys come only from
+    // ROUTE_LABELS; empty fields are omitted (they clear/unset the route).
+    // This is independent of `downloadLayout`: switching to HF cache must not
+    // wipe configured route folders (plan §7.2.1).
+    const downloadRoutes = {};
+    ROUTE_LABELS.forEach(r => {
+      const value = $(`#${r.fieldId}`)?.value?.trim() || '';
+      if (value) downloadRoutes[r.key] = value;
+    });
+
     const body = {
       token: $('#hfToken')?.value || '',
       cacheDir: $('#cacheDirInput')?.value?.trim() || '',
@@ -2587,6 +2704,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         .split(/\r?\n/)
         .map(v => v.trim())
         .filter(Boolean),
+      downloadRoutes,
       connections: parseInt($('#connections')?.value) || 8,
       maxActive: parseInt($('#maxActive')?.value) || 3,
       maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
@@ -2634,6 +2752,24 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (localGroup) {
       localGroup.style.display = layout === 'local' ? '' : 'none';
     }
+    // Type folders are independent of the layout toggle and stay visible.
+  }
+
+  // fillRoutePreset fills the labeled type-folder fields from a single root
+  // path. Form-only: it never creates directories and never saves (plan §2.7).
+  function fillRoutePreset() {
+    const root = $('#routePresetRoot')?.value?.trim() || '';
+    if (!root) {
+      showToast('Enter a preset root folder first', 'info');
+      return;
+    }
+    const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/';
+    const cleanRoot = root.replace(/[\\/]+$/, '');
+    ROUTE_LABELS.forEach(r => {
+      const el = $(`#${r.fieldId}`);
+      if (el) el.value = [cleanRoot, ...r.preset].join(sep);
+    });
+    showToast('Type folders filled — review and save to apply', 'info');
   }
 
   function resetSettings() {
@@ -2646,6 +2782,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     setVal('#localDirInput', '');
     setVal('#localScanDirs', '');
     setVal('#downloadLayout', 'cache');
+    ROUTE_LABELS.forEach(r => setVal(`#${r.fieldId}`, ''));
+    setVal('#routePresetRoot', '');
     setVal('#hfToken', '');
     setVal('#connections', '8');
     setVal('#maxActive', '3');
@@ -3320,6 +3458,20 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     let html = `<div class="selectable-items quant-list" id="${containerId}">`;
 
+    // Offer a labeled destination choice when type folders are configured.
+    // The select lives once per analysis result; downloadQuant reads it. Keys
+    // never appear in the markup (renderRouteSelect uses option indexes).
+    if (getConfiguredRouteOptions().length) {
+      html += `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('quantRouteSelect', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>`;
+    }
+
     for (const [category, categoryItems] of Object.entries(categories)) {
       const title = categoryTitles[category] || category.charAt(0).toUpperCase() + category.slice(1);
 
@@ -3399,6 +3551,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         filters: filterValue ? [filterValue] : [],
         exactMatch: !!filterValue
       };
+      // Send the labeled destination choice when type folders are configured.
+      // For an upstream companion (mmproj) this still resolves to the analyzed
+      // model's route, so companions land with the parent.
+      const routeKey = routeSelectValue('quantRouteSelect');
+      if (routeKey) body.routeKey = routeKey;
       // When downloading from an upstream repo (e.g. mmproj from a base model),
       // tell the server to store the file under the current model's folder.
       if (localRepo) body.localRepo = localRepo;
