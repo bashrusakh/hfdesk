@@ -44,6 +44,7 @@ RUN BUILD_VERSION="${VERSION}" && \
     if [ -z "$BUILD_VERSION" ] || [ "$BUILD_VERSION" = "latest" ]; then \
       BUILD_VERSION="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"; \
     fi && \
+    BUILD_VERSION="${BUILD_VERSION#v}" && \
     if [ -z "$BUILD_VERSION" ]; then \
       echo "error: no build version (pass --build-arg VERSION=<tag> or populate the VERSION file)" >&2; \
       exit 1; \
