@@ -83,9 +83,36 @@ ARG GID=1000
 # entrypoint privilege drop (Alpine has no su-exec/setpriv --reuid by default).
 RUN apk add --no-cache ca-certificates tzdata su-exec
 
-# Create the non-root image user with the build-time UID/GID.
-RUN addgroup -g "$GID" hfdesk && \
-    adduser -D -h /data -u "$UID" -G hfdesk hfdesk
+# Create (or reuse) the non-root image user/group with the build-time UID/GID.
+# Alpine reserves some IDs (for example gid 100 is "users" and uid 65534 is
+# "nobody"), so `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`
+# on a NAS/homelab host can collide with an existing entry. Rather than fail
+# the build, reuse the existing group/account for that ID and record its name;
+# the entrypoint remaps by the resolved name. Genuine misconfiguration (a
+# non-numeric or out-of-range ID) still fails in addgroup/adduser.
+RUN set -eu; \
+    if getent group "$GID" >/dev/null; then \
+      hfdesk_group="$(getent group "$GID" | cut -d: -f1)"; \
+    else \
+      addgroup -g "$GID" hfdesk; \
+      hfdesk_group=hfdesk; \
+    fi; \
+    if [ "$hfdesk_group" = root ]; then \
+      echo "error: GID $GID resolves to the root group; refusing to use it as the image group" >&2; \
+      exit 1; \
+    fi; \
+    if getent passwd "$UID" >/dev/null; then \
+      hfdesk_user="$(getent passwd "$UID" | cut -d: -f1)"; \
+    else \
+      adduser -D -h /data -u "$UID" -G "$hfdesk_group" hfdesk; \
+      hfdesk_user=hfdesk; \
+    fi; \
+    if [ "$hfdesk_user" = root ]; then \
+      echo "error: UID $UID resolves to the root account; refusing to use it as the image user" >&2; \
+      exit 1; \
+    fi; \
+    printf '%s\n' "$hfdesk_group" > /etc/hfdesk-group; \
+    printf '%s\n' "$hfdesk_user" > /etc/hfdesk-user
 
 # Copy binary and entrypoint from builder
 COPY --from=builder /hfdesk /usr/local/bin/hfdesk
@@ -105,13 +132,15 @@ ENV HOME=/data \
     HFDESK_UID=$UID \
     HFDESK_GID=$GID
 
-# Create the single writable data root. Do NOT pre-create the app subdirs:
-# a fresh named volume copies this directory's ownership/permissions, so if
-# they were owned by the image user an arbitrary `--user <uid>` could not
-# create its own state. The sticky, world-writable root lets any UID create
-# its state dirs; the entrypoint only owns the root itself (never descending
-# into the attacker-writable tree), and the app creates its subdirs as the
-# target UID. Model/cache trees are left to the app to create.
+# Create the single writable data root. `adduser -h /data` already owns it as
+# the image user, so it is the 1777 (sticky, world-writable) mode - not the
+# ownership - that lets an arbitrary `--user <uid>` create its own state.
+#
+# Do NOT pre-create the app subdirs: a fresh named volume copies this
+# directory's contents, and subdirs owned by the image user at mode 0755 would
+# not be writable by an arbitrary UID. The entrypoint only owns the root itself
+# (never descending into the attacker-writable tree), and the app creates its
+# subdirs as the target UID. Model/cache trees are left to the app to create.
 RUN mkdir -p /data && chmod 1777 /data
 
 # Note: no USER directive. The entrypoint must start as root to apply

@@ -22,6 +22,7 @@
 - Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
 - Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
 - Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
+- Docker: `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)` no longer fails when the requested UID/GID collides with a reserved Alpine account or group (for example gid `100` is `users`); the image user reuses the existing entry and `PUID`/`PGID` still remap at runtime (#61)
 - Docker: the README example mounted the host cache to `/root/.cache/huggingface` while the image used `/home/hfdesk/.cache/huggingface`, so the Hugging Face cache was never persisted. Existing users must update their volume mount to `/data` (#61)
 
 ## [1.2.2] - 2026-06-29

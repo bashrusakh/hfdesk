@@ -46,12 +46,31 @@ UMASK="${UMASK:-022}"
 
 APP_BIN="${HFDESK_BIN:-/usr/local/bin/hfdesk}"
 
+# Build-time account names. The Dockerfile creates the image user as "hfdesk"
+# when it can, but reuses an existing Alpine account/group when the requested
+# UID/GID collides with a reserved ID (for example gid 100 is "users"). It
+# records the resolved names here so the remap below targets the right entry.
+RESOLVED_USER="hfdesk"
+RESOLVED_GROUP="hfdesk"
+if [ -r /etc/hfdesk-user ]; then
+    RESOLVED_USER="$(cat /etc/hfdesk-user)"
+fi
+if [ -r /etc/hfdesk-group ]; then
+    RESOLVED_GROUP="$(cat /etc/hfdesk-group)"
+fi
+
 # Fixed writable data root. Keep in sync with the Dockerfile ENV defaults.
 # Not overridable: see the security note above.
 DATA_ROOT="/data"
 
 # Apply the requested umask before either exec path. This is just a process
 # attribute, so it is harmless (and still honored) when running non-root.
+case "$UMASK" in
+    '' | *[!0-7]*)
+        echo "entrypoint: UMASK must be an octal mask such as 022 (got '$UMASK')" >&2
+        exit 64
+        ;;
+esac
 umask "$UMASK"
 
 # Already non-root: honor the caller's UID/GID as-is and never chown. The
@@ -73,17 +92,18 @@ case "$PGID" in
         ;;
 esac
 
-# Remap the hfdesk account to the requested IDs. Alpine's BusyBox has no
-# usermod, so edit the account database directly. The passwd entry carries the
-# primary GID, so remap it whenever either the UID or the GID differs; remapping
-# on the UID alone would leave /etc/passwd with a stale GID after a PGID-only
-# change.
-if [ "$(id -g hfdesk 2>/dev/null || echo x)" != "$PGID" ]; then
-    sed -i "s/^\(hfdesk:x:\)[0-9]*:/\1${PGID}:/" /etc/group
+# Remap the resolved image account to the requested IDs. Alpine's BusyBox has
+# no usermod, so edit the account database directly. The passwd entry carries
+# the primary GID, so remap it whenever either the UID or the GID differs;
+# remapping on the UID alone would leave /etc/passwd with a stale GID after a
+# PGID-only change. Target the resolved account/group names because a colliding
+# build may have reused an existing Alpine entry instead of creating "hfdesk".
+if [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
+    sed -i "s/^\(${RESOLVED_GROUP}:x:\)[0-9]*:/\1${PGID}:/" /etc/group
 fi
-if [ "$(id -u hfdesk 2>/dev/null || echo x)" != "$PUID" ] || \
-   [ "$(id -g hfdesk 2>/dev/null || echo x)" != "$PGID" ]; then
-    sed -i "s/^\(hfdesk:x:\)[0-9]*:[0-9]*:/\1${PUID}:${PGID}:/" /etc/passwd
+if [ "$(id -u "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PUID" ] || \
+   [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
+    sed -i "s/^\(${RESOLVED_USER}:x:\)[0-9]*:[0-9]*:/\1${PUID}:${PGID}:/" /etc/passwd
 fi
 
 # Symlink-safe handling of the fixed data root.

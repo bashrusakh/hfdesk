@@ -225,6 +225,10 @@ securityContext:
   fsGroup: 568
 ```
 
+Note that `--user`/`fsGroup` only works with a named volume or a
+pre-permissioned host directory (or one whose ownership `fsGroup` sets); a bare
+`--user` over a root-owned `0755` bind mount cannot write.
+
 ### Build your own
 
 Match the image user to your host user at build time:
@@ -232,6 +236,10 @@ Match the image user to your host user at build time:
 ```bash
 docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
 ```
+
+If the requested UID/GID is already used by a reserved Alpine account or group
+(for example gid `100` is `users`), the build reuses that existing entry instead
+of failing; `PUID`/`PGID` still remap the app process at runtime.
 
 ### Migrating from the old cache path
 
