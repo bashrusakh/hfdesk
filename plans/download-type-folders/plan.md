@@ -29,6 +29,8 @@ Chosen direction is **A+B**:
   opt-in; a repo is routed only when a matching key is configured.
 - **B** — coarse keys (`llm`, `audio`, `diffusion`, `embedding`) plus optional
   finer sub-keys (`llm/gguf`, `llm/safetensors`, later `audio/whisper`, ...).
+- The dashboard shows **human labels** for these settings, never the keys;
+  keys are an internal config/advanced-API detail. See §2.3 and §7.2.
 
 Minimum accepted outcome: separate LLM vs Audio. Better: also split LLM into
 GGUF vs Safetensors. The B scheme below supports both.
@@ -47,6 +49,12 @@ GGUF vs Safetensors. The B scheme below supports both.
 
 ## 2. Config and data model (A+B)
 
+Design principle: **keys are internal; labels are user-facing.** The config
+file and the server store a map keyed by a closed, server-defined set of route
+keys. The dashboard UI never shows a key — it renders human labels bound to
+those keys (§2.3). A key is never free-form user input; the server rejects any
+key outside the closed set.
+
 ### 2.1 Field name and shape
 Add one field to both the persisted file and the in-memory server config:
 
@@ -58,28 +66,30 @@ Add one field to both the persisted file and the in-memory server config:
 - `internal/server/server.go` `Config` (`:22-53`): add the same
   `DownloadRoutes map[string]string`.
 
-Example `hfdesk.json` / `hfdesk.yaml`:
+Example `hfdesk.json` / `hfdesk.yaml` — this is the internal/advanced format;
+end users normally set these values through the labeled Settings fields in
+§7.2, not by editing JSON:
 
 ```json
 {
   "local-dir": "/mnt/nvme/models",
   "download-routes": {
-    "llm":            "/mnt/nvme/models/LLM",
-    "llm/gguf":       "/mnt/nvme/models/LLM/GGUF",
-    "llm/safetensors":"/mnt/nvme/models/LLM/Safetensors",
-    "diffusion":      "/mnt/nvme/models/Diffusion/Checkpoints",
-    "audio":          "/mnt/nvme/models/Audio",
-    "embedding":      "/mnt/nvme/models/Embedding"
+    "llm/gguf":        "/mnt/nvme/models/LLM/GGUF",
+    "llm/safetensors": "/mnt/nvme/models/LLM/Safetensors",
+    "audio":           "/mnt/nvme/models/Audio",
+    "diffusion":       "/mnt/nvme/models/Diffusion",
+    "embedding":       "/mnt/nvme/models/Embedding"
   }
 }
 ```
 
-### 2.2 Key scheme
-Namespace-separated, `/`-delimited, most-specific-first. Phase 1 defines:
+### 2.2 Closed key set (internal only)
+Namespace-separated, `/`-delimited, most-specific-first. The server defines
+and owns this set; it is not user-extensible. Phase 1 keys:
 
-| Key | Meaning |
+| Key (internal) | Meaning |
 |---|---|
-| `llm` | Any LLM (transformers / gguf / gptq / awq / onnx-as-llm) |
+| `llm` | Any LLM (gptq/awq/other); coarse fallback for `llm/*` |
 | `llm/gguf` | GGUF quantized LLM (fine, wins over `llm`) |
 | `llm/safetensors` | Transformers safetensors/bin LLM (fine, wins over `llm`) |
 | `diffusion` | Diffusers pipelines / diffusion LoRAs |
@@ -91,7 +101,58 @@ Reserved for Phase 3 (not required, do not implement early):
 `diffusion/lora`, `diffusion/vae`, `diffusion/clip`, `diffusion/controlnet`,
 `llm/gptq`, `llm/awq`, optional `dataset`.
 
-### 2.3 Precedence and fallback
+### 2.3 User-facing label table (dashboard only)
+The UI renders one labeled path field per key and maps label<->key in a single
+fixed table. The user never sees `llm/gguf`, `llm`, etc.
+
+| Label shown to the user | Bound internal key | Field state |
+|---|---|---|
+| `GGUF models` | `llm/gguf` | path or empty |
+| `Safetensors / LLM` | `llm/safetensors` | path or empty |
+| `Audio` | `audio` | path or empty |
+| `Diffusion` | `diffusion` | path or empty |
+| `Embedding` | `embedding` | path or empty |
+
+Every field is empty by default and empty means "use current behavior"
+(server-global `LocalDir` flat layout, else HF cache). The coarse `llm` key
+remains a valid internal/config key and resolution fallback, but is not
+surfaced by the Phase 2 UI — see §11 [OPEN] on whether to add an
+"Other LLM" field later.
+
+### 2.4 API shape decision — recommend (a), the keyed map
+Two options were considered:
+
+- **(a)** Config and API keep the keyed map; the UI maps labels<->keys using
+  the fixed table in §2.3.
+- **(b)** The API accepts a fixed set of labeled fields (one struct field per
+  label), mapping to keys server-side.
+
+**Recommendation: (a).** Justification:
+
+- Single canonical representation: the config file, the in-memory `Config`,
+  the `SettingsResponse`, and the `POST /api/settings` body all use the same
+  keyed map. There is no parallel labeled schema to keep in sync, and no
+  two-way translation layer in the server.
+- Forward-compatible: adding a finer split (e.g. `audio/whisper`,
+  `diffusion/unet`) is an additive key plus one UI label row, with no API or
+  struct change. Option (b) would require a new field and migration for every
+  split, duplicating the same information.
+- The closed set is still enforced server-side: the server validates every
+  incoming key against the known set and rejects unknown keys with `400`, so
+  keys are never free-form user input.
+- "Never show keys" is a **UI rule**, satisfied by the §2.3 label table. Keys
+  are the internal/advanced format; `docs/API.md` documents them for API
+  consumers, who are technical users rather than the dashboard user.
+- Alternative (b) remains a possible later hardening if the maintainers want
+  zero key exposure even over the HTTP API; it can be layered on top of the
+  same keyed storage without a config migration. Flagged as [OPEN] in §11.
+
+Where keys appear, the split is:
+- **Internal / config / advanced API**: `config.go`, `server.go`, the
+  `download-routes` file field, and the `downloadRoutes` API fields.
+- **User-facing**: only the §2.3 labels in `index.html` / `app.js`.
+
+### 2.5 Precedence and fallback
 Resolution order for a model download (first match wins):
 
 1. An explicit per-request destination path (`req.localDir`) — unchanged
@@ -107,14 +168,56 @@ routed to a model key unless an optional `dataset` key is later added.
 
 Empty or whitespace-only route values are ignored (treated as unconfigured).
 
+### 2.6 Path validation and save flow
+Match the current settings behavior; do not add stricter validation than the
+existing fields.
+
+- **Normalization**: apply `cleanPathList` semantics to each route value —
+  `strings.TrimSpace`, `filepath.Clean`, drop empties
+  (`internal/server/api.go:762-782`). Reuse the same helper style rather than
+  inventing a new normalizer.
+- **No directory creation, no existence requirement**: `POST /api/settings`
+  today does not validate, normalize beyond trim/`Clean`, or create
+  directories, and a bad path persists and only fails at download time
+  (`internal/server/api.go:377-399`, `:436-507`, `:509-563`). Keep that for
+  route paths: do **not** silently `MkdirAll`, and do not hard-fail a save for
+  a non-existent path.
+- **Recommended light warning**: optionally stat each non-empty route path
+  and return a non-blocking `warnings` array (e.g. "path does not exist yet")
+  in the success response so the UI can show it. This must never fail the
+  request and never create the directory. If maintainers prefer zero new
+  behavior, omit the warning — [OPEN] in §11.
+- **Key validation**: reject unknown keys with `400`; empty values clear the
+  key. Existing settings fields keep their current (unchanged) validation.
+- **Failure reporting**: a rejected key returns `400` before any config
+  mutation, using the existing validate-then-apply ordering in
+  `handleUpdateSettings` (`api.go:406-428`).
+
+### 2.7 Preset (one-click folder fill)
+An optional convenience control on the Settings page:
+
+- One root path input plus a button (working label e.g. "Fill type folders").
+- On click, fills the five labeled fields (§2.3) with
+  `<root>/LLM/GGUF`, `<root>/LLM/Safetensors`, `<root>/Audio`,
+  `<root>/Diffusion`, `<root>/Embedding`. Nothing is typed by hand.
+- **Form-only**: it only fills the form. The user still reviews and presses
+  Save; the normal settings save flow persists the map. It does **not** create
+  directories on disk, and it does not save by itself. Recommended: no
+  filesystem mutation at all; whether a future "create folders now" action is
+  wanted is [OPEN] in §11.
+- An empty root is a no-op with a toast.
+- The preset writes into the same labeled fields a user could edit manually;
+  it is not a separate storage path.
+
 ---
 
-## 3. `RepoType` -> route-key mapping
+## 3. `RepoType` -> route-key mapping (internal resolution only)
 
 Current types (`pkg/smartdl/types.go:34-108`) and detection
-(`analyzer.go:417-490`, `specialized.go:415-539`). Mapping below is the
-recommended treatment; items marked **[OPEN]** need a maintainer decision and
-must not be silently resolved.
+(`analyzer.go:417-490`, `specialized.go:415-539`). This table is **internal**:
+it maps to route keys, which the user never sees. The user only sees the
+§2.3 labels. Items marked **[OPEN]** need a maintainer decision and must not
+be silently resolved.
 
 | RepoType / condition | Fine key (if configured) | Coarse fallback | Notes |
 |---|---|---|---|
@@ -131,6 +234,9 @@ must not be silently resolved.
 | `multimodal` | — | fallback (no route) **[OPEN]** | Not in user tree — see §3.5. |
 | `generic` / unknown | — | fallback (no route) | Safe default: LocalDir/cache. |
 | `dataset` | — | fallback (no route) | Preserve current dataset behavior. |
+
+Every key column above is internal. The corresponding dashboard label (if any)
+is defined once in the §2.3 table; no other place in the UI may render a key.
 
 ### 3.1 Embedding
 There is no dedicated `RepoType` for embeddings. They arrive as
@@ -198,6 +304,14 @@ Options considered:
 - **(c)** is rejected: extension heuristics duplicate `detectType` and would
   silently mis-handle ONNX, LoRA, and embeddings.
 
+User-facing vs internal at this boundary:
+- The **route key is internal**. In Phase 1 it is sent over the API by
+  technical/raw clients. In Phase 2 the dashboard derives the key from the
+  analysis result via the §3 mapping; the user never sees or types it. If a
+  user opens the download modal, they see a labeled destination choice
+  (e.g. "GGUF models"), and the app maps that label to its key.
+- A raw API client that sends no key gets today's behavior exactly.
+
 Fallback when no key is sent (raw API users, CLI, or clients that skip
 analysis): behave exactly as today (LocalDir / HF cache). Keys for
 `mmproj`/`LocalRepo` upstream downloads should be the **same key as the parent
@@ -229,7 +343,19 @@ In `CreateJob`:
    (same flat/real-file mode as today).
 3. Add a `RouteKey string` field to `Job` (`jobs.go:31-42`) for auditability
    and UI display. Do **not** add a second destination field: `LocalDir`
-   already carries the effective destination.
+   already carries the effective destination. `Job.RouteKey` is internal and
+   must not be rendered as a raw key in the UI; show the §2.3 label or the
+   destination folder instead.
+
+Note on the flat/local mode switch: `Config.LocalDir` non-empty globally puts
+the server in flat/local mode (`internal/server/server.go:29-33`; the
+`flat := effectiveLocalDir != ""` branch in `jobs.go:360-369`). Setting a
+resolved route path as the job's `effectiveLocalDir` intentionally reuses that
+same flat-file branch, because route destinations are real-file folders like
+`/mnt/nvme/models/LLM/GGUF`. A route path is therefore a per-job use of flat
+mode and must not be confused with the server-wide `LocalDir` mode switch —
+the server-global `LocalDir` setting is unchanged, and route config is
+independent of it (see §7.2 on the layout toggle).
 
 Consistency requirements (must hold for resume/retry/restart/companions):
 - `job.LocalDir` is persisted in `jobs_state.json` (Job JSON tags,
@@ -266,8 +392,12 @@ New destination leaves must be discoverable and statable:
 - This also drives Hub local badges, which read the same root list.
 - `/api/diskfree` (`internal/server/search.go:205-248`) validates its `path`
   query param against a fixed allowlist. Add every configured route path to
-  `configured` so a settings UI or download modal can request free space for
-  a route folder instead of returning `400`.
+  `configured` so the settings page or download modal can request free space
+  for a route folder instead of returning `400`. `path` here is a filesystem
+  path, not a route key; keys are never sent to this endpoint.
+- User-facing note: the Cache browser group label for a route folder may be
+  shown as a human label (e.g. the folder name or "Type folders"), never as an
+  internal key.
 
 ---
 
@@ -275,35 +405,92 @@ New destination leaves must be discoverable and statable:
 
 ### 7.1 API
 - `DownloadRequest` (`internal/server/api_types.go:7-26`): add
-  `RouteKey string json:"routeKey,omitempty"`. Document that it is a **key**,
-  not a path, and that unknown/unconfigured keys are rejected.
+  `RouteKey string json:"routeKey,omitempty"`. Document that it is an
+  **internal key from the closed set** (§2.2), not a path, and that
+  unknown/unconfigured keys are rejected with `400`. This is an advanced/raw
+  API field; the dashboard hides it behind labels.
 - `SettingsResponse` (`api_types.go:44-65`): add
   `DownloadRoutes map[string]string json:"downloadRoutes,omitempty"`.
-  Populate it in `handleGetSettings` (`api.go:343-358`).
+  Populate it in `handleGetSettings` (`api.go:343-358`). The API exposes the
+  keyed map (option (a), §2.4); the dashboard maps keys to labels.
 - `handleUpdateSettings` request struct (`api.go:377-399`): add
   `DownloadRoutes *map[string]string json:"downloadRoutes,omitempty"`; apply
   via copy-on-write inside `withConfig` (`api.go:436-507`) and persist through
-  `SaveConfigFile` (`api.go:530-556`). Validate keys against the known key
-  scheme (`^[a-z]+(/[a-z]+)?$`) and ignore/clear empty values.
+  `SaveConfigFile` (`api.go:530-556`). Normalize values per §2.6 and reject
+  keys outside the closed set with `400`.
 - `ApplyConfigToServer` (`config.go:193-246`): copy `DownloadRoutes` from the
   file into `serverCfg` when CLI/config precedence allows.
 - Sync `docs/API.md` settings section (`docs/API.md:124-143`) with the new
-  fields and the `routeKey` semantics.
+  fields, the closed key set, and the `routeKey` semantics.
 
-### 7.2 Settings page
-- `internal/assets/static/index.html` Storage card (`:689-727`): add a route
-  editor (key -> path rows) under the existing storage rows.
-- `internal/assets/static/js/app.js`: extend `loadSettings`/`saveSettings`/
-  `syncStorageFields` (`:2423-2650`) to read/write `downloadRoutes`.
+### 7.2 Settings page (labeled destination fields)
+Replace the rejected "route-key editor" idea. The user sees labeled path
+fields, never keys.
+
+- `internal/assets/static/index.html` Storage card (`:699-725`): add a "Type
+  folders" group with five rows, each a label plus a plain text path input
+  (same pattern as the existing `localDirInput` / `localScanDirs` text inputs):
+
+  | Label | Bound key (hidden) |
+  |---|---|
+  | `GGUF models` | `llm/gguf` |
+  | `Safetensors / LLM` | `llm/safetensors` |
+  | `Audio` | `audio` |
+  | `Diffusion` | `diffusion` |
+  | `Embedding` | `embedding` |
+
+  Placeholders show an example path (e.g. `/mnt/nvme/models/LLM/GGUF`).
+  Each field is empty by default; empty means "use current behavior".
+- **No native folder picker.** The frontend cannot hand a server-side
+  absolute path to a native directory dialog (the server is remote/headless;
+  there is no such picker anywhere in the current UI). Do not promise
+  desktop-style "Browse". A text input with placeholder plus the preset
+  (§7.2.1) is the working pattern.
+- **Preset control** (optional): a root path input plus a button (working
+  label e.g. "Fill type folders") that fills the five fields with
+  `<root>/LLM/GGUF`, `<root>/LLM/Safetensors`, `<root>/Audio`,
+  `<root>/Diffusion`, `<root>/Embedding`. Form-only, per §2.7: nothing is
+  created on disk, and the user still presses Save.
+- `internal/assets/static/js/app.js` (`loadSettings` `:2423-2486`,
+  `saveSettings` `:2574-2625`, `syncStorageFields` `:2627-2637`,
+  `resetSettings` `:2639-2664`):
+  - `loadSettings`: write `data.downloadRoutes[<key>]` into each labeled
+    field via the fixed label<->key table.
+  - `saveSettings`: build a `downloadRoutes` object from the fields; send
+    empty fields as "unset" (omit or empty string), never as a key path.
+
+#### 7.2.1 Layout-toggle independence (critical)
+Current `saveSettings` sends `localDir: ''` whenever
+`downloadLayout != 'local'` (`app.js:2585`), i.e. switching to HF cache
+**clears** the configured local path. The new route fields are a separate
+concern and **must not** be wiped by the HF-cache/local layout toggle:
+
+- Route fields are always included in the `downloadRoutes` body regardless of
+  `downloadLayout`.
+- `syncStorageFields` continues to show/hide only `cacheDirGroup` and
+  `localDirGroup`; the Type-folders group is always visible and unaffected by
+  the toggle.
+- `saveSettings` must not derive or clear route values from `downloadLayout`.
+
+#### 7.2.2 Reset behavior
+`resetSettings` (`app.js:2639-2664`) already clears `localDirInput`,
+`localScanDirs`, and `downloadLayout` behind a confirm dialog.
+Recommendation: also clear the five Type-folder fields and the preset root
+input under the same existing confirm, keeping "reset" consistent. If a
+maintainer prefers to preserve route config across reset, mark that [OPEN]
+(§11); the default recommendation is to clear them.
 
 ### 7.3 Download modal
 - `app.js` `dlModalLocalDir` (`:985-1020`) and the quant modal
-  (`:3380-3425`): prefill a route select from the existing analysis result
-  (`type`/`task` -> key via §3 mapping), defaulting to "configured routes
-  only" with a clear override. Prefer a route-key selector over a free path
-  when routes are configured, so the UI cannot drift from server-side keys.
+  (`:3380-3425`): prefill a **labeled destination choice** derived from the
+  existing analysis result (`type`/`task` -> key via §3, then key -> label via
+  §2.3). Show labels (e.g. "GGUF models", "Audio") plus a "Default" option;
+  never show raw keys or a free path field when routes are configured, so the
+  UI cannot drift from server-side keys.
 - Keep a "Default (LocalDir / HF cache)" option that sends no `routeKey`, so
   existing users are unaffected.
+- The modal sends the internal key under the hood; the label mapping stays in
+  one place (§2.3 table).
 
 ---
 
@@ -311,15 +498,19 @@ New destination leaves must be discoverable and statable:
 
 - **Default unchanged**: with an empty `download-routes` map, `resolveRoute`
   returns `""` and `CreateJob` follows the existing LocalDir/cache path
-  exactly. No behavior change for existing users.
-- **Server authority**: the server accepts only keys present in
-  `cfg.DownloadRoutes`; a path-shaped or unknown value is rejected with `400`.
-  The route feature does not broaden the API to arbitrary client paths.
+  exactly. No behavior change for existing users. Empty labeled fields mean
+  exactly this.
+- **Server authority**: the server accepts only keys from the closed set
+  (§2.2); a path-shaped or unknown value is rejected with `400`. Route keys are
+  never free-form user input, and the UI never exposes them.
 - **Existing `req.localDir` looseness is preserved as-is**, not worsened. A
   separate hardening task may add it to the allowlist; that is out of scope.
 - **Path safety**: reapply the existing untrusted-path guards used by
   cache/mirror operations; do not follow route paths outside configured roots
   for delete/rebuild.
+- **No implicit fs mutation**: saving settings, and the preset button, do not
+  create directories; a non-existent path persists and fails at download time
+  exactly like today's fields.
 - Empty/whitespace route values are ignored; duplicate paths are deduped in
   scan roots.
 
@@ -331,19 +522,26 @@ New destination leaves must be discoverable and statable:
 1. Config: `DownloadRoutes` in `ConfigFile` + `Config`; `ApplyConfigToServer`
    and `SaveConfigFile`.
 2. `resolveRoute` helper + `RouteKey` on `Job`; wire resolver into `CreateJob`
-   with key validation; extend dedup.
+   with closed-set key validation; extend dedup.
 3. Scan roots: add route dirs to `localCacheRoots` and its callers.
 4. Disk-free allowlist addition.
 5. Unit tests (§10).
 6. `docs/API.md` settings + `DownloadRequest` update.
 
-Deliverable: API users can POST a `routeKey` and downloads land in the
-configured folders; Cache browser and disk-free work; defaults unchanged.
+Deliverable: Phase 1 is exercised **purely via API / config file** using the
+internal keys — a technical user or script can set `download-routes` and POST
+`routeKey` and downloads land in the configured folders. No dashboard UI yet,
+so no key is shown to a normal user. Cache browser and disk-free work; defaults
+unchanged.
 
-### Phase 2 — UI
-- Settings route editor (index.html + app.js).
-- Download/quant modal route prefill and selector.
+### Phase 2a — labeled settings fields (no preset)
+- "Type folders" group with five labeled path inputs (index.html + app.js).
+- Labeled destination choice in the download/quant modal.
+- Independent of the layout toggle; reset clears them per §7.2.2.
 - Manual browser smoke test.
+
+### Phase 2b — optional preset
+- Root input + "Fill type folders" button that fills the form only (§2.7).
 
 ### Phase 3 — docs + optional finer splits
 - `CHANGELOG.md`, `README.md:39` wording.
@@ -359,6 +557,8 @@ configured folders; Cache browser and disk-free work; defaults unchanged.
 Unit tests (Phase 1):
 - `resolveRoute`: most-specific-wins (`llm/gguf` beats `llm`), coarse-only,
   unconfigured key -> `""`, empty values ignored, unknown key.
+- Key validation: a key outside the closed set (§2.2), including a
+  path-shaped value, is rejected with `400` and no config mutation.
 - `CreateJob` destination selection: `routeKey` -> configured path sets
   `LocalDir`/`flat`; unknown key -> `400`; no key + `LocalDir` set -> existing
   flat path; no key + no `LocalDir` -> HF cache; `req.localDir` still wins.
@@ -367,6 +567,8 @@ Unit tests (Phase 1):
 - `handleDiskFree`: configured route path accepted; unconfigured path -> `400`.
 - Settings round-trip: POST `downloadRoutes` persists to and reloads from
   `ConfigFile` (JSON and YAML).
+- Settings normalization: route values are trimmed/Cleaned and empty values
+  dropped; no directory is created by a save.
 - Dedup: same repo routed to two different keys is not collapsed.
 
 Regression (must remain unchanged):
@@ -374,15 +576,25 @@ Regression (must remain unchanged):
 - HF-cache-only mode is unaffected.
 - Datasets are not routed.
 - Pause/resume/retry/restart reuse the persisted `job.LocalDir`.
+- Existing settings fields keep current validation; a bad path still persists
+  and fails only at download time.
+
+UI tests / checks (Phase 2):
+- Labeled field <-> key mapping round-trips through save/load.
+- Route fields survive toggling `downloadLayout` cache<->local (no wipe).
+- `resetSettings` clears route fields under the confirm.
+- Preset fills the five fields from a root and does not create directories.
 
 Commands:
 - Minimum: `go test ./internal/server ./pkg/hfdownloader ./pkg/smartdl`
 - Cross-package: `go test ./...`
 - Concurrency (jobs/config changes): `go test ./... -race`
 - `gofmt -w` changed Go files.
-- Manual: configure routes, download an LLM (gguf + safetensors), an audio
-  model, and an embedding model; confirm folders, Cache browser visibility,
-  disk-free for a route folder, and unchanged behavior with routes empty.
+- Manual: use the Settings labeled fields (and preset) to configure routes,
+  download an LLM (gguf + safetensors), an audio model, and an embedding model;
+  confirm folders, Cache browser visibility, disk-free for a route folder,
+  route fields surviving a layout toggle, and unchanged behavior with fields
+  empty.
 - Docs-only edits state tests were not run.
 
 ---
@@ -395,6 +607,9 @@ Risks / regressions
 - Settings concurrency: route map mutation must follow the existing
   copy-on-write + generation pattern in `handleUpdateSettings`
   (`api.go:430-528`) to avoid racing in-flight jobs.
+- Layout-toggle wipe: if the new save path naively reuses the `layout === 'local'
+  ? localDir : ''` pattern for route values, route config would be cleared when
+  HF cache is selected. §7.2.1 makes route fields independent; a test guards it.
 - Dedup semantics change is user-visible (two jobs vs one); call it out in the
   PR body.
 - Stored jobs created before this change have no `RouteKey`; they remain valid
@@ -407,6 +622,17 @@ Open questions for the maintainer
 4. `embedding` as a top-level key (as proposed) vs under `llm`.
 5. Should the existing `req.localDir` path override be brought under the same
    allowlist as part of this work, or tracked separately.
+6. Should the Phase 2 UI also expose an "Other LLM" field bound to the coarse
+   `llm` key, or keep the UI to the five labeled fields and leave `llm` to the
+   config file / advanced API?
+7. Option (b) (labeled API fields, zero key exposure over HTTP) vs option (a)
+   (keyed map, keys visible only to API consumers): confirm (a) is acceptable,
+   since `docs/API.md` would otherwise document keys.
+8. Save-time non-blocking "path does not exist" warning: wanted, or keep
+   today's silent no-validation behavior.
+9. Reset behavior: clear route fields on reset (recommended) vs preserve them.
+10. Preset scope: form-fill only (recommended) vs optionally create the
+    subfolders on disk.
 
 ---
 
@@ -415,12 +641,13 @@ Open questions for the maintainer
 - `internal/server/config.go` — `ConfigFile.DownloadRoutes`, `ApplyConfigToServer`
 - `internal/server/server.go` — `Config.DownloadRoutes`
 - `internal/server/jobs.go` — `Job.RouteKey`, `CreateJob`, dedup
-- `internal/server/routes.go` (new) — `resolveRoute`
+- `internal/server/routes.go` (new) — `resolveRoute` + closed key set
 - `internal/server/api_types.go` — `DownloadRequest.RouteKey`, `SettingsResponse.DownloadRoutes`
-- `internal/server/api.go` — settings get/update, `localCacheRoots` + callers
+- `internal/server/api.go` — settings get/update, route normalization, `localCacheRoots` + callers
 - `internal/server/search.go` — disk-free allowlist
 - `pkg/hfdownloader/plan.go` — unchanged (consumes `job.LocalDir`); verify only
 - `internal/assets/static/index.html`, `internal/assets/static/js/app.js` — Phase 2
+  (labeled fields + label<->key table + optional preset; layout-toggle independence)
 - `docs/API.md`, `README.md`, `CHANGELOG.md` — docs sync
 - tests alongside the above packages
 
