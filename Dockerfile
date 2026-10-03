@@ -35,7 +35,10 @@ RUN go mod download
 COPY . .
 
 # Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /hfdesk ./cmd/hfdesk
+# Inject the version from the VERSION file via ldflags so the image reports the
+# real application version instead of the un-flagged default ("dev").
+RUN VERSION="$(cat VERSION | tr -d '[:space:]')" && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=${VERSION}" -o /hfdesk ./cmd/hfdesk
 
 # =============================================================================
 # Final stage - minimal image
