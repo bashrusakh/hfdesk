@@ -140,6 +140,14 @@ go test ./...
 
 For UI or downloader changes, also do a quick manual smoke test in the browser.
 
+## Versioning
+
+The git release tag is the single source of truth for released artifacts. The
+tracked `VERSION` file is a local-development fallback used only when a build has
+no explicit version (a bare `docker build`, `build.sh`, or `build-dev.yml`).
+Release builds pass the tag explicitly, so a stale `VERSION` value cannot ship in
+a released artifact and no manual sync is required for releases.
+
 ## Project structure
 
 | Path | What |
