@@ -140,7 +140,7 @@ Storage fields:
 }
 ```
 
-`cacheDir` controls where HF cache-layout downloads are written. When `localDir` is set, downloads use real files under `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
+`cacheDir` controls where HF cache-layout downloads are written. When `localDir` is set, downloads use real files under `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots. `localScanDirs` are additional model-management roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results; repos found there can be deleted from the Cache browser.
 
 ## Cache
 
@@ -148,14 +148,42 @@ Storage fields:
 GET    /api/cache
 GET    /api/cache/{owner}/{repo}
 POST   /api/cache/rebuild
-DELETE /api/cache/{owner}/{repo}?type=model
+DELETE /api/cache/{owner}/{repo}?type=model&source=Local
 ```
+
+`DELETE` accepts an optional `source` query parameter that selects which copy of the repo to remove (matched case-insensitively and trimmed):
+
+- `HF cache` (or omitted): deletes the HF hub directory, plus the friendly-view path if present. If the hub directory is gone but the friendly path still exists, that orphan is deleted instead of returning `404`.
+- `Friendly view`: deletes the friendly-view directory (and the hub directory when present).
+- `Local`: deletes the real `<root>/<owner>/<name>` folder from the local cache root (`localDir`, `localScanDirs`, or the cache dir). Returns `404` when the repo is not found in any local root, or when `type=dataset` is requested (local entries are always models).
+
+`HF cache` and `Friendly view` remove the same storage — the hub directory and its friendly-view projection together — so either label cleans up both. Only `Local` removes a single folder, the exact `<root>/<owner>/<name>` directory.
+
+`DELETE` also accepts an optional `path` query parameter that addresses one exact copy. The server recomputes the allowed copy paths for the repo and deletes only when the requested path equals one of them after normalization; otherwise it returns `400` and deletes nothing. The copy's source decides which safe deleter runs (`HF cache`/`Friendly view` use the hub/friendly logic with containment checks; `Local` uses the local safe delete with root-component symlink checks). When `path` is omitted, the `source`-based behavior above applies.
+
+When `source` is omitted and no matching HF-cache entry exists, the handler falls back to the local roots so existing clients can still delete locally stored repos.
 
 Cache entries may come from:
 
 - `HF cache`
 - `Friendly view`
 - `Local`
+
+Under a raw cache root (the cache dir used directly as a local root), `Local` entries whose owner directory is one of `hub`, `models`, `datasets`, `blobs`, `snapshots`, or `refs` are skipped, so listed and deleted entries agree and HF-cache internals are never treated as deletable repos.
+
+`GET /api/cache/{owner}/{repo}` describes the primary copy in its top-level fields and additionally returns a `copies` array enumerating every distinct deletable physical location for the repo. The first entry is the HF cache (or an orphan `Friendly view` when the hub directory is gone), followed by one `Local` entry per local root that contains the repo. Each entry has:
+
+```json
+{
+  "source": "HF cache",
+  "path": "/home/user/.cache/huggingface/hub/models--owner--name",
+  "size": 12345,
+  "sizeHuman": "12.1 KiB",
+  "fileCount": 4
+}
+```
+
+`Friendly view` is not listed alongside the HF cache entry because it is the same underlying storage; it appears only as an orphan when the hub directory is absent.
 
 `downloadStatus` is one of:
 

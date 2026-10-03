@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Delete local and friendly-view repositories from the Cache browser, not just HF-cache entries (#63)
+- Cache repository details now list every physical copy (HF cache, friendly view, and each local root), each deletable on its own so a repo stored in both the HF cache and a local folder can be cleaned up per location (#63)
+
+### Fixed
+
+- Cache delete now removes the real local folder (`localDir`/`localScanDirs`) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
+
 ## [1.2.2] - 2026-06-29
 
 ### Fixed

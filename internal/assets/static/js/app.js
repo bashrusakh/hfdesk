@@ -1631,6 +1631,16 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   let cacheSort = 'name';
   let cacheView = 'list';
   let cacheSearch = '';
+  let currentCacheDetail = null;
+  // The delete request the confirmation modal was opened for. Stored here so the
+  // confirm handler never has to interpolate filesystem paths into inline HTML.
+  let pendingCacheDelete = null;
+
+  // Cache source labels. Keep in sync with the server and the API docs so the
+  // delete routing and the local-specific warning wording stay aligned.
+  const CACHE_SOURCE_HF = 'HF cache';
+  const CACHE_SOURCE_FRIENDLY = 'Friendly view';
+  const CACHE_SOURCE_LOCAL = 'Local';
 
   async function loadCache() {
     const container = $('#cacheList');
@@ -1918,6 +1928,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     try {
       showModal('Repository Details', '<div class="loading-state"><div class="spinner"></div></div>');
       const data = await api('GET', `/cache/${repo}`);
+      currentCacheDetail = data;
 
       const typeIcon = data.type === 'model'
         ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
@@ -2011,6 +2022,45 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
            </div>`
         : '';
 
+      // Every physical copy of this repo, each independently deletable. Falls
+      // back to a single top-level delete button for older servers that do not
+      // send a copies array yet.
+      const canDelete = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(data.repo);
+      const copies = Array.isArray(data.copies) ? data.copies : [];
+      const deleteIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+                </svg>`;
+      const copiesHtml = copies.length > 0
+        ? `<div class="cache-detail-section">
+             <h4>Locations</h4>
+             <div style="display:flex;flex-direction:column;gap:12px;">
+               ${copies.map((copy, i) => {
+                 const isLocalCopy = (copy.source || '').toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase();
+                 const metaParts = [];
+                 if (copy.sizeHuman) metaParts.push(String(copy.sizeHuman));
+                 if (typeof copy.fileCount === 'number') metaParts.push(`${copy.fileCount} files`);
+                 const meta = escapeHtml(metaParts.join(' · '));
+                 return `
+                   <div style="display:flex;flex-direction:row;align-items:flex-start;justify-content:space-between;gap:12px;">
+                     <div style="display:flex;flex-direction:column;gap:4px;min-width:0;flex:1;">
+                       <span class="cache-path-label">${escapeHtml(copy.source || '')}${isLocalCopy ? ' (real folder on disk)' : ''}</span>
+                       <code class="cache-path-value">${escapeHtml(copy.path || '')}</code>
+                       <span class="cache-path-label">${meta}</span>
+                     </div>
+                     ${canDelete ? `
+                       <button class="btn btn-danger btn-sm" onclick="confirmDeleteCacheCopy(${i})" title="Delete this location" style="flex-shrink:0;">
+                         ${deleteIcon}
+                         Delete
+                       </button>
+                     ` : ''}
+                   </div>
+                 `;
+               }).join('')}
+             </div>
+           </div>`
+        : '';
+
       setModalContent(`
         <div class="cache-detail-modal">
           <div class="cache-detail-header">
@@ -2055,12 +2105,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             <h4>Paths</h4>
             <div class="cache-detail-paths">
               <div class="cache-path-item">
-                <span class="cache-path-label">${data.source === 'HF cache' || !data.source ? 'Cache (HF format)' : 'Local path'}</span>
+                <span class="cache-path-label">${data.source === CACHE_SOURCE_HF || !data.source ? 'Cache (HF format)' : 'Local path'}</span>
                 <code class="cache-path-value">${escapeHtml(data.path)}</code>
               </div>
               ${data.friendlyPath ? `
                 <div class="cache-path-item">
-                  <span class="cache-path-label">Friendly view</span>
+                  <span class="cache-path-label">${CACHE_SOURCE_FRIENDLY}</span>
                   <code class="cache-path-value">${escapeHtml(data.friendlyPath)}</code>
                 </div>
               ` : ''}
@@ -2069,14 +2119,18 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
           ${filesHtml}
 
+          ${copiesHtml}
+
           <div class="cache-detail-actions">
-            ${data.source === 'HF cache' || !data.source ? `<button class="btn btn-danger" onclick="confirmDeleteCache('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}')">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete
-            </button>` : ''}
+            ${copies.length === 0 && canDelete ? `
+              <button class="btn btn-danger" onclick="confirmDeleteCache('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}', '${escapeHtml(data.source || '')}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+                </svg>
+                Delete
+              </button>
+            ` : ''}
             <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" class="btn btn-secondary">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                 <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
@@ -2165,9 +2219,32 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     }
   }
 
+  // Delete a copy identified by its index in currentCacheDetail.copies. The
+  // button carries only this integer index: filesystem paths can contain quote
+  // characters, so they must never be interpolated into an inline onclick
+  // handler. The copy object is resolved here and passed to confirmDeleteCache.
+  window.confirmDeleteCacheCopy = function(index) {
+    const detail = currentCacheDetail;
+    const copy = detail && detail.copies ? detail.copies[index] : null;
+    if (!copy) {
+      showToast('This location is no longer available', 'error');
+      return;
+    }
+    confirmDeleteCache(detail.repo, detail.type, copy.source, copy.path);
+  };
+
   // Delete a cached repo with confirmation
-  window.confirmDeleteCache = function(repo, type) {
-    showModal('Delete from Cache', `
+  window.confirmDeleteCache = function(repo, type, source, path) {
+    pendingCacheDelete = { repo: repo, type: type, source: source || '', path: path || '' };
+    const isLocal = (source || '').toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase();
+    const copyPath = path || (currentCacheDetail && currentCacheDetail.repo === repo ? currentCacheDetail.path : '');
+    const message = isLocal
+      ? `Are you sure you want to permanently delete the real folder for <strong>${escapeHtml(repo)}</strong>?`
+      : `Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?`;
+    const note = isLocal
+      ? `This will permanently remove the model folder${copyPath ? ` at <code>${escapeHtml(copyPath)}</code>` : ''} from disk. This action cannot be undone.`
+      : `This will permanently remove all cached files for this ${escapeHtml(type)}. This action cannot be undone.`;
+    showModal(isLocal ? 'Delete Local Folder' : 'Delete from Cache', `
       <div class="delete-confirm">
         <div class="delete-warning">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
@@ -2175,11 +2252,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
           </svg>
         </div>
-        <p class="delete-message">Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?</p>
-        <p class="delete-note">This will permanently remove all cached files for this ${type}. This action cannot be undone.</p>
+        <p class="delete-message">${message}</p>
+        <p class="delete-note">${note}</p>
         <div class="form-actions" style="margin-top: 20px;">
           <button class="btn btn-ghost" onclick="hideModal()">Cancel</button>
-          <button class="btn btn-danger" onclick="deleteCache('${escapeHtml(repo)}', '${escapeHtml(type)}')">
+          <button class="btn btn-danger" onclick="deleteCachePending()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
@@ -2190,12 +2267,22 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     `);
   };
 
+  // Run the delete the confirmation modal was opened for.
+  window.deleteCachePending = function() {
+    const p = pendingCacheDelete;
+    pendingCacheDelete = null;
+    if (!p) return;
+    deleteCache(p.repo, p.type, p.source, p.path);
+  };
+
   // Actually delete the cache
-  window.deleteCache = async function(repo, type) {
+  window.deleteCache = async function(repo, type, source, path) {
     try {
-      await api('DELETE', `/cache/${repo}?type=${type}`);
+      const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
+      const pathParam = path ? `&path=${encodeURIComponent(path)}` : '';
+      await api('DELETE', `/cache/${repo}?type=${type}${sourceParam}${pathParam}`);
       hideModal();
-      showToast(`Deleted ${repo} from cache`, 'success');
+      showToast(source && source.toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase() ? `Deleted ${repo} from disk` : `Deleted ${repo} from cache`, 'success');
       loadCache(); // Refresh the list
     } catch (e) {
       showToast(`Failed to delete: ${e.message}`, 'error');
@@ -3203,6 +3290,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
   function hideModal() {
     $('#modalBackdrop').classList.remove('active');
+    currentCacheDetail = null;
+    pendingCacheDelete = null;
   }
 
   // Expose hideModal globally for onclick handlers
