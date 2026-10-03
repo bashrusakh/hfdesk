@@ -24,9 +24,11 @@
 #   docker run --rm --user 568:568 -p 8080:8080 \
 #     -v hfdesk-data:/data hfdesk
 #
-# With HuggingFace token (for private/gated models):
-#   docker run --rm -e HF_TOKEN=hf_xxx -p 8080:8080 \
-#     -v hfdesk-data:/data hfdesk
+# With a HuggingFace token (for private/gated models), pass it with --token or
+# set it in the HFDesk settings UI/API. The binary does not read an HF_TOKEN
+# environment variable:
+#   docker run --rm -p 8080:8080 \
+#     -v hfdesk-data:/data hfdesk --token hf_xxx
 #
 # The container starts as root only so the entrypoint can honor PUID/PGID and
 # then drop privileges; the app process always runs as the requested UID/GID.
@@ -100,7 +102,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV HOME=/data \
     XDG_CONFIG_HOME=/data/.config \
     HF_HOME=/data/.cache/huggingface \
-    HFDESK_DATA_ROOT=/data \
     HFDESK_UID=$UID \
     HFDESK_GID=$GID
 
@@ -108,8 +109,9 @@ ENV HOME=/data \
 # a fresh named volume copies this directory's ownership/permissions, so if
 # they were owned by the image user an arbitrary `--user <uid>` could not
 # create its own state. The sticky, world-writable root lets any UID create
-# its state dirs; the entrypoint tightens/owns the small subdirs it creates
-# when it runs as root. Model/cache trees are left to the app to create.
+# its state dirs; the entrypoint only owns the root itself (never descending
+# into the attacker-writable tree), and the app creates its subdirs as the
+# target UID. Model/cache trees are left to the app to create.
 RUN mkdir -p /data && chmod 1777 /data
 
 # Note: no USER directive. The entrypoint must start as root to apply

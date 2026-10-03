@@ -14,7 +14,7 @@
 
 - Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
 - Docker: all writable state (settings, jobs, history, HF cache, local models) now lives under a single `/data` root, so one volume persists everything; `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, `HF_HOME=/data/.cache/huggingface`, and `WORKDIR /data` (#61)
-- Docker: the container starts as root only to apply PUID/PGID, then drops privileges; the app process still runs non-root (default UID/GID 1000) (#61)
+- Docker: the container starts as root only to apply PUID/PGID, then drops privileges; the app process runs non-root (default UID/GID 1000) unless `PUID=0`/`PGID=0` is set explicitly (#61)
 
 ### Fixed
 

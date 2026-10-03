@@ -202,7 +202,9 @@ docker run --rm -p 8080:8080 \
 - `UMASK` — file creation mask (default `022`).
 
 The container starts as root only so the entrypoint can apply these values,
-then drops privileges; the app always runs non-root.
+then drops privileges; the app process runs non-root unless you explicitly set
+`PUID=0`/`PGID=0`. The image has no `USER` directive, so `docker exec` enters
+the container as root (the privilege drop applies to PID 1 only).
 
 ### Run as an arbitrary UID (enterprise / Kubernetes)
 
@@ -239,7 +241,19 @@ persisted anything. The cache now lives at `/data/.cache/huggingface`. Point
 your volume at `/data` (recommended), or move existing data:
 
 ```bash
+mkdir -p /path/to/your/data/.cache
 mv ~/.cache/huggingface /path/to/your/data/.cache/huggingface
+```
+
+Switching `PUID`/`PGID` on a volume that already holds files owned by a
+previous UID leaves those files owned by the old UID: the entrypoint only hands
+the `/data` root to the target UID and intentionally never recursively chowns
+the cache/model tree (it can be a huge mount, and a planted symlink inside the
+writable tree must not be followed). If an existing volume was written by a
+different UID, fix it once with a deliberate, recursive `chown`, for example:
+
+```bash
+sudo chown -R 1026:100 /mnt/user/appdata/hfdesk
 ```
 
 ## Credits
