@@ -237,6 +237,91 @@ func TestJobManager_CreateJob_RouteKey(t *testing.T) {
 	})
 }
 
+// TestJobManager_CreateJob_DatasetIgnoresRouteKey is the regression guard for
+// the plan invariant (plan.md §2.5/§6): a dataset is never routed to a model
+// key. A raw API request with dataset:true plus routeKey must fall through to
+// the existing LocalDir/HF-cache behavior regardless of the key.
+func TestJobManager_CreateJob_DatasetIgnoresRouteKey(t *testing.T) {
+	cacheDir := t.TempDir()
+	routeDir := filepath.Join(t.TempDir(), "LLM", "GGUF")
+
+	t.Run("dataset ignores route key and keeps LocalDir", func(t *testing.T) {
+		localDir := filepath.Join(t.TempDir(), "models")
+		mgr, cleanup := newRouteTestManager(t, Config{
+			CacheDir:       cacheDir,
+			LocalDir:       localDir,
+			DownloadRoutes: map[string]string{"llm/gguf": routeDir},
+		})
+		defer cleanup()
+
+		job, _, err := mgr.CreateJob(DownloadRequest{Repo: "owner/data", Dataset: true, RouteKey: "llm/gguf"})
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		if job.LocalDir != localDir {
+			t.Errorf("LocalDir = %q, want server LocalDir %q (dataset must not be routed)", job.LocalDir, localDir)
+		}
+		if job.LocalDir == routeDir {
+			t.Errorf("dataset landed in route folder %q", routeDir)
+		}
+		if job.OutputDir != localDir || !job.Flat {
+			t.Errorf("OutputDir=%q Flat=%v, want %q/true", job.OutputDir, job.Flat, localDir)
+		}
+		if job.RouteKey != "" {
+			t.Errorf("RouteKey = %q, want empty for an unrouted dataset", job.RouteKey)
+		}
+	})
+
+	t.Run("dataset ignores route key and uses HF cache", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{
+			CacheDir:       cacheDir,
+			DownloadRoutes: map[string]string{"llm/gguf": routeDir},
+		})
+		defer cleanup()
+
+		job, _, err := mgr.CreateJob(DownloadRequest{Repo: "owner/data2", Dataset: true, RouteKey: "llm/gguf"})
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		if job.LocalDir != "" || job.Flat {
+			t.Errorf("dataset with route key should keep HF cache behavior, got LocalDir=%q Flat=%v", job.LocalDir, job.Flat)
+		}
+		if job.OutputDir != cacheDir {
+			t.Errorf("OutputDir = %q, want cache dir %q", job.OutputDir, cacheDir)
+		}
+		if job.RouteKey != "" {
+			t.Errorf("RouteKey = %q, want empty for an unrouted dataset", job.RouteKey)
+		}
+	})
+
+	t.Run("dataset ignores even an unknown route key", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{CacheDir: cacheDir})
+		defer cleanup()
+
+		// Ignoring routeKey for datasets means no new 400 for a request that
+		// previously succeeded; the dataset simply follows default behavior.
+		if _, _, err := mgr.CreateJob(DownloadRequest{Repo: "owner/data3", Dataset: true, RouteKey: "not-a-key"}); err != nil {
+			t.Fatalf("dataset route key must be ignored, got error: %v", err)
+		}
+	})
+
+	t.Run("model with same route key is still routed", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{
+			CacheDir:       cacheDir,
+			DownloadRoutes: map[string]string{"llm/gguf": routeDir},
+		})
+		defer cleanup()
+
+		job, _, err := mgr.CreateJob(DownloadRequest{Repo: "owner/model", RouteKey: "llm/gguf"})
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		if job.LocalDir != routeDir {
+			t.Errorf("LocalDir = %q, want route dir %q", job.LocalDir, routeDir)
+		}
+	})
+}
+
 func TestJobManager_RouteKey_Dedup(t *testing.T) {
 	mgr, cleanup := newRouteTestManager(t, Config{
 		CacheDir: t.TempDir(),
