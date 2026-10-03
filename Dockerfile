@@ -34,11 +34,22 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the binary
-# Inject the version from the VERSION file via ldflags so the image reports the
-# real application version instead of the un-flagged default ("dev").
-RUN VERSION="$(cat VERSION | tr -d '[:space:]')" && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=${VERSION}" -o /hfdesk ./cmd/hfdesk
+# Build the binary.
+# Version precedence: (1) the VERSION build-arg, passed by CI from the release
+# tag, which is the single source of truth for released artifacts; (2) the
+# tracked VERSION file as a fallback for local builds. "latest" is a Docker tag
+# alias, not a release version, so it is treated as unset.
+ARG VERSION=""
+RUN BUILD_VERSION="${VERSION}" && \
+    if [ -z "$BUILD_VERSION" ] || [ "$BUILD_VERSION" = "latest" ]; then \
+      BUILD_VERSION="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"; \
+    fi && \
+    BUILD_VERSION="${BUILD_VERSION#v}" && \
+    if [ -z "$BUILD_VERSION" ]; then \
+      echo "error: no build version (pass --build-arg VERSION=<tag> or populate the VERSION file)" >&2; \
+      exit 1; \
+    fi && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=${BUILD_VERSION}" -o /hfdesk ./cmd/hfdesk
 
 # =============================================================================
 # Final stage - minimal image
