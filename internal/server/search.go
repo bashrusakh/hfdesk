@@ -187,7 +187,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, m.ID, isDataset); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
@@ -211,6 +211,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 
 	// Build the ordered list of configured candidate paths.
 	configured := []string{cfg.LocalDir, cfg.CacheDir, hfdownloader.DefaultCacheDir(), RunDir()}
+	configured = append(configured, routeDirs(cfg.DownloadRoutes)...)
 
 	// If the caller provides an explicit path, only honour it when it matches
 	// one of the configured directories (prevents arbitrary fs-stat via the API).

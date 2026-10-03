@@ -23,6 +23,11 @@ type DownloadRequest struct {
 	// When set, files fetched from Repo are stored as if they belong to LocalRepo.
 	// Used when downloading upstream mmproj files alongside the current model's quants.
 	LocalRepo string `json:"localRepo,omitempty"`
+	// RouteKey selects a configured download route (a key from the closed,
+	// server-defined set, never a path). When set and configured, the resolved
+	// destination is used as the job's flat/local directory. An explicit
+	// localDir takes priority; an unknown key is rejected with 400.
+	RouteKey string `json:"routeKey,omitempty"`
 }
 
 // PlanResponse is the response for a dry-run/plan request.
@@ -57,6 +62,9 @@ type SettingsResponse struct {
 	StorageMode   string   `json:"storageMode"`
 	LocalDir      string   `json:"localDir,omitempty"`
 	LocalScanDirs []string `json:"localScanDirs,omitempty"`
+	// DownloadRoutes maps internal route keys to destination directories.
+	// Opt-in; empty/omitted means routed downloads are disabled.
+	DownloadRoutes map[string]string `json:"downloadRoutes,omitempty"`
 	// Proxy settings
 	Proxy *ProxySettingsResponse `json:"proxy,omitempty"`
 	// Config file paths

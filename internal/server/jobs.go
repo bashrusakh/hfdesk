@@ -49,6 +49,11 @@ type Job struct {
 	EndedAt    *time.Time        `json:"endedAt,omitempty"`
 	Files      []JobFileProgress `json:"files,omitempty"`
 
+	// RouteKey is the download route key requested at creation (internal/audit
+	// only). The resolved destination lives in LocalDir; this field is never a
+	// path and must not be re-resolved at run time.
+	RouteKey string `json:"routeKey,omitempty"`
+
 	cancel     context.CancelFunc `json:"-"`
 	generation int                `json:"-"` // Tracks which runJob instance is current
 	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
@@ -355,11 +360,23 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
-	// Determine effective local-dir: per-request overrides server-global.
-	// If either is set, use flat/real-file mode; otherwise use HF cache layout.
+	// Validate an explicitly requested route key against the closed set before
+	// any config read that could be mistaken for a path. An unknown key is a
+	// client error, surfaced to the handler as HTTP 400.
+	if req.RouteKey != "" && !isRouteKey(req.RouteKey) {
+		return nil, false, errInvalidRouteKey
+	}
+
+	// Determine effective local-dir: per-request override > configured route >
+	// server-global LocalDir. If any is set, use flat/real-file mode; otherwise
+	// use the HF cache layout.
 	effectiveLocalDir := cfg.LocalDir
 	if req.LocalDir != "" {
 		effectiveLocalDir = req.LocalDir
+	} else if req.RouteKey != "" {
+		if resolved := resolveRoute(cfg.DownloadRoutes, req.RouteKey); resolved != "" {
+			effectiveLocalDir = resolved
+		}
 	}
 
 	flat := effectiveLocalDir != ""
@@ -377,6 +394,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
+			existing.LocalDir == effectiveLocalDir &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
 			stringSlicesEqual(existing.Excludes, req.Excludes) {
@@ -398,6 +416,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		LocalRepo:  req.LocalRepo,
 		Flat:       flat,
 		ExactMatch: req.ExactMatch,
+		RouteKey:   req.RouteKey,
 		Status:     JobStatusQueued,
 		CreatedAt:  time.Now(),
 		Progress:   JobProgress{},

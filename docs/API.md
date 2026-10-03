@@ -106,7 +106,13 @@ Notes:
 - `revision` defaults to `main`.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
-- Duplicate active downloads return the existing job.
+- `routeKey` (optional) selects a configured download route (see Settings). It
+  is an internal key from the closed set below, never a path. A configured key
+  routes the download into its destination folder (flat mode); `localDir`
+  takes priority when both are set.
+- Unknown `routeKey` values are rejected with `400`.
+- Duplicate active downloads return the existing job; two requests for the same
+  repo routed to different destinations are distinct jobs.
 
 ## Jobs
 
@@ -136,11 +142,32 @@ Storage fields:
 {
   "cacheDir": "I:\\huggingface",
   "localDir": "D:\\Models",
-  "localScanDirs": ["D:\\Models", "I:\\LM Studio\\models"]
+  "localScanDirs": ["D:\\Models", "I:\\LM Studio\\models"],
+  "downloadRoutes": {
+    "llm/gguf": "D:\\Models\\LLM\\GGUF",
+    "llm/safetensors": "D:\\Models\\LLM\\Safetensors",
+    "audio": "D:\\Models\\Audio",
+    "diffusion": "D:\\Models\\Diffusion",
+    "embedding": "D:\\Models\\Embedding"
+  }
 }
 ```
 
 `cacheDir` controls where HF cache-layout downloads are written. When `localDir` is set, downloads use real files under `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
+
+`downloadRoutes` is an opt-in map from an internal route key to a destination directory. When a download request sends a `routeKey` that resolves in this map, the job is written to that folder instead of `localDir`/HF cache. Route destinations are also scanned by the Cache browser and accepted by `/api/diskfree?path=...`.
+
+The route key set is closed and server-defined; unknown keys are rejected with `400` on both `/api/settings` and `/api/download`:
+
+- `llm/gguf` — GGUF quantized LLMs (falls back to `llm`)
+- `llm/safetensors` — Transformers safetensors/bin LLMs (falls back to `llm`)
+- `llm` — any other LLM (internal fallback key)
+- `diffusion` — diffusion pipelines / LoRAs
+- `audio` — audio models
+- `embedding` — feature-extraction / embedding models
+
+Route values are trimmed and `filepath.Clean`ed on save; empty values clear a
+key. No directory is created by saving settings.
 
 ## Cache
 

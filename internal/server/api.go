@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -77,6 +78,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	// Create and start the job (or return existing if duplicate)
 	job, wasExisting, err := s.jobs.CreateJob(req)
 	if err != nil {
+		if errors.Is(err, errInvalidRouteKey) {
+			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to create job", err.Error())
 		return
 	}
@@ -353,6 +358,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		StorageMode:        storageMode,
 		LocalDir:           cfg.LocalDir,
 		LocalScanDirs:      cfg.LocalScanDirs,
+		DownloadRoutes:     cfg.DownloadRoutes,
 		ConfigFile:         ConfigPath(),
 		TargetsFile:        hfdownloader.DefaultTargetsPath(),
 	}
@@ -375,17 +381,20 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 // Note: Output directories cannot be changed via API for security.
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token              *string  `json:"token,omitempty"`
-		CacheDir           *string  `json:"cacheDir,omitempty"`
-		LocalDir           *string  `json:"localDir,omitempty"`
-		LocalScanDirs      []string `json:"localScanDirs,omitempty"`
-		Concurrency        *int     `json:"connections,omitempty"`
-		MaxActive          *int     `json:"maxActive,omitempty"`
-		MultipartThreshold *string  `json:"multipartThreshold,omitempty"`
-		MaxSpeed           *string  `json:"maxSpeed,omitempty"`
-		Verify             *string  `json:"verify,omitempty"`
-		Retries            *int     `json:"retries,omitempty"`
-		Endpoint           *string  `json:"endpoint,omitempty"`
+		Token         *string  `json:"token,omitempty"`
+		CacheDir      *string  `json:"cacheDir,omitempty"`
+		LocalDir      *string  `json:"localDir,omitempty"`
+		LocalScanDirs []string `json:"localScanDirs,omitempty"`
+		// DownloadRoutes, when present, replaces the route map. Keys must be in
+		// the closed set (routes.go); values are paths (trimmed/Cleaned).
+		DownloadRoutes     *map[string]string `json:"downloadRoutes,omitempty"`
+		Concurrency        *int               `json:"connections,omitempty"`
+		MaxActive          *int               `json:"maxActive,omitempty"`
+		MultipartThreshold *string            `json:"multipartThreshold,omitempty"`
+		MaxSpeed           *string            `json:"maxSpeed,omitempty"`
+		Verify             *string            `json:"verify,omitempty"`
+		Retries            *int               `json:"retries,omitempty"`
+		Endpoint           *string            `json:"endpoint,omitempty"`
 		// Proxy settings
 		Proxy *struct {
 			URL                *string `json:"url,omitempty"`
@@ -409,6 +418,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var (
 		newMultipartThreshold string
 		newMaxSpeed           string
+		newDownloadRoutes     map[string]string
 	)
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
 		trimmed := strings.TrimSpace(*req.MultipartThreshold)
@@ -425,6 +435,15 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newMaxSpeed = trimmed
+	}
+	if req.DownloadRoutes != nil {
+		for key := range *req.DownloadRoutes {
+			if !isRouteKey(key) {
+				writeError(w, http.StatusBadRequest, "Invalid downloadRoutes key", "unknown route key: "+key)
+				return
+			}
+		}
+		newDownloadRoutes = normalizeDownloadRoutes(*req.DownloadRoutes)
 	}
 
 	// Phase 2: build the new config on a local copy under withConfig (which
@@ -445,6 +464,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LocalScanDirs != nil {
 			c.LocalScanDirs = cleanPathList(req.LocalScanDirs)
+		}
+		// DownloadRoutes is replaced wholesale (copy-on-write) so the current
+		// map is never mutated in place while in-flight jobs read it.
+		if req.DownloadRoutes != nil {
+			c.DownloadRoutes = newDownloadRoutes
 		}
 		if req.Concurrency != nil && *req.Concurrency > 0 {
 			c.Concurrency = *req.Concurrency
@@ -541,6 +565,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Verify:             finalCfg.Verify,
 		Retries:            &retries,
 		Endpoint:           finalCfg.Endpoint,
+		DownloadRoutes:     finalCfg.DownloadRoutes,
 	}
 	// Add proxy to config file if set
 	if finalCfg.Proxy != nil {
@@ -783,10 +808,10 @@ func cleanPathList(paths []string) []string {
 
 // localCacheRoots builds the list of directories to scan for cached
 // repos: the Friendly-view <cache>/models tree, the user-supplied
-// localDir, the user-supplied localScanDirs, and the raw cache dir
-// (with SkipSpecial because its hub/blobs layout is internal). The
-// returned slice is deduped by absolute path.
-func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
+// localDir, the user-supplied localScanDirs, every configured download-route
+// destination, and the raw cache dir (with SkipSpecial because its hub/blobs
+// layout is internal). The returned slice is deduped by absolute path.
+func localCacheRoots(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) []localCacheRoot {
 	var roots []localCacheRoot
 	seen := make(map[string]bool)
 	add := func(path, source string, skipSpecial bool) {
@@ -808,6 +833,9 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localC
 	add(filepath.Join(cacheDir, "models"), "Friendly view", false)
 	add(localDir, "Local", localSkipSpecial)
 	for _, dir := range localScanDirs {
+		add(dir, "Local", false)
+	}
+	for _, dir := range routeDirs(downloadRoutes) {
 		add(dir, "Local", false)
 	}
 	add(cacheDir, "Local", true)
@@ -989,9 +1017,9 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 // discovered repos. When includeFiles is true, each result includes
 // the per-file list. Repos that look like HF-cache internals
 // (hub/blobs/snapshots/refs) are skipped.
-func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
+func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
 		if _, err := os.Stat(root.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -1039,12 +1067,12 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 // local cache root and returns its CachedRepoInfo. Returns
 // os.ErrNotExist if the repo is not present in any root. The
 // includeFiles flag controls whether the per-file list is filled in.
-func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
+func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	parts := strings.SplitN(repoID, "/", 2)
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
 		if !hasLocalWeightFile(repoDir) {
 			continue
@@ -1205,7 +1233,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
 	}
 
-	localRepos, _ := scanLocalCachedRepos(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, false)
+	localRepos, _ := scanLocalCachedRepos(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, false)
 	for _, repo := range localRepos {
 		if repoType != "" && repoType != repo.Type {
 			continue
@@ -1270,7 +1298,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
-			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, repo, true)
+			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, repo, true)
 			if localErr == nil {
 				writeJSON(w, http.StatusOK, localRepo)
 				return
