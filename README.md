@@ -93,6 +93,12 @@ HFDesk reads `hfdesk.json`, `hfdesk.yaml`, or `hfdesk.yml` from the launch direc
 }
 ```
 
+The Hugging Face token is resolved in this order: `--token` flag, then the `HF_TOKEN` environment variable, then the `token` field in the config file. Set `HF_TOKEN` to authenticate without writing the token to disk:
+
+```bash
+HF_TOKEN=hf_xxx hfdesk
+```
+
 Proxy example:
 
 ```json
