@@ -78,21 +78,23 @@ type Job struct {
 	speedRunStart time.Time `json:"-"`
 
 	// partialFilesPtr is a pointer to the per-job in-flight file
-	// tracker map. The downloader callback updates the map through
-	// the pointer; the pointer itself is only reassigned by runJob
-	// (which holds m.mu) and by cleanupPausedJobPartFiles (which
-	// also holds the per-job partialFilesMu). The pointer
-	// indirection lets cloneJobLocked take a m.mu-protected
-	// snapshot of the pointer (no race on the pointer word
-	// itself) and then deep-copy the pointed-to map under
-	// partialFilesMu.
+	// tracker map. Every read and write of the pointer, and every
+	// mutation of the pointed-to map, happens under the per-job
+	// partialFilesMu: runJob swaps in a fresh map at the start of a
+	// run, OnPartialFile mutates that map, cleanupPausedJobPartFiles
+	// nils the pointer, and cloneJobLocked holds the mutex across its
+	// shallow struct copy and the deep copy of the map. The pointer
+	// indirection still matters because cloneJobLocked's whole-struct
+	// copy reads the pointer word; that read must happen under
+	// partialFilesMu too, or it races runJob's swap (github issue
+	// #77).
 	//
 	// partialFilesMu is a *sync.Mutex (not a value) so that
 	// cloneJobLocked's shallow copy reads a single pointer word
 	// instead of the mutex's internal state, which the runtime
-	// mutates with atomics. Reading the mutex's internal state
+	// mutates with atomics. Copying the mutex's internal state
 	// concurrently with a Lock/Unlock would race with those
-	// atomics; reading the pointer does not.
+	// atomics; copying the pointer does not.
 	partialFilesPtr *map[string]struct{}
 	partialFilesMu  *sync.Mutex `json:"-"`
 }
@@ -236,47 +238,50 @@ func generateID() string {
 // subsequent mutations of the live job's slices can't leak through a shared
 // backing array.
 //
-// The in-flight partial-file tracker is held via partialFilesPtr, a
-// pointer that the downloader callback reassigns atomically (under
-// partialFilesMu) when starting a new run. The clone reads
-// partialFilesPtr under partialFilesMu to avoid racing the
-// downloader callback, then deep-copies the pointed-to map under
-// the same lock. The downloader can keep mutating the live map
-// concurrently; the clone gets an independent snapshot.
+// The in-flight partial-file tracker is held via partialFilesPtr, a pointer
+// that runJob reassigns (and cleanupPausedJobPartFiles nils) under the
+// per-job partialFilesMu alone — not under m.mu. This function therefore
+// holds partialFilesMu across both the shallow struct copy, whose read of
+// partialFilesPtr would otherwise race those writers (github issue #77),
+// and the deep copy of the pointed-to map. The downloader can keep mutating
+// the live map concurrently; the clone gets an independent snapshot.
 func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j == nil {
 		return nil
 	}
 
-	// Step 1: read partialFilesPtr under partialFilesMu so the
-	// downloader callback's reassignment of the pointer can't race
-	// with our read. We then drop the lock and do the rest of the
-	// shallow copy under m.mu. The pointed-to map is what mutates
-	// concurrently; we won't touch it until step 3, when we re-acquire
-	// the lock for the deep copy. partialFilesMu can be nil for
-	// jobs constructed in tests via &Job{...} without going through
-	// CreateJob; in that case there's no tracker to snapshot.
-	var trackerPtr *map[string]struct{}
-	if j.partialFilesMu != nil {
+	// Acquire the per-job tracker mutex before the whole-struct copy:
+	// `clone := *j` below reads partialFilesPtr, whose writers (runJob's
+	// reset, cleanupPausedJobPartFiles' clear) hold only partialFilesMu.
+	// partialFilesMu can be nil for jobs constructed in tests via
+	// &Job{...} without going through CreateJob; in that case there is
+	// no tracker and no writer to synchronize with.
+	locked := j.partialFilesMu != nil
+	if locked {
 		j.partialFilesMu.Lock()
-		trackerPtr = j.partialFilesPtr
-		j.partialFilesMu.Unlock()
 	}
 
-	// Now safe to do the shallow copy under m.mu: the only field
-	// we read that mutates outside m.mu is partialFilesPtr, and
-	// we've snapshotted it.
 	clone := *j
 	clone.cancel = nil
 	clone.partialFilesPtr = nil
-	if j.partialFilesMu != nil {
-		// Leave clone.partialFilesMu pointing at the same mutex the
-		// live job uses; the clone has no need to acquire it.
-	} else {
-		clone.partialFilesMu = nil
+	// clone.partialFilesMu still points at the live job's mutex; the
+	// clone never acquires it, so sharing the pointer is harmless.
+
+	// Deep-copy the in-flight tracker while partialFilesMu is still held
+	// so the snapshot is atomic with respect to writers.
+	if j.partialFilesPtr != nil {
+		cloneMap := make(map[string]struct{}, len(*j.partialFilesPtr))
+		for dst := range *j.partialFilesPtr {
+			cloneMap[dst] = struct{}{}
+		}
+		clone.partialFilesPtr = &cloneMap
 	}
 
-	// Step 2: deep-copy slices/pointers.
+	if locked {
+		j.partialFilesMu.Unlock()
+	}
+
+	// Deep-copy slices/pointers.
 	if j.Filters != nil {
 		clone.Filters = append([]string(nil), j.Filters...)
 	}
@@ -293,27 +298,6 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j.EndedAt != nil {
 		t := *j.EndedAt
 		clone.EndedAt = &t
-	}
-
-	// Step 3: deep-copy the in-flight tracker under partialFilesMu.
-	// The downloader callback may swap the underlying map between
-	// the read in step 1 and now; we re-read under the lock and
-	// fall back to the snapshot if it changed. If the mutex was
-	// never allocated, the tracker is empty.
-	if j.partialFilesMu != nil {
-		j.partialFilesMu.Lock()
-		ptr := j.partialFilesPtr
-		if ptr == nil {
-			ptr = trackerPtr
-		}
-		if ptr != nil {
-			cloneMap := make(map[string]struct{}, len(*ptr))
-			for dst := range *ptr {
-				cloneMap[dst] = struct{}{}
-			}
-			clone.partialFilesPtr = &cloneMap
-		}
-		j.partialFilesMu.Unlock()
 	}
 	return &clone
 }
