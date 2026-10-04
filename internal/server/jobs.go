@@ -264,8 +264,9 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	clone := *j
 	clone.cancel = nil
 	clone.partialFilesPtr = nil
-	// clone.partialFilesMu still points at the live job's mutex; the
-	// clone never acquires it, so sharing the pointer is harmless.
+	// clone.partialFilesMu still points at the live job's mutex.
+	// Normal snapshot consumers do not need it; internal cleanup paths
+	// may acquire it to protect the cloned tracker.
 
 	// Deep-copy the in-flight tracker while partialFilesMu is still held
 	// so the snapshot is atomic with respect to writers.
