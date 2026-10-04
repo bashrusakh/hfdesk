@@ -20,6 +20,7 @@
 ### Fixed
 
 - Cache delete now removes the real local folder (`localDir`/`localScanDirs`/download-route folders) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
+- A variant delete scoped as a dataset (`type=dataset`) no longer acts on a Local copy, which holds models only; it now returns "not found" and deletes nothing, matching whole-copy Local deletes, while HF/friendly dataset variants remain supported (#63)
 - Whole-copy delete refuses to remove a Local folder that encloses a configured root, and the "Delete entire copy" confirmation now states the path, file count, and detected variants so the destructive scope is explicit (#63)
 - Cache repository details always include the `copies` array, even when the repo has no deletable copies, so the UI no longer shows a legacy delete button that would fail on a repo with nothing to remove (#63)
 - Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).

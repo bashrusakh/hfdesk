@@ -2190,7 +2190,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
                  // is guaranteed to fail.
                  const wholeCopyAllowed = copy.wholeCopyDeleteAllowed === true;
                  const wholeCopyNoteHtml = canDelete && !wholeCopyAllowed
-                   ? `<span class="cache-path-label">Entire-copy delete unavailable: this location nests a configured root. Delete individual variants instead.</span>`
+                   ? `<span class="cache-path-label">${variants.length > 0
+                       ? 'Entire-copy delete unavailable: this location nests a configured root. Delete individual variants instead.'
+                       : 'Entire-copy delete unavailable: this location contains a configured folder.'}</span>`
                    : '';
                  return `
                    <div style="display:flex;flex-direction:column;gap:6px;border:1px solid var(--color-border, #2a2a2a);border-radius:8px;padding:10px;">

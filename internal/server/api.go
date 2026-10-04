@@ -2445,8 +2445,11 @@ func localAuthorityKeys(cacheDir, localDir string, localScanDirs []string, downl
 //
 // A candidate must pass localLeafRepoIsDeletable against the cache dir,
 // friendly namespaces, and every configured root, so the details modal never
-// advertises the cache dir, a friendly namespace, a configured root, an
-// overlapping root's container, or a container of nested model repos.
+// advertises the cache dir, a friendly namespace, a configured root, or a path
+// equal to or below one of those through another root. The listing predicate is
+// deliberately relaxed about a configured root nested inside the candidate: an
+// enclosure that owns its own weight file is listed (upstream #66 parity), even
+// though a whole-copy delete of it is refused; see localWholeCopyDeleteAllowed.
 func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, owner, name string) []localCopyCandidate {
 	var candidates []localCopyCandidate
 	seen := make(map[string]bool)
@@ -2499,9 +2502,9 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, down
 			continue
 		}
 		// The advertised entry must be a leaf repo, not the cache dir, a
-		// friendly namespace, a configured root, or a container of nested
-		// model repos. Applying the same predicate as the delete side keeps the
-		// listed set equal to the deletable set.
+		// friendly namespace, or a configured root. The predicate is relaxed
+		// about a configured root nested inside the entry, so an enclosure that
+		// owns its own weight file is still listed (upstream #66 parity).
 		if !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 			continue
 		}
@@ -2935,6 +2938,11 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 					deletedBytes += info.Size()
 				}
 			}
+		} else {
+			// A manifest entry with no Blob has no stored file to remove, so
+			// nothing is deleted for it. Record it rather than silently
+			// under-reporting the response as a complete variant delete.
+			failures = append(failures, fmt.Sprintf("%s: manifest entry has no stored blob; nothing removed", base))
 		}
 		// Snapshot links named after the original file.
 		for _, commit := range snapshots {
@@ -3052,6 +3060,14 @@ func (s *Server) handleCacheDeleteVariant(w http.ResponseWriter, cacheDir string
 	switch resolvedSource {
 	case cacheSourceLocal:
 		if !haveLocal {
+			writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+			return
+		}
+		// Local roots hold models only. A dataset-scoped variant request on a
+		// Local copy is reported as not found, matching deleteLocalRootRepo and
+		// deleteLocalCopy, and deletes nothing. HF/friendly dataset variants
+		// remain valid, so this gate is deliberately Local-only.
+		if repoType != hfdownloader.RepoTypeModel {
 			writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
 			return
 		}

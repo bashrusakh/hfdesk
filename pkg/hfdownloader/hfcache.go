@@ -449,10 +449,15 @@ func (r *RepoDir) FriendlyState() FriendlyProjectionState {
 		}
 		// The manifest is a real regular file written at the projection root
 		// alongside the symlinks; it corroborates ownership but is not itself a
-		// link. Only the root manifest is exempt: a nested real file of any
-		// name (including a nested hfd.yaml) means this folder is not a proven
-		// whole-folder projection and must be preserved.
+		// link. Only a regular root manifest is exempt: a symlinked root
+		// manifest is an alias, and a nested real file of any name (including a
+		// nested hfd.yaml) means this folder is not a proven whole-folder
+		// projection and must be preserved.
 		if path == filepath.Join(friendlyPath, ManifestFilename) {
+			if !d.Type().IsRegular() {
+				state = FriendlyNotProjection
+				return filepath.SkipAll
+			}
 			return nil
 		}
 		if d.Type()&os.ModeSymlink == 0 {

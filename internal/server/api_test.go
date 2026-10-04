@@ -4542,3 +4542,175 @@ func TestAPI_CacheDelete_VariantHFLinkCleanupFailureSurfaced(t *testing.T) {
 		t.Errorf("other quant's blob must survive: %v", err)
 	}
 }
+
+// TestAPI_CacheDelete_VariantLocalDatasetNotFound is the F4 parity fix: a
+// dataset-scoped variant request against a Local copy must return 404 and delete
+// nothing, matching deleteLocalRootRepo/deleteLocalCopy, because local roots
+// hold models only. A model-scoped variant request on the same copy still works.
+func TestAPI_CacheDelete_VariantLocalDatasetNotFound(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "qwen")
+	writeCacheFiles(t, repoDir, "model-Q4_K_M.gguf", "model-Q8_0.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// Dataset scope on the Local copy: 404 and nothing deleted.
+	q := url.Values{}
+	q.Set("type", "dataset")
+	q.Set("source", cacheSourceLocal)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, "alice/qwen", q)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("dataset variant on Local copy = %d, want 404. Body: %s", w.Code, w.Body.String())
+	}
+	for _, keep := range []string{"model-Q4_K_M.gguf", "model-Q8_0.gguf"} {
+		if _, err := os.Stat(filepath.Join(repoDir, keep)); err != nil {
+			t.Errorf("dataset variant refusal must delete nothing, %s gone: %v", keep, err)
+		}
+	}
+
+	// Model scope on the same copy still deletes the requested variant.
+	q.Set("type", "model")
+	w = deleteCacheReq(t, srv, "alice/qwen", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("model variant on Local copy = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Errorf("expected model variant removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q8_0.gguf")); err != nil {
+		t.Errorf("other quant must survive: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantHFDatasetUnaffected verifies the F4 gate is
+// Local-only: a dataset-scoped variant request on the HF/friendly copy still
+// works, because datasets are legitimate HF-cache artifacts.
+func TestAPI_CacheDelete_VariantHFDatasetUnaffected(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "dat"
+
+	hubRepo := filepath.Join(cacheDir, "hub", "datasets--"+owner+"--"+name)
+	writeCacheFiles(t, filepath.Join(hubRepo, "blobs"), "sha_go", "sha_keep")
+	friendlyDir := filepath.Join(cacheDir, "datasets", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "dataset",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			{Name: "model-Q4_K_M.gguf", Blob: "blobs/sha_go", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	for file, blob := range map[string]string{
+		"model-Q4_K_M.gguf": "sha_go",
+		"model-Q8_0.gguf":   "sha_keep",
+	} {
+		target := filepath.Join("..", "..", "..", "hub", "datasets--"+owner+"--"+name, "blobs", blob)
+		if err := os.Symlink(target, filepath.Join(friendlyDir, file)); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "dataset")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("dataset variant on HF copy = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_go")); !os.IsNotExist(err) {
+		t.Errorf("expected dataset variant blob removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_keep")); err != nil {
+		t.Errorf("other dataset variant blob must survive: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantHFEmptyBlobReported verifies the residual fix: a
+// matching manifest entry with an empty Blob has no stored file to remove, so
+// the response must record an incomplete-cleanup warning instead of silently
+// under-reporting a complete variant delete.
+func TestAPI_CacheDelete_VariantHFEmptyBlobReported(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "qwen"
+
+	hubRepo := filepath.Join(cacheDir, "hub", "models--"+owner+"--"+name)
+	writeCacheFiles(t, filepath.Join(hubRepo, "blobs"), "sha_keep")
+	friendlyDir := filepath.Join(cacheDir, "models", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "model",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			// The variant entry has provenance but no stored blob.
+			{Name: "model-Q4_K_M.gguf", Blob: "", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty-blob variant delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, meta := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true for an empty-Blob manifest entry, got %s", w.Body.String())
+	}
+	warnings, _ := meta["warnings"].([]string)
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "no stored blob") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a no-stored-blob warning, got %v", warnings)
+	}
+	// The unrelated variant's blob must survive untouched.
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_keep")); err != nil {
+		t.Errorf("other quant's blob must survive: %v", err)
+	}
+}

@@ -693,3 +693,32 @@ func TestRepoDir_FriendlyState_NestedManifestNotProjection(t *testing.T) {
 		t.Errorf("FriendlyState() with nested real hfd.yaml = %v, want FriendlyNotProjection", got)
 	}
 }
+
+// TestRepoDir_FriendlyState_SymlinkedManifestNotProjection is the residual fix:
+// the root manifest exemption must require a regular file. A symlinked root
+// hfd.yaml is an alias, not the owned manifest written alongside the
+// projection's links, so the folder is not a proven projection and must be
+// preserved rather than removed.
+func TestRepoDir_FriendlyState_SymlinkedManifestNotProjection(t *testing.T) {
+	cache := NewHFCache(t.TempDir(), 0)
+	repo, _ := cache.Repo("owner/name", RepoTypeModel)
+	friendly := repo.FriendlyPath()
+	if err := os.MkdirAll(friendly, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A link into this repo's hub keeps the rest of the folder looking like a
+	// projection.
+	target := filepath.Join("..", "..", "..", "hub", "models--owner--name", "blobs", "sha")
+	if err := os.Symlink(target, filepath.Join(friendly, "model.gguf")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	// The root manifest is itself a symlink (e.g. to another file), so it is
+	// not the real projection marker.
+	manifestTarget := filepath.Join("..", "..", "..", "hub", "models--owner--name", "blobs", "manifest")
+	if err := os.Symlink(manifestTarget, filepath.Join(friendly, ManifestFilename)); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	if got := repo.FriendlyState(); got != FriendlyNotProjection {
+		t.Errorf("FriendlyState() with symlinked root hfd.yaml = %v, want FriendlyNotProjection", got)
+	}
+}
