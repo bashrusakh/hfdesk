@@ -59,9 +59,12 @@ type Config struct {
 	// tokenWrite is the pending explicit settings set/clear intent, not the
 	// effective startup credential. It is inherited by ordinary updates and
 	// retained across skipped side effects and failed saves; it is cleared
-	// only once durably persisted for the still-current generation. nil
-	// preserves the disk token.
+	// only once durably persisted by the persister whose snapshot carried the
+	// same tokenWriteGen identity. nil preserves the disk token.
 	tokenWrite *string
+	// tokenWriteGen identifies the pending tokenWrite intent; bumped only when
+	// an explicit set/clear replaces it, never by ordinary updates.
+	tokenWriteGen uint64
 }
 
 // DefaultConfig returns sensible defaults.
@@ -152,17 +155,20 @@ func (s *Server) withConfig(fn func(*Config)) (Config, uint64) {
 	return s.config, s.configGen
 }
 
-// consumeTokenWrite clears the pending explicit token write intent once it has
-// been durably persisted. It only clears when gen is still the current
-// generation, so a newer commit that landed after the persist keeps its own or
-// inherited intent. It must only be called after saveSettingsConfig succeeded,
-// while holding persistMu (the config lock is taken here). It does not bump
-// configGen: the in-memory config is semantically unchanged apart from dropping
-// the already-persisted intent.
-func (s *Server) consumeTokenWrite(gen uint64) {
+// consumeTokenWrite clears the pending explicit token write intent once the
+// exact intent identified by intentGen has been durably persisted. Comparing
+// the intent identity rather than configGen is what makes this generation-safe:
+// ordinary updates inherit the intent and bump configGen without authoring a
+// new one, so a newer inherited snapshot cannot clear an intent that a
+// genuinely newer explicit set/clear has already replaced, and cannot re-apply
+// an already-persisted value. It must only be called after saveSettingsConfig
+// succeeded, while holding persistMu (the config lock is taken here). It does
+// not bump configGen or tokenWriteGen: the in-memory config is semantically
+// unchanged apart from dropping the already-persisted intent.
+func (s *Server) consumeTokenWrite(intentGen uint64) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
-	if s.configGen != gen || s.config.tokenWrite == nil {
+	if s.config.tokenWrite == nil || s.config.tokenWriteGen != intentGen {
 		return
 	}
 	c := s.config

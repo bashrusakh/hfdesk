@@ -135,6 +135,94 @@ func TestSettingsTokenOutOfBandPreservedOnOrdinarySave(t *testing.T) {
 	}
 }
 
+// TestSettingsTokenInheritedIntentNotReapplied targets the consume-identity
+// contract directly. It models the exact interleaving where an explicit set is
+// authored, a newer ordinary update inherits the pending intent and commits a
+// new config generation, the explicit value is persisted and consumed, an
+// out-of-band edit then changes the disk token, and finally the inherited
+// ordinary snapshot is persisted. Because an ordinary update only inherits the
+// intent (it authors no new tokenWriteGen), consuming by config generation
+// would leave the intent live and the inherited persister would re-apply the
+// already-persisted value, clobbering the out-of-band edit. The phases are
+// driven directly through withConfig/saveSettingsConfig/consumeTokenWrite
+// because the full-HTTP ordering cannot be scheduled deterministically (both
+// requests block on persistMu).
+func TestSettingsTokenInheritedIntentNotReapplied(t *testing.T) {
+	path := isolateTokenConfig(t)
+	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk_seed"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(DefaultConfig())
+
+	// Request #1: explicit set A authors a fresh intent identity and snapshots
+	// the config it just produced (generation 1).
+	cfgExplicit, genExplicit := s.withConfig(func(c *Config) {
+		token := "hf_authored_A"
+		c.Token = token
+		c.tokenWrite = &token
+		c.tokenWriteGen++
+	})
+	if cfgExplicit.tokenWrite == nil {
+		t.Fatal("explicit update did not author a pending intent")
+	}
+
+	// Request #2: ordinary update inherits the pending intent and bumps the
+	// config generation (2) without authoring a new intent. This is the "newer
+	// ordinary generation" from the bug report; it blocks on persistMu until #1
+	// finishes.
+	cfgOrdinary, genOrdinary := s.withConfig(func(c *Config) {
+		c.Concurrency = 12
+	})
+	if genOrdinary <= genExplicit {
+		t.Fatalf("ordinary generation %d did not advance past explicit generation %d", genOrdinary, genExplicit)
+	}
+	if cfgOrdinary.tokenWrite == nil || cfgOrdinary.tokenWriteGen != cfgExplicit.tokenWriteGen {
+		t.Fatal("ordinary update did not inherit the pending intent identity")
+	}
+
+	// Request #1 wins persistMu: it persists A from its own snapshot, then
+	// consumes the exact intent identity it carried. A config-generation
+	// comparison would wrongly see generation 2 here and skip the clear.
+	if err := saveSettingsConfig(&ConfigFile{Connections: cfgExplicit.Concurrency}, cfgExplicit.tokenWrite); err != nil {
+		t.Fatal(err)
+	}
+	s.consumeTokenWrite(cfgExplicit.tokenWriteGen)
+
+	// Out-of-band change to B. The intent is now durably satisfied, so a later
+	// ordinary save must preserve this value.
+	writeTokenFixture(t, path, `{"token":"hf_out_of_band_B"}`)
+	if stored, err := LoadConfigFile(); err != nil || stored.Token != "hf_out_of_band_B" {
+		t.Fatalf("out-of-band seed failed: token=%q err=%v", stored.Token, err)
+	}
+
+	// Request #2 now acquires persistMu and snapshots as the handler does,
+	// after #1's consume. With the identity fix this snapshot carries no intent
+	// and falls back to preserving the disk token; with a config-generation
+	// consume the intent would still be live and the save below would clobber B.
+	snap2, cur2 := s.snapshotConfigWithGen()
+	if cur2 != genOrdinary {
+		t.Fatalf("ordinary snapshot generation = %d, want %d", cur2, genOrdinary)
+	}
+	if err := saveSettingsConfig(&ConfigFile{Connections: snap2.Concurrency}, snap2.tokenWrite); err != nil {
+		t.Fatal(err)
+	}
+	s.consumeTokenWrite(snap2.tokenWriteGen)
+
+	stored, err := LoadConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Token != "hf_out_of_band_B" {
+		t.Errorf("stored token = %q, want %q (inherited ordinary snapshot must not re-apply the persisted explicit value)", stored.Token, "hf_out_of_band_B")
+	}
+	if live := s.snapshotConfig(); live.Token != "hf_authored_A" || live.Concurrency != 12 {
+		t.Errorf("live token/concurrency = %q/%d, want %q/12 (in-memory state must be unchanged)", live.Token, live.Concurrency, "hf_authored_A")
+	}
+	if gen := s.snapshotConfig().tokenWriteGen; gen != 1 {
+		t.Errorf("tokenWriteGen = %d, want unchanged 1", gen)
+	}
+}
+
 func TestSettingsTokenExplicitSetClear(t *testing.T) {
 	isolateTokenConfig(t)
 	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk_original"}); err != nil {

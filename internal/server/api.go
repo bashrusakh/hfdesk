@@ -467,6 +467,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			token := *req.Token
 			c.Token = token
 			c.tokenWrite = &token
+			// A genuinely new explicit set/clear authors a fresh intent
+			// identity so an older persister cannot clear it.
+			c.tokenWriteGen++
 		}
 		if req.CacheDir != nil {
 			c.CacheDir = strings.TrimSpace(*req.CacheDir)
@@ -598,10 +601,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The pending explicit token intent is now durable for this generation, so
-	// consume it. If a newer update committed concurrently, keep it: that
-	// generation owns the intent it inherited or authored.
-	s.consumeTokenWrite(myGen)
+	// The pending explicit token intent is now durable for the exact intent
+	// this snapshot carried, so consume it by identity. If a newer explicit
+	// set/clear committed concurrently, keep it: that intent has its own
+	// tokenWriteGen and is not the one just persisted.
+	s.consumeTokenWrite(finalCfg.tokenWriteGen)
 
 	writeJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
