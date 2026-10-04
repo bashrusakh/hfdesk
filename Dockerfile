@@ -92,8 +92,9 @@ RUN apk add --no-cache ca-certificates tzdata su-exec
 #
 # UID/GID must be numeric so the image never bakes a name into HFDESK_UID/GID
 # (which the entrypoint then rejects at runtime with exit 64). A non-numeric
-# value is refused here at build time; an out-of-range numeric ID still fails
-# in addgroup/adduser.
+# value is refused here at build time, and addgroup/adduser failures (for
+# example an out-of-range numeric ID) are checked explicitly so the build stops
+# with a clear error instead of a raw BusyBox message.
 RUN set -eu; \
     case "$GID" in \
       '' | *[!0-9]*) echo "error: GID must be a numeric id (got '$GID')" >&2; exit 1 ;; \
@@ -104,7 +105,10 @@ RUN set -eu; \
     if getent group "$GID" >/dev/null; then \
       hfdesk_group="$(getent group "$GID" | cut -d: -f1)"; \
     else \
-      addgroup -g "$GID" hfdesk; \
+      if ! addgroup -g "$GID" hfdesk; then \
+        echo "error: cannot create group with GID $GID (out of range or already in use)" >&2; \
+        exit 1; \
+      fi; \
       hfdesk_group=hfdesk; \
     fi; \
     if [ "$hfdesk_group" = root ]; then \
@@ -114,7 +118,10 @@ RUN set -eu; \
     if getent passwd "$UID" >/dev/null; then \
       hfdesk_user="$(getent passwd "$UID" | cut -d: -f1)"; \
     else \
-      adduser -D -h /data -u "$UID" -G "$hfdesk_group" hfdesk; \
+      if ! adduser -D -h /data -u "$UID" -G "$hfdesk_group" hfdesk; then \
+        echo "error: cannot create user with UID $UID (out of range or already in use)" >&2; \
+        exit 1; \
+      fi; \
       hfdesk_user=hfdesk; \
     fi; \
     if [ "$hfdesk_user" = root ]; then \
