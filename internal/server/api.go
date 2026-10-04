@@ -873,13 +873,67 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 	return roots
 }
 
+// excludedSubroots keeps all scan roots, but gives each configured descendant
+// exclusive ownership of its subtree. Absolute lexical keys also handle mixed
+// relative/absolute configuration without resolving symlinks.
+func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
+	rootPath, err := filepath.Abs(root.Path)
+	if err != nil {
+		return nil
+	}
+	rootKey := pathIdentityKey(rootPath)
+	var excluded []string
+	for _, candidate := range roots {
+		candidatePath, err := filepath.Abs(candidate.Path)
+		if err != nil {
+			continue
+		}
+		candidateKey := pathIdentityKey(candidatePath)
+		if candidateKey != rootKey && withinLocalRoot(rootKey, candidateKey) {
+			excluded = append(excluded, candidateKey)
+		}
+	}
+	return excluded
+}
+
+// withinLocalRoot compares lexical path keys with a directory boundary, so
+// GGUF-other is not within GGUF. Keys retain the platform's case semantics.
+func withinLocalRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// walkLocalCacheRepo uses the same subtree ownership for weight qualification,
+// file accounting, and metadata. Check even the initial directory: a candidate
+// repo may itself be a configured subroot or lie beneath one.
+func walkLocalCacheRepo(dir string, excluded []string, walkFn filepath.WalkFunc) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && len(excluded) > 0 {
+			absolute, absErr := filepath.Abs(path)
+			if absErr != nil {
+				return absErr
+			}
+			key := pathIdentityKey(absolute)
+			for _, subroot := range excluded {
+				if withinLocalRoot(subroot, key) {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+		return walkFn(path, info, err)
+	})
+}
+
 // hasLocalWeightFile reports whether dir (or any subdirectory) contains
 // at least one .gguf or .safetensors file. Used to decide whether an
 // owner/name folder under a cache root is a real repo worth listing
-// vs. an unrelated directory.
-func hasLocalWeightFile(dir string) bool {
+// vs. an unrelated directory, without crossing configured subroots.
+func hasLocalWeightFile(dir string, excluded []string) bool {
 	found := false
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -938,10 +992,10 @@ type cacheGGUFMetadata struct {
 // summary (distinct labels, mmproj presence, capabilities) for the
 // repo rooted there. When includeMMProjFiles is true, the relative
 // paths of mmproj companions are also recorded.
-func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMetadata {
+func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []string) cacheGGUFMetadata {
 	seen := make(map[string]bool)
 	meta := cacheGGUFMetadata{}
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
 			return nil
 		}
@@ -976,13 +1030,13 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMeta
 // includeFiles is true) enumerates the files. The source label
 // (e.g. "HF cache", "Friendly view", "Local") is propagated to the
 // result so the UI can group repos by origin.
-func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
+func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool, excluded []string) (*CachedRepoInfo, error) {
 	var totalSize int64
 	var fileCount int
 	var files []CachedFileInfo
 	var newest time.Time
 
-	err := filepath.Walk(repoDir, func(path string, info os.FileInfo, err error) error {
+	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -1021,7 +1075,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	if !newest.IsZero() {
 		downloaded = newest.Format("2006-01-02")
 	}
-	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles)
+	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles, excluded)
 
 	return &CachedRepoInfo{
 		Repo:           owner + "/" + name,
@@ -1050,7 +1104,9 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 // (hub/blobs/snapshots/refs) are skipped.
 func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	for _, root := range roots {
+		excluded := root.excludedSubroots(roots)
 		if _, err := os.Stat(root.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -1078,10 +1134,10 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, dow
 				}
 				name := modelEntry.Name()
 				repoDir := filepath.Join(ownerDir, name)
-				if !hasLocalWeightFile(repoDir) {
+				if !hasLocalWeightFile(repoDir, excluded) {
 					continue
 				}
-				repo, err := buildLocalCacheRepo(owner, name, repoDir, root.Source, includeFiles)
+				repo, err := buildLocalCacheRepo(owner, name, repoDir, root.Source, includeFiles, excluded)
 				if err == nil {
 					repos = append(repos, *repo)
 				}
@@ -1100,15 +1156,17 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, down
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	for _, root := range roots {
 		if root.skipsOwner(parts[0]) {
 			continue
 		}
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
-		if !hasLocalWeightFile(repoDir) {
+		excluded := root.excludedSubroots(roots)
+		if !hasLocalWeightFile(repoDir, excluded) {
 			continue
 		}
-		return buildLocalCacheRepo(parts[0], parts[1], repoDir, root.Source, includeFiles)
+		return buildLocalCacheRepo(parts[0], parts[1], repoDir, root.Source, includeFiles, excluded)
 	}
 	return nil, os.ErrNotExist
 }
@@ -1238,7 +1296,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			shortCommit = shortCommit[:7]
 		}
 
-		ggufMeta := collectCacheGGUFMetadata(friendlyPath, false)
+		ggufMeta := collectCacheGGUFMetadata(friendlyPath, false, nil)
 
 		repo := CachedRepoInfo{
 			Repo:           repoID,
@@ -1446,7 +1504,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		shortCommit = shortCommit[:7]
 	}
 
-	ggufMeta := collectCacheGGUFMetadata(friendlyPath, true)
+	ggufMeta := collectCacheGGUFMetadata(friendlyPath, true, nil)
 
 	info := CachedRepoInfo{
 		Repo:           repoDir.RepoID(),

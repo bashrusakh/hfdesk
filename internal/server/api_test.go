@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -210,6 +212,281 @@ func TestLocalCachedRepos_RootRestrictions(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestLocalCachedRepos_NestedRoots(t *testing.T) {
+	type expectedRepo struct {
+		path, source string
+		files        []string
+		quants       []string
+	}
+	for _, tc := range []struct {
+		name, cache, local string
+		scanDirs           []string
+		routes             map[string]string
+		files              []string
+		want               map[string]expectedRepo
+		absent             []string
+		linuxOnly          bool
+		relativeRoutes     bool
+	}{
+		{
+			name: "local-and-fine", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name:   "coarse-and-fine-without-local",
+			routes: map[string]string{"llm": "models/LLM", "llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/coarse/real/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"coarse/real": {path: "models/LLM/coarse/real", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"GGUF/owner"},
+		},
+		{
+			name: "three-root-levels", local: "models",
+			routes: map[string]string{"llm": "models/LLM", "llm/gguf": "models/LLM/GGUF"},
+			files: []string{
+				"models/parent/real/shards/model.safetensors", "models/LLM/coarse/real/model.safetensors",
+				"models/LLM/GGUF/owner/model/foo.gguf",
+			},
+			want: map[string]expectedRepo{
+				"parent/real": {path: "models/parent/real", files: []string{"shards/model.safetensors"}},
+				"coarse/real": {path: "models/LLM/coarse/real", files: []string{"model.safetensors"}},
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+			},
+			absent: []string{"LLM/GGUF", "LLM/coarse", "GGUF/owner"},
+		},
+		{
+			name: "absolute-local-relative-route", local: "models", relativeRoutes: true,
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "siblings-and-real-ancestor", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF", "audio": "models/Audio"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/Audio/sound/voice/model.safetensors", "models/parent/real/shards/deep/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"sound/voice": {path: "models/Audio/sound/voice", files: []string{"model.safetensors"}},
+				"parent/real": {path: "models/parent/real", files: []string{"shards/deep/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF", "Audio/sound"},
+		},
+		{
+			name: "scan-dir-overlap", local: "models", scanDirs: []string{"models", "models/LLM/GGUF"},
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF/"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/parent/real/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"parent/real": {path: "models/parent/real", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "friendly-and-raw-overlap", cache: "cache", local: "cache", scanDirs: []string{"cache", "cache/models"},
+			routes: map[string]string{"llm": "cache", "llm/gguf": "cache/models/LLM/GGUF"},
+			files: []string{
+				"cache/models/LLM/GGUF/owner/model/foo.gguf", "cache/models/friendly/real/model.safetensors",
+				"cache/raw/real/model.safetensors", "cache/hub/fake/nested/model.safetensors",
+			},
+			want: map[string]expectedRepo{
+				"owner/model":   {path: "cache/models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"friendly/real": {path: "cache/models/friendly/real", source: "Friendly view", files: []string{"model.safetensors"}},
+				"raw/real":      {path: "cache/raw/real", files: []string{"model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF", "models/LLM", "hub/fake"},
+		},
+		{
+			name: "descendant-inside-real-repo", local: "models",
+			routes: map[string]string{"llm/gguf": "models/parent/real/routed"},
+			files: []string{
+				"models/parent/real/shards/own-Q4_K_M.gguf", "models/parent/real/routed/owner/model/child-Q8_0.gguf",
+				"models/parent/real/routed/owner/model/mmproj-F16.gguf",
+			},
+			want: map[string]expectedRepo{
+				"parent/real": {path: "models/parent/real", files: []string{"shards/own-Q4_K_M.gguf"}, quants: []string{"Q4_K_M"}},
+				"owner/model": {path: "models/parent/real/routed/owner/model", files: []string{"child-Q8_0.gguf", "mmproj-F16.gguf"}, quants: []string{"Q8_0"}},
+			},
+		},
+		{
+			name: "descendant-only-weights-do-not-qualify-parent", local: "models",
+			routes: map[string]string{"llm/gguf": "models/parent/empty/routed"},
+			files:  []string{"models/parent/empty/README.md", "models/parent/empty/routed/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/parent/empty/routed/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"parent/empty"},
+		},
+		{
+			name: "lookup-continues-after-excluded-candidate", local: "models", scanDirs: []string{"other"},
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "other/LLM/GGUF/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/GGUF":    {path: "other/LLM/GGUF", files: []string{"shards/model.safetensors"}},
+			},
+		},
+		{
+			name: "prefix-boundary", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/GGUF-other/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model":    {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/GGUF-other": {path: "models/LLM/GGUF-other", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "case-distinct", local: "models", linuxOnly: true,
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/gguf/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/gguf":    {path: "models/LLM/gguf", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.linuxOnly && runtime.GOOS != "linux" {
+				t.Skip("requires Linux case-sensitive directories")
+			}
+			base := t.TempDir()
+			path := func(relative string) string {
+				if relative == "" {
+					return ""
+				}
+				return filepath.Join(base, filepath.FromSlash(relative))
+			}
+			cacheDir := path(tc.cache)
+			if cacheDir == "" {
+				cacheDir = path("cache")
+			}
+			var scanDirs []string
+			for _, dir := range tc.scanDirs {
+				scanDirs = append(scanDirs, path(dir))
+			}
+			routes := make(map[string]string)
+			for key, dir := range tc.routes {
+				routes[key] = path(dir)
+				if tc.relativeRoutes {
+					cwd, err := os.Getwd()
+					if err != nil {
+						t.Fatal(err)
+					}
+					routes[key], err = filepath.Rel(cwd, routes[key])
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for _, file := range tc.files {
+				if err := os.MkdirAll(filepath.Dir(path(file)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path(file), []byte("weights"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, includeFiles := range []bool{false, true} {
+				t.Run(fmt.Sprintf("files-%v", includeFiles), func(t *testing.T) {
+					check := func(repo CachedRepoInfo) {
+						t.Helper()
+						want, ok := tc.want[repo.Repo]
+						if !ok {
+							t.Errorf("synthetic/unexpected repo %s at %s", repo.Repo, repo.Path)
+							return
+						}
+						source := want.source
+						if source == "" {
+							source = "Local"
+						}
+						absolute, err := filepath.Abs(repo.Path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if absolute != path(want.path) || repo.Source != source {
+							t.Errorf("%s: path/source = %s/%s, want %s/%s", repo.Repo, repo.Path, repo.Source, path(want.path), source)
+						}
+						if repo.FileCount != len(want.files) || repo.Size != int64(len(want.files)*len("weights")) {
+							t.Errorf("%s: fileCount/size = %d/%d, want %d/%d", repo.Repo, repo.FileCount, repo.Size, len(want.files), len(want.files)*len("weights"))
+						}
+						var names, mmproj []string
+						for _, file := range repo.Files {
+							names = append(names, file.Name)
+						}
+						var wantNames []string
+						wantMMProj := false
+						for _, file := range want.files {
+							if includeFiles {
+								wantNames = append(wantNames, filepath.FromSlash(file))
+							}
+							if filepath.Base(file) == "mmproj-F16.gguf" {
+								wantMMProj = true
+								if includeFiles {
+									mmproj = append(mmproj, filepath.FromSlash(file))
+								}
+							}
+						}
+						if !reflect.DeepEqual(names, wantNames) || !reflect.DeepEqual(repo.Quantizations, want.quants) || repo.HasMMProj != wantMMProj || !reflect.DeepEqual(repo.MMProjFiles, mmproj) {
+							t.Errorf("%s: files/metadata = %v/%v/%v/%v, want %v/%v/%v/%v", repo.Repo, names, repo.Quantizations, repo.HasMMProj, repo.MMProjFiles, wantNames, want.quants, wantMMProj, mmproj)
+						}
+					}
+					repos, err := scanLocalCachedRepos(cacheDir, path(tc.local), scanDirs, routes, includeFiles)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(repos) != len(tc.want) {
+						t.Errorf("scan returned %d repos, want %d", len(repos), len(tc.want))
+					}
+					seen := make(map[string]bool)
+					for _, repo := range repos {
+						if seen[repo.Repo] {
+							t.Errorf("duplicate repo %s", repo.Repo)
+						}
+						seen[repo.Repo] = true
+						check(repo)
+					}
+					for id := range tc.want {
+						if !seen[id] {
+							t.Errorf("scan omitted %s", id)
+						}
+						repo, err := findLocalCachedRepo(cacheDir, path(tc.local), scanDirs, routes, id, includeFiles)
+						if err != nil {
+							t.Errorf("lookup %s: %v", id, err)
+							continue
+						}
+						check(*repo)
+					}
+					for _, id := range tc.absent {
+						if _, err := findLocalCachedRepo(cacheDir, path(tc.local), scanDirs, routes, id, includeFiles); !os.IsNotExist(err) {
+							t.Errorf("lookup exposed synthetic repo %s: %v", id, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
+	base := t.TempDir()
+	root := localCacheRoot{Path: filepath.Join(base, "Models")}
+	child := localCacheRoot{Path: filepath.Join(base, "models", "GGUF")}
+	roots := []localCacheRoot{root, child}
+	got := root.excludedSubroots(roots)
+	var want []string
+	if runtime.GOOS == "windows" {
+		want = []string{pathIdentityKey(child.Path)}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("case-different parent: excluded = %v, want %v", got, want)
 	}
 }
 
