@@ -660,3 +660,36 @@ func TestRejectSymlinkedComponents(t *testing.T) {
 		t.Errorf("expected real path to be accepted, got %v", err)
 	}
 }
+
+// TestRepoDir_FriendlyState_NestedManifestNotProjection is the M1 regression: a
+// friendly directory that otherwise looks like a projection (root manifest plus
+// links into this repo's hub) but contains a real nested regular file -- even a
+// nested hfd.yaml -- must not be classified as a whole-folder projection.
+// Exempting only the root manifest keeps the real nested file from being
+// removed as if it were a projection link.
+func TestRepoDir_FriendlyState_NestedManifestNotProjection(t *testing.T) {
+	cache := NewHFCache(t.TempDir(), 0)
+	repo, _ := cache.Repo("owner/name", RepoTypeModel)
+	friendly := repo.FriendlyPath()
+	if err := os.MkdirAll(filepath.Join(friendly, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Valid root manifest (the legitimate projection marker).
+	if err := os.WriteFile(filepath.Join(friendly, ManifestFilename), []byte("branch: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A link into this repo's hub keeps the rest of the folder looking like a
+	// projection.
+	target := filepath.Join("..", "..", "..", "hub", "models--owner--name", "blobs", "sha")
+	if err := os.Symlink(target, filepath.Join(friendly, "model.gguf")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	// A real nested file (a nested hfd.yaml is the strongest case) must
+	// disqualify the whole folder.
+	if err := os.WriteFile(filepath.Join(friendly, "sub", ManifestFilename), []byte("nested\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.FriendlyState(); got != FriendlyNotProjection {
+		t.Errorf("FriendlyState() with nested real hfd.yaml = %v, want FriendlyNotProjection", got)
+	}
+}

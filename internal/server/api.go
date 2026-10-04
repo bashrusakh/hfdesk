@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -811,23 +812,46 @@ type localCacheRoot struct {
 	SkipSpecial bool
 }
 
-// physPathKey returns a physical-identity key for a filesystem path. It
-// cleans the path and, when the path exists, resolves symlinks, then makes it
-// absolute. Unlike the previous case-folded key, case is preserved (this
-// project targets case-sensitive paths; on a case-insensitive filesystem
-// EvalSymlinks returns the on-disk spelling, so genuine aliases still
-// collapse). Used to dedup roots by physical identity rather than spelling,
-// so a symlinked root and its real path become one root while two truly
-// distinct roots such as /Models and /models stay separate.
+// physPathKeyCaseInsensitive reports whether physical-identity keys must
+// fold case on the given platform. It is a platform decision, not a filesystem
+// probe: filepath.EvalSymlinks canonicalizes case only on Windows, while on
+// macOS (which is case-insensitive by default) it preserves the caller's
+// casing. Fold on those two platforms so a case-insensitive filesystem still
+// collapses aliases; Linux is treated as case-sensitive so genuinely distinct
+// roots such as /Models and /models stay separate.
+func physPathKeyCaseInsensitive(goos string) bool {
+	return goos == "windows" || goos == "darwin"
+}
+
+// physPathKey returns a physical-identity key for a filesystem path on the
+// current platform. See physPathKeyForGOOS for the platform-dependent case
+// handling.
 func physPathKey(path string) string {
+	return physPathKeyForGOOS(path, runtime.GOOS)
+}
+
+// physPathKeyForGOOS is physPathKey with the platform decision injected so the
+// case-folding branch is testable without running on that OS. On platforms
+// whose default filesystem is case-insensitive (Windows, macOS) the key is
+// lowercased, because EvalSymlinks only canonicalizes case on Windows and would
+// otherwise leave case-differing aliases of one physical directory un-deduped.
+// On Linux the key preserves case, so two truly distinct roots such as /Models
+// and /models stay separate. Used to dedup roots by physical identity rather
+// than spelling, so a symlinked root and its real path become one root while
+// distinct case-sensitive roots remain distinct.
+func physPathKeyForGOOS(path, goos string) string {
 	cleaned := filepath.Clean(path)
 	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
 		cleaned = resolved
 	}
+	key := cleaned
 	if abs, err := filepath.Abs(cleaned); err == nil {
-		return abs
+		key = abs
 	}
-	return cleaned
+	if physPathKeyCaseInsensitive(goos) {
+		key = strings.ToLower(key)
+	}
+	return key
 }
 
 // cleanPathList trims whitespace, filepath.Cleans each path, drops
@@ -954,6 +978,143 @@ func hasLocalWeightFile(dir string) bool {
 		return nil
 	})
 	return found
+}
+
+// isWeightFileName reports whether name has a recognized weight-file
+// extension (.gguf / .safetensors).
+func isWeightFileName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".gguf", ".safetensors":
+		return true
+	}
+	return false
+}
+
+// dirOwnsWeightFile reports whether dir directly contains a weight file as a
+// DIRECT child. Unlike hasLocalWeightFile this does not search subdirectories,
+// so a container of model repos (org/family, org, models/<owner>) does not
+// qualify merely because a nested repo owns a weight file. Sharded/multi-file
+// models, filtered subsets, and mmproj companions all place their weights
+// directly in the repo directory, so direct ownership preserves them.
+func dirOwnsWeightFile(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if isWeightFileName(entry.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWeightBearingSubdir reports whether any strict descendant directory of dir
+// directly owns a weight file. Such a descendant is a nested model repo, so dir
+// is a container of models rather than a leaf model and must never be
+// advertised or deleted as one. Nested directories that hold only non-weight
+// files (config.json, tokenizers, etc.) do not disqualify dir.
+func hasWeightBearingSubdir(dir string) bool {
+	found := false
+	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || path == dir || !d.IsDir() {
+			return nil
+		}
+		if dirOwnsWeightFile(path) {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// localUnitGuards returns the physical paths that a deletable Local leaf must
+// not be, contain, or (except through its own configured root) be contained by:
+// the cache dir, its friendly models/ and datasets/ namespaces, and every
+// configured Local root (localDir and localScanDirs). Rejecting these keeps a
+// Local delete from removing the whole cache, a friendly namespace, or a
+// configured root through an ancestor/overlapping scan root.
+func localUnitGuards(cacheDir, localDir string, localScanDirs []string) []string {
+	if cacheDir == "" {
+		return nil
+	}
+	guards := []string{
+		cacheDir,
+		filepath.Join(cacheDir, "models"),
+		filepath.Join(cacheDir, "datasets"),
+	}
+	if localDir != "" {
+		guards = append(guards, localDir)
+	}
+	for _, dir := range localScanDirs {
+		if dir != "" {
+			guards = append(guards, dir)
+		}
+	}
+	return guards
+}
+
+// pathIsPrefix reports whether parent equals child or is a directory ancestor
+// of child. Both arguments must already be physical keys (absolute,
+// symlink-resolved, and case-normalized for the platform), so pathIsPrefix
+// never matches a sibling like /data/Models-evil against /data/Models.
+func pathIsPrefix(parent, child string) bool {
+	return parent == child || strings.HasPrefix(child, parent+string(filepath.Separator))
+}
+
+// localUnitGuardedPath reports whether absTarget collides with a guarded path:
+// it equals a guard, is an ancestor of a guard (deleting it would delete the
+// cache dir, a friendly namespace, or a configured root), or is a descendant of
+// a guard. Descendant containment is allowed only through the candidate's own
+// root (or an ancestor of it), because a deletable leaf is normally nested
+// under its own configured root -- for example an explicit Local root at
+// <cache>/models legitimately deletes <cache>/models/<owner>/<name>.
+func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
+	targetKey := physPathKey(absTarget)
+	for _, guard := range guards {
+		guardKey := physPathKey(guard)
+		if targetKey == guardKey {
+			return true
+		}
+		if pathIsPrefix(targetKey, guardKey) {
+			return true
+		}
+		if pathIsPrefix(guardKey, targetKey) && guardKey != rootKey && !pathIsPrefix(guardKey, rootKey) {
+			return true
+		}
+	}
+	return false
+}
+
+// localLeafRepoIsDeletable reports whether absTarget is a genuine LEAF Local
+// model directory that may be advertised and deleted. It is the single
+// ownership predicate shared by enumeration (localCopyCandidates, the cache
+// list, and findLocalCachedRepo) and deletion (resolveLocalDeleteTarget), so the
+// listed set equals the deletable set. A leaf:
+//  1. does not equal, contain, or (except through its own root) sit inside the
+//     cache dir, a friendly namespace, or a configured root (see
+//     localUnitGuardedPath);
+//  2. directly owns at least one weight file, unless allowWeightless is set
+//     (used to complete a retained partial delete whose remainder no longer has
+//     a weight file); and
+//  3. contains no descendant directory that itself owns a weight file, so a
+//     container of model repos is never a leaf.
+//
+// rootKey is the physical key of the configured root absTarget was resolved
+// from. Sharded/multi-file models, filtered subsets, mmproj companions, and
+// nested non-weight subdirectories inside one model remain deletable.
+func localLeafRepoIsDeletable(absTarget, rootKey string, guards []string, allowWeightless bool) bool {
+	if !allowWeightless && !dirOwnsWeightFile(absTarget) {
+		return false
+	}
+	if hasWeightBearingSubdir(absTarget) {
+		return false
+	}
+	return !localUnitGuardedPath(absTarget, rootKey, guards)
 }
 
 // cacheQuantPattern matches a GGUF quantisation token inside a filename
@@ -1114,6 +1275,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 // (hub/blobs/snapshots/refs) are skipped.
 func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
 		if _, err := os.Stat(root.Path); os.IsNotExist(err) {
 			continue
@@ -1155,6 +1317,13 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 				if !hasLocalWeightFile(repoDir) {
 					continue
 				}
+				// Advertise only leaf Local model directories: never the cache
+				// dir, a friendly namespace, a configured root, or a container
+				// of nested model repos. Friendly-view/raw-cache entries are
+				// not Local-deletable units, so their listing is unchanged.
+				if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
+					continue
+				}
 				source := localRepoSource(cacheDir, owner, name, repoDir, root.Source)
 				repo, err := buildLocalCacheRepo(owner, name, repoDir, source, includeFiles)
 				if err == nil {
@@ -1175,6 +1344,7 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repo
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
 		// A repo reached through a symlinked intermediate component (or a
@@ -1183,6 +1353,13 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repo
 			continue
 		}
 		if !hasLocalWeightFile(repoDir) {
+			continue
+		}
+		// Only a leaf Local model directory resolves: a container of nested
+		// model repos, the cache dir, a friendly namespace, or a configured
+		// root is not this repo. Friendly-view/raw-cache entries are not
+		// Local-deletable units, so their resolution is unchanged.
+		if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
 			continue
 		}
 		return buildLocalCacheRepo(parts[0], parts[1], repoDir, localRepoSource(cacheDir, parts[0], parts[1], repoDir, root.Source), includeFiles)
@@ -1718,7 +1895,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 			s.deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
 			return
 		case cacheSourceLocal:
-			s.deleteLocalCopy(w, repo, repoType, owner, name, localCand)
+			s.deleteLocalCopy(w, cacheDir, cfg, repo, repoType, owner, name, localCand)
 			return
 		}
 		writeError(w, http.StatusBadRequest, "Invalid path", "Unsupported copy source")
@@ -2006,19 +2183,29 @@ func (s *Server) deleteFriendlyViewRepo(w http.ResponseWriter, repoDir *hfdownlo
 type localCopyCandidate struct {
 	Root    string // configured root path, e.g. localDir
 	RepoDir string // exact deletable <root>/<owner>/<name> path
+	// Partial marks a retained partial-delete target whose remainder may no
+	// longer directly own a weight file. Only such a retry may skip the
+	// direct-weight requirement; a fresh candidate is always weight-bearing.
+	Partial bool
 }
 
 // localCopyCandidates returns the deletable <root>/<owner>/<name> path for each
-// local cache root that actually contains a weight file, in the same order the
-// cache list uses. HF-cache internals under a raw cache root
+// local cache root that is a genuine LEAF model directory, in the same order
+// the cache list uses. HF-cache internals under a raw cache root
 // (hub/models/datasets/blobs/snapshots/refs) are skipped so the shown entry and
 // the deleted entry agree. A friendly-view projection of this exact repo is not
 // a Local copy: it is the same storage as the hub. A real folder that happens
 // to live under the friendly namespace (e.g. an explicit Local root configured
 // at <cache>/models) is still listed, because it is independent storage.
+//
+// A candidate must pass localLeafRepoIsDeletable against the cache dir,
+// friendly namespaces, and every configured root, so the details modal never
+// advertises the cache dir, a friendly namespace, a configured root, an
+// overlapping root's container, or a container of nested model repos.
 func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owner, name string) []localCopyCandidate {
 	var candidates []localCopyCandidate
 	seen := make(map[string]bool)
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
 
 	// Resolve whether <cache>/models/<owner>/<name> is a genuine projection of
 	// this repo. Locals are models only, so the model friendly path applies.
@@ -2059,6 +2246,13 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 			continue
 		}
 		if !hasLocalWeightFile(repoDir) {
+			continue
+		}
+		// The advertised entry must be a leaf repo, not the cache dir, a
+		// friendly namespace, a configured root, or a container of nested
+		// model repos. Applying the same predicate as the delete side keeps the
+		// listed set equal to the deletable set.
+		if !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
 			continue
 		}
 		key := physPathKey(repoDir)
@@ -2164,10 +2358,15 @@ func (s *Server) matchLocalDeleteEvidence(cacheDir string, cfg Config, owner, na
 		if _, err := os.Lstat(ev.RepoDir); err != nil {
 			continue
 		}
-		if _, err := resolveLocalDeleteTarget(ev.Root, owner, name); err != nil {
+		// allowWeightless: a partial delete may have already removed the weight
+		// file, leaving only the protected remainder. The retained target was
+		// validated as a leaf when the delete began and is revalidated here for
+		// guards/containment, so the weight requirement is the only part a
+		// retry may skip.
+		if _, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, ev.Root, owner, name, true); err != nil {
 			continue
 		}
-		return localCopyCandidate{Root: ev.Root, RepoDir: ev.RepoDir}, true
+		return localCopyCandidate{Root: ev.Root, RepoDir: ev.RepoDir, Partial: true}, true
 	}
 	return localCopyCandidate{}, false
 }
@@ -2187,18 +2386,21 @@ func (s *Server) deleteLocalRootRepo(w http.ResponseWriter, cacheDir string, cfg
 	candidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name)
 	if len(candidates) == 0 {
 		if cand, ok := s.retryableLocalTarget(cacheDir, cfg, owner, name, repoType); ok {
-			s.deleteLocalCopy(w, repo, repoType, owner, name, cand)
+			s.deleteLocalCopy(w, cacheDir, cfg, repo, repoType, owner, name, cand)
 			return
 		}
 		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
 		return
 	}
-	s.deleteLocalCopy(w, repo, repoType, owner, name, candidates[0])
+	s.deleteLocalCopy(w, cacheDir, cfg, repo, repoType, owner, name, candidates[0])
 }
 
 // deleteLocalCopy deletes one specific local copy. Local entries are always
-// models, so a non-model request type is reported as not found.
-func (s *Server) deleteLocalCopy(w http.ResponseWriter, repo string, repoType hfdownloader.RepoType, owner, name string, cand localCopyCandidate) {
+// models, so a non-model request type is reported as not found. cand.Partial
+// marks a retained partial-delete retry whose remainder may no longer own a
+// weight file; a fresh candidate is always revalidated as a weight-bearing
+// leaf.
+func (s *Server) deleteLocalCopy(w http.ResponseWriter, cacheDir string, cfg Config, repo string, repoType hfdownloader.RepoType, owner, name string, cand localCopyCandidate) {
 	if repoType != hfdownloader.RepoTypeModel {
 		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
 		return
@@ -2206,7 +2408,7 @@ func (s *Server) deleteLocalCopy(w http.ResponseWriter, repo string, repoType hf
 	key := localDeleteEvidenceKey(repoType, cand.Root, owner, name)
 	// Validate before recording anything, so a validation-only failure leaves
 	// no stale evidence behind.
-	absTarget, err := resolveLocalDeleteTarget(cand.Root, owner, name)
+	absTarget, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cand.Root, owner, name, cand.Partial)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
 		return
@@ -2398,7 +2600,16 @@ func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, re
 // every intermediate component must be a real directory (not a symlink) and the
 // leaf must not be a symlink. Prefix checks use the root plus a separator so a
 // sibling like /data/Models-evil never matches root /data/Models.
-func resolveLocalDeleteTarget(root, owner, name string) (string, error) {
+//
+// Beyond the structural checks, the target must be a genuine LEAF Local repo:
+// it must not be, contain, or (through its own root) sit inside the cache dir, a
+// friendly namespace, or another configured root, and it must not be a
+// container of nested weight-bearing model directories. It must directly own a
+// weight file unless allowWeightless is set, which only the retained
+// partial-delete retry uses (the remainder may no longer carry a weight file).
+// This is the deletion-side half of the shared predicate localCopyCandidates
+// applies, so the listed set equals the deletable set.
+func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string, root, owner, name string, allowWeightless bool) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
@@ -2450,6 +2661,13 @@ func resolveLocalDeleteTarget(root, owner, name string) (string, error) {
 		if realTarget != base && !strings.HasPrefix(realTarget+string(filepath.Separator), base+string(filepath.Separator)) {
 			return "", fmt.Errorf("resolved target outside local root")
 		}
+	}
+
+	// Leaf-repo predicate: reject the cache dir, friendly namespaces,
+	// configured roots, overlapping/ancestor roots, and containers of nested
+	// model repos before anything is removed.
+	if !localLeafRepoIsDeletable(absTarget, physPathKey(absRoot), localUnitGuards(cacheDir, localDir, localScanDirs), allowWeightless) {
+		return "", fmt.Errorf("target is not a deletable leaf model directory")
 	}
 
 	return absTarget, nil

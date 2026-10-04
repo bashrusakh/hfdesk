@@ -447,9 +447,12 @@ func (r *RepoDir) FriendlyState() FriendlyProjectionState {
 		if d.IsDir() {
 			return nil
 		}
-		// The manifest is a real regular file written alongside the symlinks;
-		// it corroborates ownership but is not itself a link.
-		if d.Name() == ManifestFilename {
+		// The manifest is a real regular file written at the projection root
+		// alongside the symlinks; it corroborates ownership but is not itself a
+		// link. Only the root manifest is exempt: a nested real file of any
+		// name (including a nested hfd.yaml) means this folder is not a proven
+		// whole-folder projection and must be preserved.
+		if path == filepath.Join(friendlyPath, ManifestFilename) {
 			return nil
 		}
 		if d.Type()&os.ModeSymlink == 0 {

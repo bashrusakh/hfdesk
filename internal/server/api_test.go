@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -2661,5 +2662,351 @@ func TestAPI_CacheDelete_SymlinkedConfiguredRootWorks(t *testing.T) {
 	}
 	if _, err := os.Stat(sibling); err != nil {
 		t.Errorf("expected sibling to survive, stat err = %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Batch: leaf-repo ownership predicate for Local deletion (H1) and
+// platform-aware physical-key case folding (M2). Each H1 test fails on
+// the pre-batch candidate by advertising and deleting a container, and
+// passes once a Local unit must be a leaf model directory.
+// ---------------------------------------------------------------------
+
+// cacheListRepoIDs issues GET /api/cache and returns the advertised repo IDs.
+func cacheListRepoIDs(t *testing.T, srv *Server, q url.Values) []string {
+	t.Helper()
+	path := "/api/cache"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	req := httptest.NewRequest("GET", path, nil)
+	w := httptest.NewRecorder()
+	srv.handleCacheList(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache list = %d: %s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode cache list: %v", err)
+	}
+	ids := make([]string, 0, len(list.Repos))
+	for _, r := range list.Repos {
+		ids = append(ids, r.Repo)
+	}
+	return ids
+}
+
+func containsRepo(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAPI_CacheDelete_ScanRootDoesNotAdvertiseCacheDir is H1 case 1: a
+// home-like scan root whose two-level descendant is the HF cache dir must not
+// advertise or delete that directory. Before the leaf predicate, `.cache` /
+// `huggingface` collapsed onto the whole cache dir and deleting it wiped the
+// cache.
+func TestAPI_CacheDelete_ScanRootDoesNotAdvertiseCacheDir(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	cacheDir := filepath.Join(home, ".cache", "huggingface")
+	hubRepo := filepath.Join(cacheDir, "hub", "models--alice--one")
+	writeRepoFixture(t, hubRepo, "sha256")
+	// A real friendly model too, so the cache dir is clearly non-empty.
+	writeRepoFixture(t, filepath.Join(cacheDir, "models", "alice", "one"), "model.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{home},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	if ids := cacheListRepoIDs(t, srv, nil); containsRepo(ids, ".cache/huggingface") {
+		t.Errorf("cache dir advertised as Local repo: %v", ids)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	w := deleteCacheReq(t, srv, ".cache/huggingface", q)
+	if w.Code == http.StatusOK {
+		t.Fatalf("deleting the cache dir via scan root succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(cacheDir); err != nil {
+		t.Fatalf("cache dir must survive, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "models", "alice", "one", "model.gguf")); err != nil {
+		t.Errorf("friendly model must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_ParentScanRootDoesNotExposeFriendlyNamespace is H1 case 2:
+// a scan root that is the parent of the cache dir makes `cache` / `models`
+// resolve to the friendly namespace. That namespace must not be advertised or
+// deleted, because deleting it removes every repo under it.
+func TestAPI_CacheDelete_ParentScanRootDoesNotExposeFriendlyNamespace(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	alice := filepath.Join(cacheDir, "models", "alice", "one")
+	bob := filepath.Join(cacheDir, "models", "bob", "two")
+	writeRepoFixture(t, alice, "one.gguf")
+	writeRepoFixture(t, bob, "two.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{root},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	if ids := cacheListRepoIDs(t, srv, nil); containsRepo(ids, "cache/models") {
+		t.Errorf("friendly namespace advertised as Local repo: %v", ids)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	w := deleteCacheReq(t, srv, "cache/models", q)
+	if w.Code == http.StatusOK {
+		t.Fatalf("deleting the friendly namespace via parent scan root succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(alice); err != nil {
+		t.Errorf("alice/one must survive, stat err = %v", err)
+	}
+	if _, err := os.Stat(bob); err != nil {
+		t.Errorf("bob/two must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_OverlappingRootsDoNotExposeContainer is H1 case 3:
+// overlapping parent/child scan roots expose `models/alice` from the parent
+// root, a container holding `alice/one`. The container must not be advertised
+// or deleted, while the real leaf `alice/one` from the child root stays
+// deletable.
+func TestAPI_CacheDelete_OverlappingRootsDoNotExposeContainer(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	scanRoot := filepath.Join(root, "scan")
+	modelsRoot := filepath.Join(scanRoot, "models")
+	container := filepath.Join(modelsRoot, "alice")
+	leaf := filepath.Join(container, "one")
+	writeRepoFixture(t, leaf, "model.gguf")
+	// The container itself owns no weight file directly; only the nested leaf
+	// does, which makes it a container rather than a leaf model.
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{scanRoot, modelsRoot},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	ids := cacheListRepoIDs(t, srv, nil)
+	if containsRepo(ids, "models/alice") {
+		t.Errorf("container advertised as a repo: %v", ids)
+	}
+	if !containsRepo(ids, "alice/one") {
+		t.Errorf("real leaf alice/one not advertised: %v", ids)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	// By-path on the container must also be rejected and delete nothing.
+	q.Set("path", container)
+	w := deleteCacheReq(t, srv, "models/alice", q)
+	if w.Code == http.StatusOK {
+		t.Fatalf("deleting the container succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(leaf); err != nil {
+		t.Errorf("nested leaf must survive, stat err = %v", err)
+	}
+
+	// The real leaf from the child root is deletable.
+	q2 := url.Values{}
+	q2.Set("type", "model")
+	q2.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv, "alice/one", q2); w.Code != http.StatusOK {
+		t.Fatalf("deleting real leaf alice/one = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(leaf); !os.IsNotExist(err) {
+		t.Errorf("expected real leaf removed, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_NestedLibraryContainerNotDeletable is H1 case 4: a nested
+// library layout lib/org/family/model/model.gguf makes `org` / `family` a
+// container of the nested model. It must not be advertised or deleted, so the
+// nested model survives.
+func TestAPI_CacheDelete_NestedLibraryContainerNotDeletable(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	libDir := filepath.Join(root, "lib")
+	nested := filepath.Join(libDir, "org", "family", "model")
+	writeRepoFixture(t, nested, "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    libDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	if ids := cacheListRepoIDs(t, srv, nil); containsRepo(ids, "org/family") {
+		t.Errorf("nested-library container advertised as Local repo: %v", ids)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	w := deleteCacheReq(t, srv, "org/family", q)
+	if w.Code == http.StatusOK {
+		t.Fatalf("deleting the nested-library container succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(nested, "model.gguf")); err != nil {
+		t.Errorf("nested model must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_LeafModelWithNestedNonWeightDirsDeletes is the H1
+// positive control: a legitimate single-model folder containing shards, an
+// mmproj companion, and nested non-weight subdirectories (including a nested
+// real hfd.yaml) is still a leaf and must delete, removing the whole folder
+// while leaving siblings intact.
+func TestAPI_CacheDelete_LeafModelWithNestedNonWeightDirsDeletes(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "owner", "name")
+	writeRepoFixture(t, repoDir, "model-00001-of-00002.safetensors")
+	writeRepoFixture(t, repoDir, "model-00002-of-00002.safetensors")
+	writeRepoFixture(t, repoDir, "mmproj-F16.gguf")
+	if err := os.MkdirAll(filepath.Join(repoDir, "configs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "configs", "generation.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A nested real hfd.yaml is a non-weight file and must not disqualify a
+	// folder that directly owns its weights.
+	if err := os.WriteFile(filepath.Join(repoDir, "configs", "hfd.yaml"), []byte("nested\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(localDir, "owner", "sibling")
+	writeRepoFixture(t, sibling, "sibling.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// Advertised and deletable.
+	info := cacheInfoForTest(t, srv, "owner/name")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("legit leaf model not listed as Local copy: %#v", info.Copies)
+	}
+	if filepath.Clean(localCopy.Path) != filepath.Clean(repoDir) {
+		t.Errorf("listed Local path = %q, want %q", localCopy.Path, repoDir)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv, "owner/name", q); w.Code != http.StatusOK {
+		t.Fatalf("deleting legit leaf model = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected leaf model folder removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
+	}
+}
+
+// TestPhysPathKey_CaseFoldByPlatform is M2: on platforms whose default
+// filesystem is case-insensitive (Windows, macOS) the physical key folds case,
+// while Linux preserves it so truly distinct case-sensitive roots stay
+// distinct. Symlink aliases collapse on every platform.
+func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
+	// The platform decision itself.
+	for _, tc := range []struct {
+		goos string
+		want bool
+	}{
+		{"linux", false},
+		{"windows", true},
+		{"darwin", true},
+		{"freebsd", false},
+	} {
+		if got := physPathKeyCaseInsensitive(tc.goos); got != tc.want {
+			t.Errorf("physPathKeyCaseInsensitive(%q) = %v, want %v", tc.goos, got, tc.want)
+		}
+	}
+
+	root := t.TempDir()
+	mixed := filepath.Join(root, "ModelsRoot")
+	if err := os.MkdirAll(mixed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Host-independent: both keys resolve the same path, and darwin/windows
+	// differ from linux only by case folding.
+	linuxKey := physPathKeyForGOOS(mixed, "linux")
+	for _, goos := range []string{"windows", "darwin"} {
+		got := physPathKeyForGOOS(mixed, goos)
+		if got != strings.ToLower(linuxKey) {
+			t.Errorf("%s key = %q, want folded %q", goos, got, strings.ToLower(linuxKey))
+		}
+	}
+	if linuxKey == strings.ToLower(linuxKey) {
+		// The path's case did not survive on-disk resolution (case-insensitive
+		// host); the fold-vs-preserve distinction cannot be exercised here.
+		t.Logf("host resolved %q to %q; skipping case-preservation assertions", mixed, linuxKey)
+		return
+	}
+
+	// Two case-distinct roots whose lowercased spellings collide must stay
+	// distinct on Linux.
+	other := filepath.Join(root, "modelsroot")
+	if physPathKeyForGOOS(mixed, "linux") == physPathKeyForGOOS(other, "linux") {
+		t.Errorf("linux keys collapsed distinct case roots: %q", physPathKeyForGOOS(mixed, "linux"))
+	}
+	if physPathKeyForGOOS(mixed, "darwin") != physPathKeyForGOOS(other, "darwin") {
+		t.Errorf("darwin keys did not collapse case-differing aliases")
+	}
+
+	// Symlink alias and real path collapse on every platform.
+	realDir := filepath.Join(root, "real-local")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasDir := filepath.Join(root, "alias-local")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	for _, goos := range []string{"linux", "windows", "darwin"} {
+		if physPathKeyForGOOS(aliasDir, goos) != physPathKeyForGOOS(realDir, goos) {
+			t.Errorf("%s: symlink alias did not collapse to real path", goos)
+		}
 	}
 }
