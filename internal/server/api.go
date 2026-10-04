@@ -791,6 +791,17 @@ type localCacheRoot struct {
 	SkipSpecial bool
 }
 
+// skipsOwner applies the root's exclusion policy only to a top-level owner.
+func (root localCacheRoot) skipsOwner(owner string) bool {
+	if root.SkipSpecial {
+		switch strings.ToLower(owner) {
+		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
+			return true
+		}
+	}
+	return false
+}
+
 // pathIdentityKey preserves case-sensitive paths except on Windows, where
 // configured paths have historically been compared case-insensitively.
 // It is a lexical comparison key, not symlink or filesystem canonicalization.
@@ -828,20 +839,22 @@ func cleanPathList(paths []string) []string {
 // repos: the Friendly-view <cache>/models tree, the user-supplied
 // localDir, the user-supplied localScanDirs, every configured download-route
 // destination, and the raw cache dir (with SkipSpecial because its hub/blobs
-// layout is internal). The returned slice is deduped by absolute path.
+// layout is internal). Roots are deduped by lexical path identity, preserving
+// the first path/source/order and merging SkipSpecial with OR.
 func localCacheRoots(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) []localCacheRoot {
 	var roots []localCacheRoot
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	add := func(path, source string, skipSpecial bool) {
 		if path == "" {
 			return
 		}
 		cleaned := filepath.Clean(path)
 		key := pathIdentityKey(cleaned)
-		if seen[key] {
+		if index, ok := seen[key]; ok {
+			roots[index].SkipSpecial = roots[index].SkipSpecial || skipSpecial
 			return
 		}
-		seen[key] = true
+		seen[key] = len(roots)
 		roots = append(roots, localCacheRoot{Path: cleaned, Source: source, SkipSpecial: skipSpecial})
 	}
 
@@ -1051,11 +1064,8 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, dow
 				continue
 			}
 			owner := ownerEntry.Name()
-			if root.SkipSpecial {
-				switch strings.ToLower(owner) {
-				case "hub", "models", "datasets", "blobs", "snapshots", "refs":
-					continue
-				}
+			if root.skipsOwner(owner) {
+				continue
 			}
 			ownerDir := filepath.Join(root.Path, owner)
 			models, err := os.ReadDir(ownerDir)
@@ -1091,6 +1101,9 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, down
 		return nil, os.ErrNotExist
 	}
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
+		if root.skipsOwner(parts[0]) {
+			continue
+		}
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
 		if !hasLocalWeightFile(repoDir) {
 			continue

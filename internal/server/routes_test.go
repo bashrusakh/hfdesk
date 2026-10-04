@@ -584,6 +584,44 @@ func TestAPI_RouteKeyValidationIngress(t *testing.T) {
 	}
 }
 
+func TestLocalCacheRoots_MergedRestrictions(t *testing.T) {
+	// Each bit registers the raw cache through another configuration path.
+	for mask := 0; mask < 8; mask++ {
+		for _, friendlyOverlap := range []bool{false, true} {
+			t.Run(fmt.Sprintf("overlap-%d/friendly-%v", mask, friendlyOverlap), func(t *testing.T) {
+				cacheDir := filepath.Join(t.TempDir(), "cache")
+				friendlyDir := filepath.Join(cacheDir, "models")
+				localDir := ""
+				var scanDirs []string
+				var routes map[string]string
+				if mask&1 != 0 {
+					routes = map[string]string{"audio": cacheDir, "embedding": cacheDir + string(filepath.Separator)}
+				}
+				if mask&2 != 0 {
+					localDir = cacheDir
+				}
+				if mask&4 != 0 {
+					scanDirs = append(scanDirs, cacheDir+string(filepath.Separator))
+				}
+				if friendlyOverlap {
+					scanDirs = append(scanDirs, friendlyDir)
+					if routes == nil {
+						routes = make(map[string]string)
+					}
+					routes["llm"] = friendlyDir
+				}
+				want := []localCacheRoot{
+					{Path: friendlyDir, Source: "Friendly view"},
+					{Path: cacheDir, Source: "Local", SkipSpecial: true},
+				}
+				if got := localCacheRoots(cacheDir, localDir, scanDirs, routes); !reflect.DeepEqual(got, want) {
+					t.Errorf("roots = %#v, want %#v", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestLocalCacheRoots_IncludesRoutes(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "hf")

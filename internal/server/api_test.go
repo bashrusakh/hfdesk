@@ -93,6 +93,126 @@ func TestScanLocalCachedRepos(t *testing.T) {
 	}
 }
 
+func TestLocalCachedRepos_RootRestrictions(t *testing.T) {
+	for mask := 0; mask < 8; mask++ {
+		for _, friendlyOverlap := range []bool{false, true} {
+			t.Run(fmt.Sprintf("overlap-%d/friendly-%v", mask, friendlyOverlap), func(t *testing.T) {
+				base := t.TempDir()
+				cacheDir := filepath.Join(base, "cache")
+				friendlyDir := filepath.Join(cacheDir, "models")
+				otherDir := filepath.Join(base, "local")
+				writeWeight := func(path string) {
+					t.Helper()
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("weights"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Nested weights ensure internals would qualify as false repos.
+				blocked := []string{"hub/models--fake--repo", "models/owner", "datasets/fake", "blobs/fake", "snapshots/fake", "refs/fake", "HuB/fake"}
+				for _, id := range blocked {
+					if id == "models/owner" {
+						continue // The friendly owner/real fixture supplies nested weights.
+					}
+					writeWeight(filepath.Join(cacheDir, filepath.FromSlash(id), "nested", "model.safetensors"))
+				}
+				writeWeight(filepath.Join(friendlyDir, "owner", "real", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(friendlyDir, "models", "friendly", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(cacheDir, "ordinary", "raw", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(otherDir, "ordinary", "local", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(otherDir, "models", "owner", "nested", "model.safetensors"))
+
+				localDir := ""
+				var scanDirs []string
+				var routes map[string]string
+				if mask&1 != 0 {
+					routes = map[string]string{"audio": cacheDir, "embedding": cacheDir + string(filepath.Separator)}
+				}
+				if mask&2 != 0 {
+					localDir = cacheDir
+				}
+				if mask&4 != 0 {
+					scanDirs = append(scanDirs, cacheDir+string(filepath.Separator))
+				}
+				if friendlyOverlap {
+					scanDirs = append(scanDirs, friendlyDir)
+					if routes == nil {
+						routes = make(map[string]string)
+					}
+					routes["llm"] = friendlyDir
+				}
+				// When LocalDir is the cache, lookup must skip that root and
+				// continue here for the otherwise excluded models/owner ID.
+				scanDirs = append(scanDirs, otherDir)
+				want := map[string]localCacheRoot{
+					"owner/real":      {Path: filepath.Join(friendlyDir, "owner", "real"), Source: "Friendly view"},
+					"models/friendly": {Path: filepath.Join(friendlyDir, "models", "friendly"), Source: "Friendly view"},
+					"ordinary/raw":    {Path: filepath.Join(cacheDir, "ordinary", "raw"), Source: "Local"},
+					"ordinary/local":  {Path: filepath.Join(otherDir, "ordinary", "local"), Source: "Local"},
+					"models/owner":    {Path: filepath.Join(otherDir, "models", "owner"), Source: "Local"},
+				}
+				for _, includeFiles := range []bool{false, true} {
+					t.Run(fmt.Sprintf("files-%v", includeFiles), func(t *testing.T) {
+						checkRepo := func(repo CachedRepoInfo) {
+							t.Helper()
+							expected, ok := want[repo.Repo]
+							if !ok || repo.Path != expected.Path || repo.Source != expected.Source {
+								t.Errorf("unexpected repo %s at %s (%s)", repo.Repo, repo.Path, repo.Source)
+							}
+							if repo.FileCount != 1 || repo.Size != int64(len("weights")) {
+								t.Errorf("repo %s: fileCount=%d size=%d", repo.Repo, repo.FileCount, repo.Size)
+							}
+							if includeFiles {
+								if len(repo.Files) != 1 || repo.Files[0].Name != filepath.Join("nested", "model.safetensors") {
+									t.Errorf("repo %s: files = %#v", repo.Repo, repo.Files)
+								}
+							} else if len(repo.Files) != 0 {
+								t.Errorf("repo %s: unwanted file list", repo.Repo)
+							}
+						}
+						repos, err := scanLocalCachedRepos(cacheDir, localDir, scanDirs, routes, includeFiles)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if len(repos) != len(want) {
+							t.Errorf("scan returned %d repos, want %d", len(repos), len(want))
+						}
+						seen := make(map[string]bool)
+						for _, repo := range repos {
+							if seen[repo.Repo] {
+								t.Errorf("duplicate repo %s", repo.Repo)
+							}
+							seen[repo.Repo] = true
+							checkRepo(repo)
+						}
+						for id := range want {
+							if !seen[id] {
+								t.Errorf("scan omitted %s", id)
+							}
+							info, err := findLocalCachedRepo(cacheDir, localDir, scanDirs, routes, id, includeFiles)
+							if err != nil {
+								t.Errorf("lookup %s: %v", id, err)
+								continue
+							}
+							checkRepo(*info)
+						}
+						for _, id := range blocked {
+							if _, ok := want[id]; ok {
+								continue // models/owner exists in the independent local root.
+							}
+							if _, err := findLocalCachedRepo(cacheDir, localDir, scanDirs, routes, id, includeFiles); !os.IsNotExist(err) {
+								t.Errorf("lookup exposed internal %s: %v", id, err)
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	cacheDir := t.TempDir()
 	localDir := t.TempDir()
