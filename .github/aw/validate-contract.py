@@ -140,7 +140,6 @@ def check_contract_files() -> None:
         "AGENTS.md",
         "CONTRIBUTING.md",
         ".github/PULL_REQUEST_TEMPLATE.md",
-        ".github/aw/scripts/fetch-policy-contract.sh",
     }
     for token in BACKTICK.findall(text):
         token = token.strip()

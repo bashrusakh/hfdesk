@@ -34,12 +34,18 @@ pre-agent-steps:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPO: ${{ github.repository }}
-      POLICY_REF: ${{ github.event.pull_request.base.sha }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      # Explicit space-separated list: the helper's multi-line default only
-      # resolves its first entry under `read -r -a`.
-      CORE_CONTRACT_FILES: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md"
-    run: bash .github/aw/scripts/fetch-policy-contract.sh
+      POLICY_REF: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch || 'main' }}
+      CONTRACT_FILES: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md .github/PULL_REQUEST_TEMPLATE.md"
+    run: |
+      set -euo pipefail
+      sha=$(gh api "repos/$GITHUB_REPO/commits/$POLICY_REF" --jq .sha)
+      dir=".policy/$sha"; mkdir -p "$dir"
+      for f in $CONTRACT_FILES; do
+        mkdir -p "$dir/$(dirname "$f")"
+        gh api "repos/$GITHUB_REPO/contents/$f?ref=$sha" --jq .content | base64 -d > "$dir/$f"
+      done
+      echo "POLICY_SHA=$sha" >> "$GITHUB_ENV"
+      echo "Resolved policy contract at $sha"
 safe-outputs:
   staged: true
   add-labels:
