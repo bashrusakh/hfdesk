@@ -22,6 +22,9 @@
 - Cache delete now removes the real local folder (`localDir`/`localScanDirs`/download-route folders) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
 - Whole-copy delete refuses to remove a Local folder that encloses a configured root, and the "Delete entire copy" confirmation now states the path, file count, and detected variants so the destructive scope is explicit (#63)
 - Cache repository details always include the `copies` array, even when the repo has no deletable copies, so the UI no longer shows a legacy delete button that would fail on a repo with nothing to remove (#63)
+- Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
+- Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
+- Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
 
 ## [1.2.2] - 2026-06-29
 

@@ -856,8 +856,8 @@
                   <label for="hfToken" title="Required for private repositories and gated models.">HuggingFace Token</label>
                   <div class="settings-control">
                     <div class="input-with-toggle">
-                      <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx">
-                      <button type="button" class="toggle-visibility" data-target="hfToken">
+                      <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx" aria-describedby="hfTokenHelp">
+                      <button type="button" class="toggle-visibility" data-target="hfToken" aria-label="Show or hide token">
                         <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
                           <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                         </svg>
@@ -867,6 +867,7 @@
                         </svg>
                       </button>
                     </div>
+                    <div class="form-hint" id="hfTokenHelp">Leave unchanged to keep the token. Type a replacement or delete the displayed token to clear it, then Save. Startup overrides can restore the token after restart.</div>
                   </div>
                 </div>
               </div>

@@ -369,7 +369,10 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	// Don't expose full token, just indicate if set
 	tokenStatus := ""
 	if cfg.Token != "" {
-		tokenStatus = "********" + cfg.Token[max(0, len(cfg.Token)-4):]
+		tokenStatus = tokenRedactionPrefix
+		if len(cfg.Token) > 4 {
+			tokenStatus += cfg.Token[len(cfg.Token)-4:]
+		}
 	}
 
 	cacheDir := cfg.CacheDir
@@ -492,8 +495,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// stays short. myGen is the generation we just produced; the side
 	// effects below drop themselves if a newer commit landed in between.
 	_, myGen := s.withConfig(func(c *Config) {
-		if req.Token != nil {
-			c.Token = *req.Token
+		if req.Token != nil && !isRedactedToken(*req.Token) {
+			token := *req.Token
+			c.Token = token
+			c.tokenWrite = &token
+			// A genuinely new explicit set/clear authors a fresh intent
+			// identity so an older persister cannot clear it.
+			c.tokenWriteGen++
 		}
 		if req.CacheDir != nil {
 			c.CacheDir = strings.TrimSpace(*req.CacheDir)
@@ -596,7 +604,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		CacheDir:           finalCfg.CacheDir,
 		LocalDir:           finalCfg.LocalDir,
 		LocalScanDirs:      finalCfg.LocalScanDirs,
-		Token:              finalCfg.Token,
 		Connections:        finalCfg.Concurrency,
 		MaxActive:          finalCfg.MaxActive,
 		MultipartThreshold: finalCfg.MultipartThreshold,
@@ -617,7 +624,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			InsecureSkipVerify: finalCfg.Proxy.InsecureSkipVerify,
 		}
 	}
-	if err := SaveConfigFile(fileCfg); err != nil {
+	if err := saveSettingsConfig(fileCfg, finalCfg.tokenWrite); err != nil {
 		// Log error but don't fail the request - settings are still applied in-memory
 		writeJSON(w, http.StatusOK, SuccessResponse{
 			Success: true,
@@ -625,6 +632,12 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// The pending explicit token intent is now durable for the exact intent
+	// this snapshot carried, so consume it by identity. If a newer explicit
+	// set/clear committed concurrently, keep it: that intent has its own
+	// tokenWriteGen and is not the one just persisted.
+	s.consumeTokenWrite(finalCfg.tokenWriteGen)
 
 	writeJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
