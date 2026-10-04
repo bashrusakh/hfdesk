@@ -220,29 +220,100 @@ func TestConfigSettingsSymlinks(t *testing.T) {
 	}
 }
 
+// TestConfigSettingsStartupPrecedence exercises the full startup token matrix
+// through the real config path: --token flag > trimmed non-empty HF_TOKEN env >
+// config file token. Every case also asserts the non-token file settings still
+// apply and that an ordinary save does not disturb the stored credential.
 func TestConfigSettingsStartupPrecedence(t *testing.T) {
-	isolateTokenConfig(t)
-	// Neutralize any ambient credential from the developer/CI environment so the
-	// file-vs-flag precedence below is deterministic.
-	t.Setenv("HF_TOKEN", "")
-	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk", CacheDir: "file-cache", Connections: 5}); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		env      string
+		file     string
+		wantLive string
+		wantDisk string
+	}{
+		{"flag-over-env-over-file", "hf_flag", "hf_env", "hf_disk", "hf_flag", "hf_disk"},
+		{"env-over-file", "", "hf_env", "hf_disk", "hf_env", "hf_disk"},
+		{"env-only", "", "hf_env", "", "hf_env", ""},
+		{"whitespace-env-falls-back-to-file", "", "   ", "hf_disk", "hf_disk", "hf_disk"},
+		{"empty-env-falls-back-to-file", "", "", "hf_disk", "hf_disk", "hf_disk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateTokenConfig(t)
+			// Set the env tier explicitly so the matrix is deterministic
+			// regardless of any ambient credential in the test environment.
+			t.Setenv("HF_TOKEN", tc.env)
+			if err := SaveConfigFile(&ConfigFile{Token: tc.file, CacheDir: "file-cache", Connections: 5}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{Token: tc.flag}
+			if err := ApplyConfigToServer(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Token != tc.wantLive || cfg.CacheDir != "file-cache" || cfg.Concurrency != 5 {
+				t.Error("valid startup precedence changed")
+			}
+			s := New(cfg)
+			requireTokenSettingsOK(t, s, `{}`)
+			requireTokenState(t, s, tc.wantLive, tc.wantDisk)
+		})
 	}
-	for _, override := range []string{"", "hf_flag"} {
-		cfg := Config{Token: override}
-		if err := ApplyConfigToServer(&cfg); err != nil {
-			t.Fatal(err)
-		}
-		want := override
-		if want == "" {
-			want = "hf_disk"
-		}
-		if cfg.Token != want || cfg.CacheDir != "file-cache" || cfg.Concurrency != 5 {
-			t.Error("valid startup precedence changed")
-		}
-		s := New(cfg)
-		requireTokenSettingsOK(t, s, `{}`)
-		requireTokenState(t, s, want, "hf_disk")
+}
+
+// TestConfigSettingsEnvTokenLifecycle proves that the HF_TOKEN environment
+// credential is a startup-only source. An ordinary settings save must never
+// copy it to disk, and an existing stored file credential must survive. An
+// explicit set/clear request still authors the stored value even when startup
+// came from the environment.
+func TestConfigSettingsEnvTokenLifecycle(t *testing.T) {
+	type step struct{ body, live, disk string }
+	for _, tc := range []struct {
+		name      string
+		fileToken string
+		steps     []step
+	}{
+		{
+			name:      "env-only",
+			fileToken: "",
+			steps:     []step{{`{"connections":11}`, "hf_env", ""}},
+		},
+		{
+			name:      "env-over-file",
+			fileToken: "hf_file",
+			steps: []step{
+				{`{"connections":11}`, "hf_env", "hf_file"},
+				{`{"token":"hf_set"}`, "hf_set", "hf_set"},
+				{`{"token":""}`, "", ""},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolateTokenConfig(t)
+			t.Setenv("HF_TOKEN", "hf_env")
+			if err := SaveConfigFile(&ConfigFile{Token: tc.fileToken}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			if err := ApplyConfigToServer(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Token != "hf_env" {
+				t.Fatalf("startup token = %q, want %q", cfg.Token, "hf_env")
+			}
+			s := New(cfg)
+			for _, st := range tc.steps {
+				requireTokenSettingsOK(t, s, st.body)
+				requireTokenState(t, s, st.live, st.disk)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(data, []byte("hf_env")) {
+				t.Error("env credential leaked to disk")
+			}
+		})
 	}
 }
 
