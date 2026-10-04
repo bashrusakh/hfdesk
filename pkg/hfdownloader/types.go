@@ -185,7 +185,8 @@ type Settings struct {
 	// Get yours at: https://huggingface.co/settings/tokens
 	// The Settings struct does not read the environment itself; library
 	// callers pass the token explicitly (e.g. os.Getenv("HF_TOKEN")). The
-	// hfdesk server reads HF_TOKEN when no --token flag or config token is set.
+	// hfdesk server resolves tokens in this order: --token flag, HF_TOKEN
+	// environment variable, then config-file token.
 	Token string
 
 	// Endpoint is the base URL for HuggingFace Hub API.
