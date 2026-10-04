@@ -5,8 +5,21 @@ package server
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// isWithinTemp reports whether path resolves inside the current temp dir.
+func isWithinTemp(path string) bool {
+	path = filepath.Clean(path)
+	temp := filepath.Clean(os.TempDir())
+	rel, err := filepath.Rel(temp, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
 
 // TestApplyConfigToServer_TokenPrecedence verifies that the token is resolved
 // as: --token flag > HF_TOKEN environment variable > config file token.
@@ -39,15 +52,32 @@ func TestApplyConfigToServer_TokenPrecedence(t *testing.T) {
 			fileToken: "file-token",
 			wantToken: "file-token",
 		},
+		{
+			name:      "whitespace-only env does not override file",
+			flagToken: "",
+			envToken:  "   ",
+			fileToken: "file-token",
+			wantToken: "file-token",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Isolate from the caller's real config file and any config in the
-			// launch directory, then point the app config dir at a temp dir.
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			// Isolate from the caller's real config file on every platform.
+			// XDG_CONFIG_HOME covers Unix; AppData/USERPROFILE cover Windows,
+			// where os.UserConfigDir() ignores XDG_CONFIG_HOME.
+			tmp := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", tmp)
+			t.Setenv("AppData", tmp)
+			t.Setenv("USERPROFILE", tmp)
+			t.Setenv("HOME", tmp)
 			t.Setenv("HF_TOKEN", tt.envToken)
-			_ = os.Remove(ConfigPath())
+
+			configPath := ConfigPath()
+			if !isWithinTemp(configPath) {
+				t.Skipf("ConfigPath() = %q is outside the temp dir; refusing to touch a real config", configPath)
+			}
+			_ = os.Remove(configPath)
 
 			if tt.fileToken != "" {
 				if err := SaveConfigFile(&ConfigFile{Token: tt.fileToken}); err != nil {
