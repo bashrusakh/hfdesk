@@ -6,11 +6,15 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -121,7 +125,7 @@ func TestRouteDirs(t *testing.T) {
 		"diffusion":       "   ",             // dropped (empty)
 		"not-a-key":       "/models/Unknown", // ignored (outside closed set)
 	})
-	// Dedup is case-insensitive by cleaned path; /models/Audio appears twice.
+	// /models/Audio appears twice after cleaning.
 	if len(dirs) != 3 {
 		t.Fatalf("expected 3 distinct route dirs, got %d: %#v", len(dirs), dirs)
 	}
@@ -409,6 +413,173 @@ func TestAPI_StartDownload_InvalidRouteKey(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("routeKey %q: status = %d, want 400. body=%s", key, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestConfiguredPathIdentity(t *testing.T) {
+	upper := filepath.Join(t.TempDir(), "Audio")
+	lower := filepath.Join(filepath.Dir(upper), "audio")
+	want := []string{upper, lower}
+	if runtime.GOOS == "windows" {
+		want = []string{upper}
+	}
+	paths := []string{"  " + upper + "  ", upper + string(filepath.Separator), lower, " "}
+	if got := cleanPathList(paths); !reflect.DeepEqual(got, want) {
+		t.Errorf("cleanPathList = %v, want %v", got, want)
+	}
+	routes := map[string]string{"audio": upper, "embedding": lower, "llm": upper + string(filepath.Separator)}
+	if got := routeDirs(routes); !reflect.DeepEqual(got, want) {
+		t.Errorf("routeDirs = %v, want %v", got, want)
+	}
+	roots := localCacheRoots(filepath.Join(filepath.Dir(upper), "cache"), upper, cleanPathList(paths), routes)
+	var got []string
+	for _, root := range roots {
+		if root.Path == upper || root.Path == lower {
+			got = append(got, root.Path)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("localCacheRoots = %v, want %v", got, want)
+	}
+	// Both configured spellings must be allowed, even when Windows dedups them.
+	srv := &Server{config: Config{DownloadRoutes: routes}}
+	for _, dir := range []string{upper, lower} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		srv.handleDiskFree(w, httptest.NewRequest("GET", "/api/diskfree?path="+dir, nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("diskfree %s: %d %s", dir, w.Code, w.Body.String())
+		}
+	}
+	// Cache special directories are skipped only when the local root is the
+	// cache itself, not a distinct Linux directory with case-only differences.
+	for _, localDir := range []string{lower, upper} {
+		wantSkip := localDir == lower || runtime.GOOS == "windows"
+		for _, root := range localCacheRoots(lower, localDir, nil, nil) {
+			if root.Path == localDir && root.SkipSpecial != wantSkip {
+				t.Errorf("local %s SkipSpecial = %v, want %v", localDir, root.SkipSpecial, wantSkip)
+			}
+		}
+	}
+}
+
+func TestCaseDistinctRouteDestinations(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux case-sensitive directories")
+	}
+	root := t.TempDir()
+	routes := map[string]string{"audio": filepath.Join(root, "Audio"), "embedding": filepath.Join(root, "audio")}
+	cacheDir := filepath.Join(root, "cache")
+	srv := &Server{config: Config{CacheDir: cacheDir, DownloadRoutes: routes}}
+	for key, dir := range routes {
+		repoDir := filepath.Join(dir, "owner", key)
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, "model.safetensors"), []byte("weights"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		srv.handleDiskFree(w, httptest.NewRequest("GET", "/api/diskfree?path="+dir, nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("diskfree %s: %d %s", dir, w.Code, w.Body.String())
+		}
+	}
+	repos, err := scanLocalCachedRepos(cacheDir, "", nil, routes, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range routes {
+		id := "owner/" + key
+		if err := foundRepo(repos, id, "Local"); err != nil {
+			t.Errorf("scanner omitted %s", id)
+		}
+		if _, err := findLocalCachedRepo(cacheDir, "", nil, routes, id, false); err != nil {
+			t.Errorf("lookup omitted %s: %v", id, err)
+		}
+	}
+}
+
+func TestAPI_RouteKeyValidationIngress(t *testing.T) {
+	var calls atomic.Int64
+	var datasetCalls atomic.Int64
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if strings.HasPrefix(r.URL.Path, "/api/datasets/") {
+			datasetCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			fmt.Fprint(w, `{"sha":"deadbeef"}`)
+		case strings.Contains(r.URL.Path, "/tree/"):
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected HF request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer endpoint.Close()
+	cfg := Config{CacheDir: t.TempDir(), Endpoint: endpoint.URL, DownloadRoutes: map[string]string{"audio": t.TempDir()}}
+	srv := &Server{config: cfg, jobs: NewJobManager(cfg, NewWSHub())}
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+	for _, ingress := range []struct {
+		name, path string
+		dryRun     bool
+	}{
+		{"download", "/api/download", false},
+		{"dry-run", "/api/download", true},
+		{"plan", "/api/plan", false},
+	} {
+		for _, tc := range []struct {
+			key     string
+			dataset bool
+			want    int
+		}{
+			{"/etc/evil", false, http.StatusBadRequest},
+			{"llm/gptq", false, http.StatusBadRequest},
+			{"audio", false, http.StatusOK},
+			{"embedding", false, http.StatusOK},
+			{"", false, http.StatusOK},
+			{"llm/gptq", true, http.StatusOK},
+			{"audio", true, http.StatusOK},
+			{"", true, http.StatusOK},
+		} {
+			// Successful real job creation is covered by the existing manager tests.
+			if ingress.name == "download" && tc.want != http.StatusBadRequest {
+				continue
+			}
+			t.Run(ingress.name+"/"+tc.key+fmt.Sprint(tc.dataset), func(t *testing.T) {
+				body, err := json.Marshal(DownloadRequest{Repo: "owner/model", RouteKey: tc.key, Dataset: tc.dataset, DryRun: ingress.dryRun})
+				if err != nil {
+					t.Fatal(err)
+				}
+				before, beforeDataset := calls.Load(), datasetCalls.Load()
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest("POST", ingress.path, bytes.NewReader(body)))
+				if w.Code != tc.want {
+					t.Fatalf("status = %d, want %d: %s", w.Code, tc.want, w.Body.String())
+				}
+				if tc.want == http.StatusBadRequest {
+					if calls.Load() != before {
+						t.Error("invalid selector attempted network")
+					}
+				} else {
+					if calls.Load() == before {
+						t.Error("preview did not reach HF scanner")
+					}
+					if tc.dataset && datasetCalls.Load() == beforeDataset {
+						t.Error("dataset preview did not use dataset API")
+					}
+				}
+				if len(srv.jobs.ListJobs()) != 0 {
+					t.Error("preview or invalid request created a job")
+				}
+			})
 		}
 	}
 }

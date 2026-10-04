@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -114,6 +115,10 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) {
 	if req.Repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing required field: repo", "")
+		return
+	}
+	if _, err := validatedRouteKey(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
 
@@ -786,8 +791,19 @@ type localCacheRoot struct {
 	SkipSpecial bool
 }
 
+// pathIdentityKey preserves case-sensitive paths except on Windows, where
+// configured paths have historically been compared case-insensitively.
+// It is a lexical comparison key, not symlink or filesystem canonicalization.
+func pathIdentityKey(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
 // cleanPathList trims whitespace, filepath.Cleans each path, drops
-// empties, and de-duplicates case-insensitively. Used to normalize
+// empties, and de-duplicates by platform path identity. Used to normalize
 // the user-supplied LocalScanDirs list before it lands in s.config.
 func cleanPathList(paths []string) []string {
 	var cleaned []string
@@ -798,7 +814,7 @@ func cleanPathList(paths []string) []string {
 			continue
 		}
 		path = filepath.Clean(path)
-		key := strings.ToLower(path)
+		key := pathIdentityKey(path)
 		if seen[key] {
 			continue
 		}
@@ -821,7 +837,7 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 			return
 		}
 		cleaned := filepath.Clean(path)
-		key := strings.ToLower(cleaned)
+		key := pathIdentityKey(cleaned)
 		if seen[key] {
 			return
 		}
@@ -830,7 +846,7 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 	}
 
 	cacheRoot := filepath.Clean(cacheDir)
-	localSkipSpecial := localDir != "" && strings.EqualFold(filepath.Clean(localDir), cacheRoot)
+	localSkipSpecial := localDir != "" && pathIdentityKey(localDir) == pathIdentityKey(cacheRoot)
 
 	add(filepath.Join(cacheDir, "models"), "Friendly view", false)
 	add(localDir, "Local", localSkipSpecial)

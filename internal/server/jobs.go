@@ -360,20 +360,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
-	// Datasets are never routed: they use the server-global LocalDir or the HF
-	// cache and ignore routeKey entirely, matching their pre-routing behavior.
-	// A raw client that sends dataset:true with a key gets today's dataset
-	// behavior instead of a new error or a model route folder.
-	routeKey := req.RouteKey
-	if req.Dataset {
-		routeKey = ""
-	}
-
-	// Validate an explicitly requested route key against the closed set before
-	// any config read that could be mistaken for a path. An unknown key is a
-	// client error, surfaced to the handler as HTTP 400.
-	if routeKey != "" && !isRouteKey(routeKey) {
-		return nil, false, errInvalidRouteKey
+	// Apply the same model selector validation and dataset bypass as previews.
+	routeKey, err := validatedRouteKey(req)
+	if err != nil {
+		return nil, false, err
 	}
 
 	// Determine effective local-dir: per-request override > configured route >

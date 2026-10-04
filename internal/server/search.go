@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -218,7 +217,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	var path string
 	if requested := r.URL.Query().Get("path"); requested != "" {
 		for _, c := range configured {
-			if c != "" && filepath.Clean(requested) == filepath.Clean(c) {
+			if c != "" && pathIdentityKey(requested) == pathIdentityKey(c) {
 				path = c
 				break
 			}

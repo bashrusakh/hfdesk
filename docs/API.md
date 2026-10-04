@@ -110,7 +110,8 @@ Notes:
   is an internal key from the closed set below, never a path. A configured key
   routes the download into its destination folder (flat mode); `localDir`
   takes priority when both are set.
-- Unknown `routeKey` values are rejected with `400`. Exception: when
+- Unknown `routeKey` values are rejected with `400` before contacting the Hub,
+  including previews via `dryRun: true` or `POST /api/plan`. Exception: when
   `dataset: true`, `routeKey` is ignored entirely — datasets are never routed,
   and the request follows the normal `localDir`/HF-cache behavior regardless of
   the key. This keeps a dataset request that previously succeeded (for example

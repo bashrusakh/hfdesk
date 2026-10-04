@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// errInvalidRouteKey is returned by CreateJob when a request supplies a
+// errInvalidRouteKey is returned when a model request supplies a
 // routeKey outside the closed, server-defined key set. Handlers map it to
 // HTTP 400 rather than treating the value as a destination path.
 var errInvalidRouteKey = errors.New("invalid routeKey")
@@ -31,6 +31,19 @@ var routeKeys = map[string]bool{
 // isRouteKey reports whether key belongs to the closed route-key set.
 func isRouteKey(key string) bool {
 	return routeKeys[key]
+}
+
+// validatedRouteKey is the shared selector boundary for downloads and previews.
+// Datasets ignore selectors; models accept only the closed key set (or no key),
+// regardless of whether a destination is currently configured.
+func validatedRouteKey(req DownloadRequest) (string, error) {
+	if req.Dataset {
+		return "", nil
+	}
+	if req.RouteKey != "" && !isRouteKey(req.RouteKey) {
+		return "", errInvalidRouteKey
+	}
+	return req.RouteKey, nil
 }
 
 // parentRouteKey returns the coarse parent of a namespaced route key
@@ -121,7 +134,6 @@ func routeDirs(routes map[string]string) []string {
 		return nil
 	}
 	var dirs []string
-	seen := make(map[string]bool, len(routes))
 	for key, value := range routes {
 		if !isRouteKey(key) {
 			continue
@@ -130,14 +142,10 @@ func routeDirs(routes map[string]string) []string {
 		if value == "" {
 			continue
 		}
-		cleaned := filepath.Clean(value)
-		norm := strings.ToLower(cleaned)
-		if seen[norm] {
-			continue
-		}
-		seen[norm] = true
-		dirs = append(dirs, cleaned)
+		dirs = append(dirs, filepath.Clean(value))
 	}
+	// Sort before deduplication so case-equivalent Windows spellings have a
+	// deterministic representative independent of map iteration order.
 	sort.Strings(dirs)
-	return dirs
+	return cleanPathList(dirs)
 }
