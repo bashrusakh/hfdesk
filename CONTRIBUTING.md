@@ -140,6 +140,15 @@ go test ./...
 
 For UI or downloader changes, also do a quick manual smoke test in the browser.
 
+## Versioning
+
+`build.sh` and `build-dev.yml` read the tracked `VERSION` file as their primary
+source of the version. Released artifacts take the version from the git release
+tag instead: GitHub release binaries and the RPM use the tag directly, and the
+Docker image receives it as an explicit `VERSION` build arg. A stale `VERSION`
+value therefore cannot ship in a released artifact, and no manual sync is
+required for releases.
+
 ## Project structure
 
 | Path | What |
