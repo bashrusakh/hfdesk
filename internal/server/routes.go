@@ -88,6 +88,28 @@ func normalizeDownloadRoutes(routes map[string]string) map[string]string {
 	return out
 }
 
+// sanitizeDownloadRoutes drops every key outside the closed route-key set and
+// then applies normalizeDownloadRoutes value semantics (trim, filepath.Clean,
+// drop empties). It is the shared boundary filter for route maps so the server
+// never holds or advertises a key outside the closed set: a hand-edited or
+// legacy config key is silently dropped here rather than surviving in
+// cfg.DownloadRoutes and failing later validation. Returns nil when no valid
+// non-empty entry remains. Values dropped for an unknown key are never
+// interpreted as paths.
+func sanitizeDownloadRoutes(routes map[string]string) map[string]string {
+	if len(routes) == 0 {
+		return nil
+	}
+	known := make(map[string]string, len(routes))
+	for key, value := range routes {
+		if !isRouteKey(key) {
+			continue
+		}
+		known[key] = value
+	}
+	return normalizeDownloadRoutes(known)
+}
+
 // routeDirs returns the distinct, non-empty destination paths from a
 // download-routes map, cleaned and sorted for a deterministic scan order.
 // Only keys in the closed route-key set are considered, so a hand-edited

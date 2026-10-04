@@ -2806,6 +2806,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     setVal('#localScanDirs', '');
     setVal('#downloadLayout', 'cache');
     ROUTE_LABELS.forEach(r => setVal(`#${r.fieldId}`, ''));
+    // Clear every route key, including keys the dashboard does not surface
+    // (e.g. "llm"). saveSettings merges the labeled fields onto this map, so
+    // starting from an empty map makes the next save send downloadRoutes={}
+    // rather than resurrecting an unsurfaced key from the loaded settings.
+    if (state.settings) state.settings.downloadRoutes = {};
     setVal('#routePresetRoot', '');
     setVal('#hfToken', '');
     setVal('#connections', '8');
@@ -3484,7 +3489,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     // Offer a labeled destination choice when type folders are configured.
     // The select lives once per analysis result; downloadQuant reads it. Keys
     // never appear in the markup (renderRouteSelect uses option indexes).
-    if (getConfiguredRouteOptions().length) {
+    // Datasets are never routed (the server ignores routeKey when dataset is
+    // set), so no control is offered for a dataset analysis.
+    if (!currentAnalysis?.is_dataset && getConfiguredRouteOptions().length) {
       html += `
         <div class="quant-category">
           <div class="quant-category-title">Save to</div>
@@ -3613,8 +3620,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     // Offer a labeled destination choice when type folders are configured.
     // Non-selectable types (e.g. audio) have no selectable_items, so this file
     // list and the "Download All" wizard are the paths that reach the server;
-    // both read this one select. Keys never appear in the markup.
-    const routeGroup = getConfiguredRouteOptions().length ? `
+    // both read this one select. Keys never appear in the markup. Datasets are
+    // never routed, so no control is offered for a dataset analysis.
+    const routeGroup = !currentAnalysis?.is_dataset && getConfiguredRouteOptions().length ? `
         <div class="quant-category">
           <div class="quant-category-title">Save to</div>
           <div class="quant-route-control">

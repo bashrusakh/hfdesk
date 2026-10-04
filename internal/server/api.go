@@ -385,8 +385,10 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		CacheDir      *string  `json:"cacheDir,omitempty"`
 		LocalDir      *string  `json:"localDir,omitempty"`
 		LocalScanDirs []string `json:"localScanDirs,omitempty"`
-		// DownloadRoutes, when present, replaces the route map. Keys must be in
-		// the closed set (routes.go); values are paths (trimmed/Cleaned).
+		// DownloadRoutes, when present, replaces the route map. Unknown keys
+		// outside the closed set (routes.go) are dropped rather than rejected;
+		// valid values are paths (trimmed/Cleaned) and an empty/missing map
+		// clears all routes.
 		DownloadRoutes     *map[string]string `json:"downloadRoutes,omitempty"`
 		Concurrency        *int               `json:"connections,omitempty"`
 		MaxActive          *int               `json:"maxActive,omitempty"`
@@ -437,13 +439,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		newMaxSpeed = trimmed
 	}
 	if req.DownloadRoutes != nil {
-		for key := range *req.DownloadRoutes {
-			if !isRouteKey(key) {
-				writeError(w, http.StatusBadRequest, "Invalid downloadRoutes key", "unknown route key: "+key)
-				return
-			}
-		}
-		newDownloadRoutes = normalizeDownloadRoutes(*req.DownloadRoutes)
+		// Sanitize rather than reject: the UI echoes the loaded map on save, so
+		// a legacy/hand-edited key (e.g. a reserved key the server no longer
+		// knows) must not fail the whole settings save. Unknown keys are
+		// dropped and valid keys are kept; an unknown key can never be stored
+		// and its value is never interpreted as a path. An empty result clears
+		// the map (nil), matching "empty value clears a key".
+		newDownloadRoutes = sanitizeDownloadRoutes(*req.DownloadRoutes)
 	}
 
 	// Phase 2: build the new config on a local copy under withConfig (which

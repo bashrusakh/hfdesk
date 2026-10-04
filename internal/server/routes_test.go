@@ -81,6 +81,37 @@ func TestNormalizeDownloadRoutes(t *testing.T) {
 	}
 }
 
+func TestSanitizeDownloadRoutes(t *testing.T) {
+	got := sanitizeDownloadRoutes(map[string]string{
+		"llm":       "  /models/LLM/  ",
+		"llm/gguf":  "/models/LLM/GGUF",
+		"llm/gptq":  "/models/GPTQ", // unknown key: dropped, value not a path
+		"not-a-key": "/etc/evil",    // unknown key: dropped
+		"diffusion": "   ",          // known but empty: dropped
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 valid routes, got %d: %#v", len(got), got)
+	}
+	if got["llm"] != "/models/LLM" {
+		t.Errorf("llm = %q, want trimmed/cleaned /models/LLM", got["llm"])
+	}
+	if got["llm/gguf"] != "/models/LLM/GGUF" {
+		t.Errorf("llm/gguf = %q, want /models/LLM/GGUF", got["llm/gguf"])
+	}
+	for _, k := range []string{"llm/gptq", "not-a-key", "diffusion"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("key %q should have been dropped: %#v", k, got)
+		}
+	}
+
+	if v := sanitizeDownloadRoutes(map[string]string{"not-a-key": "/x"}); v != nil {
+		t.Errorf("all-unknown map should sanitize to nil, got %#v", v)
+	}
+	if v := sanitizeDownloadRoutes(nil); v != nil {
+		t.Errorf("nil map should sanitize to nil, got %#v", v)
+	}
+}
+
 func TestRouteDirs(t *testing.T) {
 	dirs := routeDirs(map[string]string{
 		"llm/gguf":        "/models/LLM/GGUF",
@@ -364,15 +395,21 @@ func TestJobManager_RouteKey_Dedup(t *testing.T) {
 
 func TestAPI_StartDownload_InvalidRouteKey(t *testing.T) {
 	srv := newTestServer()
-	body := `{"repo": "owner/model", "routeKey": "/etc/evil"}`
-	req := httptest.NewRequest("POST", "/api/download", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
 
-	srv.handleStartDownload(w, req)
+	// Both a traversal-looking value and a legacy/reserved key (which
+	// /api/settings now drops) must be strict 400s on /api/download: a route
+	// selector must not silently become a no-op.
+	for _, key := range []string{"/etc/evil", "llm/gptq"} {
+		body := `{"repo": "owner/model", "routeKey": "` + key + `"}`
+		req := httptest.NewRequest("POST", "/api/download", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400. body=%s", w.Code, w.Body.String())
+		srv.handleStartDownload(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("routeKey %q: status = %d, want 400. body=%s", key, w.Code, w.Body.String())
+		}
 	}
 }
 
@@ -554,28 +591,109 @@ func TestAPI_Settings_DownloadRoutes_RoundTripYAML(t *testing.T) {
 	}
 }
 
-func TestAPI_Settings_RejectsUnknownRouteKey(t *testing.T) {
+func TestAPI_Settings_DropsUnknownRouteKeys(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	_ = os.Remove(ConfigPath())
 
 	srv := newTestServer()
-	origRoutes := srv.config.DownloadRoutes
 
-	body := `{"connections": 16, "downloadRoutes": {"not-a-key": "/tmp/x"}}`
+	// Mixed map: one valid key and one unknown (legacy/reserved) key. The save
+	// must succeed and keep only the valid key; the unknown key must never be
+	// stored or echoed back. This is the N1 regression: the UI echoes the
+	// loaded map on save, so an unknown key must not fail the whole request.
+	body := `{"connections": 16, "downloadRoutes": {"llm/gguf": "/mnt/models/GGUF", "llm/gptq": "/mnt/models/GPTQ"}}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	srv.handleUpdateSettings(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 	}
-	// Validate-before-mutate: no partial application, no config mutation.
-	if srv.config.Concurrency == 16 {
-		t.Error("invalid route key must not partially apply concurrency")
+	if got := srv.config.DownloadRoutes["llm/gguf"]; got != "/mnt/models/GGUF" {
+		t.Errorf("valid route = %q, want /mnt/models/GGUF (in-memory %#v)", got, srv.config.DownloadRoutes)
 	}
-	if len(srv.config.DownloadRoutes) != len(origRoutes) {
-		t.Errorf("DownloadRoutes mutated on rejected request: %#v", srv.config.DownloadRoutes)
+	if _, ok := srv.config.DownloadRoutes["llm/gptq"]; ok {
+		t.Errorf("unknown route key stored in memory: %#v", srv.config.DownloadRoutes)
+	}
+	// The valid fields in the same request are still applied (no partial-apply
+	// failure, but also no silent drop of everything).
+	if srv.config.Concurrency != 16 {
+		t.Errorf("Concurrency = %d, want 16", srv.config.Concurrency)
+	}
+
+	// The persisted file must not contain the unknown key either.
+	fileCfg, err := LoadConfigFile()
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	if _, ok := fileCfg.DownloadRoutes["llm/gptq"]; ok {
+		t.Errorf("unknown route key persisted: %#v", fileCfg.DownloadRoutes)
+	}
+	if fileCfg.DownloadRoutes["llm/gguf"] != "/mnt/models/GGUF" {
+		t.Errorf("persisted routes = %#v, want llm/gguf kept", fileCfg.DownloadRoutes)
+	}
+
+	// GET must not advertise the unknown key.
+	req = httptest.NewRequest("GET", "/api/settings", nil)
+	w = httptest.NewRecorder()
+	srv.handleGetSettings(w, req)
+	var resp SettingsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resp.DownloadRoutes["llm/gptq"]; ok {
+		t.Errorf("GET advertised unknown route key: %#v", resp.DownloadRoutes)
+	}
+	if resp.DownloadRoutes["llm/gguf"] != "/mnt/models/GGUF" {
+		t.Errorf("GET downloadRoutes = %#v, want llm/gguf kept", resp.DownloadRoutes)
+	}
+
+	// A map containing only unknown keys sanitizes to no routes and still 200.
+	body = `{"downloadRoutes": {"not-a-key": "/tmp/x"}}`
+	req = httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.handleUpdateSettings(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("all-unknown map: status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if len(srv.config.DownloadRoutes) != 0 {
+		t.Errorf("all-unknown map should clear routes, got %#v", srv.config.DownloadRoutes)
+	}
+}
+
+// TestApplyConfigToServer_FiltersUnknownRouteKeys guards the config boundary:
+// a hand-edited/legacy key in the file must be dropped on load so GET cannot
+// advertise it and a later echo-save cannot fail.
+func TestApplyConfigToServer_FiltersUnknownRouteKeys(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	cfgDir := AppConfigDir()
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfgDir, "hfdesk.json")
+	body := `{"download-routes": {"llm/gptq": "/mnt/GPTQ", " audio ": "/mnt/Audio", "llm/gguf": "  /mnt/GGUF  "}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ConfigPath() != path {
+		t.Skipf("ConfigPath resolved to %s, not the test config %s", ConfigPath(), path)
+	}
+
+	serverCfg := Config{}
+	if err := ApplyConfigToServer(&serverCfg); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if _, ok := serverCfg.DownloadRoutes["llm/gptq"]; ok {
+		t.Errorf("reserved key survived config load: %#v", serverCfg.DownloadRoutes)
+	}
+	if _, ok := serverCfg.DownloadRoutes[" audio "]; ok {
+		t.Errorf("unknown space-padded key survived config load: %#v", serverCfg.DownloadRoutes)
+	}
+	if got := serverCfg.DownloadRoutes["llm/gguf"]; got != "/mnt/GGUF" {
+		t.Errorf("valid key = %q, want trimmed/cleaned /mnt/GGUF (%#v)", got, serverCfg.DownloadRoutes)
 	}
 }
 

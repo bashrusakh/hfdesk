@@ -110,7 +110,11 @@ Notes:
   is an internal key from the closed set below, never a path. A configured key
   routes the download into its destination folder (flat mode); `localDir`
   takes priority when both are set.
-- Unknown `routeKey` values are rejected with `400`.
+- Unknown `routeKey` values are rejected with `400`. Exception: when
+  `dataset: true`, `routeKey` is ignored entirely — datasets are never routed,
+  and the request follows the normal `localDir`/HF-cache behavior regardless of
+  the key. This keeps a dataset request that previously succeeded (for example
+  a client that always sends a `routeKey`) from newly failing with `400`.
 - Duplicate active downloads return the existing job; two requests for the same
   repo routed to different destinations are distinct jobs.
 
@@ -157,7 +161,12 @@ Storage fields:
 
 `downloadRoutes` is an opt-in map from an internal route key to a destination directory. When a download request sends a `routeKey` that resolves in this map, the job is written to that folder instead of `localDir`/HF cache. Route destinations are also scanned by the Cache browser and accepted by `/api/diskfree?path=...`.
 
-The route key set is closed and server-defined; unknown keys are rejected with `400` on both `/api/settings` and `/api/download`:
+The route key set is closed and server-defined. On `/api/settings`, keys
+outside the closed set are ignored and dropped — they never cause a `400` and
+are never stored, so a hand-edited or legacy key in the config file is filtered
+out on load and is not echoed back by `GET /api/settings`. On `/api/download`,
+an unknown `routeKey` is still rejected with `400` (a selector must not silently
+become a no-op), except for the `dataset: true` case noted above:
 
 - `llm/gguf` — GGUF quantized LLMs (falls back to `llm`)
 - `llm/safetensors` — Transformers safetensors/bin LLMs (falls back to `llm`)

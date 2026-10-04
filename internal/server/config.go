@@ -235,7 +235,12 @@ func ApplyConfigToServer(serverCfg *Config) error {
 		serverCfg.Endpoint = fileCfg.Endpoint
 	}
 	if len(serverCfg.DownloadRoutes) == 0 && len(fileCfg.DownloadRoutes) > 0 {
-		serverCfg.DownloadRoutes = fileCfg.DownloadRoutes
+		// Sanitize at the config boundary: drop keys outside the closed
+		// route-key set (e.g. a hand-edited legacy key) and normalize values,
+		// so cfg.DownloadRoutes never holds an invalid key and GET /api/settings
+		// never advertises one. This keeps load and save agreeing on the key
+		// set, so echoing the loaded map back cannot fail validation.
+		serverCfg.DownloadRoutes = sanitizeDownloadRoutes(fileCfg.DownloadRoutes)
 	}
 
 	// Apply proxy settings if not already set
