@@ -96,6 +96,45 @@ func TestSettingsTokenPreservation(t *testing.T) {
 	}
 }
 
+// An explicit token set is a one-shot persistence intent: once it has been
+// durably written, a later ordinary settings save must preserve whatever is
+// stored on disk at that time. Before the fix tokenWrite was never cleared, so
+// the first explicit set became a process-lifetime override that clobbered an
+// out-of-band edit on every subsequent save.
+func TestSettingsTokenOutOfBandPreservedOnOrdinarySave(t *testing.T) {
+	path := isolateTokenConfig(t)
+	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk_seed"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Token = "hf_runtime_override"
+	s := New(cfg)
+
+	// Explicit set: live and stored become A.
+	requireTokenSettingsOK(t, s, `{"token":"hf_authored_A"}`)
+	requireTokenState(t, s, "hf_authored_A", "hf_authored_A")
+
+	// Out-of-band change to the selected config file (not via the API):
+	// the stored token is now B while the live token stays A.
+	writeTokenFixture(t, path, `{"token":"hf_out_of_band_B"}`)
+	if stored, err := LoadConfigFile(); err != nil || stored.Token != "hf_out_of_band_B" {
+		t.Fatalf("out-of-band seed failed: token=%q err=%v", stored.Token, err)
+	}
+
+	// Ordinary save with token omitted must preserve B, not re-apply A.
+	requireTokenSettingsOK(t, s, `{"connections":12}`)
+	if live := s.snapshotConfig().Token; live != "hf_authored_A" {
+		t.Errorf("live token = %q, want %q", live, "hf_authored_A")
+	}
+	stored, err := LoadConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Token != "hf_out_of_band_B" {
+		t.Errorf("stored token = %q, want %q (ordinary save must not re-apply the earlier explicit set)", stored.Token, "hf_out_of_band_B")
+	}
+}
+
 func TestSettingsTokenExplicitSetClear(t *testing.T) {
 	isolateTokenConfig(t)
 	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk_original"}); err != nil {

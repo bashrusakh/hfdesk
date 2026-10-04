@@ -598,6 +598,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The pending explicit token intent is now durable for this generation, so
+	// consume it. If a newer update committed concurrently, keep it: that
+	// generation owns the intent it inherited or authored.
+	s.consumeTokenWrite(myGen)
+
 	writeJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: "Settings saved",

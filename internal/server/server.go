@@ -56,9 +56,11 @@ type Config struct {
 	// Proxy configuration
 	Proxy *hfdownloader.ProxyConfig
 
-	// tokenWrite is the latest explicit settings set/clear intent, not the
-	// effective startup credential. It is immutable and retained across ordinary
-	// updates, skipped side effects, and failed saves; nil preserves the disk token.
+	// tokenWrite is the pending explicit settings set/clear intent, not the
+	// effective startup credential. It is inherited by ordinary updates and
+	// retained across skipped side effects and failed saves; it is cleared
+	// only once durably persisted for the still-current generation. nil
+	// preserves the disk token.
 	tokenWrite *string
 }
 
@@ -148,6 +150,24 @@ func (s *Server) withConfig(fn func(*Config)) (Config, uint64) {
 	s.config = c
 	s.configGen++
 	return s.config, s.configGen
+}
+
+// consumeTokenWrite clears the pending explicit token write intent once it has
+// been durably persisted. It only clears when gen is still the current
+// generation, so a newer commit that landed after the persist keeps its own or
+// inherited intent. It must only be called after saveSettingsConfig succeeded,
+// while holding persistMu (the config lock is taken here). It does not bump
+// configGen: the in-memory config is semantically unchanged apart from dropping
+// the already-persisted intent.
+func (s *Server) consumeTokenWrite(gen uint64) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if s.configGen != gen || s.config.tokenWrite == nil {
+		return
+	}
+	c := s.config
+	c.tokenWrite = nil
+	s.config = c
 }
 
 // New creates a new server with the given configuration.

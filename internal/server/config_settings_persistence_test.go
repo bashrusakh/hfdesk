@@ -222,6 +222,9 @@ func TestConfigSettingsSymlinks(t *testing.T) {
 
 func TestConfigSettingsStartupPrecedence(t *testing.T) {
 	isolateTokenConfig(t)
+	// Neutralize any ambient credential from the developer/CI environment so the
+	// file-vs-flag precedence below is deterministic.
+	t.Setenv("HF_TOKEN", "")
 	if err := SaveConfigFile(&ConfigFile{Token: "hf_disk", CacheDir: "file-cache", Connections: 5}); err != nil {
 		t.Fatal(err)
 	}
