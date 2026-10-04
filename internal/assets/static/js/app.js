@@ -2283,9 +2283,20 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     try {
       const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
       const pathParam = path ? `&path=${encodeURIComponent(path)}` : '';
-      await api('DELETE', `/cache/${repo}?type=${type}${sourceParam}${pathParam}`);
+      // api() returns the parsed JSON body; a successful delete may carry the
+      // machine-readable cleanupIncomplete flag plus cleanupWarnings when the
+      // primary copy was removed but a companion (friendly-view) cleanup was
+      // left incomplete. showToast escapes the text it renders.
+      const result = await api('DELETE', `/cache/${repo}?type=${type}${sourceParam}${pathParam}`);
       hideModal();
-      showToast(source && source.toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase() ? `Deleted ${repo} from disk` : `Deleted ${repo} from cache`, 'success');
+      const deletedFrom = source && source.toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase() ? 'disk' : 'cache';
+      if (result && result.cleanupIncomplete) {
+        const warnings = Array.isArray(result.cleanupWarnings) ? result.cleanupWarnings : [];
+        const detail = warnings.length ? `: ${warnings[0]}` : '';
+        showToast(`Deleted ${repo} from ${deletedFrom}, but some cleanup was incomplete${detail}`, 'warning');
+      } else {
+        showToast(`Deleted ${repo} from ${deletedFrom}`, 'success');
+      }
       loadCache(); // Refresh the list
     } catch (e) {
       showToast(`Failed to delete: ${e.message}`, 'error');

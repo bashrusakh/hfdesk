@@ -87,6 +87,20 @@ type Server struct {
 	httpServer *http.Server
 	jobs       *JobManager
 	wsHub      *WSHub
+
+	// localDeleteMu guards localDeleteEvidence: the same-process record that a
+	// validated Local target was left partially deleted, so an identical retry
+	// can finish the remaining work even after weight-based discovery stops
+	// recognizing the remainder. This is deliberately in-memory only: durable
+	// restart-resumable retry is out of scope, and a changed configuration
+	// invalidates the evidence because it is keyed by the configured root.
+	localDeleteMu       sync.Mutex
+	localDeleteEvidence map[string]localDeleteEvidence
+	// deleteStepHook is a test seam that lets a test force a failure at a
+	// named delete step, producing a real partial filesystem state without
+	// depending on permission bits (which root can bypass). Step labels are
+	// "local:before-remove" and "hf:friendly-cleanup". Nil in production.
+	deleteStepHook func(step string) error
 }
 
 // snapshotConfig returns a value copy of the current server config taken
@@ -146,9 +160,10 @@ func New(cfg Config) *Server {
 	jobs := NewJobManager(cfg, wsHub)
 	jobs.LoadState()
 	s := &Server{
-		config: cfg,
-		jobs:   jobs,
-		wsHub:  wsHub,
+		config:              cfg,
+		jobs:                jobs,
+		wsHub:               wsHub,
+		localDeleteEvidence: make(map[string]localDeleteEvidence),
 	}
 	return s
 }

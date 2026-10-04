@@ -553,3 +553,110 @@ func TestRepoDir_EnsureFriendlyDir(t *testing.T) {
 		t.Errorf("friendly directory %s was not created", friendlyPath)
 	}
 }
+
+func TestRepoDir_FriendlyRoot(t *testing.T) {
+	cache := NewHFCache("/cache", 0)
+	model, _ := cache.Repo("owner/name", RepoTypeModel)
+	if got, want := model.FriendlyRoot(), filepath.Join("/cache", "models"); got != want {
+		t.Errorf("model FriendlyRoot() = %q, want %q", got, want)
+	}
+	dataset, _ := cache.Repo("owner/name", RepoTypeDataset)
+	if got, want := dataset.FriendlyRoot(), filepath.Join("/cache", "datasets"); got != want {
+		t.Errorf("dataset FriendlyRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestRepoDir_FriendlyState(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		cache := NewHFCache(t.TempDir(), 0)
+		repo, _ := cache.Repo("owner/name", RepoTypeModel)
+		if got := repo.FriendlyState(); got != FriendlyAbsent {
+			t.Errorf("FriendlyState() = %v, want FriendlyAbsent", got)
+		}
+	})
+
+	t.Run("projection with dangling hub link", func(t *testing.T) {
+		cache := NewHFCache(t.TempDir(), 0)
+		repo, _ := cache.Repo("owner/name", RepoTypeModel)
+		if err := os.MkdirAll(repo.FriendlyPath(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Relative link whose lexical target is inside this repo's hub dir,
+		// even though the hub blob does not exist (a genuine orphan friendly
+		// view).
+		target := filepath.Join("..", "..", "..", "hub", "models--owner--name", "blobs", "sha")
+		if err := os.Symlink(target, filepath.Join(repo.FriendlyPath(), "model.gguf")); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+		if got := repo.FriendlyState(); got != FriendlyProjection {
+			t.Errorf("FriendlyState() = %v, want FriendlyProjection", got)
+		}
+	})
+
+	t.Run("regular file is not a projection", func(t *testing.T) {
+		cache := NewHFCache(t.TempDir(), 0)
+		repo, _ := cache.Repo("owner/name", RepoTypeModel)
+		if err := os.MkdirAll(repo.FriendlyPath(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo.FriendlyPath(), "model.gguf"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := repo.FriendlyState(); got != FriendlyNotProjection {
+			t.Errorf("FriendlyState() = %v, want FriendlyNotProjection", got)
+		}
+	})
+
+	t.Run("link into another repo is not a projection", func(t *testing.T) {
+		cache := NewHFCache(t.TempDir(), 0)
+		repo, _ := cache.Repo("owner/name", RepoTypeModel)
+		if err := os.MkdirAll(repo.FriendlyPath(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		other := filepath.Join("..", "..", "..", "hub", "models--other--name", "blobs", "sha")
+		if err := os.Symlink(other, filepath.Join(repo.FriendlyPath(), "model.gguf")); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+		if got := repo.FriendlyState(); got != FriendlyNotProjection {
+			t.Errorf("FriendlyState() = %v, want FriendlyNotProjection", got)
+		}
+	})
+
+	t.Run("symlinked owner alias is not a projection", func(t *testing.T) {
+		cache := NewHFCache(t.TempDir(), 0)
+		repo, _ := cache.Repo("owner/name", RepoTypeModel)
+		// models/other/name is a real projection; models/owner -> models/other.
+		other, _ := cache.Repo("other/name", RepoTypeModel)
+		if err := os.MkdirAll(other.FriendlyPath(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join("..", "..", "..", "hub", "models--other--name", "blobs", "sha")
+		if err := os.Symlink(target, filepath.Join(other.FriendlyPath(), "model.gguf")); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+		if err := os.Symlink(other.FriendlyRoot()+"/other", filepath.Join(cache.ModelsDir(), "owner")); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+		if got := repo.FriendlyState(); got != FriendlyNotProjection {
+			t.Errorf("FriendlyState() = %v, want FriendlyNotProjection", got)
+		}
+	})
+}
+
+func TestRejectSymlinkedComponents(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "other", "name"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "other"), filepath.Join(root, "owner")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	// Symlinked intermediate component is rejected.
+	if err := RejectSymlinkedComponents(root, filepath.Join(root, "owner", "name")); err == nil {
+		t.Errorf("expected symlinked intermediate component to be rejected")
+	}
+	// A real two-level path is accepted.
+	if err := RejectSymlinkedComponents(root, filepath.Join(root, "other", "name")); err != nil {
+		t.Errorf("expected real path to be accepted, got %v", err)
+	}
+}

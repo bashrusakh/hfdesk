@@ -30,6 +30,28 @@ const (
 	cacheSourceLocal        = "Local"
 )
 
+// cacheDeleteIncompleteKey is the machine-readable field set on a delete
+// success response when the primary copy was removed but a companion cleanup
+// step did not complete (e.g. a protected friendly-view projection). The
+// primary `success` stays true for backward compatibility; clients that can
+// warn should inspect this flag.
+const cacheDeleteIncompleteKey = "cleanupIncomplete"
+
+// cacheDeleteSuccess builds a delete success body. When warnings is non-empty
+// the primary delete succeeded but some companion cleanup did not, so the body
+// carries cleanupIncomplete plus the individual warnings.
+func cacheDeleteSuccess(repo, message string, warnings []string) map[string]any {
+	resp := map[string]any{
+		"success": true,
+		"message": message,
+	}
+	if len(warnings) > 0 {
+		resp[cacheDeleteIncompleteKey] = true
+		resp["cleanupWarnings"] = warnings
+	}
+	return resp
+}
+
 // --- Handlers ---
 
 // Version is the application version reported by the API and shown in the web
@@ -775,16 +797,41 @@ type CacheStats struct {
 
 // localCacheRoot describes a single directory to scan for cached
 // repos, with the Source label to display in the UI and a flag for
-// whether to skip the HF-cache special subdirectories (hub, blobs,
-// etc.) that aren't user-visible repos.
+// whether to skip the HF-cache special subdirectories (hub, models,
+// datasets, blobs, snapshots, refs) that aren't user-visible repos.
+//
+// A single physical directory can carry more than one role (for example an
+// explicit Local root configured at <cache>/models). Roles are merged when
+// paths collapse to the same physical directory: SkipSpecial wins as a safety
+// exclusion, and an explicit Local role upgrades the Source label so
+// independently written real folders stay visible and deletable.
 type localCacheRoot struct {
 	Path        string
 	Source      string
 	SkipSpecial bool
 }
 
+// physPathKey returns a physical-identity key for a filesystem path. It
+// cleans the path and, when the path exists, resolves symlinks, then makes it
+// absolute. Unlike the previous case-folded key, case is preserved (this
+// project targets case-sensitive paths; on a case-insensitive filesystem
+// EvalSymlinks returns the on-disk spelling, so genuine aliases still
+// collapse). Used to dedup roots by physical identity rather than spelling,
+// so a symlinked root and its real path become one root while two truly
+// distinct roots such as /Models and /models stay separate.
+func physPathKey(path string) string {
+	cleaned := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		cleaned = resolved
+	}
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		return abs
+	}
+	return cleaned
+}
+
 // cleanPathList trims whitespace, filepath.Cleans each path, drops
-// empties, and de-duplicates case-insensitively. Used to normalize
+// empties, and de-duplicates by physical identity. Used to normalize
 // the user-supplied LocalScanDirs list before it lands in s.config.
 func cleanPathList(paths []string) []string {
 	var cleaned []string
@@ -795,7 +842,7 @@ func cleanPathList(paths []string) []string {
 			continue
 		}
 		path = filepath.Clean(path)
-		key := strings.ToLower(path)
+		key := physPathKey(path)
 		if seen[key] {
 			continue
 		}
@@ -808,34 +855,86 @@ func cleanPathList(paths []string) []string {
 // localCacheRoots builds the list of directories to scan for cached
 // repos: the Friendly-view <cache>/models tree, the user-supplied
 // localDir, the user-supplied localScanDirs, and the raw cache dir
-// (with SkipSpecial because its hub/blobs layout is internal). The
-// returned slice is deduped by absolute path.
+// (with SkipSpecial because its hub/blobs layout is internal).
+//
+// Roots are deduped by physical identity, and the roles of all spellings
+// that collapse to the same physical directory are merged rather than
+// letting the first spelling win. That preserves SkipSpecial when the raw
+// cache dir is also supplied as a scan dir, keeps an explicit Local role on
+// <cache>/models when it is configured as a Local root, and prevents a
+// symlinked root plus its real path from being listed twice.
 func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
 	var roots []localCacheRoot
-	seen := make(map[string]bool)
+	index := make(map[string]int)
 	add := func(path, source string, skipSpecial bool) {
 		if path == "" {
 			return
 		}
 		cleaned := filepath.Clean(path)
-		key := strings.ToLower(cleaned)
-		if seen[key] {
+		key := physPathKey(cleaned)
+		if i, ok := index[key]; ok {
+			// Same physical directory already present: merge roles.
+			// SkipSpecial is a safety exclusion, so it wins if any caller
+			// asks for it. An explicit Local role upgrades a Friendly-view
+			// namespace root to a real Local root (so independently written
+			// real folders under it stay visible).
+			if skipSpecial {
+				roots[i].SkipSpecial = true
+			}
+			if source == cacheSourceLocal {
+				roots[i].Source = cacheSourceLocal
+			}
 			return
 		}
-		seen[key] = true
-		roots = append(roots, localCacheRoot{Path: cleaned, Source: source, SkipSpecial: skipSpecial})
+		index[key] = len(roots)
+		roots = append(roots, localCacheRoot{
+			Path:        cleaned,
+			Source:      source,
+			SkipSpecial: skipSpecial,
+		})
 	}
 
-	cacheRoot := filepath.Clean(cacheDir)
-	localSkipSpecial := localDir != "" && strings.EqualFold(filepath.Clean(localDir), cacheRoot)
+	localSkipSpecial := localDir != "" && physPathKey(localDir) == physPathKey(cacheDir)
 
-	add(filepath.Join(cacheDir, "models"), "Friendly view", false)
-	add(localDir, "Local", localSkipSpecial)
+	add(filepath.Join(cacheDir, "models"), cacheSourceFriendlyView, false)
+	add(localDir, cacheSourceLocal, localSkipSpecial)
 	for _, dir := range localScanDirs {
-		add(dir, "Local", false)
+		add(dir, cacheSourceLocal, false)
 	}
-	add(cacheDir, "Local", true)
+	add(cacheDir, cacheSourceLocal, true)
 	return roots
+}
+
+// localRepoDirAliased reports whether <root>/<owner>/<name> is reached through
+// a symlinked intermediate component or is itself a symlink leaf. Both are
+// aliases of other storage, not deletable Local copies, so they must not be
+// advertised or resolved into.
+func localRepoDirAliased(root, repoDir string) bool {
+	if hfdownloader.RejectSymlinkedComponents(root, repoDir) != nil {
+		return true
+	}
+	if info, err := os.Lstat(repoDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return true
+	}
+	return false
+}
+
+// localRepoSource returns the Source label to report for a repo directory found
+// under rootSource. A directory that is a genuine friendly projection of the
+// same repo is reported as the Friendly view even when its enclosing root also
+// carries Local authority (e.g. localDir configured at <cache>/models), because
+// it is the hub's projection rather than independent Local storage. Any other
+// directory keeps the root's label.
+func localRepoSource(cacheDir, owner, name, repoDir, rootSource string) string {
+	if rootSource == cacheSourceFriendlyView {
+		return rootSource
+	}
+	if rd, err := hfdownloader.NewHFCache(cacheDir, 0).Repo(owner+"/"+name, hfdownloader.RepoTypeModel); err == nil &&
+		rd.FriendlyState() == hfdownloader.FriendlyProjection &&
+		physPathKey(rd.FriendlyPath()) == physPathKey(repoDir) {
+		return cacheSourceFriendlyView
+	}
+	return rootSource
 }
 
 // hasLocalWeightFile reports whether dir (or any subdirectory) contains
@@ -1046,10 +1145,18 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 				}
 				name := modelEntry.Name()
 				repoDir := filepath.Join(ownerDir, name)
+				// Do not advertise a repo reached through a symlinked
+				// intermediate component (e.g. models/<owner> -> models/other)
+				// or a symlinked leaf: it is an alias of another repo, not this
+				// one, and must not be offered as a deletable copy.
+				if localRepoDirAliased(root.Path, repoDir) {
+					continue
+				}
 				if !hasLocalWeightFile(repoDir) {
 					continue
 				}
-				repo, err := buildLocalCacheRepo(owner, name, repoDir, root.Source, includeFiles)
+				source := localRepoSource(cacheDir, owner, name, repoDir, root.Source)
+				repo, err := buildLocalCacheRepo(owner, name, repoDir, source, includeFiles)
 				if err == nil {
 					repos = append(repos, *repo)
 				}
@@ -1070,10 +1177,15 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repo
 	}
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
+		// A repo reached through a symlinked intermediate component (or a
+		// symlinked leaf) is another repo's alias; do not resolve this ID to it.
+		if localRepoDirAliased(root.Path, repoDir) {
+			continue
+		}
 		if !hasLocalWeightFile(repoDir) {
 			continue
 		}
-		return buildLocalCacheRepo(parts[0], parts[1], repoDir, root.Source, includeFiles)
+		return buildLocalCacheRepo(parts[0], parts[1], repoDir, localRepoSource(cacheDir, parts[0], parts[1], repoDir, root.Source), includeFiles)
 	}
 	return nil, os.ErrNotExist
 }
@@ -1576,22 +1688,37 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// Ensure cache dir ends with separator to prevent /cache/huggingface-evil matching /cache/huggingface
 	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
 
+	// Validate the source selector BEFORE any delete branch runs, including the
+	// exact-path branch. An unknown non-empty label is a caller error and must
+	// not fall through to a different copy's deletion merely because a valid
+	// path was also supplied. Known labels keep the existing behavior: when a
+	// path is supplied it selects the actual copy (valid-path precedence), and
+	// the known source label does not have to equal the matched copy's source.
+	source := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("source")))
+	switch source {
+	case "local", "friendly view", "", "hf cache":
+		// Valid selectors; routed below.
+	default:
+		writeError(w, http.StatusBadRequest, "Invalid source", "source must be one of: HF cache, Friendly view, Local")
+		return
+	}
+
 	// When the caller names an exact copy path, delete only that copy. The path
 	// is matched against the same server-computed candidate set handleCacheInfo
 	// lists, so a caller can never make the server delete an arbitrary path.
 	pathParam := strings.TrimSpace(r.URL.Query().Get("path"))
 	if pathParam != "" {
-		copySource, localCand, ok := matchCacheCopyPath(cacheDir, cfg, repo, repoType, pathParam)
+		copySource, localCand, ok := s.matchCacheCopyPath(cacheDir, cfg, repo, repoType, pathParam)
 		if !ok {
 			writeError(w, http.StatusBadRequest, "Invalid path", "Path is not a known copy of this repository")
 			return
 		}
 		switch copySource {
 		case cacheSourceHFCache, cacheSourceFriendlyView:
-			deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
+			s.deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
 			return
 		case cacheSourceLocal:
-			deleteLocalCopy(w, repo, repoType, owner, name, localCand)
+			s.deleteLocalCopy(w, repo, repoType, owner, name, localCand)
 			return
 		}
 		writeError(w, http.StatusBadRequest, "Invalid path", "Unsupported copy source")
@@ -1602,23 +1729,17 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// areas, so deleting there removes the real <root>/<owner>/<name> folder.
 	// The empty label and "hf cache" keep the legacy HF-cache-first behavior;
 	// an empty label additionally falls back to the local roots so cached
-	// clients that omit the param can still delete local repos. Any other
-	// label is rejected without deleting so a typo cannot remove the wrong
-	// copy and report success.
-	source := strings.TrimSpace(r.URL.Query().Get("source"))
-	switch strings.ToLower(source) {
+	// clients that omit the param can still delete local repos.
+	switch source {
 	case "local":
-		deleteLocalRootRepo(w, cacheDir, cfg, owner, name, repo, repoType)
+		s.deleteLocalRootRepo(w, cacheDir, cfg, owner, name, repo, repoType)
 		return
 	case "friendly view":
-		deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
+		s.deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
 		return
 	case "", "hf cache":
 		// Legacy HF-cache-first delete below. An empty label also reaches the
 		// local-roots fallback at the end of this handler; "hf cache" does not.
-	default:
-		writeError(w, http.StatusBadRequest, "Invalid source", "source must be one of: HF cache, Friendly view, Local")
-		return
 	}
 
 	absHubPath, err := filepath.Abs(hubPath)
@@ -1654,49 +1775,53 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Delete the friendly view directory (symlinks) with same security checks
-		if friendlyPath != "" {
-			if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
-				// Log but don't fail - hub directory was successfully deleted
-				// The friendly path might not exist or might be invalid
-			}
+		// Clean up the friendly-view projection. This only removes a genuine
+		// whole-folder projection of this exact repo; a real folder or a link
+		// into another repo is preserved and surfaced as incomplete cleanup so
+		// the UI can warn. The hub delete already succeeded, so the primary
+		// success stays true.
+		var warnings []string
+		if warning := s.cleanupFriendlyView(repoDir, absCacheDirWithSep); warning != "" {
+			warnings = append(warnings, warning)
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"success": true,
-			"message": fmt.Sprintf("Deleted %s from cache", repo),
-		})
+		writeJSON(w, http.StatusOK, cacheDeleteSuccess(repo, fmt.Sprintf("Deleted %s from cache", repo), warnings))
 		return
 	}
 
-	// Hub directory is absent. A friendly-view entry can still exist as an
-	// orphan (a real directory of symlinks whose hub target is gone); delete
-	// it rather than reporting "not found".
+	// Hub directory is absent. A friendly-view entry can still exist as a
+	// genuine orphan (a directory of symlinks whose hub target is gone); delete
+	// it rather than reporting "not found". A folder that is not a proven
+	// projection of this exact repo is preserved instead: only shared storage
+	// proven from the filesystem may be removed here.
 	if friendlyPath != "" {
-		if finfo, ferr := os.Lstat(friendlyPath); ferr == nil {
-			if finfo.Mode()&os.ModeSymlink != 0 {
-				writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
+		switch repoDir.FriendlyState() {
+		case hfdownloader.FriendlyProjection:
+			if finfo, ferr := os.Lstat(friendlyPath); ferr == nil {
+				if finfo.Mode()&os.ModeSymlink != 0 {
+					writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
+					return
+				}
+				if derr := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); derr != nil {
+					writeError(w, http.StatusInternalServerError, "Failed to delete cache", derr.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, cacheDeleteSuccess(repo, fmt.Sprintf("Deleted %s from cache", repo), nil))
+				return
+			} else if !os.IsNotExist(ferr) {
+				writeError(w, http.StatusInternalServerError, "Failed to check path", ferr.Error())
 				return
 			}
-			if derr := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); derr != nil {
-				writeError(w, http.StatusInternalServerError, "Failed to delete cache", derr.Error())
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"success": true,
-				"message": fmt.Sprintf("Deleted %s from cache", repo),
-			})
-			return
-		} else if !os.IsNotExist(ferr) {
-			writeError(w, http.StatusInternalServerError, "Failed to check path", ferr.Error())
-			return
+		case hfdownloader.FriendlyNotProjection:
+			// A real folder (or a link into another repo) is not the friendly
+			// copy of this repo; fall through so nothing unrelated is removed.
 		}
 	}
 
-	// Nothing found in the HF cache. For an empty/unknown source, fall back to
+	// Nothing found in the HF cache. For an empty source, fall back to
 	// the local roots so older clients can still delete those entries.
 	if source == "" {
-		deleteLocalRootRepo(w, cacheDir, cfg, owner, name, repo, repoType)
+		s.deleteLocalRootRepo(w, cacheDir, cfg, owner, name, repo, repoType)
 		return
 	}
 
@@ -1755,14 +1880,53 @@ func validateHubDeletePath(absHubPath, absCacheDir, absCacheDirWithSep string, r
 	return nil
 }
 
+// cleanupFriendlyView removes the friendly-view directory for repoDir only when
+// it is a genuine whole-folder projection of this exact repo (proven from the
+// filesystem). It returns a warning string when cleanup did not complete; the
+// caller keeps the primary success and surfaces the warning. A real folder or a
+// link into another repo is preserved, never deleted.
+func (s *Server) cleanupFriendlyView(repoDir *hfdownloader.RepoDir, absCacheDirWithSep string) string {
+	friendlyPath := repoDir.FriendlyPath()
+	if friendlyPath == "" {
+		return ""
+	}
+	switch repoDir.FriendlyState() {
+	case hfdownloader.FriendlyProjection:
+		// Proven shared storage; safe to remove below.
+	case hfdownloader.FriendlyNotProjection:
+		return fmt.Sprintf("friendly view %s is not a whole-folder projection of this repository; left in place", friendlyPath)
+	default:
+		return ""
+	}
+
+	if s.deleteStepHook != nil {
+		if err := s.deleteStepHook("hf:friendly-cleanup"); err != nil {
+			log.Printf("warning: could not delete friendly view %s: %v", friendlyPath, err)
+			return fmt.Sprintf("friendly view cleanup failed: %v", err)
+		}
+	}
+	if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
+		log.Printf("warning: could not delete friendly view %s: %v", friendlyPath, err)
+		return fmt.Sprintf("friendly view cleanup failed: %v", err)
+	}
+	return ""
+}
+
 // deleteFriendlyViewRepo deletes the friendly-view projection of a repo (the
-// real <cache>/models/<owner>/<name> directory that holds symlinks), plus the
-// HF hub directory when it still exists.
-func deleteFriendlyViewRepo(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo, absCacheDir, absCacheDirWithSep string, repoType hfdownloader.RepoType) {
+// <cache>/models/<owner>/<name> directory that holds symlinks), plus the HF hub
+// directory when it still exists.
+//
+// The friendly directory is only removed when it is a proven whole-folder
+// projection of this exact repo. When the hub was deleted but the friendly
+// folder is a real folder or links into another repo, it is preserved and the
+// success response carries cleanupIncomplete so the UI can warn. When neither
+// exists, the request is a 404; when only a non-projection exists, it is a 400.
+func (s *Server) deleteFriendlyViewRepo(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo, absCacheDir, absCacheDirWithSep string, repoType hfdownloader.RepoType) {
 	friendlyPath := repoDir.FriendlyPath()
 	hubPath := repoDir.Path()
 
 	deleted := false
+	var warnings []string
 
 	// Remove the hub directory first when present, using the same HF-cache
 	// containment checks as the default path.
@@ -1791,35 +1955,42 @@ func deleteFriendlyViewRepo(w http.ResponseWriter, repoDir *hfdownloader.RepoDir
 	}
 
 	if friendlyPath != "" {
-		if finfo, ferr := os.Lstat(friendlyPath); ferr == nil {
-			if finfo.Mode()&os.ModeSymlink != 0 {
-				// A symlinked friendly path is never deleted. If the hub copy was
-				// already removed, treat it as a non-fatal leftover and keep the
-				// success response, matching the default delete branch.
-				if !deleted {
-					writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
-					return
+		switch repoDir.FriendlyState() {
+		case hfdownloader.FriendlyProjection:
+			if s.deleteStepHook != nil {
+				if herr := s.deleteStepHook("hf:friendly-cleanup"); herr != nil {
+					if !deleted {
+						writeError(w, http.StatusInternalServerError, "Failed to delete cache", herr.Error())
+						return
+					}
+					log.Printf("warning: could not delete friendly view %s: %v", friendlyPath, herr)
+					warnings = append(warnings, fmt.Sprintf("friendly view cleanup failed: %v", herr))
+					break
 				}
-				log.Printf("warning: could not delete friendly view %s: symlinked directory", friendlyPath)
-			} else if derr := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); derr != nil {
+			}
+			if derr := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); derr != nil {
 				// The hub directory was already deleted, so the delete itself
-				// succeeded; log the friendly-view cleanup failure instead of
-				// failing the whole request. Without a hub delete this is still
-				// the primary operation and its failure is reported.
+				// succeeded; report the friendly-view cleanup failure as
+				// incomplete instead of failing the whole request. Without a
+				// hub delete this is still the primary operation and its
+				// failure is reported.
 				if !deleted {
 					writeError(w, http.StatusInternalServerError, "Failed to delete cache", derr.Error())
 					return
 				}
 				log.Printf("warning: could not delete friendly view %s: %v", friendlyPath, derr)
+				warnings = append(warnings, fmt.Sprintf("friendly view cleanup failed: %v", derr))
 			} else {
 				deleted = true
 			}
-		} else if !os.IsNotExist(ferr) {
+		case hfdownloader.FriendlyNotProjection:
+			// Never delete a real folder or a link into another repo as if it
+			// were this repo's friendly projection.
 			if !deleted {
-				writeError(w, http.StatusInternalServerError, "Failed to check path", ferr.Error())
+				writeError(w, http.StatusBadRequest, "Invalid path", "Friendly view path is not a projection of this repository")
 				return
 			}
-			log.Printf("warning: could not check friendly view %s: %v", friendlyPath, ferr)
+			warnings = append(warnings, "friendly view is not a whole-folder projection of this repository; left in place")
 		}
 	}
 
@@ -1828,10 +1999,7 @@ func deleteFriendlyViewRepo(w http.ResponseWriter, repoDir *hfdownloader.RepoDir
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"message": fmt.Sprintf("Deleted %s from cache", repo),
-	})
+	writeJSON(w, http.StatusOK, cacheDeleteSuccess(repo, fmt.Sprintf("Deleted %s from cache", repo), warnings))
 }
 
 // localCopyCandidate is one deletable owner/name folder under a local root.
@@ -1842,14 +2010,33 @@ type localCopyCandidate struct {
 
 // localCopyCandidates returns the deletable <root>/<owner>/<name> path for each
 // local cache root that actually contains a weight file, in the same order the
-// cache list uses. The "Friendly view" projection is excluded because it is the
-// same storage as the HF hub copy; HF-cache internals under a raw cache root
+// cache list uses. HF-cache internals under a raw cache root
 // (hub/models/datasets/blobs/snapshots/refs) are skipped so the shown entry and
-// the deleted entry agree.
+// the deleted entry agree. A friendly-view projection of this exact repo is not
+// a Local copy: it is the same storage as the hub. A real folder that happens
+// to live under the friendly namespace (e.g. an explicit Local root configured
+// at <cache>/models) is still listed, because it is independent storage.
 func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owner, name string) []localCopyCandidate {
 	var candidates []localCopyCandidate
+	seen := make(map[string]bool)
+
+	// Resolve whether <cache>/models/<owner>/<name> is a genuine projection of
+	// this repo. Locals are models only, so the model friendly path applies.
+	projectionKey := ""
+	if cache := hfdownloader.NewHFCache(cacheDir, 0); cache != nil {
+		if rd, err := cache.Repo(owner+"/"+name, hfdownloader.RepoTypeModel); err == nil &&
+			rd.FriendlyState() == hfdownloader.FriendlyProjection {
+			projectionKey = physPathKey(rd.FriendlyPath())
+		}
+	}
+
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
-		if root.Source == cacheSourceFriendlyView {
+		// Only roots carrying Local authority are deletable as Local storage.
+		// The implicit friendly namespace alone is not Local storage; it only
+		// becomes one when the same physical directory is also configured as a
+		// Local root (localDir/scanDir), in which case the merged role sets
+		// Source to Local.
+		if root.Source != cacheSourceLocal {
 			continue
 		}
 		if root.SkipSpecial {
@@ -1859,50 +2046,187 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 			}
 		}
 		repoDir := filepath.Join(root.Path, owner, name)
-		// Mirror the delete-side component check (rejectSymlinkedComponents):
-		// a candidate reached through a symlinked or missing intermediate
-		// component would be advertised but never deletable, so skip it here
-		// to keep the listed set equal to the deletable set.
-		if rejectSymlinkedComponents(root.Path, repoDir) != nil {
+		// Mirror the delete-side check: a candidate reached through a symlinked
+		// or missing intermediate component, or a symlinked leaf, would be
+		// advertised but never deletable, so skip it to keep the listed set
+		// equal to the deletable set.
+		if localRepoDirAliased(root.Path, repoDir) {
+			continue
+		}
+		// A genuine friendly projection of this exact repo is the same storage
+		// as the hub, not an independent Local copy.
+		if projectionKey != "" && physPathKey(repoDir) == projectionKey {
 			continue
 		}
 		if !hasLocalWeightFile(repoDir) {
 			continue
 		}
+		key := physPathKey(repoDir)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		candidates = append(candidates, localCopyCandidate{Root: root.Path, RepoDir: repoDir})
 	}
 	return candidates
 }
 
+// configuredLocalRoots returns the Local-authority roots currently in effect
+// (localDir, the scan dirs, and the raw cache dir when it carries Local
+// authority), deduped by physical identity. This is exactly the set
+// localCopyCandidates can resolve a deletable target from, so retained
+// partial-delete evidence is validated against the same authorization.
+func configuredLocalRoots(cacheDir, localDir string, localScanDirs []string) []string {
+	var roots []string
+	seen := make(map[string]bool)
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+		if root.Source != cacheSourceLocal {
+			continue
+		}
+		key := physPathKey(root.Path)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		roots = append(roots, root.Path)
+	}
+	return roots
+}
+
+// localDeleteEvidence records that a validated Local target began deletion and
+// may have been left partially deleted. It is deliberately in-memory only: the
+// continuation horizon is the current server process, and a changed root or
+// repository invalidates the record because it is keyed by all three.
+type localDeleteEvidence struct {
+	Root    string
+	RepoDir string
+}
+
+// localDeleteEvidenceKey identifies one (type, root, owner, name) delete
+// target. physPathKey makes a symlinked root alias match its real path.
+func localDeleteEvidenceKey(repoType hfdownloader.RepoType, root, owner, name string) string {
+	return string(repoType) + "\x00" + physPathKey(root) + "\x00" + owner + "\x00" + name
+}
+
+func (s *Server) rememberLocalDelete(key string, cand localCopyCandidate) {
+	s.localDeleteMu.Lock()
+	defer s.localDeleteMu.Unlock()
+	if s.localDeleteEvidence == nil {
+		s.localDeleteEvidence = make(map[string]localDeleteEvidence)
+	}
+	s.localDeleteEvidence[key] = localDeleteEvidence{Root: cand.Root, RepoDir: cand.RepoDir}
+}
+
+func (s *Server) forgetLocalDelete(key string) {
+	s.localDeleteMu.Lock()
+	defer s.localDeleteMu.Unlock()
+	delete(s.localDeleteEvidence, key)
+}
+
+// retryableLocalTarget returns the exact target of a previous partially
+// completed Local delete for this repo, when the owning root is still
+// configured and the remainder still exists. It never redirects to a different
+// copy: the target is matched only by the recorded root plus owner/name, and a
+// changed root/config invalidates the record.
+func (s *Server) retryableLocalTarget(cacheDir string, cfg Config, owner, name string, repoType hfdownloader.RepoType) (localCopyCandidate, bool) {
+	if repoType != hfdownloader.RepoTypeModel {
+		return localCopyCandidate{}, false
+	}
+	return s.matchLocalDeleteEvidence(cacheDir, cfg, owner, name, "")
+}
+
+// matchLocalDeleteEvidence looks up retained partial-delete evidence for a repo
+// under the currently configured roots. When requestedAbs is non-empty the
+// evidence must also name that exact absolute target (by-path retry); when it
+// is empty any surviving remainder for the repo matches (no-path retry).
+func (s *Server) matchLocalDeleteEvidence(cacheDir string, cfg Config, owner, name, requestedAbs string) (localCopyCandidate, bool) {
+	roots := configuredLocalRoots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs)
+	if len(roots) == 0 {
+		return localCopyCandidate{}, false
+	}
+	s.localDeleteMu.Lock()
+	defer s.localDeleteMu.Unlock()
+	for _, root := range roots {
+		key := localDeleteEvidenceKey(hfdownloader.RepoTypeModel, root, owner, name)
+		ev, ok := s.localDeleteEvidence[key]
+		if !ok {
+			continue
+		}
+		if requestedAbs != "" {
+			evAbs, aerr := filepath.Abs(ev.RepoDir)
+			if aerr != nil || evAbs != requestedAbs {
+				continue
+			}
+		}
+		// The remainder must still physically exist, and must still validate
+		// as the exact authorized target. A vanished remainder means there is
+		// nothing left to retry.
+		if _, err := os.Lstat(ev.RepoDir); err != nil {
+			continue
+		}
+		if _, err := resolveLocalDeleteTarget(ev.Root, owner, name); err != nil {
+			continue
+		}
+		return localCopyCandidate{Root: ev.Root, RepoDir: ev.RepoDir}, true
+	}
+	return localCopyCandidate{}, false
+}
+
 // deleteLocalRootRepo deletes the exact <root>/<owner>/<name> folder for a repo
 // stored under one of the local cache roots. Local entries are always models, so
 // a non-model request type is reported as not found rather than deleting a
-// folder it did not ask for. It skips the "Friendly view" projection so a Local
-// entry deletes the real folder, and reports failures as 500.
-func deleteLocalRootRepo(w http.ResponseWriter, cacheDir string, cfg Config, owner, name, repo string, repoType hfdownloader.RepoType) {
-	candidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name)
-	if len(candidates) == 0 {
-		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
-		return
-	}
-	deleteLocalCopy(w, repo, repoType, owner, name, candidates[0])
-}
-
-// deleteLocalCopy deletes one specific local copy. Local entries are always
-// models, so a non-model request type is reported as not found.
-func deleteLocalCopy(w http.ResponseWriter, repo string, repoType hfdownloader.RepoType, owner, name string, cand localCopyCandidate) {
+// folder it did not ask for. It skips friendly projections so a Local entry
+// deletes real storage, and reports failures as 500. A previously started
+// partial delete of the same target is retried within the current process even
+// when weight-based discovery no longer recognizes the remainder.
+func (s *Server) deleteLocalRootRepo(w http.ResponseWriter, cacheDir string, cfg Config, owner, name, repo string, repoType hfdownloader.RepoType) {
 	if repoType != hfdownloader.RepoTypeModel {
 		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
 		return
 	}
-	if err := safeDeleteLocalRepo(cand.Root, owner, name); err != nil {
+	candidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name)
+	if len(candidates) == 0 {
+		if cand, ok := s.retryableLocalTarget(cacheDir, cfg, owner, name, repoType); ok {
+			s.deleteLocalCopy(w, repo, repoType, owner, name, cand)
+			return
+		}
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	}
+	s.deleteLocalCopy(w, repo, repoType, owner, name, candidates[0])
+}
+
+// deleteLocalCopy deletes one specific local copy. Local entries are always
+// models, so a non-model request type is reported as not found.
+func (s *Server) deleteLocalCopy(w http.ResponseWriter, repo string, repoType hfdownloader.RepoType, owner, name string, cand localCopyCandidate) {
+	if repoType != hfdownloader.RepoTypeModel {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	}
+	key := localDeleteEvidenceKey(repoType, cand.Root, owner, name)
+	// Validate before recording anything, so a validation-only failure leaves
+	// no stale evidence behind.
+	absTarget, err := resolveLocalDeleteTarget(cand.Root, owner, name)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"message": fmt.Sprintf("Deleted %s from disk", repo),
-	})
+	// Record the validated target before mutating so a partial delete is
+	// retryable within this process even though a failed RemoveAll leaves no
+	// weight file behind for discovery.
+	s.rememberLocalDelete(key, cand)
+	if s.deleteStepHook != nil {
+		if herr := s.deleteStepHook("local:before-remove"); herr != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to delete local folder", herr.Error())
+			return
+		}
+	}
+	if err := os.RemoveAll(absTarget); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
+		return
+	}
+	s.forgetLocalDelete(key)
+	writeJSON(w, http.StatusOK, cacheDeleteSuccess(repo, fmt.Sprintf("Deleted %s from disk", repo), nil))
 }
 
 // cacheCopyUsage returns the total bytes stored under dir and the number of
@@ -1989,21 +2313,21 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 			})
 		} else if os.IsNotExist(statErr) {
 			// Only consider the friendly view as an orphan copy when the hub
-			// entry is genuinely absent. When the hub exists but is a symlink
-			// or a non-directory, the friendly delete would be rejected for
-			// the same reason, so listing it would advertise an undeletable
-			// copy.
-			if friendlyPath := repoDir.FriendlyPath(); friendlyPath != "" {
-				if finfo, ferr := os.Lstat(friendlyPath); ferr == nil && finfo.IsDir() {
-					size, count := cacheCopyUsage(friendlyPath, true)
-					copies = append(copies, CacheCopy{
-						Source:    cacheSourceFriendlyView,
-						Path:      friendlyPath,
-						Size:      size,
-						SizeHuman: humanSizeBytes(size),
-						FileCount: count,
-					})
-				}
+			// entry is genuinely absent AND the directory is a proven
+			// whole-folder projection of this exact repo. A folder of real
+			// files, a link into another repo, or a path reached through a
+			// symlinked owner alias is not this copy and must not be listed
+			// (nor deleted) as if it were.
+			if friendlyPath := repoDir.FriendlyPath(); friendlyPath != "" &&
+				repoDir.FriendlyState() == hfdownloader.FriendlyProjection {
+				size, count := cacheCopyUsage(friendlyPath, true)
+				copies = append(copies, CacheCopy{
+					Source:    cacheSourceFriendlyView,
+					Path:      friendlyPath,
+					Size:      size,
+					SizeHuman: humanSizeBytes(size),
+					FileCount: count,
+				})
 			}
 		}
 	}
@@ -2032,7 +2356,12 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 // so only an exact match against a path the server itself would list is
 // accepted. For a Local match it also returns the owning candidate so the
 // correct root can be used for the safe delete.
-func matchCacheCopyPath(cacheDir string, cfg Config, repo string, repoType hfdownloader.RepoType, pathParam string) (string, localCopyCandidate, bool) {
+//
+// A Local path that is no longer listed (because a previous partial delete
+// removed the weight file) is still accepted when this server retained
+// evidence that the exact target was partially deleted; that keeps an identical
+// retry of the same validated target possible for the current process.
+func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, repoType hfdownloader.RepoType, pathParam string) (string, localCopyCandidate, bool) {
 	requested, err := filepath.Abs(strings.TrimSpace(pathParam))
 	if err != nil {
 		return "", localCopyCandidate{}, false
@@ -2048,6 +2377,13 @@ func matchCacheCopyPath(cacheDir string, cfg Config, repo string, repoType hfdow
 			return cacheSourceLocal, cand, true
 		}
 	}
+	// A Local path that is no longer listed (the weight file is already gone)
+	// is still accepted when this server retained evidence that the exact
+	// target was partially deleted; that keeps an identical retry of the same
+	// validated target possible for the current process.
+	if cand, ok := s.matchLocalDeleteEvidence(cacheDir, cfg, owner, name, requested); ok {
+		return cacheSourceLocal, cand, true
+	}
 	for _, copy := range enumerateCacheCopies(cacheDir, cfg, repo, repoType) {
 		if candAbs, aerr := filepath.Abs(copy.Path); aerr == nil && candAbs == requested {
 			return copy.Source, localCopyCandidate{}, true
@@ -2056,37 +2392,36 @@ func matchCacheCopyPath(cacheDir string, cfg Config, repo string, repoType hfdow
 	return "", localCopyCandidate{}, false
 }
 
-// safeDeleteLocalRepo deletes exactly <root>/<owner>/<name>, enforcing that the
-// target stays inside the specific root it was resolved from. Every target is
-// resolved with filepath.Abs and (when it exists) filepath.EvalSymlinks; the
-// top-level target must not be a symlink, and prefix checks use the root plus a
-// separator so a sibling like /data/Models-evil never matches root /data/Models.
-// Only the exact two-level repo directory is removed, never an ancestor or a
-// sibling.
-func safeDeleteLocalRepo(root, owner, name string) error {
+// resolveLocalDeleteTarget validates that deleting <root>/<owner>/<name> is
+// safe and returns the absolute target path. The target must be exactly a
+// two-level owner/name directory inside the specific root it was resolved from;
+// every intermediate component must be a real directory (not a symlink) and the
+// leaf must not be a symlink. Prefix checks use the root plus a separator so a
+// sibling like /data/Models-evil never matches root /data/Models.
+func resolveLocalDeleteTarget(root, owner, name string) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return err
+		return "", err
 	}
 	absTarget, err := filepath.Abs(filepath.Join(absRoot, owner, name))
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	rootWithSep := absRoot + string(filepath.Separator)
 	if absTarget == absRoot || !strings.HasPrefix(absTarget+string(filepath.Separator), rootWithSep) {
-		return fmt.Errorf("target outside local root")
+		return "", fmt.Errorf("target outside local root")
 	}
 
 	rel, err := filepath.Rel(absRoot, absTarget)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("target escapes local root")
+		return "", fmt.Errorf("target escapes local root")
 	}
 	if strings.Count(rel, string(filepath.Separator)) != 1 {
-		return fmt.Errorf("target is not an owner/name directory")
+		return "", fmt.Errorf("target is not an owner/name directory")
 	}
 
 	// Validate every path component between the root and the target, not just
@@ -2094,16 +2429,16 @@ func safeDeleteLocalRepo(root, owner, name string) error {
 	// would otherwise make the leaf Lstat below resolve to the real
 	// <root>/other/<name>; os.RemoveAll would then follow the intermediate link
 	// and delete the sibling instead of the intended <root>/<owner>/<name>.
-	if err := rejectSymlinkedComponents(absRoot, absTarget); err != nil {
-		return err
+	if err := hfdownloader.RejectSymlinkedComponents(absRoot, absTarget); err != nil {
+		return "", err
 	}
 
 	info, err := os.Lstat(absTarget)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("cannot delete symlinked directory")
+		return "", fmt.Errorf("cannot delete symlinked directory")
 	}
 
 	realTarget, err := filepath.EvalSymlinks(absTarget)
@@ -2113,39 +2448,11 @@ func safeDeleteLocalRepo(root, owner, name string) error {
 			base = realRoot
 		}
 		if realTarget != base && !strings.HasPrefix(realTarget+string(filepath.Separator), base+string(filepath.Separator)) {
-			return fmt.Errorf("resolved target outside local root")
+			return "", fmt.Errorf("resolved target outside local root")
 		}
 	}
 
-	return os.RemoveAll(absTarget)
-}
-
-// rejectSymlinkedComponents ensures every path component strictly between root
-// and target (the parent of the leaf, e.g. <root>/<owner>) is a real directory
-// and not a symlink. The leaf itself is validated separately by the caller. The
-// root may legitimately be a symlink (e.g. a symlinked localDir), so it is not
-// inspected here.
-func rejectSymlinkedComponents(root, target string) error {
-	rel, err := filepath.Rel(root, target)
-	if err != nil {
-		return err
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) < 2 {
-		return nil
-	}
-	current := root
-	for _, part := range parts[:len(parts)-1] {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("cannot delete through symlinked directory %q", part)
-		}
-	}
-	return nil
+	return absTarget, nil
 }
 
 // isValidRepoComponent checks if a repository owner or name contains only safe characters.

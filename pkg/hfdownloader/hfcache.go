@@ -367,6 +367,145 @@ func (r *RepoDir) FriendlyPath() string {
 	return filepath.Join(r.cache.ModelsDir(), r.owner, r.name)
 }
 
+// FriendlyRoot returns the friendly-view namespace root for this repo's type
+// (the models/ or datasets/ directory under the cache root).
+func (r *RepoDir) FriendlyRoot() string {
+	if r.repoType == RepoTypeDataset {
+		return r.cache.DatasetsDir()
+	}
+	return r.cache.ModelsDir()
+}
+
+// FriendlyProjectionState classifies a repo's friendly-view directory.
+type FriendlyProjectionState int
+
+const (
+	// FriendlyAbsent means the friendly-view directory does not exist.
+	FriendlyAbsent FriendlyProjectionState = iota
+	// FriendlyProjection means the whole friendly-view directory is a genuine
+	// projection of this exact repo: every entry is a symlink whose lexical
+	// target lives inside this repo's hub directory, plus optional hfd.yaml
+	// manifest files. Removing it removes only links into this repo's hub.
+	FriendlyProjection
+	// FriendlyNotProjection means the directory exists but is not a proven
+	// projection of this exact repo (regular payload, a link into another
+	// repo's hub, or a symlinked path component). Callers must preserve it
+	// rather than clean it up as shared friendly-view storage.
+	FriendlyNotProjection
+)
+
+// FriendlyState reports whether this repo's friendly-view directory is a
+// genuine, whole-folder projection owned by this exact repo. Ownership is
+// proven from the filesystem rather than from the path spelling: a link whose
+// lexical target is inside this repo's hub directory still proves ownership
+// when the target is dangling (a genuine orphan friendly view), while a link
+// into another repo, a regular file, or a symlinked path component does not.
+func (r *RepoDir) FriendlyState() FriendlyProjectionState {
+	friendlyRoot := r.FriendlyRoot()
+	friendlyPath := r.FriendlyPath()
+
+	rel, err := filepath.Rel(friendlyRoot, friendlyPath)
+	if err != nil {
+		return FriendlyNotProjection
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] == "." || parts[1] == "." ||
+		parts[0] == ".." || parts[1] == ".." {
+		return FriendlyNotProjection
+	}
+
+	// Resolve the friendly path first so an absent directory is reported as
+	// absent rather than as a component-resolution failure.
+	info, err := os.Lstat(friendlyPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return FriendlyAbsent
+		}
+		return FriendlyNotProjection
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return FriendlyNotProjection
+	}
+
+	// A friendly path reached through a symlinked component is an alias, not
+	// this repo's projection (e.g. models/<owner> -> models/<other>).
+	if err := RejectSymlinkedComponents(friendlyRoot, friendlyPath); err != nil {
+		return FriendlyNotProjection
+	}
+
+	hubDir, err := filepath.Abs(r.Path())
+	if err != nil {
+		return FriendlyNotProjection
+	}
+	hubPrefix := hubDir + string(filepath.Separator)
+
+	state := FriendlyProjection
+	walkErr := filepath.WalkDir(friendlyPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		// The manifest is a real regular file written alongside the symlinks;
+		// it corroborates ownership but is not itself a link.
+		if d.Name() == ManifestFilename {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink == 0 {
+			state = FriendlyNotProjection
+			return filepath.SkipAll
+		}
+		target, lerr := os.Readlink(path)
+		if lerr != nil {
+			state = FriendlyNotProjection
+			return filepath.SkipAll
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		target, aerr := filepath.Abs(target)
+		if aerr != nil || !strings.HasPrefix(target, hubPrefix) {
+			state = FriendlyNotProjection
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return FriendlyNotProjection
+	}
+	return state
+}
+
+// RejectSymlinkedComponents returns an error when any path component strictly
+// between root and target (the parent of the leaf) is a symlink. The root is
+// allowed to be a symlink (a symlinked configured root is legitimate); the leaf
+// is validated separately by callers. This prevents resolving a symlinked
+// intermediate directory, such as <root>/<owner> -> <root>/other, into an
+// unrelated sibling.
+func RejectSymlinkedComponents(root, target string) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) < 2 {
+		return nil
+	}
+	current := root
+	for _, part := range parts[:len(parts)-1] {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("cannot use symlinked directory %q", part)
+		}
+	}
+	return nil
+}
+
 // RepoID returns the repository ID in owner/name format.
 func (r *RepoDir) RepoID() string {
 	return r.owner + "/" + r.name

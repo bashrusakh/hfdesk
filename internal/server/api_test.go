@@ -938,15 +938,33 @@ func TestAPI_CacheDelete_LocalTargetSymlink(t *testing.T) {
 	}
 }
 
+// writeFriendlyProjection creates a genuine friendly-view projection: a real
+// <cache>/models/<owner>/<name> directory holding a relative symlink whose
+// lexical target is inside the repo's hub directory. The target may be dangling
+// (an orphan friendly view). Tests that need a deletable friendly copy must use
+// this instead of regular files, because a folder of real files is not a proven
+// projection and is deliberately preserved by the delete path.
+func writeFriendlyProjection(t *testing.T, cacheDir, owner, name, linkName string) string {
+	t.Helper()
+	dir := filepath.Join(cacheDir, "models", owner, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir friendly projection: %v", err)
+	}
+	target := filepath.Join("..", "..", "..", "hub", "models--"+owner+"--"+name, "blobs", "sha256")
+	if err := os.Symlink(target, filepath.Join(dir, linkName)); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	return dir
+}
+
 // TestAPI_CacheDelete_FriendlyViewRoundTrip verifies that deleting with
 // source=Friendly view removes both the friendly <cache>/models/<owner>/<name>
-// directory and the HF hub directory in one request, returning 200.
+// projection and the HF hub directory in one request, returning 200.
 func TestAPI_CacheDelete_FriendlyViewRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
 
-	friendlyRepo := filepath.Join(cacheDir, "models", "owner", "name")
-	writeRepoFixture(t, friendlyRepo, "model.gguf")
+	friendlyRepo := writeFriendlyProjection(t, cacheDir, "owner", "name", "model.gguf")
 	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
 	writeRepoFixture(t, hubRepo, "model.gguf")
 
@@ -1077,13 +1095,13 @@ func TestAPI_CacheDelete_HFCacheNotFoundUnchanged(t *testing.T) {
 	}
 }
 
-// TestAPI_CacheDelete_OrphanFriendlyView verifies a friendly-view entry whose
-// hub directory is gone is deleted instead of reported as not found.
+// TestAPI_CacheDelete_OrphanFriendlyView verifies a genuine friendly-view
+// projection whose hub directory is gone is deleted instead of reported as not
+// found.
 func TestAPI_CacheDelete_OrphanFriendlyView(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
-	friendlyRepo := filepath.Join(cacheDir, "models", "owner", "name")
-	writeRepoFixture(t, friendlyRepo, "model.gguf")
+	friendlyRepo := writeFriendlyProjection(t, cacheDir, "owner", "name", "model.gguf")
 
 	srv := New(Config{
 		Addr:        "127.0.0.1",
@@ -2005,5 +2023,643 @@ func TestAPI_CacheInfo_HFCacheOutsideConfiguredCacheDirNotListed(t *testing.T) {
 	}
 	if _, err := os.Stat(hubRepo); err != nil {
 		t.Errorf("expected hub copy outside cacheDir to survive, stat err = %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Batch: per-copy cache deletion selectors, physical identity, and
+// partial-delete retry. Each test below fails on the pre-batch candidate
+// and passes after the fix.
+// ---------------------------------------------------------------------
+
+// deleteCacheReq issues a DELETE /api/cache/{repo} request against the
+// handler and returns the recorder.
+func deleteCacheReq(t *testing.T, srv *Server, repo string, q url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("DELETE", "/api/cache/"+repo+"?"+q.Encode(), nil)
+	req.SetPathValue("repo", repo)
+	w := httptest.NewRecorder()
+	srv.handleCacheDelete(w, req)
+	return w
+}
+
+// decodeDeleteSuccess decodes a delete success body and reports whether the
+// machine-readable incomplete-cleanup signal was set.
+func decodeDeleteSuccess(t *testing.T, w *httptest.ResponseRecorder) (bool, map[string]any) {
+	t.Helper()
+	var resp struct {
+		Success           bool     `json:"success"`
+		CleanupIncomplete bool     `json:"cleanupIncomplete"`
+		CleanupWarnings   []string `json:"cleanupWarnings"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode delete response: %v (body=%s)", err, w.Body.String())
+	}
+	if !resp.Success {
+		t.Errorf("success = false in a 200 response: %s", w.Body.String())
+	}
+	return resp.CleanupIncomplete, map[string]any{"warnings": resp.CleanupWarnings}
+}
+
+// TestAPI_CacheDelete_UnknownSourceWithValidPathRejected is defect A: an
+// unknown non-empty source must be rejected 400 before the by-path branch even
+// when a valid copy path is supplied, so a typo cannot delete the wrong copy.
+func TestAPI_CacheDelete_UnknownSourceWithValidPathRejected(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
+	friendlyRepo := writeFriendlyProjection(t, cacheDir, "owner", "name", "model.gguf")
+	localRepo := filepath.Join(localDir, "owner", "name")
+	writeRepoFixture(t, hubRepo, "model.gguf")
+	writeRepoFixture(t, localRepo, "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, "owner/name")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("no Local copy in %#v", info.Copies)
+	}
+
+	// Unknown label plus a perfectly valid path: must still be 400, nothing
+	// deleted.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", "locle")
+	q.Set("path", localCopy.Path)
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown source with valid path = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	for _, path := range []string{hubRepo, friendlyRepo, localRepo} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("expected %s to survive rejected delete, stat err = %v", path, err)
+		}
+	}
+
+	// A known-but-conflicting label is not a new invalid-input requirement: the
+	// supplied path still selects the actual copy (valid-path precedence).
+	q = url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("path", localCopy.Path)
+	w = deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("known source with valid path = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(localRepo); !os.IsNotExist(err) {
+		t.Errorf("expected pathed Local copy deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(hubRepo); err != nil {
+		t.Errorf("expected hub copy to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_ScanDirEqualToCacheDirNoAncestorDelete is defect B1:
+// localScanDirs=[cacheDir] must keep SkipSpecial, so /cache/models/victim with
+// two model folders is NOT advertised as Local repo models/victim and deleting
+// that repo does not remove both folders (synthetic ancestor deletion).
+func TestAPI_CacheDelete_ScanDirEqualToCacheDirNoAncestorDelete(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	// Two independent repos under the friendly namespace.
+	one := filepath.Join(cacheDir, "models", "alice", "one")
+	two := filepath.Join(cacheDir, "models", "bob", "two")
+	writeRepoFixture(t, one, "one.gguf")
+	writeRepoFixture(t, two, "two.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{cacheDir},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	// The friendly namespace's direct child "models" must stay special-cased.
+	req := httptest.NewRequest("GET", "/api/cache", nil)
+	w := httptest.NewRecorder()
+	srv.handleCacheList(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache list = %d: %s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range list.Repos {
+		if r.Repo == "models/victim" || r.Repo == "models/alice" || r.Repo == "models/bob" {
+			t.Errorf("synthetic ancestor repo %q advertised: %#v", r.Repo, r)
+		}
+	}
+
+	// Deleting the synthetic repo must not remove the two real repos.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	w = deleteCacheReq(t, srv, "models/victim", q)
+	if w.Code == http.StatusOK {
+		t.Errorf("delete of synthetic ancestor repo unexpectedly succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(one); err != nil {
+		t.Errorf("expected alice/one to survive, stat err = %v", err)
+	}
+	if _, err := os.Stat(two); err != nil {
+		t.Errorf("expected bob/two to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_ExplicitCacheModelsRootKeepsIndependentLocal is defect B2:
+// an explicit Local root at <cache>/models may hold independent real files; a
+// same-named hub entry must not hide it, and deleting the HF copy must not
+// remove it.
+func TestAPI_CacheDelete_ExplicitCacheModelsRootKeepsIndependentLocal(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	modelsRoot := filepath.Join(cacheDir, "models")
+
+	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
+	writeRepoFixture(t, hubRepo, "blob")
+	// Real independent Local storage under an explicit Local root at
+	// <cache>/models.
+	realLocal := filepath.Join(modelsRoot, "owner", "name")
+	writeRepoFixture(t, realLocal, "real.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{modelsRoot},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	info := cacheInfoForTest(t, srv, "owner/name")
+	if copy := cacheCopyBySource(info.Copies, cacheSourceHFCache); copy == nil {
+		t.Errorf("expected HF cache copy in %#v", info.Copies)
+	}
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("independent real Local copy hidden: %#v", info.Copies)
+	}
+	if filepath.Clean(localCopy.Path) != filepath.Clean(realLocal) {
+		t.Errorf("Local copy path = %q, want %q", localCopy.Path, realLocal)
+	}
+
+	// Deleting the HF copy must not remove the independent real Local folder.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("path", filepath.Join(hubRepo))
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF-cache by-path delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(hubRepo); !os.IsNotExist(err) {
+		t.Errorf("expected hub copy deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(realLocal); err != nil {
+		t.Errorf("independent real Local folder must survive HF delete, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_OrphanFriendlyOwnerAliasPreserved is defect B3: an owner
+// alias /cache/models/orphan-alias -> /cache/models/other-orphan must not be
+// advertised as repo orphan-alias/name, and deleting that repo must not remove
+// the other repo's projection.
+func TestAPI_CacheDelete_OrphanFriendlyOwnerAliasPreserved(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+
+	// Real orphan friendly projection for other-orphan/name.
+	realProjection := writeFriendlyProjection(t, cacheDir, "other-orphan", "name", "model.gguf")
+	// Owner alias: models/orphan-alias -> models/other-orphan.
+	aliasOwner := filepath.Join(cacheDir, "models", "orphan-alias")
+	if err := os.Symlink(filepath.Join(cacheDir, "models", "other-orphan"), aliasOwner); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// The alias must not resolve to a listed repo.
+	req := httptest.NewRequest("GET", "/api/cache", nil)
+	w := httptest.NewRecorder()
+	srv.handleCacheList(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache list = %d: %s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range list.Repos {
+		if r.Repo == "orphan-alias/name" {
+			t.Errorf("owner alias advertised as repo: %#v", r)
+		}
+	}
+
+	// Deleting the alias repo must not remove the other repo's projection.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	w = deleteCacheReq(t, srv, "orphan-alias/name", q)
+	if w.Code == http.StatusOK {
+		t.Errorf("delete via orphan alias unexpectedly succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(realProjection); err != nil {
+		t.Errorf("other orphan's projection must survive alias delete, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheInfo_SymlinkedRootAliasVsTwoCaseRoots is defect B4: a configured
+// symlinked root plus its real path must collapse to one physical copy, while
+// two truly distinct case-sensitive roots whose lowercased spellings collide
+// must both stay visible.
+func TestAPI_CacheInfo_SymlinkedRootAliasVsTwoCaseRoots(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+
+	realRoot := filepath.Join(root, "real-local")
+	aliasRoot := filepath.Join(root, "alias-local")
+	writeRepoFixture(t, filepath.Join(realRoot, "owner", "name"), "model.gguf")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	// Two roots whose lowercased spellings collide. On a case-sensitive
+	// filesystem they are distinct directories; skip on a case-insensitive
+	// filesystem where the second creation resolves to the same directory.
+	upper := filepath.Join(root, "ModelsRoot")
+	lower := filepath.Join(root, "modelsroot")
+	writeRepoFixture(t, filepath.Join(upper, "owner", "name"), "upper.gguf")
+	writeRepoFixture(t, filepath.Join(lower, "owner", "name"), "lower.gguf")
+	upperInfo, errU := os.Stat(upper)
+	lowerInfo, errL := os.Stat(lower)
+	if errU == nil && errL == nil && os.SameFile(upperInfo, lowerInfo) {
+		t.Skip("case-insensitive filesystem: cannot test case-distinct roots")
+	}
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalDir:      aliasRoot,
+		LocalScanDirs: []string{realRoot},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	// Symlinked root + real path collapse to one physical Local copy.
+	info := cacheInfoForTest(t, srv, "owner/name")
+	if got := countCacheCopiesBySource(info.Copies, cacheSourceLocal); got != 1 {
+		t.Errorf("Local copies for symlinked root + real path = %d, want 1. copies=%#v", got, info.Copies)
+	}
+
+	// Two case-distinct roots whose lowercased forms collide must both stay
+	// visible (the old lowercased dedup merged them).
+	srv2 := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{upper, lower},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+	info2 := cacheInfoForTest(t, srv2, "owner/name")
+	if got := countCacheCopiesBySource(info2.Copies, cacheSourceLocal); got != 2 {
+		t.Errorf("Local copies for two case-colliding roots = %d, want 2. copies=%#v", got, info2.Copies)
+	}
+}
+
+// TestAPI_CacheDelete_LocalPartialThenRetry is defect C2: after a partial local
+// delete (weights removed, a protected remainder left) the identical retry
+// must succeed and remove only the remainder.
+func TestAPI_CacheDelete_LocalPartialThenRetry(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	localRepo := filepath.Join(localDir, "owner", "name")
+	writeRepoFixture(t, localRepo, "model.gguf")
+	// A remainder that is not a weight file.
+	remainder := filepath.Join(localRepo, "config.json")
+	if err := os.WriteFile(remainder, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	siblingRepo := filepath.Join(localDir, "owner", "sibling")
+	writeRepoFixture(t, siblingRepo, "sibling.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// Force a real partial state: the delete validates and records the target,
+	// then fails before removal; the test removes the weight file to simulate
+	// the remainder a protected config.json would leave.
+	srv.deleteStepHook = func(step string) error {
+		if step == "local:before-remove" {
+			_ = os.Remove(filepath.Join(localRepo, "model.gguf"))
+			return fmt.Errorf("injected partial failure")
+		}
+		return nil
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localRepo)
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("partial local delete = %d, want 500. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(localRepo); err != nil {
+		t.Fatalf("expected remainder to survive partial delete, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(localRepo, "config.json")); err != nil {
+		t.Fatalf("expected config.json remainder, stat err = %v", err)
+	}
+
+	// The identical retry must succeed and remove the remainder.
+	srv.deleteStepHook = nil
+	w = deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("identical retry after partial = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(localRepo); !os.IsNotExist(err) {
+		t.Errorf("expected remainder removed on retry, stat err = %v", err)
+	}
+	if _, err := os.Stat(siblingRepo); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_UnrelatedEmptyTwoLevelFolderStaysIneligible is defect C2:
+// retry eligibility must not degrade into accepting any empty/two-level folder.
+// A different, unrelated empty owner/name folder must remain non-deletable.
+func TestAPI_CacheDelete_UnrelatedEmptyTwoLevelFolderStaysIneligible(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+
+	// A partial delete for owner/name leaves evidence.
+	localRepo := filepath.Join(localDir, "owner", "name")
+	writeRepoFixture(t, localRepo, "model.gguf")
+
+	// An unrelated empty two-level folder must never be eligible.
+	unrelated := filepath.Join(localDir, "owner", "unrelated-empty")
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	srv.deleteStepHook = func(step string) error {
+		if step == "local:before-remove" {
+			_ = os.Remove(filepath.Join(localRepo, "model.gguf"))
+			return fmt.Errorf("injected partial failure")
+		}
+		return nil
+	}
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localRepo)
+	if w := deleteCacheReq(t, srv, "owner/name", q); w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected partial 500, got %d: %s", w.Code, w.Body.String())
+	}
+	srv.deleteStepHook = nil
+
+	// A no-path delete for the unrelated empty repo must still be 404.
+	q2 := url.Values{}
+	q2.Set("type", "model")
+	q2.Set("source", cacheSourceLocal)
+	w := deleteCacheReq(t, srv, "owner/unrelated-empty", q2)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unrelated empty folder delete = %d, want 404. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated empty folder must survive, stat err = %v", err)
+	}
+
+	// The retained owner/name evidence must not authorize the unrelated path.
+	q3 := url.Values{}
+	q3.Set("type", "model")
+	q3.Set("source", cacheSourceLocal)
+	q3.Set("path", unrelated)
+	w = deleteCacheReq(t, srv, "owner/name", q3)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unrelated path with owner/name repo = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated path must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_ChangedTargetBeforeRetryInvalidates is defect C2: retry
+// eligibility is bound to the configured root, so a changed root invalidates
+// the continuation rather than redirecting it to another copy.
+func TestAPI_CacheDelete_ChangedTargetBeforeRetryInvalidates(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	otherDir := filepath.Join(root, "other")
+	localRepo := filepath.Join(localDir, "owner", "name")
+	otherRepo := filepath.Join(otherDir, "owner", "name")
+	writeRepoFixture(t, localRepo, "model.gguf")
+	writeRepoFixture(t, otherRepo, "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	srv.deleteStepHook = func(step string) error {
+		if step == "local:before-remove" {
+			_ = os.Remove(filepath.Join(localRepo, "model.gguf"))
+			return fmt.Errorf("injected partial failure")
+		}
+		return nil
+	}
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localRepo)
+	if w := deleteCacheReq(t, srv, "owner/name", q); w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected partial 500, got %d: %s", w.Code, w.Body.String())
+	}
+	srv.deleteStepHook = nil
+
+	// Change the configured Local root: the recorded target no longer belongs
+	// to an authorized root, so the identical retry must NOT succeed and must
+	// not delete the other copy instead.
+	srv.configMu.Lock()
+	srv.config.LocalDir = otherDir
+	srv.configMu.Unlock()
+
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code == http.StatusOK {
+		t.Errorf("retry after root change unexpectedly succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(otherRepo); err != nil {
+		t.Errorf("other copy must survive invalidated retry, stat err = %v", err)
+	}
+	if _, err := os.Stat(localRepo); err != nil {
+		t.Errorf("original remainder must survive invalidated retry, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_HFRemovedProtectedProjectionIncomplete is defect C1: when
+// the HF hub directory is removed but the friendly projection cleanup is
+// protected, the response must still report primary success while exposing a
+// machine-readable incomplete-cleanup signal.
+func TestAPI_CacheDelete_HFRemovedProtectedProjectionIncomplete(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
+	writeRepoFixture(t, hubRepo, "blob")
+	friendlyRepo := writeFriendlyProjection(t, cacheDir, "owner", "name", "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+	srv.deleteStepHook = func(step string) error {
+		if step == "hf:friendly-cleanup" {
+			return fmt.Errorf("injected protected projection failure")
+		}
+		return nil
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF delete with protected projection = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, _ := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true, got body %s", w.Body.String())
+	}
+	if _, err := os.Stat(hubRepo); !os.IsNotExist(err) {
+		t.Errorf("expected hub removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(friendlyRepo); err != nil {
+		t.Errorf("protected projection must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_HFFriendlyCleanupOfRealFolderPreservedAndSignaled
+// verifies that a friendly directory containing real files is never removed by
+// an HF-cache delete (safe default) and that the response exposes the
+// incomplete-cleanup signal rather than silently reporting full success.
+func TestAPI_CacheDelete_HFFriendlyCleanupOfRealFolderPreservedAndSignaled(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
+	writeRepoFixture(t, hubRepo, "blob")
+	// A real friendly folder (regular files, not a symlink projection).
+	friendlyRepo := filepath.Join(cacheDir, "models", "owner", "name")
+	writeRepoFixture(t, friendlyRepo, "real.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF delete with real friendly folder = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, _ := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true for preserved real folder, got %s", w.Body.String())
+	}
+	if _, err := os.Stat(hubRepo); !os.IsNotExist(err) {
+		t.Errorf("expected hub removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(friendlyRepo); err != nil {
+		t.Errorf("real friendly folder must be preserved, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_SymlinkedConfiguredRootWorks preserves the behavior that
+// a configured root may itself be a symlink: only components below the root are
+// restricted, so a repo directly under a symlinked root is still deletable.
+func TestAPI_CacheDelete_SymlinkedConfiguredRootWorks(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	realRoot := filepath.Join(root, "real-local")
+	linkRoot := filepath.Join(root, "link-local")
+	repoDir := filepath.Join(realRoot, "owner", "name")
+	writeRepoFixture(t, repoDir, "model.gguf")
+	sibling := filepath.Join(realRoot, "owner", "sibling")
+	writeRepoFixture(t, sibling, "sibling.gguf")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    linkRoot,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	w := deleteCacheReq(t, srv, "owner/name", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete under symlinked configured root = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected repo under symlinked root deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
 	}
 }

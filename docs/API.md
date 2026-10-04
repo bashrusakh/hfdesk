@@ -165,6 +165,19 @@ Any other `source` value is rejected with `400` before anything is deleted.
 
 When `source` is omitted and no matching HF-cache entry exists, the handler falls back to the local roots so existing clients can still delete locally stored repos.
 
+A successful `DELETE` normally responds with `{"success": true, "message": "..."}`. When the primary copy was removed but a companion cleanup step (the friendly-view projection) could not be completed — for example because the friendly-view directory is a real folder rather than a proven projection, or because removing it failed — the response keeps the same `200` success status and adds:
+
+```json
+{
+  "success": true,
+  "message": "Deleted owner/name from cache",
+  "cleanupIncomplete": true,
+  "cleanupWarnings": ["friendly view is not a whole-folder projection of this repository; left in place"]
+}
+```
+
+The primary deletion still succeeded; clients that can warn should surface `cleanupWarnings`. The friendly view is only deleted when it is a proven whole-folder projection of this exact repo, and is left in place otherwise.
+
 Cache entries may come from:
 
 - `HF cache`

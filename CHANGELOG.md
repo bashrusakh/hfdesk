@@ -6,6 +6,8 @@
 
 - Delete local and friendly-view repositories from the Cache browser, not just HF-cache entries (#63)
 - Cache repository details now list every physical copy (HF cache, the friendly view only when it is an orphan whose hub entry is gone, and each local root), each deletable on its own so a repo stored in both the HF cache and a local folder can be cleaned up per location (#63)
+- Delete responses now report `cleanupIncomplete` with `cleanupWarnings` when the primary copy was removed but a companion cleanup was left incomplete, and the UI shows a warning toast instead of a plain success (#63)
+- The friendly view is only removed when it is a proven whole-folder projection of the deleted repo; a real folder or a link into another repo is preserved and reported as incomplete cleanup (#63)
 
 ### Fixed
 
