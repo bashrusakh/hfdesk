@@ -65,13 +65,13 @@ DATA_ROOT="/data"
 
 # Apply the requested umask before either exec path. This is just a process
 # attribute, so it is harmless (and still honored) when running non-root.
-case "$UMASK" in
-    '' | *[!0-7]*)
-        echo "entrypoint: UMASK must be an octal mask such as 022 (got '$UMASK')" >&2
-        exit 64
-        ;;
-esac
-umask "$UMASK"
+# Let umask itself validate: a character-allowlist check would accept values
+# like 7777 that are all-octal but too large for the shell to apply, producing
+# a raw umask failure (exit 2) instead of this friendly error.
+if ! umask "$UMASK" 2>/dev/null; then
+    echo "entrypoint: UMASK must be an octal mask such as 022 (got '$UMASK')" >&2
+    exit 64
+fi
 
 # Already non-root: honor the caller's UID/GID as-is and never chown. The
 # world-writable data root lets any UID create its state directories.

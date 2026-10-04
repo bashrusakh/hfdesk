@@ -88,9 +88,19 @@ RUN apk add --no-cache ca-certificates tzdata su-exec
 # "nobody"), so `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`
 # on a NAS/homelab host can collide with an existing entry. Rather than fail
 # the build, reuse the existing group/account for that ID and record its name;
-# the entrypoint remaps by the resolved name. Genuine misconfiguration (a
-# non-numeric or out-of-range ID) still fails in addgroup/adduser.
+# the entrypoint remaps by the resolved name.
+#
+# UID/GID must be numeric so the image never bakes a name into HFDESK_UID/GID
+# (which the entrypoint then rejects at runtime with exit 64). A non-numeric
+# value is refused here at build time; an out-of-range numeric ID still fails
+# in addgroup/adduser.
 RUN set -eu; \
+    case "$GID" in \
+      '' | *[!0-9]*) echo "error: GID must be a numeric id (got '$GID')" >&2; exit 1 ;; \
+    esac; \
+    case "$UID" in \
+      '' | *[!0-9]*) echo "error: UID must be a numeric id (got '$UID')" >&2; exit 1 ;; \
+    esac; \
     if getent group "$GID" >/dev/null; then \
       hfdesk_group="$(getent group "$GID" | cut -d: -f1)"; \
     else \
