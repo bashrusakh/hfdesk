@@ -200,6 +200,19 @@ Any other `source` value is rejected with `400` before anything is deleted.
 
 `DELETE` also accepts an optional `path` query parameter that addresses one exact copy. The server recomputes the allowed copy paths for the repo and deletes only when the requested path equals one of them after normalization; otherwise it returns `400` and deletes nothing. The copy's source decides which safe deleter runs (`HF cache`/`Friendly view` use the hub/friendly logic with containment checks; `Local` uses the local safe delete with root-component symlink checks). When `path` is omitted, the `source`-based behavior above applies.
 
+Without `variant`, `DELETE` removes the **entire copy** at the selected location. A Local whole-copy delete refuses to remove a folder that encloses a configured root (`localDir`, a `localScanDirs` entry, or a `downloadRoutes` destination), returning an error and deleting nothing, because removing the folder would also destroy the nested configured root. Such an enclosing folder may still be listed as a repo (it owns its own weights) and may still support selective delete; only the whole-folder `RemoveAll` is refused.
+
+`DELETE` additionally accepts an optional `variant` query parameter that performs a **selective (per-artifact) delete**: it removes exactly the server-computed file set of one artifact (for example one GGUF quantisation) instead of the whole copy. `variant` is orthogonal to `source` and `path` and is processed for a resolved `Local` copy or an `HF cache`/`Friendly view` copy.
+
+- The `variant` token is validated server-side against the copy's own detected artifacts; a token the copy does not advertise is rejected with `400` and nothing is deleted. The server never trusts an arbitrary token.
+- For a `Local` GGUF copy the allowed tokens are the detected quantisation labels (e.g. `Q4_K_M`, `UD_Q6_K`). All files of the quant are removed together, so split/sharded quants (`...-00001-of-00002.gguf`) lose every shard. Matching is anchored to the file's detected quantisation label, so `mmproj` companions and unrelated files are never selected.
+- For a `HF cache`/`Friendly view` copy the `variant` is mapped through the copy's `hfd.yaml` per-file manifest (`files[].name`); the matching blob, snapshot links, and friendly-view links are removed. When no usable manifest exists, selective delete is refused with `400` rather than guessing.
+- For a Local non-GGUF copy without provenance (for example a `safetensors`/diffusers folder), selective delete is refused with `400` ("selective delete needs provenance"); only an entire-copy delete is available.
+- After deleting, directories that became empty are pruned. The copy directory itself is removed only when it is fully empty; files that did not match the variant are never touched.
+- The response reports the truthful counts, for example `{"success": true, "variant": "Q4_K_M", "deletedFiles": 2, "deletedBytes": 12345}`. If some matched files could not be removed, the response adds `cleanupIncomplete`/`cleanupWarnings` as above.
+
+Whole-copy delete keeps working unchanged for callers that do not pass `variant`.
+
 When `source` is omitted and no matching HF-cache entry exists, the handler falls back to the local roots so existing clients can still delete locally stored repos.
 
 A successful `DELETE` normally responds with `{"success": true, "message": "..."}`. When the primary copy was removed but a companion cleanup step (the friendly-view projection) could not be completed — for example because the friendly-view directory is a real folder rather than a proven projection, or because removing it failed — the response keeps the same `200` success status and adds:
@@ -231,9 +244,12 @@ Under a raw cache root (the cache dir used directly as a local root), `Local` en
   "path": "/home/user/.cache/huggingface/hub/models--owner--name",
   "size": 12345,
   "sizeHuman": "12.1 KiB",
-  "fileCount": 4
+  "fileCount": 4,
+  "selectiveVariants": ["Q4_K_M", "Q8_0"]
 }
 ```
+
+`selectiveVariants` lists the artifact tokens this copy supports for selective deletion with `DELETE ...&variant=<token>`: the detected GGUF quantisation labels for a Local copy, or the `hfd.yaml` filename tokens for an `HF cache`/`Friendly view` copy. It is omitted (or empty) when the copy cannot support selective delete — a Local non-GGUF folder without provenance, or an HF/friendly copy with no manifest — in which case the UI offers only an entire-copy delete.
 
 `Friendly view` is not listed alongside the HF cache entry because it is the same underlying storage; it appears only as an orphan when the hub directory is absent. The `copies` key is always present in a current server's response, possibly as an empty `[]` when the repo has no deletable copies; a missing key means an older server and is why the UI keeps a legacy fallback delete button.
 

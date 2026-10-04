@@ -4048,3 +4048,406 @@ func TestPathIdentityKey_CaseFoldByPlatform(t *testing.T) {
 		}
 	}
 }
+
+// writeCacheFiles creates dir and each named file (with non-empty content) so a
+// test can build a multi-artifact copy without repeated boilerplate.
+func writeCacheFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// Batch: whole-copy vs variant delete split (PR #70 contract). A whole-copy
+// delete must refuse to RemoveAll an enclosure that holds a configured root,
+// while listing still advertises that enclosure (upstream #66), and a variant
+// delete removes exactly one artifact's file set.
+// ---------------------------------------------------------------------
+
+// TestAPI_CacheDelete_WholeCopyRefusesEnclosingConfiguredRoot is the strict
+// delete predicate: a repo that is advertised because it owns its own weight
+// file must NOT be removable by whole-copy delete when it encloses a configured
+// Local root (localDir or a download-route destination). Deleting it would
+// RemoveAll the nested configured root. Listing stays unchanged.
+func TestAPI_CacheDelete_WholeCopyRefusesEnclosingConfiguredRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		localDir     string // when set, the enclosed configured root
+		route        string // when set, the enclosed configured root
+		enclosedFile string
+	}{
+		{
+			name:         "enclosed-local-dir",
+			localDir:     "parent/real/nested",
+			enclosedFile: "parent/real/nested/owner/model/nested.gguf",
+		},
+		{
+			name:         "enclosed-route-dir",
+			route:        "parent/real/routed",
+			enclosedFile: "parent/real/routed/owner/model/routed.gguf",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			cacheDir := filepath.Join(root, "cache")
+			scanRoot := filepath.Join(root, "scan")
+			enclosure := filepath.Join(scanRoot, "parent", "real")
+			// The enclosure owns its own weight file, so upstream listing must
+			// advertise it as a real repo.
+			writeCacheFiles(t, enclosure, "own-Q4_K_M.gguf")
+			// The configured root nested inside the enclosure.
+			writeCacheFiles(t, filepath.Join(scanRoot, filepath.FromSlash(tc.enclosedFile)))
+
+			cfg := Config{
+				Addr:          "127.0.0.1",
+				Port:          0,
+				CacheDir:      cacheDir,
+				LocalScanDirs: []string{scanRoot},
+				Concurrency:   2,
+				MaxActive:     1,
+			}
+			if tc.localDir != "" {
+				cfg.LocalDir = filepath.Join(scanRoot, filepath.FromSlash(tc.localDir))
+			}
+			if tc.route != "" {
+				cfg.DownloadRoutes = map[string]string{"llm": filepath.Join(scanRoot, filepath.FromSlash(tc.route))}
+			}
+			srv := New(cfg)
+
+			// Listing parity: the enclosure is advertised as a Local copy.
+			info := cacheInfoForTest(t, srv, "parent/real")
+			if copy := cacheCopyBySource(info.Copies, cacheSourceLocal); copy == nil {
+				t.Fatalf("enclosure not advertised as Local copy: %#v", info.Copies)
+			}
+
+			// Whole-copy delete of the enclosure must be refused and delete
+			// nothing: it encloses a configured root.
+			q := url.Values{}
+			q.Set("type", "model")
+			q.Set("source", cacheSourceLocal)
+			q.Set("path", enclosure)
+			w := deleteCacheReq(t, srv, "parent/real", q)
+			if w.Code == http.StatusOK {
+				t.Fatalf("whole-copy delete of enclosure with nested configured root succeeded: %s", w.Body.String())
+			}
+			if _, err := os.Stat(filepath.Join(enclosure, "own-Q4_K_M.gguf")); err != nil {
+				t.Errorf("enclosure's own weight must survive refused delete, stat err = %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(scanRoot, filepath.FromSlash(tc.enclosedFile))); err != nil {
+				t.Errorf("nested configured root's file must survive refused delete, stat err = %v", err)
+			}
+		})
+	}
+}
+
+// TestAPI_CacheDelete_WholeCopyStandaloneStillSucceeds is the positive control
+// for the strict predicate: a normal copy that encloses no configured root is
+// still removable by whole-copy delete.
+func TestAPI_CacheDelete_WholeCopyStandaloneStillSucceeds(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "owner", "name")
+	writeCacheFiles(t, repoDir, "model.gguf")
+	sibling := filepath.Join(localDir, "owner", "sibling")
+	writeCacheFiles(t, sibling, "sibling.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv, "owner/name", q); w.Code != http.StatusOK {
+		t.Fatalf("standalone local delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected standalone copy removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantLocalGGUF is the core selective-delete contract: a
+// variant delete removes exactly the detected quant's files, leaves every other
+// quant and companion, prunes nothing that still holds files, rejects an unknown
+// token without deleting anything, and removes all shards of a split quant.
+func TestAPI_CacheDelete_VariantLocalGGUF(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "qwen")
+	writeCacheFiles(t, repoDir,
+		"model-IQ3_XS.gguf",
+		"model-Q4_K_M.gguf",
+		"model-Q8_0.gguf",
+		"model-Q6_K.gguf",
+		"model-Q5_K_M-00001-of-00002.gguf",
+		"model-Q5_K_M-00002-of-00002.gguf",
+		"mmproj-F16.gguf",
+		"config.json",
+	)
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// The copy advertises the detected quants as selective variants.
+	info := cacheInfoForTest(t, srv, "alice/qwen")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("local copy not listed: %#v", info.Copies)
+	}
+	for _, want := range []string{"IQ3_XS", "Q4_K_M", "Q8_0", "Q6_K", "Q5_K_M"} {
+		if !slicesContains(localCopy.SelectiveVariants, want) {
+			t.Errorf("SelectiveVariants %v missing %s", localCopy.SelectiveVariants, want)
+		}
+	}
+
+	deleteVariant := func(variant string) *httptest.ResponseRecorder {
+		q := url.Values{}
+		q.Set("type", "model")
+		q.Set("source", cacheSourceLocal)
+		q.Set("path", localCopy.Path)
+		q.Set("variant", variant)
+		return deleteCacheReq(t, srv, "alice/qwen", q)
+	}
+
+	// Unknown variant: 400 and nothing deleted.
+	w := deleteVariant("IQ3_XXS")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown variant = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-IQ3_XS.gguf")); err != nil {
+		t.Errorf("unknown variant must delete nothing, IQ3_XS gone: %v", err)
+	}
+
+	// Delete one quant: only its file goes, directory and companions stay.
+	w = deleteVariant("IQ3_XS")
+	if w.Code != http.StatusOK {
+		t.Fatalf("variant IQ3_XS delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-IQ3_XS.gguf")); !os.IsNotExist(err) {
+		t.Errorf("expected IQ3_XS removed, stat err = %v", err)
+	}
+	for _, keep := range []string{"model-Q4_K_M.gguf", "model-Q8_0.gguf", "model-Q6_K.gguf", "mmproj-F16.gguf", "config.json"} {
+		if _, err := os.Stat(filepath.Join(repoDir, keep)); err != nil {
+			t.Errorf("variant delete removed unrelated file %s: %v", keep, err)
+		}
+	}
+	if _, err := os.Stat(repoDir); err != nil {
+		t.Errorf("copy directory must survive a variant delete: %v", err)
+	}
+
+	// Split quant: all shards of Q5_K_M are removed together.
+	w = deleteVariant("Q5_K_M")
+	if w.Code != http.StatusOK {
+		t.Fatalf("variant Q5_K_M delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	for _, gone := range []string{"model-Q5_K_M-00001-of-00002.gguf", "model-Q5_K_M-00002-of-00002.gguf"} {
+		if _, err := os.Stat(filepath.Join(repoDir, gone)); !os.IsNotExist(err) {
+			t.Errorf("expected shard %s removed, stat err = %v", gone, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); err != nil {
+		t.Errorf("split delete must leave other quants, Q4_K_M gone: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantLocalNonGGUFRejected covers the provenance caveat:
+// a Local non-GGUF (safetensors) copy has no manifest, so selective delete is
+// refused with 400 and deletes nothing; only entire-copy is available.
+func TestAPI_CacheDelete_VariantLocalNonGGUFRejected(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "diff")
+	writeCacheFiles(t, repoDir, "model.safetensors", "config.json")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, "alice/diff")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("local copy not listed: %#v", info.Copies)
+	}
+	if len(localCopy.SelectiveVariants) != 0 {
+		t.Errorf("non-GGUF copy advertised selective variants: %v", localCopy.SelectiveVariants)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localCopy.Path)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, "alice/diff", q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("non-GGUF selective delete = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model.safetensors")); err != nil {
+		t.Errorf("rejected selective delete must delete nothing: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantOnEnclosingCopyLeavesNestedRoot covers the split
+// from the selective-delete side: a copy that whole-copy delete refuses (it
+// encloses a configured root) still supports a variant delete of its own
+// on-disk quant, and the nested configured root is untouched.
+func TestAPI_CacheDelete_VariantOnEnclosingCopyLeavesNestedRoot(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	scanRoot := filepath.Join(root, "scan")
+	enclosure := filepath.Join(scanRoot, "parent", "real")
+	writeCacheFiles(t, enclosure, "own-Q4_K_M.gguf", "own-Q8_0.gguf")
+	// A configured Local root nested inside the enclosure, holding its own
+	// weight file at a deeper path.
+	nested := filepath.Join(enclosure, "nested")
+	writeCacheFiles(t, filepath.Join(nested, "owner", "model"), "nested-Q4_K_M.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalScanDirs: []string{scanRoot},
+		LocalDir:      nested,
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	info := cacheInfoForTest(t, srv, "parent/real")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("enclosure not listed: %#v", info.Copies)
+	}
+	if !slicesContains(localCopy.SelectiveVariants, "Q4_K_M") {
+		t.Fatalf("SelectiveVariants = %v, want Q4_K_M", localCopy.SelectiveVariants)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localCopy.Path)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, "parent/real", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("variant delete on enclosure = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(enclosure, "own-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Errorf("expected own Q4_K_M removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(enclosure, "own-Q8_0.gguf")); err != nil {
+		t.Errorf("own Q8_0 must survive: %v", err)
+	}
+	// The nested configured root's file must never be selected by the enclosing
+	// copy's variant delete.
+	if _, err := os.Stat(filepath.Join(nested, "owner", "model", "nested-Q4_K_M.gguf")); err != nil {
+		t.Errorf("nested configured root's file must survive: %v", err)
+	}
+}
+
+// HF-cache/friendly copy using its hfd.yaml per-file provenance: the variant's
+// blob and friendly link are removed while another quant's files survive.
+func TestAPI_CacheDelete_VariantHFManifest(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "qwen"
+
+	hubRepo := filepath.Join(cacheDir, "hub", "models--alice--qwen")
+	writeCacheFiles(t, filepath.Join(hubRepo, "blobs"), "sha_keep", "sha_go")
+	// A friendly projection directory (regular dir) holding the manifest plus
+	// links named after each original file.
+	friendlyDir := filepath.Join(cacheDir, "models", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "model",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			{Name: "model-Q4_K_M.gguf", Blob: "blobs/sha_go", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// Friendly links named after the files, pointing into the hub blobs.
+	for file, blob := range map[string]string{
+		"model-Q4_K_M.gguf": "sha_go",
+		"model-Q8_0.gguf":   "sha_keep",
+	} {
+		target := filepath.Join("..", "..", "..", "hub", "models--alice--qwen", "blobs", blob)
+		if err := os.Symlink(target, filepath.Join(friendlyDir, file)); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, owner+"/"+name)
+	hfCopy := cacheCopyBySource(info.Copies, cacheSourceHFCache)
+	if hfCopy == nil {
+		t.Fatalf("HF copy not listed: %#v", info.Copies)
+	}
+	if !slicesContains(hfCopy.SelectiveVariants, "Q4_K_M") || !slicesContains(hfCopy.SelectiveVariants, "Q8_0") {
+		t.Fatalf("HF copy SelectiveVariants = %v, want Q4_K_M and Q8_0", hfCopy.SelectiveVariants)
+	}
+
+	// Unknown variant refuses first.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q6_K")
+	if w := deleteCacheReq(t, srv, owner+"/"+name, q); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown HF variant = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF variant delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_go")); !os.IsNotExist(err) {
+		t.Errorf("expected variant blob removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_keep")); err != nil {
+		t.Errorf("other quant's blob must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(friendlyDir, "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Errorf("expected variant friendly link removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(friendlyDir, "model-Q8_0.gguf")); err != nil {
+		t.Errorf("other quant's friendly link must survive: %v", err)
+	}
+}

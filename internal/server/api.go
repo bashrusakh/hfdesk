@@ -799,6 +799,12 @@ type CacheCopy struct {
 	Size      int64  `json:"size"`
 	SizeHuman string `json:"sizeHuman"`
 	FileCount int    `json:"fileCount"`
+	// SelectiveVariants lists the artifact tokens this copy supports for
+	// selective (per-variant) deletion, computed server-side from the copy's own
+	// GGUF quantisation labels (Local) or its hfd.yaml manifest (HF/friendly).
+	// Empty/omitted means only an entire-copy delete is available, so the UI can
+	// avoid offering variant buttons the server would reject.
+	SelectiveVariants []string `json:"selectiveVariants,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -1174,10 +1180,8 @@ func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
 }
 
 // localLeafRepoIsDeletable reports whether absTarget is a genuine Local model
-// directory that may be advertised and deleted. It is the single ownership
-// predicate shared by enumeration (localCopyCandidates, the cache list, and
-// findLocalCachedRepo) and deletion (resolveLocalDeleteTarget), so the listed
-// set equals the deletable set.
+// directory that may be ADVERTISED by enumeration (localCopyCandidates, the
+// cache list, and findLocalCachedRepo).
 //
 // A local model is exactly <root>/<owner>/<name>, and its ownership is proven
 // recursively: it must contain at least one weight file (.gguf/.safetensors)
@@ -1199,12 +1203,47 @@ func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
 // qualification via excluded so the enclosure cannot inherit its weight file.
 // Symlink/alias protections are applied separately.
 //
+// This predicate is intentionally RELAXED about a configured root nested inside
+// the candidate: upstream #66 advertises such an enclosure as a real repo (it
+// owns its own weights), and listing must keep that parity. A whole-copy
+// deletion carries a stricter requirement -- see localWholeCopyDeleteAllowed.
+//
 // rootKey is the physical key of the configured root absTarget was resolved
 // from, and excluded lists the physical keys of configured subroots whose
 // subtrees another root owns, so a weight file inside one does not qualify this
 // target.
 func localLeafRepoIsDeletable(absTarget, rootKey string, guards, excluded []string, allowWeightless bool) bool {
 	return (allowWeightless || hasLocalWeightFile(absTarget, excluded)) && !localUnitGuardedPath(absTarget, rootKey, guards)
+}
+
+// localWholeCopyDeleteAllowed reports whether absTarget may be removed in its
+// entirety by a whole-copy delete ("Delete entire copy"). It is the strict
+// superset of the listing predicate: the target must still be an advertised
+// leaf model (localLeafRepoIsDeletable), AND it must enclose no configured
+// guard at all.
+//
+// localLeafRepoIsDeletable deliberately permits a configured root nested inside
+// the candidate (an enclosure that owns its own weight file is a real repo for
+// discovery, and upstream #66 requires it to be listed). A whole-copy
+// RemoveAll of that enclosure would also destroy the nested configured root, so
+// delete must additionally reject any target that strictly encloses or equals a
+// configured guard. The cache boundary is already covered (it is a guard) and
+// the existing descendant/equal checks still apply through the listing
+// predicate.
+func localWholeCopyDeleteAllowed(absTarget, rootKey string, guards, excluded []string, allowWeightless bool) bool {
+	if !localLeafRepoIsDeletable(absTarget, rootKey, guards, excluded, allowWeightless) {
+		return false
+	}
+	targetKey := pathIdentityKey(absTarget)
+	for _, guard := range guards {
+		guardKey := pathIdentityKey(guard)
+		// Equal guards are already rejected by the listing predicate, but keep
+		// the explicit check so the strictness does not depend on guard order.
+		if targetKey == guardKey || pathIsPrefix(targetKey, guardKey) {
+			return false
+		}
+	}
+	return true
 }
 
 // cacheQuantPattern matches a GGUF quantisation token inside a filename
@@ -1998,10 +2037,19 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Variant deletes are a distinct, selective operation: remove only the
+	// server-computed file set of one artifact instead of the whole copy. The
+	// variant token is optional and orthogonal to path/source.
+	variant := strings.TrimSpace(r.URL.Query().Get("variant"))
+	pathParam := strings.TrimSpace(r.URL.Query().Get("path"))
+	if variant != "" {
+		s.handleCacheDeleteVariant(w, cacheDir, cfg, repo, repoType, repoDir, owner, name, source, pathParam, variant)
+		return
+	}
+
 	// When the caller names an exact copy path, delete only that copy. The path
 	// is matched against the same server-computed candidate set handleCacheInfo
 	// lists, so a caller can never make the server delete an arbitrary path.
-	pathParam := strings.TrimSpace(r.URL.Query().Get("path"))
 	if pathParam != "" {
 		copySource, localCand, ok := s.matchCacheCopyPath(cacheDir, cfg, repo, repoType, pathParam)
 		if !ok {
@@ -2587,6 +2635,402 @@ func (s *Server) deleteLocalCopy(w http.ResponseWriter, cacheDir string, cfg Con
 	writeJSON(w, http.StatusOK, cacheDeleteSuccess(repo, fmt.Sprintf("Deleted %s from disk", repo), nil))
 }
 
+// --- Selective (per-variant) delete ---
+//
+// A whole-copy delete (above) removes the entire <root>/<owner>/<name> folder.
+// A variant delete removes exactly the server-computed file set of one artifact
+// (e.g. a single GGUF quant), reusing the same selector semantics used at
+// download time. The allowed tokens are recomputed server-side from the copy's
+// own contents; a caller-supplied token that is not one of them is rejected
+// before anything is touched.
+
+// fileMatchesCacheVariant reports whether the base name of a GGUF file belongs
+// to the artifact identified by variant. Matching is deliberately anchored to
+// the file's own quantisation label (the exact inverse of how
+// collectCacheGGUFMetadata derives the allowed tokens) so split shards
+// (-00001-of-00002) and all files of one quant are selected together, while a
+// different quant is never pulled in. The download selector
+// hfdownloader.MatchesFilter is also consulted for segment-bounded matching.
+// mmproj companions and non-GGUF files never match a quant variant.
+func fileMatchesCacheVariant(base, variant string) bool {
+	if isCacheMMProjFile(base) {
+		return false
+	}
+	if !strings.EqualFold(filepath.Ext(base), ".gguf") {
+		return false
+	}
+	if cacheQuantLabel(base) == variant {
+		return true
+	}
+	return hfdownloader.MatchesFilter(base, variant, true)
+}
+
+// collectLocalVariantFiles returns the absolute paths of the GGUF files inside
+// copyDir that belong to variant. It walks without following symlinks and skips
+// subtrees owned by a nested configured root (excluded), so a variant delete
+// never reaches outside the resolved copy.
+func collectLocalVariantFiles(copyDir, variant string, excluded []string) []string {
+	var files []string
+	walkLocalCacheRepo(copyDir, excluded, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		// Never follow a symlinked file: it is an alias of other storage, not
+		// this copy's bytes.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if !fileMatchesCacheVariant(info.Name(), variant) {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	return files
+}
+
+// collectLocalVariantTokens returns the distinct quantisation tokens a Local
+// copy supports for selective deletion. It is the same detection used to
+// advertise Quantizations, so the UI and the delete endpoint agree.
+func collectLocalVariantTokens(copyDir string, excluded []string) []string {
+	return collectCacheGGUFMetadata(copyDir, false, excluded).Quantizations
+}
+
+// readHFCopyManifest loads the hfd.yaml provenance for a friendly-copy path.
+// Returns the parsed manifest and true when one exists.
+func readHFCopyManifest(friendlyPath string) (*hfdownloader.DownloadManifest, bool) {
+	if friendlyPath == "" {
+		return nil, false
+	}
+	m, err := hfdownloader.ReadManifest(filepath.Join(friendlyPath, hfdownloader.ManifestFilename))
+	if err != nil || m == nil || len(m.Files) == 0 {
+		return nil, false
+	}
+	return m, true
+}
+
+// manifestVariantTokens returns the distinct quantisation tokens present in a
+// manifest's file list. mmproj companions are skipped, matching the Local
+// detection.
+func manifestVariantTokens(m *hfdownloader.DownloadManifest) []string {
+	seen := make(map[string]bool)
+	var tokens []string
+	for _, f := range m.Files {
+		base := filepath.Base(f.Name)
+		if isCacheMMProjFile(base) {
+			continue
+		}
+		if q := cacheQuantLabel(base); q != "" && !seen[q] {
+			seen[q] = true
+			tokens = append(tokens, q)
+		}
+	}
+	sort.Strings(tokens)
+	return tokens
+}
+
+// localCopyExcludedSubroots returns the physical keys of nested configured
+// roots owned by other roots, for the given copy root. Variant deletes use it
+// so they never descend into a subtree another configured root owns.
+func localCopyExcludedSubroots(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, root string) []string {
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	return localCacheRoot{Path: root}.excludedSubroots(roots)
+}
+
+// pruneEmptyDirs removes directories under root that became empty, bottom-up.
+// Directories inside an excluded nested configured root are never visited, so
+// pruning cannot disturb another root's subtree. The root itself is removed
+// only when removeRoot is set and it is empty after pruning. Errors are
+// ignored: pruning is best-effort cleanup and must never turn a successful file
+// delete into a failure.
+func pruneEmptyDirs(root string, excluded []string, removeRoot bool) {
+	var dirs []string
+	_ = walkLocalCacheRepo(root, excluded, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		dirs = append(dirs, path)
+		return nil
+	})
+	// Deepest first so a parent can become empty once its children are gone.
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, dir := range dirs {
+		if !removeRoot && pathIdentityKey(dir) == pathIdentityKey(root) {
+			continue
+		}
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
+			_ = os.Remove(dir)
+		}
+	}
+}
+
+// deleteLocalVariant deletes exactly the files of variant inside copyDir,
+// prunes directories that became empty, and reports the truthful counts. It
+// returns false after writing an error response when variant is not one of the
+// copy's detected tokens (deleting nothing).
+func deleteLocalVariant(w http.ResponseWriter, repo, variant, copyDir string, excluded []string) {
+	tokens := collectLocalVariantTokens(copyDir, excluded)
+	if len(tokens) == 0 {
+		// No GGUF artifacts detected: a Local non-GGUF folder without hfd.yaml
+		// provenance cannot resolve an artifact to a file set, so only
+		// entire-copy deletion is available.
+		writeError(w, http.StatusBadRequest, "Selective delete unavailable", "selective delete needs provenance (no GGUF artifacts detected)")
+		return
+	}
+	if !slicesContains(tokens, variant) {
+		writeError(w, http.StatusBadRequest, "Unknown variant", "variant is not a detected artifact of this copy")
+		return
+	}
+	files := collectLocalVariantFiles(copyDir, variant, excluded)
+	if len(files) == 0 {
+		writeError(w, http.StatusBadRequest, "Unknown variant", "no files match this variant in the copy")
+		return
+	}
+	var failures []string
+	var deleted int
+	var deletedBytes int64
+	for _, path := range files {
+		info, err := os.Lstat(path)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+			continue
+		}
+		deleted++
+		deletedBytes += info.Size()
+	}
+	// Prune now-empty subdirectories; the copy root itself is removed only when
+	// it is fully empty, so a copy holding other artifacts stays discoverable.
+	pruneEmptyDirs(copyDir, excluded, true)
+	resp := map[string]any{
+		"success":      true,
+		"message":      fmt.Sprintf("Deleted variant %s (%d files) from %s", variant, deleted, repo),
+		"variant":      variant,
+		"deletedFiles": deleted,
+		"deletedBytes": deletedBytes,
+	}
+	if len(failures) > 0 {
+		resp[cacheDeleteIncompleteKey] = true
+		resp["cleanupWarnings"] = failures
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// deleteHFVariant deletes the blob, snapshot links, and friendly-view link for
+// each manifest entry of variant. It refuses when no usable provenance exists
+// (the caller checks that first). Guarded so every path stays inside the hub
+// or friendly copy root.
+func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo, variant string, m *hfdownloader.DownloadManifest) {
+	hubRoot, err := filepath.Abs(repoDir.Path())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to resolve path", err.Error())
+		return
+	}
+	hubPrefix := hubRoot + string(filepath.Separator)
+	friendlyPath := repoDir.FriendlyPath()
+	var friendlyRoot, friendlyPrefix string
+	if friendlyPath != "" {
+		if abs, aerr := filepath.Abs(friendlyPath); aerr == nil {
+			friendlyRoot = abs
+			friendlyPrefix = abs + string(filepath.Separator)
+		}
+	}
+
+	var failures []string
+	var deleted int
+	var deletedBytes int64
+	snapshots, _ := repoDir.ListSnapshots()
+	// Blobs referenced by entries that are NOT being deleted must be preserved
+	// even if a deleted entry happens to share the same blob hash.
+	keptBlobs := make(map[string]bool)
+	for _, f := range m.Files {
+		if fileMatchesCacheVariant(filepath.Base(f.Name), variant) {
+			continue
+		}
+		if f.Blob != "" {
+			keptBlobs[pathIdentityKey(filepath.Join(hubRoot, filepath.FromSlash(f.Blob)))] = true
+		}
+	}
+	for _, f := range m.Files {
+		base := filepath.Base(f.Name)
+		if !fileMatchesCacheVariant(base, variant) {
+			continue
+		}
+		// Blob file: manifest Blob is relative to the hub repo directory.
+		if f.Blob != "" {
+			blobPath, jerr := hfdownloader.SafeJoin(hubRoot, filepath.FromSlash(f.Blob))
+			if jerr != nil || (blobPath != hubRoot && !strings.HasPrefix(blobPath+string(filepath.Separator), hubPrefix)) {
+				failures = append(failures, fmt.Sprintf("%s: unsafe blob path", base))
+			} else if keptBlobs[pathIdentityKey(blobPath)] {
+				// Shared with a kept entry; leave it in place.
+			} else if info, serr := os.Lstat(blobPath); serr == nil && info.Mode()&os.ModeSymlink == 0 {
+				if rerr := os.Remove(blobPath); rerr != nil {
+					failures = append(failures, fmt.Sprintf("%s: %v", base, rerr))
+				} else {
+					deleted++
+					deletedBytes += info.Size()
+				}
+			}
+		}
+		// Snapshot links named after the original file.
+		for _, commit := range snapshots {
+			snapshotDir, derr := repoDir.SnapshotDir(commit)
+			if derr != nil {
+				continue
+			}
+			link := filepath.Join(snapshotDir, filepath.FromSlash(f.Name))
+			if linkAbs, aerr := filepath.Abs(link); aerr != nil || !strings.HasPrefix(linkAbs+string(filepath.Separator), hubPrefix) {
+				continue
+			}
+			if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+				_ = os.Remove(link)
+			}
+		}
+		// Friendly-view link for the same original file.
+		if friendlyRoot != "" {
+			link := filepath.Join(friendlyRoot, filepath.FromSlash(f.Name))
+			if linkAbs, aerr := filepath.Abs(link); aerr == nil &&
+				strings.HasPrefix(linkAbs+string(filepath.Separator), friendlyPrefix) {
+				if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+					_ = os.Remove(link)
+				}
+			}
+		}
+	}
+	pruneEmptyDirs(hubRoot, nil, false)
+	if friendlyRoot != "" {
+		pruneEmptyDirs(friendlyRoot, nil, false)
+	}
+	resp := map[string]any{
+		"success":      true,
+		"message":      fmt.Sprintf("Deleted variant %s (%d files) from %s", variant, deleted, repo),
+		"variant":      variant,
+		"deletedFiles": deleted,
+		"deletedBytes": deletedBytes,
+	}
+	if len(failures) > 0 {
+		resp[cacheDeleteIncompleteKey] = true
+		resp["cleanupWarnings"] = failures
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// slicesContains reports whether ss contains want.
+func slicesContains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// handleCacheDeleteVariant resolves the target copy and performs a selective
+// variant delete. The variant token must be one the copy itself advertises
+// (detected GGUF quantisation for Local, or a manifest filename token for
+// HF/friendly); anything else is a 400 that deletes nothing. Local non-GGUF
+// copies without provenance cannot support selective delete and are rejected.
+func (s *Server) handleCacheDeleteVariant(w http.ResponseWriter, cacheDir string, cfg Config, repo string, repoType hfdownloader.RepoType, repoDir *hfdownloader.RepoDir, owner, name, source, pathParam, variant string) {
+	// Resolve which copy the variant applies to, using the same server-computed
+	// candidate sets as whole-copy delete. A caller-supplied path must match one
+	// of them; without a path, route by source (Local first for an empty or
+	// local label, otherwise the HF/friendly copy).
+	resolvedSource := source
+	localCand := localCopyCandidate{}
+	haveLocal := false
+	if pathParam != "" {
+		cs, cand, ok := s.matchCacheCopyPath(cacheDir, cfg, repo, repoType, pathParam)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "Invalid path", "Path is not a known copy of this repository")
+			return
+		}
+		resolvedSource = cs
+		localCand = cand
+		haveLocal = cs == cacheSourceLocal
+	} else {
+		hasManifest := false
+		if m, ok := readHFCopyManifest(repoDir.FriendlyPath()); ok && slicesContains(manifestVariantTokens(m), variant) {
+			hasManifest = true
+		}
+		localCandidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name)
+		switch source {
+		case "local":
+			if len(localCandidates) > 0 {
+				localCand = localCandidates[0]
+				haveLocal = true
+				resolvedSource = cacheSourceLocal
+			} else {
+				writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+				return
+			}
+		case "friendly view", "hf cache":
+			resolvedSource = cacheSourceHFCache
+		default: // ""
+			// Empty source prefers the copy that actually carries the artifact:
+			// the HF/friendly manifest when it knows the variant, else Local.
+			if hasManifest {
+				resolvedSource = cacheSourceHFCache
+			} else if len(localCandidates) > 0 {
+				localCand = localCandidates[0]
+				haveLocal = true
+				resolvedSource = cacheSourceLocal
+			} else {
+				resolvedSource = cacheSourceHFCache
+			}
+		}
+	}
+
+	switch resolvedSource {
+	case cacheSourceLocal:
+		if !haveLocal {
+			writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+			return
+		}
+		// Revalidate the copy as an authorized target before touching any file.
+		// A variant delete removes only matched files, never the container, so
+		// the listing-level predicate is the correct authorization here.
+		absTarget, err := resolveLocalVariantTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, localCand.Root, owner, name)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid variant target", err.Error())
+			return
+		}
+		excluded := localCopyExcludedSubroots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, localCand.Root)
+		deleteLocalVariant(w, repo, variant, absTarget, excluded)
+		return
+	case cacheSourceHFCache, cacheSourceFriendlyView:
+		m, ok := readHFCopyManifest(repoDir.FriendlyPath())
+		if !ok {
+			writeError(w, http.StatusBadRequest, "Selective delete unavailable", "selective delete needs provenance (hfd.yaml)")
+			return
+		}
+		if !slicesContains(manifestVariantTokens(m), variant) {
+			writeError(w, http.StatusBadRequest, "Unknown variant", "variant is not a detected artifact of this copy")
+			return
+		}
+		// Apply the same hub containment check as the whole-copy HF/friendly
+		// route: a hub path outside the configured cache dir is not a deletable
+		// copy (e.g. an HF_HUB_CACHE override), so selective delete must refuse
+		// it too rather than operating on files outside the configured cache.
+		if absCacheDir, aerr := filepath.Abs(cacheDir); aerr == nil {
+			absHubPath, herr := filepath.Abs(repoDir.Path())
+			if herr != nil {
+				writeError(w, http.StatusInternalServerError, "Failed to resolve path", herr.Error())
+				return
+			}
+			if verr := validateHubDeletePath(absHubPath, absCacheDir, absCacheDir+string(filepath.Separator), repoType); verr != nil {
+				writeCacheDeleteError(w, verr)
+				return
+			}
+		}
+		deleteHFVariant(w, repoDir, repo, variant, m)
+		return
+	}
+	writeError(w, http.StatusBadRequest, "Selective delete unavailable", "this copy does not support selective delete")
+}
+
 // cacheCopyUsage returns the total bytes stored under dir and the number of
 // files. When resolveSymlinks is false the size reflects what deleting the
 // directory removes in place: for an HF hub directory this measures blobs once
@@ -2666,11 +3110,12 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 			validateHubDeletePath(absHubPath, absCacheDir, absCacheDirWithSep, repoType) == nil {
 			size, count := cacheCopyUsage(hubPath, false)
 			copies = append(copies, CacheCopy{
-				Source:    cacheSourceHFCache,
-				Path:      hubPath,
-				Size:      size,
-				SizeHuman: humanSizeBytes(size),
-				FileCount: count,
+				Source:            cacheSourceHFCache,
+				Path:              hubPath,
+				Size:              size,
+				SizeHuman:         humanSizeBytes(size),
+				FileCount:         count,
+				SelectiveVariants: hfManifestVariantTokens(repoDir.FriendlyPath()),
 			})
 		} else if os.IsNotExist(statErr) {
 			// Only consider the friendly view as an orphan copy when the hub
@@ -2683,11 +3128,12 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 				repoDir.FriendlyState() == hfdownloader.FriendlyProjection {
 				size, count := cacheCopyUsage(friendlyPath, true)
 				copies = append(copies, CacheCopy{
-					Source:    cacheSourceFriendlyView,
-					Path:      friendlyPath,
-					Size:      size,
-					SizeHuman: humanSizeBytes(size),
-					FileCount: count,
+					Source:            cacheSourceFriendlyView,
+					Path:              friendlyPath,
+					Size:              size,
+					SizeHuman:         humanSizeBytes(size),
+					FileCount:         count,
+					SelectiveVariants: hfManifestVariantTokens(friendlyPath),
 				})
 			}
 		}
@@ -2699,17 +3145,29 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 	if repoType == hfdownloader.RepoTypeModel {
 		for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name) {
 			size, count := cacheCopyUsage(cand.RepoDir, true)
+			excluded := localCopyExcludedSubroots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cand.Root)
 			copies = append(copies, CacheCopy{
-				Source:    cacheSourceLocal,
-				Path:      cand.RepoDir,
-				Size:      size,
-				SizeHuman: humanSizeBytes(size),
-				FileCount: count,
+				Source:            cacheSourceLocal,
+				Path:              cand.RepoDir,
+				Size:              size,
+				SizeHuman:         humanSizeBytes(size),
+				FileCount:         count,
+				SelectiveVariants: collectLocalVariantTokens(cand.RepoDir, excluded),
 			})
 		}
 	}
 
 	return copies
+}
+
+// hfManifestVariantTokens loads the hfd.yaml at friendlyPath and returns its
+// selective-delete tokens, or nil when there is no usable provenance.
+func hfManifestVariantTokens(friendlyPath string) []string {
+	m, ok := readHFCopyManifest(friendlyPath)
+	if !ok {
+		return nil
+	}
+	return manifestVariantTokens(m)
 }
 
 // matchCacheCopyPath resolves a caller-supplied path to one of the
@@ -2766,9 +3224,54 @@ func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, re
 // container of nested weight-bearing model directories. It must directly own a
 // weight file unless allowWeightless is set, which only the retained
 // partial-delete retry uses (the remainder may no longer carry a weight file).
-// This is the deletion-side half of the shared predicate localCopyCandidates
-// applies, so the listed set equals the deletable set.
+// This is a WHOLE-COPY delete, so the strict predicate additionally rejects any
+// target that encloses a configured root: listing may advertise such an
+// enclosure (upstream #66), but RemoveAll on it would destroy the nested root.
 func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, root, owner, name string, allowWeightless bool) (string, error) {
+	absTarget, err := localTargetStructuralPath(root, owner, name)
+	if err != nil {
+		return "", err
+	}
+	absRoot, _ := filepath.Abs(root)
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	targetRoot := localCacheRoot{Path: absRoot}
+	if !localWholeCopyDeleteAllowed(absTarget, pathIdentityKey(absRoot),
+		localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes),
+		targetRoot.excludedSubroots(roots), allowWeightless) {
+		return "", fmt.Errorf("target is not a deletable leaf model directory")
+	}
+	return absTarget, nil
+}
+
+// resolveLocalVariantTarget validates the same structural invariants as
+// resolveLocalDeleteTarget but applies the listing predicate instead of the
+// strict whole-copy predicate. A variant delete removes only the matched files
+// inside the copy (never the container with RemoveAll), so a copy that merely
+// encloses a configured root remains a valid selective-delete target; the walk
+// skips excluded subroots so the nested root is untouched.
+func resolveLocalVariantTarget(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, root, owner, name string) (string, error) {
+	absTarget, err := localTargetStructuralPath(root, owner, name)
+	if err != nil {
+		return "", err
+	}
+	absRoot, _ := filepath.Abs(root)
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	targetRoot := localCacheRoot{Path: absRoot}
+	if !localLeafRepoIsDeletable(absTarget, pathIdentityKey(absRoot),
+		localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes),
+		targetRoot.excludedSubroots(roots), false) {
+		return "", fmt.Errorf("target is not a deletable leaf model directory")
+	}
+	return absTarget, nil
+}
+
+// localTargetStructuralPath applies the structural half of local-delete
+// validation: the target must be exactly a two-level owner/name directory inside
+// root, every intermediate component must be a real directory (not a symlink),
+// the leaf must not be a symlink, and the resolved leaf must stay inside the
+// resolved root. It deliberately does not apply the ownership predicate; callers
+// choose listing-level or whole-copy-level strictness.
+func localTargetStructuralPath(root, owner, name string) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
@@ -2820,19 +3323,6 @@ func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string,
 		if realTarget != base && !strings.HasPrefix(realTarget+string(filepath.Separator), base+string(filepath.Separator)) {
 			return "", fmt.Errorf("resolved target outside local root")
 		}
-	}
-
-	// Leaf-repo predicate: reject the cache dir, friendly namespaces,
-	// configured roots, overlapping/ancestor roots, and containers of nested
-	// model repos before anything is removed. A configured subroot's subtree
-	// that another root owns is excluded from the weight qualification so this
-	// target cannot borrow a nested root's weight file.
-	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
-	targetRoot := localCacheRoot{Path: absRoot}
-	if !localLeafRepoIsDeletable(absTarget, pathIdentityKey(absRoot),
-		localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes),
-		targetRoot.excludedSubroots(roots), allowWeightless) {
-		return "", fmt.Errorf("target is not a deletable leaf model directory")
 	}
 
 	return absTarget, nil

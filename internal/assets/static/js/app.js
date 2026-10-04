@@ -2160,26 +2160,43 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       const copiesHtml = copies.length > 0
         ? `<div class="cache-detail-section">
              <h4>Locations</h4>
-             <div style="display:flex;flex-direction:column;gap:12px;">
+             <div style="display:flex;flex-direction:column;gap:16px;">
                ${copies.map((copy, i) => {
                  const isLocalCopy = (copy.source || '').toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase();
                  const metaParts = [];
                  if (copy.sizeHuman) metaParts.push(String(copy.sizeHuman));
                  if (typeof copy.fileCount === 'number') metaParts.push(`${copy.fileCount} files`);
                  const meta = escapeHtml(metaParts.join(' · '));
+                 // Variant tokens the server says this copy supports for
+                 // selective delete. Empty/absent means only entire-copy is
+                 // available, so no variant buttons are rendered.
+                 const variants = Array.isArray(copy.selectiveVariants) ? copy.selectiveVariants : [];
+                 const variantsHtml = canDelete && variants.length > 0
+                   ? `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:2px;">
+                        <span class="cache-path-label">Delete one variant:</span>
+                        ${variants.map(v => `
+                          <button class="btn btn-ghost btn-sm" onclick="confirmDeleteCacheVariant(${i}, decodeURIComponent('${encodeURIComponent(v)}'))" title="Delete only the ${escapeHtml(v)} files" style="flex-shrink:0;">
+                            ${escapeHtml(v)}
+                          </button>
+                        `).join('')}
+                      </div>`
+                   : '';
                  return `
-                   <div style="display:flex;flex-direction:row;align-items:flex-start;justify-content:space-between;gap:12px;">
-                     <div style="display:flex;flex-direction:column;gap:4px;min-width:0;flex:1;">
-                       <span class="cache-path-label">${escapeHtml(copy.source || '')}${isLocalCopy ? ' (real folder on disk)' : ''}</span>
-                       <code class="cache-path-value">${escapeHtml(copy.path || '')}</code>
-                       <span class="cache-path-label">${meta}</span>
+                   <div style="display:flex;flex-direction:column;gap:6px;border:1px solid var(--color-border, #2a2a2a);border-radius:8px;padding:10px;">
+                     <div style="display:flex;flex-direction:row;align-items:flex-start;justify-content:space-between;gap:12px;">
+                       <div style="display:flex;flex-direction:column;gap:4px;min-width:0;flex:1;">
+                         <span class="cache-path-label">${escapeHtml(copy.source || '')}${isLocalCopy ? ' (real folder on disk)' : ''}</span>
+                         <code class="cache-path-value">${escapeHtml(copy.path || '')}</code>
+                         <span class="cache-path-label">${meta}</span>
+                       </div>
+                       ${canDelete ? `
+                         <button class="btn btn-danger btn-sm" onclick="confirmDeleteCacheCopy(${i})" title="Delete every file at this location" style="flex-shrink:0;">
+                           ${deleteIcon}
+                           Delete entire copy
+                         </button>
+                       ` : ''}
                      </div>
-                     ${canDelete ? `
-                       <button class="btn btn-danger btn-sm" onclick="confirmDeleteCacheCopy(${i})" title="Delete this location" style="flex-shrink:0;">
-                         ${deleteIcon}
-                         Delete
-                       </button>
-                     ` : ''}
+                     ${variantsHtml}
                    </div>
                  `;
                }).join('')}
@@ -2254,7 +2271,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
                   <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                   <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
                 </svg>
-                Delete
+                Delete entire copy
               </button>
             ` : ''}
             <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" class="btn btn-secondary">
@@ -2356,21 +2373,71 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       showToast('This location is no longer available', 'error');
       return;
     }
-    confirmDeleteCache(detail.repo, detail.type, copy.source, copy.path);
+    confirmDeleteCache(detail.repo, detail.type, copy.source, copy.path, copy);
   };
 
-  // Delete a cached repo with confirmation
-  window.confirmDeleteCache = function(repo, type, source, path) {
-    pendingCacheDelete = { repo: repo, type: type, source: source || '', path: path || '' };
+  // Delete one artifact (variant) inside a copy, identified by the copy index
+  // and the server-advertised token. Only the integer index and an escaped
+  // token cross the inline-onclick boundary; the copy object comes from the
+  // current detail payload.
+  window.confirmDeleteCacheVariant = function(index, variant) {
+    const detail = currentCacheDetail;
+    const copy = detail && detail.copies ? detail.copies[index] : null;
+    if (!copy) {
+      showToast('This location is no longer available', 'error');
+      return;
+    }
+    confirmDeleteCache(detail.repo, detail.type, copy.source, copy.path, copy, variant);
+  };
+
+  // Delete a cached repo with confirmation. When variant is set this is a
+  // selective delete of one artifact; otherwise it removes the entire copy.
+  window.confirmDeleteCache = function(repo, type, source, path, copy, variant) {
+    pendingCacheDelete = { repo: repo, type: type, source: source || '', path: path || '', variant: variant || '' };
     const isLocal = (source || '').toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase();
     const copyPath = path || (currentCacheDetail && currentCacheDetail.repo === repo ? currentCacheDetail.path : '');
+    const fileCount = copy && typeof copy.fileCount === 'number' ? copy.fileCount : null;
+    const variants = copy && Array.isArray(copy.selectiveVariants) ? copy.selectiveVariants : [];
+
+    if (variant) {
+      // Selective delete: make clear it removes only this variant's files.
+      showModal('Delete Variant', `
+        <div class="delete-confirm">
+          <div class="delete-warning">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <p class="delete-message">Delete only the <strong>${escapeHtml(variant)}</strong> files of <strong>${escapeHtml(repo)}</strong>?</p>
+          <p class="delete-note">This removes only the files belonging to this variant${copyPath ? ` in <code>${escapeHtml(copyPath)}</code>` : ''}. Other variants and files are kept. This action cannot be undone.</p>
+          <div class="form-actions" style="margin-top: 20px;">
+            <button class="btn btn-ghost" onclick="hideModal()">Cancel</button>
+            <button class="btn btn-danger" onclick="deleteCachePending()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              </svg>
+              Delete variant
+            </button>
+          </div>
+        </div>
+      `);
+      return;
+    }
+
     const message = isLocal
-      ? `Are you sure you want to permanently delete the real folder for <strong>${escapeHtml(repo)}</strong>?`
+      ? `Are you sure you want to permanently delete the entire real folder for <strong>${escapeHtml(repo)}</strong>?`
       : `Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?`;
+    const detailParts = [];
+    if (copyPath) detailParts.push(`at <code>${escapeHtml(copyPath)}</code>`);
+    if (fileCount !== null) detailParts.push(`${fileCount} files`);
+    const scopeNote = variants.length
+      ? `Detected variants: ${escapeHtml(variants.join(', '))}.`
+      : '';
     const note = isLocal
-      ? `This will permanently remove the model folder${copyPath ? ` at <code>${escapeHtml(copyPath)}</code>` : ''} from disk. This action cannot be undone.`
-      : `This will permanently remove all cached files for this ${escapeHtml(type)}. This action cannot be undone.`;
-    showModal(isLocal ? 'Delete Local Folder' : 'Delete from Cache', `
+      ? `This permanently removes <strong>ALL files</strong> at this location${detailParts.length ? ` (${detailParts.join(', ')})` : ''} from disk. ${scopeNote} This action cannot be undone.`
+      : `This permanently removes <strong>ALL files</strong> for this ${escapeHtml(type)}${detailParts.length ? ` (${detailParts.join(', ')})` : ''}. ${scopeNote} This action cannot be undone.`;
+    showModal(isLocal ? 'Delete Entire Local Copy' : 'Delete Entire Copy from Cache', `
       <div class="delete-confirm">
         <div class="delete-warning">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
@@ -2386,7 +2453,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
-            Delete
+            Delete entire copy
           </button>
         </div>
       </div>
@@ -2401,27 +2468,29 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   window.deleteCachePending = function() {
     const p = pendingCacheDelete;
     if (!p) return;
-    deleteCache(p.repo, p.type, p.source, p.path);
+    deleteCache(p.repo, p.type, p.source, p.path, p.variant);
   };
 
-  // Actually delete the cache
-  window.deleteCache = async function(repo, type, source, path) {
+  // Actually delete the cache (whole copy, or one variant when variant is set)
+  window.deleteCache = async function(repo, type, source, path, variant) {
     try {
       const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
       const pathParam = path ? `&path=${encodeURIComponent(path)}` : '';
+      const variantParam = variant ? `&variant=${encodeURIComponent(variant)}` : '';
       // api() returns the parsed JSON body; a successful delete may carry the
       // machine-readable cleanupIncomplete flag plus cleanupWarnings when the
       // primary copy was removed but a companion (friendly-view) cleanup was
       // left incomplete. showToast escapes the text it renders.
-      const result = await api('DELETE', `/cache/${repo}?type=${type}${sourceParam}${pathParam}`);
+      const result = await api('DELETE', `/cache/${repo}?type=${type}${sourceParam}${pathParam}${variantParam}`);
       hideModal();
       const deletedFrom = source && source.toLowerCase() === CACHE_SOURCE_LOCAL.toLowerCase() ? 'disk' : 'cache';
+      const what = variant ? `variant ${variant}` : repo;
       if (result && result.cleanupIncomplete) {
         const warnings = Array.isArray(result.cleanupWarnings) ? result.cleanupWarnings : [];
         const detail = warnings.length ? `: ${warnings[0]}` : '';
-        showToast(`Deleted ${repo} from ${deletedFrom}, but some cleanup was incomplete${detail}`, 'warning');
+        showToast(`Deleted ${what} from ${deletedFrom}, but some cleanup was incomplete${detail}`, 'warning');
       } else {
-        showToast(`Deleted ${repo} from ${deletedFrom}`, 'success');
+        showToast(`Deleted ${what} from ${deletedFrom}`, 'success');
       }
       loadCache(); // Refresh the list
     } catch (e) {

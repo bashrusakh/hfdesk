@@ -58,3 +58,35 @@ func TestFilterMatches(t *testing.T) {
 		})
 	}
 }
+
+// TestMatchesFilter verifies the exported wrapper lowercases both arguments and
+// delegates to filterMatches, so a caller may pass names/filters in any case
+// (the cache-delete path matches on-disk names and detected quant labels).
+func TestMatchesFilter(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter string
+		exact  bool
+		want   bool
+	}{
+		// Case-insensitive on both sides.
+		{"Qwen3-30B-A3B-Q4_K_M.gguf", "q4_k_m", false, true},
+		{"qwen3-30b-a3b-q4_k_m.gguf", "Q4_K_M", false, true},
+		{"Gemma-3-27B-UD-Q6_K_XL.gguf", "Q6_K", true, false},
+		{"Gemma-3-27B-Q6_K.gguf", "Q6_K", true, true},
+		// Split shards keep the quant as a whole segment.
+		{"model-Q8_0-00001-of-00002.gguf", "Q8_0", true, true},
+		// Unknown tokens do not match.
+		{"model-Q4_K_M.gguf", "IQ3_XS", false, false},
+		// mmproj companions must not match a quant token.
+		{"mmproj-F16.gguf", "Q4_K_M", false, false},
+		{"", "Q4_K_M", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+"|"+tt.filter, func(t *testing.T) {
+			if got := MatchesFilter(tt.name, tt.filter, tt.exact); got != tt.want {
+				t.Errorf("MatchesFilter(%q, %q, exact=%v) = %v, want %v", tt.name, tt.filter, tt.exact, got, tt.want)
+			}
+		})
+	}
+}

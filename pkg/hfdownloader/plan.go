@@ -299,6 +299,16 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 	return false
 }
 
+// MatchesFilter reports whether filter matches the file name using the exact
+// same case-insensitive rule as download-time filtering. The name and filter
+// are lowercased here, so callers pass them in any case; exact selects
+// whole-segment matching (see filterMatches). It is exported so the cache-delete
+// path can reuse the selector that chose an artifact's files at download time
+// instead of inventing a second, divergent matching rule.
+func MatchesFilter(name, filter string, exact bool) bool {
+	return filterMatches(strings.ToLower(name), strings.ToLower(filter), exact)
+}
+
 // isFilterDelimiter reports whether r separates segments for exact-match
 // filtering. Underscores are intentionally NOT delimiters because quantization
 // names contain them (e.g. Q6_K, Q4_K_M).

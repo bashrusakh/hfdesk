@@ -5,7 +5,9 @@
 ### Added
 
 - Delete local and friendly-view repositories from the Cache browser, not just HF-cache entries (#63)
+- Delete a single variant (for example one GGUF quant) from a copy via `DELETE /api/cache/{owner}/{repo}?variant=<token>`, removing exactly that artifact's files (all shards of a split quant; never mmproj companions or unrelated files) while keeping the rest of the copy (#63)
 - Cache repository details now list every physical copy (HF cache, the friendly view only when it is an orphan whose hub entry is gone, and each local root), each deletable on its own so a repo stored in both the HF cache and a local folder can be cleaned up per location (#63)
+- Each copy advertises the `selectiveVariants` it supports, so the Cache details view shows per-variant delete buttons only where the server can honor them (#63)
 - Delete responses now report `cleanupIncomplete` with `cleanupWarnings` when the primary copy was removed but a companion cleanup was left incomplete, and the UI shows a warning toast instead of a plain success (#63)
 - The friendly view is only removed when it is a proven whole-folder projection of the deleted repo; a real folder or a link into another repo is preserved and reported as incomplete cleanup (#63)
 - Route downloads into optional per-type folders (LLM/GGUF, LLM/Safetensors, LLM, Audio, Diffusion, Embedding) via opt-in type routes (#62)
@@ -18,6 +20,7 @@
 ### Fixed
 
 - Cache delete now removes the real local folder (`localDir`/`localScanDirs`/download-route folders) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
+- Whole-copy delete refuses to remove a Local folder that encloses a configured root, and the "Delete entire copy" confirmation now states the path, file count, and detected variants so the destructive scope is explicit (#63)
 - Cache repository details always include the `copies` array, even when the repo has no deletable copies, so the UI no longer shows a legacy delete button that would fail on a repo with nothing to remove (#63)
 
 ## [1.2.2] - 2026-06-29
