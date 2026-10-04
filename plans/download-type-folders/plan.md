@@ -1,11 +1,46 @@
 # Plan: Type/Category Download Routing (issue #62)
 
-Status: proposal / not started
-Author role: planner
+Status: retained historical design; routing and follow-ups implemented in PR #66
+Original design author role: planner
 Repository: bashrusakh/hfdesk
-Resolved base ref: `origin/main @ 0c18669d7f4b05648b2d3a63eb65db988cc1969a`
-Worktree: `/home/bash/.local/share/opencode/worktree/9c0a860b968eea07f09f313dc0265e642cc070aa/cosmic-pangolin`
-All file:line references verified against that SHA.
+Historical design reference: `0c18669d7f4b05648b2d3a63eb65db988cc1969a` (original base, not the current base)
+File:line references below are historical locator hints, not current line numbers.
+
+## Implementation and follow-up summary
+
+Retained for design rationale, not as an active delivery checklist. Sections
+1–12 preserve historical recommendations, phase sequencing, and open questions;
+they do not define current workflow status or prove verification. Current source
+and [docs/API.md](../../docs/API.md) describe the implemented contract and take
+precedence where the historical design differs.
+
+- **PACKAGE A — destination selection and disk-space preview:** labeled dashboard
+  selectors support coarse `llm` fallback for GGUF, Transformers, GPTQ, and AWQ.
+  Actual fine selector mapping is `gguf` -> `llm/gguf`, and non-embedding
+  `transformers`, `gptq`, `awq` -> `llm/safetensors`; either fine selector can
+  resolve through `llm`. Feature-extraction Transformers map to `embedding`,
+  Diffusers to `diffusion`, and audio to `audio`; LoRA and other unmapped types
+  have no automatic selector (unlike the historical LoRA recommendation in §3).
+  The coarse `llm` key remains config/API-only, preserved by normal dashboard
+  saves. Job creation and `POST /api/diskfree` share
+  `resolveDownloadDestination`: explicit `localDir` > fine/coarse route > global
+  `LocalDir` > HF cache. Unknown model keys return `400`, but known unconfigured
+  keys fall back normally (superseding the rejection proposed in §§5 and 7.1).
+  The dashboard guards downloads using the effective-destination preview: less
+  than 100 MiB blocks submission, preview/stat failure is non-fatal, and the
+  check is advisory rather than a reservation. Datasets ignore selectors;
+  empty routes/no selector preserve the existing LocalDir/HF-cache behavior.
+- **PACKAGE B — nested scan-root ownership:** configured descendant roots remain
+  independently scanned as `<owner>/<repo>` libraries. Ancestor scans exclude
+  those subtrees using the shared `walkLocalCacheRepo` boundary for repository
+  qualification, file/size accounting, and GGUF/mmproj metadata. List and lookup
+  apply the same exclusions, so a child's files or metadata do not create or
+  contaminate an ancestor entry. Independent friendly/local roots and merged
+  raw-cache special-directory exclusions remain in place.
+
+This summary records implementation, not test/review/CI success or Ready state.
+Consult [PR #66](https://github.com/bashrusakh/hfdesk/pull/66) for current
+validation, review, and CI status.
 
 ---
 
