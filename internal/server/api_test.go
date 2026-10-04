@@ -1746,6 +1746,49 @@ func TestAPI_CacheInfo_DatasetOmitsLocalCopy(t *testing.T) {
 	}
 }
 
+// TestFindLocalCachedRepo_SkipsSpecialOwner verifies that the single-repo
+// lookup applies the same SkipSpecial owner exclusion as scanLocalCachedRepos
+// and localCopyCandidates: a raw-cache child under an HF-internal owner
+// (hub/models/datasets/blobs/snapshots/refs) is not an independent Local repo,
+// so the details lookup agrees with the list and the delete routes instead of
+// resolving to a repo no delete route accepts.
+func TestFindLocalCachedRepo_SkipsSpecialOwner(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	// A raw-cache root child under a special owner that directly owns a weight
+	// file. Before the parity fix this resolved as a Local repo, so
+	// GET /api/cache/hub/foo returned 200 while every delete route 404'd.
+	writeRepoFixture(t, filepath.Join(cacheDir, "hub", "foo"), "model.gguf")
+	// A genuine Local repo under a real owner must still resolve.
+	realLocal := filepath.Join(cacheDir, "alice", "one")
+	writeRepoFixture(t, realLocal, "model.gguf")
+
+	if got, err := findLocalCachedRepo(cacheDir, "", nil, "hub/foo", false); err == nil {
+		t.Errorf("findLocalCachedRepo(hub/foo) resolved to %#v, want not found", got)
+	}
+	got, err := findLocalCachedRepo(cacheDir, "", nil, "alice/one", false)
+	if err != nil {
+		t.Fatalf("findLocalCachedRepo(alice/one) err = %v", err)
+	}
+	if filepath.Clean(got.Path) != filepath.Clean(realLocal) {
+		t.Errorf("real Local path = %q, want %q", got.Path, realLocal)
+	}
+
+	// The details handler must agree with the delete route: no Local copy is
+	// advertised (and the handler 404s) for the special-owner child.
+	srv := New(Config{
+		Addr: "127.0.0.1", Port: 0, CacheDir: cacheDir,
+		Concurrency: 2, MaxActive: 1,
+	})
+	req := httptest.NewRequest("GET", "/api/cache/hub/foo", nil)
+	req.SetPathValue("repo", "hub/foo")
+	w := httptest.NewRecorder()
+	srv.handleCacheInfo(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("handleCacheInfo(hub/foo) = %d, want 404. Body: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestAPI_CacheInfo_SymlinkedHubNotListed verifies that a hub path which is a
 // top-level symlink is not advertised as a deletable HF-cache copy, matching
 // the delete path which rejects such a link with 400.
@@ -2847,16 +2890,25 @@ func TestAPI_CacheDelete_OverlappingRootsDoNotExposeContainer(t *testing.T) {
 	}
 }
 
-// TestAPI_CacheDelete_NestedLibraryContainerNotDeletable is H1 case 4: a nested
-// library layout lib/org/family/model/model.gguf makes `org` / `family` a
-// container of the nested model. It must not be advertised or deleted, so the
-// nested model survives.
-func TestAPI_CacheDelete_NestedLibraryContainerNotDeletable(t *testing.T) {
+// TestAPI_CacheDelete_DeepLibraryNestedWeightsIsOneDeletableModel documents the
+// user-approved Local-model semantics: a locally stored model is exactly
+// <root>/<owner>/<name> when it contains at least one weight file ANYWHERE
+// inside it, including nested subdirectories. There is deliberately no notion of
+// a nested repo deeper than <root>/<owner>/<name> under a single root; only the
+// hard boundaries (the cache dir, the friendly namespaces, and configured
+// roots) are excluded. So with LocalDir=lib and the layout
+// lib/org/family/model/model.gguf, `org` / `family` is ONE legitimate model: it
+// is listed and deleting it removes exactly lib/org/family, including the
+// nested model folder.
+func TestAPI_CacheDelete_DeepLibraryNestedWeightsIsOneDeletableModel(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
 	libDir := filepath.Join(root, "lib")
 	nested := filepath.Join(libDir, "org", "family", "model")
 	writeRepoFixture(t, nested, "model.gguf")
+	// A sibling model under the same owner stays untouched.
+	sibling := filepath.Join(libDir, "org", "other", "model")
+	writeRepoFixture(t, sibling, "other.gguf")
 
 	srv := New(Config{
 		Addr:        "127.0.0.1",
@@ -2867,19 +2919,154 @@ func TestAPI_CacheDelete_NestedLibraryContainerNotDeletable(t *testing.T) {
 		MaxActive:   1,
 	})
 
-	if ids := cacheListRepoIDs(t, srv, nil); containsRepo(ids, "org/family") {
-		t.Errorf("nested-library container advertised as Local repo: %v", ids)
+	ids := cacheListRepoIDs(t, srv, nil)
+	if !containsRepo(ids, "org/family") {
+		t.Fatalf("deep nested-weight model org/family not advertised: %v", ids)
+	}
+	if !containsRepo(ids, "org/other") {
+		t.Errorf("sibling org/other not advertised: %v", ids)
 	}
 
 	q := url.Values{}
 	q.Set("type", "model")
 	q.Set("source", cacheSourceLocal)
-	w := deleteCacheReq(t, srv, "org/family", q)
-	if w.Code == http.StatusOK {
-		t.Fatalf("deleting the nested-library container succeeded: %s", w.Body.String())
+	if w := deleteCacheReq(t, srv, "org/family", q); w.Code != http.StatusOK {
+		t.Fatalf("deleting deep nested-weight model = %d, want 200. Body: %s", w.Code, w.Body.String())
 	}
-	if _, err := os.Stat(filepath.Join(nested, "model.gguf")); err != nil {
-		t.Errorf("nested model must survive, stat err = %v", err)
+	if _, err := os.Stat(filepath.Join(libDir, "org", "family")); !os.IsNotExist(err) {
+		t.Errorf("expected lib/org/family removed as one model, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling org/other to survive, stat err = %v", err)
+	}
+
+	// Negative: a configured root that is reachable as a two-level repo under
+	// another configured scan root is a hard boundary and stays non-deletable,
+	// even though it contains nested weights.
+	parent := filepath.Join(root, "parent")
+	configuredRoot := filepath.Join(parent, "org", "family")
+	writeRepoFixture(t, filepath.Join(configuredRoot, "model"), "deep.gguf")
+
+	srv2 := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalDir:      configuredRoot,
+		LocalScanDirs: []string{parent},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	if ids := cacheListRepoIDs(t, srv2, nil); containsRepo(ids, "org/family") {
+		t.Errorf("configured root advertised as Local repo: %v", ids)
+	}
+	q2 := url.Values{}
+	q2.Set("type", "model")
+	q2.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv2, "org/family", q2); w.Code == http.StatusOK {
+		t.Fatalf("deleting the configured root as a repo succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(configuredRoot, "model")); err != nil {
+		t.Errorf("configured root must survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_DiffusersLeafWithComponentSubdirs covers the user-approved
+// semantics for diffusers-style models: a single Local model whose weights live
+// only under component subdirectories (<repo>/unet, <repo>/vae, ...) is one
+// model. It is listed as a Local copy and a by-path delete removes exactly the
+// <localDir>/alice/diff folder, component subdirs included, leaving siblings.
+func TestAPI_CacheDelete_DiffusersLeafWithComponentSubdirs(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "diff")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "model_index.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeRepoFixture(t, filepath.Join(repoDir, "unet"), "weights.safetensors")
+	writeRepoFixture(t, filepath.Join(repoDir, "vae"), "weights.safetensors")
+	sibling := filepath.Join(localDir, "alice", "sibling")
+	writeRepoFixture(t, sibling, "sibling.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, "alice/diff")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("diffusers model not listed as Local copy: %#v", info.Copies)
+	}
+	if filepath.Clean(localCopy.Path) != filepath.Clean(repoDir) {
+		t.Errorf("listed Local path = %q, want %q", localCopy.Path, repoDir)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localCopy.Path)
+	if w := deleteCacheReq(t, srv, "alice/diff", q); w.Code != http.StatusOK {
+		t.Fatalf("by-path delete of diffusers model = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected diffusers model folder removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_FilteredLeafSubdir covers filtered layouts: a model whose
+// weights live under a filter subdirectory (<repo>/q4_k_m/model.gguf) is still
+// one model. It is listed and a no-path Local delete removes exactly that
+// folder, leaving siblings.
+func TestAPI_CacheDelete_FilteredLeafSubdir(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "qwen")
+	writeRepoFixture(t, filepath.Join(repoDir, "q4_k_m"), "model.gguf")
+	sibling := filepath.Join(localDir, "alice", "sibling")
+	writeRepoFixture(t, sibling, "sibling.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, "alice/qwen")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("filtered model not listed as Local copy: %#v", info.Copies)
+	}
+	if filepath.Clean(localCopy.Path) != filepath.Clean(repoDir) {
+		t.Errorf("listed Local path = %q, want %q", localCopy.Path, repoDir)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv, "alice/qwen", q); w.Code != http.StatusOK {
+		t.Fatalf("no-path delete of filtered model = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected filtered model folder removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("expected sibling to survive, stat err = %v", err)
 	}
 }
 

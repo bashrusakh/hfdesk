@@ -2122,7 +2122,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           ${copiesHtml}
 
           <div class="cache-detail-actions">
-            ${copies.length === 0 && canDelete ? `
+            ${!Array.isArray(data.copies) && canDelete ? `
               <button class="btn btn-danger" onclick="confirmDeleteCache('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}', '${escapeHtml(data.source || '')}')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                   <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>

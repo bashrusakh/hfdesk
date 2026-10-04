@@ -980,58 +980,6 @@ func hasLocalWeightFile(dir string) bool {
 	return found
 }
 
-// isWeightFileName reports whether name has a recognized weight-file
-// extension (.gguf / .safetensors).
-func isWeightFileName(name string) bool {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".gguf", ".safetensors":
-		return true
-	}
-	return false
-}
-
-// dirOwnsWeightFile reports whether dir directly contains a weight file as a
-// DIRECT child. Unlike hasLocalWeightFile this does not search subdirectories,
-// so a container of model repos (org/family, org, models/<owner>) does not
-// qualify merely because a nested repo owns a weight file. Sharded/multi-file
-// models, filtered subsets, and mmproj companions all place their weights
-// directly in the repo directory, so direct ownership preserves them.
-func dirOwnsWeightFile(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if isWeightFileName(entry.Name()) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasWeightBearingSubdir reports whether any strict descendant directory of dir
-// directly owns a weight file. Such a descendant is a nested model repo, so dir
-// is a container of models rather than a leaf model and must never be
-// advertised or deleted as one. Nested directories that hold only non-weight
-// files (config.json, tokenizers, etc.) do not disqualify dir.
-func hasWeightBearingSubdir(dir string) bool {
-	found := false
-	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || path == dir || !d.IsDir() {
-			return nil
-		}
-		if dirOwnsWeightFile(path) {
-			found = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return found
-}
-
 // localUnitGuards returns the physical paths that a deletable Local leaf must
 // not be, contain, or (except through its own configured root) be contained by:
 // the cache dir, its friendly models/ and datasets/ namespaces, and every
@@ -1090,31 +1038,31 @@ func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
 	return false
 }
 
-// localLeafRepoIsDeletable reports whether absTarget is a genuine LEAF Local
-// model directory that may be advertised and deleted. It is the single
-// ownership predicate shared by enumeration (localCopyCandidates, the cache
-// list, and findLocalCachedRepo) and deletion (resolveLocalDeleteTarget), so the
-// listed set equals the deletable set. A leaf:
-//  1. does not equal, contain, or (except through its own root) sit inside the
-//     cache dir, a friendly namespace, or a configured root (see
-//     localUnitGuardedPath);
-//  2. directly owns at least one weight file, unless allowWeightless is set
-//     (used to complete a retained partial delete whose remainder no longer has
-//     a weight file); and
-//  3. contains no descendant directory that itself owns a weight file, so a
-//     container of model repos is never a leaf.
+// localLeafRepoIsDeletable reports whether absTarget is a genuine Local model
+// directory that may be advertised and deleted. It is the single ownership
+// predicate shared by enumeration (localCopyCandidates, the cache list, and
+// findLocalCachedRepo) and deletion (resolveLocalDeleteTarget), so the listed
+// set equals the deletable set.
+//
+// A local model is exactly <root>/<owner>/<name>, and its ownership is proven
+// recursively: it must contain at least one weight file (.gguf/.safetensors)
+// anywhere inside it, including nested subdirectories, unless allowWeightless
+// is set (used to complete a retained partial delete whose remainder no longer
+// has a weight file). This keeps diffusers-style models (weights under unet/,
+// vae/, text_encoder/) and filtered layouts (weights under q4_k_m/) as one
+// deletable model. There is deliberately no notion of a nested repo deeper than
+// <root>/<owner>/<name> under a single root.
+//
+// The only excluded targets are the hard boundaries: the cache dir, the
+// friendly models/ and datasets/ namespaces, and every configured root
+// (localDir, localScanDirs), plus any path equal to / ancestor of / descendant
+// of those, which also covers overlapping parent/child roots (see
+// localUnitGuardedPath). Symlink/alias protections are applied separately.
 //
 // rootKey is the physical key of the configured root absTarget was resolved
-// from. Sharded/multi-file models, filtered subsets, mmproj companions, and
-// nested non-weight subdirectories inside one model remain deletable.
+// from.
 func localLeafRepoIsDeletable(absTarget, rootKey string, guards []string, allowWeightless bool) bool {
-	if !allowWeightless && !dirOwnsWeightFile(absTarget) {
-		return false
-	}
-	if hasWeightBearingSubdir(absTarget) {
-		return false
-	}
-	return !localUnitGuardedPath(absTarget, rootKey, guards)
+	return (allowWeightless || hasLocalWeightFile(absTarget)) && !localUnitGuardedPath(absTarget, rootKey, guards)
 }
 
 // cacheQuantPattern matches a GGUF quantisation token inside a filename
@@ -1346,6 +1294,17 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repo
 	}
 	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
 	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+		// Mirror the owner exclusion scanLocalCachedRepos and
+		// localCopyCandidates apply for a raw cache root, so a single-repo
+		// lookup agrees with the list and the delete routes: an owner such as
+		// hub/models/datasets is HF-cache internals, not an independent Local
+		// repo, and must not resolve to one.
+		if root.SkipSpecial {
+			switch strings.ToLower(parts[0]) {
+			case "hub", "models", "datasets", "blobs", "snapshots", "refs":
+				continue
+			}
+		}
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
 		// A repo reached through a symlinked intermediate component (or a
 		// symlinked leaf) is another repo's alias; do not resolve this ID to it.
