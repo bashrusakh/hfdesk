@@ -1735,3 +1735,247 @@ func TestCreateJob_DedupDestinationIdentity_LocalDirOverride(t *testing.T) {
 		t.Error("LocalRepo-split flat jobs should have different IDs")
 	}
 }
+
+// --- PausedJob partial-cleanup destination freeze (e21c9c0 missed case) ---
+
+// seedPausedFrozenCleanupJob inserts a paused cache-mode job whose frozen
+// OutputDir points at rootDir and seeds real downloader partial artifacts
+// plus the per-job in-flight dst tracker under that same root, mirroring the
+// state cleanupPausedJobPartFiles sees for a paused job after its runJob
+// goroutine has already exited. Each dst contributes the artifact family
+// CleanupJobPartFiles removes (dst+".part", dst+".part-NN", dst+".parts.json").
+func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir string) (*Job, string, []string) {
+	t.Helper()
+	blobsDir := filepath.Join(cacheHubLayoutDir(rootDir, repo), "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
+	dst2 := filepath.Join(blobsDir, "tmp-cafebabe00000000")
+	artifacts := []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"}
+	for _, path := range artifacts {
+		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A "completed" blob that must survive any cleanup.
+	if err := os.WriteFile(filepath.Join(blobsDir, "completed-blob"), []byte("done"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker := map[string]struct{}{dst1: {}, dst2: {}}
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	job := &Job{
+		ID:              id,
+		Repo:            repo,
+		Status:          JobStatusPaused,
+		CreatedAt:       time.Now(),
+		OutputDir:       rootDir,
+		partialFilesPtr: &tracker,
+		partialFilesMu:  &sync.Mutex{},
+	}
+	mgr.jobs[id] = job
+	return job, blobsDir, artifacts
+}
+
+// TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot is the paused-cleanup
+// companion of the runJob destination freeze: pause → cancel/dismiss must
+// validate and remove the in-flight dsts under the cache root the job was
+// frozen with (job.OutputDir), not the cache root currently configured in
+// settings.
+func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
+	checkFrozenCleanup := func(t *testing.T, mgr *JobManager, cacheDirB, blobsA string, artifacts []string, end func(id string) bool) {
+		t.Helper()
+		// Partials must exist under the frozen root before the settings move.
+		for _, path := range artifacts {
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("precondition: %s should exist: %v", path, err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(cacheHubLayoutDir(cacheDirB, "owner/pausedfreeze"), "blobs"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		untouchedB := filepath.Join(cacheHubLayoutDir(cacheDirB, "owner/pausedfreeze"), "blobs", "tmp-underb.part")
+		if err := os.WriteFile(untouchedB, []byte("untouched"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !end("") {
+			t.Fatal("pausing end action should succeed")
+		}
+		for _, path := range artifacts {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("frozen-root partial %s was not cleaned up after settings moved the cache root (err=%v)", path, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(blobsA, "completed-blob")); err != nil {
+			t.Errorf("completed blob should survive cleanup (err=%v)", err)
+		}
+		if _, err := os.Stat(untouchedB); err != nil {
+			t.Errorf("file under settings cache root B must be untouched (err=%v)", err)
+		}
+	}
+
+	t.Run("cancel targets frozen root after settings move", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "cacheA")
+		dirB := filepath.Join(root, "cacheB")
+		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+
+		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-cancel", "owner/pausedfreeze", dirA)
+
+		// Settings move the cache root to B while the job is paused.
+		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
+
+		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, func(id string) bool {
+			if !mgr.CancelJob(job.ID) {
+				return false
+			}
+			if j, _ := mgr.GetJob(job.ID); j.Status != JobStatusCancelled {
+				t.Errorf("status = %s, want cancelled", j.Status)
+			}
+			return true
+		})
+	})
+
+	t.Run("dismiss targets frozen root after settings move", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "cacheA")
+		dirB := filepath.Join(root, "cacheB")
+		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+
+		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-dismiss", "owner/pausedfreeze", dirA)
+
+		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
+
+		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, func(id string) bool {
+			res, _ := mgr.DismissJobResult(job.ID)
+			return res == DismissJobOK
+		})
+	})
+}
+
+// TestJobDestFreeze_PausedCleanupLegacyAndFlatPreserved pins the preserved
+// semantics around the paused-cleanup freeze: legacy restored jobs (empty
+// OutputDir) keep cleaning under the current configured cache root — exactly
+// runJob's legacy fallback — and flat jobs keep cleaning under the frozen
+// job.LocalDir regardless of the settings CacheDir.
+func TestJobDestFreeze_PausedCleanupLegacyAndFlatPreserved(t *testing.T) {
+	t.Run("legacy empty OutputDir cleans current cache root", func(t *testing.T) {
+		dirA := t.TempDir()
+		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+
+		blobsDir := filepath.Join(cacheHubLayoutDir(dirA, "owner/legacyclean"), "blobs")
+		if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(blobsDir, "tmp-legacycurrent")
+		if err := os.WriteFile(dst+".part", []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tracker := map[string]struct{}{dst: {}}
+		mgr.mu.Lock()
+		mgr.jobs["legacy-clean"] = &Job{
+			ID:              "legacy-clean",
+			Repo:            "owner/legacyclean",
+			Status:          JobStatusPaused,
+			CreatedAt:       time.Now(),
+			OutputDir:       "", // legacy state file, pre-OutputDir format
+			LocalDir:        "",
+			partialFilesPtr: &tracker,
+			partialFilesMu:  &sync.Mutex{},
+		}
+		mgr.mu.Unlock()
+
+		if !mgr.CancelJob("legacy-clean") {
+			t.Fatal("CancelJob should succeed for a legacy paused job")
+		}
+		if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
+			t.Errorf("legacy paused job partial under current cache root should be cleaned up (err=%v)", err)
+		}
+	})
+
+	t.Run("legacy cleanup follows settings-changed current root", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "cacheA")
+		dirB := filepath.Join(root, "cacheB")
+		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+
+		// A resumed legacy job runs under the current root: after the settings
+		// move to B its dsts live under B, so cleanup must target B too.
+		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
+		blobsDir := filepath.Join(cacheHubLayoutDir(dirB, "owner/legacymoved"), "blobs")
+		if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(blobsDir, "tmp-legacymoved")
+		if err := os.WriteFile(dst+".part", []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tracker := map[string]struct{}{dst: {}}
+		mgr.mu.Lock()
+		mgr.jobs["legacy-moved"] = &Job{
+			ID:              "legacy-moved",
+			Repo:            "owner/legacymoved",
+			Status:          JobStatusPaused,
+			CreatedAt:       time.Now(),
+			OutputDir:       "", // legacy state file, pre-OutputDir format
+			LocalDir:        "",
+			partialFilesPtr: &tracker,
+			partialFilesMu:  &sync.Mutex{},
+		}
+		mgr.mu.Unlock()
+
+		if !mgr.CancelJob("legacy-moved") {
+			t.Fatal("CancelJob should succeed for a legacy paused job")
+		}
+		if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
+			t.Errorf("legacy paused job partial under settings-changed current root should be cleaned up (err=%v)", err)
+		}
+	})
+
+	t.Run("flat cleanup keeps frozen LocalDir", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "cacheA")
+		dirB := filepath.Join(root, "cacheB")
+		localDir := filepath.Join(root, "models")
+		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+
+		flatSub := filepath.Join(localDir, "owner", "flatclean")
+		if err := os.MkdirAll(flatSub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(flatSub, "model.gguf")
+		if err := os.WriteFile(dst+".part", []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tracker := map[string]struct{}{dst: {}}
+		mgr.mu.Lock()
+		mgr.jobs["flat-clean"] = &Job{
+			ID:              "flat-clean",
+			Repo:            "owner/flatclean",
+			Status:          JobStatusPaused,
+			CreatedAt:       time.Now(),
+			OutputDir:       localDir, // flat jobs freeze OutputDir = LocalDir
+			LocalDir:        localDir,
+			Flat:            true,
+			partialFilesPtr: &tracker,
+			partialFilesMu:  &sync.Mutex{},
+		}
+		mgr.mu.Unlock()
+
+		// Settings change must not reroute flat cleanup into the cache roots.
+		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
+
+		if !mgr.CancelJob("flat-clean") {
+			t.Fatal("CancelJob should succeed for a flat paused job")
+		}
+		if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
+			t.Errorf("flat paused job partial under frozen LocalDir should be cleaned up (err=%v)", err)
+		}
+		for _, cacheDir := range []string{dirA, dirB} {
+			if _, err := os.Stat(cacheHubLayoutDir(cacheDir, "owner/flatclean")); !os.IsNotExist(err) {
+				t.Errorf("flat cleanup must not touch cache root %s (err=%v)", cacheDir, err)
+			}
+		}
+	})
+}

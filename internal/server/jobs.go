@@ -1287,8 +1287,22 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		return
 	}
 	cfg := m.snapshotConfig()
+	// The paused job's runJob goroutine has already exited, so the settings
+	// the last run (or a future resume) will use may differ from the current
+	// cfg. Mirror runJob's destination-freeze chain exactly: frozen
+	// job.OutputDir for cache mode, frozen job.LocalDir for flat mode, and
+	// the configured/default cache only for legacy restored jobs whose
+	// OutputDir was empty — cleanup must validate dsts against the same
+	// root the artifacts were downloaded to.
+	cacheDir := job.OutputDir
+	if cacheDir == "" {
+		cacheDir = cfg.CacheDir
+	}
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
 	settings := hfdownloader.Settings{
-		CacheDir: cfg.CacheDir,
+		CacheDir: cacheDir,
 	}
 	if job.LocalDir != "" {
 		settings.OutputDir = job.LocalDir
