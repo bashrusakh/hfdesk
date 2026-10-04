@@ -222,6 +222,47 @@ func TestServerUnexpectedServeErrorIsReturned(t *testing.T) {
 	}
 }
 
+func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
+	addr := reserveServerTestAddr(t)
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+	registerTestJobManagerCleanup(t, m)
+	writeStarted := make(chan struct{})
+	allowWrite := make(chan struct{})
+	m.persistStateFile = func(string, []*Job) error {
+		close(writeStarted)
+		<-allowWrite
+		return nil
+	}
+	s := &Server{jobs: m}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.serveHTTP(ctx, addr, http.NotFoundHandler(), 50*time.Millisecond) }()
+	waitForServerListener(t, addr)
+	cancel()
+	select {
+	case <-writeStarted:
+	case <-time.After(5 * time.Second):
+		close(allowWrite)
+		t.Fatal("final persistence did not start")
+	}
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			close(allowWrite)
+			t.Fatalf("shutdown error = %v, want final persistence timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(allowWrite)
+		t.Fatal("server did not return after final persistence timeout")
+	}
+	close(allowWrite)
+	select {
+	case <-m.closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager close coordinator did not finish after release")
+	}
+}
+
 type failingAcceptListener struct {
 	net.Listener
 	err error

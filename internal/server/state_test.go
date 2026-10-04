@@ -245,6 +245,47 @@ type failingStateTemp struct{ stateTempFile }
 
 func (f failingStateTemp) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
+func TestReplaceJobsStateFileSyncFailurePreservesTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.json")
+	old := []byte(`{"jobs":[{"id":"old"}]}`)
+	if err := os.WriteFile(path, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("sync failed")
+	err := replaceJobsStateFile(path, []byte(`{"jobs":[{"id":"new"}]}`), failingSyncOps{defaultStateFileOps{}, syncErr})
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("sync error not reported: %v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != string(old) {
+		t.Fatalf("target changed after sync failure: %s", got)
+	}
+	assertNoStateTemps(t, filepath.Dir(path))
+}
+
+type failingSyncOps struct {
+	stateFileOps
+	err error
+}
+
+func (f failingSyncOps) createTemp(dir string) (stateTempFile, error) {
+	tmp, err := f.stateFileOps.createTemp(dir)
+	if err != nil {
+		return nil, err
+	}
+	return failingSyncTemp{stateTempFile: tmp, err: f.err}, nil
+}
+
+type failingSyncTemp struct {
+	stateTempFile
+	err error
+}
+
+func (f failingSyncTemp) Sync() error { return f.err }
+
 type shortWriteOps struct{ stateFileOps }
 
 func (f shortWriteOps) createTemp(dir string) (stateTempFile, error) {

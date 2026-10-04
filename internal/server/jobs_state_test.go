@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
-	"time"
 )
 
 func TestJobManagerSerializesSnapshotThroughCommit(t *testing.T) {
@@ -16,6 +16,8 @@ func TestJobManagerSerializesSnapshotThroughCommit(t *testing.T) {
 	path := m.statePath
 	firstStarted := make(chan struct{})
 	allowFirst := make(chan struct{})
+	secondAtLock := make(chan struct{})
+	m.saveMu = &observedSaveLocker{secondLock: secondAtLock}
 	m.persistStateFile = func(path string, jobs []*Job) error {
 		if len(jobs) == 1 && jobs[0].Repo == "before" {
 			close(firstStarted)
@@ -39,11 +41,12 @@ func TestJobManagerSerializesSnapshotThroughCommit(t *testing.T) {
 		secondDone <- m.saveState()
 	}()
 	<-secondStarted
-	select {
-	case err := <-secondDone:
-		t.Fatalf("second snapshot committed while first was blocked: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
+	<-secondAtLock
+	// This mutation is after the second lock attempt, but before its snapshot
+	// only when snapshot capture remains inside the saveMu critical section.
+	m.mu.Lock()
+	m.jobs["job"].Repo = "after-snapshot-barrier"
+	m.mu.Unlock()
 	close(allowFirst)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
@@ -55,10 +58,29 @@ func TestJobManagerSerializesSnapshotThroughCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded) != 1 || loaded[0].Repo != "after" {
+	if len(loaded) != 1 || loaded[0].Repo != "after-snapshot-barrier" {
 		t.Fatalf("final state contains stale snapshot: %#v", loaded)
 	}
 }
+
+type observedSaveLocker struct {
+	mu         sync.Mutex
+	callMu     sync.Mutex
+	calls      int
+	secondLock chan struct{}
+}
+
+func (l *observedSaveLocker) Lock() {
+	l.callMu.Lock()
+	l.calls++
+	if l.calls == 2 {
+		close(l.secondLock)
+	}
+	l.callMu.Unlock()
+	l.mu.Lock()
+}
+
+func (l *observedSaveLocker) Unlock() { l.mu.Unlock() }
 
 func TestJobManagerUsesFixedStatePathForLoadAndSave(t *testing.T) {
 	configA, configB := t.TempDir(), t.TempDir()

@@ -99,6 +99,7 @@ type stateTempFile interface {
 	Name() string
 	Write([]byte) (int, error)
 	Chmod(os.FileMode) error
+	Sync() error
 	Close() error
 }
 
@@ -119,7 +120,9 @@ func (defaultStateFileOps) createTemp(dir string) (stateTempFile, error) {
 	}
 	return nil, fmt.Errorf("could not allocate unique jobs state temp file")
 }
-func (defaultStateFileOps) rename(oldpath, newpath string) error  { return os.Rename(oldpath, newpath) }
+func (defaultStateFileOps) rename(oldpath, newpath string) error {
+	return renameStateFile(oldpath, newpath)
+}
 func (defaultStateFileOps) remove(path string) error              { return os.Remove(path) }
 func (defaultStateFileOps) stat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
@@ -156,9 +159,13 @@ func replaceJobsStateFile(path string, data []byte, ops stateFileOps) (retErr er
 	if writeErr == nil && n != len(data) {
 		writeErr = fmt.Errorf("short write: wrote %d of %d bytes", n, len(data))
 	}
+	var syncErr error
+	if writeErr == nil {
+		syncErr = tmp.Sync()
+	}
 	closeErr := tmp.Close()
-	if writeErr != nil || closeErr != nil {
-		return errors.Join(wrapStateErr("write jobs state temp file", writeErr), wrapStateErr("close jobs state temp file", closeErr))
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		return errors.Join(wrapStateErr("write jobs state temp file", writeErr), wrapStateErr("sync jobs state temp file", syncErr), wrapStateErr("close jobs state temp file", closeErr))
 	}
 	if err := ops.rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace jobs state file: %w", err)

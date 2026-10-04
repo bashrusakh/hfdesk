@@ -135,7 +135,7 @@ type JobFileProgress struct {
 // JobManager manages download jobs.
 type JobManager struct {
 	mu                sync.RWMutex
-	saveMu            sync.Mutex
+	saveMu            sync.Locker
 	jobs              map[string]*Job
 	config            Config
 	statePath         string
@@ -181,6 +181,7 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	m := &JobManager{
+		saveMu:           &sync.Mutex{},
 		jobs:             make(map[string]*Job),
 		config:           cfg,
 		statePath:        statePath,
