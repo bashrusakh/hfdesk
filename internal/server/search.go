@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -187,7 +186,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, m.ID, isDataset); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
@@ -211,13 +210,14 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 
 	// Build the ordered list of configured candidate paths.
 	configured := []string{cfg.LocalDir, cfg.CacheDir, hfdownloader.DefaultCacheDir(), RunDir()}
+	configured = append(configured, routeDirs(cfg.DownloadRoutes)...)
 
 	// If the caller provides an explicit path, only honour it when it matches
 	// one of the configured directories (prevents arbitrary fs-stat via the API).
 	var path string
 	if requested := r.URL.Query().Get("path"); requested != "" {
 		for _, c := range configured {
-			if c != "" && filepath.Clean(requested) == filepath.Clean(c) {
+			if c != "" && pathIdentityKey(requested) == pathIdentityKey(c) {
 				path = c
 				break
 			}
@@ -235,6 +235,28 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	writeDiskFree(w, path)
+}
+
+// handleDownloadDiskFree previews the same destination as CreateJob without
+// creating directories, contacting the Hub, or starting a job. Explicit
+// localDir has the same semantics as on POST /api/download; GET retains its
+// configured-path allowlist for filesystem browsing.
+func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) {
+	var req DownloadRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	_, _, path, err := resolveDownloadDestination(s.snapshotConfig(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+		return
+	}
+	writeDiskFree(w, path)
+}
+
+func writeDiskFree(w http.ResponseWriter, path string) {
 	free, total, err := diskFreeBytes(path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())

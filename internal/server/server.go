@@ -44,6 +44,11 @@ type Config struct {
 	AllowedOrigins     []string // CORS origins
 	Endpoint           string   // Custom HuggingFace endpoint (e.g., for mirrors)
 
+	// DownloadRoutes maps a closed route key (see routes.go) to a destination
+	// directory used when a download request supplies that routeKey. Opt-in:
+	// empty means every download uses LocalDir/HF cache exactly as before.
+	DownloadRoutes map[string]string
+
 	// Authentication
 	AuthUser string // Basic auth username (empty = no auth)
 	AuthPass string // Basic auth password
@@ -119,10 +124,11 @@ func (s *Server) snapshotConfigWithGen() (Config, uint64) {
 // state (no partially-updated corruption) and concurrent readers that
 // hold a pre-call snapshotConfig() copy are unaffected.
 //
-// fn must REPLACE (not mutate in place) any slice or pointer fields:
-// s.config holds e.g. *ProxyConfig and []string LocalScanDirs whose
-// backing memory is shared with the copy. handleUpdateSettings handles
-// this with copy-on-write for Proxy and cleanPathList for LocalScanDirs.
+// fn must REPLACE (not mutate in place) any slice, map, or pointer fields:
+// s.config holds e.g. *ProxyConfig, []string LocalScanDirs, and
+// map[string]string DownloadRoutes whose backing memory is shared with the
+// copy. handleUpdateSettings handles this with copy-on-write for Proxy and
+// cleanPathList for LocalScanDirs.
 //
 // The returned Config is the new effective value (a copy of the same
 // struct fn mutated) and the returned uint64 is the post-mutation
@@ -283,6 +289,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 
 	// Disk free space
 	mux.HandleFunc("GET /api/diskfree", s.handleDiskFree)
+	mux.HandleFunc("POST /api/diskfree", s.handleDownloadDiskFree)
 
 	// WebSocket
 	mux.HandleFunc("GET /api/ws", s.handleWebSocket)

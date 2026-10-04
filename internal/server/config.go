@@ -53,6 +53,10 @@ type ConfigFile struct {
 	BackoffInitial     string       `json:"backoff-initial,omitempty" yaml:"backoff-initial,omitempty"`
 	BackoffMax         string       `json:"backoff-max,omitempty" yaml:"backoff-max,omitempty"`
 	Proxy              *ProxyConfig `json:"proxy,omitempty" yaml:"proxy,omitempty"`
+	// DownloadRoutes maps a closed route key (see routes.go) to a destination
+	// directory for routed downloads. Opt-in: empty means use LocalDir/HF
+	// cache as before.
+	DownloadRoutes map[string]string `json:"download-routes,omitempty" yaml:"download-routes,omitempty"`
 }
 
 // ProxyConfig holds proxy settings for the config file.
@@ -234,6 +238,14 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint
+	}
+	if len(serverCfg.DownloadRoutes) == 0 && len(fileCfg.DownloadRoutes) > 0 {
+		// Sanitize at the config boundary: drop keys outside the closed
+		// route-key set (e.g. a hand-edited legacy key) and normalize values,
+		// so cfg.DownloadRoutes never holds an invalid key and GET /api/settings
+		// never advertises one. This keeps load and save agreeing on the key
+		// set, so echoing the loaded map back cannot fail validation.
+		serverCfg.DownloadRoutes = sanitizeDownloadRoutes(fileCfg.DownloadRoutes)
 	}
 
 	// Apply proxy settings if not already set

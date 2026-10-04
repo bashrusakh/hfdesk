@@ -723,6 +723,51 @@
                     <textarea id="localScanDirs" rows="2" class="path-input" placeholder="D:\Models&#10;I:\LM Studio\models" spellcheck="false"></textarea>
                   </div>
                 </div>
+                <div id="typeFoldersGroup" class="settings-rows">
+                  <div class="settings-row settings-row-top">
+                    <label>Type folders</label>
+                    <div class="settings-control">
+                      <p class="form-hint" style="margin-top:0">Optional. Send downloads for a model type to its own folder. Leave a field empty to use the current default. Paths are folders on the server.</p>
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeLlmGguf" title="Folder for GGUF quantized models.">GGUF models</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeLlmGguf" class="path-input" placeholder="/mnt/nvme/models/LLM/GGUF" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeLlmSafetensors" title="Folder for Transformers safetensors/bin models.">Safetensors / LLM</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeLlmSafetensors" class="path-input" placeholder="/mnt/nvme/models/LLM/Safetensors" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeAudio" title="Folder for audio models (ASR, TTS).">Audio</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeAudio" class="path-input" placeholder="/mnt/nvme/models/Audio" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeDiffusion" title="Folder for diffusion pipelines and adapters.">Diffusion</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeDiffusion" class="path-input" placeholder="/mnt/nvme/models/Diffusion" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeEmbedding" title="Folder for feature-extraction / embedding models.">Embedding</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeEmbedding" class="path-input" placeholder="/mnt/nvme/models/Embedding" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routePresetRoot" title="Fills the fields above with standard subfolders. Nothing is created on disk until you save.">Preset root</label>
+                    <div class="settings-control" style="display:flex; gap:8px; align-items:center">
+                      <input type="text" id="routePresetRoot" class="path-input" placeholder="/mnt/nvme/models" spellcheck="false">
+                      <button type="button" class="btn btn-secondary btn-sm" id="fillRoutePresetBtn" style="flex-shrink:0">Fill type folders</button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
