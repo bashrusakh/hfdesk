@@ -32,6 +32,8 @@ jobs:
       - name: Test
         run: go test ./...
 
+  # Exercise the native state-file replacement path added here. The full suite
+  # has separate pre-existing Windows-compatibility gaps.
   go-windows:
     name: Go checks (Windows)
     runs-on: windows-latest
@@ -46,5 +48,11 @@ jobs:
           go-version: "1.24"
           cache: true
 
-      - name: Test
-        run: go test ./...
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test native state replacement
+        run: go test ./internal/server -run 'Test(WindowsReplaceJobsStateFileUsesNativeReplacement|ReplaceJobsStateFile)' -v

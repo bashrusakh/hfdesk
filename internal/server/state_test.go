@@ -31,8 +31,10 @@ func TestReplaceJobsStateFileKeepsPreviousFileUntilRename(t *testing.T) {
 	if string(got) != string(old) {
 		t.Fatalf("target changed before commit: %s", got)
 	}
-	if mode := fileMode(t, path); mode.Perm() != 0o600 {
-		t.Fatalf("mode widened: %v", mode.Perm())
+	if runtime.GOOS != "windows" {
+		if mode := fileMode(t, path); mode.Perm() != 0o600 {
+			t.Fatalf("mode widened: %v", mode.Perm())
+		}
 	}
 	assertNoStateTemps(t, filepath.Dir(path))
 }
