@@ -11,6 +11,12 @@
 
 - Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
 
+### Fixed
+
+- Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
+- Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
+- Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
+
 ## [1.2.2] - 2026-06-29
 
 ### Fixed

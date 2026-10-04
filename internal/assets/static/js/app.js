@@ -2544,6 +2544,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     updateSpeedGauge();
   }
 
+  let settingsTokenBaseline = '';
+  let settingsTokenReset = false;
+
+  function setSettingsTokenDisplay(value) {
+    settingsTokenBaseline = value || '';
+    settingsTokenReset = false;
+    $('#hfToken').value = settingsTokenBaseline;
+  }
+
   async function loadSettings() {
     try {
       const data = await api('GET', '/settings');
@@ -2586,7 +2595,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         }
       }
 
-      $('#hfToken').value = data.token || '';
+      setSettingsTokenDisplay(data.token);
       $('#connections').value = data.connections ?? 8;
       $('#maxActive').value = data.maxActive ?? 3;
       $('#maxSpeed').value = maxSpeedToMbit(data.maxSpeed);
@@ -2730,7 +2739,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
 
     const body = {
-      token: $('#hfToken')?.value || '',
       cacheDir: $('#cacheDirInput')?.value?.trim() || '',
       localDir: layout === 'local' ? defaultLocalDir : '',
       localScanDirs: ($('#localScanDirs')?.value || '')
@@ -2745,6 +2753,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       verify: $('#verify')?.value || 'size',
       endpoint: $('#endpoint')?.value || ''
     };
+
+    // The loaded mask is display-only. Only authored changes or Reset carry
+    // token intent; an ordinary Save must preserve active and stored tokens.
+    const token = $('#hfToken')?.value || '';
+    if (settingsTokenReset || token !== settingsTokenBaseline) {
+      body.token = token;
+    }
 
     // Add proxy settings if URL is provided
     const proxyUrl = $('#proxyUrl')?.value || '';
@@ -2765,6 +2780,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     try {
       const result = await api('POST', '/settings', body);
       showToast(result.message || 'Settings saved', 'success');
+      if (Object.prototype.hasOwnProperty.call(body, 'token')) {
+        // Avoid retaining a raw replacement or replaying a clear if the
+        // follow-up GET fails. The server remains the display source of truth.
+        setSettingsTokenDisplay(body.token ? '********' : '');
+      }
       await loadSettings();
       // Clear password field after save
       if ($('#proxyPassword')) {
@@ -2823,6 +2843,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (state.settings) state.settings.downloadRoutes = {};
     setVal('#routePresetRoot', '');
     setVal('#hfToken', '');
+    settingsTokenReset = true;
     setVal('#connections', '8');
     setVal('#maxActive', '3');
     setVal('#maxSpeed', '');

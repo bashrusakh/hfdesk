@@ -5,6 +5,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,6 +72,13 @@ type ProxyConfig struct {
 
 var configMu sync.Mutex
 
+// This prefix is reserved for display values, including masks from older GETs.
+const tokenRedactionPrefix = "********"
+
+func isRedactedToken(token string) bool {
+	return strings.HasPrefix(token, tokenRedactionPrefix)
+}
+
 // AppConfigDir returns the normal per-user HFDesk configuration directory.
 func AppConfigDir() string {
 	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
@@ -128,7 +136,12 @@ func ConfigPath() string {
 // LoadConfigFile loads configuration from the config file.
 // Returns empty config if file doesn't exist (not an error).
 func LoadConfigFile() (*ConfigFile, error) {
-	path := ConfigPath()
+	configMu.Lock()
+	defer configMu.Unlock()
+	return loadConfigFile(ConfigPath())
+}
+
+func loadConfigFile(path string) (*ConfigFile, error) {
 	if path == "" {
 		return &ConfigFile{}, nil
 	}
@@ -155,6 +168,11 @@ func LoadConfigFile() (*ConfigFile, error) {
 		}
 	}
 
+	// Old settings clients could have persisted a display mask. It must never
+	// be used as a credential or propagated to a subsequent settings save.
+	if isRedactedToken(cfg.Token) {
+		cfg.Token = ""
+	}
 	return cfg, nil
 }
 
@@ -163,9 +181,34 @@ func SaveConfigFile(cfg *ConfigFile) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 
+	return saveConfigFile(ConfigPath(), cfg)
+}
+
+// saveSettingsConfig preserves the selected file's credential unless an
+// explicit settings set/clear intent exists. Resolve/read/write under one lock
+// so a concurrent save cannot change the credential between read and write.
+func saveSettingsConfig(cfg *ConfigFile, tokenWrite *string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
 	path := ConfigPath()
+	stored, err := loadConfigFile(path)
+	if err != nil {
+		return err
+	}
+	c := *cfg
+	c.Token = stored.Token
+	if tokenWrite != nil {
+		c.Token = *tokenWrite
+	}
+	return saveConfigFile(path, &c)
+}
+
+func saveConfigFile(path string, cfg *ConfigFile) error {
 	if path == "" {
 		return nil
+	}
+	if isRedactedToken(cfg.Token) {
+		return errors.New("cannot save a redacted token as a credential")
 	}
 
 	// Ensure config directory exists
@@ -189,7 +232,62 @@ func SaveConfigFile(cfg *ConfigFile) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0o644)
+	// Keep following config symlinks as before, but replace the target only
+	// after a complete write. A read/chmod/write failure must not truncate the
+	// previous config. Tighten old files too: a create mode alone cannot do so.
+	path, err = configWriteTarget(path)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Stat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return errors.New("config target is not a regular file")
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hfdesk-config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// Resolve final-component symlinks (including dangling links) without replacing
+// the link itself. Directory symlinks continue to be followed by filesystem IO.
+func configWriteTarget(path string) (string, error) {
+	for range 255 {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return path, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return path, nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = target
+	}
+	return "", errors.New("too many config symlinks")
 }
 
 // ApplyConfigToServer applies config file settings to server config.
