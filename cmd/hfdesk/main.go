@@ -37,7 +37,7 @@ func main() {
 
 	flag.IntVar(&port, "port", 8080, "HTTP port")
 	flag.StringVar(&cacheDir, "cache-dir", "", "Hugging Face cache directory")
-	flag.StringVar(&token, "token", "", "Hugging Face token")
+	flag.StringVar(&token, "token", "", "Hugging Face token (also reads HF_TOKEN env)")
 	flag.StringVar(&localDir, "local-dir", "", "write real files into this directory instead of the HF cache layout")
 	flag.BoolVar(&openUI, "open", true, "open the web UI in the default browser")
 	flag.BoolVar(&noOpen, "no-open", false, "do not open the web UI automatically")

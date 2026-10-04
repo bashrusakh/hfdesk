@@ -206,8 +206,13 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	if len(serverCfg.LocalScanDirs) == 0 && len(fileCfg.LocalScanDirs) > 0 {
 		serverCfg.LocalScanDirs = fileCfg.LocalScanDirs
 	}
-	if serverCfg.Token == "" && fileCfg.Token != "" {
-		serverCfg.Token = fileCfg.Token
+	// Token precedence: --token flag > HF_TOKEN env > config file.
+	if serverCfg.Token == "" {
+		if envToken := strings.TrimSpace(os.Getenv("HF_TOKEN")); envToken != "" {
+			serverCfg.Token = envToken
+		} else if fileCfg.Token != "" {
+			serverCfg.Token = fileCfg.Token
+		}
 	}
 	if fileCfg.Connections > 0 {
 		serverCfg.Concurrency = fileCfg.Connections
