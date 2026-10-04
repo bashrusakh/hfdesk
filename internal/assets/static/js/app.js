@@ -2267,10 +2267,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     `);
   };
 
-  // Run the delete the confirmation modal was opened for.
+  // Run the delete the confirmation modal was opened for. The pending entry is
+  // kept until the modal actually closes: hideModal (called on success inside
+  // deleteCache, and for Cancel/backdrop/Escape) is what clears it, so a failed
+  // delete leaves the confirmation modal open with a working Delete button
+  // that re-fires the same request.
   window.deleteCachePending = function() {
     const p = pendingCacheDelete;
-    pendingCacheDelete = null;
     if (!p) return;
     deleteCache(p.repo, p.type, p.source, p.path);
   };

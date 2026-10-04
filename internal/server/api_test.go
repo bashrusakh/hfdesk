@@ -1825,3 +1825,185 @@ func TestAPI_CacheDelete_ByPathSymlinkedLocalOwner(t *testing.T) {
 		t.Errorf("expected real sibling target to survive, stat err = %v", err)
 	}
 }
+
+// TestAPI_CacheDelete_UnknownSourceRejected verifies that an unrecognized
+// non-empty source label (e.g. a typo) is rejected with 400 without deleting
+// anything. Before the fix such labels fell through to the legacy HF-cache
+// branch, deleting the hub and friendly copies of a different copy than the
+// caller named while still reporting success.
+func TestAPI_CacheDelete_UnknownSourceRejected(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	hubRepo := filepath.Join(cacheDir, "hub", "models--owner--name")
+	friendlyRepo := filepath.Join(cacheDir, "models", "owner", "name")
+	localRepo := filepath.Join(localDir, "owner", "name")
+	writeRepoFixture(t, hubRepo, "model.gguf")
+	writeRepoFixture(t, friendlyRepo, "model.gguf")
+	writeRepoFixture(t, localRepo, "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// A typo for "local" must not be interpreted as any known copy.
+	req := httptest.NewRequest("DELETE", "/api/cache/owner/name?type=model&source=locle", nil)
+	req.SetPathValue("repo", "owner/name")
+	w := httptest.NewRecorder()
+	srv.handleCacheDelete(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown source = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if resp.Error != "Invalid source" {
+		t.Errorf("error = %q, want %q", resp.Error, "Invalid source")
+	}
+	for _, path := range []string{hubRepo, friendlyRepo, localRepo} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("expected %s to survive rejected delete, stat err = %v", path, err)
+		}
+	}
+}
+
+// TestAPI_CacheDelete_EmptySourceKeepsLocalFallback verifies that the empty
+// source label keeps its legacy behavior after the unknown-label rejection
+// was added: HF-cache-first delete, with the local-roots fallback still
+// reachable when nothing exists in the HF cache. "hf cache" must hit the
+// legacy branch too, but without the local fallback (it returns 404).
+func TestAPI_CacheDelete_EmptySourceKeepsLocalFallback(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	localRepo := filepath.Join(localDir, "owner", "name")
+	// Nothing in the HF cache; only a local copy exists.
+	writeRepoFixture(t, localRepo, "model.gguf")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// Empty source: falls back to the local roots and deletes the local copy.
+	req := httptest.NewRequest("DELETE", "/api/cache/owner/name?type=model", nil)
+	req.SetPathValue("repo", "owner/name")
+	w := httptest.NewRecorder()
+	srv.handleCacheDelete(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty source delete = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(localRepo); !os.IsNotExist(err) {
+		t.Errorf("expected local copy deleted by empty-source fallback, stat err = %v", err)
+	}
+
+	// "hf cache" label: same legacy branch, but no local fallback.
+	writeRepoFixture(t, localRepo, "model.gguf")
+	req = httptest.NewRequest("DELETE", "/api/cache/owner/name?type=model&source=HF+cache", nil)
+	req.SetPathValue("repo", "owner/name")
+	w = httptest.NewRecorder()
+	srv.handleCacheDelete(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("hf cache source with only a local copy = %d, want 404. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(localRepo); err != nil {
+		t.Errorf("expected local copy to survive hf-cache delete, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheInfo_SymlinkedOwnerLocalCopyNotListed verifies that a Local
+// copy reached through a symlinked intermediate owner directory is not
+// listed in the details copies: safeDeleteLocalRepo/rejectSymlinkedComponents
+// would reject its delete, so listing it would advertise an undeletable copy.
+// A non-symlinked candidate in another root must still be listed.
+func TestAPI_CacheInfo_SymlinkedOwnerLocalCopyNotListed(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	scanDir := filepath.Join(root, "scan")
+
+	// Real repo under the symlink target, reachable as localDir/owner/name.
+	writeRepoFixture(t, filepath.Join(localDir, "other", "name"), "victim.gguf")
+	if err := os.Symlink(filepath.Join(localDir, "other"), filepath.Join(localDir, "owner")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	// A legit candidate in a different root must keep listing.
+	writeRepoFixture(t, filepath.Join(scanDir, "owner", "name"), "model.gguf")
+
+	srv := New(Config{
+		Addr:          "127.0.0.1",
+		Port:          0,
+		CacheDir:      cacheDir,
+		LocalDir:      localDir,
+		LocalScanDirs: []string{scanDir},
+		Concurrency:   2,
+		MaxActive:     1,
+	})
+
+	info := cacheInfoForTest(t, srv, "owner/name")
+	for _, c := range info.Copies {
+		if c.Source == cacheSourceLocal && filepath.Clean(c.Path) == filepath.Clean(filepath.Join(localDir, "owner", "name")) {
+			t.Errorf("symlinked-owner local copy %q must not be listed: %#v", c.Path, info.Copies)
+		}
+	}
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("no Local copy listed; want the non-symlinked scanDir candidate: %#v", info.Copies)
+	}
+	wantPath := filepath.Join(scanDir, "owner", "name")
+	if filepath.Clean(localCopy.Path) != filepath.Clean(wantPath) {
+		t.Errorf("listed Local path = %q, want %q", localCopy.Path, wantPath)
+	}
+}
+
+// TestAPI_CacheInfo_HFCacheOutsideConfiguredCacheDirNotListed verifies that
+// an HF-cache copy resolved through HF_HUB_CACHE pointing outside the
+// configured cacheDir is not listed: the delete endpoint validates against the
+// configured cacheDir, so both delete routes would reject it. A copy that
+// would fail the same validation must not be advertised as deletable.
+func TestAPI_CacheInfo_HFCacheOutsideConfiguredCacheDirNotListed(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	// Separate hub location, outside the configured cacheDir.
+	hubHome := filepath.Join(root, "hfhome")
+	t.Setenv("HF_HUB_CACHE", filepath.Join(hubHome, "hub"))
+
+	hubRepo := filepath.Join(hubHome, "hub", "models--owner--name")
+	writeRepoFixture(t, hubRepo, "blob")
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	// The cache list and handleCacheInfo must not list the hub copy living
+	// outside the configured cache dir.
+	info := cacheInfoForTest(t, srv, "owner/name")
+	if copy := cacheCopyBySource(info.Copies, cacheSourceHFCache); copy != nil {
+		t.Errorf("HF cache copy outside configured cacheDir must not be listed: %#v", copy)
+	}
+	for _, c := range info.Copies {
+		if filepath.Clean(c.Path) == filepath.Clean(hubRepo) {
+			t.Errorf("hub path %q must not be listed: %#v", hubRepo, info.Copies)
+		}
+	}
+	if _, err := os.Stat(hubRepo); err != nil {
+		t.Errorf("expected hub copy outside cacheDir to survive, stat err = %v", err)
+	}
+}

@@ -1600,9 +1600,11 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Route by the cache-list source label. Local roots are model-management
 	// areas, so deleting there removes the real <root>/<owner>/<name> folder.
-	// Empty/unknown labels keep the legacy HF-cache-first behavior, falling
-	// back to the local roots so cached clients that omit the param can still
-	// delete local repos.
+	// The empty label and "hf cache" keep the legacy HF-cache-first behavior;
+	// an empty label additionally falls back to the local roots so cached
+	// clients that omit the param can still delete local repos. Any other
+	// label is rejected without deleting so a typo cannot remove the wrong
+	// copy and report success.
 	source := strings.TrimSpace(r.URL.Query().Get("source"))
 	switch strings.ToLower(source) {
 	case "local":
@@ -1610,6 +1612,12 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	case "friendly view":
 		deleteFriendlyViewRepo(w, repoDir, repo, absCacheDir, absCacheDirWithSep, repoType)
+		return
+	case "", "hf cache":
+		// Legacy HF-cache-first delete below. An empty label also reaches the
+		// local-roots fallback at the end of this handler; "hf cache" does not.
+	default:
+		writeError(w, http.StatusBadRequest, "Invalid source", "source must be one of: HF cache, Friendly view, Local")
 		return
 	}
 
@@ -1851,6 +1859,13 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 			}
 		}
 		repoDir := filepath.Join(root.Path, owner, name)
+		// Mirror the delete-side component check (rejectSymlinkedComponents):
+		// a candidate reached through a symlinked or missing intermediate
+		// component would be advertised but never deletable, so skip it here
+		// to keep the listed set equal to the deletable set.
+		if rejectSymlinkedComponents(root.Path, repoDir) != nil {
+			continue
+		}
 		if !hasLocalWeightFile(repoDir) {
 			continue
 		}
@@ -1944,11 +1959,26 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 	cache := hfdownloader.NewHFCache(cacheDir, 0)
 	if repoDir, err := cache.Repo(repo, repoType); err == nil {
 		hubPath := repoDir.Path()
-		// Use Lstat so a top-level symlink at the hub path is not followed: the
-		// delete path rejects such a link (400), so it must not be listed as a
-		// deletable copy either. os.Lstat reports symlinks as ModeSymlink, which
-		// fails IsDir() below.
-		if info, statErr := os.Lstat(hubPath); statErr == nil && info.IsDir() {
+		// Only list copies the delete endpoint would actually accept: it
+		// validates the hub path against the configured cacheDir, while
+		// repoDir.Path() may point elsewhere (e.g. an HF_HUB_CACHE override).
+		// Gate on the same predicate so a copy is never advertised as
+		// deletable when both delete routes would reject it. Use Lstat so a
+		// top-level symlink at the hub path is not followed: the delete path
+		// rejects such a link (400), so it must not be listed as a deletable
+		// copy either. os.Lstat reports symlinks as ModeSymlink, which fails
+		// IsDir() below.
+		absCacheDir, err := filepath.Abs(cacheDir)
+		if err != nil {
+			return nil
+		}
+		absCacheDirWithSep := absCacheDir + string(filepath.Separator)
+		absHubPath, err := filepath.Abs(hubPath)
+		if err != nil {
+			return nil
+		}
+		if info, statErr := os.Lstat(hubPath); statErr == nil && info.IsDir() &&
+			validateHubDeletePath(absHubPath, absCacheDir, absCacheDirWithSep, repoType) == nil {
 			size, count := cacheCopyUsage(hubPath, false)
 			copies = append(copies, CacheCopy{
 				Source:    cacheSourceHFCache,
@@ -1959,9 +1989,10 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 			})
 		} else if os.IsNotExist(statErr) {
 			// Only consider the friendly view as an orphan copy when the hub
-			// entry is genuinely absent. When the hub exists but is a symlink or
-			// a non-directory, the friendly delete would be rejected for the same
-			// reason, so listing it would advertise an undeletable copy.
+			// entry is genuinely absent. When the hub exists but is a symlink
+			// or a non-directory, the friendly delete would be rejected for
+			// the same reason, so listing it would advertise an undeletable
+			// copy.
 			if friendlyPath := repoDir.FriendlyPath(); friendlyPath != "" {
 				if finfo, ferr := os.Lstat(friendlyPath); ferr == nil && finfo.IsDir() {
 					size, count := cacheCopyUsage(friendlyPath, true)

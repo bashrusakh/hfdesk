@@ -157,6 +157,8 @@ DELETE /api/cache/{owner}/{repo}?type=model&source=Local
 - `Friendly view`: deletes the friendly-view directory (and the hub directory when present).
 - `Local`: deletes the real `<root>/<owner>/<name>` folder from the local cache root (`localDir`, `localScanDirs`, or the cache dir). Returns `404` when the repo is not found in any local root, or when `type=dataset` is requested (local entries are always models).
 
+Any other `source` value is rejected with `400` before anything is deleted.
+
 `HF cache` and `Friendly view` remove the same storage — the hub directory and its friendly-view projection together — so either label cleans up both. Only `Local` removes a single folder, the exact `<root>/<owner>/<name>` directory.
 
 `DELETE` also accepts an optional `path` query parameter that addresses one exact copy. The server recomputes the allowed copy paths for the repo and deletes only when the requested path equals one of them after normalization; otherwise it returns `400` and deletes nothing. The copy's source decides which safe deleter runs (`HF cache`/`Friendly view` use the hub/friendly logic with containment checks; `Local` uses the local safe delete with root-component symlink checks). When `path` is omitted, the `source`-based behavior above applies.
