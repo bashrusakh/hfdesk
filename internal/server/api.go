@@ -111,6 +111,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	// Create and start the job (or return existing if duplicate)
 	job, wasExisting, err := s.jobs.CreateJob(req)
 	if err != nil {
+		if errors.Is(err, errInvalidRouteKey) {
+			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to create job", err.Error())
 		return
 	}
@@ -143,6 +147,10 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) {
 	if req.Repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing required field: repo", "")
+		return
+	}
+	if _, err := validatedRouteKey(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
 
@@ -387,6 +395,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		StorageMode:        storageMode,
 		LocalDir:           cfg.LocalDir,
 		LocalScanDirs:      cfg.LocalScanDirs,
+		DownloadRoutes:     cfg.DownloadRoutes,
 		ConfigFile:         ConfigPath(),
 		TargetsFile:        hfdownloader.DefaultTargetsPath(),
 	}
@@ -409,17 +418,22 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 // Note: Output directories cannot be changed via API for security.
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token              *string  `json:"token,omitempty"`
-		CacheDir           *string  `json:"cacheDir,omitempty"`
-		LocalDir           *string  `json:"localDir,omitempty"`
-		LocalScanDirs      []string `json:"localScanDirs,omitempty"`
-		Concurrency        *int     `json:"connections,omitempty"`
-		MaxActive          *int     `json:"maxActive,omitempty"`
-		MultipartThreshold *string  `json:"multipartThreshold,omitempty"`
-		MaxSpeed           *string  `json:"maxSpeed,omitempty"`
-		Verify             *string  `json:"verify,omitempty"`
-		Retries            *int     `json:"retries,omitempty"`
-		Endpoint           *string  `json:"endpoint,omitempty"`
+		Token         *string  `json:"token,omitempty"`
+		CacheDir      *string  `json:"cacheDir,omitempty"`
+		LocalDir      *string  `json:"localDir,omitempty"`
+		LocalScanDirs []string `json:"localScanDirs,omitempty"`
+		// DownloadRoutes, when present, replaces the route map. Unknown keys
+		// outside the closed set (routes.go) are dropped rather than rejected;
+		// valid values are paths (trimmed/Cleaned) and an empty/missing map
+		// clears all routes.
+		DownloadRoutes     *map[string]string `json:"downloadRoutes,omitempty"`
+		Concurrency        *int               `json:"connections,omitempty"`
+		MaxActive          *int               `json:"maxActive,omitempty"`
+		MultipartThreshold *string            `json:"multipartThreshold,omitempty"`
+		MaxSpeed           *string            `json:"maxSpeed,omitempty"`
+		Verify             *string            `json:"verify,omitempty"`
+		Retries            *int               `json:"retries,omitempty"`
+		Endpoint           *string            `json:"endpoint,omitempty"`
 		// Proxy settings
 		Proxy *struct {
 			URL                *string `json:"url,omitempty"`
@@ -443,6 +457,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var (
 		newMultipartThreshold string
 		newMaxSpeed           string
+		newDownloadRoutes     map[string]string
 	)
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
 		trimmed := strings.TrimSpace(*req.MultipartThreshold)
@@ -459,6 +474,15 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newMaxSpeed = trimmed
+	}
+	if req.DownloadRoutes != nil {
+		// Sanitize rather than reject: the UI echoes the loaded map on save, so
+		// a legacy/hand-edited key (e.g. a reserved key the server no longer
+		// knows) must not fail the whole settings save. Unknown keys are
+		// dropped and valid keys are kept; an unknown key can never be stored
+		// and its value is never interpreted as a path. An empty result clears
+		// the map (nil), matching "empty value clears a key".
+		newDownloadRoutes = sanitizeDownloadRoutes(*req.DownloadRoutes)
 	}
 
 	// Phase 2: build the new config on a local copy under withConfig (which
@@ -479,6 +503,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LocalScanDirs != nil {
 			c.LocalScanDirs = cleanPathList(req.LocalScanDirs)
+		}
+		// DownloadRoutes is replaced wholesale (copy-on-write) so the current
+		// map is never mutated in place while in-flight jobs read it.
+		if req.DownloadRoutes != nil {
+			c.DownloadRoutes = newDownloadRoutes
 		}
 		if req.Concurrency != nil && *req.Concurrency > 0 {
 			c.Concurrency = *req.Concurrency
@@ -575,6 +604,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Verify:             finalCfg.Verify,
 		Retries:            &retries,
 		Endpoint:           finalCfg.Endpoint,
+		DownloadRoutes:     finalCfg.DownloadRoutes,
 	}
 	// Add proxy to config file if set
 	if finalCfg.Proxy != nil {
@@ -751,7 +781,11 @@ type CachedRepoInfo struct {
 	// Copies enumerates every distinct deletable physical location for this
 	// repo. The top-level fields above describe the primary/first copy for
 	// backward compatibility; the UI uses Copies to offer per-location delete.
-	Copies        []CacheCopy `json:"copies,omitempty"`
+	// It intentionally has no omitempty: a current server always emits the key
+	// (possibly as an empty []), so the UI can tell "current server, no
+	// deletable copies" apart from "old server that does not send copies at
+	// all" and only offer the legacy fallback delete button in the latter case.
+	Copies        []CacheCopy `json:"copies"`
 	Quantizations []string    `json:"quantizations,omitempty"`
 	HasMMProj     bool        `json:"hasMMProj,omitempty"`
 	MMProjFiles   []string    `json:"mmprojFiles,omitempty"`
@@ -804,42 +838,60 @@ type CacheStats struct {
 // A single physical directory can carry more than one role (for example an
 // explicit Local root configured at <cache>/models). Roles are merged when
 // paths collapse to the same physical directory: SkipSpecial wins as a safety
-// exclusion, and an explicit Local role upgrades the Source label so
-// independently written real folders stay visible and deletable.
+// exclusion, while the first spelling keeps the path/source/order. Delete
+// authority is decided by path in localAuthorityKeys, not by this display
+// Source, so an explicit Local root at <cache>/models still deletes its real
+// folders even though it keeps the first-wins "Friendly view" label.
 type localCacheRoot struct {
 	Path        string
 	Source      string
 	SkipSpecial bool
 }
 
-// physPathKeyCaseInsensitive reports whether physical-identity keys must
-// fold case on the given platform. It is a platform decision, not a filesystem
+// skipsOwner applies the root's exclusion policy only to a top-level owner.
+func (root localCacheRoot) skipsOwner(owner string) bool {
+	if root.SkipSpecial {
+		switch strings.ToLower(owner) {
+		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
+			return true
+		}
+	}
+	return false
+}
+
+// pathIdentityKeyCaseInsensitive reports whether path-identity keys must fold
+// case on the given platform. It is a platform decision, not a filesystem
 // probe: filepath.EvalSymlinks canonicalizes case only on Windows, while on
 // macOS (which is case-insensitive by default) it preserves the caller's
 // casing. Fold on those two platforms so a case-insensitive filesystem still
 // collapses aliases; Linux is treated as case-sensitive so genuinely distinct
 // roots such as /Models and /models stay separate.
-func physPathKeyCaseInsensitive(goos string) bool {
+func pathIdentityKeyCaseInsensitive(goos string) bool {
 	return goos == "windows" || goos == "darwin"
 }
 
-// physPathKey returns a physical-identity key for a filesystem path on the
-// current platform. See physPathKeyForGOOS for the platform-dependent case
-// handling.
-func physPathKey(path string) string {
-	return physPathKeyForGOOS(path, runtime.GOOS)
+// pathIdentityKey returns the physical-identity key for a configured path on
+// the current platform. It resolves symlinks and makes the path absolute so a
+// symlinked root and its real path share one identity, then folds case on
+// case-insensitive-default platforms (Windows, macOS). See
+// pathIdentityKeyForGOOS for the platform-dependent case handling.
+//
+// This is the single path-identity helper shared by configured-path
+// comparison (cleanPathList, download-route dedup), cache-root dedup, the
+// local-delete boundary guards, and delete evidence, so every place that
+// decides whether two spellings name the same physical path agrees.
+func pathIdentityKey(path string) string {
+	return pathIdentityKeyForGOOS(path, runtime.GOOS)
 }
 
-// physPathKeyForGOOS is physPathKey with the platform decision injected so the
-// case-folding branch is testable without running on that OS. On platforms
-// whose default filesystem is case-insensitive (Windows, macOS) the key is
-// lowercased, because EvalSymlinks only canonicalizes case on Windows and would
-// otherwise leave case-differing aliases of one physical directory un-deduped.
-// On Linux the key preserves case, so two truly distinct roots such as /Models
-// and /models stay separate. Used to dedup roots by physical identity rather
-// than spelling, so a symlinked root and its real path become one root while
-// distinct case-sensitive roots remain distinct.
-func physPathKeyForGOOS(path, goos string) string {
+// pathIdentityKeyForGOOS is pathIdentityKey with the platform decision injected
+// so the case-folding branch is testable without running on that OS. On
+// platforms whose default filesystem is case-insensitive (Windows, macOS) the
+// key is lowercased, because EvalSymlinks only canonicalizes case on Windows
+// and would otherwise leave case-differing aliases of one physical directory
+// un-deduped. On Linux the key preserves case, so two truly distinct roots such
+// as /Models and /models stay separate.
+func pathIdentityKeyForGOOS(path, goos string) string {
 	cleaned := filepath.Clean(path)
 	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
 		cleaned = resolved
@@ -848,14 +900,14 @@ func physPathKeyForGOOS(path, goos string) string {
 	if abs, err := filepath.Abs(cleaned); err == nil {
 		key = abs
 	}
-	if physPathKeyCaseInsensitive(goos) {
+	if pathIdentityKeyCaseInsensitive(goos) {
 		key = strings.ToLower(key)
 	}
 	return key
 }
 
 // cleanPathList trims whitespace, filepath.Cleans each path, drops
-// empties, and de-duplicates by physical identity. Used to normalize
+// empties, and de-duplicates by platform path identity. Used to normalize
 // the user-supplied LocalScanDirs list before it lands in s.config.
 func cleanPathList(paths []string) []string {
 	var cleaned []string
@@ -866,7 +918,7 @@ func cleanPathList(paths []string) []string {
 			continue
 		}
 		path = filepath.Clean(path)
-		key := physPathKey(path)
+		key := pathIdentityKey(path)
 		if seen[key] {
 			continue
 		}
@@ -878,16 +930,17 @@ func cleanPathList(paths []string) []string {
 
 // localCacheRoots builds the list of directories to scan for cached
 // repos: the Friendly-view <cache>/models tree, the user-supplied
-// localDir, the user-supplied localScanDirs, and the raw cache dir
-// (with SkipSpecial because its hub/blobs layout is internal).
+// localDir, the user-supplied localScanDirs, every configured download-route
+// destination, and the raw cache dir (with SkipSpecial because its hub/blobs
+// layout is internal).
 //
-// Roots are deduped by physical identity, and the roles of all spellings
-// that collapse to the same physical directory are merged rather than
-// letting the first spelling win. That preserves SkipSpecial when the raw
-// cache dir is also supplied as a scan dir, keeps an explicit Local role on
-// <cache>/models when it is configured as a Local root, and prevents a
-// symlinked root plus its real path from being listed twice.
-func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localCacheRoot {
+// Roots are deduped by physical identity, and the roles of all spellings that
+// collapse to the same physical directory are merged rather than letting the
+// first spelling win. That preserves SkipSpecial when the raw cache dir is also
+// supplied as a scan dir, keeps an explicit Local role on <cache>/models when
+// it is configured as a Local root, and prevents a symlinked root plus its real
+// path from being listed twice.
+func localCacheRoots(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) []localCacheRoot {
 	var roots []localCacheRoot
 	index := make(map[string]int)
 	add := func(path, source string, skipSpecial bool) {
@@ -895,18 +948,16 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localC
 			return
 		}
 		cleaned := filepath.Clean(path)
-		key := physPathKey(cleaned)
+		key := pathIdentityKey(cleaned)
 		if i, ok := index[key]; ok {
-			// Same physical directory already present: merge roles.
-			// SkipSpecial is a safety exclusion, so it wins if any caller
-			// asks for it. An explicit Local role upgrades a Friendly-view
-			// namespace root to a real Local root (so independently written
-			// real folders under it stay visible).
+			// Same physical directory already represented: merge the
+			// SkipSpecial safety exclusion with OR, but keep the first
+			// spelling's path/source/order. Upstream lists <cache>/models as
+			// the Friendly view even when it is also configured as a Local
+			// root; delete authority is decided separately by localRootHasAuthority,
+			// not by relabeling the Source.
 			if skipSpecial {
 				roots[i].SkipSpecial = true
-			}
-			if source == cacheSourceLocal {
-				roots[i].Source = cacheSourceLocal
 			}
 			return
 		}
@@ -918,15 +969,72 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string) []localC
 		})
 	}
 
-	localSkipSpecial := localDir != "" && physPathKey(localDir) == physPathKey(cacheDir)
+	localSkipSpecial := localDir != "" && pathIdentityKey(localDir) == pathIdentityKey(cacheDir)
 
 	add(filepath.Join(cacheDir, "models"), cacheSourceFriendlyView, false)
 	add(localDir, cacheSourceLocal, localSkipSpecial)
 	for _, dir := range localScanDirs {
 		add(dir, cacheSourceLocal, false)
 	}
+	for _, dir := range routeDirs(downloadRoutes) {
+		add(dir, cacheSourceLocal, false)
+	}
 	add(cacheDir, cacheSourceLocal, true)
 	return roots
+}
+
+// excludedSubroots keeps all scan roots, but gives each configured descendant
+// exclusive ownership of its subtree. Absolute lexical keys also handle mixed
+// relative/absolute configuration without resolving symlinks.
+func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
+	rootPath, err := filepath.Abs(root.Path)
+	if err != nil {
+		return nil
+	}
+	rootKey := pathIdentityKey(rootPath)
+	var excluded []string
+	for _, candidate := range roots {
+		candidatePath, err := filepath.Abs(candidate.Path)
+		if err != nil {
+			continue
+		}
+		candidateKey := pathIdentityKey(candidatePath)
+		if candidateKey != rootKey && withinLocalRoot(rootKey, candidateKey) {
+			excluded = append(excluded, candidateKey)
+		}
+	}
+	return excluded
+}
+
+// withinLocalRoot compares lexical path keys with a directory boundary, so
+// GGUF-other is not within GGUF. Keys retain the platform's case semantics.
+func withinLocalRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// walkLocalCacheRepo uses the same subtree ownership for weight qualification,
+// file accounting, and metadata. Check even the initial directory: a candidate
+// repo may itself be a configured subroot or lie beneath one.
+func walkLocalCacheRepo(dir string, excluded []string, walkFn filepath.WalkFunc) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && len(excluded) > 0 {
+			absolute, absErr := filepath.Abs(path)
+			if absErr != nil {
+				return absErr
+			}
+			key := pathIdentityKey(absolute)
+			for _, subroot := range excluded {
+				if withinLocalRoot(subroot, key) {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+		return walkFn(path, info, err)
+	})
 }
 
 // localRepoDirAliased reports whether <root>/<owner>/<name> is reached through
@@ -955,7 +1063,7 @@ func localRepoSource(cacheDir, owner, name, repoDir, rootSource string) string {
 	}
 	if rd, err := hfdownloader.NewHFCache(cacheDir, 0).Repo(owner+"/"+name, hfdownloader.RepoTypeModel); err == nil &&
 		rd.FriendlyState() == hfdownloader.FriendlyProjection &&
-		physPathKey(rd.FriendlyPath()) == physPathKey(repoDir) {
+		pathIdentityKey(rd.FriendlyPath()) == pathIdentityKey(repoDir) {
 		return cacheSourceFriendlyView
 	}
 	return rootSource
@@ -964,10 +1072,10 @@ func localRepoSource(cacheDir, owner, name, repoDir, rootSource string) string {
 // hasLocalWeightFile reports whether dir (or any subdirectory) contains
 // at least one .gguf or .safetensors file. Used to decide whether an
 // owner/name folder under a cache root is a real repo worth listing
-// vs. an unrelated directory.
-func hasLocalWeightFile(dir string) bool {
+// vs. an unrelated directory, without crossing configured subroots.
+func hasLocalWeightFile(dir string, excluded []string) bool {
 	found := false
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -983,10 +1091,11 @@ func hasLocalWeightFile(dir string) bool {
 // localUnitGuards returns the physical paths that a deletable Local leaf must
 // not be, contain, or (except through its own configured root) be contained by:
 // the cache dir, its friendly models/ and datasets/ namespaces, and every
-// configured Local root (localDir and localScanDirs). Rejecting these keeps a
-// Local delete from removing the whole cache, a friendly namespace, or a
-// configured root through an ancestor/overlapping scan root.
-func localUnitGuards(cacheDir, localDir string, localScanDirs []string) []string {
+// configured Local root (localDir, localScanDirs, and each download-route
+// destination). Rejecting these keeps a Local delete from removing the whole
+// cache, a friendly namespace, or a configured root through an
+// ancestor/overlapping scan root.
+func localUnitGuards(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) []string {
 	if cacheDir == "" {
 		return nil
 	}
@@ -1003,6 +1112,11 @@ func localUnitGuards(cacheDir, localDir string, localScanDirs []string) []string
 			guards = append(guards, dir)
 		}
 	}
+	for _, dir := range routeDirs(downloadRoutes) {
+		if dir != "" {
+			guards = append(guards, dir)
+		}
+	}
 	return guards
 }
 
@@ -1015,21 +1129,42 @@ func pathIsPrefix(parent, child string) bool {
 }
 
 // localUnitGuardedPath reports whether absTarget collides with a guarded path:
-// it equals a guard, is an ancestor of a guard (deleting it would delete the
-// cache dir, a friendly namespace, or a configured root), or is a descendant of
-// a guard. Descendant containment is allowed only through the candidate's own
-// root (or an ancestor of it), because a deletable leaf is normally nested
-// under its own configured root -- for example an explicit Local root at
-// <cache>/models legitimately deletes <cache>/models/<owner>/<name>.
+// it equals a guard, is an ancestor of a guarded hard boundary (deleting it
+// would delete the cache dir or a friendly namespace), or is a descendant of a
+// guard reached through a different root. Descendant containment is allowed only
+// through the candidate's own root (or an ancestor of it), because a deletable
+// leaf is normally nested under its own configured root -- for example an
+// explicit Local root at <cache>/models legitimately deletes
+// <cache>/models/<owner>/<name>.
+//
+// A configured descendant root (localDir/scanDir/download-route destination)
+// nested inside another root's owner/name folder does not by itself block the
+// enclosing repo: upstream routing treats the nested root as owning its own
+// subtree while the enclosing repo remains a real repo for its own files. Only
+// the cache boundary (the cache dir and its models/ and datasets/ namespaces) is
+// hard: an ancestor of it is always rejected, so deleting a container can never
+// wipe the cache or a friendly namespace.
 func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
-	targetKey := physPathKey(absTarget)
+	targetKey := pathIdentityKey(absTarget)
+	// localUnitGuards always places the cache dir first, so it identifies the
+	// hard boundary used for ancestor checks.
+	var cacheKey string
+	if len(guards) > 0 {
+		cacheKey = pathIdentityKey(guards[0])
+	}
 	for _, guard := range guards {
-		guardKey := physPathKey(guard)
+		guardKey := pathIdentityKey(guard)
 		if targetKey == guardKey {
 			return true
 		}
 		if pathIsPrefix(targetKey, guardKey) {
-			return true
+			// The target encloses this guard. Only the cache boundary is a hard
+			// ancestor boundary; a nested configured Local root is owned by the
+			// enclosing repo.
+			if cacheKey != "" && pathIsPrefix(cacheKey, guardKey) {
+				return true
+			}
+			continue
 		}
 		if pathIsPrefix(guardKey, targetKey) && guardKey != rootKey && !pathIsPrefix(guardKey, rootKey) {
 			return true
@@ -1054,15 +1189,22 @@ func localUnitGuardedPath(absTarget, rootKey string, guards []string) bool {
 // <root>/<owner>/<name> under a single root.
 //
 // The only excluded targets are the hard boundaries: the cache dir, the
-// friendly models/ and datasets/ namespaces, and every configured root
-// (localDir, localScanDirs), plus any path equal to / ancestor of / descendant
-// of those, which also covers overlapping parent/child roots (see
-// localUnitGuardedPath). Symlink/alias protections are applied separately.
+// friendly models/ and datasets/ namespaces (equal to, or an ancestor of, the
+// cache boundary), and any path equal to, descendant of, or (for the cache
+// boundary) ancestor of a configured root (localDir, localScanDirs, and
+// download-route destinations) -- see localUnitGuardedPath. A configured
+// descendant root nested inside another root's owner/name folder does not by
+// itself block that enclosing repo (upstream routing owns the subtree while the
+// enclosing folder stays a real repo); it is excluded from the weight
+// qualification via excluded so the enclosure cannot inherit its weight file.
+// Symlink/alias protections are applied separately.
 //
 // rootKey is the physical key of the configured root absTarget was resolved
-// from.
-func localLeafRepoIsDeletable(absTarget, rootKey string, guards []string, allowWeightless bool) bool {
-	return (allowWeightless || hasLocalWeightFile(absTarget)) && !localUnitGuardedPath(absTarget, rootKey, guards)
+// from, and excluded lists the physical keys of configured subroots whose
+// subtrees another root owns, so a weight file inside one does not qualify this
+// target.
+func localLeafRepoIsDeletable(absTarget, rootKey string, guards, excluded []string, allowWeightless bool) bool {
+	return (allowWeightless || hasLocalWeightFile(absTarget, excluded)) && !localUnitGuardedPath(absTarget, rootKey, guards)
 }
 
 // cacheQuantPattern matches a GGUF quantisation token inside a filename
@@ -1111,10 +1253,10 @@ type cacheGGUFMetadata struct {
 // summary (distinct labels, mmproj presence, capabilities) for the
 // repo rooted there. When includeMMProjFiles is true, the relative
 // paths of mmproj companions are also recorded.
-func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMetadata {
+func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []string) cacheGGUFMetadata {
 	seen := make(map[string]bool)
 	meta := cacheGGUFMetadata{}
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
 			return nil
 		}
@@ -1143,19 +1285,32 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool) cacheGGUFMeta
 	return meta
 }
 
+// collectHFFriendlyGGUFMetadata preserves the friendly projection's metadata,
+// but applies the same configured-subroot ownership as local scans. Derive
+// exclusions from the library root, not the repo: a configured root may equal
+// or enclose the repo's friendly path and must then exclude the entire walk.
+func collectHFFriendlyGGUFMetadata(cache *hfdownloader.HFCache, repo *hfdownloader.RepoDir, cfg Config, includeMMProjFiles bool) cacheGGUFMetadata {
+	library := localCacheRoot{Path: cache.ModelsDir()}
+	if repo.Type() == hfdownloader.RepoTypeDataset {
+		library.Path = cache.DatasetsDir()
+	}
+	roots := localCacheRoots(cache.Root, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
+	return collectCacheGGUFMetadata(repo.FriendlyPath(), includeMMProjFiles, library.excludedSubroots(roots))
+}
+
 // buildLocalCacheRepo builds a CachedRepoInfo for a single owner/name
 // folder under a local cache root. It walks the directory, computes
 // total size / file count, gathers GGUF metadata, and (when
 // includeFiles is true) enumerates the files. The source label
 // (e.g. "HF cache", "Friendly view", "Local") is propagated to the
 // result so the UI can group repos by origin.
-func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool) (*CachedRepoInfo, error) {
+func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool, excluded []string) (*CachedRepoInfo, error) {
 	var totalSize int64
 	var fileCount int
 	var files []CachedFileInfo
 	var newest time.Time
 
-	err := filepath.Walk(repoDir, func(path string, info os.FileInfo, err error) error {
+	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -1194,7 +1349,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 	if !newest.IsZero() {
 		downloaded = newest.Format("2006-01-02")
 	}
-	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles)
+	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles, excluded)
 
 	return &CachedRepoInfo{
 		Repo:           owner + "/" + name,
@@ -1209,10 +1364,13 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 		DownloadStatus: "unknown",
 		Files:          files,
 		Source:         source,
-		Quantizations:  ggufMeta.Quantizations,
-		HasMMProj:      ggufMeta.HasMMProj,
-		MMProjFiles:    ggufMeta.MMProjFiles,
-		Capabilities:   ggufMeta.Capabilities,
+		// Keep the key present (as []) in list responses too, so a current
+		// server is distinguishable from one that omits copies.
+		Copies:        []CacheCopy{},
+		Quantizations: ggufMeta.Quantizations,
+		HasMMProj:     ggufMeta.HasMMProj,
+		MMProjFiles:   ggufMeta.MMProjFiles,
+		Capabilities:  ggufMeta.Capabilities,
 	}, nil
 }
 
@@ -1221,10 +1379,12 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool)
 // discovered repos. When includeFiles is true, each result includes
 // the per-file list. Repos that look like HF-cache internals
 // (hub/blobs/snapshots/refs) are skipped.
-func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, includeFiles bool) ([]CachedRepoInfo, error) {
+func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, includeFiles bool) ([]CachedRepoInfo, error) {
 	var repos []CachedRepoInfo
-	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes)
+	for _, root := range roots {
+		excluded := root.excludedSubroots(roots)
 		if _, err := os.Stat(root.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -1238,11 +1398,8 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 				continue
 			}
 			owner := ownerEntry.Name()
-			if root.SkipSpecial {
-				switch strings.ToLower(owner) {
-				case "hub", "models", "datasets", "blobs", "snapshots", "refs":
-					continue
-				}
+			if root.skipsOwner(owner) {
+				continue
 			}
 			ownerDir := filepath.Join(root.Path, owner)
 			models, err := os.ReadDir(ownerDir)
@@ -1262,18 +1419,18 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 				if localRepoDirAliased(root.Path, repoDir) {
 					continue
 				}
-				if !hasLocalWeightFile(repoDir) {
+				if !hasLocalWeightFile(repoDir, excluded) {
 					continue
 				}
 				// Advertise only leaf Local model directories: never the cache
 				// dir, a friendly namespace, a configured root, or a container
 				// of nested model repos. Friendly-view/raw-cache entries are
 				// not Local-deletable units, so their listing is unchanged.
-				if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
+				if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 					continue
 				}
 				source := localRepoSource(cacheDir, owner, name, repoDir, root.Source)
-				repo, err := buildLocalCacheRepo(owner, name, repoDir, source, includeFiles)
+				repo, err := buildLocalCacheRepo(owner, name, repoDir, source, includeFiles, excluded)
 				if err == nil {
 					repos = append(repos, *repo)
 				}
@@ -1287,41 +1444,40 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, inc
 // local cache root and returns its CachedRepoInfo. Returns
 // os.ErrNotExist if the repo is not present in any root. The
 // includeFiles flag controls whether the per-file list is filled in.
-func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
+func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	parts := strings.SplitN(repoID, "/", 2)
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
-	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes)
+	for _, root := range roots {
 		// Mirror the owner exclusion scanLocalCachedRepos and
 		// localCopyCandidates apply for a raw cache root, so a single-repo
 		// lookup agrees with the list and the delete routes: an owner such as
 		// hub/models/datasets is HF-cache internals, not an independent Local
 		// repo, and must not resolve to one.
-		if root.SkipSpecial {
-			switch strings.ToLower(parts[0]) {
-			case "hub", "models", "datasets", "blobs", "snapshots", "refs":
-				continue
-			}
+		if root.skipsOwner(parts[0]) {
+			continue
 		}
 		repoDir := filepath.Join(root.Path, parts[0], parts[1])
+		excluded := root.excludedSubroots(roots)
 		// A repo reached through a symlinked intermediate component (or a
 		// symlinked leaf) is another repo's alias; do not resolve this ID to it.
 		if localRepoDirAliased(root.Path, repoDir) {
 			continue
 		}
-		if !hasLocalWeightFile(repoDir) {
+		if !hasLocalWeightFile(repoDir, excluded) {
 			continue
 		}
 		// Only a leaf Local model directory resolves: a container of nested
 		// model repos, the cache dir, a friendly namespace, or a configured
 		// root is not this repo. Friendly-view/raw-cache entries are not
 		// Local-deletable units, so their resolution is unchanged.
-		if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
+		if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 			continue
 		}
-		return buildLocalCacheRepo(parts[0], parts[1], repoDir, localRepoSource(cacheDir, parts[0], parts[1], repoDir, root.Source), includeFiles)
+		return buildLocalCacheRepo(parts[0], parts[1], repoDir, localRepoSource(cacheDir, parts[0], parts[1], repoDir, root.Source), includeFiles, excluded)
 	}
 	return nil, os.ErrNotExist
 }
@@ -1451,7 +1607,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			shortCommit = shortCommit[:7]
 		}
 
-		ggufMeta := collectCacheGGUFMetadata(friendlyPath, false)
+		ggufMeta := collectHFFriendlyGGUFMetadata(cache, rd, cfg, false)
 
 		repo := CachedRepoInfo{
 			Repo:           repoID,
@@ -1469,15 +1625,18 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			DownloadStatus: downloadStatus,
 			Manifest:       manifest,
 			Source:         "HF cache",
-			Quantizations:  ggufMeta.Quantizations,
-			HasMMProj:      ggufMeta.HasMMProj,
-			Capabilities:   ggufMeta.Capabilities,
+			// Keep the key present (as []) so a current server is
+			// distinguishable from one that omits copies.
+			Copies:        []CacheCopy{},
+			Quantizations: ggufMeta.Quantizations,
+			HasMMProj:     ggufMeta.HasMMProj,
+			Capabilities:  ggufMeta.Capabilities,
 		}
 		repos = append(repos, repo)
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
 	}
 
-	localRepos, _ := scanLocalCachedRepos(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, false)
+	localRepos, _ := scanLocalCachedRepos(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, false)
 	for _, repo := range localRepos {
 		if repoType != "" && repoType != repo.Type {
 			continue
@@ -1542,7 +1701,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
-			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, repo, true)
+			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, repo, true)
 			if localErr == nil {
 				localRepo.Copies = enumerateCacheCopies(cacheDir, cfg, repo, hfdownloader.RepoTypeModel)
 				writeJSON(w, http.StatusOK, localRepo)
@@ -1660,7 +1819,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		shortCommit = shortCommit[:7]
 	}
 
-	ggufMeta := collectCacheGGUFMetadata(friendlyPath, true)
+	ggufMeta := collectHFFriendlyGGUFMetadata(cache, repoDir, cfg, true)
 
 	info := CachedRepoInfo{
 		Repo:           repoDir.RepoID(),
@@ -2148,6 +2307,35 @@ type localCopyCandidate struct {
 	Partial bool
 }
 
+// localAuthorityKeys returns the physical keys of roots that carry Local
+// delete authority: the explicitly configured localDir, the scan dirs, every
+// download-route destination, and the raw cache dir itself (whose non-special
+// owners are user-managed folders). It deliberately excludes the implicit
+// friendly namespace <cache>/models unless that exact path was also explicitly
+// configured, so an implicit friendly projection is never treated as
+// independent Local storage. Deduping by key keeps a symlinked root alias and
+// its real path as one authority entry.
+func localAuthorityKeys(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) map[string]bool {
+	keys := make(map[string]bool)
+	if cacheDir != "" {
+		keys[pathIdentityKey(cacheDir)] = true
+	}
+	if localDir != "" {
+		keys[pathIdentityKey(localDir)] = true
+	}
+	for _, dir := range localScanDirs {
+		if dir != "" {
+			keys[pathIdentityKey(dir)] = true
+		}
+	}
+	for _, dir := range routeDirs(downloadRoutes) {
+		if dir != "" {
+			keys[pathIdentityKey(dir)] = true
+		}
+	}
+	return keys
+}
+
 // localCopyCandidates returns the deletable <root>/<owner>/<name> path for each
 // local cache root that is a genuine LEAF model directory, in the same order
 // the cache list uses. HF-cache internals under a raw cache root
@@ -2161,10 +2349,12 @@ type localCopyCandidate struct {
 // friendly namespaces, and every configured root, so the details modal never
 // advertises the cache dir, a friendly namespace, a configured root, an
 // overlapping root's container, or a container of nested model repos.
-func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owner, name string) []localCopyCandidate {
+func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, owner, name string) []localCopyCandidate {
 	var candidates []localCopyCandidate
 	seen := make(map[string]bool)
-	guards := localUnitGuards(cacheDir, localDir, localScanDirs)
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	guards := localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes)
+	authority := localAuthorityKeys(cacheDir, localDir, localScanDirs, downloadRoutes)
 
 	// Resolve whether <cache>/models/<owner>/<name> is a genuine projection of
 	// this repo. Locals are models only, so the model friendly path applies.
@@ -2172,17 +2362,19 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 	if cache := hfdownloader.NewHFCache(cacheDir, 0); cache != nil {
 		if rd, err := cache.Repo(owner+"/"+name, hfdownloader.RepoTypeModel); err == nil &&
 			rd.FriendlyState() == hfdownloader.FriendlyProjection {
-			projectionKey = physPathKey(rd.FriendlyPath())
+			projectionKey = pathIdentityKey(rd.FriendlyPath())
 		}
 	}
 
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
-		// Only roots carrying Local authority are deletable as Local storage.
-		// The implicit friendly namespace alone is not Local storage; it only
-		// becomes one when the same physical directory is also configured as a
-		// Local root (localDir/scanDir), in which case the merged role sets
-		// Source to Local.
-		if root.Source != cacheSourceLocal {
+	for _, root := range roots {
+		// Only roots carrying Local delete authority are deletable as Local
+		// storage. An implicit friendly namespace alone is not Local storage; it
+		// only becomes one when the same physical directory is also explicitly
+		// configured as a Local root (localDir/scanDir/route). Delete authority
+		// is decided by path, not by the root's display Source, because an
+		// explicitly configured <cache>/models keeps the first-wins "Friendly
+		// view" display label while still being real Local storage.
+		if !authority[pathIdentityKey(root.Path)] {
 			continue
 		}
 		if root.SkipSpecial {
@@ -2192,6 +2384,7 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 			}
 		}
 		repoDir := filepath.Join(root.Path, owner, name)
+		excluded := root.excludedSubroots(roots)
 		// Mirror the delete-side check: a candidate reached through a symlinked
 		// or missing intermediate component, or a symlinked leaf, would be
 		// advertised but never deletable, so skip it to keep the listed set
@@ -2201,20 +2394,20 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 		}
 		// A genuine friendly projection of this exact repo is the same storage
 		// as the hub, not an independent Local copy.
-		if projectionKey != "" && physPathKey(repoDir) == projectionKey {
+		if projectionKey != "" && pathIdentityKey(repoDir) == projectionKey {
 			continue
 		}
-		if !hasLocalWeightFile(repoDir) {
+		if !hasLocalWeightFile(repoDir, excluded) {
 			continue
 		}
 		// The advertised entry must be a leaf repo, not the cache dir, a
 		// friendly namespace, a configured root, or a container of nested
 		// model repos. Applying the same predicate as the delete side keeps the
 		// listed set equal to the deletable set.
-		if !localLeafRepoIsDeletable(repoDir, physPathKey(root.Path), guards, false) {
+		if !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 			continue
 		}
-		key := physPathKey(repoDir)
+		key := pathIdentityKey(repoDir)
 		if seen[key] {
 			continue
 		}
@@ -2225,19 +2418,23 @@ func localCopyCandidates(cacheDir, localDir string, localScanDirs []string, owne
 }
 
 // configuredLocalRoots returns the Local-authority roots currently in effect
-// (localDir, the scan dirs, and the raw cache dir when it carries Local
-// authority), deduped by physical identity. This is exactly the set
+// (localDir, the scan dirs, each download-route destination, and the raw cache
+// dir), deduped by physical identity. This is exactly the set
 // localCopyCandidates can resolve a deletable target from, so retained
-// partial-delete evidence is validated against the same authorization.
-func configuredLocalRoots(cacheDir, localDir string, localScanDirs []string) []string {
+// partial-delete evidence is validated against the same authorization. The
+// implicit friendly namespace is included only when explicitly configured.
+func configuredLocalRoots(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string) []string {
 	var roots []string
 	seen := make(map[string]bool)
-	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs) {
-		if root.Source != cacheSourceLocal {
+	authority := localAuthorityKeys(cacheDir, localDir, localScanDirs, downloadRoutes)
+	for _, root := range localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes) {
+		key := pathIdentityKey(root.Path)
+		if seen[key] {
 			continue
 		}
-		key := physPathKey(root.Path)
-		if seen[key] {
+		// Include only roots that are explicitly configured (or the raw cache
+		// dir); the implicit friendly namespace is not Local authority.
+		if !authority[key] {
 			continue
 		}
 		seen[key] = true
@@ -2256,9 +2453,9 @@ type localDeleteEvidence struct {
 }
 
 // localDeleteEvidenceKey identifies one (type, root, owner, name) delete
-// target. physPathKey makes a symlinked root alias match its real path.
+// target. pathIdentityKey makes a symlinked root alias match its real path.
 func localDeleteEvidenceKey(repoType hfdownloader.RepoType, root, owner, name string) string {
-	return string(repoType) + "\x00" + physPathKey(root) + "\x00" + owner + "\x00" + name
+	return string(repoType) + "\x00" + pathIdentityKey(root) + "\x00" + owner + "\x00" + name
 }
 
 func (s *Server) rememberLocalDelete(key string, cand localCopyCandidate) {
@@ -2293,7 +2490,7 @@ func (s *Server) retryableLocalTarget(cacheDir string, cfg Config, owner, name s
 // evidence must also name that exact absolute target (by-path retry); when it
 // is empty any surviving remainder for the repo matches (no-path retry).
 func (s *Server) matchLocalDeleteEvidence(cacheDir string, cfg Config, owner, name, requestedAbs string) (localCopyCandidate, bool) {
-	roots := configuredLocalRoots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs)
+	roots := configuredLocalRoots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
 	if len(roots) == 0 {
 		return localCopyCandidate{}, false
 	}
@@ -2322,7 +2519,7 @@ func (s *Server) matchLocalDeleteEvidence(cacheDir string, cfg Config, owner, na
 		// validated as a leaf when the delete began and is revalidated here for
 		// guards/containment, so the weight requirement is the only part a
 		// retry may skip.
-		if _, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, ev.Root, owner, name, true); err != nil {
+		if _, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, ev.Root, owner, name, true); err != nil {
 			continue
 		}
 		return localCopyCandidate{Root: ev.Root, RepoDir: ev.RepoDir, Partial: true}, true
@@ -2342,7 +2539,7 @@ func (s *Server) deleteLocalRootRepo(w http.ResponseWriter, cacheDir string, cfg
 		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
 		return
 	}
-	candidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name)
+	candidates := localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name)
 	if len(candidates) == 0 {
 		if cand, ok := s.retryableLocalTarget(cacheDir, cfg, owner, name, repoType); ok {
 			s.deleteLocalCopy(w, cacheDir, cfg, repo, repoType, owner, name, cand)
@@ -2367,7 +2564,7 @@ func (s *Server) deleteLocalCopy(w http.ResponseWriter, cacheDir string, cfg Con
 	key := localDeleteEvidenceKey(repoType, cand.Root, owner, name)
 	// Validate before recording anything, so a validation-only failure leaves
 	// no stale evidence behind.
-	absTarget, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cand.Root, owner, name, cand.Partial)
+	absTarget, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cand.Root, owner, name, cand.Partial)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
 		return
@@ -2433,13 +2630,16 @@ func cacheCopyUsage(dir string, resolveSymlinks bool) (int64, int) {
 // file. The "Friendly view" projection is not listed alongside the hub because
 // it is the same storage.
 func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfdownloader.RepoType) []CacheCopy {
+	// Start from a non-nil empty slice so a current server always serializes
+	// "copies": [] rather than null/omitted. The UI uses [] to mean "current
+	// server, no deletable copies" and only shows the legacy fallback delete
+	// button when the key is absent entirely.
+	copies := []CacheCopy{}
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 {
-		return nil
+		return copies
 	}
 	owner, name := parts[0], parts[1]
-
-	var copies []CacheCopy
 
 	cache := hfdownloader.NewHFCache(cacheDir, 0)
 	if repoDir, err := cache.Repo(repo, repoType); err == nil {
@@ -2455,12 +2655,12 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 		// IsDir() below.
 		absCacheDir, err := filepath.Abs(cacheDir)
 		if err != nil {
-			return nil
+			return copies
 		}
 		absCacheDirWithSep := absCacheDir + string(filepath.Separator)
 		absHubPath, err := filepath.Abs(hubPath)
 		if err != nil {
-			return nil
+			return copies
 		}
 		if info, statErr := os.Lstat(hubPath); statErr == nil && info.IsDir() &&
 			validateHubDeletePath(absHubPath, absCacheDir, absCacheDirWithSep, repoType) == nil {
@@ -2497,7 +2697,7 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 	// response would advertise a copy whose Delete returns 404 (deleteLocalCopy
 	// rejects non-model types), so omit them for datasets.
 	if repoType == hfdownloader.RepoTypeModel {
-		for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name) {
+		for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name) {
 			size, count := cacheCopyUsage(cand.RepoDir, true)
 			copies = append(copies, CacheCopy{
 				Source:    cacheSourceLocal,
@@ -2533,7 +2733,7 @@ func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, re
 	}
 	owner, name := parts[0], parts[1]
 
-	for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, owner, name) {
+	for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name) {
 		if candAbs, aerr := filepath.Abs(cand.RepoDir); aerr == nil && candAbs == requested {
 			return cacheSourceLocal, cand, true
 		}
@@ -2568,7 +2768,7 @@ func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, re
 // partial-delete retry uses (the remainder may no longer carry a weight file).
 // This is the deletion-side half of the shared predicate localCopyCandidates
 // applies, so the listed set equals the deletable set.
-func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string, root, owner, name string, allowWeightless bool) (string, error) {
+func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, root, owner, name string, allowWeightless bool) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
@@ -2624,8 +2824,14 @@ func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string,
 
 	// Leaf-repo predicate: reject the cache dir, friendly namespaces,
 	// configured roots, overlapping/ancestor roots, and containers of nested
-	// model repos before anything is removed.
-	if !localLeafRepoIsDeletable(absTarget, physPathKey(absRoot), localUnitGuards(cacheDir, localDir, localScanDirs), allowWeightless) {
+	// model repos before anything is removed. A configured subroot's subtree
+	// that another root owns is excluded from the weight qualification so this
+	// target cannot borrow a nested root's weight file.
+	roots := localCacheRoots(cacheDir, localDir, localScanDirs, downloadRoutes)
+	targetRoot := localCacheRoot{Path: absRoot}
+	if !localLeafRepoIsDeletable(absTarget, pathIdentityKey(absRoot),
+		localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes),
+		targetRoot.excludedSubroots(roots), allowWeightless) {
 		return "", fmt.Errorf("target is not a deletable leaf model directory")
 	}
 

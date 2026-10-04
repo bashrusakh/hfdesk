@@ -27,6 +27,105 @@
   const isFilePreview = () => window.location.protocol === 'file:';
 
   // =========================================
+  // Download route labels
+  // =========================================
+  //
+  // The server owns a closed set of internal route keys. The user must never
+  // see those keys, so the dashboard maps each label to its key in this single
+  // fixed table. Field ids
+  // and labels are the only route-facing surface; keys are sent to the API but
+  // never rendered into the DOM.
+  const ROUTE_LABELS = [
+    { key: 'llm/gguf',        label: 'GGUF models',       fieldId: 'routeLlmGguf',        preset: ['LLM', 'GGUF'] },
+    { key: 'llm/safetensors', label: 'Safetensors / LLM', fieldId: 'routeLlmSafetensors', preset: ['LLM', 'Safetensors'] },
+    { key: 'audio',           label: 'Audio',             fieldId: 'routeAudio',          preset: ['Audio'] },
+    { key: 'diffusion',       label: 'Diffusion',         fieldId: 'routeDiffusion',      preset: ['Diffusion'] },
+    { key: 'embedding',       label: 'Embedding',         fieldId: 'routeEmbedding',      preset: ['Embedding'] }
+  ];
+
+  // getConfiguredRouteOptions returns the labeled options for routes that have
+  // a non-empty destination configured, including the server's llm parent
+  // fallback. These are semantic selectors, not client-resolved paths.
+  function getConfiguredRouteOptions() {
+    const routes = state.settings?.downloadRoutes || {};
+    return ROUTE_LABELS
+      .filter(r => String(routes[r.key] || '').trim() !== ''
+        || (r.key.startsWith('llm/') && String(routes.llm || '').trim() !== ''))
+      .map(r => ({ key: r.key, label: r.label }));
+  }
+
+  // routeKeyForAnalysis derives the internal route key from an existing
+  // /api/analyze result. Returns '' when no route applies; selectors can also
+  // resolve through a configured parent on the server.
+  function routeKeyForAnalysis(analysis) {
+    if (!analysis || analysis.is_dataset) return '';
+    switch (analysis.type) {
+      case 'gguf':
+        return 'llm/gguf';
+      case 'transformers':
+        return analysis.transformers?.task === 'feature-extraction'
+          ? 'embedding'
+          : 'llm/safetensors';
+      case 'gptq':
+      case 'awq':
+        return 'llm/safetensors';
+      case 'diffusers':
+        return 'diffusion';
+      case 'audio':
+        return 'audio';
+      default:
+        return '';
+    }
+  }
+
+  // _routeSelectKeys records the exact key list each rendered select was built
+  // from, keyed by element id. Keys stay out of the DOM, but routeSelectValue
+  // compares identity so a reconfigured route set of the same size can never
+  // make a selected index resolve to a different key.
+  const _routeSelectKeys = new Map();
+
+  // renderRouteSelect builds a labeled destination <select>. Option values are
+  // indexes into the fixed option list, never raw keys, so keys stay out of the
+  // rendered markup. An empty selection means "Default (server setting)".
+  function renderRouteSelect(id, { className = '', style = '', ariaLabel = '' } = {}) {
+    const opts = getConfiguredRouteOptions();
+    const prefill = routeKeyForAnalysis(currentAnalysis);
+    const selIdx = opts.findIndex(o => o.key === prefill);
+    _routeSelectKeys.set(id, opts.map(o => o.key));
+    const rows = opts.map((o, i) =>
+      `<option value="${i}"${i === selIdx ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+    const cls = className ? ` class="${escapeHtml(className)}"` : '';
+    const styleAttr = style ? ` style="${escapeHtml(style)}"` : '';
+    const aria = ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : '';
+    // data-option-count records how many configured routes this select was
+    // built from. routeSelectValue refuses to interpret an index if the live
+    // count drifted, so a changed route set can never map to the wrong key.
+    return `<select id="${escapeHtml(id)}"${cls}${styleAttr}${aria} data-option-count="${opts.length}">
+      <option value="-1"${selIdx < 0 ? ' selected' : ''}>Default (server setting)</option>
+      ${rows}
+    </select>`;
+  }
+
+  // routeSelectValue maps the selected index back to a configured key, or ''
+  // for the default option / an absent or stale select.
+  function routeSelectValue(id) {
+    const el = $(`#${id}`);
+    if (!el) return '';
+    const idx = parseInt(el.value, 10);
+    if (!Number.isInteger(idx) || idx < 0) return '';
+    const opts = getConfiguredRouteOptions();
+    const rendered = parseInt(el.dataset.optionCount, 10);
+    if (opts.length !== rendered) return '';
+    // Key-identity guard: the index is only meaningful if the key list is the
+    // same one the select was rendered from (not merely the same length).
+    const renderedKeys = _routeSelectKeys.get(id);
+    if (!renderedKeys || renderedKeys.length !== opts.length
+        || renderedKeys.some((k, i) => k !== opts[i].key)) return '';
+    return idx < opts.length ? opts[idx].key : '';
+  }
+
+  // =========================================
   // Navigation
   // =========================================
 
@@ -212,6 +311,27 @@
       throw new Error(message);
     }
     return data;
+  }
+
+  // Every download entry point previews its actual request through the server's
+  // destination owner. Do not resolve folder paths separately in the browser.
+  async function checkDownloadDiskSpace(body, warn = false) {
+    let df;
+    try {
+      df = await api('POST', '/diskfree', body);
+    } catch (_) {
+      // Disk-stat failures remain non-fatal, as before. Download validation is
+      // still authoritative and will reject invalid selectors itself.
+      return true;
+    }
+    if (df.free < 100 * 1024 * 1024) {
+      showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
+      return false;
+    }
+    if (warn && df.free < 2 * 1024 * 1024 * 1024) {
+      showToast(`Low disk space warning: ${formatBytes(df.free)} free on ${df.path}`, 'warning');
+    }
+    return true;
   }
 
   // =========================================
@@ -959,6 +1079,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       ? advancedOptions.exclude.split(',').map(s => s.trim()).filter(Boolean)
       : [];
 
+    // Non-selectable types (e.g. audio) send the destination chosen in the
+    // file list's "Save to" select; '' keeps the previous behavior.
+    const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+
     try {
       const body = {
         repo,
@@ -970,7 +1094,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         // exact enough that q6_k does not also pull q6_k_xl.
         exactMatch: filters.length > 0
       };
+      if (routeKey) body.routeKey = routeKey;
 
+      if (!await checkDownloadDiskSpace(body)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -982,11 +1108,21 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // downloadFromAnalysis: show a simple download modal in the unified Models page
   window.downloadFromAnalysis = function(repo, isDataset) {
     const rev = currentAnalysis?.branch || 'main';
+    // Offer a labeled destination choice only when type folders are configured;
+    // otherwise the modal is exactly as before.
+    const routeOptions = getConfiguredRouteOptions();
+    const routeGroup = !isDataset && routeOptions.length ? `
+      <div class="form-group">
+        <label for="dlModalRoute">Save to</label>
+        ${renderRouteSelect('dlModalRoute')}
+        <p class="form-hint">Choose a configured type folder, or keep the server default.</p>
+      </div>` : '';
     showModal('Download', `
       <div class="form-group">
         <label>Repository</label>
         <div style="font-weight:600; padding: 6px 0;">${escapeHtml(repo)}</div>
       </div>
+      ${routeGroup}
       <div class="form-group">
         <label for="dlModalLocalDir">Save to folder <span class="form-hint-inline">(optional)</span></label>
         <input type="text" id="dlModalLocalDir" placeholder="leave blank for Settings default">
@@ -1001,16 +1137,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   };
 
   window.confirmDirectDownload = async function(repo, isDataset, revision) {
-    hideModal();
     const localDir = $('#dlModalLocalDir')?.value?.trim() || '';
+    const routeKey = isDataset ? '' : routeSelectValue('dlModalRoute');
+    hideModal();
     try {
-      const df = await fetch('/api/diskfree' + (localDir ? `?path=${encodeURIComponent(localDir)}` : '')).then(r => r.json()).catch(() => null);
-      if (df && df.free < 100 * 1024 * 1024) {
-        showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
       const body = { repo, revision: revision || 'main', dataset: isDataset };
       if (localDir) body.localDir = localDir;
+      if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -1071,6 +1205,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (!badge) return;
     try {
       const s = await api('GET', '/settings');
+      // Keep the route map available to the download/quant modals, which can be
+      // opened from the Models page without visiting Settings first.
+      state.settings = s;
       if (s.storageMode === 'local') {
         badge.textContent = `Storage: local files → ${s.localDir}`;
         badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
@@ -1102,20 +1239,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       return;
     }
 
-    // Disk-free guard: warn if < 2 GB, block if < 100 MB
-    try {
-      const dfParams = localDir ? `?path=${encodeURIComponent(localDir)}` : '';
-      const df = await fetch('/api/diskfree' + dfParams).then(r => r.json());
-      const freeMB = df.free / (1024 * 1024);
-      if (freeMB < 100) {
-        showToast(`Not enough disk space: only ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
-      if (freeMB < 2048) {
-        showToast(`Low disk space warning: ${formatBytes(df.free)} free on ${df.path}`, 'warning');
-      }
-    } catch (_) { /* non-fatal */ }
-
     const body = {
       repo,
       revision,
@@ -1127,6 +1250,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (localDir) body.localDir = localDir;
 
     try {
+      if (!await checkDownloadDiskSpace(body, true)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -2023,8 +2147,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         : '';
 
       // Every physical copy of this repo, each independently deletable. Falls
-      // back to a single top-level delete button for older servers that do not
-      // send a copies array yet.
+      // back to a single top-level delete button only for older servers that do
+      // not send a copies array at all; a current server always sends the key
+      // (possibly as an empty []), which means "no deletable copies" and must
+      // not offer a fallback button that would 400.
       const canDelete = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(data.repo);
       const copies = Array.isArray(data.copies) ? data.copies : [];
       const deleteIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
@@ -2542,6 +2668,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (downloadLayout) {
         downloadLayout.value = data.storageMode === 'local' ? 'local' : 'cache';
       }
+      // Populate the labeled type-folder fields from the keyed route map. The
+      // label<->key mapping lives only in ROUTE_LABELS; the user never sees a
+      // raw key.
+      const routes = data.downloadRoutes || {};
+      ROUTE_LABELS.forEach(r => {
+        const el = $(`#${r.fieldId}`);
+        if (el) el.value = routes[r.key] || '';
+      });
       syncStorageFields();
 
       // Display config file paths
@@ -2590,6 +2724,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     $('#saveSettingsBtn')?.addEventListener('click', saveSettings);
     $('#resetSettingsBtn')?.addEventListener('click', resetSettings);
     $('#downloadLayout')?.addEventListener('change', syncStorageFields);
+    $('#fillRoutePresetBtn')?.addEventListener('click', fillRoutePreset);
 
     // Toggle password visibility
     $$('.toggle-visibility').forEach(btn => {
@@ -2680,6 +2815,23 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       return;
     }
     const retries = parseInt($('#retries')?.value);
+
+    // Build the route map by merging the labeled fields onto the currently
+    // loaded map. Keys not surfaced by the UI (e.g. "llm") survive a dashboard
+    // save, while a cleared labeled field still removes its route. The server
+    // replaces the map wholesale, so the client must send the merged object.
+    // This is independent of `downloadLayout`: switching to HF cache must not
+    // wipe configured route folders (plan §7.2.1).
+    const downloadRoutes = { ...(state.settings?.downloadRoutes || {}) };
+    ROUTE_LABELS.forEach(r => {
+      const value = $(`#${r.fieldId}`)?.value?.trim() || '';
+      if (value) {
+        downloadRoutes[r.key] = value;
+      } else {
+        delete downloadRoutes[r.key];
+      }
+    });
+
     const body = {
       token: $('#hfToken')?.value || '',
       cacheDir: $('#cacheDirInput')?.value?.trim() || '',
@@ -2688,6 +2840,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         .split(/\r?\n/)
         .map(v => v.trim())
         .filter(Boolean),
+      downloadRoutes,
       connections: parseInt($('#connections')?.value) || 8,
       maxActive: parseInt($('#maxActive')?.value) || 3,
       maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
@@ -2735,6 +2888,24 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (localGroup) {
       localGroup.style.display = layout === 'local' ? '' : 'none';
     }
+    // Type folders are independent of the layout toggle and stay visible.
+  }
+
+  // fillRoutePreset fills the labeled type-folder fields from a single root
+  // path. Form-only: it never creates directories and never saves (plan §2.7).
+  function fillRoutePreset() {
+    const root = $('#routePresetRoot')?.value?.trim() || '';
+    if (!root) {
+      showToast('Enter a preset root folder first', 'info');
+      return;
+    }
+    const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/';
+    const cleanRoot = root.replace(/[\\/]+$/, '');
+    ROUTE_LABELS.forEach(r => {
+      const el = $(`#${r.fieldId}`);
+      if (el) el.value = [cleanRoot, ...r.preset].join(sep);
+    });
+    showToast('Type folders filled — review and save to apply', 'info');
   }
 
   function resetSettings() {
@@ -2747,6 +2918,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     setVal('#localDirInput', '');
     setVal('#localScanDirs', '');
     setVal('#downloadLayout', 'cache');
+    ROUTE_LABELS.forEach(r => setVal(`#${r.fieldId}`, ''));
+    // Clear every route key, including keys the dashboard does not surface
+    // (e.g. "llm"). saveSettings merges the labeled fields onto this map, so
+    // starting from an empty map makes the next save send downloadRoutes={}
+    // rather than resurrecting an unsurfaced key from the loaded settings.
+    if (state.settings) state.settings.downloadRoutes = {};
+    setVal('#routePresetRoot', '');
     setVal('#hfToken', '');
     setVal('#connections', '8');
     setVal('#maxActive', '3');
@@ -3423,6 +3601,22 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     let html = `<div class="selectable-items quant-list" id="${containerId}">`;
 
+    // Offer a labeled destination choice when type folders are configured.
+    // The select lives once per analysis result; downloadQuant reads it. Keys
+    // never appear in the markup (renderRouteSelect uses option indexes).
+    // Datasets are never routed (the server ignores routeKey when dataset is
+    // set), so no control is offered for a dataset analysis.
+    if (!currentAnalysis?.is_dataset && getConfiguredRouteOptions().length) {
+      html += `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('quantRouteSelect', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>`;
+    }
+
     for (const [category, categoryItems] of Object.entries(categories)) {
       const title = categoryTitles[category] || category.charAt(0).toUpperCase() + category.slice(1);
 
@@ -3482,13 +3676,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Download a single quantization from the quant list
   window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo) {
     try {
-      // Disk-free guard
-      const df = await fetch('/api/diskfree').then(r => r.json()).catch(() => null);
-      if (df && df.free < 100 * 1024 * 1024) {
-        showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
-
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
       // the repo being analyzed, not to its ancestors.
@@ -3502,9 +3689,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         filters: filterValue ? [filterValue] : [],
         exactMatch: !!filterValue
       };
+      // Send the labeled destination choice when type folders are configured.
+      // For an upstream companion (mmproj) this still resolves to the analyzed
+      // model's route, so companions land with the parent.
+      const routeKey = isDataset ? '' : routeSelectValue('quantRouteSelect');
+      if (routeKey) body.routeKey = routeKey;
       // When downloading from an upstream repo (e.g. mmproj from a base model),
       // tell the server to store the file under the current model's folder.
       if (localRepo) body.localRepo = localRepo;
+      if (!await checkDownloadDiskSpace(body)) return;
       const data = await api('POST', '/download', body);
 
       if (data.message) {
@@ -3533,6 +3726,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   function renderNonSelectableFiles(data) {
     if (!data.files?.length) return '';
     const repo = data.repo;
+    // Offer a labeled destination choice when type folders are configured.
+    // Non-selectable types (e.g. audio) have no selectable_items, so this file
+    // list and the "Download All" wizard are the paths that reach the server;
+    // both read this one select. Keys never appear in the markup. Datasets are
+    // never routed, so no control is offered for a dataset analysis.
+    const routeGroup = !currentAnalysis?.is_dataset && getConfiguredRouteOptions().length ? `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('nonSelectableRoute', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>` : '';
     // Exclude non-model files from the list (keep only content files)
     const files = data.files.filter(f => {
       const n = (f.path || f.name || '').toLowerCase();
@@ -3561,6 +3767,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     return `
       <div class="analysis-section">
+        ${routeGroup}
         <div class="quant-category">
           <div class="quant-category-title">Files (${data.files.length})</div>
           ${rows}${more}
@@ -3571,10 +3778,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Download a single specific file by filter
   window.downloadSingleFile = async function(repo, filename, isDataset) {
     try {
-      await api('POST', '/download', {
+      // Destination chosen in the file list's "Save to" select, when present.
+      const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+      const body = {
         repo, revision: currentAnalysis?.branch || 'main',
         dataset: isDataset, filters: [filename], exactMatch: true
-      });
+      };
+      if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
+      await api('POST', '/download', body);
       showToast(`Queued: ${filename}`, 'success');
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');

@@ -8,10 +8,17 @@
 - Cache repository details now list every physical copy (HF cache, the friendly view only when it is an orphan whose hub entry is gone, and each local root), each deletable on its own so a repo stored in both the HF cache and a local folder can be cleaned up per location (#63)
 - Delete responses now report `cleanupIncomplete` with `cleanupWarnings` when the primary copy was removed but a companion cleanup was left incomplete, and the UI shows a warning toast instead of a plain success (#63)
 - The friendly view is only removed when it is a proven whole-folder projection of the deleted repo; a real folder or a link into another repo is preserved and reported as incomplete cleanup (#63)
+- Route downloads into optional per-type folders (LLM/GGUF, LLM/Safetensors, LLM, Audio, Diffusion, Embedding) via opt-in type routes (#62)
+- `HF_TOKEN` environment variable support: the token is now resolved as `--token` flag, then `HF_TOKEN` env, then the config file token (#72)
+
+### Changed
+
+- Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
 
 ### Fixed
 
-- Cache delete now removes the real local folder (`localDir`/`localScanDirs`) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
+- Cache delete now removes the real local folder (`localDir`/`localScanDirs`/download-route folders) and orphaned friendly-view entries instead of failing with "not found", with path-safety checks to prevent deleting siblings or escaping the configured roots (#63)
+- Cache repository details always include the `copies` array, even when the repo has no deletable copies, so the UI no longer shows a legacy delete button that would fail on a repo with nothing to remove (#63)
 
 ## [1.2.2] - 2026-06-29
 

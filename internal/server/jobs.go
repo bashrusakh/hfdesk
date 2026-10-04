@@ -49,6 +49,11 @@ type Job struct {
 	EndedAt    *time.Time        `json:"endedAt,omitempty"`
 	Files      []JobFileProgress `json:"files,omitempty"`
 
+	// RouteKey is the download route key requested at creation (internal/audit
+	// only). The resolved destination lives in LocalDir; this field is never a
+	// path and must not be re-resolved at run time.
+	RouteKey string `json:"routeKey,omitempty"`
+
 	cancel     context.CancelFunc `json:"-"`
 	generation int                `json:"-"` // Tracks which runJob instance is current
 	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
@@ -336,9 +341,16 @@ func stringSlicesEqual(a, b []string) bool {
 }
 
 // CreateJob creates a new download job.
-// Returns existing job only when repo, revision, dataset AND filters match
-// an active job. Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16)
-// create independent jobs.
+// Returns existing job only when repo, revision, dataset, destination and
+// filters match an active job. Different filters on the same repo (e.g.
+// Q4_K_M vs mmproj-f16) create independent jobs.
+//
+// The destination is resolved from the current settings at creation and
+// frozen on the job: later settings changes never move an existing job's
+// destination. Destination identity is the frozen OutputDir plus LocalRepo
+// and ExactMatch, so the same repo requested with a different frozen
+// destination, destination folder override, or matching mode creates a new
+// job.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	revision := req.Revision
 	if revision == "" {
@@ -349,34 +361,41 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	// these reads (UpdateConfig replaces m.config under the write lock).
 	cfg := m.snapshotConfig()
 
-	// Use HuggingFace cache directory (v3 mode)
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
+	routeKey, effectiveLocalDir, outputDir, err := resolveDownloadDestination(cfg, req)
+	if err != nil {
+		return nil, false, err
 	}
-
-	// Determine effective local-dir: per-request overrides server-global.
-	// If either is set, use flat/real-file mode; otherwise use HF cache layout.
-	effectiveLocalDir := cfg.LocalDir
-	if req.LocalDir != "" {
-		effectiveLocalDir = req.LocalDir
-	}
-
 	flat := effectiveLocalDir != ""
-	outputDir := cacheDir
-	if flat {
-		outputDir = effectiveLocalDir
-	}
+
+	// The requested destination identity for dedup purposes: the frozen
+	// output root (flat local dir when set, cache root otherwise), compared
+	// with pathIdentityKey so platform case/clean semantics match how the
+	// rest of the server compares configured paths.
+	reqDestKey := pathIdentityKey(outputDir)
 
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
 	// are also identical, so the user can download a quantization and a
 	// vision encoder (mmproj) for the same repo at the same time.
+	//
+	// Destination identity uses the frozen OutputDir (not LocalDir):
+	// LocalDir changes meaning whenever the settings/routes change between
+	// two creations — two cache-mode jobs created under different cache
+	// roots are different destinations, and two jobs created under equal
+	// LocalDir strings but frozen into different output roots must not be
+	// collapsed when a settings change alters the effective path in
+	// between. LocalRepo and ExactMatch are part of the identity too: the
+	// former redirects where the files land (cache folder ID / subfolder),
+	// the latter selects which files match, so two requests differing in
+	// either are different downloads even when the rest matches.
 	m.mu.Lock()
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
+			pathIdentityKey(existing.OutputDir) == reqDestKey &&
+			existing.LocalRepo == req.LocalRepo &&
+			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
 			stringSlicesEqual(existing.Excludes, req.Excludes) {
@@ -398,6 +417,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		LocalRepo:  req.LocalRepo,
 		Flat:       flat,
 		ExactMatch: req.ExactMatch,
+		RouteKey:   routeKey,
 		Status:     JobStatusQueued,
 		CreatedAt:  time.Now(),
 		Progress:   JobProgress{},
@@ -1080,8 +1100,21 @@ func (m *JobManager) runJob(job *Job) {
 	// be a data race.
 	cfg := m.snapshotConfig()
 
-	// Use HuggingFace cache structure (v3 mode) instead of legacy OutputDir
-	cacheDir := cfg.CacheDir
+	// The destination was resolved and frozen into the job fields at
+	// CreateJob time (routes.go resolveDownloadDestination): cache mode
+	// carries the cache root in job.OutputDir, flat mode carries the
+	// resolved local folder in job.LocalDir (applied below). runJob must
+	// honor the frozen destination — re-snapshotting cfg.CacheDir here
+	// would move an existing job's downloads into a newly configured cache
+	// root while the job still reports its original OutputDir.
+	//
+	// Legacy state files persisted before OutputDir existed carry an empty
+	// value; those restored jobs keep their historical current-cache-root
+	// semantics by falling back to the configured or default cache.
+	cacheDir := job.OutputDir
+	if cacheDir == "" {
+		cacheDir = cfg.CacheDir
+	}
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
@@ -1254,8 +1287,22 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		return
 	}
 	cfg := m.snapshotConfig()
+	// The paused job's runJob goroutine has already exited, so the settings
+	// the last run (or a future resume) will use may differ from the current
+	// cfg. Mirror runJob's destination-freeze chain exactly: frozen
+	// job.OutputDir for cache mode, frozen job.LocalDir for flat mode, and
+	// the configured/default cache only for legacy restored jobs whose
+	// OutputDir was empty — cleanup must validate dsts against the same
+	// root the artifacts were downloaded to.
+	cacheDir := job.OutputDir
+	if cacheDir == "" {
+		cacheDir = cfg.CacheDir
+	}
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
 	settings := hfdownloader.Settings{
-		CacheDir: cfg.CacheDir,
+		CacheDir: cacheDir,
 	}
 	if job.LocalDir != "" {
 		settings.OutputDir = job.LocalDir

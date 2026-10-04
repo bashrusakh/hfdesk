@@ -5,6 +5,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,10 +13,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 var testCacheDir string
@@ -78,7 +83,7 @@ func TestScanLocalCachedRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	repos, err := scanLocalCachedRepos(cacheDir, localDir, nil, false)
+	repos, err := scanLocalCachedRepos(cacheDir, localDir, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +97,401 @@ func TestScanLocalCachedRepos(t *testing.T) {
 	}
 	if found["owner/model"] != "Friendly view" {
 		t.Fatalf("expected friendly-view repo, got %#v", found)
+	}
+}
+
+func TestLocalCachedRepos_RootRestrictions(t *testing.T) {
+	for mask := 0; mask < 8; mask++ {
+		for _, friendlyOverlap := range []bool{false, true} {
+			t.Run(fmt.Sprintf("overlap-%d/friendly-%v", mask, friendlyOverlap), func(t *testing.T) {
+				base := t.TempDir()
+				cacheDir := filepath.Join(base, "cache")
+				friendlyDir := filepath.Join(cacheDir, "models")
+				otherDir := filepath.Join(base, "local")
+				writeWeight := func(path string) {
+					t.Helper()
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("weights"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Nested weights ensure internals would qualify as false repos.
+				blocked := []string{"hub/models--fake--repo", "models/owner", "datasets/fake", "blobs/fake", "snapshots/fake", "refs/fake", "HuB/fake"}
+				for _, id := range blocked {
+					if id == "models/owner" {
+						continue // The friendly owner/real fixture supplies nested weights.
+					}
+					writeWeight(filepath.Join(cacheDir, filepath.FromSlash(id), "nested", "model.safetensors"))
+				}
+				writeWeight(filepath.Join(friendlyDir, "owner", "real", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(friendlyDir, "models", "friendly", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(cacheDir, "ordinary", "raw", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(otherDir, "ordinary", "local", "nested", "model.safetensors"))
+				writeWeight(filepath.Join(otherDir, "models", "owner", "nested", "model.safetensors"))
+
+				localDir := ""
+				var scanDirs []string
+				var routes map[string]string
+				if mask&1 != 0 {
+					routes = map[string]string{"audio": cacheDir, "embedding": cacheDir + string(filepath.Separator)}
+				}
+				if mask&2 != 0 {
+					localDir = cacheDir
+				}
+				if mask&4 != 0 {
+					scanDirs = append(scanDirs, cacheDir+string(filepath.Separator))
+				}
+				if friendlyOverlap {
+					scanDirs = append(scanDirs, friendlyDir)
+					if routes == nil {
+						routes = make(map[string]string)
+					}
+					routes["llm"] = friendlyDir
+				}
+				// When LocalDir is the cache, lookup must skip that root and
+				// continue here for the otherwise excluded models/owner ID.
+				scanDirs = append(scanDirs, otherDir)
+				want := map[string]localCacheRoot{
+					"owner/real":      {Path: filepath.Join(friendlyDir, "owner", "real"), Source: "Friendly view"},
+					"models/friendly": {Path: filepath.Join(friendlyDir, "models", "friendly"), Source: "Friendly view"},
+					"ordinary/raw":    {Path: filepath.Join(cacheDir, "ordinary", "raw"), Source: "Local"},
+					"ordinary/local":  {Path: filepath.Join(otherDir, "ordinary", "local"), Source: "Local"},
+					"models/owner":    {Path: filepath.Join(otherDir, "models", "owner"), Source: "Local"},
+				}
+				for _, includeFiles := range []bool{false, true} {
+					t.Run(fmt.Sprintf("files-%v", includeFiles), func(t *testing.T) {
+						checkRepo := func(repo CachedRepoInfo) {
+							t.Helper()
+							expected, ok := want[repo.Repo]
+							if !ok || repo.Path != expected.Path || repo.Source != expected.Source {
+								t.Errorf("unexpected repo %s at %s (%s)", repo.Repo, repo.Path, repo.Source)
+							}
+							if repo.FileCount != 1 || repo.Size != int64(len("weights")) {
+								t.Errorf("repo %s: fileCount=%d size=%d", repo.Repo, repo.FileCount, repo.Size)
+							}
+							if includeFiles {
+								if len(repo.Files) != 1 || repo.Files[0].Name != filepath.Join("nested", "model.safetensors") {
+									t.Errorf("repo %s: files = %#v", repo.Repo, repo.Files)
+								}
+							} else if len(repo.Files) != 0 {
+								t.Errorf("repo %s: unwanted file list", repo.Repo)
+							}
+						}
+						repos, err := scanLocalCachedRepos(cacheDir, localDir, scanDirs, routes, includeFiles)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if len(repos) != len(want) {
+							t.Errorf("scan returned %d repos, want %d", len(repos), len(want))
+						}
+						seen := make(map[string]bool)
+						for _, repo := range repos {
+							if seen[repo.Repo] {
+								t.Errorf("duplicate repo %s", repo.Repo)
+							}
+							seen[repo.Repo] = true
+							checkRepo(repo)
+						}
+						for id := range want {
+							if !seen[id] {
+								t.Errorf("scan omitted %s", id)
+							}
+							info, err := findLocalCachedRepo(cacheDir, localDir, scanDirs, routes, id, includeFiles)
+							if err != nil {
+								t.Errorf("lookup %s: %v", id, err)
+								continue
+							}
+							checkRepo(*info)
+						}
+						for _, id := range blocked {
+							if _, ok := want[id]; ok {
+								continue // models/owner exists in the independent local root.
+							}
+							if _, err := findLocalCachedRepo(cacheDir, localDir, scanDirs, routes, id, includeFiles); !os.IsNotExist(err) {
+								t.Errorf("lookup exposed internal %s: %v", id, err)
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestLocalCachedRepos_NestedRoots(t *testing.T) {
+	type expectedRepo struct {
+		path, source string
+		files        []string
+		quants       []string
+	}
+	for _, tc := range []struct {
+		name, cache, local string
+		scanDirs           []string
+		routes             map[string]string
+		files              []string
+		want               map[string]expectedRepo
+		absent             []string
+		linuxOnly          bool
+		relativeRoutes     bool
+	}{
+		{
+			name: "local-and-fine", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name:   "coarse-and-fine-without-local",
+			routes: map[string]string{"llm": "models/LLM", "llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/coarse/real/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"coarse/real": {path: "models/LLM/coarse/real", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"GGUF/owner"},
+		},
+		{
+			name: "three-root-levels", local: "models",
+			routes: map[string]string{"llm": "models/LLM", "llm/gguf": "models/LLM/GGUF"},
+			files: []string{
+				"models/parent/real/shards/model.safetensors", "models/LLM/coarse/real/model.safetensors",
+				"models/LLM/GGUF/owner/model/foo.gguf",
+			},
+			want: map[string]expectedRepo{
+				"parent/real": {path: "models/parent/real", files: []string{"shards/model.safetensors"}},
+				"coarse/real": {path: "models/LLM/coarse/real", files: []string{"model.safetensors"}},
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+			},
+			absent: []string{"LLM/GGUF", "LLM/coarse", "GGUF/owner"},
+		},
+		{
+			name: "absolute-local-relative-route", local: "models", relativeRoutes: true,
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "siblings-and-real-ancestor", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF", "audio": "models/Audio"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/Audio/sound/voice/model.safetensors", "models/parent/real/shards/deep/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"sound/voice": {path: "models/Audio/sound/voice", files: []string{"model.safetensors"}},
+				"parent/real": {path: "models/parent/real", files: []string{"shards/deep/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF", "Audio/sound"},
+		},
+		{
+			name: "scan-dir-overlap", local: "models", scanDirs: []string{"models", "models/LLM/GGUF"},
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF/"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/parent/real/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"parent/real": {path: "models/parent/real", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "friendly-and-raw-overlap", cache: "cache", local: "cache", scanDirs: []string{"cache", "cache/models"},
+			routes: map[string]string{"llm": "cache", "llm/gguf": "cache/models/LLM/GGUF"},
+			files: []string{
+				"cache/models/LLM/GGUF/owner/model/foo.gguf", "cache/models/friendly/real/model.safetensors",
+				"cache/raw/real/model.safetensors", "cache/hub/fake/nested/model.safetensors",
+			},
+			want: map[string]expectedRepo{
+				"owner/model":   {path: "cache/models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"friendly/real": {path: "cache/models/friendly/real", source: "Friendly view", files: []string{"model.safetensors"}},
+				"raw/real":      {path: "cache/raw/real", files: []string{"model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF", "models/LLM", "hub/fake"},
+		},
+		{
+			name: "descendant-inside-real-repo", local: "models",
+			routes: map[string]string{"llm/gguf": "models/parent/real/routed"},
+			files: []string{
+				"models/parent/real/shards/own-Q4_K_M.gguf", "models/parent/real/routed/owner/model/child-Q8_0.gguf",
+				"models/parent/real/routed/owner/model/mmproj-F16.gguf",
+			},
+			want: map[string]expectedRepo{
+				"parent/real": {path: "models/parent/real", files: []string{"shards/own-Q4_K_M.gguf"}, quants: []string{"Q4_K_M"}},
+				"owner/model": {path: "models/parent/real/routed/owner/model", files: []string{"child-Q8_0.gguf", "mmproj-F16.gguf"}, quants: []string{"Q8_0"}},
+			},
+		},
+		{
+			name: "descendant-only-weights-do-not-qualify-parent", local: "models",
+			routes: map[string]string{"llm/gguf": "models/parent/empty/routed"},
+			files:  []string{"models/parent/empty/README.md", "models/parent/empty/routed/owner/model/foo.gguf"},
+			want:   map[string]expectedRepo{"owner/model": {path: "models/parent/empty/routed/owner/model", files: []string{"foo.gguf"}}},
+			absent: []string{"parent/empty"},
+		},
+		{
+			name: "lookup-continues-after-excluded-candidate", local: "models", scanDirs: []string{"other"},
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "other/LLM/GGUF/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/GGUF":    {path: "other/LLM/GGUF", files: []string{"shards/model.safetensors"}},
+			},
+		},
+		{
+			name: "prefix-boundary", local: "models",
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/GGUF-other/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model":    {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/GGUF-other": {path: "models/LLM/GGUF-other", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+		{
+			name: "case-distinct", local: "models", linuxOnly: true,
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/gguf/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/gguf":    {path: "models/LLM/gguf", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.linuxOnly && runtime.GOOS != "linux" {
+				t.Skip("requires Linux case-sensitive directories")
+			}
+			base := t.TempDir()
+			path := func(relative string) string {
+				if relative == "" {
+					return ""
+				}
+				return filepath.Join(base, filepath.FromSlash(relative))
+			}
+			cacheDir := path(tc.cache)
+			if cacheDir == "" {
+				cacheDir = path("cache")
+			}
+			var scanDirs []string
+			for _, dir := range tc.scanDirs {
+				scanDirs = append(scanDirs, path(dir))
+			}
+			routes := make(map[string]string)
+			for key, dir := range tc.routes {
+				routes[key] = path(dir)
+				if tc.relativeRoutes {
+					cwd, err := os.Getwd()
+					if err != nil {
+						t.Fatal(err)
+					}
+					routes[key], err = filepath.Rel(cwd, routes[key])
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for _, file := range tc.files {
+				if err := os.MkdirAll(filepath.Dir(path(file)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path(file), []byte("weights"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, includeFiles := range []bool{false, true} {
+				t.Run(fmt.Sprintf("files-%v", includeFiles), func(t *testing.T) {
+					check := func(repo CachedRepoInfo) {
+						t.Helper()
+						want, ok := tc.want[repo.Repo]
+						if !ok {
+							t.Errorf("synthetic/unexpected repo %s at %s", repo.Repo, repo.Path)
+							return
+						}
+						source := want.source
+						if source == "" {
+							source = "Local"
+						}
+						absolute, err := filepath.Abs(repo.Path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if absolute != path(want.path) || repo.Source != source {
+							t.Errorf("%s: path/source = %s/%s, want %s/%s", repo.Repo, repo.Path, repo.Source, path(want.path), source)
+						}
+						if repo.FileCount != len(want.files) || repo.Size != int64(len(want.files)*len("weights")) {
+							t.Errorf("%s: fileCount/size = %d/%d, want %d/%d", repo.Repo, repo.FileCount, repo.Size, len(want.files), len(want.files)*len("weights"))
+						}
+						var names, mmproj []string
+						for _, file := range repo.Files {
+							names = append(names, file.Name)
+						}
+						var wantNames []string
+						wantMMProj := false
+						for _, file := range want.files {
+							if includeFiles {
+								wantNames = append(wantNames, filepath.FromSlash(file))
+							}
+							if filepath.Base(file) == "mmproj-F16.gguf" {
+								wantMMProj = true
+								if includeFiles {
+									mmproj = append(mmproj, filepath.FromSlash(file))
+								}
+							}
+						}
+						if !reflect.DeepEqual(names, wantNames) || !reflect.DeepEqual(repo.Quantizations, want.quants) || repo.HasMMProj != wantMMProj || !reflect.DeepEqual(repo.MMProjFiles, mmproj) {
+							t.Errorf("%s: files/metadata = %v/%v/%v/%v, want %v/%v/%v/%v", repo.Repo, names, repo.Quantizations, repo.HasMMProj, repo.MMProjFiles, wantNames, want.quants, wantMMProj, mmproj)
+						}
+					}
+					repos, err := scanLocalCachedRepos(cacheDir, path(tc.local), scanDirs, routes, includeFiles)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(repos) != len(tc.want) {
+						t.Errorf("scan returned %d repos, want %d", len(repos), len(tc.want))
+					}
+					seen := make(map[string]bool)
+					for _, repo := range repos {
+						if seen[repo.Repo] {
+							t.Errorf("duplicate repo %s", repo.Repo)
+						}
+						seen[repo.Repo] = true
+						check(repo)
+					}
+					for id := range tc.want {
+						if !seen[id] {
+							t.Errorf("scan omitted %s", id)
+						}
+						repo, err := findLocalCachedRepo(cacheDir, path(tc.local), scanDirs, routes, id, includeFiles)
+						if err != nil {
+							t.Errorf("lookup %s: %v", id, err)
+							continue
+						}
+						check(*repo)
+					}
+					for _, id := range tc.absent {
+						if _, err := findLocalCachedRepo(cacheDir, path(tc.local), scanDirs, routes, id, includeFiles); !os.IsNotExist(err) {
+							t.Errorf("lookup exposed synthetic repo %s: %v", id, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
+	base := t.TempDir()
+	root := localCacheRoot{Path: filepath.Join(base, "Models")}
+	child := localCacheRoot{Path: filepath.Join(base, "models", "GGUF")}
+	roots := []localCacheRoot{root, child}
+	got := root.excludedSubroots(roots)
+	var want []string
+	if runtime.GOOS == "windows" {
+		want = []string{pathIdentityKey(child.Path)}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("case-different parent: excluded = %v, want %v", got, want)
 	}
 }
 
@@ -150,6 +550,309 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	}
 	if len(resp.Repos[0].Capabilities) != 1 || resp.Repos[0].Capabilities[0] != "vision" {
 		t.Fatalf("Capabilities = %#v, want [vision]", resp.Repos[0].Capabilities)
+	}
+}
+
+// addCacheTestGGUF uses the real blob/snapshot/friendly projection helpers, so
+// metadata tests exercise symlink names without substituting snapshot metadata.
+func addCacheTestGGUF(t *testing.T, repo *hfdownloader.RepoDir, commit, name, filter string, friendly bool) {
+	t.Helper()
+	name = filepath.FromSlash(name)
+	data := []byte(name)
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+	if err := os.MkdirAll(repo.BlobsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repo.BlobPath(hash), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateSnapshot(commit, []hfdownloader.SnapshotFile{{RelativePath: name, SHA256: hash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.WriteRef("main", commit); err != nil {
+		t.Fatal(err)
+	}
+	if friendly {
+		if err := repo.CreateFriendlySymlink(commit, name, filepath.FromSlash(filter)); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(repo.FriendlyPath(), filepath.FromSlash(filter), name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("friendly file is not a symlink: %s (%v)", path, err)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("friendly link does not resolve to blob: %s (%v)", path, err)
+		}
+	}
+}
+
+func getCacheTestJSON(t *testing.T, mux *http.ServeMux, path string, result any) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET %s: %d: %s", path, w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), result); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkCacheTestMetadata(t *testing.T, repo CachedRepoInfo, quants, mmproj []string, detail bool) {
+	t.Helper()
+	var capabilities, paths []string
+	if len(mmproj) > 0 {
+		capabilities = []string{"vision"}
+		if detail {
+			paths = mmproj
+		}
+	}
+	if !reflect.DeepEqual(repo.Quantizations, quants) || repo.HasMMProj != (len(mmproj) > 0) ||
+		!reflect.DeepEqual(repo.Capabilities, capabilities) || !reflect.DeepEqual(repo.MMProjFiles, paths) {
+		t.Errorf("%s metadata = %v/%v/%v/%v, want %v/%v/%v/%v", repo.Repo,
+			repo.Quantizations, repo.HasMMProj, repo.Capabilities, repo.MMProjFiles,
+			quants, len(mmproj) > 0, capabilities, paths)
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_Ownership(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("production HF projection helpers do not create symlinks on Windows")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		for _, tc := range []struct {
+			name, registration, subroot string
+			relative, retained          bool
+			prunesRepo                  bool
+		}{
+			{name: "route-nested", registration: "route", subroot: "parent/real/routed"},
+			{name: "local-nested", registration: "local", subroot: "parent/real/routed"},
+			{name: "scan-nested", registration: "scan", subroot: "parent/real/routed"},
+			{name: "relative-route", registration: "route", subroot: "parent/real/routed", relative: true},
+			{name: "equal-repo", registration: "route", subroot: "parent/real", prunesRepo: true},
+			{name: "enclosing-repo", registration: "scan", subroot: "parent", prunesRepo: true},
+			{name: "equal-library", registration: "route", subroot: "."},
+			{name: "enclosing-library", registration: "local", subroot: ".."},
+			{name: "retained-filtered-projection", registration: "route", subroot: "parent/real/routed", retained: true},
+		} {
+			// Registering the dataset library itself as a model scan root has
+			// existing dual-type listing semantics outside this metadata fix.
+			if repoType == hfdownloader.RepoTypeDataset && tc.name == "equal-library" {
+				continue
+			}
+			t.Run(string(repoType)+"/"+tc.name, func(t *testing.T) {
+				base := t.TempDir()
+				cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"), 0)
+				parent, err := cache.Repo("parent/real", repoType)
+				if err != nil {
+					t.Fatal(err)
+				}
+				addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", true)
+				library := cache.ModelsDir()
+				if repoType == hfdownloader.RepoTypeDataset {
+					library = cache.DatasetsDir()
+				}
+				root := filepath.Join(library, filepath.FromSlash(tc.subroot))
+				writeFile := func(path string) {
+					t.Helper()
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("weights"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				childPath := filepath.Join(root, "child", "model")
+				writeFile(filepath.Join(childPath, "child-Q8_0.gguf"))
+				writeFile(filepath.Join(childPath, "mmproj-F16.gguf"))
+				// Unrelated local, friendly-only and raw-cache repos must survive.
+				independent := filepath.Join(base, "independent")
+				writeFile(filepath.Join(independent, "sibling", "real", "model.safetensors"))
+				writeFile(filepath.Join(cache.ModelsDir(), "friendly", "only", "model.safetensors"))
+				writeFile(filepath.Join(cache.Root, "ordinary", "raw", "model.safetensors"))
+				quants := []string{"Q4_K_M"}
+				var mmproj []string
+				if tc.retained {
+					// Both revisions remain in the projection. Deep/filter-prefixed
+					// own files and a prefix sibling of the excluded root stay owned.
+					addCacheTestGGUF(t, parent, "bbbbbbbb", "deep/own-Q5_K_M.gguf", "selected", true)
+					addCacheTestGGUF(t, parent, "bbbbbbbb", "deep/mmproj-F16.gguf", "routed-other", true)
+					quants = []string{"Q4_K_M", "Q5_K_M"}
+					mmproj = []string{filepath.FromSlash("routed-other/deep/mmproj-F16.gguf")}
+				}
+				if tc.prunesRepo {
+					quants = nil
+				}
+				configuredRoot := root
+				if tc.relative {
+					cwd, err := os.Getwd()
+					if err != nil {
+						t.Fatal(err)
+					}
+					configuredRoot, err = filepath.Rel(cwd, root)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg := Config{CacheDir: cache.Root, LocalScanDirs: []string{independent}}
+				switch tc.registration {
+				case "route":
+					cfg.DownloadRoutes = map[string]string{"llm/gguf": configuredRoot}
+				case "local":
+					cfg.LocalDir = configuredRoot
+				case "scan":
+					cfg.LocalScanDirs = append(cfg.LocalScanDirs, configuredRoot)
+				}
+				srv := &Server{config: cfg}
+				mux := http.NewServeMux()
+				srv.registerAPIRoutes(mux)
+				var list struct {
+					Repos []CachedRepoInfo `json:"repos"`
+					Stats CacheStats       `json:"stats"`
+				}
+				getCacheTestJSON(t, mux, "/api/cache", &list)
+				if len(list.Repos) != 5 || list.Stats.TotalModels+list.Stats.TotalDatasets != 5 {
+					t.Errorf("list/stats count = %d/%d, want 5 without synthetic repos", len(list.Repos), list.Stats.TotalModels+list.Stats.TotalDatasets)
+				}
+				want := map[string]bool{"parent/real": true, "child/model": true, "sibling/real": true, "friendly/only": true, "ordinary/raw": true}
+				for _, repo := range list.Repos {
+					if !want[repo.Repo] {
+						t.Errorf("synthetic or duplicate repo: %s (%s)", repo.Repo, repo.Path)
+					}
+					delete(want, repo.Repo)
+					var detail CachedRepoInfo
+					getCacheTestJSON(t, mux, "/api/cache/"+repo.Repo, &detail)
+					if detail.Path != repo.Path || detail.Source != repo.Source || detail.Type != repo.Type {
+						t.Errorf("%s list/detail ownership mismatch: %#v / %#v", repo.Repo, repo, detail)
+					}
+					switch repo.Repo {
+					case "parent/real":
+						if repo.Source != "HF cache" || repo.Path != parent.Path() || repo.FriendlyPath != parent.FriendlyPath() || repo.Type != string(repoType) {
+							t.Errorf("parent lost HF precedence: %#v", repo)
+						}
+						checkCacheTestMetadata(t, repo, quants, mmproj, false)
+						checkCacheTestMetadata(t, detail, quants, mmproj, true)
+						// Ownership filtering must not change snapshot file accounting.
+						if len(detail.Files) != 1 || detail.Files[0].Name != "own-Q4_K_M.gguf" || detail.Size != int64(len("own-Q4_K_M.gguf")) {
+							t.Errorf("parent snapshot accounting changed: %#v", detail)
+						}
+					case "child/model":
+						absPath, err := filepath.Abs(repo.Path)
+						if err != nil || absPath != childPath || repo.FileCount != 2 || detail.FileCount != 2 || len(detail.Files) != 2 {
+							t.Errorf("child ownership/accounting changed: %#v / %#v (%v)", repo, detail, err)
+						}
+						checkCacheTestMetadata(t, repo, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, false)
+						checkCacheTestMetadata(t, detail, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, true)
+					default:
+						if repo.FileCount != 1 || detail.FileCount != 1 {
+							t.Errorf("preserved repo accounting changed: %#v / %#v", repo, detail)
+						}
+						checkCacheTestMetadata(t, repo, nil, nil, false)
+						checkCacheTestMetadata(t, detail, nil, nil, true)
+					}
+				}
+				if len(want) != 0 {
+					t.Errorf("omitted repos: %v", want)
+				}
+			})
+		}
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_NoProjection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("real snapshot symlink fixture requires non-Windows HF helpers")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		t.Run(string(repoType), func(t *testing.T) {
+			cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+			parent, err := cache.Repo("parent/real", repoType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", false)
+			addCacheTestGGUF(t, parent, "aaaaaaaa", "mmproj-F16.gguf", "", false)
+			srv := &Server{config: Config{CacheDir: cache.Root}}
+			mux := http.NewServeMux()
+			srv.registerAPIRoutes(mux)
+			var list struct {
+				Repos []CachedRepoInfo `json:"repos"`
+			}
+			getCacheTestJSON(t, mux, "/api/cache", &list)
+			if len(list.Repos) != 1 || list.Repos[0].Source != "HF cache" {
+				t.Fatalf("missing HF record: %#v", list.Repos)
+			}
+			var detail CachedRepoInfo
+			getCacheTestJSON(t, mux, "/api/cache/parent/real", &detail)
+			if len(detail.Files) != 2 || len(detail.Snapshots) != 1 || detail.FileCount != 2 {
+				t.Errorf("snapshot fixture not visible: %#v", detail)
+			}
+			checkCacheTestMetadata(t, list.Repos[0], nil, nil, false)
+			checkCacheTestMetadata(t, detail, nil, nil, true)
+		})
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_ConfigSnapshot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("production HF projection helpers do not create symlinks on Windows")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	parent, err := cache.Repo("parent/real", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", true)
+	// Existing parent projection content changes ownership when this directory
+	// is registered/unregistered; no sticky lifecycle reservation is intended.
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "child/model/child-Q8_0.gguf", "routed", true)
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "child/model/mmproj-F16.gguf", "routed", true)
+	root := filepath.Join(parent.FriendlyPath(), "routed")
+	srv := &Server{config: Config{CacheDir: cache.Root}}
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+	for _, registered := range []bool{false, true, false} {
+		srv.withConfig(func(cfg *Config) {
+			cfg.DownloadRoutes = nil
+			if registered {
+				cfg.DownloadRoutes = map[string]string{"llm/gguf": root}
+			}
+		})
+		quants := []string{"Q4_K_M", "Q8_0"}
+		mmproj := []string{filepath.FromSlash("routed/child/model/mmproj-F16.gguf")}
+		count := 1
+		if registered {
+			quants, mmproj, count = []string{"Q4_K_M"}, nil, 2
+		}
+		var list struct {
+			Repos []CachedRepoInfo `json:"repos"`
+		}
+		getCacheTestJSON(t, mux, "/api/cache", &list)
+		if len(list.Repos) != count {
+			t.Errorf("registered=%v: list count = %d, want %d", registered, len(list.Repos), count)
+		}
+		for _, repo := range list.Repos {
+			if repo.Repo == "parent/real" {
+				checkCacheTestMetadata(t, repo, quants, mmproj, false)
+			}
+		}
+		var detail CachedRepoInfo
+		getCacheTestJSON(t, mux, "/api/cache/parent/real", &detail)
+		checkCacheTestMetadata(t, detail, quants, mmproj, true)
+		if registered {
+			getCacheTestJSON(t, mux, "/api/cache/child/model", &detail)
+			checkCacheTestMetadata(t, detail, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, true)
+		} else {
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/cache/child/model", nil))
+			if w.Code != http.StatusNotFound {
+				t.Errorf("unregistered child lookup = %d, want 404", w.Code)
+			}
+		}
 	}
 }
 
@@ -1447,6 +2150,81 @@ func TestAPI_CacheInfo_ListsHFCacheAndLocalCopies(t *testing.T) {
 	}
 }
 
+// TestAPI_CacheInfo_AlwaysEmitsCopiesKey is M1: a current server must always
+// include the "copies" key in a cache-info response, even when there are zero
+// deletable copies. Otherwise the UI's legacy fallback (which keys off the
+// absence of the array) renders a Delete button that always 400s. Two zero-copy
+// cases are covered: a real folder under the friendly namespace that is not a
+// projection, and an HF hub outside the configured cache dir.
+func TestAPI_CacheInfo_AlwaysEmitsCopiesKey(t *testing.T) {
+	assertCopiesKey := func(t *testing.T, body []byte) {
+		t.Helper()
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			t.Fatalf("decode raw cache info: %v", err)
+		}
+		value, ok := raw["copies"]
+		if !ok {
+			t.Fatalf("cache info omitted the copies key: %s", body)
+		}
+		if string(value) == "null" {
+			t.Fatalf("copies key is JSON null, want []: %s", body)
+		}
+		var decoded []CacheCopy
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			t.Fatalf("decode copies %s: %v", value, err)
+		}
+		if len(decoded) != 0 {
+			t.Fatalf("copies = %#v, want empty for this fixture", decoded)
+		}
+	}
+
+	t.Run("friendly-view-only-real-folder", func(t *testing.T) {
+		root := t.TempDir()
+		cacheDir := filepath.Join(root, "cache")
+		// A real folder under <cache>/models with no hub and no friendly
+		// projection: handleCacheInfo resolves it but there is nothing
+		// deletable, so copies must still be emitted as [].
+		writeRepoFixture(t, filepath.Join(cacheDir, "models", "owner", "name"), "model.gguf")
+
+		srv := New(Config{
+			Addr: "127.0.0.1", Port: 0, CacheDir: cacheDir,
+			Concurrency: 2, MaxActive: 1,
+		})
+		req := httptest.NewRequest("GET", "/api/cache/owner/name", nil)
+		req.SetPathValue("repo", "owner/name")
+		w := httptest.NewRecorder()
+		srv.handleCacheInfo(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("handleCacheInfo = %d, want 200. Body: %s", w.Code, w.Body.String())
+		}
+		assertCopiesKey(t, w.Body.Bytes())
+	})
+
+	t.Run("hf-hub-outside-configured-cache", func(t *testing.T) {
+		root := t.TempDir()
+		cacheDir := filepath.Join(root, "cache")
+		externalHub := filepath.Join(root, "external-hub")
+		// Point HF_HUB_CACHE at a hub outside the configured cache dir so the
+		// HF-cache copy is not deletable and the response has zero copies.
+		t.Setenv("HF_HUB_CACHE", externalHub)
+		writeRepoFixture(t, filepath.Join(externalHub, "models--owner--name"), "blob")
+
+		srv := New(Config{
+			Addr: "127.0.0.1", Port: 0, CacheDir: cacheDir,
+			Concurrency: 2, MaxActive: 1,
+		})
+		req := httptest.NewRequest("GET", "/api/cache/owner/name", nil)
+		req.SetPathValue("repo", "owner/name")
+		w := httptest.NewRecorder()
+		srv.handleCacheInfo(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("handleCacheInfo = %d, want 200. Body: %s", w.Code, w.Body.String())
+		}
+		assertCopiesKey(t, w.Body.Bytes())
+	})
+}
+
 // TestAPI_CacheDelete_ByPathTargetsOneCopy verifies that delete with an exact
 // path removes only the targeted local copy and leaves the HF-cache copy.
 func TestAPI_CacheDelete_ByPathTargetsOneCopy(t *testing.T) {
@@ -1763,10 +2541,10 @@ func TestFindLocalCachedRepo_SkipsSpecialOwner(t *testing.T) {
 	realLocal := filepath.Join(cacheDir, "alice", "one")
 	writeRepoFixture(t, realLocal, "model.gguf")
 
-	if got, err := findLocalCachedRepo(cacheDir, "", nil, "hub/foo", false); err == nil {
+	if got, err := findLocalCachedRepo(cacheDir, "", nil, nil, "hub/foo", false); err == nil {
 		t.Errorf("findLocalCachedRepo(hub/foo) resolved to %#v, want not found", got)
 	}
-	got, err := findLocalCachedRepo(cacheDir, "", nil, "alice/one", false)
+	got, err := findLocalCachedRepo(cacheDir, "", nil, nil, "alice/one", false)
 	if err != nil {
 		t.Fatalf("findLocalCachedRepo(alice/one) err = %v", err)
 	}
@@ -2164,6 +2942,79 @@ func TestAPI_CacheDelete_UnknownSourceWithValidPathRejected(t *testing.T) {
 	}
 	if _, err := os.Stat(hubRepo); err != nil {
 		t.Errorf("expected hub copy to survive, stat err = %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_RouteDirsBehaveLikeLocalRoots verifies the semantic
+// reconciliation with upstream #66: a configured download-route destination is a
+// Local root like any other. It is listed and deletable as its own
+// <routeDir>/<owner>/<name> repo, and it is protected as an ancestor boundary so
+// a route dir can never be deleted as a synthetic two-level repo under another
+// scan root.
+func TestAPI_CacheDelete_RouteDirsBehaveLikeLocalRoots(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	routeDir := filepath.Join(root, "LLM", "GGUF")
+	repoDir := filepath.Join(routeDir, "owner", "name")
+	writeRepoFixture(t, repoDir, "model.gguf")
+
+	srv := New(Config{
+		Addr:           "127.0.0.1",
+		Port:           0,
+		CacheDir:       cacheDir,
+		DownloadRoutes: map[string]string{"llm/gguf": routeDir},
+		Concurrency:    2,
+		MaxActive:      1,
+	})
+
+	// Listed as a Local copy.
+	info := cacheInfoForTest(t, srv, "owner/name")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("route-dir repo not listed as Local copy: %#v", info.Copies)
+	}
+	if filepath.Clean(localCopy.Path) != filepath.Clean(repoDir) {
+		t.Fatalf("listed Local path = %q, want %q", localCopy.Path, repoDir)
+	}
+
+	// Deletable.
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv, "owner/name", q); w.Code != http.StatusOK {
+		t.Fatalf("deleting route-dir repo = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("expected route-dir repo removed, stat err = %v", err)
+	}
+
+	// A route dir nested under a parent scan root is a hard ancestor boundary:
+	// the parent scan root must not advertise it as a two-level repo and must
+	// not delete it.
+	parent := filepath.Join(root, "parent")
+	nestedRoute := filepath.Join(parent, "org", "family")
+	writeRepoFixture(t, filepath.Join(nestedRoute, "model"), "deep.gguf")
+
+	srv2 := New(Config{
+		Addr:           "127.0.0.1",
+		Port:           0,
+		CacheDir:       cacheDir,
+		LocalScanDirs:  []string{parent},
+		DownloadRoutes: map[string]string{"audio": nestedRoute},
+		Concurrency:    2,
+		MaxActive:      1,
+	})
+	if ids := cacheListRepoIDs(t, srv2, nil); containsRepo(ids, "org/family") {
+		t.Errorf("nested route dir advertised as a repo: %v", ids)
+	}
+	q2 := url.Values{}
+	q2.Set("type", "model")
+	q2.Set("source", cacheSourceLocal)
+	if w := deleteCacheReq(t, srv2, "org/family", q2); w.Code == http.StatusOK {
+		t.Fatalf("deleting a nested route dir as a repo succeeded: %s", w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(nestedRoute, "model")); err != nil {
+		t.Errorf("nested route dir must survive, stat err = %v", err)
 	}
 }
 
@@ -3134,7 +3985,7 @@ func TestAPI_CacheDelete_LeafModelWithNestedNonWeightDirsDeletes(t *testing.T) {
 // filesystem is case-insensitive (Windows, macOS) the physical key folds case,
 // while Linux preserves it so truly distinct case-sensitive roots stay
 // distinct. Symlink aliases collapse on every platform.
-func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
+func TestPathIdentityKey_CaseFoldByPlatform(t *testing.T) {
 	// The platform decision itself.
 	for _, tc := range []struct {
 		goos string
@@ -3145,8 +3996,8 @@ func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
 		{"darwin", true},
 		{"freebsd", false},
 	} {
-		if got := physPathKeyCaseInsensitive(tc.goos); got != tc.want {
-			t.Errorf("physPathKeyCaseInsensitive(%q) = %v, want %v", tc.goos, got, tc.want)
+		if got := pathIdentityKeyCaseInsensitive(tc.goos); got != tc.want {
+			t.Errorf("pathIdentityKeyCaseInsensitive(%q) = %v, want %v", tc.goos, got, tc.want)
 		}
 	}
 
@@ -3158,9 +4009,9 @@ func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
 
 	// Host-independent: both keys resolve the same path, and darwin/windows
 	// differ from linux only by case folding.
-	linuxKey := physPathKeyForGOOS(mixed, "linux")
+	linuxKey := pathIdentityKeyForGOOS(mixed, "linux")
 	for _, goos := range []string{"windows", "darwin"} {
-		got := physPathKeyForGOOS(mixed, goos)
+		got := pathIdentityKeyForGOOS(mixed, goos)
 		if got != strings.ToLower(linuxKey) {
 			t.Errorf("%s key = %q, want folded %q", goos, got, strings.ToLower(linuxKey))
 		}
@@ -3175,10 +4026,10 @@ func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
 	// Two case-distinct roots whose lowercased spellings collide must stay
 	// distinct on Linux.
 	other := filepath.Join(root, "modelsroot")
-	if physPathKeyForGOOS(mixed, "linux") == physPathKeyForGOOS(other, "linux") {
-		t.Errorf("linux keys collapsed distinct case roots: %q", physPathKeyForGOOS(mixed, "linux"))
+	if pathIdentityKeyForGOOS(mixed, "linux") == pathIdentityKeyForGOOS(other, "linux") {
+		t.Errorf("linux keys collapsed distinct case roots: %q", pathIdentityKeyForGOOS(mixed, "linux"))
 	}
-	if physPathKeyForGOOS(mixed, "darwin") != physPathKeyForGOOS(other, "darwin") {
+	if pathIdentityKeyForGOOS(mixed, "darwin") != pathIdentityKeyForGOOS(other, "darwin") {
 		t.Errorf("darwin keys did not collapse case-differing aliases")
 	}
 
@@ -3192,7 +4043,7 @@ func TestPhysPathKey_CaseFoldByPlatform(t *testing.T) {
 		t.Skipf("symlinks not supported: %v", err)
 	}
 	for _, goos := range []string{"linux", "windows", "darwin"} {
-		if physPathKeyForGOOS(aliasDir, goos) != physPathKeyForGOOS(realDir, goos) {
+		if pathIdentityKeyForGOOS(aliasDir, goos) != pathIdentityKeyForGOOS(realDir, goos) {
 			t.Errorf("%s: symlink alias did not collapse to real path", goos)
 		}
 	}
