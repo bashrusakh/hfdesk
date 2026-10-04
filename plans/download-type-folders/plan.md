@@ -52,8 +52,9 @@ GGUF vs Safetensors. The B scheme below supports both.
 Design principle: **keys are internal; labels are user-facing.** The config
 file and the server store a map keyed by a closed, server-defined set of route
 keys. The dashboard UI never shows a key — it renders human labels bound to
-those keys (§2.3). A key is never free-form user input; the server rejects any
-key outside the closed set.
+those keys (§2.3). A key is never free-form user input; the server enforces the
+closed set — the settings save drops unknown keys and the download API rejects
+them with 400.
 
 ### 2.1 Field name and shape
 Add one field to both the persisted file and the in-memory server config:
@@ -137,9 +138,10 @@ Two options were considered:
   `diffusion/unet`) is an additive key plus one UI label row, with no API or
   struct change. Option (b) would require a new field and migration for every
   split, duplicating the same information.
-- The closed set is still enforced server-side: the server validates every
-  incoming key against the known set and rejects unknown keys with `400`, so
-  keys are never free-form user input.
+- The closed set is still enforced server-side: the settings save sanitizes the
+  map (keys outside the known set are dropped, never stored or echoed), and the
+  download API rejects an unknown routeKey with `400`, so keys are never
+  free-form user input.
 - "Never show keys" is a **UI rule**, satisfied by the §2.3 label table. Keys
   are the internal/advanced format; `docs/API.md` documents them for API
   consumers, who are technical users rather than the dashboard user.
@@ -187,11 +189,20 @@ existing fields.
   in the success response so the UI can show it. This must never fail the
   request and never create the directory. If maintainers prefer zero new
   behavior, omit the warning — [OPEN] in §11.
-- **Key validation**: reject unknown keys with `400`; empty values clear the
-  key. Existing settings fields keep their current (unchanged) validation.
-- **Failure reporting**: a rejected key returns `400` before any config
-  mutation, using the existing validate-then-apply ordering in
-  `handleUpdateSettings` (`api.go:406-428`).
+- **Key handling on settings save (sanitize, not reject)**: `POST /api/settings`
+  drops every key outside the closed set (§2.2) via the shared
+  `sanitizeDownloadRoutes` helper (`internal/server/routes.go`) instead of
+  returning `400`; valid keys are kept, an empty value clears its key, and the
+  save still succeeds (`200`). Rationale: the dashboard echoes the loaded map on
+  save, so a legacy/hand-edited key must not fail the whole save. The same
+  helper is applied at the config-load boundary in `ApplyConfigToServer`
+  (`config.go`), so `GET` never advertises an unknown key. An unknown key's
+  value is never interpreted as a destination path.
+- **Key validation on download (strict)**: `/api/download` keeps strict
+  semantics — an unknown `routeKey` is still rejected with `400` before any job
+  starts, EXCEPT when `dataset: true`, where `routeKey` is ignored entirely
+  (datasets are never routed; §2.5).
+- Existing settings fields keep their current (unchanged) validation.
 
 ### 2.7 Preset (one-click folder fill)
 An optional convenience control on the Settings page:
@@ -339,6 +350,8 @@ func resolveRoute(routes map[string]string, key string) string
 In `CreateJob`:
 1. Parse the requested `routeKey` against `cfg.DownloadRoutes`; reject an
    unknown/unconfigured key with `400` rather than treating it as a path.
+   Exception: `dataset: true` ignores `routeKey` entirely (blanked before
+   validation), so a dataset is never routed (§2.5).
 2. If a route resolves, set `effectiveLocalDir` to that path and `flat = true`
    (same flat/real-file mode as today).
 3. Add a `RouteKey string` field to `Job` (`jobs.go:31-42`) for auditability
@@ -407,7 +420,8 @@ New destination leaves must be discoverable and statable:
 - `DownloadRequest` (`internal/server/api_types.go:7-26`): add
   `RouteKey string json:"routeKey,omitempty"`. Document that it is an
   **internal key from the closed set** (§2.2), not a path, and that
-  unknown/unconfigured keys are rejected with `400`. This is an advanced/raw
+  unknown/unconfigured keys are rejected with `400` (except when
+  `dataset: true`, which ignores it). This is an advanced/raw
   API field; the dashboard hides it behind labels.
 - `SettingsResponse` (`api_types.go:44-65`): add
   `DownloadRoutes map[string]string json:"downloadRoutes,omitempty"`.
@@ -416,8 +430,9 @@ New destination leaves must be discoverable and statable:
 - `handleUpdateSettings` request struct (`api.go:377-399`): add
   `DownloadRoutes *map[string]string json:"downloadRoutes,omitempty"`; apply
   via copy-on-write inside `withConfig` (`api.go:436-507`) and persist through
-  `SaveConfigFile` (`api.go:530-556`). Normalize values per §2.6 and reject
-  keys outside the closed set with `400`.
+  `SaveConfigFile` (`api.go:530-556`). Sanitize per §2.6 using the shared
+  `sanitizeDownloadRoutes` helper: keys outside the closed set are dropped (not
+  rejected), valid keys kept, empty values cleared; the save still succeeds.
 - `ApplyConfigToServer` (`config.go:193-246`): copy `DownloadRoutes` from the
   file into `serverCfg` when CLI/config precedence allows.
 - Sync `docs/API.md` settings section (`docs/API.md:124-143`) with the new
@@ -456,8 +471,9 @@ fields, never keys.
   `resetSettings` `:2639-2664`):
   - `loadSettings`: write `data.downloadRoutes[<key>]` into each labeled
     field via the fixed label<->key table.
-  - `saveSettings`: build a `downloadRoutes` object from the fields; send
-    empty fields as "unset" (omit or empty string), never as a key path.
+  - `saveSettings`: start from the loaded map and apply the labeled fields onto
+    it (empty field deletes its key), so a valid non-surfaced key such as `llm`
+    survives a dashboard save; never send an empty field as a key path.
 
 #### 7.2.1 Layout-toggle independence (critical)
 Current `saveSettings` sends `localDir: ''` whenever
@@ -476,9 +492,13 @@ concern and **must not** be wiped by the HF-cache/local layout toggle:
 `resetSettings` (`app.js:2639-2664`) already clears `localDirInput`,
 `localScanDirs`, and `downloadLayout` behind a confirm dialog.
 Recommendation: also clear the five Type-folder fields and the preset root
-input under the same existing confirm, keeping "reset" consistent. If a
-maintainer prefers to preserve route config across reset, mark that [OPEN]
-(§11); the default recommendation is to clear them.
+input under the same existing confirm, keeping "reset" consistent. Reset now
+resets `state.settings.downloadRoutes` to `{}`, so the next Save clears ALL
+route keys (including non-surfaced ones such as `llm`) plus the preset root;
+"Reset to defaults" is a full clear, distinct from a normal save which
+merges/preserves non-surfaced keys. If a maintainer prefers to preserve route
+config across reset, mark that [OPEN] (§11); the default recommendation is to
+clear them.
 
 ### 7.3 Download modal
 - `app.js` `dlModalLocalDir` (`:985-1020`) and the quant modal
@@ -489,6 +509,9 @@ maintainer prefers to preserve route config across reset, mark that [OPEN]
   UI cannot drift from server-side keys.
 - Keep a "Default (LocalDir / HF cache)" option that sends no `routeKey`, so
   existing users are unaffected.
+- Non-selectable types (e.g. audio) also get a labeled "Save to" select
+  prefilled from the analysis, so a configured route is reachable for them.
+- Dataset analyses render no destination select and send no `routeKey`.
 - The modal sends the internal key under the hood; the label mapping stays in
   one place (§2.3 table).
 
@@ -500,9 +523,12 @@ maintainer prefers to preserve route config across reset, mark that [OPEN]
   returns `""` and `CreateJob` follows the existing LocalDir/cache path
   exactly. No behavior change for existing users. Empty labeled fields mean
   exactly this.
-- **Server authority**: the server accepts only keys from the closed set
-  (§2.2); a path-shaped or unknown value is rejected with `400`. Route keys are
-  never free-form user input, and the UI never exposes them.
+- **Server authority**: the server enforces the closed set (§2.2) at both
+  boundaries: the settings save drops an unknown/path-shaped key via
+  `sanitizeDownloadRoutes` (never stored, never echoed), and `/api/download`
+  rejects an unknown `routeKey` with `400` (except `dataset: true`, which is
+  never routed). Route keys are never free-form user input, and the UI never
+  exposes them.
 - **Existing `req.localDir` looseness is preserved as-is**, not worsened. A
   separate hardening task may add it to the allowlist; that is out of scope.
 - **Path safety**: reapply the existing untrusted-path guards used by
@@ -557,11 +583,19 @@ unchanged.
 Unit tests (Phase 1):
 - `resolveRoute`: most-specific-wins (`llm/gguf` beats `llm`), coarse-only,
   unconfigured key -> `""`, empty values ignored, unknown key.
-- Key validation: a key outside the closed set (§2.2), including a
-  path-shaped value, is rejected with `400` and no config mutation.
+- Settings sanitize-to-drop: an unknown key (including a path-shaped value) in
+  the settings map is dropped, not rejected — `handleUpdateSettings` still
+  returns `200`, and `GET`/`ApplyConfigToServer` never surface it
+  (`TestAPI_Settings_DropsUnknownRouteKeys`,
+  `TestApplyConfigToServer_FiltersUnknownRouteKeys`,
+  `TestSanitizeDownloadRoutes` covering trim/`Clean`, empty-drop, and
+  unknown-drop); an all-unknown map clears `downloadRoutes`.
 - `CreateJob` destination selection: `routeKey` -> configured path sets
-  `LocalDir`/`flat`; unknown key -> `400`; no key + `LocalDir` set -> existing
-  flat path; no key + no `LocalDir` -> HF cache; `req.localDir` still wins.
+  `LocalDir`/`flat`; unknown key on `/api/download` -> `400`
+  (`TestAPI_StartDownload_InvalidRouteKey`); `dataset: true` ignores `routeKey`
+  (`TestJobManager_CreateJob_DatasetIgnoresRouteKey`); no key + `LocalDir` set
+  -> existing flat path; no key + no `LocalDir` -> HF cache; `req.localDir`
+  still wins.
 - `localCacheRoots`: configured route paths appear and are deduped;
   `scanLocalCachedRepos`/`findLocalCachedRepo` see a repo in a route folder.
 - `handleDiskFree`: configured route path accepted; unconfigured path -> `400`.
@@ -581,6 +615,10 @@ Regression (must remain unchanged):
 
 UI tests / checks (Phase 2):
 - Labeled field <-> key mapping round-trips through save/load.
+- A normal save merges the labeled fields onto the loaded map and preserves a
+  valid non-surfaced key such as `llm`; reset sends an empty map.
+- Non-selectable (audio) analyses show a labeled destination select and send its
+  key; dataset analyses show none and send no `routeKey`.
 - Route fields survive toggling `downloadLayout` cache<->local (no wipe).
 - `resetSettings` clears route fields under the confirm.
 - Preset fills the five fields from a root and does not create directories.
