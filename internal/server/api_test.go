@@ -5,6 +5,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 var testCacheDir string
@@ -545,6 +548,309 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	}
 	if len(resp.Repos[0].Capabilities) != 1 || resp.Repos[0].Capabilities[0] != "vision" {
 		t.Fatalf("Capabilities = %#v, want [vision]", resp.Repos[0].Capabilities)
+	}
+}
+
+// addCacheTestGGUF uses the real blob/snapshot/friendly projection helpers, so
+// metadata tests exercise symlink names without substituting snapshot metadata.
+func addCacheTestGGUF(t *testing.T, repo *hfdownloader.RepoDir, commit, name, filter string, friendly bool) {
+	t.Helper()
+	name = filepath.FromSlash(name)
+	data := []byte(name)
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+	if err := os.MkdirAll(repo.BlobsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repo.BlobPath(hash), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateSnapshot(commit, []hfdownloader.SnapshotFile{{RelativePath: name, SHA256: hash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.WriteRef("main", commit); err != nil {
+		t.Fatal(err)
+	}
+	if friendly {
+		if err := repo.CreateFriendlySymlink(commit, name, filepath.FromSlash(filter)); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(repo.FriendlyPath(), filepath.FromSlash(filter), name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("friendly file is not a symlink: %s (%v)", path, err)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("friendly link does not resolve to blob: %s (%v)", path, err)
+		}
+	}
+}
+
+func getCacheTestJSON(t *testing.T, mux *http.ServeMux, path string, result any) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET %s: %d: %s", path, w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), result); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkCacheTestMetadata(t *testing.T, repo CachedRepoInfo, quants, mmproj []string, detail bool) {
+	t.Helper()
+	var capabilities, paths []string
+	if len(mmproj) > 0 {
+		capabilities = []string{"vision"}
+		if detail {
+			paths = mmproj
+		}
+	}
+	if !reflect.DeepEqual(repo.Quantizations, quants) || repo.HasMMProj != (len(mmproj) > 0) ||
+		!reflect.DeepEqual(repo.Capabilities, capabilities) || !reflect.DeepEqual(repo.MMProjFiles, paths) {
+		t.Errorf("%s metadata = %v/%v/%v/%v, want %v/%v/%v/%v", repo.Repo,
+			repo.Quantizations, repo.HasMMProj, repo.Capabilities, repo.MMProjFiles,
+			quants, len(mmproj) > 0, capabilities, paths)
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_Ownership(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("production HF projection helpers do not create symlinks on Windows")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		for _, tc := range []struct {
+			name, registration, subroot string
+			relative, retained          bool
+			prunesRepo                  bool
+		}{
+			{name: "route-nested", registration: "route", subroot: "parent/real/routed"},
+			{name: "local-nested", registration: "local", subroot: "parent/real/routed"},
+			{name: "scan-nested", registration: "scan", subroot: "parent/real/routed"},
+			{name: "relative-route", registration: "route", subroot: "parent/real/routed", relative: true},
+			{name: "equal-repo", registration: "route", subroot: "parent/real", prunesRepo: true},
+			{name: "enclosing-repo", registration: "scan", subroot: "parent", prunesRepo: true},
+			{name: "equal-library", registration: "route", subroot: "."},
+			{name: "enclosing-library", registration: "local", subroot: ".."},
+			{name: "retained-filtered-projection", registration: "route", subroot: "parent/real/routed", retained: true},
+		} {
+			// Registering the dataset library itself as a model scan root has
+			// existing dual-type listing semantics outside this metadata fix.
+			if repoType == hfdownloader.RepoTypeDataset && tc.name == "equal-library" {
+				continue
+			}
+			t.Run(string(repoType)+"/"+tc.name, func(t *testing.T) {
+				base := t.TempDir()
+				cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"), 0)
+				parent, err := cache.Repo("parent/real", repoType)
+				if err != nil {
+					t.Fatal(err)
+				}
+				addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", true)
+				library := cache.ModelsDir()
+				if repoType == hfdownloader.RepoTypeDataset {
+					library = cache.DatasetsDir()
+				}
+				root := filepath.Join(library, filepath.FromSlash(tc.subroot))
+				writeFile := func(path string) {
+					t.Helper()
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("weights"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				childPath := filepath.Join(root, "child", "model")
+				writeFile(filepath.Join(childPath, "child-Q8_0.gguf"))
+				writeFile(filepath.Join(childPath, "mmproj-F16.gguf"))
+				// Unrelated local, friendly-only and raw-cache repos must survive.
+				independent := filepath.Join(base, "independent")
+				writeFile(filepath.Join(independent, "sibling", "real", "model.safetensors"))
+				writeFile(filepath.Join(cache.ModelsDir(), "friendly", "only", "model.safetensors"))
+				writeFile(filepath.Join(cache.Root, "ordinary", "raw", "model.safetensors"))
+				quants := []string{"Q4_K_M"}
+				var mmproj []string
+				if tc.retained {
+					// Both revisions remain in the projection. Deep/filter-prefixed
+					// own files and a prefix sibling of the excluded root stay owned.
+					addCacheTestGGUF(t, parent, "bbbbbbbb", "deep/own-Q5_K_M.gguf", "selected", true)
+					addCacheTestGGUF(t, parent, "bbbbbbbb", "deep/mmproj-F16.gguf", "routed-other", true)
+					quants = []string{"Q4_K_M", "Q5_K_M"}
+					mmproj = []string{filepath.FromSlash("routed-other/deep/mmproj-F16.gguf")}
+				}
+				if tc.prunesRepo {
+					quants = nil
+				}
+				configuredRoot := root
+				if tc.relative {
+					cwd, err := os.Getwd()
+					if err != nil {
+						t.Fatal(err)
+					}
+					configuredRoot, err = filepath.Rel(cwd, root)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg := Config{CacheDir: cache.Root, LocalScanDirs: []string{independent}}
+				switch tc.registration {
+				case "route":
+					cfg.DownloadRoutes = map[string]string{"llm/gguf": configuredRoot}
+				case "local":
+					cfg.LocalDir = configuredRoot
+				case "scan":
+					cfg.LocalScanDirs = append(cfg.LocalScanDirs, configuredRoot)
+				}
+				srv := &Server{config: cfg}
+				mux := http.NewServeMux()
+				srv.registerAPIRoutes(mux)
+				var list struct {
+					Repos []CachedRepoInfo `json:"repos"`
+					Stats CacheStats       `json:"stats"`
+				}
+				getCacheTestJSON(t, mux, "/api/cache", &list)
+				if len(list.Repos) != 5 || list.Stats.TotalModels+list.Stats.TotalDatasets != 5 {
+					t.Errorf("list/stats count = %d/%d, want 5 without synthetic repos", len(list.Repos), list.Stats.TotalModels+list.Stats.TotalDatasets)
+				}
+				want := map[string]bool{"parent/real": true, "child/model": true, "sibling/real": true, "friendly/only": true, "ordinary/raw": true}
+				for _, repo := range list.Repos {
+					if !want[repo.Repo] {
+						t.Errorf("synthetic or duplicate repo: %s (%s)", repo.Repo, repo.Path)
+					}
+					delete(want, repo.Repo)
+					var detail CachedRepoInfo
+					getCacheTestJSON(t, mux, "/api/cache/"+repo.Repo, &detail)
+					if detail.Path != repo.Path || detail.Source != repo.Source || detail.Type != repo.Type {
+						t.Errorf("%s list/detail ownership mismatch: %#v / %#v", repo.Repo, repo, detail)
+					}
+					switch repo.Repo {
+					case "parent/real":
+						if repo.Source != "HF cache" || repo.Path != parent.Path() || repo.FriendlyPath != parent.FriendlyPath() || repo.Type != string(repoType) {
+							t.Errorf("parent lost HF precedence: %#v", repo)
+						}
+						checkCacheTestMetadata(t, repo, quants, mmproj, false)
+						checkCacheTestMetadata(t, detail, quants, mmproj, true)
+						// Ownership filtering must not change snapshot file accounting.
+						if len(detail.Files) != 1 || detail.Files[0].Name != "own-Q4_K_M.gguf" || detail.Size != int64(len("own-Q4_K_M.gguf")) {
+							t.Errorf("parent snapshot accounting changed: %#v", detail)
+						}
+					case "child/model":
+						absPath, err := filepath.Abs(repo.Path)
+						if err != nil || absPath != childPath || repo.FileCount != 2 || detail.FileCount != 2 || len(detail.Files) != 2 {
+							t.Errorf("child ownership/accounting changed: %#v / %#v (%v)", repo, detail, err)
+						}
+						checkCacheTestMetadata(t, repo, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, false)
+						checkCacheTestMetadata(t, detail, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, true)
+					default:
+						if repo.FileCount != 1 || detail.FileCount != 1 {
+							t.Errorf("preserved repo accounting changed: %#v / %#v", repo, detail)
+						}
+						checkCacheTestMetadata(t, repo, nil, nil, false)
+						checkCacheTestMetadata(t, detail, nil, nil, true)
+					}
+				}
+				if len(want) != 0 {
+					t.Errorf("omitted repos: %v", want)
+				}
+			})
+		}
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_NoProjection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("real snapshot symlink fixture requires non-Windows HF helpers")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		t.Run(string(repoType), func(t *testing.T) {
+			cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+			parent, err := cache.Repo("parent/real", repoType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", false)
+			addCacheTestGGUF(t, parent, "aaaaaaaa", "mmproj-F16.gguf", "", false)
+			srv := &Server{config: Config{CacheDir: cache.Root}}
+			mux := http.NewServeMux()
+			srv.registerAPIRoutes(mux)
+			var list struct {
+				Repos []CachedRepoInfo `json:"repos"`
+			}
+			getCacheTestJSON(t, mux, "/api/cache", &list)
+			if len(list.Repos) != 1 || list.Repos[0].Source != "HF cache" {
+				t.Fatalf("missing HF record: %#v", list.Repos)
+			}
+			var detail CachedRepoInfo
+			getCacheTestJSON(t, mux, "/api/cache/parent/real", &detail)
+			if len(detail.Files) != 2 || len(detail.Snapshots) != 1 || detail.FileCount != 2 {
+				t.Errorf("snapshot fixture not visible: %#v", detail)
+			}
+			checkCacheTestMetadata(t, list.Repos[0], nil, nil, false)
+			checkCacheTestMetadata(t, detail, nil, nil, true)
+		})
+	}
+}
+
+func TestAPI_CacheHFFriendlyMetadata_ConfigSnapshot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("production HF projection helpers do not create symlinks on Windows")
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	parent, err := cache.Repo("parent/real", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "own-Q4_K_M.gguf", "", true)
+	// Existing parent projection content changes ownership when this directory
+	// is registered/unregistered; no sticky lifecycle reservation is intended.
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "child/model/child-Q8_0.gguf", "routed", true)
+	addCacheTestGGUF(t, parent, "aaaaaaaa", "child/model/mmproj-F16.gguf", "routed", true)
+	root := filepath.Join(parent.FriendlyPath(), "routed")
+	srv := &Server{config: Config{CacheDir: cache.Root}}
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+	for _, registered := range []bool{false, true, false} {
+		srv.withConfig(func(cfg *Config) {
+			cfg.DownloadRoutes = nil
+			if registered {
+				cfg.DownloadRoutes = map[string]string{"llm/gguf": root}
+			}
+		})
+		quants := []string{"Q4_K_M", "Q8_0"}
+		mmproj := []string{filepath.FromSlash("routed/child/model/mmproj-F16.gguf")}
+		count := 1
+		if registered {
+			quants, mmproj, count = []string{"Q4_K_M"}, nil, 2
+		}
+		var list struct {
+			Repos []CachedRepoInfo `json:"repos"`
+		}
+		getCacheTestJSON(t, mux, "/api/cache", &list)
+		if len(list.Repos) != count {
+			t.Errorf("registered=%v: list count = %d, want %d", registered, len(list.Repos), count)
+		}
+		for _, repo := range list.Repos {
+			if repo.Repo == "parent/real" {
+				checkCacheTestMetadata(t, repo, quants, mmproj, false)
+			}
+		}
+		var detail CachedRepoInfo
+		getCacheTestJSON(t, mux, "/api/cache/parent/real", &detail)
+		checkCacheTestMetadata(t, detail, quants, mmproj, true)
+		if registered {
+			getCacheTestJSON(t, mux, "/api/cache/child/model", &detail)
+			checkCacheTestMetadata(t, detail, []string{"Q8_0"}, []string{"mmproj-F16.gguf"}, true)
+		} else {
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/cache/child/model", nil))
+			if w.Code != http.StatusNotFound {
+				t.Errorf("unregistered child lookup = %d, want 404", w.Code)
+			}
+		}
 	}
 }
 

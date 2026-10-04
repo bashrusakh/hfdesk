@@ -1024,6 +1024,19 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []st
 	return meta
 }
 
+// collectHFFriendlyGGUFMetadata preserves the friendly projection's metadata,
+// but applies the same configured-subroot ownership as local scans. Derive
+// exclusions from the library root, not the repo: a configured root may equal
+// or enclose the repo's friendly path and must then exclude the entire walk.
+func collectHFFriendlyGGUFMetadata(cache *hfdownloader.HFCache, repo *hfdownloader.RepoDir, cfg Config, includeMMProjFiles bool) cacheGGUFMetadata {
+	library := localCacheRoot{Path: cache.ModelsDir()}
+	if repo.Type() == hfdownloader.RepoTypeDataset {
+		library.Path = cache.DatasetsDir()
+	}
+	roots := localCacheRoots(cache.Root, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
+	return collectCacheGGUFMetadata(repo.FriendlyPath(), includeMMProjFiles, library.excludedSubroots(roots))
+}
+
 // buildLocalCacheRepo builds a CachedRepoInfo for a single owner/name
 // folder under a local cache root. It walks the directory, computes
 // total size / file count, gathers GGUF metadata, and (when
@@ -1296,7 +1309,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			shortCommit = shortCommit[:7]
 		}
 
-		ggufMeta := collectCacheGGUFMetadata(friendlyPath, false, nil)
+		ggufMeta := collectHFFriendlyGGUFMetadata(cache, rd, cfg, false)
 
 		repo := CachedRepoInfo{
 			Repo:           repoID,
@@ -1504,7 +1517,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		shortCommit = shortCommit[:7]
 	}
 
-	ggufMeta := collectCacheGGUFMetadata(friendlyPath, true, nil)
+	ggufMeta := collectHFFriendlyGGUFMetadata(cache, repoDir, cfg, true)
 
 	info := CachedRepoInfo{
 		Repo:           repoDir.RepoID(),
