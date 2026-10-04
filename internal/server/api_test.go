@@ -4122,19 +4122,26 @@ func TestAPI_CacheDelete_WholeCopyRefusesEnclosingConfiguredRoot(t *testing.T) {
 
 			// Listing parity: the enclosure is advertised as a Local copy.
 			info := cacheInfoForTest(t, srv, "parent/real")
-			if copy := cacheCopyBySource(info.Copies, cacheSourceLocal); copy == nil {
+			enclosureCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+			if enclosureCopy == nil {
 				t.Fatalf("enclosure not advertised as Local copy: %#v", info.Copies)
 			}
+			// The UI eligibility flag must say whole-copy delete is not allowed,
+			// so it does not render a guaranteed-to-fail "Delete entire copy".
+			if enclosureCopy.WholeCopyDeleteAllowed {
+				t.Errorf("enclosure copy advertised wholeCopyDeleteAllowed=true; delete would refuse")
+			}
 
-			// Whole-copy delete of the enclosure must be refused and delete
-			// nothing: it encloses a configured root.
+			// Whole-copy delete of the enclosure must be refused with a client
+			// error (policy refusal, not a server failure) and delete nothing:
+			// it encloses a configured root.
 			q := url.Values{}
 			q.Set("type", "model")
 			q.Set("source", cacheSourceLocal)
 			q.Set("path", enclosure)
 			w := deleteCacheReq(t, srv, "parent/real", q)
-			if w.Code == http.StatusOK {
-				t.Fatalf("whole-copy delete of enclosure with nested configured root succeeded: %s", w.Body.String())
+			if w.Code != http.StatusConflict {
+				t.Fatalf("whole-copy delete of enclosure with nested configured root = %d, want 409. Body: %s", w.Code, w.Body.String())
 			}
 			if _, err := os.Stat(filepath.Join(enclosure, "own-Q4_K_M.gguf")); err != nil {
 				t.Errorf("enclosure's own weight must survive refused delete, stat err = %v", err)
@@ -4166,6 +4173,17 @@ func TestAPI_CacheDelete_WholeCopyStandaloneStillSucceeds(t *testing.T) {
 		Concurrency: 2,
 		MaxActive:   1,
 	})
+
+	// The standalone copy must advertise whole-copy delete eligibility so the
+	// UI renders the "Delete entire copy" button.
+	info := cacheInfoForTest(t, srv, "owner/name")
+	standaloneCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if standaloneCopy == nil {
+		t.Fatalf("standalone copy not advertised: %#v", info.Copies)
+	}
+	if !standaloneCopy.WholeCopyDeleteAllowed {
+		t.Errorf("standalone copy advertised wholeCopyDeleteAllowed=false; want true")
+	}
 
 	q := url.Values{}
 	q.Set("type", "model")
@@ -4449,5 +4467,78 @@ func TestAPI_CacheDelete_VariantHFManifest(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(friendlyDir, "model-Q8_0.gguf")); err != nil {
 		t.Errorf("other quant's friendly link must survive: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantHFLinkCleanupFailureSurfaced verifies M2: when the
+// snapshot-link cleanup cannot be performed during a variant delete, the failure
+// is surfaced via cleanupIncomplete/cleanupWarnings instead of being silently
+// dropped, while the primary blob removal still succeeds. A regular file at the
+// snapshots path makes ListSnapshots fail deterministically (no reliance on
+// permission bits, which root bypasses).
+func TestAPI_CacheDelete_VariantHFLinkCleanupFailureSurfaced(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "qwen"
+
+	hubRepo := filepath.Join(cacheDir, "hub", "models--alice--qwen")
+	writeCacheFiles(t, filepath.Join(hubRepo, "blobs"), "sha_keep", "sha_go")
+	// Force ListSnapshots to fail: the snapshots path is a regular file, so
+	// os.ReadDir returns an error rather than an empty list.
+	if err := os.WriteFile(filepath.Join(hubRepo, "snapshots"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatalf("write snapshots file: %v", err)
+	}
+	friendlyDir := filepath.Join(cacheDir, "models", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "model",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			{Name: "model-Q4_K_M.gguf", Blob: "blobs/sha_go", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF variant delete with failed snapshot listing = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, meta := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true when link cleanup cannot run, got %s", w.Body.String())
+	}
+	warnings, _ := meta["warnings"].([]string)
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "snapshot links") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a snapshot-link cleanup warning, got %v", warnings)
+	}
+	// Primary operation still succeeds: the variant blob is gone.
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_go")); !os.IsNotExist(err) {
+		t.Errorf("expected variant blob removed despite link cleanup failure, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_keep")); err != nil {
+		t.Errorf("other quant's blob must survive: %v", err)
 	}
 }

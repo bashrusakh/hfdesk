@@ -2169,17 +2169,28 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
                  const meta = escapeHtml(metaParts.join(' · '));
                  // Variant tokens the server says this copy supports for
                  // selective delete. Empty/absent means only entire-copy is
-                 // available, so no variant buttons are rendered.
+                 // available, so no variant buttons are rendered. The button
+                 // carries only the variant's index within this array; the token
+                 // itself is resolved from the current detail payload, never
+                 // interpolated into the inline handler.
                  const variants = Array.isArray(copy.selectiveVariants) ? copy.selectiveVariants : [];
                  const variantsHtml = canDelete && variants.length > 0
                    ? `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:2px;">
                         <span class="cache-path-label">Delete one variant:</span>
-                        ${variants.map(v => `
-                          <button class="btn btn-ghost btn-sm" onclick="confirmDeleteCacheVariant(${i}, decodeURIComponent('${encodeURIComponent(v)}'))" title="Delete only the ${escapeHtml(v)} files" style="flex-shrink:0;">
+                        ${variants.map((v, vi) => `
+                          <button class="btn btn-ghost btn-sm" onclick="confirmDeleteCacheVariant(${i}, ${vi})" title="Delete only the ${escapeHtml(v)} files" style="flex-shrink:0;">
                             ${escapeHtml(v)}
                           </button>
                         `).join('')}
                       </div>`
+                   : '';
+                 // A copy the server would refuse to whole-delete (a Local
+                 // enclosure nesting a configured root) is listed with its
+                 // variant buttons but must not offer an entire-copy Delete that
+                 // is guaranteed to fail.
+                 const wholeCopyAllowed = copy.wholeCopyDeleteAllowed === true;
+                 const wholeCopyNoteHtml = canDelete && !wholeCopyAllowed
+                   ? `<span class="cache-path-label">Entire-copy delete unavailable: this location nests a configured root. Delete individual variants instead.</span>`
                    : '';
                  return `
                    <div style="display:flex;flex-direction:column;gap:6px;border:1px solid var(--color-border, #2a2a2a);border-radius:8px;padding:10px;">
@@ -2189,13 +2200,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
                          <code class="cache-path-value">${escapeHtml(copy.path || '')}</code>
                          <span class="cache-path-label">${meta}</span>
                        </div>
-                       ${canDelete ? `
+                       ${canDelete && wholeCopyAllowed ? `
                          <button class="btn btn-danger btn-sm" onclick="confirmDeleteCacheCopy(${i})" title="Delete every file at this location" style="flex-shrink:0;">
                            ${deleteIcon}
                            Delete entire copy
                          </button>
                        ` : ''}
                      </div>
+                     ${wholeCopyNoteHtml}
                      ${variantsHtml}
                    </div>
                  `;
@@ -2377,14 +2389,21 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   };
 
   // Delete one artifact (variant) inside a copy, identified by the copy index
-  // and the server-advertised token. Only the integer index and an escaped
-  // token cross the inline-onclick boundary; the copy object comes from the
-  // current detail payload.
-  window.confirmDeleteCacheVariant = function(index, variant) {
+  // and the variant's index within that copy's selectiveVariants array. Only the
+  // two integer indices cross the inline-onclick boundary; the artifact token is
+  // resolved here from the current detail payload, so no server-provided string
+  // is interpolated into an inline handler.
+  window.confirmDeleteCacheVariant = function(index, variantIndex) {
     const detail = currentCacheDetail;
     const copy = detail && detail.copies ? detail.copies[index] : null;
     if (!copy) {
       showToast('This location is no longer available', 'error');
+      return;
+    }
+    const variants = Array.isArray(copy.selectiveVariants) ? copy.selectiveVariants : [];
+    const variant = variants[variantIndex];
+    if (typeof variant !== 'string' || variant === '') {
+      showToast('This variant is no longer available', 'error');
       return;
     }
     confirmDeleteCache(detail.repo, detail.type, copy.source, copy.path, copy, variant);

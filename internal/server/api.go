@@ -818,6 +818,15 @@ type CacheCopy struct {
 	// Empty/omitted means only an entire-copy delete is available, so the UI can
 	// avoid offering variant buttons the server would reject.
 	SelectiveVariants []string `json:"selectiveVariants,omitempty"`
+	// WholeCopyDeleteAllowed reports whether this copy may be removed in its
+	// entirety ("Delete entire copy"). It is false for a Local enclosure that
+	// nests a configured root (localDir, a scan dir, or a download-route
+	// destination): such a copy is still listed and still supports variant
+	// delete, but a whole-copy RemoveAll would also destroy the nested root and
+	// is refused server-side, so the UI must not offer a guaranteed-to-fail
+	// button. HF cache and Friendly view copies (and ordinary Local leaves) are
+	// allowed.
+	WholeCopyDeleteAllowed bool `json:"wholeCopyDeleteAllowed"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -973,7 +982,7 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 			// SkipSpecial safety exclusion with OR, but keep the first
 			// spelling's path/source/order. Upstream lists <cache>/models as
 			// the Friendly view even when it is also configured as a Local
-			// root; delete authority is decided separately by localRootHasAuthority,
+			// root; delete authority is decided separately by localAuthorityKeys,
 			// not by relabeling the Source.
 			if skipSpecial {
 				roots[i].SkipSpecial = true
@@ -1474,10 +1483,13 @@ func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, dow
 				if !hasLocalWeightFile(repoDir, excluded) {
 					continue
 				}
-				// Advertise only leaf Local model directories: never the cache
-				// dir, a friendly namespace, a configured root, or a container
-				// of nested model repos. Friendly-view/raw-cache entries are
-				// not Local-deletable units, so their listing is unchanged.
+				// Advertise Local model directories per the (relaxed) listing
+				// predicate: never the cache dir, a friendly namespace, or a
+				// configured root. An enclosure that owns its own weight file
+				// IS listed even when it nests a configured root (upstream #66
+				// parity); whole-copy delete is stricter and refuses exactly
+				// that case. Friendly-view/raw-cache entries are not
+				// Local-deletable units, so their listing is unchanged.
 				if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 					continue
 				}
@@ -1522,10 +1534,12 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, down
 		if !hasLocalWeightFile(repoDir, excluded) {
 			continue
 		}
-		// Only a leaf Local model directory resolves: a container of nested
-		// model repos, the cache dir, a friendly namespace, or a configured
-		// root is not this repo. Friendly-view/raw-cache entries are not
-		// Local-deletable units, so their resolution is unchanged.
+		// Resolve any Local model directory the (relaxed) listing predicate
+		// accepts: the cache dir, a friendly namespace, or a configured root is
+		// not this repo, but an enclosure that owns its own weight file is
+		// advertised even when it nests a configured root (upstream #66 parity).
+		// Friendly-view/raw-cache entries are not Local-deletable units, so
+		// their resolution is unchanged.
 		if root.Source == cacheSourceLocal && !localLeafRepoIsDeletable(repoDir, pathIdentityKey(root.Path), guards, excluded, false) {
 			continue
 		}
@@ -2205,6 +2219,29 @@ func writeCacheDeleteError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 }
 
+// localDeleteRefusalError marks a Local whole-copy delete that was refused by
+// POLICY rather than by an I/O failure: the target is not a deletable leaf
+// (e.g. it encloses a configured root, so RemoveAll would destroy shared
+// storage). It maps to a client error so a caller is not told the server
+// malfunctioned. The strict predicate in resolveLocalDeleteTarget produces it;
+// genuine filesystem failures stay plain errors and remain 500.
+type localDeleteRefusalError struct{ detail string }
+
+func (e *localDeleteRefusalError) Error() string { return e.detail }
+
+// writeLocalDeleteError maps a Local whole-copy delete validation error to the
+// appropriate HTTP status. A policy refusal is a 409 Conflict; anything else is
+// treated as a server-side I/O failure (500). Nothing has been deleted when
+// this is called from the validation step.
+func writeLocalDeleteError(w http.ResponseWriter, err error) {
+	var refusal *localDeleteRefusalError
+	if errors.As(err, &refusal) {
+		writeError(w, http.StatusConflict, "Cannot delete local folder", refusal.detail)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
+}
+
 // validateHubDeletePath applies the HF-cache containment and structure checks
 // (security layers 8-10) to an already-existing hub repo directory. It returns
 // nil when the path is safe to delete.
@@ -2627,7 +2664,7 @@ func (s *Server) deleteLocalCopy(w http.ResponseWriter, cacheDir string, cfg Con
 	// no stale evidence behind.
 	absTarget, err := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cand.Root, owner, name, cand.Partial)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to delete local folder", err.Error())
+		writeLocalDeleteError(w, err)
 		return
 	}
 	// Record the validated target before mutating so a partial delete is
@@ -2836,6 +2873,11 @@ func deleteLocalVariant(w http.ResponseWriter, repo, variant, copyDir string, ex
 // each manifest entry of variant. It refuses when no usable provenance exists
 // (the caller checks that first). Guarded so every path stays inside the hub
 // or friendly copy root.
+//
+// The blob removal is the primary operation: a blob failure or a link-cleanup
+// failure never flips success to failure, but every such failure is collected
+// into cleanupIncomplete/cleanupWarnings so a dangling snapshot or friendly link
+// is surfaced rather than silently left behind.
 func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo, variant string, m *hfdownloader.DownloadManifest) {
 	hubRoot, err := filepath.Abs(repoDir.Path())
 	if err != nil {
@@ -2855,7 +2897,13 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 	var failures []string
 	var deleted int
 	var deletedBytes int64
-	snapshots, _ := repoDir.ListSnapshots()
+	snapshots, snapErr := repoDir.ListSnapshots()
+	if snapErr != nil {
+		// The blob delete can still proceed, but without the snapshot list we
+		// cannot clean up the snapshot links; report it as incomplete cleanup
+		// instead of silently leaving dangling links behind.
+		failures = append(failures, fmt.Sprintf("snapshot links: %v", snapErr))
+	}
 	// Blobs referenced by entries that are NOT being deleted must be preserved
 	// even if a deleted entry happens to share the same blob hash.
 	keptBlobs := make(map[string]bool)
@@ -2892,6 +2940,7 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 		for _, commit := range snapshots {
 			snapshotDir, derr := repoDir.SnapshotDir(commit)
 			if derr != nil {
+				failures = append(failures, fmt.Sprintf("%s: snapshot %s: %v", base, commit, derr))
 				continue
 			}
 			link := filepath.Join(snapshotDir, filepath.FromSlash(f.Name))
@@ -2899,7 +2948,9 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 				continue
 			}
 			if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-				_ = os.Remove(link)
+				if rerr := os.Remove(link); rerr != nil {
+					failures = append(failures, fmt.Sprintf("%s: snapshot link: %v", base, rerr))
+				}
 			}
 		}
 		// Friendly-view link for the same original file.
@@ -2908,7 +2959,9 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 			if linkAbs, aerr := filepath.Abs(link); aerr == nil &&
 				strings.HasPrefix(linkAbs+string(filepath.Separator), friendlyPrefix) {
 				if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-					_ = os.Remove(link)
+					if rerr := os.Remove(link); rerr != nil {
+						failures = append(failures, fmt.Sprintf("%s: friendly link: %v", base, rerr))
+					}
 				}
 			}
 		}
@@ -3123,12 +3176,13 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 			validateHubDeletePath(absHubPath, absCacheDir, absCacheDirWithSep, repoType) == nil {
 			size, count := cacheCopyUsage(hubPath, false)
 			copies = append(copies, CacheCopy{
-				Source:            cacheSourceHFCache,
-				Path:              hubPath,
-				Size:              size,
-				SizeHuman:         humanSizeBytes(size),
-				FileCount:         count,
-				SelectiveVariants: hfManifestVariantTokens(repoDir.FriendlyPath()),
+				Source:                 cacheSourceHFCache,
+				Path:                   hubPath,
+				Size:                   size,
+				SizeHuman:              humanSizeBytes(size),
+				FileCount:              count,
+				SelectiveVariants:      hfManifestVariantTokens(repoDir.FriendlyPath()),
+				WholeCopyDeleteAllowed: true,
 			})
 		} else if os.IsNotExist(statErr) {
 			// Only consider the friendly view as an orphan copy when the hub
@@ -3141,12 +3195,13 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 				repoDir.FriendlyState() == hfdownloader.FriendlyProjection {
 				size, count := cacheCopyUsage(friendlyPath, true)
 				copies = append(copies, CacheCopy{
-					Source:            cacheSourceFriendlyView,
-					Path:              friendlyPath,
-					Size:              size,
-					SizeHuman:         humanSizeBytes(size),
-					FileCount:         count,
-					SelectiveVariants: hfManifestVariantTokens(friendlyPath),
+					Source:                 cacheSourceFriendlyView,
+					Path:                   friendlyPath,
+					Size:                   size,
+					SizeHuman:              humanSizeBytes(size),
+					FileCount:              count,
+					SelectiveVariants:      hfManifestVariantTokens(friendlyPath),
+					WholeCopyDeleteAllowed: true,
 				})
 			}
 		}
@@ -3159,13 +3214,21 @@ func enumerateCacheCopies(cacheDir string, cfg Config, repo string, repoType hfd
 		for _, cand := range localCopyCandidates(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, owner, name) {
 			size, count := cacheCopyUsage(cand.RepoDir, true)
 			excluded := localCopyExcludedSubroots(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cand.Root)
+			// A Local whole-copy delete is allowed only when the SAME strict
+			// resolver the delete endpoint uses accepts the target. An enclosure
+			// that nests a configured root is listed (and keeps its variant
+			// buttons) but must not offer an entire-copy Delete the server would
+			// refuse. resolveLocalDeleteTarget is the single source of truth, so
+			// listing eligibility can never drift from the delete predicate.
+			_, wholeErr := resolveLocalDeleteTarget(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cand.Root, owner, name, false)
 			copies = append(copies, CacheCopy{
-				Source:            cacheSourceLocal,
-				Path:              cand.RepoDir,
-				Size:              size,
-				SizeHuman:         humanSizeBytes(size),
-				FileCount:         count,
-				SelectiveVariants: collectLocalVariantTokens(cand.RepoDir, excluded),
+				Source:                 cacheSourceLocal,
+				Path:                   cand.RepoDir,
+				Size:                   size,
+				SizeHuman:              humanSizeBytes(size),
+				FileCount:              count,
+				SelectiveVariants:      collectLocalVariantTokens(cand.RepoDir, excluded),
+				WholeCopyDeleteAllowed: wholeErr == nil,
 			})
 		}
 	}
@@ -3240,6 +3303,8 @@ func (s *Server) matchCacheCopyPath(cacheDir string, cfg Config, repo string, re
 // This is a WHOLE-COPY delete, so the strict predicate additionally rejects any
 // target that encloses a configured root: listing may advertise such an
 // enclosure (upstream #66), but RemoveAll on it would destroy the nested root.
+// That policy refusal is returned as a *localDeleteRefusalError so callers can
+// map it to a client error (409) instead of a server failure.
 func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, root, owner, name string, allowWeightless bool) (string, error) {
 	absTarget, err := localTargetStructuralPath(root, owner, name)
 	if err != nil {
@@ -3251,7 +3316,7 @@ func resolveLocalDeleteTarget(cacheDir, localDir string, localScanDirs []string,
 	if !localWholeCopyDeleteAllowed(absTarget, pathIdentityKey(absRoot),
 		localUnitGuards(cacheDir, localDir, localScanDirs, downloadRoutes),
 		targetRoot.excludedSubroots(roots), allowWeightless) {
-		return "", fmt.Errorf("target is not a deletable leaf model directory")
+		return "", &localDeleteRefusalError{detail: "target is not a deletable leaf model directory"}
 	}
 	return absTarget, nil
 }

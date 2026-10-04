@@ -209,7 +209,7 @@ Any other `source` value is rejected with `400` before anything is deleted.
 
 `DELETE` also accepts an optional `path` query parameter that addresses one exact copy. The server recomputes the allowed copy paths for the repo and deletes only when the requested path equals one of them after normalization; otherwise it returns `400` and deletes nothing. The copy's source decides which safe deleter runs (`HF cache`/`Friendly view` use the hub/friendly logic with containment checks; `Local` uses the local safe delete with root-component symlink checks). When `path` is omitted, the `source`-based behavior above applies.
 
-Without `variant`, `DELETE` removes the **entire copy** at the selected location. A Local whole-copy delete refuses to remove a folder that encloses a configured root (`localDir`, a `localScanDirs` entry, or a `downloadRoutes` destination), returning an error and deleting nothing, because removing the folder would also destroy the nested configured root. Such an enclosing folder may still be listed as a repo (it owns its own weights) and may still support selective delete; only the whole-folder `RemoveAll` is refused.
+Without `variant`, `DELETE` removes the **entire copy** at the selected location. A Local whole-copy delete refuses to remove a folder that encloses a configured root (`localDir`, a `localScanDirs` entry, or a `downloadRoutes` destination), returning `409` (with the refusal message and nothing deleted), because removing the folder would also destroy the nested configured root. Genuine filesystem failures remain `500`. Such an enclosing folder may still be listed as a repo (it owns its own weights) and may still support selective delete; only the whole-folder `RemoveAll` is refused.
 
 `DELETE` additionally accepts an optional `variant` query parameter that performs a **selective (per-artifact) delete**: it removes exactly the server-computed file set of one artifact (for example one GGUF quantisation) instead of the whole copy. `variant` is orthogonal to `source` and `path` and is processed for a resolved `Local` copy or an `HF cache`/`Friendly view` copy.
 
@@ -254,11 +254,14 @@ Under a raw cache root (the cache dir used directly as a local root), `Local` en
   "size": 12345,
   "sizeHuman": "12.1 KiB",
   "fileCount": 4,
-  "selectiveVariants": ["Q4_K_M", "Q8_0"]
+  "selectiveVariants": ["Q4_K_M", "Q8_0"],
+  "wholeCopyDeleteAllowed": true
 }
 ```
 
 `selectiveVariants` lists the artifact tokens this copy supports for selective deletion with `DELETE ...&variant=<token>`: the detected GGUF quantisation labels for a Local copy, or the `hfd.yaml` filename tokens for an `HF cache`/`Friendly view` copy. It is omitted (or empty) when the copy cannot support selective delete — a Local non-GGUF folder without provenance, or an HF/friendly copy with no manifest — in which case the UI offers only an entire-copy delete.
+
+`wholeCopyDeleteAllowed` reports whether the copy may be removed in its entirety. It is `false` for a Local copy that nests a configured root (such a whole-copy delete is refused with `409`); the copy is still listed and may still support selective delete, but the UI must not offer a guaranteed-to-fail "Delete entire copy" button. It is `true` for HF cache and Friendly view copies and for ordinary Local leaves.
 
 `Friendly view` is not listed alongside the HF cache entry because it is the same underlying storage; it appears only as an orphan when the hub directory is absent. The `copies` key is always present in a current server's response, possibly as an empty `[]` when the repo has no deletable copies; a missing key means an older server and is why the UI keeps a legacy fallback delete button.
 
