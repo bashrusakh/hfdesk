@@ -289,6 +289,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 
 	// Disk free space
 	mux.HandleFunc("GET /api/diskfree", s.handleDiskFree)
+	mux.HandleFunc("POST /api/diskfree", s.handleDownloadDiskFree)
 
 	// WebSocket
 	mux.HandleFunc("GET /api/ws", s.handleWebSocket)

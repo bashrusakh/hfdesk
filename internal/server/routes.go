@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // errInvalidRouteKey is returned when a model request supplies a
@@ -44,6 +46,30 @@ func validatedRouteKey(req DownloadRequest) (string, error) {
 		return "", errInvalidRouteKey
 	}
 	return req.RouteKey, nil
+}
+
+// resolveDownloadDestination is the common destination owner for job creation
+// and disk previews. It preserves explicit localDir > route (including parent
+// fallback) > global LocalDir > HF cache, with dataset selector bypass.
+func resolveDownloadDestination(cfg Config, req DownloadRequest) (routeKey, localDir, outputDir string, err error) {
+	routeKey, err = validatedRouteKey(req)
+	if err != nil {
+		return "", "", "", err
+	}
+	localDir = cfg.LocalDir
+	if req.LocalDir != "" {
+		localDir = req.LocalDir
+	} else if resolved := resolveRoute(cfg.DownloadRoutes, routeKey); resolved != "" {
+		localDir = resolved
+	}
+	outputDir = localDir
+	if outputDir == "" {
+		outputDir = cfg.CacheDir
+		if outputDir == "" {
+			outputDir = hfdownloader.DefaultCacheDir()
+		}
+	}
+	return routeKey, localDir, outputDir, nil
 }
 
 // parentRouteKey returns the coarse parent of a namespaced route key

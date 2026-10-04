@@ -235,6 +235,28 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	writeDiskFree(w, path)
+}
+
+// handleDownloadDiskFree previews the same destination as CreateJob without
+// creating directories, contacting the Hub, or starting a job. Explicit
+// localDir has the same semantics as on POST /api/download; GET retains its
+// configured-path allowlist for filesystem browsing.
+func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) {
+	var req DownloadRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	_, _, path, err := resolveDownloadDestination(s.snapshotConfig(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+		return
+	}
+	writeDiskFree(w, path)
+}
+
+func writeDiskFree(w http.ResponseWriter, path string) {
 	free, total, err := diskFreeBytes(path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())

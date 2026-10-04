@@ -32,7 +32,7 @@
   //
   // The server owns a closed set of internal route keys. The user must never
   // see those keys, so the dashboard maps each label to its key in this single
-  // fixed table (mirrors plans/download-type-folders/plan.md §2.3). Field ids
+  // fixed table. Field ids
   // and labels are the only route-facing surface; keys are sent to the API but
   // never rendered into the DOM.
   const ROUTE_LABELS = [
@@ -44,17 +44,19 @@
   ];
 
   // getConfiguredRouteOptions returns the labeled options for routes that have
-  // a non-empty destination configured, in the fixed table order.
+  // a non-empty destination configured, including the server's llm parent
+  // fallback. These are semantic selectors, not client-resolved paths.
   function getConfiguredRouteOptions() {
     const routes = state.settings?.downloadRoutes || {};
     return ROUTE_LABELS
-      .filter(r => String(routes[r.key] || '').trim() !== '')
+      .filter(r => String(routes[r.key] || '').trim() !== ''
+        || (r.key.startsWith('llm/') && String(routes.llm || '').trim() !== ''))
       .map(r => ({ key: r.key, label: r.label }));
   }
 
   // routeKeyForAnalysis derives the internal route key from an existing
-  // /api/analyze result (plan §3). Returns '' when no route applies; callers
-  // only ever send keys that are actually configured.
+  // /api/analyze result. Returns '' when no route applies; selectors can also
+  // resolve through a configured parent on the server.
   function routeKeyForAnalysis(analysis) {
     if (!analysis || analysis.is_dataset) return '';
     switch (analysis.type) {
@@ -64,6 +66,9 @@
         return analysis.transformers?.task === 'feature-extraction'
           ? 'embedding'
           : 'llm/safetensors';
+      case 'gptq':
+      case 'awq':
+        return 'llm/safetensors';
       case 'diffusers':
         return 'diffusion';
       case 'audio':
@@ -306,6 +311,27 @@
       throw new Error(message);
     }
     return data;
+  }
+
+  // Every download entry point previews its actual request through the server's
+  // destination owner. Do not resolve folder paths separately in the browser.
+  async function checkDownloadDiskSpace(body, warn = false) {
+    let df;
+    try {
+      df = await api('POST', '/diskfree', body);
+    } catch (_) {
+      // Disk-stat failures remain non-fatal, as before. Download validation is
+      // still authoritative and will reject invalid selectors itself.
+      return true;
+    }
+    if (df.free < 100 * 1024 * 1024) {
+      showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
+      return false;
+    }
+    if (warn && df.free < 2 * 1024 * 1024 * 1024) {
+      showToast(`Low disk space warning: ${formatBytes(df.free)} free on ${df.path}`, 'warning');
+    }
+    return true;
   }
 
   // =========================================
@@ -1055,7 +1081,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     // Non-selectable types (e.g. audio) send the destination chosen in the
     // file list's "Save to" select; '' keeps the previous behavior.
-    const routeKey = routeSelectValue('nonSelectableRoute');
+    const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
 
     try {
       const body = {
@@ -1070,6 +1096,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       };
       if (routeKey) body.routeKey = routeKey;
 
+      if (!await checkDownloadDiskSpace(body)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -1084,7 +1111,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     // Offer a labeled destination choice only when type folders are configured;
     // otherwise the modal is exactly as before.
     const routeOptions = getConfiguredRouteOptions();
-    const routeGroup = routeOptions.length ? `
+    const routeGroup = !isDataset && routeOptions.length ? `
       <div class="form-group">
         <label for="dlModalRoute">Save to</label>
         ${renderRouteSelect('dlModalRoute')}
@@ -1110,18 +1137,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   };
 
   window.confirmDirectDownload = async function(repo, isDataset, revision) {
-    hideModal();
     const localDir = $('#dlModalLocalDir')?.value?.trim() || '';
-    const routeKey = routeSelectValue('dlModalRoute');
+    const routeKey = isDataset ? '' : routeSelectValue('dlModalRoute');
+    hideModal();
     try {
-      const df = await fetch('/api/diskfree' + (localDir ? `?path=${encodeURIComponent(localDir)}` : '')).then(r => r.json()).catch(() => null);
-      if (df && df.free < 100 * 1024 * 1024) {
-        showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
       const body = { repo, revision: revision || 'main', dataset: isDataset };
       if (localDir) body.localDir = localDir;
       if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -1216,20 +1239,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       return;
     }
 
-    // Disk-free guard: warn if < 2 GB, block if < 100 MB
-    try {
-      const dfParams = localDir ? `?path=${encodeURIComponent(localDir)}` : '';
-      const df = await fetch('/api/diskfree' + dfParams).then(r => r.json());
-      const freeMB = df.free / (1024 * 1024);
-      if (freeMB < 100) {
-        showToast(`Not enough disk space: only ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
-      if (freeMB < 2048) {
-        showToast(`Low disk space warning: ${formatBytes(df.free)} free on ${df.path}`, 'warning');
-      }
-    } catch (_) { /* non-fatal */ }
-
     const body = {
       repo,
       revision,
@@ -1241,6 +1250,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (localDir) body.localDir = localDir;
 
     try {
+      if (!await checkDownloadDiskSpace(body, true)) return;
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
@@ -3561,13 +3571,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Download a single quantization from the quant list
   window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo) {
     try {
-      // Disk-free guard
-      const df = await fetch('/api/diskfree').then(r => r.json()).catch(() => null);
-      if (df && df.free < 100 * 1024 * 1024) {
-        showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
-        return;
-      }
-
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
       // the repo being analyzed, not to its ancestors.
@@ -3584,11 +3587,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       // Send the labeled destination choice when type folders are configured.
       // For an upstream companion (mmproj) this still resolves to the analyzed
       // model's route, so companions land with the parent.
-      const routeKey = routeSelectValue('quantRouteSelect');
+      const routeKey = isDataset ? '' : routeSelectValue('quantRouteSelect');
       if (routeKey) body.routeKey = routeKey;
       // When downloading from an upstream repo (e.g. mmproj from a base model),
       // tell the server to store the file under the current model's folder.
       if (localRepo) body.localRepo = localRepo;
+      if (!await checkDownloadDiskSpace(body)) return;
       const data = await api('POST', '/download', body);
 
       if (data.message) {
@@ -3670,12 +3674,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   window.downloadSingleFile = async function(repo, filename, isDataset) {
     try {
       // Destination chosen in the file list's "Save to" select, when present.
-      const routeKey = routeSelectValue('nonSelectableRoute');
+      const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
       const body = {
         repo, revision: currentAnalysis?.branch || 'main',
         dataset: isDataset, filters: [filename], exactMatch: true
       };
       if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
       await api('POST', '/download', body);
       showToast(`Queued: ${filename}`, 'success');
     } catch (e) {

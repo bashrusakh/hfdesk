@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -17,7 +18,151 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// Node's built-in VM runs the shipped UI against the real HTTP handlers and
+// CreateJob. Only DOM plumbing and disk capacity (for threshold cases) are
+// simulated; selector mapping and destination resolution are production code.
+func TestDownloadUIDestination(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node unavailable: run testdata/download-ui.cjs with Node to verify the UI")
+	}
+	for _, mode := range []string{"parent", "fine", "local", "cache"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			cfg := Config{CacheDir: filepath.Join(root, "cache"), MaxActive: 1}
+			if mode != "cache" {
+				cfg.LocalDir = filepath.Join(root, "local")
+			}
+			if mode == "parent" || mode == "fine" {
+				cfg.DownloadRoutes = map[string]string{"llm": filepath.Join(root, "llm"), "audio": filepath.Join(root, "audio")}
+			}
+			if mode == "fine" {
+				cfg.DownloadRoutes["llm/gguf"] = filepath.Join(root, "gguf")
+				cfg.DownloadRoutes["llm/safetensors"] = filepath.Join(root, "safetensors")
+			}
+			mgr := NewJobManager(cfg, nil)
+			mgr.jobs["occupied"] = &Job{Status: JobStatusRunning}
+			srv := &Server{config: cfg, jobs: mgr}
+			mux := http.NewServeMux()
+			srv.registerAPIRoutes(mux)
+			httpSrv := httptest.NewServer(mux)
+			defer httpSrv.Close()
+			fixture, err := json.Marshal(map[string]any{"url": httpSrv.URL, "routes": cfg.DownloadRoutes, "local": cfg.LocalDir, "cache": cfg.CacheDir, "manual": filepath.Join(root, "manual")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(node, "testdata/download-ui.cjs")
+			cmd.Env = append(os.Environ(), "HFDESK_UI_FIXTURE="+string(fixture))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("UI regression: %v\n%s", err, out)
+			}
+			t.Log(string(out))
+		})
+	}
+}
+
+// Check the public disk preview against real job creation, not a second resolver
+// in the test. A full scheduler slot keeps these jobs queued and off the network.
+func TestDownloadDiskFreeDestination(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "cache")
+	local := filepath.Join(root, "local")
+	parent := filepath.Join(root, "llm")
+	fine := filepath.Join(root, "gguf")
+	audio := filepath.Join(root, "audio")
+	explicit := filepath.Join(root, "manual")
+	for _, dir := range []string{cache, local, parent, fine, audio, explicit} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name string
+		cfg  Config
+		req  DownloadRequest
+		want string
+	}{
+		{"explicit override", Config{CacheDir: cache, LocalDir: local, DownloadRoutes: map[string]string{"llm/gguf": fine}}, DownloadRequest{RouteKey: "llm/gguf", LocalDir: explicit}, explicit},
+		{"fine wins", Config{CacheDir: cache, LocalDir: local, DownloadRoutes: map[string]string{"llm": parent, "llm/gguf": fine}}, DownloadRequest{RouteKey: "llm/gguf"}, fine},
+		{"parent gguf", Config{CacheDir: cache, LocalDir: local, DownloadRoutes: map[string]string{"llm": parent}}, DownloadRequest{RouteKey: "llm/gguf"}, parent},
+		{"parent safetensors", Config{CacheDir: cache, LocalDir: local, DownloadRoutes: map[string]string{"llm": parent}}, DownloadRequest{RouteKey: "llm/safetensors"}, parent},
+		{"audio", Config{CacheDir: cache, DownloadRoutes: map[string]string{"audio": audio}}, DownloadRequest{RouteKey: "audio"}, audio},
+		{"global local", Config{CacheDir: cache, LocalDir: local}, DownloadRequest{RouteKey: "llm/gguf"}, local},
+		{"cache", Config{CacheDir: cache}, DownloadRequest{RouteKey: "llm/gguf"}, cache},
+		{"default cache", Config{}, DownloadRequest{}, hfdownloader.DefaultCacheDir()},
+		{"dataset bypass", Config{CacheDir: cache, LocalDir: local, DownloadRoutes: map[string]string{"llm/gguf": fine}}, DownloadRequest{Dataset: true, RouteKey: "unknown"}, local},
+		{"dataset explicit", Config{CacheDir: cache, LocalDir: local}, DownloadRequest{Dataset: true, LocalDir: explicit}, explicit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.cfg.MaxActive = 1
+			mgr := NewJobManager(tt.cfg, nil)
+			mgr.jobs["occupied"] = &Job{Status: JobStatusRunning}
+			srv := &Server{config: tt.cfg, jobs: mgr}
+			tt.req.Repo = "owner/model"
+			body, err := json.Marshal(tt.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			srv.registerAPIRoutes(mux)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/diskfree", bytes.NewReader(body)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("disk preview: %d %s", w.Code, w.Body.String())
+			}
+			var preview struct {
+				Path        string
+				Free, Total uint64
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &preview); err != nil {
+				t.Fatal(err)
+			}
+			job, _, err := mgr.CreateJob(tt.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if preview.Path != tt.want || job.OutputDir != preview.Path {
+				t.Fatalf("preview=%q job=%q want=%q", preview.Path, job.OutputDir, tt.want)
+			}
+			free, total, err := diskFreeBytes(tt.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if preview.Total != total || preview.Free > total || free > total {
+				t.Fatalf("invalid disk statistics: %+v", preview)
+			}
+			// A settings replacement cannot move the destination of an existing job.
+			mgr.UpdateConfig(Config{LocalDir: explicit, MaxActive: 1})
+			frozen, _ := mgr.GetJob(job.ID)
+			if frozen.OutputDir != tt.want {
+				t.Fatalf("job moved after settings change: %+v", frozen)
+			}
+		})
+	}
+}
+
+func TestDownloadDiskFreeValidation(t *testing.T) {
+	srv := &Server{config: Config{CacheDir: t.TempDir()}}
+	for _, body := range []string{`{`, `{"routeKey":"unknown"}`, `{"routeKey":"unknown","localDir":"/manual"}`} {
+		w := httptest.NewRecorder()
+		srv.handleDownloadDiskFree(w, httptest.NewRequest("POST", "/api/diskfree", strings.NewReader(body)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", body, w.Code, w.Body.String())
+		}
+	}
+	// GET's arbitrary-path restriction must not be widened by the new preview.
+	w := httptest.NewRecorder()
+	srv.handleDiskFree(w, httptest.NewRequest("GET", "/api/diskfree?path=/not-configured", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET restriction: %d %s", w.Code, w.Body.String())
+	}
+}
 
 func TestResolveRoute(t *testing.T) {
 	routes := map[string]string{

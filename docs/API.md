@@ -218,9 +218,25 @@ Mirror operations compare and synchronize cache roots to configured targets.
 ```http
 GET /api/history
 GET /api/diskfree?path=/path/to/cache
+POST /api/diskfree
 ```
 
-`/api/diskfree` defaults to the resolved HF cache directory when no path is provided.
+`GET /api/diskfree` defaults to global `localDir`, then configured `cacheDir`,
+then the default HF cache directory. An explicit `path` must match a configured
+directory (including download route directories).
+
+`POST /api/diskfree` previews the effective download destination using optional
+`routeKey`, `localDir`, and `dataset` fields from the download request. `repo` is
+not required; other download fields are ignored. Resolution is identical to job
+creation: explicit `localDir` > configured route (fine key, then parent) > global
+`localDir` > configured/default HF cache. Datasets ignore `routeKey`; unknown
+model selectors return `400`, even with an explicit `localDir`. An explicit
+`localDir` is accepted as on `POST /api/download`, independently of GET's browsing
+allowlist. The response is `{ "path": "...", "free": 123, "total": 456 }` with
+byte counts; stat failures return `500`. This read-only check uses the nearest
+existing ancestor for a not-yet-created folder, creates no directories or jobs,
+and does not contact the Hub. It is advisory: settings and available space may
+change before creation; each job's destination remains frozen at creation.
 
 ## WebSocket
 

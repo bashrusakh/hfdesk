@@ -354,35 +354,11 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	// these reads (UpdateConfig replaces m.config under the write lock).
 	cfg := m.snapshotConfig()
 
-	// Use HuggingFace cache directory (v3 mode)
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
-	// Apply the same model selector validation and dataset bypass as previews.
-	routeKey, err := validatedRouteKey(req)
+	routeKey, effectiveLocalDir, outputDir, err := resolveDownloadDestination(cfg, req)
 	if err != nil {
 		return nil, false, err
 	}
-
-	// Determine effective local-dir: per-request override > configured route >
-	// server-global LocalDir. If any is set, use flat/real-file mode; otherwise
-	// use the HF cache layout.
-	effectiveLocalDir := cfg.LocalDir
-	if req.LocalDir != "" {
-		effectiveLocalDir = req.LocalDir
-	} else if routeKey != "" {
-		if resolved := resolveRoute(cfg.DownloadRoutes, routeKey); resolved != "" {
-			effectiveLocalDir = resolved
-		}
-	}
-
 	flat := effectiveLocalDir != ""
-	outputDir := cacheDir
-	if flat {
-		outputDir = effectiveLocalDir
-	}
 
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
