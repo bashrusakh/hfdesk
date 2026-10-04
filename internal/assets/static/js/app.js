@@ -73,6 +73,12 @@
     }
   }
 
+  // _routeSelectKeys records the exact key list each rendered select was built
+  // from, keyed by element id. Keys stay out of the DOM, but routeSelectValue
+  // compares identity so a reconfigured route set of the same size can never
+  // make a selected index resolve to a different key.
+  const _routeSelectKeys = new Map();
+
   // renderRouteSelect builds a labeled destination <select>. Option values are
   // indexes into the fixed option list, never raw keys, so keys stay out of the
   // rendered markup. An empty selection means "Default (server setting)".
@@ -80,6 +86,7 @@
     const opts = getConfiguredRouteOptions();
     const prefill = routeKeyForAnalysis(currentAnalysis);
     const selIdx = opts.findIndex(o => o.key === prefill);
+    _routeSelectKeys.set(id, opts.map(o => o.key));
     const rows = opts.map((o, i) =>
       `<option value="${i}"${i === selIdx ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
     ).join('');
@@ -105,6 +112,11 @@
     const opts = getConfiguredRouteOptions();
     const rendered = parseInt(el.dataset.optionCount, 10);
     if (opts.length !== rendered) return '';
+    // Key-identity guard: the index is only meaningful if the key list is the
+    // same one the select was rendered from (not merely the same length).
+    const renderedKeys = _routeSelectKeys.get(id);
+    if (!renderedKeys || renderedKeys.length !== opts.length
+        || renderedKeys.some((k, i) => k !== opts[i].key)) return '';
     return idx < opts.length ? opts[idx].key : '';
   }
 
@@ -1041,6 +1053,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       ? advancedOptions.exclude.split(',').map(s => s.trim()).filter(Boolean)
       : [];
 
+    // Non-selectable types (e.g. audio) send the destination chosen in the
+    // file list's "Save to" select; '' keeps the previous behavior.
+    const routeKey = routeSelectValue('nonSelectableRoute');
+
     try {
       const body = {
         repo,
@@ -1052,6 +1068,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         // exact enough that q6_k does not also pull q6_k_xl.
         exactMatch: filters.length > 0
       };
+      if (routeKey) body.routeKey = routeKey;
 
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
@@ -2686,14 +2703,20 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     }
     const retries = parseInt($('#retries')?.value);
 
-    // Build the route map from the labeled fields. Keys come only from
-    // ROUTE_LABELS; empty fields are omitted (they clear/unset the route).
+    // Build the route map by merging the labeled fields onto the currently
+    // loaded map. Keys not surfaced by the UI (e.g. "llm") survive a dashboard
+    // save, while a cleared labeled field still removes its route. The server
+    // replaces the map wholesale, so the client must send the merged object.
     // This is independent of `downloadLayout`: switching to HF cache must not
     // wipe configured route folders (plan §7.2.1).
-    const downloadRoutes = {};
+    const downloadRoutes = { ...(state.settings?.downloadRoutes || {}) };
     ROUTE_LABELS.forEach(r => {
       const value = $(`#${r.fieldId}`)?.value?.trim() || '';
-      if (value) downloadRoutes[r.key] = value;
+      if (value) {
+        downloadRoutes[r.key] = value;
+      } else {
+        delete downloadRoutes[r.key];
+      }
     });
 
     const body = {
@@ -3587,6 +3610,18 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   function renderNonSelectableFiles(data) {
     if (!data.files?.length) return '';
     const repo = data.repo;
+    // Offer a labeled destination choice when type folders are configured.
+    // Non-selectable types (e.g. audio) have no selectable_items, so this file
+    // list and the "Download All" wizard are the paths that reach the server;
+    // both read this one select. Keys never appear in the markup.
+    const routeGroup = getConfiguredRouteOptions().length ? `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('nonSelectableRoute', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>` : '';
     // Exclude non-model files from the list (keep only content files)
     const files = data.files.filter(f => {
       const n = (f.path || f.name || '').toLowerCase();
@@ -3615,6 +3650,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     return `
       <div class="analysis-section">
+        ${routeGroup}
         <div class="quant-category">
           <div class="quant-category-title">Files (${data.files.length})</div>
           ${rows}${more}
@@ -3625,10 +3661,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Download a single specific file by filter
   window.downloadSingleFile = async function(repo, filename, isDataset) {
     try {
-      await api('POST', '/download', {
+      // Destination chosen in the file list's "Save to" select, when present.
+      const routeKey = routeSelectValue('nonSelectableRoute');
+      const body = {
         repo, revision: currentAnalysis?.branch || 'main',
         dataset: isDataset, filters: [filename], exactMatch: true
-      });
+      };
+      if (routeKey) body.routeKey = routeKey;
+      await api('POST', '/download', body);
       showToast(`Queued: ${filename}`, 'success');
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
