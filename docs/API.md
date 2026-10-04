@@ -170,7 +170,7 @@ an unknown `routeKey` is still rejected with `400` (a selector must not silently
 become a no-op), except for the `dataset: true` case noted above:
 
 - `llm/gguf` — GGUF quantized LLMs (falls back to `llm`)
-- `llm/safetensors` — Transformers safetensors/bin LLMs (falls back to `llm`)
+- `llm/safetensors` — Transformers safetensors/bin LLMs, including GPTQ/AWQ-quantized models detected via `quantize_config.json` (falls back to `llm`)
 - `llm` — any other LLM (internal fallback key)
 - `diffusion` — diffusion pipelines / LoRAs
 - `audio` — audio models

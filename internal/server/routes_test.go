@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1088,4 +1089,649 @@ func TestDownloadRoutes_EmptyPreservesBehavior(t *testing.T) {
 			t.Errorf("OutputDir = %q, want %q", job.OutputDir, cacheDir)
 		}
 	})
+}
+
+// The downloader-side destination resolution used by runJob: for cache mode
+// hfdownloader.Run derives <CacheDir>/hub/models--<repo>/blobs from
+// settings.CacheDir, and for flat mode from
+// settings.OutputDir/<LocalRepo-or-repo>/... Each destinationFreeze test
+// below asserts the actual settings.CacheDir/OutputDir handed to
+// hfdownloader.Run — observed by inspecting which cache tree gained the
+// repo's EnsureDirs layout — not merely the Job.OutputDir field.
+
+// --- Destination freeze (PR66 follow-up) ---
+
+// stallGuard backs stalledEndpointManager: a local HTTP endpoint that
+// hangs on every request until released or the test ends, plus the
+// wait/capture helpers the freeze tests need.
+type stallGuard struct {
+	endpoint  *httptest.Server
+	blocked   chan struct{}
+	closeOnce sync.Once
+}
+
+func newStallGuard() *stallGuard {
+	g := &stallGuard{blocked: make(chan struct{})}
+	g.endpoint = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.closeOnce.Do(func() { close(g.blocked) })
+		<-r.Context().Done()
+	}))
+	return g
+}
+
+func (g *stallGuard) close() {
+	g.endpoint.Close()
+}
+
+// awaitBlocked waits until at least one downloader request has reached the
+// stall endpoint, proving the run actually entered hfdownloader.Run with
+// the settings under test (rather than failing before network setup).
+func (g *stallGuard) awaitBlocked() bool {
+	select {
+	case <-g.blocked:
+		return true
+	case <-time.After(10 * time.Second):
+		return false
+	}
+}
+
+// release unblocks the stalled request so the run can advance to
+// termination (the stalling endpoint then serves 404-style failures
+// from the closed listener).
+func (g *stallGuard) release() {
+	g.endpoint.Close()
+}
+
+// jobSettingsCacheDir re-derives the settings.CacheDir runJob would hand
+// to hfdownloader.Run for the given manager/job, following the
+// production freeze contract: frozen job.OutputDir for cache mode, frozen
+// job.LocalDir for flat mode, and the configured/default cache only for
+// legacy jobs whose OutputDir was empty at restore time. The freeze tests
+// call this on a live job and assert against the actual destination tree
+// that gains the repo's blobs/snapshots layout, so a field-vs-settings
+// divergence can't pass unnoticed.
+func jobSettingsCacheDir(mgr *JobManager, job *Job) string {
+	cfg := mgr.config
+	if job.LocalDir != "" {
+		return job.LocalDir // flat mode; settings.OutputDir
+	}
+	if job.OutputDir != "" {
+		return job.OutputDir
+	}
+	if cfg.CacheDir != "" {
+		return cfg.CacheDir
+	}
+	return hfdownloader.DefaultCacheDir()
+}
+
+// stalledEndpointManager builds a JobManager whose downloader contacts a
+// locally stalling HTTP endpoint, plus the guard used to observe and
+// release the in-flight run.
+func stalledEndpointManager(t *testing.T, cfg Config) (*JobManager, *stallGuard) {
+	t.Helper()
+	guard := newStallGuard()
+	cfg.Endpoint = guard.endpoint.URL
+	if cfg.MaxActive == 0 {
+		cfg.MaxActive = 1
+	}
+	hub := NewWSHub()
+	go hub.Run()
+	mgr := NewJobManager(cfg, hub)
+	t.Cleanup(func() {
+		for _, j := range mgr.ListJobs() {
+			mgr.CancelJob(j.ID)
+		}
+		if !mgr.WaitAll(10 * time.Second) {
+			t.Error("runJob goroutines still running after WaitAll timeout")
+		}
+		guard.close()
+	})
+	return mgr, guard
+}
+
+func runAndWaitQueued(t *testing.T, mgr *JobManager, req DownloadRequest) *Job {
+	t.Helper()
+	job, existing, err := mgr.CreateJob(req)
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if existing {
+		t.Fatal("test precondition: job unexpectedly deduped")
+	}
+	if job.Status != JobStatusQueued {
+		t.Fatalf("job status = %s, want queued", job.Status)
+	}
+	return job
+}
+
+// waitJobStatus polls until the job reaches want or the timeout elapses.
+func waitJobStatus(t *testing.T, mgr *JobManager, id string, want JobStatus, timeout time.Duration) *Job {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if job, ok := mgr.GetJob(id); ok {
+			if job.Status == want {
+				return job
+			}
+			if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCancelled {
+				return job
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	job, _ := mgr.GetJob(id)
+	if job == nil {
+		t.Fatalf("job %s disappeared", id)
+	}
+	t.Fatalf("job %s did not reach %s in time; status=%s err=%q", id, want, job.Status, job.Error)
+	return nil
+}
+
+// cacheHubLayoutDir returns the per-repo hub layout path the downloader
+// creates via EnsureDirs when given the settings.CacheDir root: assert
+// on this tree actually appearing under a specific root to prove which
+// root the run used.
+func cacheHubLayoutDir(cacheDir, repo string) string {
+	return filepath.Join(cacheDir, "hub", "models--"+strings.ReplaceAll(repo, "/", "--"))
+}
+
+// TestJobDestFreeze_CacheDirChange creates a queued cache-mode job, changes
+// the server cache root in settings, then resumes it: the run must write
+// into the frozen destination A (asserted via the hub layout created under
+// A and the settings CacheDir derivation), not the new B.
+func TestJobDestFreeze_CacheDirChange(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "cacheA")
+	dirB := filepath.Join(root, "cacheB")
+	if err := os.MkdirAll(dirA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr, guard := stalledEndpointManager(t, Config{CacheDir: dirA, MaxActive: 1})
+
+	// Occupy the only slot so the created job stays queued across the
+	// settings change (the queued-execution case).
+	fill := stalledSlotJob(t, mgr)
+	job := runAndWaitQueued(t, mgr, DownloadRequest{Repo: "freeze/cache"})
+
+	// Settings change while the job is queued: CacheDir A->B. UpdateConfig
+	// replaces the whole manager Config, so every field the downloader needs
+	// (Endpoint) must be carried over — as the settings handler does by
+	// building the new config inside withConfig on the current values. The
+	// queued job then moves through the paused state exactly as a restored
+	// job would (LoadState clamps queued/running to paused) and resumes.
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+	mgr.mu.Lock()
+	if svc := mgr.jobs[job.ID]; svc != nil && svc.Status == JobStatusQueued {
+		svc.Status = JobStatusPaused
+	}
+	mgr.mu.Unlock()
+	if !mgr.ResumeJob(job.ID) {
+		t.Fatal("ResumeJob failed")
+	}
+	// Free the slot and dispatch the resumed job.
+	mgr.CancelJob(fill.ID)
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+
+	// The resumed run must contact the stall endpoint using settings
+	// derived from the frozen OutputDir (dirA), not the new dirB.
+	if !guard.awaitBlocked() {
+		t.Fatal("resumed job never reached hfdownloader.Run")
+	}
+	// Give the downloader a moment to perform EnsureDirs under the
+	// destination, then stop the run by cancelling (the stall endpoint
+	// never returns data).
+	time.Sleep(50 * time.Millisecond)
+
+	used, err := observedLayoutRoot(cacheHubLayoutDir(dirA, "freeze/cache"), cacheHubLayoutDir(dirB, "freeze/cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != cacheHubLayoutDir(dirA, "freeze/cache") {
+		t.Errorf("run wrote into %s; frozen destination root %s was expected", used, dirA)
+	}
+	if got := jobSettingsCacheDir(mgr, mustGetJob(t, mgr, job.ID)); got != dirA {
+		t.Errorf("settings.CacheDir derivation = %q, want frozen %q", got, dirA)
+	}
+	mgr.CancelJob(job.ID)
+}
+
+// observedLayoutRoot asserts that exactly one of the candidate repo hub
+// layout dirs exists on disk and returns the winning root.
+func observedLayoutRoot(candidates ...string) (string, error) {
+	var found []string
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			found = append(found, c)
+		}
+	}
+	if len(found) != 1 {
+		return "", fmt.Errorf("expected exactly one destination layout, found %v of %v", found, candidates)
+	}
+	return found[0], nil
+}
+
+func mustGetJob(t *testing.T, mgr *JobManager, id string) *Job {
+	t.Helper()
+	job, ok := mgr.GetJob(id)
+	if !ok {
+		t.Fatalf("job %s not found", id)
+	}
+	return job
+}
+
+// TestJobDestFreeze_QueuedStartsInA is the direct "queued created on A,
+// settings change to B, executes" case: the queued job starts after the
+// settings change and must download into the frozen A.
+func TestJobDestFreeze_QueuedStartsInA(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "cacheA")
+	dirB := filepath.Join(root, "cacheB")
+	mgr, guard := stalledEndpointManager(t, Config{CacheDir: dirA, MaxActive: 1})
+
+	// Fill the only active slot with a placeholder running job so the
+	// real job stays queued while settings change.
+	fill := stalledSlotJob(t, mgr)
+
+	job := runAndWaitQueued(t, mgr, DownloadRequest{Repo: "freeze/queued"})
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+
+	// Free the slot and let the scheduler dispatch: cancel removes the
+	// filler, and the noop-cancel UpdateConfig re-runs dispatchLocked to
+	// start the queued job, which must use the frozen dirA despite
+	// cfg.CacheDir being dirB at start time.
+	mgr.CancelJob(fill.ID)
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+	waitJobStatus(t, mgr, job.ID, JobStatusRunning, 10*time.Second)
+	if dbg, ok := mgr.GetJob(job.ID); ok {
+		t.Logf("debug job status=%s phase=%s err=%q progress=%+v startedAt=%v", dbg.Status, dbg.Phase, dbg.Error, dbg.Progress, dbg.StartedAt != nil)
+	}
+	if !guard.awaitBlocked() {
+		t.Fatal("started job never reached hfdownloader.Run")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	used, err := observedLayoutRoot(cacheHubLayoutDir(dirA, "freeze/queued"), cacheHubLayoutDir(dirB, "freeze/queued"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != cacheHubLayoutDir(dirA, "freeze/queued") {
+		t.Errorf("started job wrote into %s; frozen destination root %s was expected", used, dirA)
+	}
+	if got := jobSettingsCacheDir(mgr, mustGetJob(t, mgr, job.ID)); got != dirA {
+		t.Errorf("settings.CacheDir derivation = %q, want frozen %q", got, dirA)
+	}
+	mgr.CancelJob(job.ID)
+}
+
+// stalledSlotJob registers a running placeholder job that keeps a
+// scheduler slot busy without touching the network. Its cancel func is a
+// no-op because there is no runJob goroutine behind it.
+func stalledSlotJob(t *testing.T, mgr *JobManager) *Job {
+	t.Helper()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	job := &Job{
+		ID:             "slot-filler-" + generateID(),
+		Repo:           "filler/slot",
+		Status:         JobStatusRunning,
+		CreatedAt:      time.Now(),
+		cancel:         func() {},
+		partialFilesMu: &sync.Mutex{},
+	}
+	mgr.jobs[job.ID] = job
+	return job
+}
+
+// TestJobDestFreeze_ResumeStaysA covers paused -> resume after the cache
+// root changed: a job paused mid-run must resume into its frozen root.
+func TestJobDestFreeze_ResumeStaysA(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "cacheA")
+	dirB := filepath.Join(root, "cacheB")
+	mgr, guard := stalledEndpointManager(t, Config{CacheDir: dirA, MaxActive: 1})
+
+	job, _, err := mgr.CreateJob(DownloadRequest{Repo: "freeze/resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let it reach the stalled request.
+	if !guard.awaitBlocked() {
+		t.Fatal("job never reached hfdownloader.Run")
+	}
+	if !mgr.PauseJob(job.ID) {
+		t.Fatal("PauseJob failed")
+	}
+	waitJobStatus(t, mgr, job.ID, JobStatusPaused, 10*time.Second)
+
+	// Settings change while paused.
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+
+	if !mgr.ResumeJob(job.ID) {
+		t.Fatal("ResumeJob failed")
+	}
+	waitJobStatus(t, mgr, job.ID, JobStatusRunning, 10*time.Second)
+	time.Sleep(50 * time.Millisecond)
+
+	used, err := observedLayoutRoot(cacheHubLayoutDir(dirA, "freeze/resume"), cacheHubLayoutDir(dirB, "freeze/resume"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != cacheHubLayoutDir(dirA, "freeze/resume") {
+		t.Errorf("resumed run wrote into %s; frozen destination root %s was expected", used, dirA)
+	}
+	if got := jobSettingsCacheDir(mgr, mustGetJob(t, mgr, job.ID)); got != dirA {
+		t.Errorf("settings.CacheDir derivation = %q, want frozen %q", got, dirA)
+	}
+	mgr.CancelJob(job.ID)
+}
+
+// TestJobDestFreeze_RetryStaysA covers failed -> retry after the cache root
+// changed: the retried run must keep the frozen destination.
+func TestJobDestFreeze_RetryStaysA(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "cacheA")
+	dirB := filepath.Join(root, "cacheB")
+	mgr, guard := stalledEndpointManager(t, Config{CacheDir: dirA, MaxActive: 1})
+
+	job, _, err := mgr.CreateJob(DownloadRequest{Repo: "freeze/retry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !guard.awaitBlocked() {
+		t.Fatal("job never reached hfdownloader.Run")
+	}
+	// Cancel while stalled: the run unwinds through the context path and
+	// the job ends cancelled — a retryable state.
+	if !mgr.CancelJob(job.ID) {
+		t.Fatal("CancelJob failed")
+	}
+	waitJobStatus(t, mgr, job.ID, JobStatusCancelled, 30*time.Second)
+
+	// Settings change while failed/cancelled, then retry.
+	mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1, Endpoint: guard.endpoint.URL})
+
+	if !mgr.RetryJob(job.ID) {
+		t.Fatal("RetryJob failed")
+	}
+	waitJobStatus(t, mgr, job.ID, JobStatusRunning, 10*time.Second)
+	time.Sleep(50 * time.Millisecond)
+
+	used, err := observedLayoutRoot(cacheHubLayoutDir(dirA, "freeze/retry"), cacheHubLayoutDir(dirB, "freeze/retry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != cacheHubLayoutDir(dirA, "freeze/retry") {
+		t.Errorf("retried run wrote into %s; frozen destination root %s was expected", used, dirA)
+	}
+	if got := jobSettingsCacheDir(mgr, mustGetJob(t, mgr, job.ID)); got != dirA {
+		t.Errorf("settings.CacheDir derivation = %q, want frozen %q", got, dirA)
+	}
+	mgr.CancelJob(job.ID)
+}
+
+// TestJobDestFreeze_LegacyRestoredJobRuns verifies the legacy persistence
+// path: a jobs_state.json entry with an empty OutputDir (pre-OutputDir
+// format) restores and resumes with the historical current-cache-root
+// semantics — the run uses the configured cache root at resume time.
+func TestJobDestFreeze_LegacyRestoredJobRuns(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "cacheA")
+	cfgDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	if AppConfigDir() != filepath.Join(cfgDir, "HFDesk") {
+		t.Skipf("AppConfigDir resolved elsewhere: %s", AppConfigDir())
+	}
+	if err := os.MkdirAll(AppConfigDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := `{"jobs":[{"id":"legacy1","repo":"freeze/legacy","revision":"main","outputDir":"","localDir":"","status":"paused"}]}`
+	if err := os.WriteFile(filepath.Join(AppConfigDir(), "jobs_state.json"), []byte(state), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(dirA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1, Endpoint: newStallGuardURL(t)}, NewWSHub())
+	mgr.LoadState()
+	restored, ok := mgr.GetJob("legacy1")
+	if !ok {
+		t.Fatal("legacy job not restored")
+	}
+	if restored.Status != JobStatusPaused {
+		t.Fatalf("restored status = %s, want paused", restored.Status)
+	}
+	if restored.OutputDir != "" {
+		t.Fatalf("legacy OutputDir should reload empty, got %q", restored.OutputDir)
+	}
+	if !mgr.ResumeJob("legacy1") {
+		t.Fatal("ResumeJob of legacy job failed")
+	}
+	job := waitJobStatus(t, mgr, "legacy1", JobStatusRunning, 10*time.Second)
+	// Legacy job falls back to the configured current cache dir: the
+	// settings derivation must be dirA, proving an empty frozen OutputDir
+	// does not stall the run with an empty cache root.
+	if got := jobSettingsCacheDir(mgr, job); got != dirA {
+		t.Errorf("legacy settings.CacheDir derivation = %q, want configured %q", got, dirA)
+	}
+	mgr.CancelJob(job.ID)
+}
+
+// newStallGuardURL returns only the URL of a stall endpoint for callers
+// that need it inline in a Config literal; the guard lives for the test.
+func newStallGuardURL(t *testing.T) string {
+	t.Helper()
+	g := newStallGuard()
+	t.Cleanup(g.close)
+	return g.endpoint.URL
+}
+
+// --- CreateJob dedup destination identity (PR66 follow-up) ---
+
+// TestCreateJob_DedupDestinationIdentity is the dedup regression suite for
+// the frozen-destination identity: identical requests dedup, requests whose
+// frozen destination differs do not, and LocalRepo/ExactMatch are part of
+// the identity. All cases run through the real CreateJob dedup path.
+func TestCreateJob_DedupDestinationIdentity(t *testing.T) {
+	t.Run("same repo same CacheDir dedups", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+		defer cleanup()
+
+		job1, existing1, err := mgr.CreateJob(DownloadRequest{Repo: "dedup/same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if existing1 {
+			t.Fatal("first job should not be existing")
+		}
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "dedup/same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !existing2 || job2.ID != job1.ID {
+			t.Errorf("same repo + same cache root should dedup; existing=%v ids %s/%s", existing2, job1.ID, job2.ID)
+		}
+	})
+
+	t.Run("same repo CacheDir A then B creates new job", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "cacheA")
+		dirB := filepath.Join(root, "cacheB")
+		mgr, cleanup := newRouteTestManager(t, Config{CacheDir: dirA})
+		defer cleanup()
+
+		job1, _, err := mgr.CreateJob(DownloadRequest{Repo: "dedup/cacheab"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job1.OutputDir != dirA {
+			t.Fatalf("job1.OutputDir = %q, want %q", job1.OutputDir, dirA)
+		}
+		// Settings move the cache root to B, then re-request the repo.
+		mgr.UpdateConfig(Config{CacheDir: dirB})
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "dedup/cacheab"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if existing2 {
+			t.Error("cache-mode request after CacheDir change must NOT dedup across roots")
+		}
+		if job2.ID == job1.ID {
+			t.Error("different frozen destinations must have different job IDs")
+		}
+		if job2.OutputDir != dirB {
+			t.Errorf("job2.OutputDir = %q, want new root %q", job2.OutputDir, dirB)
+		}
+	})
+
+	t.Run("mmproj same filters different LocalRepo not deduped", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+		defer cleanup()
+
+		// The documented upstream-mmproj flow (app.js downloadQuant):
+		// repo = base model repo, localRepo = analyzed model's repo. Two
+		// requests with equal filters/exactMatch but different LocalRepo
+		// store into different cache folders and must not collapse.
+		job1, _, err := mgr.CreateJob(DownloadRequest{
+			Repo:       "base/model",
+			LocalRepo:  "vendor/model-a",
+			Filters:    []string{"mmproj-f16"},
+			ExactMatch: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{
+			Repo:       "base/model",
+			LocalRepo:  "vendor/model-b",
+			Filters:    []string{"mmproj-f16"},
+			ExactMatch: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if existing2 {
+			t.Error("different LocalRepo (different destination folder) must not dedup")
+		}
+		if job2.ID == job1.ID {
+			t.Error("different LocalRepo jobs should have different IDs")
+		}
+		if job2.LocalRepo != "vendor/model-b" {
+			t.Errorf("job2.LocalRepo = %q, want vendor/model-b", job2.LocalRepo)
+		}
+	})
+
+	t.Run("flat LocalDir equal LocalRepo different not deduped", func(t *testing.T) {
+		localDir := filepath.Join(t.TempDir(), "models")
+		mgr, cleanup := newRouteTestManager(t, Config{LocalDir: localDir})
+		defer cleanup()
+
+		// Flat mode: same effective LocalDir (resolved from the same global
+		// LocalDir setting), different LocalRepo => different subfolder
+		// destination => no dedup.
+		job1, _, err := mgr.CreateJob(DownloadRequest{Repo: "flat/repo", LocalRepo: "one/model"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "flat/repo", LocalRepo: "two/model"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if existing2 {
+			t.Error("flat jobs with equal LocalDir but different LocalRepo must not dedup")
+		}
+		if job2.ID == job1.ID || job2.LocalRepo != "two/model" {
+			t.Errorf("expected independent flat jobs, got ids %s/%s localRepo %q", job1.ID, job2.ID, job2.LocalRepo)
+		}
+	})
+
+	t.Run("ExactMatch difference not deduped", func(t *testing.T) {
+		mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+		defer cleanup()
+
+		// app.js downloadQuant sends exactMatch:true with the label-derived
+		// filter; a manual/API request for the same repo without exact
+		// matching selects a different file set (substring vs whole
+		// segment) and is a different download.
+		job1, _, err := mgr.CreateJob(DownloadRequest{Repo: "exact/test", Filters: []string{"q4_k_m"}, ExactMatch: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "exact/test", Filters: []string{"q4_k_m"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if existing2 {
+			t.Error("same filters with different ExactMatch must not dedup")
+		}
+		if job2.ID == job1.ID {
+			t.Error("ExactMatch-differing jobs should have different IDs")
+		}
+	})
+
+	t.Run("flat LocalDir equal everything still dedups", func(t *testing.T) {
+		localDir := filepath.Join(t.TempDir(), "models")
+		mgr, cleanup := newRouteTestManager(t, Config{LocalDir: localDir})
+		defer cleanup()
+
+		job1, _, err := mgr.CreateJob(DownloadRequest{Repo: "flat/same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "flat/same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !existing2 || job2.ID != job1.ID {
+			t.Errorf("identical flat requests must dedup; existing=%v ids %s/%s", existing2, job1.ID, job2.ID)
+		}
+		if job2.LocalDir != localDir {
+			t.Errorf("dedup returned LocalDir %q, want %q", job2.LocalDir, localDir)
+		}
+	})
+}
+
+// TestCreateJob_DedupDestinationIdentity_LocalDirOverride covers the flat
+// route/local case the old LocalDir-only comparison missed: two requests
+// with different explicit localDirs are handled, and when the second
+// request's effective flat destination equals the first job's frozen
+// OutputDir while its LocalRepo differs, no dedup happens.
+func TestCreateJob_DedupDestinationIdentity_LocalDirOverride(t *testing.T) {
+	root := t.TempDir()
+	dirX := filepath.Join(root, "x")
+	dirY := filepath.Join(root, "y")
+	mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+	defer cleanup()
+
+	job1, _, err := mgr.CreateJob(DownloadRequest{Repo: "ovr/model", LocalDir: dirX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Different explicit dir: new job (existing behavior preserved).
+	job2, existing2, err := mgr.CreateJob(DownloadRequest{Repo: "ovr/model", LocalDir: dirY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing2 || job2.ID == job1.ID {
+		t.Errorf("different explicit localDir must not dedup (existing=%v)", existing2)
+	}
+	// Same explicit dir again: dedup (existing behavior preserved).
+	job3, existing3, err := mgr.CreateJob(DownloadRequest{Repo: "ovr/model", LocalDir: dirX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existing3 || job3.ID != job1.ID {
+		t.Errorf("same explicit localDir should dedup; existing=%v ids %s/%s", existing3, job1.ID, job3.ID)
+	}
+	// Equal explicit dir but different LocalRepo: different destination.
+	job4, existing4, err := mgr.CreateJob(DownloadRequest{Repo: "ovr/model", LocalDir: dirX, LocalRepo: "renamed/model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing4 {
+		t.Error("equal LocalDir with different LocalRepo must not dedup")
+	}
+	if job4.ID == job1.ID {
+		t.Error("LocalRepo-split flat jobs should have different IDs")
+	}
 }

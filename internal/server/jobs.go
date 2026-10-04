@@ -341,9 +341,16 @@ func stringSlicesEqual(a, b []string) bool {
 }
 
 // CreateJob creates a new download job.
-// Returns existing job only when repo, revision, dataset AND filters match
-// an active job. Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16)
-// create independent jobs.
+// Returns existing job only when repo, revision, dataset, destination and
+// filters match an active job. Different filters on the same repo (e.g.
+// Q4_K_M vs mmproj-f16) create independent jobs.
+//
+// The destination is resolved from the current settings at creation and
+// frozen on the job: later settings changes never move an existing job's
+// destination. Destination identity is the frozen OutputDir plus LocalRepo
+// and ExactMatch, so the same repo requested with a different frozen
+// destination, destination folder override, or matching mode creates a new
+// job.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	revision := req.Revision
 	if revision == "" {
@@ -360,16 +367,35 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	}
 	flat := effectiveLocalDir != ""
 
+	// The requested destination identity for dedup purposes: the frozen
+	// output root (flat local dir when set, cache root otherwise), compared
+	// with pathIdentityKey so platform case/clean semantics match how the
+	// rest of the server compares configured paths.
+	reqDestKey := pathIdentityKey(outputDir)
+
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
 	// are also identical, so the user can download a quantization and a
 	// vision encoder (mmproj) for the same repo at the same time.
+	//
+	// Destination identity uses the frozen OutputDir (not LocalDir):
+	// LocalDir changes meaning whenever the settings/routes change between
+	// two creations — two cache-mode jobs created under different cache
+	// roots are different destinations, and two jobs created under equal
+	// LocalDir strings but frozen into different output roots must not be
+	// collapsed when a settings change alters the effective path in
+	// between. LocalRepo and ExactMatch are part of the identity too: the
+	// former redirects where the files land (cache folder ID / subfolder),
+	// the latter selects which files match, so two requests differing in
+	// either are different downloads even when the rest matches.
 	m.mu.Lock()
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
-			existing.LocalDir == effectiveLocalDir &&
+			pathIdentityKey(existing.OutputDir) == reqDestKey &&
+			existing.LocalRepo == req.LocalRepo &&
+			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
 			stringSlicesEqual(existing.Excludes, req.Excludes) {
@@ -1074,8 +1100,21 @@ func (m *JobManager) runJob(job *Job) {
 	// be a data race.
 	cfg := m.snapshotConfig()
 
-	// Use HuggingFace cache structure (v3 mode) instead of legacy OutputDir
-	cacheDir := cfg.CacheDir
+	// The destination was resolved and frozen into the job fields at
+	// CreateJob time (routes.go resolveDownloadDestination): cache mode
+	// carries the cache root in job.OutputDir, flat mode carries the
+	// resolved local folder in job.LocalDir (applied below). runJob must
+	// honor the frozen destination — re-snapshotting cfg.CacheDir here
+	// would move an existing job's downloads into a newly configured cache
+	// root while the job still reports its original OutputDir.
+	//
+	// Legacy state files persisted before OutputDir existed carry an empty
+	// value; those restored jobs keep their historical current-cache-root
+	// semantics by falling back to the configured or default cache.
+	cacheDir := job.OutputDir
+	if cacheDir == "" {
+		cacheDir = cfg.CacheDir
+	}
 	if cacheDir == "" {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
