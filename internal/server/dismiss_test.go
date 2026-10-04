@@ -16,7 +16,7 @@ import (
 // a live download by clicking the wrong button. Paused jobs are terminal
 // from the "visible in list" standpoint and can be dismissed.
 func TestDismissJob_OnlyTerminalStates(t *testing.T) {
-	m := NewJobManager(Config{}, nil)
+	m := newTestJobManager(t, Config{}, nil)
 
 	cases := []struct {
 		status     JobStatus
@@ -61,7 +61,7 @@ func TestDismissJob_OnlyTerminalStates(t *testing.T) {
 // guarantee: once a job is dismissed, it no longer appears in the list
 // that sendInitialState uses to rehydrate a reconnecting browser.
 func TestDismissJob_SurvivesPageRefresh(t *testing.T) {
-	m := NewJobManager(Config{}, nil)
+	m := newTestJobManager(t, Config{}, nil)
 
 	m.jobs["live"] = &Job{ID: "live", Status: JobStatusRunning, CreatedAt: time.Now()}
 	m.jobs["gone"] = &Job{ID: "gone", Status: JobStatusCompleted, CreatedAt: time.Now()}
@@ -89,7 +89,7 @@ func TestDismissJob_SurvivesPageRefresh(t *testing.T) {
 // path follows the JobManager snapshot contract instead of returning
 // the live mutable job pointer.
 func TestDismissJobResult_ActiveJobReturnsSnapshot(t *testing.T) {
-	m := NewJobManager(Config{}, nil)
+	m := newTestJobManager(t, Config{}, nil)
 	m.jobs["live"] = &Job{
 		ID:        "live",
 		Status:    JobStatusRunning,
@@ -128,7 +128,7 @@ func TestHandleDismissJob_EndToEnd(t *testing.T) {
 
 	srv := &Server{
 		config: Config{},
-		jobs:   NewJobManager(Config{}, hub),
+		jobs:   newTestJobManager(t, Config{}, hub),
 		wsHub:  hub,
 	}
 	srv.jobs.jobs["done1"] = &Job{

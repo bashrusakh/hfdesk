@@ -45,7 +45,7 @@ func TestDownloadUIDestination(t *testing.T) {
 				cfg.DownloadRoutes["llm/gguf"] = filepath.Join(root, "gguf")
 				cfg.DownloadRoutes["llm/safetensors"] = filepath.Join(root, "safetensors")
 			}
-			mgr := NewJobManager(cfg, nil)
+			mgr := newTestJobManager(t, cfg, nil)
 			mgr.jobs["occupied"] = &Job{Status: JobStatusRunning}
 			srv := &Server{config: cfg, jobs: mgr}
 			mux := http.NewServeMux()
@@ -102,7 +102,7 @@ func TestDownloadDiskFreeDestination(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.cfg.MaxActive = 1
-			mgr := NewJobManager(tt.cfg, nil)
+			mgr := newTestJobManager(t, tt.cfg, nil)
 			mgr.jobs["occupied"] = &Job{Status: JobStatusRunning}
 			srv := &Server{config: tt.cfg, jobs: mgr}
 			tt.req.Repo = "owner/model"
@@ -309,7 +309,7 @@ func newRouteTestManager(t *testing.T, cfg Config) (*JobManager, func()) {
 	}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 	cleanup := func() {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -544,7 +544,7 @@ func TestJobManager_RouteKey_Dedup(t *testing.T) {
 }
 
 func TestAPI_StartDownload_InvalidRouteKey(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Both a traversal-looking value and a legacy/reserved key (which
 	// /api/settings now drops) must be strict 400s on /api/download: a route
@@ -670,7 +670,7 @@ func TestAPI_RouteKeyValidationIngress(t *testing.T) {
 	}))
 	defer endpoint.Close()
 	cfg := Config{CacheDir: t.TempDir(), Endpoint: endpoint.URL, DownloadRoutes: map[string]string{"audio": t.TempDir()}}
-	srv := &Server{config: cfg, jobs: NewJobManager(cfg, NewWSHub())}
+	srv := &Server{config: cfg, jobs: newTestJobManager(t, cfg, NewWSHub())}
 	mux := http.NewServeMux()
 	srv.registerAPIRoutes(mux)
 	for _, ingress := range []struct {
@@ -838,7 +838,7 @@ func TestAPI_DiskFree_AcceptsRoutePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(Config{
+	srv := newTestServerWithConfig(t, Config{
 		CacheDir: cacheDir,
 		DownloadRoutes: map[string]string{
 			"llm/gguf": routeDir,
@@ -872,7 +872,7 @@ func TestAPI_Settings_DownloadRoutes_RoundTripJSON(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	_ = os.Remove(ConfigPath())
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	body := `{"downloadRoutes": {"llm/gguf": "  /mnt/models/LLM/GGUF  ", "audio": "/mnt/models/Audio"}}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
@@ -927,7 +927,7 @@ func TestAPI_Settings_DownloadRoutes_RoundTripYAML(t *testing.T) {
 		t.Skipf("ConfigPath resolved to %s, not the YAML file", ConfigPath())
 	}
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	body := `{"downloadRoutes": {"embedding": "/mnt/models/Embedding"}}`
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -950,7 +950,7 @@ func TestAPI_Settings_DropsUnknownRouteKeys(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	_ = os.Remove(ConfigPath())
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Mixed map: one valid key and one unknown (legacy/reserved) key. The save
 	// must succeed and keep only the valid key; the unknown key must never be
@@ -1176,7 +1176,7 @@ func stalledEndpointManager(t *testing.T, cfg Config) (*JobManager, *stallGuard)
 	}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 	t.Cleanup(func() {
 		for _, j := range mgr.ListJobs() {
 			mgr.CancelJob(j.ID)
@@ -1492,7 +1492,8 @@ func TestJobDestFreeze_LegacyRestoredJobRuns(t *testing.T) {
 	if err := os.MkdirAll(dirA, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1, Endpoint: newStallGuardURL(t)}, NewWSHub())
+	mgr := newJobManagerWithStatePath(Config{CacheDir: dirA, MaxActive: 1, Endpoint: newStallGuardURL(t)}, NewWSHub(), filepath.Join(AppConfigDir(), "jobs_state.json"))
+	registerTestJobManagerCleanup(t, mgr)
 	mgr.LoadState()
 	restored, ok := mgr.GetJob("legacy1")
 	if !ok {
@@ -1819,7 +1820,7 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 		root := t.TempDir()
 		dirA := filepath.Join(root, "cacheA")
 		dirB := filepath.Join(root, "cacheB")
-		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
 		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-cancel", "owner/pausedfreeze", dirA)
 
@@ -1841,7 +1842,7 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 		root := t.TempDir()
 		dirA := filepath.Join(root, "cacheA")
 		dirB := filepath.Join(root, "cacheB")
-		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
 		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-dismiss", "owner/pausedfreeze", dirA)
 
@@ -1862,7 +1863,7 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 func TestJobDestFreeze_PausedCleanupLegacyAndFlatPreserved(t *testing.T) {
 	t.Run("legacy empty OutputDir cleans current cache root", func(t *testing.T) {
 		dirA := t.TempDir()
-		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
 		blobsDir := filepath.Join(cacheHubLayoutDir(dirA, "owner/legacyclean"), "blobs")
 		if err := os.MkdirAll(blobsDir, 0o755); err != nil {
@@ -1898,7 +1899,7 @@ func TestJobDestFreeze_PausedCleanupLegacyAndFlatPreserved(t *testing.T) {
 		root := t.TempDir()
 		dirA := filepath.Join(root, "cacheA")
 		dirB := filepath.Join(root, "cacheB")
-		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
 		// A resumed legacy job runs under the current root: after the settings
 		// move to B its dsts live under B, so cleanup must target B too.
@@ -1938,7 +1939,7 @@ func TestJobDestFreeze_PausedCleanupLegacyAndFlatPreserved(t *testing.T) {
 		dirA := filepath.Join(root, "cacheA")
 		dirB := filepath.Join(root, "cacheB")
 		localDir := filepath.Join(root, "models")
-		mgr := NewJobManager(Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
+		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
 		flatSub := filepath.Join(localDir, "owner", "flatclean")
 		if err := os.MkdirAll(flatSub, 0o755); err != nil {

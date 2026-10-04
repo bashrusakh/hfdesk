@@ -7,9 +7,11 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -194,9 +196,6 @@ func New(cfg Config) *Server {
 
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	// Start WebSocket hub
-	go s.wsHub.Run()
-
 	mux := http.NewServeMux()
 
 	// API routes
@@ -242,22 +241,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// Build middleware chain: CORS -> Auth -> Logging -> Handler
 	handler := s.corsMiddleware(s.basicAuthMiddleware(s.loggingMiddleware(mux)))
 
-	s.httpServer = &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// Graceful shutdown
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		s.httpServer.Shutdown(shutdownCtx)
-	}()
-
 	log.Printf("🚀 Server starting on http://%s", addr)
 	log.Printf("   Dashboard: http://localhost:%d", s.config.Port)
 	log.Printf("   API:       http://localhost:%d/api", s.config.Port)
@@ -265,11 +248,81 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		log.Printf("   Auth:      enabled (user: %s)", s.config.AuthUser)
 	}
 
-	err := s.httpServer.ListenAndServe()
-	if err == http.ErrServerClosed {
-		return nil
+	return s.serveHTTP(ctx, addr, handler, 10*time.Second)
+}
+
+func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
+	s.httpServer = &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
-	return err
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), shutdownTimeout)
+	}
+	if s.wsHub != nil {
+		go s.wsHub.Run()
+	}
+	return s.serveHTTPListener(ctx, listener, shutdownTimeout)
+}
+
+func (s *Server) serveHTTPListener(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) error {
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.httpServer.Serve(listener) }()
+
+	stoppingForContext := false
+	serveReturned := false
+	var serveErr error
+	select {
+	case <-ctx.Done():
+		stoppingForContext = true
+	case serveErr = <-serveDone:
+		serveReturned = true
+	}
+	if ctx.Err() != nil {
+		stoppingForContext = true
+	}
+
+	// Quiesce before HTTP drain: accepted handlers may still mutate manager
+	// state, but neither their mutations nor runner completion may dispatch work.
+	s.jobs.Quiesce()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownErr := s.httpServer.Shutdown(shutdownCtx)
+	cancelShutdown()
+	if shutdownErr != nil {
+		if closeErr := s.httpServer.Close(); closeErr != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close HTTP server: %w", closeErr))
+		}
+	}
+
+	managerCtx, cancelManager := context.WithTimeout(context.Background(), shutdownTimeout)
+	managerErr := s.jobs.Close(managerCtx)
+	cancelManager()
+	if !serveReturned {
+		serveErr = <-serveDone
+	}
+
+	var resultErr error
+	if serveErr != nil && (!stoppingForContext || !errors.Is(serveErr, http.ErrServerClosed)) {
+		resultErr = errors.Join(resultErr, fmt.Errorf("serve HTTP: %w", serveErr))
+	}
+	if shutdownErr != nil {
+		resultErr = errors.Join(resultErr, fmt.Errorf("shutdown HTTP server: %w", shutdownErr))
+	}
+	if managerErr != nil {
+		resultErr = errors.Join(resultErr, fmt.Errorf("close job manager: %w", managerErr))
+	}
+	return resultErr
+}
+
+func (s *Server) closeJobsAfterListenError(listenErr error, timeout time.Duration) error {
+	s.jobs.Quiesce()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return errors.Join(listenErr, s.jobs.Close(ctx))
 }
 
 // registerAPIRoutes sets up all API endpoints.

@@ -8,7 +8,7 @@ import "testing"
 // TestJobManagerSpeedLimiterInit verifies the shared limiter is created from
 // the initial config's MaxSpeed.
 func TestJobManagerSpeedLimiterInit(t *testing.T) {
-	m := NewJobManager(Config{MaxSpeed: "250KB"}, nil)
+	m := newTestJobManager(t, Config{MaxSpeed: "250KB"}, nil)
 	if m.speedLimiter == nil {
 		t.Fatal("speedLimiter should be non-nil")
 	}
@@ -20,7 +20,7 @@ func TestJobManagerSpeedLimiterInit(t *testing.T) {
 // TestJobManagerSpeedLimiterLiveUpdate verifies that UpdateConfig applies a new
 // cap to the shared limiter on the fly (the path POST /api/settings drives).
 func TestJobManagerSpeedLimiterLiveUpdate(t *testing.T) {
-	m := NewJobManager(Config{}, nil)
+	m := newTestJobManager(t, Config{}, nil)
 	limiter := m.speedLimiter
 	if got := m.speedLimiter.Limit(); got != 0 {
 		t.Fatalf("default Limit() = %d, want 0 (unlimited)", got)
