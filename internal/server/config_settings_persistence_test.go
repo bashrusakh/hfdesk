@@ -236,6 +236,7 @@ func TestConfigSettingsStartupPrecedence(t *testing.T) {
 		{"flag-over-env-over-file", "hf_flag", "hf_env", "hf_disk", "hf_flag", "hf_disk"},
 		{"env-over-file", "", "hf_env", "hf_disk", "hf_env", "hf_disk"},
 		{"env-only", "", "hf_env", "", "hf_env", ""},
+		{"trimmed-env-wins-over-file", "", "  hf_env_trimmed  ", "hf_disk", "hf_env_trimmed", "hf_disk"},
 		{"whitespace-env-falls-back-to-file", "", "   ", "hf_disk", "hf_disk", "hf_disk"},
 		{"empty-env-falls-back-to-file", "", "", "hf_disk", "hf_disk", "hf_disk"},
 	} {
@@ -319,6 +320,10 @@ func TestConfigSettingsEnvTokenLifecycle(t *testing.T) {
 
 func TestConfigSettingsReservedMasks(t *testing.T) {
 	path := isolateTokenConfig(t)
+	// Neutralize any ambient credential so the mask-vs-credential assertions
+	// are deterministic: ApplyConfigToServer gives HF_TOKEN precedence over the
+	// config file, which would otherwise override the persisted mask under test.
+	t.Setenv("HF_TOKEN", "")
 	writeTokenFixture(t, path, `{"token":"********stale"}`)
 	cfg := DefaultConfig()
 	if err := ApplyConfigToServer(&cfg); err != nil {
