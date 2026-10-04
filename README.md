@@ -81,6 +81,10 @@ hfdesk --local-dir /mnt/models
 
 HFDesk reads `hfdesk.json`, `hfdesk.yaml`, or `hfdesk.yml` from the launch directory first, then from `~/.config`. Settings saved from the UI are written back to the launch directory.
 
+Ordinary settings updates preserve both the active Hugging Face token and any separately stored token. A runtime override such as `--token` is not copied to disk implicitly. In `POST /api/settings`, an explicitly authored nonempty `token` sets the active and stored credential; `"token": ""` clears both. Omitting `token`, sending `null`, or returning a redacted display value preserves it. Values beginning with `********` are reserved redaction markers, not credentials. Startup overrides still take precedence after a restart.
+
+Saved configuration contains explicitly stored credentials in plaintext. New and existing files saved by HFDesk have owner-only permissions (`0600`) on Unix. A persistence warning means settings took effect in memory but were not saved; repair the file/path permissions or invalid configuration and save again before restarting.
+
 ```json
 {
   "token": "hf_xxx",

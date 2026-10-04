@@ -55,6 +55,11 @@ type Config struct {
 
 	// Proxy configuration
 	Proxy *hfdownloader.ProxyConfig
+
+	// tokenWrite is the latest explicit settings set/clear intent, not the
+	// effective startup credential. It is immutable and retained across ordinary
+	// updates, skipped side effects, and failed saves; nil preserves the disk token.
+	tokenWrite *string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -147,6 +152,9 @@ func (s *Server) withConfig(fn func(*Config)) (Config, uint64) {
 
 // New creates a new server with the given configuration.
 func New(cfg Config) *Server {
+	if isRedactedToken(cfg.Token) {
+		cfg.Token = ""
+	}
 	wsHub := NewWSHub()
 	jobs := NewJobManager(cfg, wsHub)
 	jobs.LoadState()
