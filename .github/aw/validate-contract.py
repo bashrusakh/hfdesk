@@ -113,10 +113,12 @@ MIN_INTEGRITY_LEVELS = ("merged", "approved", "unapproved", "none")
 
 # The intended min-integrity level. gh-aw rejects a guard policy that sets
 # allowed-repos without min-integrity, so the field cannot simply be dropped;
-# the level and this constant must be changed together, deliberately. A change
-# that does not update this constant fails validation, so both weakening and
-# re-strengthening are caught rather than silently accepted.
-INTENDED_MIN_INTEGRITY = "approved"
+# the level and this constant must be changed together, deliberately. 'none' is
+# the deliberate choice here: triage must read reports from any contributor, and
+# gh-aw docs prescribe 'none' for public-repo triage. A change that does not
+# update this constant fails validation, so both weakening and re-strengthening
+# are caught rather than silently accepted.
+INTENDED_MIN_INTEGRITY = "none"
 
 SKIP_LIVE_LABELS_ENV = "VALIDATE_CONTRACT_SKIP_LIVE_LABELS"
 LOCK_SUFFIX = ".lock.yml"

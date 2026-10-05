@@ -51,12 +51,14 @@ tools:
   github:
     mode: local
     toolsets: [issues]
-    # Declared repository scope for the agent-visible GitHub surface: the guard
-    # policy's 'repos' is the current repository. Declared scope only — it is not
-    # a runtime guarantee that reads stay confined to it. gh-aw rejects
-    # allowed-repos without min-integrity, so a level is retained below.
+    # Declared scope only, not a runtime guarantee (a gateway safety net may widen it):
+    # 'repos' is the current repository — exactly the expression below. min-integrity: none
+    # is deliberate: triage must read reports from any contributor, and gh-aw docs prescribe
+    # 'none' for public-repo triage. Otherwise metadata-only (no shell/source/diff; safe
+    # outputs are label adds/removes only), so the injection surface is metadata-only. If
+    # abuse appears, add blocked-users / trusted-users / approval-labels.
     allowed-repos: "${{ github.repository }}"
-    min-integrity: approved
+    min-integrity: none
     # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
       - name: issue_read

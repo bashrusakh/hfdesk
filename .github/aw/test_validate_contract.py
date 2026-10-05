@@ -253,17 +253,17 @@ class ContractValidatorTest(unittest.TestCase):
         self.assert_fails("allowed-repos must be exactly")
 
     def test_min_integrity_missing_fails(self) -> None:
-        self.mutate(ISSUE_MD, "    min-integrity: approved\n", "")
+        self.mutate(ISSUE_MD, "    min-integrity: none\n", "")
         self.assert_fails("must declare min-integrity in the github tools block")
 
-    def test_min_integrity_weakened_fails(self) -> None:
+    def test_min_integrity_restrengthened_fails(self) -> None:
         for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
             with self.subTest(rel=rel):
-                self.mutate(rel, "    min-integrity: approved\n", "    min-integrity: none\n")
-                self.assert_fails("but the intended level is 'approved'")
+                self.mutate(rel, "    min-integrity: none\n", "    min-integrity: approved\n")
+                self.assert_fails("but the intended level is 'none'")
 
     def test_min_integrity_unknown_level_fails(self) -> None:
-        self.mutate(ISSUE_MD, "    min-integrity: approved\n", "    min-integrity: trusted\n")
+        self.mutate(ISSUE_MD, "    min-integrity: none\n", "    min-integrity: trusted\n")
         self.assert_fails("min-integrity must be one of")
 
     def test_edit_false_removed_fails(self) -> None:
@@ -339,16 +339,16 @@ class ContractValidatorTest(unittest.TestCase):
         self.assert_fails("guard policy 'repos' must be exactly")
 
     def test_guard_min_integrity_empty_fails(self) -> None:
-        self.mutate(PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "",')
+        self.mutate(PR_LOCK, '"min-integrity": "none",', '"min-integrity": "",')
         self.assert_fails("guard policy min-integrity must be one of")
 
-    def test_guard_min_integrity_weakened_fails(self) -> None:
-        self.mutate(PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "none",')
-        self.assert_fails("guard policy min-integrity is 'none'")
+    def test_guard_min_integrity_restrengthened_fails(self) -> None:
+        self.mutate(PR_LOCK, '"min-integrity": "none",', '"min-integrity": "approved",')
+        self.assert_fails("guard policy min-integrity is 'approved'")
 
     def test_guard_min_integrity_unknown_level_fails(self) -> None:
         self.mutate(
-            PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "trusted",'
+            PR_LOCK, '"min-integrity": "none",', '"min-integrity": "trusted",'
         )
         self.assert_fails("guard policy min-integrity must be one of")
 
