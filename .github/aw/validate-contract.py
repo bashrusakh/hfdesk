@@ -8,13 +8,15 @@ No LLM. Checks, in order:
      checkout/status-comment/bash/cli-proxy pinned false, tools.edit pinned false
      (no filesystem write capability), safe-outputs.report-failure-as-issue and
      report-failed-jobs pinned false, no add-comment, tools.github.allowed-repos
-     equal to the repository expression exactly, tools.github.min-integrity
+     declared as the single-element array ['${{ github.repository }}'] (a bare
+     scalar string is rejected by the runtime gateway), tools.github.min-integrity
      present, one of the gh-aw schema levels, and exactly the intended level,
      no source/diff tools in the github allowed list, no 'confirmed' in allowed
      label lists, and the required type family in remove-labels;
   3. each generated lock preserves those invariants (no add_comment, no forbidden
-     github tool grants, an allow-only guard policy whose 'repos' is exactly the
-     repository expression and whose 'min-integrity' is exactly the intended
+     github tool grants, an allow-only guard policy whose 'repos' is the
+     single-element array ['${{ github.repository }}'] and whose
+     'min-integrity' is exactly the intended
      level, no residual agent write capability: no --allow-tool write and no
      --allow-all-paths in the agent job, no report-failed-jobs machinery, failure
      reports disabled, no agent-job checkout, not staged) and stays structurally
@@ -46,9 +48,9 @@ What this validator does NOT guarantee:
     tool schemas, and general job wiring are not proven in sync. Run
     `gh aw compile --strict` for that.
   - It cannot prove what the runtime MCP gateway does. The guard policy is asserted
-    as a declaration (repos exactly the repository expression, min-integrity exactly
-    the intended level); it does not prove the gateway confines reads to that scope
-    at run time, and a runtime safety net may widen it.
+    as a declaration (repos exactly ['${{ github.repository }}'], min-integrity
+    exactly the intended level); it does not prove the gateway confines reads to
+    that scope at run time, and a runtime safety net may widen it.
   - The min-integrity assertion is a match against INTENDED_MIN_INTEGRITY, a constant
     in this file. It catches unreviewed weakening or re-strengthening of the declared
     level, but it is not itself evidence that the declared level is the right security
@@ -101,9 +103,13 @@ FORBIDDEN_GITHUB_TOOLS = (
 # (reconciliation capability: replace a clearly wrong managed type).
 REQUIRED_REMOVE_LABELS = ("bug", "enhancement", "documentation", "question", "refactor", "ci")
 
-# The exact repository-scope expression the guard policy must declare. A literal
-# owner/repo, "all", "public", or any wildcard pattern is a scope change (widening
-# or retargeting) and fails: a literal owner/repo cannot follow a repository
+# The exact repository-scope expression the guard policy must declare, in the
+# only runtime-accepted shape: a single-element array ['${{ github.repository }}'].
+# gh-aw emits a scalar string for a scalar declaration, and the pinned gateway
+# (gh-aw-mcpg v0.4.25) accepts a string 'repos' only as 'all' or 'public', so the
+# scalar owner/repo form compiles but fails at runtime. A literal owner/repo,
+# "all", "public", or any wildcard pattern is a scope change (widening or
+# retargeting) and fails too: a literal owner/repo cannot follow a repository
 # rename or transfer, and the widened forms are not the declared scope.
 REPO_SCOPE_EXPRESSION = "${{ github.repository }}"
 
@@ -348,6 +354,20 @@ def string_list(tail: str, body: list[str]) -> list[str]:
     return values
 
 
+def repo_scope_entries(value: str) -> list[str] | None:
+    """Parse an allowed-repos value, accepting only the YAML flow-array form.
+
+    Returns the scope entries for `[a, b]`, or None when `value` is a bare
+    scalar (quoted or not). The scalar form is the shape the runtime gateway
+    rejects (`allow-only.repos string must be 'all' or 'public'`), so it must
+    not be accepted here even when it names the same repository expression.
+    """
+    value = value.strip()
+    if not (value.startswith("[") and value.endswith("]")):
+        return None
+    return string_list(value, [])
+
+
 def triage_source_label_lists(fm: str) -> dict[str, list[str] | None]:
     """Allowed label lists declared under safe-outputs.{add,remove}-labels."""
     lists: dict[str, list[str] | None] = {}
@@ -419,12 +439,15 @@ def check_triage_sources() -> None:
                 errors.append(
                     f"{rel_path} must declare allowed-repos in the github tools block"
                 )
-            elif _unquote(declared.group(1)) != REPO_SCOPE_EXPRESSION:
-                errors.append(
-                    f"{rel_path} allowed-repos must be exactly "
-                    f"'{REPO_SCOPE_EXPRESSION}' (declared repository scope); "
-                    f"got '{_unquote(declared.group(1))}'"
-                )
+            else:
+                entries = repo_scope_entries(declared.group(1))
+                if entries != [REPO_SCOPE_EXPRESSION]:
+                    errors.append(
+                        f"{rel_path} allowed-repos must be exactly the array "
+                        f"['{REPO_SCOPE_EXPRESSION}'] (runtime-accepted declared "
+                        "repository scope; the scalar owner/repo form is rejected "
+                        f"by the gateway); got '{declared.group(1).strip()}'"
+                    )
             level = re.search(
                 r"^\s*min-integrity\s*:\s*(.+?)\s*$", github_body, re.MULTILINE
             )
@@ -676,16 +699,20 @@ def check_triage_locks() -> None:
                     f"'{level.group(1)}' but the intended level is "
                     f"'{INTENDED_MIN_INTEGRITY}'"
                 )
-            repos = re.search(r'"repos"\s*:\s*"([^"]+)"', guard)
+            repos = re.search(r'"repos"\s*:\s*(\[.*?\])', guard, re.DOTALL)
             if not repos:
                 errors.append(
-                    f"{lock_rel} guard policy must scope 'repos' to the repository"
+                    f"{lock_rel} guard policy must scope 'repos' to the repository "
+                    "as a JSON array (['${{ github.repository }}']); the scalar "
+                    "string form is rejected by the pinned gateway at runtime"
                 )
-            elif repos.group(1) != REPO_SCOPE_EXPRESSION:
-                errors.append(
-                    f"{lock_rel} guard policy 'repos' must be exactly "
-                    f"'{REPO_SCOPE_EXPRESSION}'; got '{repos.group(1)}'"
-                )
+            else:
+                entries = repo_scope_entries(repos.group(1))
+                if entries != [REPO_SCOPE_EXPRESSION]:
+                    errors.append(
+                        f"{lock_rel} guard policy 'repos' must be exactly the array "
+                        f"['{REPO_SCOPE_EXPRESSION}']; got '{repos.group(1)}'"
+                    )
 
         if not re.search(r'GH_AW_FAILURE_REPORT_AS_ISSUE\s*:\s*"false"', text):
             errors.append(

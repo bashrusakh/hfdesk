@@ -52,6 +52,15 @@ BACKLOG_MD = ".github/workflows/backlog-retriage.md"
 PIN = "e2de4a989077b7fdf558ef5656040dc2e547e674"
 ZERO_SHA = "0" * 40
 
+# The runtime-accepted allowed-repos shapes: the scalar string form is rejected
+# by the pinned gateway, so tests mutate from the array form and assert the
+# scalar / widened / literal-owner-repo alternatives all fail.
+SOURCE_REPO_SCOPE_ARRAY = '    allowed-repos: ["${{ github.repository }}"]\n'
+SOURCE_REPO_SCOPE_SCALAR = '    allowed-repos: "${{ github.repository }}"\n'
+LOCK_REPOS_ARRAY_BLOCK = (
+    '"repos": [\n                      "${{ github.repository }}"\n                    ],'
+)
+
 # Managed labels the policy expects the declared label file or the live repo to
 # provide; the fixture declares them all so the offline run is self-sufficient.
 FIXTURE_MANAGED_LABELS = (
@@ -225,32 +234,34 @@ class ContractValidatorTest(unittest.TestCase):
         self.assert_fails("must set 'report-failure-as-issue: false'")
 
     def test_allowed_repos_missing_fails(self) -> None:
-        self.mutate(ISSUE_MD, '    allowed-repos: "${{ github.repository }}"\n', "")
+        self.mutate(ISSUE_MD, SOURCE_REPO_SCOPE_ARRAY, "")
         self.assert_fails("must declare allowed-repos in the github tools block")
+
+    def test_allowed_repos_scalar_expression_fails(self) -> None:
+        self.mutate(ISSUE_MD, SOURCE_REPO_SCOPE_ARRAY, SOURCE_REPO_SCOPE_SCALAR)
+        self.assert_fails("allowed-repos must be exactly the array")
 
     def test_allowed_repos_other_owner_repo_fails(self) -> None:
         self.mutate(
             ISSUE_MD,
-            '    allowed-repos: "${{ github.repository }}"\n',
-            '    allowed-repos: "attacker/other-repo"\n',
+            SOURCE_REPO_SCOPE_ARRAY,
+            '    allowed-repos: ["attacker/other-repo"]\n',
         )
-        self.assert_fails("allowed-repos must be exactly")
+        self.assert_fails("allowed-repos must be exactly the array")
 
     def test_allowed_repos_widened_to_all_fails(self) -> None:
-        self.mutate(
-            BACKLOG_MD,
-            '    allowed-repos: "${{ github.repository }}"\n',
-            "    allowed-repos: all\n",
-        )
-        self.assert_fails("allowed-repos must be exactly")
+        self.mutate(BACKLOG_MD, SOURCE_REPO_SCOPE_ARRAY, "    allowed-repos: all\n")
+        self.assert_fails("allowed-repos must be exactly the array")
+
+    def test_allowed_repos_widened_to_public_fails(self) -> None:
+        self.mutate(PR_MD, SOURCE_REPO_SCOPE_ARRAY, "    allowed-repos: public\n")
+        self.assert_fails("allowed-repos must be exactly the array")
 
     def test_allowed_repos_widened_to_wildcard_fails(self) -> None:
         self.mutate(
-            PR_MD,
-            '    allowed-repos: "${{ github.repository }}"\n',
-            '    allowed-repos: "bashrusakh/*"\n',
+            PR_MD, SOURCE_REPO_SCOPE_ARRAY, '    allowed-repos: "bashrusakh/*"\n'
         )
-        self.assert_fails("allowed-repos must be exactly")
+        self.assert_fails("allowed-repos must be exactly the array")
 
     def test_min_integrity_missing_fails(self) -> None:
         self.mutate(ISSUE_MD, "    min-integrity: none\n", "")
@@ -326,17 +337,31 @@ class ContractValidatorTest(unittest.TestCase):
         self.mutate(BACKLOG_LOCK, PIN, ZERO_SHA, occurrences=2)
         self.assert_fails("shared import pin drift")
 
+    def test_guard_repos_scalar_form_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            LOCK_REPOS_ARRAY_BLOCK,
+            '"repos": "${{ github.repository }}",',
+        )
+        self.assert_fails("guard policy must scope 'repos' to the repository as a JSON array")
+
     def test_guard_repos_wildcard_fails(self) -> None:
-        self.mutate(ISSUE_LOCK, '"repos": "${{ github.repository }}",', '"repos": "*",')
-        self.assert_fails("guard policy 'repos' must be exactly")
+        self.mutate(ISSUE_LOCK, LOCK_REPOS_ARRAY_BLOCK, '"repos": ["*"],')
+        self.assert_fails("guard policy 'repos' must be exactly the array")
+
+    def test_guard_repos_widened_to_all_fails(self) -> None:
+        self.mutate(ISSUE_LOCK, LOCK_REPOS_ARRAY_BLOCK, '"repos": ["all"],')
+        self.assert_fails("guard policy 'repos' must be exactly the array")
+
+    def test_guard_repos_widened_to_public_fails(self) -> None:
+        self.mutate(ISSUE_LOCK, LOCK_REPOS_ARRAY_BLOCK, '"repos": ["public"],')
+        self.assert_fails("guard policy 'repos' must be exactly the array")
 
     def test_guard_repos_literal_owner_repo_fails(self) -> None:
         self.mutate(
-            ISSUE_LOCK,
-            '"repos": "${{ github.repository }}",',
-            '"repos": "bashrusakh/hfdesk",',
+            ISSUE_LOCK, LOCK_REPOS_ARRAY_BLOCK, '"repos": ["bashrusakh/hfdesk"],'
         )
-        self.assert_fails("guard policy 'repos' must be exactly")
+        self.assert_fails("guard policy 'repos' must be exactly the array")
 
     def test_guard_min_integrity_empty_fails(self) -> None:
         self.mutate(PR_LOCK, '"min-integrity": "none",', '"min-integrity": "",')

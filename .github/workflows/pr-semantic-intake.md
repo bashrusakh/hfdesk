@@ -55,7 +55,7 @@ tools:
     # 'none' for public-repo triage. Otherwise metadata-only (no shell/source/diff; safe
     # outputs are label adds/removes only), so the injection surface is metadata-only. If
     # abuse appears, add blocked-users / trusted-users / approval-labels.
-    allowed-repos: "${{ github.repository }}"
+    allowed-repos: ["${{ github.repository }}"]
     min-integrity: none
     # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
