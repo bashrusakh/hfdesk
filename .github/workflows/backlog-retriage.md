@@ -93,11 +93,11 @@ pre-agent-steps:
       printf 'Bounded backlog batch (%s items) at %s\n' "$(jq 'length' "${batch_dir}/batch.json" 2>/dev/null || echo 0)" "${batch_dir}/batch.json"
 safe-outputs:
   add-labels:
-    allowed: ["bug", "needs-info", "confirmed", "duplicate", "enhancement", "documentation", "question"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 5
   remove-labels:
-    allowed: ["bug", "needs-info", "confirmed", "duplicate", "enhancement", "documentation", "question"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
     max: 5
   add-comment:
     max: 1
@@ -144,8 +144,9 @@ unchanged and identify it as needing deeper/human review.
 
 ## hfdesk managed label boundary
 
-- Managed across the union of hfdesk triage families: `bug`, `needs-info`, `confirmed`,
-  `duplicate`, `enhancement`, `documentation`, `question`.
+- Managed across the union of hfdesk triage families: `bug`, `enhancement`,
+  `documentation`, `question`, `refactor`, `ci`, `needs-info`, `confirmed`,
+  `duplicate`.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.

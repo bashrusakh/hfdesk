@@ -52,7 +52,7 @@ pre-agent-steps:
       echo "Resolved policy contract at $sha"
 safe-outputs:
   add-labels:
-    allowed: ["bug", "needs-info", "confirmed", "duplicate", "refactor", "ci"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 2
   remove-labels:
@@ -97,8 +97,8 @@ outranks stale automated conclusions.
 
 ## hfdesk managed label boundary
 
-- Managed by issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`, `refactor`,
-  `ci`.
+- Managed by issue triage: `bug`, `enhancement`, `documentation`, `question`,
+  `refactor`, `ci`, `needs-info`, `confirmed`, `duplicate`.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.
