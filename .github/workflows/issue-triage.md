@@ -26,8 +26,8 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@0f49ef7106f9963a7b64a5bb7dfad2078aa39f8b
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@0f49ef7106f9963a7b64a5bb7dfad2078aa39f8b
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
 checkout: false
 max-ai-credits: 5
 max-turns: 20
