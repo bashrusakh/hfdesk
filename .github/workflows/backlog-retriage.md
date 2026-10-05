@@ -92,7 +92,6 @@ pre-agent-steps:
       chmod 0555 "${batch_dir}"
       printf 'Bounded backlog batch (%s items) at %s\n' "$(jq 'length' "${batch_dir}/batch.json" 2>/dev/null || echo 0)" "${batch_dir}/batch.json"
 safe-outputs:
-  staged: true
   add-labels:
     allowed: ["bug", "needs-info", "confirmed", "duplicate", "enhancement", "documentation", "question"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
