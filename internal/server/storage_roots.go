@@ -1,98 +1,51 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
-	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
-type rootRole uint8
-
-const (
-	rootBrowse rootRole = 1 << iota
-	rootProtected
-	rootHub
-)
-
-// localCacheRoot is the read-only server adapter for one immutable managed
-// root definition. ID is lexical identity; physical observations are never
-// stored here and are refreshed by ManagedRootSet operations.
+// localCacheRoot is the presentation adapter for an immutable downloader root.
+// It contains no independent ownership or physical-identity decisions.
 type localCacheRoot struct {
 	ID          string
 	Path        string
 	AbsPath     string
 	Source      string
 	SkipSpecial bool
-	roles       rootRole
-	set         *ManagedRootSet
+	set         *storageRootSet
 }
 
-func (root localCacheRoot) skipsOwner(owner string) bool {
-	if root.SkipSpecial {
-		switch strings.ToLower(owner) {
-		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
-			return true
-		}
-	}
-	return false
-}
-
-// ManagedRootSet is an immutable configuration-generation snapshot. Its root
-// definitions and lexical IDs never change; filesystem facts are observed on
-// each operation so creating/replacing a path cannot leave stale authority.
-type ManagedRootSet struct {
-	base  string
-	roots []localCacheRoot
+type storageRootSet struct {
+	domain    *hfdownloader.ManagedRootSet
+	base      string
+	hubRootID string
+	sources   map[string]string
+	roots     []localCacheRoot
+	err       error
 }
 
 func configuredPath(path, base string) string {
-	if strings.TrimSpace(path) == "" {
-		return ""
-	}
-	path = filepath.Clean(path)
-	if filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Clean(filepath.Join(base, path))
+	return hfdownloader.ConfiguredPath(path, base)
 }
 
 func configuredPathID(path, base string) string {
-	identity := configuredPath(path, base)
-	sum := sha256.Sum256([]byte(identity))
-	return "root:" + hex.EncodeToString(sum[:12])
+	return hfdownloader.ManagedRootID(path, base)
 }
 
 func pathIdentityKeyAt(path, base string) string {
-	if path == "" {
-		return ""
-	}
-	return configuredPath(path, base)
+	return hfdownloader.ConfiguredPathIdentity(path, base)
 }
 
-func cleanPathList(paths []string) []string { return cleanPathListAt(paths, mustWorkingDirectory()) }
+func cleanPathList(paths []string) []string {
+	return cleanPathListAt(paths, mustWorkingDirectory())
+}
 
 func cleanPathListAt(paths []string, base string) []string {
-	var cleaned []string
-	seen := make(map[string]bool)
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		path = filepath.Clean(path)
-		key := pathIdentityKeyAt(path, base)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		cleaned = append(cleaned, path)
-	}
-	return cleaned
+	return hfdownloader.CleanConfiguredPathList(paths, base)
 }
 
 func mustWorkingDirectory() string {
@@ -103,336 +56,166 @@ func mustWorkingDirectory() string {
 	return base
 }
 
-func newManagedRootSet(cacheDir, hubDir, localDir string, localScanDirs []string, routes map[string]string, base string) *ManagedRootSet {
-	if base == "" {
-		base = mustWorkingDirectory()
-	}
-	set := &ManagedRootSet{base: filepath.Clean(base)}
-	byID := make(map[string]int)
-	add := func(path, source string, roles rootRole, skipSpecial bool) {
-		if strings.TrimSpace(path) == "" {
-			return
+func (root localCacheRoot) skipsOwner(owner string) bool {
+	if root.SkipSpecial {
+		if root.set == nil {
+			return true
 		}
-		path = filepath.Clean(path)
-		abs := configuredPath(path, set.base)
-		id := configuredPathID(path, set.base)
-		if index, found := byID[id]; found {
-			root := &set.roots[index]
-			hadBrowseRole := root.roles&rootBrowse != 0
-			if roles&rootBrowse != 0 && (!hadBrowseRole || managedRootSourcePriority(source) < managedRootSourcePriority(root.Source)) {
-				root.Source = source
-			}
-			root.roles |= roles
-			root.SkipSpecial = root.SkipSpecial || skipSpecial
-			return
-		}
-		byID[id] = len(set.roots)
-		set.roots = append(set.roots, localCacheRoot{ID: id, Path: path, AbsPath: abs, Source: source, SkipSpecial: skipSpecial, roles: roles})
-	}
-	add(filepath.Join(cacheDir, "models"), "Friendly view", rootBrowse|rootProtected, false)
-	add(filepath.Join(cacheDir, "datasets"), "Friendly view", rootProtected, false)
-	add(localDir, "Local", rootBrowse|rootProtected, localDir != "" && pathIdentityKeyAt(localDir, set.base) == pathIdentityKeyAt(cacheDir, set.base))
-	for _, dir := range cleanPathListAt(localScanDirs, set.base) {
-		add(dir, "Local", rootBrowse|rootProtected, false)
-	}
-	for _, dir := range routeDirsAt(routes, set.base) {
-		add(dir, "Local", rootBrowse|rootProtected, false)
-	}
-	add(hubDir, "HF cache", rootProtected|rootHub, false)
-	add(cacheDir, "Local", rootBrowse|rootProtected, true)
-	for i := range set.roots {
-		set.roots[i].set = set
-	}
-	return set
-}
-
-func newManagedRootSetForConfig(cfg Config) *ManagedRootSet {
-	cfg = cfg.captureCacheEnvironment()
-	cache := cfg.cache()
-	return newManagedRootSet(cache.Root, cache.HubDir(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cfg.cacheEnv.pathBase)
-}
-
-func (set *ManagedRootSet) Roots() []localCacheRoot {
-	return append([]localCacheRoot(nil), set.roots...)
-}
-
-// observeContainment returns true only when lexical containment or fresh
-// filesystem evidence proves ancestry. It reports uncertainty rather than
-// treating an inaccessible path as either inside or outside.
-func observeContainment(parent, target string) (bool, error) {
-	inside, _, err := observeContainmentDistance(parent, target)
-	return inside, err
-}
-
-func observeContainmentDistance(parent, target string) (bool, int, error) {
-	if withinLocalRoot(parent, target) {
-		rel, _ := filepath.Rel(parent, target)
-		if rel == "." {
-			return true, 0, nil
-		}
-		return true, strings.Count(filepath.Clean(rel), string(filepath.Separator)) + 1, nil
-	}
-	parentInfo, err := os.Stat(parent)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, 0, nil
-		}
-		return false, 0, fmt.Errorf("stat configured root %q: %w", parent, err)
-	}
-	target = filepath.Clean(target)
-	distance := 0
-	for current := target; ; current = filepath.Dir(current) {
-		info, statErr := os.Stat(current)
-		if statErr == nil && os.SameFile(parentInfo, info) {
-			return true, distance, nil
-		}
-		if statErr != nil && !os.IsNotExist(statErr) {
-			return false, 0, fmt.Errorf("stat path ancestor %q: %w", current, statErr)
-		}
-		parentPath := filepath.Dir(current)
-		if parentPath == current {
-			break
-		}
-		distance++
-	}
-	return false, 0, nil
-}
-
-func withinLocalRoot(root, path string) bool {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-	if filepath.VolumeName(root) != filepath.VolumeName(path) {
-		return false
-	}
-	rootTail := strings.TrimPrefix(root, filepath.VolumeName(root))
-	pathTail := strings.TrimPrefix(path, filepath.VolumeName(path))
-	rootParts := strings.Split(strings.Trim(rootTail, string(filepath.Separator)), string(filepath.Separator))
-	pathParts := strings.Split(strings.Trim(pathTail, string(filepath.Separator)), string(filepath.Separator))
-	if len(rootParts) == 1 && rootParts[0] == "" {
-		rootParts = nil
-	}
-	if len(pathParts) == 1 && pathParts[0] == "" {
-		pathParts = nil
-	}
-	if len(pathParts) < len(rootParts) {
-		return false
-	}
-	for i := range rootParts {
-		if rootParts[i] != pathParts[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// OwnerForPath chooses the most-specific configured root that owns path.
-// Ties retain deterministic config registration order. Filesystem facts are
-// gathered afresh, including for roots created after this set was built.
-func (set *ManagedRootSet) OwnerForPath(path string) (localCacheRoot, error) {
-	target := configuredPath(path, set.base)
-	owner := -1
-	distance := int(^uint(0) >> 1)
-	for i, root := range set.roots {
-		inside, candidateDistance, err := observeContainmentDistance(root.AbsPath, target)
-		if err != nil {
-			return localCacheRoot{}, err
-		}
-		if !inside {
-			continue
-		}
-		if candidateDistance < distance {
-			owner, distance = i, candidateDistance
-		}
-	}
-	if owner < 0 {
-		return localCacheRoot{}, os.ErrNotExist
-	}
-	return set.roots[owner], nil
-}
-
-// NestedProtectedRoots returns roots beneath the selected scan root, excluding
-// the root itself. Unknown ancestry is an error, never a guessed exclusion.
-func (set *ManagedRootSet) NestedProtectedRoots(rootID string) ([]string, error) {
-	root, ok := set.rootByID(rootID)
-	if !ok {
-		return nil, fmt.Errorf("unknown managed root %q", rootID)
-	}
-	var nested []string
-	for _, candidate := range set.roots {
-		if candidate.ID == root.ID || candidate.roles&rootProtected == 0 {
-			continue
-		}
-		inside, err := observeContainment(root.AbsPath, candidate.AbsPath)
-		if err != nil {
-			return nil, err
-		}
-		if inside {
-			// Equal physical roots are a shared object, not a nested subtree.
-			rootInfo, rootErr := os.Stat(root.AbsPath)
-			candidateInfo, candidateErr := os.Stat(candidate.AbsPath)
-			if rootErr != nil && !os.IsNotExist(rootErr) {
-				return nil, fmt.Errorf("inspect managed root %q: %w", root.AbsPath, rootErr)
-			}
-			if candidateErr != nil && !os.IsNotExist(candidateErr) {
-				return nil, fmt.Errorf("inspect protected root %q: %w", candidate.AbsPath, candidateErr)
-			}
-			if rootErr == nil && candidateErr == nil && os.SameFile(rootInfo, candidateInfo) {
-				continue
-			}
-			nested = append(nested, candidate.AbsPath)
-		}
-	}
-	sort.Strings(nested)
-	return nested, nil
-}
-
-func (set *ManagedRootSet) rootByID(id string) (localCacheRoot, bool) {
-	for _, root := range set.roots {
-		if root.ID == id {
-			return root, true
-		}
-	}
-	return localCacheRoot{}, false
-}
-
-// Resolve accepts only a direct owner/name repo shape under the configured
-// root. It does not grant destructive authority by itself.
-func (set *ManagedRootSet) Resolve(rootID, owner, name string) (string, error) {
-	root, ok := set.rootByID(rootID)
-	if !ok || root.roles&rootBrowse == 0 || !isValidRepoComponent(owner) || !isValidRepoComponent(name) || owner == "." || owner == ".." || name == "." || name == ".." {
-		return "", errors.New("invalid managed root repository path")
-	}
-	return filepath.Join(root.AbsPath, owner, name), nil
-}
-
-func rejectManagedSymlinkComponents(rootPath, target string) error {
-	rootPath = filepath.Clean(rootPath)
-	target = filepath.Clean(target)
-	inside, err := observeContainment(rootPath, target)
-	if err != nil {
-		return err
-	}
-	if !inside {
-		return errors.New("target is outside its configured root")
-	}
-	if _, err := filepath.Rel(rootPath, target); err != nil {
-		return errors.New("target is not a direct managed entry")
-	}
-	volumeRoot := filepath.VolumeName(target) + string(filepath.Separator)
-	rel, err := filepath.Rel(volumeRoot, target)
-	if err != nil {
-		return fmt.Errorf("resolve managed path components: %w", err)
-	}
-	current := volumeRoot
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		info, statErr := os.Lstat(current)
-		if statErr != nil {
-			return fmt.Errorf("inspect managed path %q: %w", current, statErr)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinked managed path component %q (root %q, target %q)", current, rootPath, target)
-		}
-	}
-	return nil
-}
-
-// WholeCopyAllowed applies ownership and symlink/containment checks without
-// mutating. Callers retain responsibility for their existing operation/API.
-func (set *ManagedRootSet) WholeCopyAllowed(rootID, target string) error {
-	root, ok := set.rootByID(rootID)
-	if !ok {
-		return fmt.Errorf("unknown managed root %q", rootID)
-	}
-	target = configuredPath(target, set.base)
-	rel, relErr := filepath.Rel(root.AbsPath, target)
-	if relErr != nil || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-		return errors.New("whole-copy target is not below its configured root")
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if root.roles&rootHub != 0 {
-		if len(parts) != 1 || !validHubRepoDirName(parts[0]) {
-			return errors.New("whole-copy target is not an exact Hub repository entry")
-		}
-	} else if len(parts) != 2 || !isValidRepoComponent(parts[0]) || !isValidRepoComponent(parts[1]) || parts[0] == "." || parts[0] == ".." || parts[1] == "." || parts[1] == ".." {
-		return errors.New("whole-copy target is not an exact owner/name repository entry")
-	}
-	targetInfo, targetErr := os.Lstat(target)
-	if targetErr != nil {
-		return fmt.Errorf("cannot inspect whole-copy target: %w", targetErr)
-	}
-	if !targetInfo.IsDir() || targetInfo.Mode()&os.ModeSymlink != 0 {
-		return errors.New("whole-copy target is not a real directory")
-	}
-	owner, err := set.OwnerForPath(target)
-	if err != nil {
-		return fmt.Errorf("cannot establish managed-root owner: %w", err)
-	}
-	if owner.ID != root.ID && !sameDirectoryObject(owner.AbsPath, root.AbsPath) {
-		return fmt.Errorf("target is owned by managed root %s", owner.ID)
-	}
-	if err := rejectManagedSymlinkComponents(root.AbsPath, target); err != nil {
-		return err
-	}
-	for _, protected := range set.roots {
-		if protected.ID == root.ID || protected.roles&rootProtected == 0 {
-			continue
-		}
-		contained, err := observeContainment(target, protected.AbsPath)
-		if err != nil {
-			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
-		}
-		if contained {
-			return fmt.Errorf("target encloses protected managed root %s", protected.ID)
-		}
-		protectedInfo, protectedErr := os.Stat(protected.AbsPath)
-		if protectedErr != nil && !os.IsNotExist(protectedErr) {
-			return fmt.Errorf("cannot inspect protected managed root %s: %w", protected.ID, protectedErr)
-		}
-		if protectedErr == nil && os.SameFile(protectedInfo, targetInfo) {
-			return fmt.Errorf("target is a protected managed root %s", protected.ID)
-		}
-	}
-	return nil
-}
-
-func validHubRepoDirName(name string) bool {
-	for _, prefix := range []string{"models--", "datasets--"} {
-		if !strings.HasPrefix(name, prefix) {
-			continue
-		}
-		owner, repo, found := strings.Cut(strings.TrimPrefix(name, prefix), "--")
-		return found && isValidRepoComponent(owner) && isValidRepoComponent(repo) && owner != "." && owner != ".." && repo != "." && repo != ".."
+		allowed, err := root.set.domain.AllowsOwner(root.ID, owner)
+		return err != nil || !allowed
 	}
 	return false
 }
 
 func (root localCacheRoot) walk(dir string, fn filepath.WalkFunc) error {
 	if root.set == nil {
-		return filepath.Walk(dir, fn)
+		return errors.New("managed root adapter is not attached to its owner")
 	}
-	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		owner, ownerErr := root.set.OwnerForPath(path)
-		if ownerErr != nil {
-			return ownerErr
-		}
-		if owner.ID != root.ID && !sameDirectoryObject(owner.AbsPath, root.AbsPath) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		return fn(path, info, err)
-	})
+	if root.set.err != nil {
+		return root.set.err
+	}
+	return root.set.domain.WalkOwned(root.ID, dir, fn)
 }
 
-func sameDirectoryObject(left, right string) bool {
-	leftInfo, leftErr := os.Stat(left)
-	rightInfo, rightErr := os.Stat(right)
-	return leftErr == nil && rightErr == nil && leftInfo.IsDir() && rightInfo.IsDir() && os.SameFile(leftInfo, rightInfo)
+func newManagedRootSet(cacheDir, hubDir, localDir string, localScanDirs []string, routes map[string]string, base string) *storageRootSet {
+	if base == "" {
+		base = mustWorkingDirectory()
+	}
+	var specs []hfdownloader.ManagedRootSpec
+	sources := make(map[string]string)
+	add := func(path, source string, roles hfdownloader.ManagedRootRole, restrictions hfdownloader.ManagedRootRestriction) {
+		if strings.TrimSpace(path) == "" {
+			return
+		}
+		id := configuredPathID(path, base)
+		if roles&hfdownloader.ManagedRootBrowse != 0 {
+			if current, found := sources[id]; !found || managedRootSourcePriority(source) < managedRootSourcePriority(current) {
+				sources[id] = source
+			}
+		}
+		specs = append(specs, hfdownloader.ManagedRootSpec{Path: path, Roles: roles, Restrictions: restrictions})
+	}
+	browseProtected := hfdownloader.ManagedRootBrowse | hfdownloader.ManagedRootProtected
+	localRoles := browseProtected | hfdownloader.ManagedRootLocal
+	add(filepath.Join(cacheDir, "models"), "Friendly view", browseProtected|hfdownloader.ManagedRootModelProjection, 0)
+	add(filepath.Join(cacheDir, "datasets"), "Friendly view", hfdownloader.ManagedRootProtected|hfdownloader.ManagedRootDatasetProjection, 0)
+	localRestrictions := hfdownloader.ManagedRootRestriction(0)
+	if localDir != "" && pathIdentityKeyAt(localDir, base) == pathIdentityKeyAt(cacheDir, base) {
+		localRestrictions |= hfdownloader.ManagedRootSkipSpecial
+	}
+	add(localDir, "Local", localRoles, localRestrictions)
+	for _, dir := range cleanPathListAt(localScanDirs, base) {
+		add(dir, "Local", localRoles, 0)
+	}
+	for _, dir := range routeDirsAt(routes, base) {
+		add(dir, "Local", localRoles, 0)
+	}
+	add(hubDir, "HF cache", hfdownloader.ManagedRootProtected|hfdownloader.ManagedRootHub, 0)
+	add(cacheDir, "Local", localRoles, hfdownloader.ManagedRootSkipSpecial)
+
+	domain := hfdownloader.NewManagedRootSet(base, specs)
+	set := &storageRootSet{domain: domain, base: base, hubRootID: configuredPathID(hubDir, base), sources: sources}
+	set.roots, set.err = browseRoots(set)
+	return set
+}
+
+func newManagedRootSetForConfig(cfg Config) *storageRootSet {
+	cfg = cfg.captureCacheEnvironment()
+	cache := cfg.cache()
+	return newManagedRootSet(cache.Root, cache.HubDir(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, cfg.cacheEnv.pathBase)
+}
+
+func (set *storageRootSet) Root(id string) (localCacheRoot, bool) {
+	root, ok := set.domain.Root(id)
+	if !ok {
+		return localCacheRoot{}, false
+	}
+	return localCacheRootFromDomain(set, root), true
+}
+
+func (set *storageRootSet) Roots() []localCacheRoot {
+	roots := set.domain.Roots()
+	result := make([]localCacheRoot, 0, len(roots))
+	for _, root := range roots {
+		result = append(result, localCacheRootFromDomain(set, root))
+	}
+	return result
+}
+
+func (set *storageRootSet) OwnerForPath(path string) (localCacheRoot, error) {
+	if set.err != nil {
+		return localCacheRoot{}, set.err
+	}
+	root, err := set.domain.OwnerForPath(path)
+	if err != nil {
+		return localCacheRoot{}, err
+	}
+	return localCacheRootFromDomain(set, root), nil
+}
+
+func (set *storageRootSet) NestedProtectedRoots(rootID string) ([]string, error) {
+	if set.err != nil {
+		return nil, set.err
+	}
+	roots, err := set.domain.NestedProtectedRoots(rootID)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(roots))
+	for _, root := range roots {
+		paths = append(paths, root.AbsolutePath)
+	}
+	return paths, nil
+}
+
+func (set *storageRootSet) Resolve(rootID, owner, name string) (string, error) {
+	if set.err != nil {
+		return "", set.err
+	}
+	return set.domain.Resolve(rootID, owner, name)
+}
+
+func (set *storageRootSet) WholeCopyAllowed(rootID, target string) error {
+	if set.err != nil {
+		return set.err
+	}
+	return set.domain.WholeCopyAllowed(rootID, target)
+}
+
+func (set *storageRootSet) RepoPhysicalCopies(repoID string, repoType hfdownloader.RepoType) (hfdownloader.RepoPhysicalCopySet, error) {
+	if set.err != nil {
+		return hfdownloader.RepoPhysicalCopySet{}, set.err
+	}
+	return set.domain.RepoPhysicalCopies(repoID, repoType)
+}
+
+func (set *storageRootSet) HasHubPhysicalCopy(repoID string, repoType hfdownloader.RepoType, path string) (bool, error) {
+	copies, err := set.RepoPhysicalCopies(repoID, repoType)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range copies.Copies {
+		if candidate.Kind != hfdownloader.PhysicalCopyHub || hfdownloader.ConfiguredPathIdentity(candidate.Path, set.base) != hfdownloader.ConfiguredPathIdentity(path, set.base) {
+			continue
+		}
+		for _, rootID := range candidate.RootIDs {
+			if rootID == set.hubRootID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func localCacheRootFromDomain(set *storageRootSet, root hfdownloader.ManagedRoot) localCacheRoot {
+	return localCacheRoot{
+		ID:          root.ID,
+		Path:        root.Path,
+		AbsPath:     root.AbsolutePath,
+		Source:      set.sources[root.ID],
+		SkipSpecial: root.Restrictions&hfdownloader.ManagedRootSkipSpecial != 0,
+		set:         set,
+	}
 }
 
 func managedRootSourcePriority(source string) int {
@@ -446,31 +229,26 @@ func managedRootSourcePriority(source string) int {
 	}
 }
 
-func browseRoots(set *ManagedRootSet) []localCacheRoot {
-	var roots []localCacheRoot
-	for _, candidate := range set.roots {
-		if candidate.roles&rootBrowse == 0 {
-			continue
-		}
-		index := -1
-		for i, existing := range roots {
-			if existing.ID == candidate.ID || sameDirectoryObject(existing.AbsPath, candidate.AbsPath) {
-				index = i
-				break
+func browseRoots(set *storageRootSet) ([]localCacheRoot, error) {
+	groups, err := set.domain.BrowseRootGroups()
+	if err != nil {
+		return nil, err
+	}
+	roots := make([]localCacheRoot, 0, len(groups))
+	for _, group := range groups {
+		root := localCacheRootFromDomain(set, group.Root)
+		for _, member := range group.Members {
+			source := set.sources[member.ID]
+			if managedRootSourcePriority(source) < managedRootSourcePriority(root.Source) {
+				root.Source = source
 			}
 		}
-		if index < 0 {
-			roots = append(roots, candidate)
-			continue
-		}
-		roots[index].SkipSpecial = roots[index].SkipSpecial || candidate.SkipSpecial
-		if managedRootSourcePriority(candidate.Source) < managedRootSourcePriority(roots[index].Source) {
-			roots[index].Source = candidate.Source
-		}
+		roots = append(roots, root)
 	}
-	return roots
+	return roots, nil
 }
 
 func localCacheRoots(cacheDir, localDir string, localScanDirs []string, routes map[string]string) []localCacheRoot {
-	return browseRoots(newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), localDir, localScanDirs, routes, mustWorkingDirectory()))
+	roots, _ := browseRoots(newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), localDir, localScanDirs, routes, mustWorkingDirectory()))
+	return roots
 }

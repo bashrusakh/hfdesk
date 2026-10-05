@@ -158,6 +158,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	managedRoots := newManagedRootSetForConfig(cfg)
 	results := make([]SearchResult, 0, len(raw))
 	for _, m := range raw {
 		gated := false
@@ -181,7 +182,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepoForConfig(cfg, m.ID, isDataset); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepoInSet(managedRoots, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus

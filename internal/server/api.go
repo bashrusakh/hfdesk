@@ -900,8 +900,7 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, root localCac
 // but applies the same configured-subroot ownership as local scans. Derive
 // exclusions from the library root, not the repo: a configured root may equal
 // or enclose the repo's friendly path and must then exclude the entire walk.
-func collectHFFriendlyGGUFMetadata(cache *hfdownloader.HFCache, repo *hfdownloader.RepoDir, cfg Config, includeMMProjFiles bool) (cacheGGUFMetadata, error) {
-	set := newManagedRootSetForConfig(cfg)
+func collectHFFriendlyGGUFMetadata(cache *hfdownloader.HFCache, repo *hfdownloader.RepoDir, set *storageRootSet, includeMMProjFiles bool) (cacheGGUFMetadata, error) {
 	libraryPath := cache.ModelsDir()
 	if repo.Type() == hfdownloader.RepoTypeDataset {
 		libraryPath = cache.DatasetsDir()
@@ -996,12 +995,21 @@ func buildLocalCacheRepo(owner, name, repoDir, displayRepoDir string, root local
 // (hub/blobs/snapshots/refs) are skipped.
 func scanLocalCachedRepos(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, includeFiles bool) ([]CachedRepoInfo, error) {
 	set := newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), localDir, localScanDirs, downloadRoutes, mustWorkingDirectory())
-	return scanLocalCachedReposWithRoots(browseRoots(set), includeFiles)
+	return scanLocalCachedReposFromSet(set, includeFiles)
 }
 
 func scanLocalCachedReposForConfig(cfg Config, includeFiles bool) ([]CachedRepoInfo, error) {
-	set := newManagedRootSetForConfig(cfg)
-	return scanLocalCachedReposWithRoots(browseRoots(set), includeFiles)
+	return scanLocalCachedReposFromSet(newManagedRootSetForConfig(cfg), includeFiles)
+}
+
+func scanLocalCachedReposFromSet(set *storageRootSet, includeFiles bool) ([]CachedRepoInfo, error) {
+	if set.err != nil {
+		return nil, set.err
+	}
+	if err := set.domain.Err(); err != nil {
+		return nil, err
+	}
+	return scanLocalCachedReposWithRoots(set.roots, includeFiles)
 }
 
 func scanLocalCachedReposWithRoots(roots []localCacheRoot, includeFiles bool) ([]CachedRepoInfo, error) {
@@ -1064,40 +1072,73 @@ func scanLocalCachedReposWithRoots(roots []localCacheRoot, includeFiles bool) ([
 // includeFiles flag controls whether the per-file list is filled in.
 func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, downloadRoutes map[string]string, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
 	set := newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), localDir, localScanDirs, downloadRoutes, mustWorkingDirectory())
-	return findLocalCachedRepoWithRoots(browseRoots(set), repoID, includeFiles)
+	return findLocalCachedRepoInSet(set, repoID, includeFiles)
 }
 
 func findLocalCachedRepoForConfig(cfg Config, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
-	set := newManagedRootSetForConfig(cfg)
-	return findLocalCachedRepoWithRoots(browseRoots(set), repoID, includeFiles)
+	return findLocalCachedRepoInSet(newManagedRootSetForConfig(cfg), repoID, includeFiles)
 }
 
 func findLocalCachedRepoWithRoots(roots []localCacheRoot, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
-	parts := strings.SplitN(repoID, "/", 2)
+	if len(roots) == 0 || roots[0].set == nil {
+		return nil, os.ErrNotExist
+	}
+	return findLocalCachedRepoInSet(roots[0].set, repoID, includeFiles)
+}
+
+func findLocalCachedRepoInSet(set *storageRootSet, repoID string, includeFiles bool) (*CachedRepoInfo, error) {
+	if set.err != nil {
+		return nil, set.err
+	}
+	parts := strings.Split(repoID, "/")
 	if len(parts) != 2 {
 		return nil, os.ErrNotExist
 	}
-	for _, root := range roots {
-		if root.skipsOwner(parts[0]) {
+	physicalCopies, err := set.RepoPhysicalCopies(repoID, hfdownloader.RepoTypeModel)
+	if err != nil {
+		return nil, err
+	}
+	type candidatePath struct {
+		rootID string
+		path   string
+	}
+	var candidates []candidatePath
+	for _, physicalCopy := range physicalCopies.Copies {
+		if physicalCopy.Kind == hfdownloader.PhysicalCopyLocal {
+			candidates = append(candidates, candidatePath{rootID: physicalCopy.OwnerRootID, path: physicalCopy.Path})
+		}
+	}
+	for _, projection := range physicalCopies.Projections {
+		candidates = append(candidates, candidatePath{rootID: projection.OwnerRootID, path: projection.Path})
+	}
+	rootOrder := make(map[string]int)
+	for index, root := range set.domain.Roots() {
+		rootOrder[root.ID] = index
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return rootOrder[candidates[i].rootID] < rootOrder[candidates[j].rootID]
+	})
+	for _, candidate := range candidates {
+		root, ok := set.Root(candidate.rootID)
+		if !ok || root.skipsOwner(parts[0]) {
 			continue
 		}
-		repoDir := filepath.Join(root.AbsPath, parts[0], parts[1])
 		displayRepoDir := filepath.Join(root.Path, parts[0], parts[1])
-		qualified, err := hasLocalWeightFile(repoDir, root)
+		qualified, err := hasLocalWeightFile(candidate.path, root)
 		if err != nil {
 			return nil, err
 		}
 		if !qualified {
 			continue
 		}
-		return buildLocalCacheRepo(parts[0], parts[1], repoDir, displayRepoDir, root, includeFiles)
+		return buildLocalCacheRepo(parts[0], parts[1], candidate.path, displayRepoDir, root, includeFiles)
 	}
 	return nil, os.ErrNotExist
 }
 
 // handleCacheList lists all cached repositories with rich metadata.
 func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
-	cfg := s.snapshotConfig()
+	cfg := s.snapshotConfig().captureCacheEnvironment()
 	cacheDir := cfg.cacheRoot()
 
 	// Get query params
@@ -1105,6 +1146,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 	search := strings.ToLower(r.URL.Query().Get("search"))
 
 	cache := cfg.cache()
+	managedRoots := newManagedRootSetForConfig(cfg)
 	repoDirs, err := cache.ListRepos()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to list cache", err.Error())
@@ -1132,6 +1174,19 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		// Filter by search term
 		if search != "" && !strings.Contains(strings.ToLower(repoID), search) {
 			continue
+		}
+		hubRepoType := hfdownloader.RepoTypeModel
+		if rd.Type() == hfdownloader.RepoTypeDataset {
+			hubRepoType = hfdownloader.RepoTypeDataset
+		}
+		ownedHubCopy, ownershipErr := managedRoots.HasHubPhysicalCopy(repoID, hubRepoType, rd.Path())
+		if ownershipErr != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to establish Hub repository ownership", ownershipErr.Error())
+			return
+		}
+		if !ownedHubCopy {
+			writeError(w, http.StatusInternalServerError, "Failed to establish Hub repository ownership", "repository path is not an owned copy of the selected Hub")
+			return
 		}
 
 		// Get size by walking blobs directory
@@ -1217,7 +1272,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			shortCommit = shortCommit[:7]
 		}
 
-		ggufMeta, metaErr := collectHFFriendlyGGUFMetadata(cache, rd, cfg, false)
+		ggufMeta, metaErr := collectHFFriendlyGGUFMetadata(cache, rd, managedRoots, false)
 		if metaErr != nil {
 			writeError(w, http.StatusInternalServerError, "Failed to establish repository ownership", metaErr.Error())
 			return
@@ -1247,7 +1302,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		seenRepos[strings.ToLower(rdType+":"+repoID)] = true
 	}
 
-	localRepos, err := scanLocalCachedReposForConfig(cfg, false)
+	localRepos, err := scanLocalCachedReposFromSet(managedRoots, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to establish local repository ownership", err.Error())
 		return
@@ -1298,8 +1353,9 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.snapshotConfig()
+	cfg := s.snapshotConfig().captureCacheEnvironment()
 	cache := cfg.cache()
+	managedRoots := newManagedRootSetForConfig(cfg)
 
 	// Try as model first
 	repoDir, err := cache.Repo(repo, hfdownloader.RepoTypeModel)
@@ -1313,7 +1369,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
-			localRepo, localErr := findLocalCachedRepoForConfig(cfg, repo, true)
+			localRepo, localErr := findLocalCachedRepoInSet(managedRoots, repo, true)
 			if localErr == nil {
 				writeJSON(w, http.StatusOK, localRepo)
 				return
@@ -1325,6 +1381,16 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "Repository not found in cache", "")
 			return
 		}
+	}
+	hubRepoType := repoDir.Type()
+	ownedHubCopy, ownershipErr := managedRoots.HasHubPhysicalCopy(repo, hubRepoType, repoDir.Path())
+	if ownershipErr != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to establish Hub repository ownership", ownershipErr.Error())
+		return
+	}
+	if !ownedHubCopy {
+		writeError(w, http.StatusInternalServerError, "Failed to establish Hub repository ownership", "repository path is not an owned copy of the selected Hub")
+		return
 	}
 
 	// Get snapshots
@@ -1434,7 +1500,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		shortCommit = shortCommit[:7]
 	}
 
-	ggufMeta, metaErr := collectHFFriendlyGGUFMetadata(cache, repoDir, cfg, true)
+	ggufMeta, metaErr := collectHFFriendlyGGUFMetadata(cache, repoDir, managedRoots, true)
 	if metaErr != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to establish repository ownership", metaErr.Error())
 		return
@@ -1629,6 +1695,15 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	managedRoots := newManagedRootSetForConfig(cfg)
+	ownedHubCopy, ownershipErr := managedRoots.HasHubPhysicalCopy(repo, repoType, absHubPath)
+	if ownershipErr != nil {
+		writeError(w, http.StatusBadRequest, "Invalid path", ownershipErr.Error())
+		return
+	}
+	if !ownedHubCopy {
+		writeError(w, http.StatusBadRequest, "Invalid path", "repository path is not an owned copy of the selected Hub")
+		return
+	}
 	if err := managedRoots.WholeCopyAllowed(configuredPathID(cache.HubDir(), managedRoots.base), absHubPath); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid path", err.Error())
 		return
@@ -1677,22 +1752,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 // Allows: alphanumeric, dash (-), underscore (_), and period (.)
 // This matches HuggingFace's naming conventions.
 func isValidRepoComponent(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if !((r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') ||
-			r == '-' || r == '_' || r == '.') {
-			return false
-		}
-	}
-	// Additional check: component must not be "." or ".."
-	if s == "." || s == ".." {
-		return false
-	}
-	return true
+	return hfdownloader.IsValidRepoComponent(s)
 }
 
 // safeDeleteFriendlyPath safely deletes the friendly view path with security checks.

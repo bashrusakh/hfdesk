@@ -133,5 +133,9 @@ func manifestBelongsToRepo(cache *hfdownloader.HFCache, rd *hfdownloader.RepoDir
 		return false
 	}
 	repoInfo, err := os.Stat(rd.Path())
-	return err == nil && repoInfo.IsDir() && os.SameFile(manifestInfo, repoInfo)
+	if err != nil || !repoInfo.IsDir() {
+		return false
+	}
+	same, err := hfdownloader.SameFilePaths(manifestPath, rd.Path())
+	return err == nil && same
 }

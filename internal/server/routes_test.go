@@ -641,7 +641,8 @@ func TestLocalCacheRootsUseFilesystemEvidenceForAliases(t *testing.T) {
 	roots := localCacheRoots(actual, actual, []string{alias}, nil)
 	var matching []localCacheRoot
 	for _, root := range roots {
-		if sameDirectoryObject(root.Path, actual) {
+		same, err := hfdownloader.SameDirectoryPath(root.Path, actual)
+		if err == nil && same {
 			matching = append(matching, root)
 		}
 	}
@@ -719,8 +720,8 @@ func TestManagedRootSetCapturedIdentityAndFreshObservations(t *testing.T) {
 	}
 	newGeneration := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), "next-models", []string{missing}, nil, base)
 	newID := configuredPathID("next-models", base)
-	oldDefinition, oldFound := set.rootByID(firstID)
-	newDefinition, newFound := newGeneration.rootByID(newID)
+	oldDefinition, oldFound := set.Root(firstID)
+	newDefinition, newFound := newGeneration.Root(newID)
 	if newID == firstID || !oldFound || !newFound || oldDefinition.Path != "relative-models" || newDefinition.Path != "next-models" {
 		t.Fatal("config generation did not retain independent immutable root definitions")
 	}
@@ -823,7 +824,7 @@ func TestManagedRootOwnershipThroughAliasAndNestedRoot(t *testing.T) {
 	if err != nil || len(nested) != 1 || nested[0] != childRoot.AbsPath {
 		t.Fatalf("nested roots = %v, %v; want [%s]", nested, err, childRoot.AbsPath)
 	}
-	repos, err := scanLocalCachedReposWithRoots(browseRoots(set), true)
+	repos, err := scanLocalCachedReposWithRoots(set.roots, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -879,6 +880,32 @@ func TestManagedRootOwnershipThroughAliasAndNestedRoot(t *testing.T) {
 	}
 	if err := set.WholeCopyAllowed(childRoot.ID, childRepo); err != nil {
 		t.Fatalf("child root should own its exact repo copy: %v", err)
+	}
+}
+
+func TestFindLocalCachedRepoPreservesFriendlySourcePriority(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(base, "cache")
+	local := filepath.Join(base, "local")
+	friendlyRepo := filepath.Join(cache, "models", "owner", "model")
+	localRepo := filepath.Join(local, "owner", "model")
+	for _, repoDir := range []string{friendlyRepo, localRepo} {
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(friendlyRepo, "friendly.safetensors"), []byte("friendly"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRepo, "local.safetensors"), []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := findLocalCachedRepo(cache, local, nil, nil, "owner/model", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.Source != "Friendly view" || repo.Path != friendlyRepo || repo.FileCount != 1 || repo.Size != int64(len("friendly")) || filepath.Base(repo.Files[0].Name) != "friendly.safetensors" {
+		t.Fatalf("friendly source priority/accounting changed: %#v", repo)
 	}
 }
 
