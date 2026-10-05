@@ -55,7 +55,6 @@ pre-agent-steps:
       echo "POLICY_SHA=$sha" >> "$GITHUB_ENV"
       echo "Resolved policy contract at $sha"
 safe-outputs:
-  staged: true
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "duplicate", "refactor", "ci"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]

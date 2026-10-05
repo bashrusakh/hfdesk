@@ -91,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           # compile already validates safe-outputs; assert the compiled lock files
-          # carry a configuration and never enable label creation.
+          # carry a configuration, apply live, and never enable label creation.
           for lock in .github/workflows/issue-triage.lock.yml \
                       .github/workflows/pr-semantic-intake.lock.yml \
                       .github/workflows/backlog-retriage.lock.yml; do
@@ -101,12 +101,12 @@ jobs:
               echo "::error::$lock enables label creation (create-if-missing); forbidden."
               exit 1
             fi
-            if ! grep -q 'GH_AW_SAFE_OUTPUTS_STAGED: "true"' "$lock"; then
-              echo "::error::$lock is not installed in staged safe-output mode."
+            if grep -q 'GH_AW_SAFE_OUTPUTS_STAGED' "$lock"; then
+              echo "::error::$lock is still in staged safe-output mode; live mode required."
               exit 1
             fi
           done
-          echo "Safe-outputs staged and no label creation enabled."
+          echo "Safe-outputs apply live and no label creation enabled."
 
       - name: Detect missing contract files and renamed/removed managed labels
         env:
