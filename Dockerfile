@@ -139,10 +139,10 @@ COPY --from=builder /hfdesk /usr/local/bin/hfdesk
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# All writable state lives under one data root. HFDesk derives the HF cache
-# from HF_HOME and its app config from XDG_CONFIG_HOME/HOME, so pinning these
-# lets any UID (including --user / k8s runAsUser) write state without needing
-# the image user or an /etc/passwd entry.
+# By default, writable application state lives under one data root. HFDesk
+# derives the HF cache from HF_HOME and its app config from
+# XDG_CONFIG_HOME/HOME, so pinning these lets any UID (including --user / k8s
+# runAsUser) write state without needing the image user or an /etc/passwd entry.
 #
 # HFDESK_UID/HFDESK_GID expose the build-time ARGs so the entrypoint's default
 # PUID/PGID matches a custom `--build-arg UID/GID` image instead of forcing 1000.

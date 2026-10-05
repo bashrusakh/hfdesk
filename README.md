@@ -59,9 +59,10 @@ docker run --rm -p 8080:8080 \
   ghcr.io/bashrusakh/hfdesk:latest
 ```
 
-HFDesk keeps all writable state (settings, jobs, history, HF cache, and local
-models) under a single `/data` root. Mount one volume at `/data` to persist
-everything. See [Docker](#docker) for UID/GID options.
+By default, HFDesk consolidates writable application state (settings, jobs,
+history, HF cache, and local models) under a single `/data` root. Mount one
+volume at `/data` to persist it. Storage roots can be overridden (for example
+`HF_HUB_CACHE`); see [Docker](#docker) for UID/GID options.
 
 ## Quick Start
 
@@ -170,8 +171,8 @@ go test ./... -race
 
 ## Docker
 
-The image keeps every writable path under one mounted data root, `/data`. It
-sets `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, and
+By default, the image keeps writable application paths under one mounted data
+root, `/data`. It sets `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, and
 `HF_HOME=/data/.cache/huggingface`, and runs with `WORKDIR /data`:
 
 | Path | Contents |

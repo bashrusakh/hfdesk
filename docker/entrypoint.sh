@@ -11,10 +11,11 @@
 #
 # When the container is started non-root (docker run --user 568:568, or a
 # Kubernetes securityContext.runAsUser/fsGroup), no ownership mutation
-# is attempted and the app is exec'd directly. All writable state lives under
-# the fixed /data root, so the app never needs the image user or an /etc/passwd
-# entry. Neither startup path edits /etc/passwd or /etc/group: numeric IDs
-# are authoritative, even when they already belong to an image account.
+# is attempted and the app is exec'd directly. By default, writable application
+# state lives under the fixed /data root, so the app never needs the image user
+# or an /etc/passwd entry. Neither startup path edits /etc/passwd or
+# /etc/group: numeric IDs are authoritative, even when they already belong to
+# an image account.
 #
 # Security: /data is world-writable (mode 1777) so any UID can create its own
 # state. That also means every entry *inside* it is attacker-influenced: a
