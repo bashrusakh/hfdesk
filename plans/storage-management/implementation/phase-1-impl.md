@@ -1,11 +1,11 @@
 # Phase 1 implementation record
 
-Status: **implementation-local correction complete; independent verification and review pending**. Base
-candidate was `9accc19d11b15e9896191e2c963b8f449d928116` on
-`feature/storage-root-ownership`, reviewed against
-`34b85134e11931efc2faff972bcb2d1110154153`. The worktree was clean before this
-plan-only reassessment. Source/test changes are now present as an uncommitted
-local candidate; no publication occurred.
+Status: **source correction and upstream integration complete; independent verification and review pending**.
+The correction is committed as `957498e59c3580b38d1c02f1f6d7c052d5de1070` on
+`feature/storage-root-ownership`. It has been integrated with freshly fetched
+`origin/main` `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` by ordinary merge
+`fadcd1bde19a6751b3a72448e27ebe2518002774`; merge base was
+`34b85134e11931efc2faff972bcb2d1110154153`. No publication occurred.
 
 Historical task setup: the initial supplied baseline was
 `29f7179fa54b7eea8b264bfa88cae4ec6053b37b`; this task branch was created there.
@@ -23,7 +23,8 @@ eligibility are present. Their presence does not establish complete physical
 ancestry or protection of every destructive effect. #95 layout policy and frozen
 job associations remain the foundation, not a new implementation phase.
 
-Blocking findings on immutable baseline HEAD before the local correction:
+Findings on immutable pre-correction HEAD (addressed in `957498e`; independent
+verification remains pending):
 
 - **F1 high:** `containmentDistance` walks lexical ancestors of an externally
   configured alias, missing its real parent inside a destructive target.
@@ -52,11 +53,13 @@ ownership while still resolving aliased parent components. Projection-parent
 protection is exempted only for the associated friendly effect; other protected
 roots intersecting that effect block the whole operation.
 
-Baseline regressions cover useful preservation cases, including aliased parent
-with normal child, lexical nested-Hub refusal, case-distinct IDs, captured base,
-source priority and frozen jobs. New dirty-worktree tests cover inverse aliases,
-the complete Hub/friendly effect preflight, symlinked friendly owner/projection
-components, and a valid model ID containing `datasets--`.
+Regression tests committed with the correction cover preservation cases,
+including aliased parent with normal child, lexical nested-Hub refusal,
+case-distinct IDs, captured base, source priority and frozen jobs. They also cover
+inverse aliases/missing descendants, model and dataset friendly-root refusal
+before either removal, symlinked friendly owner/projection components with
+sentinels preserved, and a valid model ID containing `datasets--`. These are
+implementation-local evidence, not independent gate completion.
 
 Independent prior evidence remains historical and does not cover this candidate:
 
@@ -75,19 +78,21 @@ Independent prior evidence remains historical and does not cover this candidate:
   full tests/vet/build/cross-build passes are historical implementation-local
   evidence, not independent proof of F1/F2 or native Windows/macOS behavior.
 
-Candidate Windows CI has ownership steps but execution is pending. The server
-selector omits `TestCacheAndRoutePathsUseCapturedConfigBase` and
-`TestFindLocalCachedRepoPreservesFriendlySourcePriority`; several existing tests
-skip Windows/symlink capabilities. CI selection is not executed coverage.
-The bounded DevOps assignment must include named preservation/new protection
-tests and report what actually ran/skipped on native Windows/Go 1.24.
+Windows CI selects existing tests spanning the C1-C14 matrix, including
+captured-base, friendly-priority, frozen destinations, F1/F2, aliased-component
+refusal, valid-name and read-only manifest cases, in addition to prior ownership
+and state-replacement coverage. There is no existing focused C10 injected
+secondary-cleanup-I/O-failure test; this selector does not claim that case.
+Several alias/case/reparse tests may skip when Windows filesystem capabilities
+are unavailable; skips remain visible and are not weakened. The selection and
+local Linux run do not prove native Windows/Go 1.24 execution; GitHub CI results
+remain pending.
 
-Fresh main is `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` per parent fetch/host
-identity, also present in local `origin/main`. Compared with reviewed base,
-only Docker/runtime/docs/CI paths changed; no application source or root guidance
-changed. This candidate was not merged with it during reassessment. Parent must
-establish the next base before correction/CI reconciliation; no test here claims
-execution against fresh upstream.
+Fresh main `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` is integrated. Relative to
+reviewed base, upstream changed only Docker/runtime/docs/CI paths; no application
+source or root guidance changed. The merge retained those upstream changes and
+the task-branch source correction. No test here claims native Windows or Go 1.24
+execution against the integrated candidate.
 
 ## Local implementation evidence
 
@@ -108,6 +113,11 @@ execution against fresh upstream.
 - Full Linux Go 1.26.7 validation passed in isolated HOME/XDG/APPDATA/
   LOCALAPPDATA/HF/TMP: `go test ./... -count=1`, `go test ./... -race -count=1`,
   `go vet ./...`, and `go build -o <scratch>/hfdesk ./cmd/hfdesk`.
+- On integrated merge `fadcd1b`, both native-Windows storage selector commands
+  from `.github/workflows/ci.yml` passed locally on Linux Go 1.26.7 with
+  `-count=1 -v`; `go test -list` confirmed the named preservation/F1/F2 tests
+  are selected. This is selector/Linux evidence only, not Go 1.24 or native
+  Windows evidence. No selected tests skipped on this Linux run.
 - No Go 1.24 executable or installation was available; Go 1.24 compatibility
   remains unverified. Native Windows/macOS filesystem behavior is unverified.
 - No independent tester/reviewer stage was performed; their pending evidence
