@@ -2,20 +2,22 @@
 
 Canonical foundation: merged PR #95 on `main` (HF_HUB_CACHE wins over an explicit cacheDir). Issue #76 remains closed. PR #70 is superseded evidence only; its implementation and unpublished layout candidates are not a baseline.
 
-Current phase: **1, implementation-local correction complete; independent verification/review pending**. Task
-branch remains `feature/storage-root-ownership` at HEAD
-`9accc19d11b15e9896191e2c963b8f449d928116` with local implementation changes on
-the authorized worktree, based on the reviewed base
-`34b85134e11931efc2faff972bcb2d1110154153`. Full independent review requires
-changes; independent production-runtime verification confirmed configured-root
-data loss. Local F1/F2 corrections and regressions now pass, but independent
-verification/review and native platform evidence remain outstanding.
+Current phase: **1, F3 correction implemented locally; independent/native evidence pending**.
+Implementation worktree is based on `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`
+on `feature/storage-root-ownership`; base and merge base are
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The worktree is dirty with the
+authorized CI/planner changes and this source/test correction; no commit or
+publication occurred.
 
-The workflow owner supplied fresh upstream
-`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`; its intervening changes are
-Docker/runtime/docs/CI, not application cache/jobs/path/state or project guidance.
-The task candidate has not incorporated that upstream. Integration and renewed
-candidate evidence belong to the parent/implementation stage, not this plan edit.
+The workflow owner reports 40 independent production scenarios passing the
+Linux C1-C14 boundary, including the safe C10 secondary permission failure.
+Preserve those corrections. The former clean candidate's full review required
+changes because F3 showed ordinary bind-mount aliases invalidate resolved-name
+ancestor searches as proof of physical noncontainment. The correction now matches
+protected directory objects/verified missing anchors against the complete bounded
+recursive effect graph. Local Go 1.26.7 evidence is implementation-local only;
+native Go 1.24 mount CI, independent verification/review, Windows and macOS
+evidence remain pending.
 
 This plan covers the authorized Issue #63 replacement in four bounded phases:
 
@@ -31,10 +33,12 @@ whole-HF destructive effect set**, including secondary friendly cleanup, before
 any removal. Configured-definition ancestry, observed physical ancestry and
 effect eligibility are separate claims. Unestablished physical noncontainment
 is unknown, not deletion permission. The bounded correction and verification
-model is in [phase 1](phases/phase-1.md) and the
-[reassessment](reviews/protected-roots-reassessment.md).
+model is in [phase 1](phases/phase-1.md) and the current
+[namespace-proof reassessment](reviews/mount-proof-reassessment.md).
+The earlier [symlink/effect-set reassessment](reviews/protected-roots-reassessment.md)
+is historical; its resolved-ancestor negative-proof hypothesis is superseded.
 
-Next safe action: parent reconciles the local implementation and then performs
-the planned integration/CI and independent verification/review stages. Phase 2
-cannot use phase 1 as a completed foundation until those gates succeed. No
-publication was performed by this implementation.
+Next safe action: reconcile the final local source/test/CI/planner diff, then run
+the integrated independent checkpoint and full stable-diff review. Execute the
+required Go 1.24 private-namespace mount CI job before any Ready decision. Phase 2
+cannot use phase 1 as a completed foundation until these gates pass.

@@ -1,8 +1,10 @@
 # Phase 1 — root/path ownership
 
-Status: **implementation-local correction complete; independent verification and review pending**.
-Source identity: reviewed base `34b85134e11931efc2faff972bcb2d1110154153` and
-candidate `9accc19d11b15e9896191e2c963b8f449d928116`.
+Status: **F3 correction implemented locally; independent/native evidence pending**.
+Source identity: base `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` and
+candidate `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`; merge base equals base.
+Parent reports current Linux C1-C14 production verification passed; full review
+requires changes for F3. No native mount reproduction or universal proof passed.
 
 ## Contract
 
@@ -27,21 +29,47 @@ Separate three propositions:
 3. Effect eligibility: exact selected-root shape, applicable role/confinement,
    destructive component policy and absence of protected-root intersection.
 
-Choose resolved physical observations plus `Stat`/`SameFile` ancestor evidence
-inside the existing domain. `EvalSymlinks` is permitted for observation, never
-configured IDs or substituting a newly trusted destructive root. Resolve both
-sides, validate their observed objects, and inspect resolved rather than alias
-namespace ancestors. Case/volume/reparse spelling alone cannot prove outside.
-Keep lexical ownership distinct from the result used to authorize mutations.
+Resolved names and ancestor matches remain useful positive evidence, but
+**negative ancestor searches are not outside proof**: bind mounts preserve
+directory objects while exposing them under unrelated namespace parents.
+`EvalSymlinks` is permitted for observation, never configured IDs or destructive
+trust substitution. More resolution, reverse searches, different device IDs
+or GOOS heuristics do not repair this inference.
 
-For a missing descendant, observe the deepest existing prefix and unresolved
-suffix separately. A suffix beneath an existing alias into an effect must remain
-protected, not disappear as `IsNotExist`. A verified ordinary absent suffix can
-establish a nonintersecting reserved location; it does not acquire fictional
-physical identity. Dangling links, loops, inaccessible/non-directory prefixes,
-unverified ancestry or unsupported alias semantics remain unknown and refuse
-mutation. Do not globally refuse safe deletes solely because an unrelated
-optional configured path is absent.
+Chosen correction level: the existing owner must observe the directory objects
+reachable by each intended recursive removal. Protection is evaluated against
+that complete operation-specific reachability, not merely naming-tree ancestry.
+Traverse actual directory edges (including ordinary mounted directories) under
+the remover's no-follow/leaf semantics; do not use `WalkOwned`, which prunes
+exactly the protected subtrees the preflight must detect. Compare freshly
+observed protected roots and missing-path anchors with reached objects using
+established identity facts. Existing lexical reservation guards remain useful
+conservative blockers. No effect is authorized until its proof is complete.
+
+This is an ephemeral, read-only proof under ManagedRootSet, not an inventory,
+generic filesystem framework, persisted graph, new remover or phase-3 plan.
+Go 1.24 `os.Root` relative observations can help bind reads to the selected
+effect. It permits mount traversal and is not itself proof of disjointness;
+there is no `Root.Rename`/`Root.RemoveAll`. Preserve prior effect confinement.
+
+For a missing descendant, retain the deepest verified existing directory object
+and ordinary missing suffix separately, including prefixes reached through bind
+or symlink aliases. If removal reaches that anchor and affects the reserved
+location, refuse: `S/next` below a bind-mounted child of T cannot vanish from
+protection just because next is absent. Never invent a child inode. A safe
+outside reservation requires complete nonintersection evidence, not path
+spelling or failed ancestors. Preserve unrelated ordinary missing roots and
+safe friendly absence when proven.
+
+Incomplete enumeration, unreadable/failed identity facts, unsupported entry
+semantics, cycles, cancellation or exhausted resource bounds are unknown and
+refuse before any removal. Stream metadata; do not read model bytes. Compare
+opened-object facts where needed to avoid negative equality caused by deferred
+identity-load failure. Distinct namespace occurrences of one directory object
+can expose different child mounts; global SameFile deduplication is not proof
+that those edges were covered. Existing ancestor-owner exemptions must not hide
+the protected namespace object itself when a mount re-exposes it inside an
+effect. Do not blanket-refuse all mounts or silently skip them.
 
 Keep read-only browsing and destructive authority separate. Preserve representative list/details behavior and friendly orphan visibility. No public physical-copy selectors or transactional deletion changes in this phase.
 
@@ -61,11 +89,13 @@ is not atomic execution, rollback, a lease or a hostile-writer/TOCTOU guarantee.
 
 | State / transition | Required outcome |
 |---|---|
-| Definitions captured; fresh relation observations gathered | IDs unchanged; no physical fact inferred from configured spelling |
+| Definitions captured; fresh relation/reachability observations gathered | IDs unchanged; no physical fact inferred from configured spelling |
 | Any effect contains/equal-protects a configured root, or relevant relation is unknown | Refuse before any removal; retain both effects and protected sentinels |
 | Hub allowed; friendly blocked | Refuse before Hub removal, not a post-Hub partial success |
 | Friendly safely absent; Hub and remaining boundaries allowed | No secondary removal; retain normal legacy delete behavior |
 | All intended effects allowed | Execute existing legacy unit; no new delete API or engine |
+| Ancestors differ but reached directory matches protected object/anchor | Refuse; namespace spelling cannot override the object match |
+| Enumeration incomplete, active cycle or resource/capability failure | Unknown/refusal; never allow using a partial reached set |
 | Ordinary cleanup I/O failure after allowed Hub removal | Preserve existing visible secondary-failure response; no rollback claim |
 | Next request/config generation or filesystem observation changes | Re-capture/re-observe; never turn stale evidence into permission |
 
@@ -87,44 +117,79 @@ is not atomic execution, rollback, a lease or a hostile-writer/TOCTOU guarantee.
 | C12: Friendly source priority, raw cache restrictions, frozen job association | Preserve named priority tests, list/details, dedup/cleanup and lifecycle regression suites |
 | C13: Alias browse versus symlink root/owner/repo mutation refusal | Read-only content detection still works; existing #95 external-H destructive guards stay fail-closed |
 | C14: Manifest association evidence | Existing SameFile regression remains read-only evidence, not mutation authority |
+| C15: External bind S exposes existing child C inside Hub T | Domain eligibility and nested protection recognize the reached protected object; API refusal keeps Hub, friendly and sentinel |
+| C16: External bind S exposes child inside friendly effect | Complete preflight refuses before Hub removal; model/dataset trees both retained |
+| C17: Missing protected reservation S/next with bind-mounted anchor C | Anchor/suffix retained, unknown/intersection refuses; no fictional inode or dropped definition |
+| C18: Mount inside effect exposes protected root outside its naming tree | Traverse actual removal edges; detect protected object before mutation; EBUSY at final rmdir is not safety proof |
+| C19: Mount re-exposes authorizing Hub/friendly namespace inside an effect | Do not exempt the reached protected object solely by owner root ID; preserve ordinary ancestor authorization |
+| C20: Repeated directory objects with different child mount views; active cycle | Visit relevant namespace occurrences; no unsound global-object pruning; cycle/incomplete proof refuses |
+| C21: Plain symlink/reparse leaf versus traversed mounted directory | Match actual Go 1.24 remover semantics; do not follow symlink content or assume junction equals Linux bind behavior |
+| C22: Incomplete ReadDir/stat/object identity; proven unrelated mount/absence | Errors give unknown/refusal; complete disjoint proof preserves safe ordinary/unrelated-root deletion |
+| C23: Cancellation, depth/work/descriptor limits | Bound resources, close handles; incomplete proof refuses both effects before first removal |
+
+C1-C14 currently have parent-reported Linux production evidence (40 scenarios,
+including C10). C15-C23 remain correction/proof obligations. Native mount tests
+cannot run on the reported host without CAP_SYS_ADMIN; model seams and static
+source proof are not native mount execution. Windows/macOS/Go 1.24 gaps remain.
 
 ## Implementation boundary
 
 `pkg/hfdownloader.ManagedRootSet` remains the single storage-policy owner;
 `internal/server/storage_roots.go` assembles configuration/display inputs and
-adapts results. Correct the shared ancestry operation used by `OwnerForPath`,
-`NestedProtectedRoots`, `WalkOwned` and `WholeCopyAllowed`; do not add a guard
-per finding. Add/consolidate one non-mutating fixed legacy-HF effect preflight
-in that owner and route both existing destructive sites through its decision.
-The server derives actual effect paths from #95, calls the common preflight
-before any removal, maps refusal and executes the existing operation.
+adapts results. Correct the negative-proof boundary under `checkProtectedEffect`
+and reconcile `NestedProtectedRoots` with shared reachable-object evidence.
+Preserve the existing complete `LegacyHFDeleteAllowed` call before any removal,
+ordinary owned-walk/alias behavior and physical-copy/projection role separation.
+The server still derives paths from #95, maps refusal and executes its existing
+two-effect operation. Do not create a mount-name guard in the handler.
 
-Candidate implementation is not yet proven to satisfy this boundary: F1's
-lexical-parent walk misses inverse aliases, and F2 guards only the primary Hub
-effect. See [source trace and assignments](../reviews/protected-roots-reassessment.md).
+The implementation-local correction observes each effect's recursive directory
+entry graph in bounded batches, including mounted directory entries, and compares
+opened directory identities with existing protected roots or verified missing
+reservation anchors. It does not globally deduplicate object identities, so
+distinct namespace views are observed; active cycles, incomplete reads, identity
+errors and exceeded depth/work limits refuse. `NestedProtectedRoots` uses the
+same reachability evidence for existing roots. Complete Hub/friendly preflight
+ordering, symlink-leaf handling, C1-C14 corrections and ordinary cleanup response
+remain. See [source trace and evidence](../reviews/mount-proof-reassessment.md).
 No local unit/selective delete, public selector/If-Match, lease, journal,
 quarantine, rollback, transaction or new product layout policy is authorized.
 
 ## Completion evidence
 
-Establish failing C1/C2/C4 cases before correction. Run focused domain/server
-regressions, relevant existing consumers, full tests/race, vet and build. Then
-one independent tester checkpoint covers the integrated ancestry/effect-set
-boundary; a full independent review covers the selected stable whole diff.
-Bind evidence to the post-integration base/head and executing dirty state.
-Native Windows/Go 1.24 and macOS capability gaps must be explicit. Passing the
-old suite is not a pass for these missing semantic cases.
+Portable graph regressions and the native fixture are implemented. Preserve
+C1-C14 and run focused domain/server regressions, relevant existing consumers,
+full tests/race, vet and build. Implementation-local Go 1.26.7 checks pass on the
+current dirty worktree. One independent tester checkpoint and full stable-diff
+review remain required; bind them to the executing dirty state. The Go 1.24
+native-mount workflow has not run and must pass before Ready. Native Windows and
+macOS gaps remain explicit. Passing model tests do not establish native behavior.
 
-## Implementation-local correction (dirty candidate)
+### Native Linux CI execution boundary
 
-The implementation now resolves existing physical prefixes for fresh
-containment observations while keeping configured IDs lexical, and preflights
-the fixed Hub-plus-friendly legacy effect set through `ManagedRootSet` before
-the handler's first `RemoveAll`. Symlink leaf ownership remains lexical for
-discovery so a friendly alias does not transfer to its Hub target. Red/green
-focused regressions cover inverse-alias/missing-child protection and real model
-and dataset handler refusals with both trees' sentinels intact. Full local tests,
-race, vet and build passed on Linux Go 1.26.7. See
-[`phase-1-impl.md`](../implementation/phase-1-impl.md) for exact state and
-limits. This is not independent tester/reviewer evidence; native Windows,
-macOS, and Go 1.24 remain unverified.
+`.github/workflows/ci.yml` adds a Go 1.24 Ubuntu job for focused `TestNativeMount*`
+cases in `pkg/hfdownloader` and `internal/server`. The job first rejects an empty
+test selection, then runs the selected tests with
+`HFDESK_REQUIRE_NATIVE_MOUNTS=1` inside a private mount namespace
+(`sudo unshare --mount --propagation private`). Tests using this required mode
+must fail—not skip or pass without exercise—if native mount capability is
+unavailable, a fixture cannot be mounted, or the expected native cases are not
+actually exercised. Fixtures must use only disposable scratch-owned paths,
+unmount in cleanup, and never touch project/user/system data or network/model
+resources. The workflow isolates HOME, XDG config, HF cache and TMPDIR beneath
+`RUNNER_TEMP`; existing general, Windows, and Docker jobs remain unchanged.
+
+This is configured infrastructure only: no workflow run has occurred, so runner
+capability and native test execution remain pending. The current local host is
+Go 1.26.7 with zero effective capabilities; no mount was attempted. Go 1.24
+source tracing plus later native CI evidence may support the bounded proof, but
+neither selector success nor model-only tests establish native adapter behavior.
+
+## Current implementation/evidence boundary
+
+The clean integrated source at `7dc62163` includes correction `957498e` and the
+expanded Windows selectors. Complete F1/F2 preflight and symlink/reservation
+preservation have independent Linux evidence. F3 correction is now present in
+the dirty implementation worktree; full native/reviewer proof remains pending.
+See
+[`phase-1-impl.md`](../implementation/phase-1-impl.md) for evidence provenance.

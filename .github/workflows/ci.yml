@@ -32,6 +32,60 @@ jobs:
       - name: Test
         run: go test ./...
 
+  # Bind-mount namespace cases cannot silently become a green skip. Keep the
+  # fixture inside a private mount namespace and require the tests themselves
+  # to confirm native mounts were created and exercised.
+  go-native-mounts:
+    name: Go checks (native Linux mounts)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Verify required native mount test selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected="$(go test ./pkg/hfdownloader ./internal/server -list '^TestNativeMount')"
+          printf '%s\n' "$selected"
+          if ! grep -Eq '^TestNativeMount[^[:space:]]*$' <<<"$selected"; then
+            echo 'No TestNativeMount* tests were selected; refusing an empty green job.' >&2
+            exit 1
+          fi
+
+      - name: Run required native mount cases in a private namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d "$RUNNER_TEMP/hfdesk-native-mounts.XXXXXX")"
+          go_bin="$(command -v go)"
+          go_version="$("$go_bin" version)"
+          printf 'Configured toolchain: %s (%s)\n' "$go_bin" "$go_version"
+          if ! grep -Eq ' go1\.24([.[:space:]]|$)' <<<"$go_version"; then
+            echo 'Expected the setup-go Go 1.24 toolchain; refusing another Go version.' >&2
+            exit 1
+          fi
+          cleanup() { sudo rm -rf -- "$scratch"; }
+          trap cleanup EXIT
+          mkdir -p "$scratch/home" "$scratch/config" "$scratch/cache" "$scratch/gocache" "$scratch/tmp"
+          if ! sudo unshare --mount --propagation private -- true; then
+            echo 'Runner cannot create a private mount namespace; native mount proof is required.' >&2
+            exit 1
+          fi
+          sudo unshare --mount --propagation private -- \
+            env HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" \
+            HF_HOME="$scratch/cache" GOCACHE="$scratch/gocache" TMPDIR="$scratch/tmp" \
+            GO_BIN="$go_bin" GOTOOLCHAIN=local \
+            HFDESK_REQUIRE_NATIVE_MOUNTS=1 \
+            bash -euo pipefail -c 'version="$("$GO_BIN" version)"; printf "In namespace: %s (%s)\n" "$GO_BIN" "$version"; grep -Eq " go1\.24([.[:space:]]|$)" <<<"$version"; "$GO_BIN" test ./pkg/hfdownloader ./internal/server -run "^TestNativeMount" -count=1 -v'
+
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
   # argument validation cannot regress silently.

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // ManagedRootRole describes how a configured path participates in storage
@@ -103,6 +104,9 @@ type ManagedRootSet struct {
 	base  string
 	roots []ManagedRoot
 	err   error
+	// observe is nil in production. Tests may provide coherent namespace
+	// observations so bind-mount views can be modeled without mount privilege.
+	observe effectObserver
 }
 
 // ConfiguredPath returns a cleaned lexical path resolved against an explicit
@@ -413,6 +417,50 @@ func (set *ManagedRootSet) NestedProtectedRoots(rootID string) ([]ManagedRoot, e
 	if !ok {
 		return nil, fmt.Errorf("unknown managed root %q", rootID)
 	}
+	rootInfo, rootErr := os.Stat(root.AbsolutePath)
+	if rootErr == nil && rootInfo.IsDir() {
+		reached, err := set.observeEffectDirectories(root.AbsolutePath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot establish nested protected-root reachability: %w", err)
+		}
+		if len(reached) == 0 || !os.SameFile(rootInfo, reached[0].info) {
+			return nil, fmt.Errorf("managed root changed during nested-root observation %q", root.AbsolutePath)
+		}
+		var nested []ManagedRoot
+		comparisonBudget := maxEffectDirectories
+		for _, candidate := range set.roots {
+			if candidate.ID == root.ID || candidate.Roles&ManagedRootProtected == 0 {
+				continue
+			}
+			fact, err := protectedDirectoryFact(candidate, set.effectObserver())
+			if err != nil {
+				return nil, err
+			}
+			if os.SameFile(reached[0].info, fact.info) {
+				continue
+			}
+			intersects, err := effectIntersectsProtected(reached, fact, &comparisonBudget)
+			if err != nil {
+				return nil, err
+			}
+			if intersects {
+				nested = append(nested, candidate)
+			}
+		}
+		sort.Slice(nested, func(i, j int) bool { return nested[i].ID < nested[j].ID })
+		return nested, nil
+	}
+	if rootErr != nil && !os.IsNotExist(rootErr) {
+		return nil, fmt.Errorf("inspect managed root %q: %w", root.AbsolutePath, rootErr)
+	}
+	if rootErr == nil && !rootInfo.IsDir() {
+		return nil, fmt.Errorf("managed root is not a directory %q", root.AbsolutePath)
+	}
+	if errors.Is(rootErr, syscall.ENOTDIR) {
+		return nil, fmt.Errorf("managed root has a non-directory path component %q", root.AbsolutePath)
+	}
+	// A not-yet-created read-only root has no directory graph to enumerate.
+	// Retain the existing lexical/missing-suffix behavior for this case.
 	var nested []ManagedRoot
 	for _, candidate := range set.roots {
 		if candidate.ID == root.ID || candidate.Roles&ManagedRootProtected == 0 {
@@ -666,7 +714,7 @@ func (set *ManagedRootSet) WholeCopyAllowed(rootID, target string) error {
 	if err := rejectManagedSymlinkComponents(set.base, root.AbsolutePath, target); err != nil {
 		return err
 	}
-	if err := set.checkProtectedEffect(root.ID, target); err != nil {
+	if err := set.checkProtectedEffect(target); err != nil {
 		return err
 	}
 	return nil
@@ -704,7 +752,7 @@ func (set *ManagedRootSet) LegacyHFDeleteAllowed(hubRootID, hubTarget, friendlyT
 		if relErr != nil || rel != filepath.Join(owner, name) {
 			continue
 		}
-		return set.checkProtectedEffect(projection.ID, friendlyTarget)
+		return set.checkProtectedEffect(friendlyTarget)
 	}
 	return errors.New("friendly deletion effect has no configured projection owner")
 }
@@ -754,9 +802,11 @@ func ValidateLegacyFriendlyEffect(cacheRoot, friendlyTarget string) (bool, error
 	return true, nil
 }
 
-func (set *ManagedRootSet) checkProtectedEffect(exemptRootID, effect string) error {
+func (set *ManagedRootSet) checkProtectedEffect(effect string) error {
+	// Keep positive namespace-ancestor evidence as an inexpensive conservative
+	// rejection, but never use a negative result as proof of disjointness.
 	for _, protected := range set.roots {
-		if protected.ID == exemptRootID || protected.Roles&ManagedRootProtected == 0 {
+		if protected.Roles&ManagedRootProtected == 0 {
 			continue
 		}
 		contains, _, err := containmentDistance(effect, protected.AbsolutePath)
@@ -768,6 +818,27 @@ func (set *ManagedRootSet) checkProtectedEffect(exemptRootID, effect string) err
 			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
 		}
 		if contains || (containedBy && distance == 0) {
+			return fmt.Errorf("deletion effect intersects protected managed root %s", protected.ID)
+		}
+	}
+	reached, err := set.observeEffectDirectories(effect)
+	if err != nil {
+		return fmt.Errorf("cannot prove protected-root disjointness for deletion effect: %w", err)
+	}
+	comparisonBudget := maxEffectDirectories
+	for _, protected := range set.roots {
+		if protected.Roles&ManagedRootProtected == 0 {
+			continue
+		}
+		fact, err := protectedDirectoryFact(protected, set.effectObserver())
+		if err != nil {
+			return fmt.Errorf("cannot establish protected-root identity %s: %w", protected.ID, err)
+		}
+		intersects, err := effectIntersectsProtected(reached, fact, &comparisonBudget)
+		if err != nil {
+			return fmt.Errorf("cannot prove protected-root disjointness for deletion effect: %w", err)
+		}
+		if intersects {
 			return fmt.Errorf("deletion effect intersects protected managed root %s", protected.ID)
 		}
 	}

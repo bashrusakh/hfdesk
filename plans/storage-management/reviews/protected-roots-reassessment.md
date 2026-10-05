@@ -1,5 +1,12 @@
 # Protected-root / complete-effect reassessment
 
+Historical F1/F2 handoff on `9accc19`, not the current proof model.
+The resolved-ancestor negative-proof hypothesis below is superseded by
+[mount-proof-reassessment.md](mount-proof-reassessment.md): F1/F2 corrections
+passed current Linux C1-C14 verification, but ordinary bind namespaces expose
+F3 on `7dc62163`. Preserve the complete-effect preflight and earlier regressions;
+do not repeat the ancestor-search mechanism as permission to delete.
+
 Date: 2026-10-06. Status: **changes required; model handoff only**.
 Inspected source: `feature/storage-root-ownership` at
 `9accc19d11b15e9896191e2c963b8f449d928116`; reviewed base

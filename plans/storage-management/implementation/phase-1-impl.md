@@ -1,6 +1,17 @@
 # Phase 1 implementation record
 
-Status: **source correction and upstream integration complete; independent verification and review pending**.
+Status: **F3 correction implemented locally; independent/native evidence pending**.
+Current clean inspected candidate is
+`7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`, with base and merge base
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. Full current diff is 17 files,
+3097 additions / 333 deletions. Parent reports current full review requires
+changes, while 40 independent Linux production scenarios passed C1-C14,
+including real C10 permission failure returning 200 with `success:false`.
+Those passes do not cover bind namespaces. F3 is static source/system evidence;
+no native mount reproduction was possible on the review host (no CAP_SYS_ADMIN).
+No source correction/publication occurs in this plan-only update.
+
+Historical source correction/integration:
 The correction is committed as `957498e59c3580b38d1c02f1f6d7c052d5de1070` on
 `feature/storage-root-ownership`. It has been integrated with freshly fetched
 `origin/main` `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` by ordinary merge
@@ -15,16 +26,16 @@ review. The earlier candidate `4dd472075eed82f030efb0b39923cbf2416502cf` was not
 rewritten. These history milestones are not completion/readiness evidence.
 Old layout branches remain untouched and are not imported.
 
-Implemented structure: `pkg/hfdownloader/root_domain.go` (926 lines in this
-candidate) contains the root domain; `internal/server/storage_roots.go` (254
+Implemented structure: `pkg/hfdownloader/root_domain.go` (1076 lines in this
+candidate) contains the root domain; `internal/server/storage_roots.go` (261
 lines) is the configuration/presentation adapter. Stable lexical identity,
 role grouping, owned walking, copy/projection descriptors and primary-Hub
 eligibility are present. Their presence does not establish complete physical
 ancestry or protection of every destructive effect. #95 layout policy and frozen
 job associations remain the foundation, not a new implementation phase.
 
-Findings on immutable pre-correction HEAD (addressed in `957498e`; independent
-verification remains pending):
+Findings on immutable pre-correction HEAD (addressed in `957498e`; preserved
+by parent-reported current C1-C14 independent Linux verification):
 
 - **F1 high:** `containmentDistance` walks lexical ancestors of an externally
   configured alias, missing its real parent inside a destructive target.
@@ -44,7 +55,7 @@ verification remains pending):
   Parsed Hub repository type now chooses the model/dataset projection role;
   repository-name substrings no longer select the role.
 
-The shared correction is implemented in `pkg/hfdownloader/root_domain.go` and
+The F1/F2 shared correction is implemented in `pkg/hfdownloader/root_domain.go` and
 `internal/server/storage_roots.go`, with the handler using one fixed legacy-HF
 preflight before its first removal. The physical resolver preserves missing
 suffixes beneath resolved aliases without changing configured IDs. Owner
@@ -59,9 +70,29 @@ case-distinct IDs, captured base, source priority and frozen jobs. They also cov
 inverse aliases/missing descendants, model and dataset friendly-root refusal
 before either removal, symlinked friendly owner/projection components with
 sentinels preserved, and a valid model ID containing `datasets--`. These are
-implementation-local evidence, not independent gate completion.
+implementation-local evidence. Parent reports corresponding current independent
+production verification passed; this is not full phase-1 gate completion.
 
-Independent prior evidence remains historical and does not cover this candidate:
+## Current blocker: F3
+
+For T's child C exposed externally as protected bind-mounted S, EvalSymlinks
+does not change S's namespace. `containmentDistance` (`root_domain.go:286-326`)
+can return false/nil in both directions; `checkProtectedEffect:757-774` permits
+the effect. `NestedProtectedRoots:408-442` also misses S, while owned walking at
+C can match it by SameFile. The handler's existing complete preflight at
+`api.go:1706` therefore still permits unsafe Hub/friendly recursion.
+
+The read-only source inspection of Go 1.24.0 `os/removeall_at.go` establishes
+that Unix removal opens and recurses through directory entries without a
+mount-boundary exclusion: mounted directories are not symlink leaves. It may
+remove contents before an EBUSY directory-removal error. Negative resolved-name
+ancestor searches are consequently not proof of the intended deletion footprint.
+This is ordinary filesystem namespace behavior, not a hostile race/transaction
+claim. The correction model, C15-C23 cases and bounded assignments are in
+`reviews/mount-proof-reassessment.md`; the earlier resolved-ancestor hypothesis
+is explicitly superseded. No F3 code change has been made here.
+
+Independent earlier evidence remains historical and does not cover this candidate:
 
 - Reviewer `ses_ef4002372ffeSM2Ql95Bv3WFue`: full 16-file coverage,
   **changes required**, no external OCR (parent-supplied report).
@@ -120,5 +151,78 @@ execution against the integrated candidate.
   Windows evidence. No selected tests skipped on this Linux run.
 - No Go 1.24 executable or installation was available; Go 1.24 compatibility
   remains unverified. Native Windows/macOS filesystem behavior is unverified.
-- No independent tester/reviewer stage was performed; their pending evidence
-  must bind to the post-integration candidate.
+- At the time of those implementation-local runs, independent stages were still
+  pending. They have since run on `7dc62163` per the parent report above: C1-C14
+  passed, but full review requires changes for F3. Do not retain the old pending
+  statement as current status or treat those passes as mount-proof evidence.
+
+## Reassessment evidence and next action
+
+The earlier planning-only reassessment inspected the clean `7dc62163` worktree,
+existing domain/preflight, canonical artifacts, CI selectors and Go 1.24.0
+removal/Windows metadata source. It did not run tests or mounts. The parent later
+added the native Linux CI selector/job; its execution and native Windows/macOS
+results remain unestablished.
+
+The source correction now exists in the dirty worktree described below. The
+source branch, HEAD, #95 policy, Issue #76 and unpublished branches remain
+unchanged. No phase-2/3 mechanism or new filesystem-support policy is authorized.
+
+## F3 correction — implementation-local evidence
+
+`pkg/hfdownloader/root_effect.go` adds a private namespace-observation seam and
+an ephemeral bounded directory-edge walk. Each actual opened directory's
+`FileInfo` is identity-checked; entries are read in batches and only real
+directories recurse. Symlink leaves do not become content edges. Each namespace
+occurrence is traversed even when its directory identity appeared elsewhere;
+active-stack cycles, unreadable/partial entries, invalid identity, excessive
+depth/work, and close/open failures return unknown and refuse. The walk retains
+at most 100,000 directory/entry observations, at most 256 open recursion levels,
+at most 100,000 pairwise identity comparisons, and 128 entries per read call. It reads
+metadata only, not model bytes. No context is available at the existing domain
+preflight API; bounds and prompt descriptor closure are the applicable stop
+controls. It provides no hostile-writer atomicity guarantee.
+
+`checkProtectedEffect` preserves existing positive name/ancestor blockers but
+does not use negative ancestor results as permission. It compares reached
+directory identities against each configured protected existing directory or
+the deepest verified existing anchor of an ordinary missing reservation. The
+authorizing-root ID cannot suppress a graph hit. `NestedProtectedRoots` uses the
+same graph facts for existing roots and retains prior missing-root behavior.
+Both legacy effects still complete admission before the handler's first removal.
+
+Static semantic correspondence was checked against Go 1.24.0 sources:
+`removeall_at.go` first tries unlink; for directories it opens relative entries
+with `O_DIRECTORY|O_NOFOLLOW`, reads names and recurses, without a mount/device
+boundary check. Thus a bind-mounted directory is an actual recursive edge, while
+a symlink leaf is unlinked rather than traversed; final `AT_REMOVEDIR`/EBUSY can
+occur after content deletion. `removeall_noat.go` recurses after `Lstat` reports
+a directory. Go 1.24 Windows `types_windows.go` treats name-surrogate reparse
+points (including junctions) without `ModeDir`; `SameFile` identity loading can
+return false on failure. The implementation uses opened-directory `Stat` facts
+for comparison and refuses failed observations. This is static source reasoning,
+not Go 1.24 execution or native Windows evidence.
+
+Added portable model regressions establish that the fixture itself defeats both
+directions of the previous ancestor search, then cover a protected object reached
+under another parent, a missing reservation anchor, the authorizing root
+re-exposed in the effect, repeated same-object namespace views with distinct
+children, active cycles, partial reads, unreadable entry identity and exhausted
+depth. Linux
+`TestNativeMountProtectedRootReachability` uses only an isolated child mount
+namespace and disposable source/target directories; it tests Hub/friendly model
+and dataset cases, unmounts before cleanup, and honors
+`HFDESK_REQUIRE_NATIVE_MOUNTS=1` by failing rather than skipping setup problems.
+Local run skipped because `unshare(CLONE_NEWNS)` returned `operation not
+permitted`; no fixture mount was created. The parent-added Go 1.24 Ubuntu CI job
+is configured but has not executed. There is no claim of native mount pass.
+
+Implementation-local validation on Linux Go 1.26.7 passed focused F3/domain and
+server tests, `go test ./... -count=1`, `go test ./... -race -count=1`,
+`go vet ./...`, and `go build -o <scratch>/hfdesk ./cmd/hfdesk` with isolated
+HOME/XDG/APPDATA/LOCALAPPDATA/HF/TMP; the downloader test binary also cross-built
+for Windows/amd64. Temporary validation scratch was
+cleaned after removing Go module-cache read-only permissions within that owned
+directory. Independent tester/review, Go 1.24 native-mount CI, and native
+Windows/macOS remain pending. This work does not complete Phase 1 or authorize
+Phase 2/publication.
