@@ -1,0 +1,129 @@
+name: Validate Agentic Contract
+
+# Deterministic, no-LLM validation of the agentic triage contract:
+#  - the shared workflow sources validate/compile
+#  - lock files are in sync with their sources
+#  - safe-output configuration is warning/deprecation-free
+#  - labels and contract files referenced by the policy exist
+# The pinned private shared import is resolved from the vendored
+# .github/aw/imports/** snapshot, so no long-lived token is required.
+on:
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "CONTRIBUTING.md"
+      - ".github/triage-policy.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE*"
+      - ".github/labels.yml"
+      - ".github/workflows/*.md"
+      - ".github/workflows/*.lock.yml"
+      - ".github/aw/**"
+      - ".github/workflows/validate-agentic-contract.yml"
+  push:
+    branches: [main]
+    paths:
+      - "AGENTS.md"
+      - "CONTRIBUTING.md"
+      - ".github/triage-policy.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE*"
+      - ".github/labels.yml"
+      - ".github/workflows/*.md"
+      - ".github/workflows/*.lock.yml"
+      - ".github/aw/**"
+      - ".github/workflows/validate-agentic-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: validate-agentic-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GH_AW_VERSION: v0.89.21
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install gh-aw pinned to ${{ env.GH_AW_VERSION }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh extension install github/gh-aw --pin "$GH_AW_VERSION" --force
+          gh aw --version
+
+      - name: Validate agentic workflow sources (strict)
+        run: |
+          set -euo pipefail
+          gh aw validate --strict | tee /tmp/gh-aw-validate.log
+
+      - name: Compile (strict) and assert lock freshness
+        run: |
+          set -euo pipefail
+          gh aw compile --strict | tee /tmp/gh-aw-compile.log
+          # gh-aw auto-appends a .lock.yml entry to the root .gitattributes on every
+          # compile; that generated side effect is not part of this contract change.
+          git checkout -- .gitattributes 2>/dev/null || true
+          if ! git diff --exit-code; then
+            echo "::error::Lock files are out of sync with their .md sources (or the vendored import cache drifted). Run 'gh aw compile --strict' and commit the result."
+            exit 1
+          fi
+
+      - name: Assert no deprecation or unexpected warnings
+        run: |
+          set -euo pipefail
+          if grep -n -i -E 'deprecat|unknown property|additional propert' /tmp/gh-aw-validate.log /tmp/gh-aw-compile.log; then
+            echo "::error::Deprecated/unknown frontmatter or unexpected safe-output warnings detected."
+            exit 1
+          fi
+          echo "No deprecation/unknown-property warnings."
+
+      - name: Validate safe-output configuration
+        run: |
+          set -euo pipefail
+          # compile already validates safe-outputs; assert the compiled lock files
+          # carry a configuration and never enable label creation.
+          for lock in .github/workflows/issue-triage.lock.yml \
+                      .github/workflows/pr-semantic-intake.lock.yml \
+                      .github/workflows/backlog-retriage.lock.yml; do
+            test -f "$lock" || { echo "::error::Missing lock file $lock"; exit 1; }
+            grep -q 'GH_AW_SAFE_OUTPUTS_CONFIG' "$lock" || { echo "::error::$lock has no safe-outputs config"; exit 1; }
+            if grep -q 'create-if-missing' "$lock"; then
+              echo "::error::$lock enables label creation (create-if-missing); forbidden."
+              exit 1
+            fi
+            if ! grep -q 'GH_AW_SAFE_OUTPUTS_STAGED: "true"' "$lock"; then
+              echo "::error::$lock is not installed in staged safe-output mode."
+              exit 1
+            fi
+          done
+          echo "Safe-outputs staged and no label creation enabled."
+
+      - name: Detect missing contract files and renamed/removed managed labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/aw/validate-contract.py
+
+      - name: Resolve private import from vendored cache (no long-lived token)
+        run: |
+          set -euo pipefail
+          # Prove the pinned private shared import resolves from the vendored,
+          # SHA-keyed cache and NOT from the private sibling repository.
+          missing=0
+          for f in .github/aw/imports/bashrusakh/repo-docs-sync/*/packages_ghaw-triage_workflows_contract-invariant.md \
+                   .github/aw/imports/bashrusakh/repo-docs-sync/*/packages_ghaw-triage_workflows_issue-triage-core.md \
+                   .github/aw/imports/bashrusakh/repo-docs-sync/*/packages_ghaw-triage_workflows_pr-intake-core.md \
+                   .github/aw/imports/bashrusakh/repo-docs-sync/*/packages_ghaw-triage_workflows_backlog-retriage-core.md; do
+            if [ -e "$f" ]; then echo "vendored: $f"; else echo "::error::Missing vendored import $f"; missing=1; fi
+          done
+          exit "$missing"
