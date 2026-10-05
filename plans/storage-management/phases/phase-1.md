@@ -1,10 +1,11 @@
 # Phase 1 — root/path ownership
 
-Status: **F3 correction implemented locally; independent/native evidence pending**.
-Source identity: base `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` and
-candidate `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`; merge base equals base.
-Parent reports current Linux C1-C14 production verification passed; full review
-requires changes for F3. No native mount reproduction or universal proof passed.
+Status: **F3-F6 corrections implemented locally; independent/native evidence pending**.
+Source baseline HEAD `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`; the dirty
+worktree carries F4-F6. Base and merge base are
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The earlier full review's F3
+counterexample remains the historical reason for correction; no native mount
+reproduction or universal proof has passed.
 
 ## Contract
 
@@ -187,9 +188,10 @@ neither selector success nor model-only tests establish native adapter behavior.
 
 ## Current implementation/evidence boundary
 
-The clean integrated source at `7dc62163` includes correction `957498e` and the
-expanded Windows selectors. Complete F1/F2 preflight and symlink/reservation
-preservation have independent Linux evidence. F3 correction is now present in
-the dirty implementation worktree; full native/reviewer proof remains pending.
+Historical clean integrated source `7dc62163` includes correction `957498e` and
+the expanded Windows selectors. Complete F1/F2 preflight and symlink/reservation
+preservation have independent Linux evidence on that earlier candidate. Later
+F3-F6 corrections are in the current dirty worktree; full native/reviewer proof
+remains pending.
 See
 [`phase-1-impl.md`](../implementation/phase-1-impl.md) for evidence provenance.

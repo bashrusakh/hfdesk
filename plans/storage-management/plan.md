@@ -2,22 +2,23 @@
 
 Canonical foundation: merged PR #95 on `main` (HF_HUB_CACHE wins over an explicit cacheDir). Issue #76 remains closed. PR #70 is superseded evidence only; its implementation and unpublished layout candidates are not a baseline.
 
-Current phase: **1, F3 correction implemented locally; independent/native evidence pending**.
-Implementation worktree is based on `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`
-on `feature/storage-root-ownership`; base and merge base are
-`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The worktree is dirty with the
-authorized CI/planner changes and this source/test correction; no commit or
-publication occurred.
+Current phase: **1, F3-F6 corrections implemented locally; independent/native
+evidence pending**. Source baseline HEAD is
+`9498fc344a308f26dd02b5c9bbcebb2380ccdf93` on `feature/storage-root-ownership`;
+the dirty worktree contains the final F4-F6 correction. Base and merge base are
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The authorized correction and CI
+follow-up are in the dirty worktree and are not yet committed.
 
 The workflow owner reports 40 independent production scenarios passing the
 Linux C1-C14 boundary, including the safe C10 secondary permission failure.
-Preserve those corrections. The former clean candidate's full review required
-changes because F3 showed ordinary bind-mount aliases invalidate resolved-name
-ancestor searches as proof of physical noncontainment. The correction now matches
-protected directory objects/verified missing anchors against the complete bounded
-recursive effect graph. Local Go 1.26.7 evidence is implementation-local only;
-native Go 1.24 mount CI, independent verification/review, Windows and macOS
-evidence remain pending.
+Preserve those corrections. The earlier full review required changes because F3
+showed ordinary bind-mount aliases invalidate resolved-name ancestor searches as
+proof of physical noncontainment. The corrected bounded effect-graph proof also
+requires explicit EOF after short successful reads, preserves missing-anchor
+identity separately from an existing protected root, and makes the native fixture
+enter a kernel-created private mount namespace before Go runtime startup. Go
+1.26.7 local evidence is implementation-local only; Go 1.24 native-mount CI,
+independent verification/review, Windows and macOS evidence remain pending.
 
 This plan covers the authorized Issue #63 replacement in four bounded phases:
 
@@ -38,7 +39,7 @@ model is in [phase 1](phases/phase-1.md) and the current
 The earlier [symlink/effect-set reassessment](reviews/protected-roots-reassessment.md)
 is historical; its resolved-ancestor negative-proof hypothesis is superseded.
 
-Next safe action: reconcile the final local source/test/CI/planner diff, then run
-the integrated independent checkpoint and full stable-diff review. Execute the
+Next safe action: run the integrated independent checkpoint and full stable-diff
+review against the committed candidate. Execute the
 required Go 1.24 private-namespace mount CI job before any Ready decision. Phase 2
 cannot use phase 1 as a completed foundation until these gates pass.

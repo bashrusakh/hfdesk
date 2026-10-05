@@ -1,12 +1,13 @@
 # Mount-namespace / actual-effect proof reassessment
 
-Status: **changes required; planning only**. Inspected clean candidate
+Historical review status: **changes required**. Inspected clean candidate
 `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee` on
 `feature/storage-root-ownership`; base/merge base/main
 `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`.
-No source/config/test/branch edits, mounts, tooling installation, agents,
-commits or publication occur in this stage. F1/F2 correction `957498e` and the
-complete Hub/friendly preflight are to be preserved, not restarted.
+That review found F3; its counterexample and analysis below are preserved as
+historical evidence. The later bounded source correction and follow-ups are
+recorded in the resolution section. F1/F2 correction `957498e` and the complete
+Hub/friendly preflight remain preserved, not restarted.
 
 ## Authority, current evidence and counterexample
 
@@ -173,3 +174,31 @@ One integrated independent tester checkpoint then full stable-diff review is
 required after correction. Native mount and platform gaps stay explicit even if
 portable model/adapter proof is sufficient for a narrower claim. Phase 2 and
 publication remain blocked on the foundation evidence; no gate is passed here.
+
+## Bounded source correction and current evidence
+
+On source baseline HEAD `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`, the dirty
+worktree contains the debugger's bounded actual-directory-edge observation under
+the existing owner and C15-C23 model/native cases described above, plus three
+narrow follow-ups that close evidence gaps:
+
+- Short successful directory reads no longer imply exhaustion. Enumeration
+  continues through explicit EOF; empty success without EOF and non-EOF read
+  errors produce unknown/refusal.
+- A missing reservation's verified existing anchor is not conflated with an
+  existing protected root, so nested-root reconciliation retains the missing
+  reservation under an alias.
+- The native fixture is launched with `CLONE_NEWNS` by the parent process before
+  Go runtime startup and validates its mount namespace against the kernel's
+  actual parent namespace. The worker environment marker cannot substitute for
+  this isolation check. CI asserts that the exact positive bind-mount fixture is
+  selected.
+
+Final implementation-local Linux Go 1.26.7 checks pass: focused and full tests,
+full race suite, vet, build, Windows cross-build and diff checks. The ordinary
+native test skips because this host cannot create the private namespace; required
+mode fails on the same capability denial, not as a native test pass. The required
+Go 1.24 CI job has not run. Independent integrated verification/review, actual
+Go 1.24 native-mount execution, and native Windows/macOS evidence are pending;
+Phase 1 and Phase 2 remain blocked. See `../implementation/phase-1-impl.md` for
+the source/evidence record.

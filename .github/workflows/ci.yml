@@ -55,8 +55,8 @@ jobs:
           set -euo pipefail
           selected="$(go test ./pkg/hfdownloader ./internal/server -list '^TestNativeMount')"
           printf '%s\n' "$selected"
-          if ! grep -Eq '^TestNativeMount[^[:space:]]*$' <<<"$selected"; then
-            echo 'No TestNativeMount* tests were selected; refusing an empty green job.' >&2
+          if ! grep -Fxq 'TestNativeMountProtectedRootReachability' <<<"$selected"; then
+            echo 'Required positive bind-mount fixture TestNativeMountProtectedRootReachability is missing; refusing a green job.' >&2
             exit 1
           fi
 

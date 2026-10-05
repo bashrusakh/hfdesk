@@ -123,8 +123,19 @@ func (set *ManagedRootSet) observeEffectDirectories(root string) ([]reachedDirec
 				_ = dir.close()
 				return fmt.Errorf("read effect directory %q: %w", path, readErr)
 			}
-			if len(entries) < effectReadBatch || readErr != nil {
+			if errors.Is(readErr, io.EOF) {
 				break
+			}
+			if readErr != nil {
+				_ = dir.close()
+				return fmt.Errorf("read effect directory %q: %w", path, readErr)
+			}
+			// A short successful batch is not proof of exhaustion. Readers may
+			// omit entries that disappear while being enumerated; keep reading
+			// until explicit EOF, but reject zero-progress success to avoid a loop.
+			if len(entries) == 0 {
+				_ = dir.close()
+				return fmt.Errorf("read effect directory %q made no progress without EOF", path)
 			}
 		}
 		if err := dir.close(); err != nil {
@@ -139,7 +150,8 @@ func (set *ManagedRootSet) observeEffectDirectories(root string) ([]reachedDirec
 }
 
 type protectedDirectory struct {
-	info os.FileInfo
+	info     os.FileInfo
+	existing bool
 }
 
 // protectedDirectoryFact retains either the existing protected directory or
@@ -155,7 +167,7 @@ func protectedDirectoryFact(root ManagedRoot, observer effectObserver) (protecte
 			if !info.IsDir() || !os.SameFile(info, info) {
 				return protectedDirectory{}, fmt.Errorf("protected root identity is not established: %q", current)
 			}
-			return protectedDirectory{info: info}, nil
+			return protectedDirectory{info: info, existing: current == path}, nil
 		}
 		if !os.IsNotExist(err) {
 			return protectedDirectory{}, fmt.Errorf("inspect protected root %q: %w", current, err)

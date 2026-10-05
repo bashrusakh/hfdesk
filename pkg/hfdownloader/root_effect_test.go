@@ -24,6 +24,7 @@ func (e observedEntry) Info() (os.FileInfo, error) { return e.info, e.err }
 type observedDirectory struct {
 	info    os.FileInfo
 	entries []os.DirEntry
+	batches [][]os.DirEntry
 	err     error
 }
 
@@ -50,11 +51,20 @@ func (n *observedNamespace) statDir(path string) (os.FileInfo, error) {
 
 type observedHandle struct {
 	observedDirectory
-	read bool
+	read  bool
+	batch int
 }
 
 func (h *observedHandle) stat() (os.FileInfo, error) { return h.info, nil }
 func (h *observedHandle) readDir(int) ([]os.DirEntry, error) {
+	if len(h.batches) > 0 {
+		if h.batch < len(h.batches) {
+			entries := h.batches[h.batch]
+			h.batch++
+			return entries, nil
+		}
+		return nil, io.EOF
+	}
 	if h.read {
 		if h.err != nil {
 			return nil, h.err
@@ -64,6 +74,63 @@ func (h *observedHandle) readDir(int) ([]os.DirEntry, error) {
 	h.read = true
 	return h.entries, h.err
 }
+
+func TestManagedRootEffectProofContinuesAfterShortSuccessfulBatch(t *testing.T) {
+	base := t.TempDir()
+	hub := filepath.Join(base, "hub")
+	effect := filepath.Join(hub, "models--owner--model")
+	first, firstInfo := modelObservedDir(t, filepath.Join(effect, "first"))
+	protectedPath := filepath.Join(effect, "later")
+	_, protectedInfo := modelObservedDir(t, protectedPath)
+	set := NewManagedRootSet(base, []ManagedRootSpec{
+		{Path: hub, Roles: ManagedRootHub | ManagedRootProtected},
+		{Path: filepath.Join(base, "elsewhere", "reservation"), Roles: ManagedRootProtected},
+	})
+	set.observe = &observedNamespace{
+		dirs: map[string]observedDirectory{
+			effect: {info: mustStat(t, effect), batches: [][]os.DirEntry{
+				{observedEntry{name: "first", info: firstInfo}},
+				{observedEntry{name: "later", info: protectedInfo}},
+			}},
+			filepath.Join(effect, "first"): first,
+			protectedPath:                  {info: protectedInfo},
+		},
+		stat: map[string]os.FileInfo{filepath.Join(base, "elsewhere", "reservation"): protectedInfo},
+	}
+	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
+		t.Fatal("short successful batch hid a later protected effect")
+	}
+}
+
+func TestManagedRootEffectProofRequiresEOFForCompletion(t *testing.T) {
+	base := t.TempDir()
+	effect := filepath.Join(base, "effect")
+	root, _ := modelObservedDir(t, effect)
+	set := NewManagedRootSet(base, nil)
+	set.observe = &observedNamespace{dirs: map[string]observedDirectory{
+		effect: {info: root.info, batches: [][]os.DirEntry{{}}},
+	}}
+	if _, err := set.observeEffectDirectories(effect); err == nil {
+		t.Fatal("empty successful batch was mistaken for explicit exhaustion")
+	}
+}
+
+func TestManagedRootEffectProofAcceptsShortBatchFollowedByEOF(t *testing.T) {
+	base := t.TempDir()
+	effect := filepath.Join(base, "effect")
+	child, childInfo := modelObservedDir(t, filepath.Join(effect, "child"))
+	child.err = io.EOF
+	root, _ := modelObservedDir(t, effect)
+	set := NewManagedRootSet(base, nil)
+	set.observe = &observedNamespace{dirs: map[string]observedDirectory{
+		effect:                         {info: root.info, batches: [][]os.DirEntry{{observedEntry{name: "child", info: childInfo}}}},
+		filepath.Join(effect, "child"): child,
+	}}
+	if _, err := set.observeEffectDirectories(effect); err != nil {
+		t.Fatalf("short successful batch followed by EOF: %v", err)
+	}
+}
+
 func (*observedHandle) close() error { return nil }
 
 func modelObservedDir(t *testing.T, path string, children ...os.DirEntry) (observedDirectory, os.FileInfo) {

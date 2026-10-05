@@ -436,7 +436,7 @@ func (set *ManagedRootSet) NestedProtectedRoots(rootID string) ([]ManagedRoot, e
 			if err != nil {
 				return nil, err
 			}
-			if os.SameFile(reached[0].info, fact.info) {
+			if fact.existing && os.SameFile(reached[0].info, fact.info) {
 				continue
 			}
 			intersects, err := effectIntersectsProtected(reached, fact, &comparisonBudget)

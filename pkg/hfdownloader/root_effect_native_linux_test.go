@@ -4,6 +4,7 @@ package hfdownloader
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,8 @@ func TestNativeMountProtectedRootReachability(t *testing.T) {
 		return
 	}
 	cmd := exec.Command(os.Args[0], "-test.v", "-test.run=^TestNativeMountProtectedRootReachability$")
-	cmd.Env = append(os.Environ(), nativeMountChildEnv+"=1")
+	cmd.Env = nativeMountTestEnv(true)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
 	var output bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &output
 	err := cmd.Run()
@@ -33,6 +35,9 @@ func TestNativeMountProtectedRootReachability(t *testing.T) {
 		t.Skipf("native mount fixture unavailable:\n%s", output.String())
 	}
 	if err != nil {
+		if os.Getenv("HFDESK_REQUIRE_NATIVE_MOUNTS") != "1" && !strings.Contains(output.String(), "--- FAIL:") {
+			t.Skipf("cannot start private mount-namespace process: %v", err)
+		}
 		t.Fatalf("isolated native mount subprocess failed: %v\n%s", err, output.String())
 	}
 	if !strings.Contains(output.String(), "native bind-mount cases exercised") {
@@ -40,13 +45,46 @@ func TestNativeMountProtectedRootReachability(t *testing.T) {
 	}
 }
 
+func TestNativeMountWorkerMarkerCannotBypassNamespaceIsolation(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.v", "-test.run=^TestNativeMountProtectedRootReachability$")
+	cmd.Env = nativeMountTestEnv(true)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("worker marker entered native fixture without namespace isolation:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), "native mount fixture is not isolated in a distinct process namespace") {
+		t.Fatalf("worker marker was not rejected by the namespace check: %v\n%s", err, output.String())
+	}
+	if strings.Contains(output.String(), "cannot make fixture mount namespace private") || strings.Contains(output.String(), "bind-mount") {
+		t.Fatalf("unsafe worker reached mount setup before isolation rejection:\n%s", output.String())
+	}
+}
+
+func nativeMountTestEnv(worker bool) []string {
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		if strings.HasPrefix(value, nativeMountChildEnv+"=") {
+			continue
+		}
+		env = append(env, value)
+	}
+	if worker {
+		env = append(env, nativeMountChildEnv+"=1")
+	}
+	return env
+}
+
 func runNativeMountProtectedRootCases(t *testing.T) {
 	required := os.Getenv("HFDESK_REQUIRE_NATIVE_MOUNTS") == "1"
-	if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil {
-		if required {
-			t.Fatalf("required private mount namespace unavailable: %v", err)
-		}
-		t.Skipf("cannot create private mount namespace: %v", err)
+	currentNamespace, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		t.Fatalf("identify worker mount namespace: %v", err)
+	}
+	parentNamespace, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", os.Getppid()))
+	if err != nil || currentNamespace == parentNamespace {
+		t.Fatalf("native mount fixture is not isolated in a distinct process namespace: worker=%q kernel-parent=%q err=%v", currentNamespace, parentNamespace, err)
 	}
 	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		if required {

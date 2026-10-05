@@ -138,6 +138,28 @@ func TestManagedRootNestedProtectedFindsInverseAliasAndMissingDescendant(t *test
 	}
 }
 
+func TestManagedRootNestedProtectedKeepsMissingReservationUnderRootAlias(t *testing.T) {
+	base := t.TempDir()
+	hub := filepath.Join(base, "hub")
+	if err := os.MkdirAll(filepath.Join(hub, "models--owner--model"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "hub-alias")
+	if err := os.Symlink(hub, alias); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	rootID := ManagedRootID(hub, base)
+	reservedID := ManagedRootID(filepath.Join(alias, "not-yet-created"), base)
+	set := NewManagedRootSet(base, []ManagedRootSpec{
+		{Path: hub, Roles: ManagedRootHub | ManagedRootProtected},
+		{Path: filepath.Join(alias, "not-yet-created"), Roles: ManagedRootProtected},
+	})
+	nested, err := set.NestedProtectedRoots(rootID)
+	if err != nil || len(nested) != 1 || nested[0].ID != reservedID {
+		t.Fatalf("missing reservation under root alias = %#v, %v; want %s", nested, err, reservedID)
+	}
+}
+
 func TestManagedRootGroupsMergeRestrictionsOnlyForProvenAliases(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(base, "cache")

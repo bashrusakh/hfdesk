@@ -1,15 +1,13 @@
 # Phase 1 implementation record
 
-Status: **F3 correction implemented locally; independent/native evidence pending**.
-Current clean inspected candidate is
-`7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee`, with base and merge base
-`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. Full current diff is 17 files,
-3097 additions / 333 deletions. Parent reports current full review requires
-changes, while 40 independent Linux production scenarios passed C1-C14,
-including real C10 permission failure returning 200 with `success:false`.
-Those passes do not cover bind namespaces. F3 is static source/system evidence;
-no native mount reproduction was possible on the review host (no CAP_SYS_ADMIN).
-No source correction/publication occurs in this plan-only update.
+Status: **F3-F6 corrections implemented locally; independent/native evidence pending**.
+Earlier clean candidate `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee` received
+changes-required review; source baseline HEAD is
+`9498fc344a308f26dd02b5c9bbcebb2380ccdf93` and the dirty worktree carries
+F4-F6. Base and merge base are `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`.
+The parent-reported 40 independent
+Linux C1-C14 scenarios, including C10, were on the earlier candidate and do not
+cover bind namespaces. No native mount reproduction was possible on this host.
 
 Historical source correction/integration:
 The correction is committed as `957498e59c3580b38d1c02f1f6d7c052d5de1070` on
@@ -125,7 +123,7 @@ source or root guidance changed. The merge retained those upstream changes and
 the task-branch source correction. No test here claims native Windows or Go 1.24
 execution against the integrated candidate.
 
-## Local implementation evidence
+## Earlier local implementation evidence (historical)
 
 - Regressions first failed: inverse alias descendant was omitted by
   `NestedProtectedRoots`; real model and dataset DELETE requests returned 200
@@ -217,7 +215,7 @@ Local run skipped because `unshare(CLONE_NEWNS)` returned `operation not
 permitted`; no fixture mount was created. The parent-added Go 1.24 Ubuntu CI job
 is configured but has not executed. There is no claim of native mount pass.
 
-Implementation-local validation on Linux Go 1.26.7 passed focused F3/domain and
+Earlier implementation-local validation on Linux Go 1.26.7 passed focused F3/domain and
 server tests, `go test ./... -count=1`, `go test ./... -race -count=1`,
 `go vet ./...`, and `go build -o <scratch>/hfdesk ./cmd/hfdesk` with isolated
 HOME/XDG/APPDATA/LOCALAPPDATA/HF/TMP; the downloader test binary also cross-built
@@ -226,3 +224,31 @@ cleaned after removing Go module-cache read-only permissions within that owned
 directory. Independent tester/review, Go 1.24 native-mount CI, and native
 Windows/macOS remain pending. This work does not complete Phase 1 or authorize
 Phase 2/publication.
+
+## Final local correction and evidence boundary
+
+On source baseline HEAD `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`, the dirty
+worktree includes three narrow follow-ups to the bounded observer and native
+fixture:
+
+- **F4:** a successful short `ReadDir` batch is not exhaustion. Continue until
+  explicit EOF; reject zero-entry success without EOF and any non-EOF error.
+  Tests cover a short batch hiding a later protected entry, empty non-EOF, and
+  short batch followed by EOF.
+- **F5:** distinguish an actually existing protected root from the existing
+  anchor of a missing reservation. Only the former can be skipped as the root
+  itself during `NestedProtectedRoots`; a missing reservation beneath a root
+  alias remains represented. A focused regression covers it.
+- **F6:** start the native test subprocess with `CLONE_NEWNS` before Go runtime
+  startup and compare `/proc/self/ns/mnt` against `/proc/<actual-parent>/ns/mnt`.
+  The environment marker alone cannot bypass isolation; a negative regression
+  verifies rejection before mount setup. The CI selector now requires the exact
+  positive bind-mount test as well as running the selected native cases.
+
+Final implementation-local evidence: changed Go files formatted; focused package
+tests, package race tests, full `go test ./...`, full `go test ./... -race`, vet,
+build, Windows cross-build, and diff checks passed on Linux Go 1.26.7. Ordinary
+native tests skip because this host denies private mount namespaces; required
+mode correctly fails on that capability denial and is not a mount pass.
+Independent tester/review, actual Go 1.24 private-namespace CI, native Windows
+and macOS evidence remain pending. Phase 1 is not complete.
