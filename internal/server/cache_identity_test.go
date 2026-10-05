@@ -439,6 +439,43 @@ func TestCacheDiskUsesExactHub(t *testing.T) {
 	}
 }
 
+func TestManifestAssociationUsesPhysicalEvidenceOnly(t *testing.T) {
+	base := isolateCacheState(t)
+	store := filepath.Join(base, "store")
+	link := filepath.Join(base, "hub-link")
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(store, link); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	cache := hfdownloader.NewHFCacheResolved(filepath.Join(base, "app"), link, 0)
+	repo, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(repo.SnapshotsDir(), "revision", "weights.bin")
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	physicalRepo := filepath.Join(store, filepath.Base(repo.Path()))
+	manifest := &hfdownloader.DownloadManifest{RepoPath: physicalRepo}
+	if !manifestBelongsToRepo(cache, repo, manifest) {
+		t.Fatal("manifest path naming the same existing repository object was not associated")
+	}
+	otherRepo := filepath.Join(base, "other", filepath.Base(repo.Path()))
+	if err := os.MkdirAll(otherRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest.RepoPath = otherRepo
+	if manifestBelongsToRepo(cache, repo, manifest) {
+		t.Fatal("manifest path naming a different repository object was accepted")
+	}
+}
+
 func cacheRequest(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -707,6 +744,66 @@ func TestExactHubDeleteRetainsRootSymlinkGuard(t *testing.T) {
 	}
 	if _, err := os.Stat(repo); err != nil {
 		t.Fatalf("delete followed root link: %v", err)
+	}
+}
+
+func TestWholeHubDeleteRefusesConfiguredNestedRoot(t *testing.T) {
+	base := isolateCacheState(t)
+	r, h := filepath.Join(base, "friendly"), filepath.Join(base, "selected-hub")
+	t.Setenv("HF_HUB_CACHE", h)
+	repo := filepath.Join(h, "models--owner--model")
+	nested := filepath.Join(repo, "application-data")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(nested, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{CacheDir: r, LocalScanDirs: []string{nested}})
+	w := cacheRequest(t, s, "DELETE", "/api/cache/owner/model", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("nested configured root delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "keep" {
+		t.Fatalf("configured nested root was changed: %q %v", got, err)
+	}
+}
+
+func TestWholeHubDeleteKeepsExternalModelAndDatasetSupport(t *testing.T) {
+	for _, tc := range []struct {
+		typeName string
+		prefix   string
+	}{
+		{typeName: "model", prefix: "models--"},
+		{typeName: "dataset", prefix: "datasets--"},
+	} {
+		t.Run(tc.typeName, func(t *testing.T) {
+			base := isolateCacheState(t)
+			friendly := filepath.Join(base, "friendly")
+			externalHub := filepath.Join(base, "separate-hub")
+			t.Setenv("HF_HUB_CACHE", externalHub)
+			repo := filepath.Join(externalHub, tc.prefix+"owner--name")
+			if err := os.MkdirAll(filepath.Join(repo, "snapshots", "revision"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(repo, "snapshots", "revision", "weights.bin")
+			if err := os.WriteFile(marker, []byte("weights"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s := New(Config{CacheDir: friendly})
+			requestPath := "/api/cache/owner/name"
+			if tc.typeName == "dataset" {
+				requestPath += "?type=dataset"
+			}
+			response := cacheRequest(t, s, "DELETE", requestPath, "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("external %s delete status=%d body=%s", tc.typeName, response.Code, response.Body.String())
+			}
+			if _, err := os.Stat(repo); !os.IsNotExist(err) {
+				t.Fatalf("external %s repository was not removed: %v", tc.typeName, err)
+			}
+		})
 	}
 }
 

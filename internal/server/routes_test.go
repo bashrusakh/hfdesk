@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -572,17 +571,26 @@ func TestAPI_StartDownload_InvalidRouteKey(t *testing.T) {
 func TestConfiguredPathIdentity(t *testing.T) {
 	upper := filepath.Join(t.TempDir(), "Audio")
 	lower := filepath.Join(filepath.Dir(upper), "audio")
-	want := []string{upper, lower}
-	if runtime.GOOS == "windows" {
-		want = []string{upper}
+	for _, dir := range []string{upper, lower} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
+	upperInfo, upperErr := os.Stat(upper)
+	lowerInfo, lowerErr := os.Stat(lower)
+	sameObject := upperErr == nil && lowerErr == nil && os.SameFile(upperInfo, lowerInfo)
+	if configuredPathID(upper, mustWorkingDirectory()) == configuredPathID(lower, mustWorkingDirectory()) {
+		t.Fatal("case-distinct path spellings shared a configured root ID")
+	}
+	want := []string{upper, lower}
 	paths := []string{"  " + upper + "  ", upper + string(filepath.Separator), lower, " "}
 	if got := cleanPathList(paths); !reflect.DeepEqual(got, want) {
 		t.Errorf("cleanPathList = %v, want %v", got, want)
 	}
 	routes := map[string]string{"audio": upper, "embedding": lower, "llm": upper + string(filepath.Separator)}
-	if got := routeDirs(routes); !reflect.DeepEqual(got, want) {
-		t.Errorf("routeDirs = %v, want %v", got, want)
+	routeWant := cleanPathList([]string{upper, lower})
+	if got := routeDirs(routes); !reflect.DeepEqual(got, routeWant) {
+		t.Errorf("routeDirs = %v, want %v", got, routeWant)
 	}
 	roots := localCacheRoots(filepath.Join(filepath.Dir(upper), "cache"), upper, cleanPathList(paths), routes)
 	var got []string
@@ -591,25 +599,27 @@ func TestConfiguredPathIdentity(t *testing.T) {
 			got = append(got, root.Path)
 		}
 	}
-	if !reflect.DeepEqual(got, want) {
+	wantRootCount := 2
+	if sameObject {
+		wantRootCount = 1
+	}
+	if len(got) != wantRootCount {
 		t.Errorf("localCacheRoots = %v, want %v", got, want)
 	}
-	// Both configured spellings must be allowed, even when Windows dedups them.
+	// Both requested spellings remain valid even when the filesystem proves
+	// they are aliases for one directory.
 	srv := &Server{config: Config{DownloadRoutes: routes}}
 	for _, dir := range []string{upper, lower} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
 		w := httptest.NewRecorder()
 		srv.handleDiskFree(w, httptest.NewRequest("GET", "/api/diskfree?path="+dir, nil))
 		if w.Code != http.StatusOK {
 			t.Errorf("diskfree %s: %d %s", dir, w.Code, w.Body.String())
 		}
 	}
-	// Cache special directories are skipped only when the local root is the
-	// cache itself, not a distinct Linux directory with case-only differences.
+	// Cache special directories are skipped when the filesystem confirms the
+	// local root and cache root are the same directory object.
 	for _, localDir := range []string{lower, upper} {
-		wantSkip := localDir == lower || runtime.GOOS == "windows"
+		wantSkip := localDir == lower || sameObject
 		for _, root := range localCacheRoots(lower, localDir, nil, nil) {
 			if root.Path == localDir && root.SkipSpecial != wantSkip {
 				t.Errorf("local %s SkipSpecial = %v, want %v", localDir, root.SkipSpecial, wantSkip)
@@ -618,10 +628,333 @@ func TestConfiguredPathIdentity(t *testing.T) {
 	}
 }
 
-func TestCaseDistinctRouteDestinations(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("requires Linux case-sensitive directories")
+func TestLocalCacheRootsUseFilesystemEvidenceForAliases(t *testing.T) {
+	parent := t.TempDir()
+	actual := filepath.Join(parent, "cache")
+	alias := filepath.Join(parent, "cache-alias")
+	if err := os.Mkdir(actual, 0o755); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.Symlink(actual, alias); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	roots := localCacheRoots(actual, actual, []string{alias}, nil)
+	var matching []localCacheRoot
+	for _, root := range roots {
+		if sameDirectoryObject(root.Path, actual) {
+			matching = append(matching, root)
+		}
+	}
+	if len(matching) != 1 {
+		t.Fatalf("physical aliases yielded %d root definitions: %#v", len(matching), matching)
+	}
+	if matching[0].Source != "Local" || !matching[0].SkipSpecial {
+		t.Fatalf("merged root restrictions/source = %#v", matching[0])
+	}
+	if configuredPathID(actual, parent) == configuredPathID(alias, parent) {
+		t.Fatal("physical aliases collapsed into one configured root ID")
+	}
+	missingA := filepath.Join(parent, "Missing")
+	missingB := filepath.Join(parent, "missing")
+	if pathIdentityKeyAt(missingA, parent) == pathIdentityKeyAt(missingB, parent) {
+		t.Fatalf("configured lexical identities unexpectedly collapsed: %q", missingA)
+	}
+}
+
+func TestManagedRootSetCapturedIdentityAndFreshObservations(t *testing.T) {
+	base := t.TempDir()
+	missing := filepath.Join(base, "missing-root")
+	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), "relative-models", []string{missing}, nil, base)
+	var missingID string
+	for _, root := range set.roots {
+		if root.Path == missing {
+			missingID = root.ID
+		}
+	}
+	if missingID == "" {
+		t.Fatal("configured missing root was not registered")
+	}
+	firstID := configuredPathID("relative-models", base)
+	if pathIdentityKeyAt("relative-models", base) != filepath.Join(base, "relative-models") {
+		t.Fatal("relative lexical identity did not use captured base")
+	}
+	if err := os.Mkdir(missing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setAfterCreate := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), "relative-models", []string{missing}, nil, base)
+	var afterID string
+	for _, root := range setAfterCreate.roots {
+		if root.Path == missing {
+			afterID = root.ID
+		}
+	}
+	if afterID != missingID {
+		t.Fatalf("root ID changed after path creation: %q != %q", afterID, missingID)
+	}
+	if configuredPathID("relative-models", base) != firstID {
+		t.Fatal("captured lexical ID changed across a new generation")
+	}
+	if err := os.MkdirAll(filepath.Join(base, "relative-models", "owner", "model"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(base, "elsewhere")
+	if err := os.Mkdir(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(workingDirectory); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	ownerAfterCWDChange, err := set.OwnerForPath(filepath.Join("relative-models", "owner", "model"))
+	if err != nil || ownerAfterCWDChange.ID != firstID {
+		t.Fatalf("relative operation after cwd change used another base: %#v %v", ownerAfterCWDChange, err)
+	}
+	newGeneration := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), "next-models", []string{missing}, nil, base)
+	newID := configuredPathID("next-models", base)
+	oldDefinition, oldFound := set.rootByID(firstID)
+	newDefinition, newFound := newGeneration.rootByID(newID)
+	if newID == firstID || !oldFound || !newFound || oldDefinition.Path != "relative-models" || newDefinition.Path != "next-models" {
+		t.Fatal("config generation did not retain independent immutable root definitions")
+	}
+	oldRoot, err := set.OwnerForPath(missing)
+	if err != nil || oldRoot.ID != missingID {
+		t.Fatalf("old immutable definition did not observe newly present root: %#v %v", oldRoot, err)
+	}
+
+	caseA := configuredPathID(filepath.Join(base, "Models"), base)
+	caseB := configuredPathID(filepath.Join(base, "models"), base)
+	if caseA == caseB {
+		t.Fatal("case-distinct configured lexical identities were collapsed")
+	}
+}
+
+func TestCacheAndRoutePathsUseCapturedConfigBase(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", "")
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(base); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(workingDirectory); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	cfg := Config{CacheDir: "relative-cache", LocalDir: "relative-models", DownloadRoutes: map[string]string{"llm": "relative-route"}}.captureCacheEnvironment()
+	cacheBefore := cfg.cache()
+	if cacheBefore.Root != filepath.Join(base, "relative-cache") || cacheBefore.HubDir() != filepath.Join(base, "relative-cache", "hub") {
+		t.Fatalf("relative app root resolved outside captured base: %#v", cacheBefore)
+	}
+	other := filepath.Join(base, "elsewhere")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(other); err != nil {
+		t.Fatal(err)
+	}
+	if cacheAfter := cfg.cache(); cacheAfter.Root != cacheBefore.Root || cacheAfter.HubDir() != cacheBefore.HubDir() {
+		t.Fatalf("cache association changed after cwd change: before=%#v after=%#v", cacheBefore, cacheAfter)
+	}
+	set := newManagedRootSetForConfig(cfg)
+	owner, err := set.OwnerForPath(filepath.Join("relative-route", "owner", "repo"))
+	if err != nil || owner.AbsPath != filepath.Join(base, "relative-route") {
+		t.Fatalf("route identity changed after cwd change: %#v %v", owner, err)
+	}
+}
+
+func TestManagedRootOwnershipThroughAliasAndNestedRoot(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(base, "cache")
+	store := filepath.Join(base, "store")
+	child := filepath.Join(store, "routed")
+	alias := filepath.Join(base, "store-alias")
+	parentRepo := filepath.Join(store, "outer", "model")
+	childRepo := filepath.Join(child, "inner", "model")
+	for _, dir := range []string{parentRepo, childRepo} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(parentRepo, "outer.safetensors"), []byte("outer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childRepo, "inner.gguf"), []byte("inner"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(store, alias); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	set := newManagedRootSet(cache, filepath.Join(base, "hub"), alias, nil, map[string]string{"llm": child}, base)
+	var parentRoot, childRoot localCacheRoot
+	for _, root := range set.roots {
+		if root.Path == alias {
+			parentRoot = root
+		}
+		if root.Path == child {
+			childRoot = root
+		}
+	}
+	if parentRoot.ID == "" || childRoot.ID == "" {
+		t.Fatalf("roots missing: parent=%#v child=%#v", parentRoot, childRoot)
+	}
+	resolved, err := set.Resolve(childRoot.ID, "inner", "model")
+	if err != nil || resolved != childRepo {
+		t.Fatalf("root-scoped resolve = %q, %v; want %q", resolved, err, childRepo)
+	}
+	if _, err := set.Resolve(childRoot.ID, "..", "outside"); err == nil {
+		t.Fatal("root-scoped resolve accepted traversal")
+	}
+	owner, err := set.OwnerForPath(filepath.Join(alias, "routed", "inner", "model", "inner.gguf"))
+	if err != nil || owner.ID != childRoot.ID {
+		t.Fatalf("nested physical alias owner = %#v, %v; want %s", owner, err, childRoot.ID)
+	}
+	nested, err := set.NestedProtectedRoots(parentRoot.ID)
+	if err != nil || len(nested) != 1 || nested[0] != childRoot.AbsPath {
+		t.Fatalf("nested roots = %v, %v; want [%s]", nested, err, childRoot.AbsPath)
+	}
+	repos, err := scanLocalCachedReposWithRoots(browseRoots(set), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]CachedRepoInfo)
+	for _, repo := range repos {
+		byID[repo.Repo] = repo
+	}
+	for id, want := range map[string]struct {
+		file string
+		size int64
+	}{"outer/model": {"outer.safetensors", int64(len("outer"))}, "inner/model": {"inner.gguf", int64(len("inner"))}} {
+		got, ok := byID[id]
+		if !ok || got.FileCount != 1 || got.Size != want.size || len(got.Files) != 1 || filepath.Base(got.Files[0].Name) != want.file {
+			t.Errorf("repo %q ownership/accounting = %#v (present=%v), want one %q file and size %d", id, got, ok, want.file, want.size)
+		}
+	}
+	if len(byID) != 2 {
+		t.Fatalf("unexpected repo ownership results: %#v", byID)
+	}
+	t.Setenv("HF_HUB_CACHE", "")
+	srv := newTestServerWithConfig(t, Config{CacheDir: cache, LocalDir: alias, DownloadRoutes: map[string]string{"llm": child}})
+	listResponse := httptest.NewRecorder()
+	srv.handleCacheList(listResponse, httptest.NewRequest("GET", "/api/cache", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("cache list status=%d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+	var listed struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(listResponse.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Repos) != 2 {
+		t.Fatalf("cache list ownership returned %#v", listed.Repos)
+	}
+	detailRequest := httptest.NewRequest("GET", "/api/cache/inner/model", nil)
+	detailRequest.SetPathValue("repo", "inner/model")
+	detailResponse := httptest.NewRecorder()
+	srv.handleCacheInfo(detailResponse, detailRequest)
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("cache details status=%d body=%s", detailResponse.Code, detailResponse.Body.String())
+	}
+	var detailed CachedRepoInfo
+	if err := json.Unmarshal(detailResponse.Body.Bytes(), &detailed); err != nil {
+		t.Fatal(err)
+	}
+	listedChild := byID["inner/model"]
+	if detailed.Path != listedChild.Path || detailed.Source != listedChild.Source || detailed.FileCount != listedChild.FileCount || detailed.Size != listedChild.Size || !reflect.DeepEqual(detailed.Quantizations, listedChild.Quantizations) {
+		t.Fatalf("list/detail ownership diverged: list=%#v details=%#v", listedChild, detailed)
+	}
+	if err := set.WholeCopyAllowed(parentRoot.ID, filepath.Join(alias, "routed", "inner", "model")); err == nil {
+		t.Fatal("parent root authorized copy owned by nested configured root")
+	}
+	if err := set.WholeCopyAllowed(childRoot.ID, childRepo); err != nil {
+		t.Fatalf("child root should own its exact repo copy: %v", err)
+	}
+}
+
+func TestManagedRootWholeCopyRefusesEnclosedRootAndSymlinks(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "models")
+	target := filepath.Join(root, "owner", "model")
+	nested := filepath.Join(target, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), root, []string{nested}, nil, base)
+	rootID := configuredPathID(root, base)
+	if err := set.WholeCopyAllowed(rootID, target); err == nil {
+		t.Fatal("whole-copy eligibility allowed a target enclosing a configured root")
+	}
+
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(outside, "model"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkRoot := filepath.Join(base, "linked-models")
+	if err := os.Symlink(root, symlinkRoot); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	symlinkSet := newManagedRootSet(filepath.Join(base, "cache2"), filepath.Join(base, "hub2"), symlinkRoot, nil, nil, base)
+	if err := symlinkSet.WholeCopyAllowed(configuredPathID(symlinkRoot, base), filepath.Join(symlinkRoot, "owner", "model")); err == nil {
+		t.Fatal("destructive eligibility accepted a symlinked configured root")
+	}
+	realParent := filepath.Join(base, "real-parent")
+	aliasedParent := filepath.Join(base, "aliased-parent")
+	intermediateRoot := filepath.Join(aliasedParent, "models")
+	intermediateRepo := filepath.Join(intermediateRoot, "owner", "model")
+	if err := os.MkdirAll(filepath.Join(realParent, "models", "owner", "model"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realParent, aliasedParent); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	intermediateSet := newManagedRootSet(filepath.Join(base, "cache-intermediate"), filepath.Join(base, "hub-intermediate"), intermediateRoot, nil, nil, base)
+	if err := intermediateSet.WholeCopyAllowed(configuredPathID(intermediateRoot, base), intermediateRepo); err == nil {
+		t.Fatal("destructive eligibility accepted a symlink in the configured root path")
+	}
+
+	componentRoot := filepath.Join(base, "components")
+	componentOutside := filepath.Join(base, "outside-components")
+	if err := os.MkdirAll(filepath.Join(componentOutside, "model"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(componentRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(componentOutside, filepath.Join(componentRoot, "owner")); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	componentSet := newManagedRootSet(filepath.Join(base, "cache3"), filepath.Join(base, "hub3"), componentRoot, nil, nil, base)
+	if err := componentSet.WholeCopyAllowed(configuredPathID(componentRoot, base), filepath.Join(componentRoot, "owner", "model")); err == nil {
+		t.Fatal("destructive eligibility accepted a symlinked owner component")
+	}
+	leafRoot := filepath.Join(base, "leaf-components")
+	if err := os.MkdirAll(leafRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(leafRoot, "owner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "model"), filepath.Join(leafRoot, "owner", "model")); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	leafSet := newManagedRootSet(filepath.Join(base, "cache4"), filepath.Join(base, "hub4"), leafRoot, nil, nil, base)
+	if err := leafSet.WholeCopyAllowed(configuredPathID(leafRoot, base), filepath.Join(leafRoot, "owner", "model")); err == nil {
+		t.Fatal("destructive eligibility accepted a symlinked repository leaf")
+	}
+}
+
+func TestCaseDistinctRouteDestinations(t *testing.T) {
 	root := t.TempDir()
 	routes := map[string]string{"audio": filepath.Join(root, "Audio"), "embedding": filepath.Join(root, "audio")}
 	cacheDir := filepath.Join(root, "cache")
@@ -766,8 +1099,14 @@ func TestLocalCacheRoots_MergedRestrictions(t *testing.T) {
 					{Path: friendlyDir, Source: "Friendly view"},
 					{Path: cacheDir, Source: "Local", SkipSpecial: true},
 				}
-				if got := localCacheRoots(cacheDir, localDir, scanDirs, routes); !reflect.DeepEqual(got, want) {
-					t.Errorf("roots = %#v, want %#v", got, want)
+				got := localCacheRoots(cacheDir, localDir, scanDirs, routes)
+				if len(got) != len(want) {
+					t.Fatalf("roots = %#v, want %#v", got, want)
+				}
+				for i := range want {
+					if got[i].Path != want[i].Path || got[i].Source != want[i].Source || got[i].SkipSpecial != want[i].SkipSpecial {
+						t.Errorf("root %d = %#v, want path/source/restriction %#v", i, got[i], want[i])
+					}
 				}
 			})
 		}

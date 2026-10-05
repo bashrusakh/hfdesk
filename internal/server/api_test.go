@@ -233,7 +233,6 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 		files              []string
 		want               map[string]expectedRepo
 		absent             []string
-		linuxOnly          bool
 		relativeRoutes     bool
 	}{
 		{
@@ -347,21 +346,8 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 			},
 			absent: []string{"LLM/GGUF"},
 		},
-		{
-			name: "case-distinct", local: "models", linuxOnly: true,
-			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
-			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/gguf/shards/model.safetensors"},
-			want: map[string]expectedRepo{
-				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
-				"LLM/gguf":    {path: "models/LLM/gguf", files: []string{"shards/model.safetensors"}},
-			},
-			absent: []string{"LLM/GGUF"},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.linuxOnly && runtime.GOOS != "linux" {
-				t.Skip("requires Linux case-sensitive directories")
-			}
 			base := t.TempDir()
 			path := func(relative string) string {
 				if relative == "" {
@@ -480,18 +466,23 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 	}
 }
 
-func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
+func TestManagedRootSet_SubrootCaseIsLexical(t *testing.T) {
 	base := t.TempDir()
-	root := localCacheRoot{Path: filepath.Join(base, "Models")}
-	child := localCacheRoot{Path: filepath.Join(base, "models", "GGUF")}
-	roots := []localCacheRoot{root, child}
-	got := root.excludedSubroots(roots)
-	var want []string
-	if runtime.GOOS == "windows" {
-		want = []string{pathIdentityKey(child.Path)}
+	parent := filepath.Join(base, "Models")
+	child := filepath.Join(base, "models", "GGUF")
+	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), parent, nil, map[string]string{"llm": child}, base)
+	var parentID string
+	for _, root := range set.roots {
+		if root.Path == parent {
+			parentID = root.ID
+		}
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("case-different parent: excluded = %v, want %v", got, want)
+	got, err := set.NestedProtectedRoots(parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("case-different lexical paths were treated as nested: %v", got)
 	}
 }
 

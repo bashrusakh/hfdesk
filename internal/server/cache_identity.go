@@ -13,10 +13,12 @@ type cacheEnvironment struct {
 	defaultRoot string
 	rootSource  string
 	hub         string
+	pathBase    string
 }
 
 func (cfg Config) captureCacheEnvironment() Config {
 	if cfg.cacheEnv == nil {
+		pathBase, _ := filepath.Abs(".")
 		source := "default"
 		if os.Getenv("HF_HOME") != "" {
 			source = "HF_HOME"
@@ -31,7 +33,7 @@ func (cfg Config) captureCacheEnvironment() Config {
 				hub = absolute
 			}
 		}
-		cfg.cacheEnv = &cacheEnvironment{root, source, hub}
+		cfg.cacheEnv = &cacheEnvironment{defaultRoot: root, rootSource: source, hub: hub, pathBase: pathBase}
 	}
 	return cfg
 }
@@ -59,6 +61,7 @@ func (cfg Config) cacheForRoot(root string) *hfdownloader.HFCache {
 	if root == "" {
 		root = cfg.cacheRoot()
 	}
+	root = configuredPath(root, cfg.cacheEnv.pathBase)
 	hub := cfg.cacheEnv.hub
 	if hub == "" {
 		hub = filepath.Join(root, "hub")
@@ -112,9 +115,10 @@ func hubRepoHasContent(rd *hfdownloader.RepoDir) bool {
 	return found
 }
 
-// A friendly manifest may outlive a restart that selects another H. It is
-// evidence of this repository's completion only when its recorded physical
-// association matches, not merely because the owner/name matches.
+// A friendly manifest may outlive a restart that selects another H. Its path
+// is historical completion evidence only when both existing directories are
+// confirmed by the filesystem to be the same object; it never grants mutation
+// or deletion authority.
 func manifestBelongsToRepo(cache *hfdownloader.HFCache, rd *hfdownloader.RepoDir, m *hfdownloader.DownloadManifest) bool {
 	if m.RepoPath == "" || !hubRepoHasContent(rd) {
 		return false
@@ -123,10 +127,11 @@ func manifestBelongsToRepo(cache *hfdownloader.HFCache, rd *hfdownloader.RepoDir
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(cache.Root, path)
 	}
-	manifestPath, err := filepath.Abs(path)
-	if err != nil {
+	manifestPath := configuredPath(path, cache.Root)
+	manifestInfo, err := os.Stat(manifestPath)
+	if err != nil || !manifestInfo.IsDir() {
 		return false
 	}
-	repoPath, err := filepath.Abs(rd.Path())
-	return err == nil && pathIdentityKey(manifestPath) == pathIdentityKey(repoPath)
+	repoInfo, err := os.Stat(rd.Path())
+	return err == nil && repoInfo.IsDir() && os.SameFile(manifestInfo, repoInfo)
 }

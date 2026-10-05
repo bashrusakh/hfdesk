@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -159,8 +158,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheDir := cfg.cacheRoot()
-
 	results := make([]SearchResult, 0, len(raw))
 	for _, m := range raw {
 		gated := false
@@ -184,7 +181,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, m.ID, isDataset); localErr == nil {
+		if localRepo, localErr := findLocalCachedRepoForConfig(cfg, m.ID, isDataset); localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
@@ -216,7 +213,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig().captureCacheEnvironment()
 
 	// Build the ordered list of configured candidate paths.
-	routed := routeDirs(cfg.DownloadRoutes)
+	routed := routeDirsAt(cfg.DownloadRoutes, cfg.cacheEnv.pathBase)
 	configured := []string{cfg.LocalDir, cfg.cache().HubDir(), cfg.cacheRoot(), cfg.cacheEnv.defaultRoot, RunDir()}
 	configured = append(configured, routed...)
 
@@ -224,19 +221,22 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 	// one of the configured directories (prevents arbitrary fs-stat via the API).
 	var path string
 	if requested := r.URL.Query().Get("path"); requested != "" {
+		pathBase := cfg.cacheEnv.pathBase
 		for _, c := range configured {
-			if c != "" && pathIdentityKey(requested) == pathIdentityKey(c) {
+			// The allowlist is lexical configured identity (with the captured
+			// base); it does not equate symlink aliases as filesystem authority.
+			if c != "" && pathIdentityKeyAt(requested, pathBase) == pathIdentityKeyAt(c, pathBase) {
 				path = c
 				// Legacy clients pass cacheDir (R); cache capacity is measured
 				// at H, not the possibly unrelated friendly-view filesystem.
-				localPath := cfg.LocalDir != "" && pathIdentityKey(requested) == pathIdentityKey(cfg.LocalDir)
+				localPath := cfg.LocalDir != "" && pathIdentityKeyAt(requested, pathBase) == pathIdentityKeyAt(cfg.LocalDir, pathBase)
 				for _, dir := range routed {
-					if pathIdentityKey(requested) == pathIdentityKey(dir) {
+					if pathIdentityKeyAt(requested, pathBase) == pathIdentityKeyAt(dir, pathBase) {
 						localPath = true
 						break
 					}
 				}
-				if pathIdentityKey(c) == pathIdentityKey(cfg.cacheRoot()) && !localPath {
+				if pathIdentityKeyAt(c, pathBase) == pathIdentityKeyAt(cfg.cacheRoot(), pathBase) && !localPath {
 					path = cfg.cache().HubDir()
 				}
 				break
@@ -268,7 +268,7 @@ func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	cfg := s.snapshotConfig()
+	cfg := s.snapshotConfig().captureCacheEnvironment()
 	_, localDir, path, err := resolveDownloadDestination(cfg, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
@@ -277,17 +277,14 @@ func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) 
 	if localDir == "" {
 		path = cfg.cache().HubDir()
 	} else {
-		path, err = filepath.Abs(path)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to resolve destination", err.Error())
-			return
-		}
+		path = configuredPath(path, cfg.cacheEnv.pathBase)
 	}
 	writeDiskFree(w, path, cfg)
 }
 
 func writeDiskFree(w http.ResponseWriter, path string, cfg Config) {
-	free, total, err := diskFreeBytes(path)
+	cfg = cfg.captureCacheEnvironment()
+	free, total, err := diskFreeBytes(configuredPath(path, cfg.cacheEnv.pathBase))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())
 		return

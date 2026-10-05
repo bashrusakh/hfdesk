@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -484,10 +483,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	if flat {
 		// Persist physical local destinations too: a restart from another
 		// launch directory must not reinterpret a previously relative path.
-		effectiveLocalDir, err = filepath.Abs(effectiveLocalDir)
-		if err != nil {
-			return nil, false, err
-		}
+		effectiveLocalDir = configuredPath(effectiveLocalDir, cfg.captureCacheEnvironment().cacheEnv.pathBase)
 		outputDir = effectiveLocalDir
 	} else {
 		cache := cfg.cache()
@@ -496,9 +492,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 
 	// The requested destination identity for dedup purposes: the frozen
 	// output root (flat local dir when set, cache root otherwise), compared
-	// with pathIdentityKey so platform case/clean semantics match how the
-	// rest of the server compares configured paths.
-	reqDestKey := pathIdentityKey(outputDir)
+	// with the startup-captured lexical base so equivalent relative/absolute
+	// config paths retain stable identity without filesystem case guesses.
+	pathBase := cfg.captureCacheEnvironment().cacheEnv.pathBase
+	reqDestKey := pathIdentityKeyAt(outputDir, pathBase)
 
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
@@ -524,9 +521,9 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
-			pathIdentityKey(existing.OutputDir) == reqDestKey &&
+			pathIdentityKeyAt(existing.OutputDir, pathBase) == reqDestKey &&
 			existing.Flat == flat &&
-			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
+			pathIdentityKeyAt(existing.HubDir, pathBase) == pathIdentityKeyAt(hubDir, pathBase) &&
 			existing.LocalRepo == req.LocalRepo &&
 			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
