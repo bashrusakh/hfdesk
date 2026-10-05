@@ -1655,7 +1655,6 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// Security Layer 5: Resolve absolute paths
 	absCacheDir := configuredPath(cacheDir, cfg.cacheEnv.pathBase)
 	// Ensure cache dir ends with separator to prevent /cache/huggingface-evil matching /cache/huggingface
-	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
 	absHubDir := configuredPath(cache.HubDir(), cfg.cacheEnv.pathBase)
 	absHubPath := configuredPath(hubPath, cfg.cacheEnv.pathBase)
 
@@ -1704,7 +1703,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid path", "repository path is not an owned copy of the selected Hub")
 		return
 	}
-	if err := managedRoots.WholeCopyAllowed(configuredPathID(cache.HubDir(), managedRoots.base), absHubPath); err != nil {
+	if err := managedRoots.LegacyHFDeleteAllowed(configuredPathID(cache.HubDir(), managedRoots.base), absHubPath, friendlyPath, absCacheDir); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid path", err.Error())
 		return
 	}
@@ -1734,7 +1733,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Delete the friendly view directory (symlinks) with same security checks
 	if friendlyPath != "" {
-		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
+		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDir); err != nil {
 			if !os.IsNotExist(err) {
 				writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Hub repository deleted; friendly view removal failed", "errors": []string{err.Error()}})
 				return
@@ -1756,35 +1755,15 @@ func isValidRepoComponent(s string) bool {
 }
 
 // safeDeleteFriendlyPath safely deletes the friendly view path with security checks.
-func safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep string) error {
-	absFriendlyPath, err := filepath.Abs(friendlyPath)
+func safeDeleteFriendlyPath(friendlyPath, absCacheDir string) error {
+	exists, err := hfdownloader.ValidateLegacyFriendlyEffect(absCacheDir, friendlyPath)
 	if err != nil {
 		return err
 	}
-
-	// Check it's within cache
-	if !strings.HasPrefix(absFriendlyPath+string(filepath.Separator), absCacheDirWithSep) {
-		return fmt.Errorf("friendly path outside cache")
+	if !exists {
+		return os.ErrNotExist
 	}
-
-	// Check it's not a symlink at the top level
-	info, err := os.Lstat(absFriendlyPath)
-	if err != nil {
-		return err // Doesn't exist, that's fine
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("friendly path is a symlink")
-	}
-
-	// Resolve symlinks and verify again
-	realPath, err := filepath.EvalSymlinks(absFriendlyPath)
-	if err == nil && realPath != absFriendlyPath {
-		if !strings.HasPrefix(realPath+string(filepath.Separator), absCacheDirWithSep) {
-			return fmt.Errorf("resolved friendly path outside cache")
-		}
-	}
-
-	return os.RemoveAll(absFriendlyPath)
+	return os.RemoveAll(friendlyPath)
 }
 
 // parseCommandFilters extracts filter information from a manifest command string.

@@ -281,8 +281,8 @@ func withinManagedRoot(root, path string) bool {
 }
 
 // containmentDistance first recognizes configured lexical ancestry, then
-// checks existing physical ancestors with SameFile. A lexical match describes
-// config ownership only; it is never a substitute for destructive confinement.
+// compares freshly resolved physical namespaces. Configured spellings remain
+// unchanged; resolved names are observations only.
 func containmentDistance(parent, target string) (bool, int, error) {
 	if withinManagedRoot(parent, target) {
 		rel, _ := filepath.Rel(parent, target)
@@ -291,29 +291,75 @@ func containmentDistance(parent, target string) (bool, int, error) {
 		}
 		return true, strings.Count(filepath.Clean(rel), string(filepath.Separator)) + 1, nil
 	}
-	parentInfo, err := os.Stat(parent)
+	resolvedParent, _, err := resolveObservedPath(parent)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, 0, nil
-		}
-		return false, 0, fmt.Errorf("stat configured root %q: %w", parent, err)
+		return false, 0, fmt.Errorf("resolve configured root %q: %w", parent, err)
 	}
-	distance := 0
-	for current := filepath.Clean(target); ; current = filepath.Dir(current) {
-		info, statErr := os.Stat(current)
-		if statErr == nil && os.SameFile(parentInfo, info) {
-			return true, distance, nil
+	resolvedTarget, _, err := resolveObservedPath(target)
+	if err != nil {
+		return false, 0, fmt.Errorf("resolve target path %q: %w", target, err)
+	}
+	if withinManagedRoot(resolvedParent, resolvedTarget) {
+		rel, _ := filepath.Rel(resolvedParent, resolvedTarget)
+		if rel == "." {
+			return true, 0, nil
 		}
-		if statErr != nil && !os.IsNotExist(statErr) {
-			return false, 0, fmt.Errorf("stat path ancestor %q: %w", current, statErr)
+		return true, strings.Count(filepath.Clean(rel), string(filepath.Separator)) + 1, nil
+	}
+	parentInfo, parentErr := os.Stat(resolvedParent)
+	if parentErr == nil {
+		for current, distance := filepath.Clean(resolvedTarget), 0; ; current, distance = filepath.Dir(current), distance+1 {
+			info, statErr := os.Stat(current)
+			if statErr == nil && os.SameFile(parentInfo, info) {
+				return true, distance, nil
+			}
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return false, 0, fmt.Errorf("stat resolved path ancestor %q: %w", current, statErr)
+			}
+			if filepath.Dir(current) == current {
+				break
+			}
 		}
-		parentPath := filepath.Dir(current)
-		if parentPath == current {
-			break
-		}
-		distance++
+	} else if !os.IsNotExist(parentErr) {
+		return false, 0, fmt.Errorf("stat resolved configured root %q: %w", resolvedParent, parentErr)
 	}
 	return false, 0, nil
+}
+
+// resolveObservedPath resolves symlinked existing prefixes and retains a
+// verified ordinary missing suffix. It never changes configured identity.
+func resolveObservedPath(path string) (string, bool, error) {
+	path = filepath.Clean(path)
+	var suffix []string
+	for current := path; ; current = filepath.Dir(current) {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			info, statErr := os.Stat(resolved)
+			if statErr != nil {
+				return "", false, statErr
+			}
+			if !info.IsDir() && len(suffix) != 0 {
+				return "", false, fmt.Errorf("non-directory path prefix %q", current)
+			}
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), len(suffix) == 0, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", false, err
+		}
+		if info, lstatErr := os.Lstat(current); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return "", false, fmt.Errorf("unresolved symlink %q", current)
+		} else if lstatErr != nil && !os.IsNotExist(lstatErr) {
+			return "", false, lstatErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", false, err
+		}
+		suffix = append(suffix, filepath.Base(current))
+	}
 }
 
 // OwnerForPath selects the most-specific configured root using lexical
@@ -325,7 +371,7 @@ func (set *ManagedRootSet) OwnerForPath(path string) (ManagedRoot, error) {
 	target := ConfiguredPath(path, set.base)
 	owner, distance := -1, int(^uint(0)>>1)
 	for i, root := range set.roots {
-		inside, candidateDistance, err := containmentDistance(root.AbsolutePath, target)
+		inside, candidateDistance, err := ownerContainmentDistance(root.AbsolutePath, target)
 		if err != nil {
 			return ManagedRoot{}, err
 		}
@@ -337,6 +383,24 @@ func (set *ManagedRootSet) OwnerForPath(path string) (ManagedRoot, error) {
 		return ManagedRoot{}, os.ErrNotExist
 	}
 	return set.roots[owner], nil
+}
+
+// A symlinked leaf remains owned by its configured lexical parent for
+// discovery. Resolving that leaf would incorrectly transfer a friendly/local
+// alias of a Hub repository to the Hub root; parent-component aliases are
+// still resolved so nested configured roots retain ownership.
+func ownerContainmentDistance(parent, target string) (bool, int, error) {
+	if withinManagedRoot(parent, target) {
+		return containmentDistance(parent, target)
+	}
+	info, err := os.Lstat(target)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return false, 0, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, 0, fmt.Errorf("inspect ownership target %q: %w", target, err)
+	}
+	return containmentDistance(parent, target)
 }
 
 // NestedProtectedRoots returns protected roots below rootID. Unknown ancestry
@@ -602,23 +666,109 @@ func (set *ManagedRootSet) WholeCopyAllowed(rootID, target string) error {
 	if err := rejectManagedSymlinkComponents(set.base, root.AbsolutePath, target); err != nil {
 		return err
 	}
-	for _, protected := range set.roots {
-		if protected.ID == root.ID || protected.Roles&ManagedRootProtected == 0 {
+	if err := set.checkProtectedEffect(root.ID, target); err != nil {
+		return err
+	}
+	return nil
+}
+
+// LegacyHFDeleteAllowed preflights the complete existing whole-HF deletion
+// unit before either its Hub copy or optional friendly subtree is removed.
+func (set *ManagedRootSet) LegacyHFDeleteAllowed(hubRootID, hubTarget, friendlyTarget, cacheRoot string) error {
+	if err := set.WholeCopyAllowed(hubRootID, hubTarget); err != nil {
+		return err
+	}
+	if friendlyTarget == "" {
+		return nil
+	}
+	owner, name, repoType, ok := parseHubRepoDirName(filepath.Base(hubTarget))
+	if !ok {
+		return errors.New("cannot establish friendly repository identity")
+	}
+	role := ManagedRootModelProjection
+	if repoType == RepoTypeDataset {
+		role = ManagedRootDatasetProjection
+	}
+	exists, err := ValidateLegacyFriendlyEffect(cacheRoot, friendlyTarget)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	for _, projection := range set.roots {
+		if projection.Roles&role == 0 {
 			continue
 		}
-		contained, _, err := containmentDistance(target, protected.AbsolutePath)
+		rel, relErr := filepath.Rel(projection.AbsolutePath, friendlyTarget)
+		if relErr != nil || rel != filepath.Join(owner, name) {
+			continue
+		}
+		return set.checkProtectedEffect(projection.ID, friendlyTarget)
+	}
+	return errors.New("friendly deletion effect has no configured projection owner")
+}
+
+// ValidateLegacyFriendlyEffect verifies the existing legacy friendly path
+// without following symlinked components. A missing ordinary component is a
+// safely absent effect; errors and non-directory prefixes are unknown/refused.
+func ValidateLegacyFriendlyEffect(cacheRoot, friendlyTarget string) (bool, error) {
+	if !filepath.IsAbs(cacheRoot) || !filepath.IsAbs(friendlyTarget) {
+		return false, errors.New("friendly deletion paths must be absolute")
+	}
+	root := filepath.Clean(cacheRoot)
+	target := filepath.Clean(friendlyTarget)
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, errors.New("friendly deletion effect is outside its cache root")
+	}
+	volumeRoot := filepath.VolumeName(target) + string(filepath.Separator)
+	components, err := filepath.Rel(volumeRoot, target)
+	if err != nil {
+		return false, fmt.Errorf("resolve friendly deletion components: %w", err)
+	}
+	current := volumeRoot
+	parts := strings.Split(components, string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) {
+			return false, nil
+		}
+		if statErr != nil {
+			return false, fmt.Errorf("inspect friendly deletion component %q: %w", current, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return false, fmt.Errorf("friendly deletion path contains symlinked component %q", current)
+		}
+		if i != len(parts)-1 && !info.IsDir() {
+			return false, fmt.Errorf("friendly deletion path has non-directory component %q", current)
+		}
+		if i == len(parts)-1 && !info.IsDir() {
+			return false, errors.New("friendly deletion effect is not a real directory")
+		}
+	}
+	return true, nil
+}
+
+func (set *ManagedRootSet) checkProtectedEffect(exemptRootID, effect string) error {
+	for _, protected := range set.roots {
+		if protected.ID == exemptRootID || protected.Roles&ManagedRootProtected == 0 {
+			continue
+		}
+		contains, _, err := containmentDistance(effect, protected.AbsolutePath)
 		if err != nil {
 			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
 		}
-		if contained {
-			return fmt.Errorf("target encloses protected managed root %s", protected.ID)
+		containedBy, distance, err := containmentDistance(protected.AbsolutePath, effect)
+		if err != nil {
+			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
 		}
-		protectedInfo, protectedErr := os.Stat(protected.AbsolutePath)
-		if protectedErr != nil && !os.IsNotExist(protectedErr) {
-			return fmt.Errorf("cannot inspect protected managed root %s: %w", protected.ID, protectedErr)
-		}
-		if protectedErr == nil && os.SameFile(protectedInfo, targetInfo) {
-			return fmt.Errorf("target is a protected managed root %s", protected.ID)
+		if contains || (containedBy && distance == 0) {
+			return fmt.Errorf("deletion effect intersects protected managed root %s", protected.ID)
 		}
 	}
 	return nil

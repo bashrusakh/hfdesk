@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1487,6 +1488,190 @@ func TestAPI_CacheDelete_ValidRepoFormat(t *testing.T) {
 					tt.wantCode, tt.repo, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestAPI_CacheDelete_ProtectsNestedFriendlyRootsBeforeEitherRemoval(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		t.Run(string(repoType), func(t *testing.T) {
+			cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+			repo, err := cache.Repo("owner/model", repoType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(repo.Path(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			hubMarker := filepath.Join(repo.Path(), "hub-sentinel")
+			if err := os.WriteFile(hubMarker, []byte("hub"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			friendlyMarker := filepath.Join(repo.FriendlyPath(), "friendly-sentinel")
+			if err := os.MkdirAll(filepath.Dir(friendlyMarker), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(friendlyMarker, []byte("friendly"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			srv := &Server{config: Config{CacheDir: cache.Root, LocalDir: repo.FriendlyPath()}}
+			req := httptest.NewRequest(http.MethodDelete, "/api/cache/owner/model?type="+string(repoType), nil)
+			req.SetPathValue("repo", "owner/model")
+			w := httptest.NewRecorder()
+			srv.handleCacheDelete(w, req)
+			if w.Code < 400 || w.Code >= 500 {
+				t.Fatalf("protected friendly root response = %d: %s", w.Code, w.Body.String())
+			}
+			for _, marker := range []string{hubMarker, friendlyMarker} {
+				if _, err := os.Stat(marker); err != nil {
+					t.Errorf("preflight removed protected data %q: %v", marker, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAPI_CacheDelete_ProtectsInverseAliasNestedInHubBeforeRemoval(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		t.Run(string(repoType), func(t *testing.T) {
+			base := t.TempDir()
+			cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"), 0)
+			repo, err := cache.Repo("owner/model", repoType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := filepath.Join(repo.Path(), "application-data")
+			if err := os.MkdirAll(child, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(repo.Path(), "hub-sentinel")
+			if err := os.WriteFile(marker, []byte("hub"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			friendlyMarker := filepath.Join(repo.FriendlyPath(), "friendly-sentinel")
+			if err := os.MkdirAll(filepath.Dir(friendlyMarker), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(friendlyMarker, []byte("friendly"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(base, "configured-alias")
+			if err := os.Symlink(child, alias); err != nil {
+				t.Skipf("directory symlink unavailable: %v", err)
+			}
+			srv := &Server{config: Config{CacheDir: cache.Root, LocalScanDirs: []string{alias}}}
+			req := httptest.NewRequest(http.MethodDelete, "/api/cache/owner/model?type="+string(repoType), nil)
+			req.SetPathValue("repo", "owner/model")
+			w := httptest.NewRecorder()
+			srv.handleCacheDelete(w, req)
+			if w.Code < 400 || w.Code >= 500 {
+				t.Fatalf("protected inverse alias response = %d: %s", w.Code, w.Body.String())
+			}
+			for _, path := range []string{marker, friendlyMarker} {
+				if _, err := os.Stat(path); err != nil {
+					t.Errorf("preflight removed data despite protected inverse alias %q: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAPI_CacheDelete_RefusesAliasedFriendlyComponentsBeforeHubRemoval(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		for _, aliasComponent := range []string{"owner", "projection-root"} {
+			t.Run(string(repoType)+"/"+aliasComponent, func(t *testing.T) {
+				base := t.TempDir()
+				cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"), 0)
+				repo, err := cache.Repo("owner/model", repoType)
+				if err != nil {
+					t.Fatal(err)
+				}
+				hubMarker := filepath.Join(repo.Path(), "hub-sentinel")
+				if err := os.MkdirAll(repo.Path(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(hubMarker, []byte("hub"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				friendlyTarget := repo.FriendlyPath()
+				foreignTarget := filepath.Join(filepath.Dir(filepath.Dir(friendlyTarget)), "foreign", "model")
+				if err := os.MkdirAll(foreignTarget, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				foreignMarker := filepath.Join(foreignTarget, "foreign-sentinel")
+				if err := os.WriteFile(foreignMarker, []byte("foreign"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if aliasComponent == "owner" {
+					ownerDir := filepath.Dir(friendlyTarget)
+					if err := os.RemoveAll(ownerDir); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(filepath.Dir(foreignTarget), ownerDir); err != nil {
+						t.Skipf("directory symlink unavailable: %v", err)
+					}
+				} else {
+					library := filepath.Join(cache.Root, "models")
+					if repoType == hfdownloader.RepoTypeDataset {
+						library = filepath.Join(cache.Root, "datasets")
+					}
+					backing := filepath.Join(cache.Root, "friendly-backing")
+					if err := os.Rename(library, backing); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(backing, library); err != nil {
+						t.Skipf("directory symlink unavailable: %v", err)
+					}
+				}
+				srv := &Server{config: Config{CacheDir: cache.Root}}
+				req := httptest.NewRequest(http.MethodDelete, "/api/cache/owner/model?type="+string(repoType), nil)
+				req.SetPathValue("repo", "owner/model")
+				w := httptest.NewRecorder()
+				srv.handleCacheDelete(w, req)
+				if w.Code < 400 || w.Code >= 500 {
+					t.Fatalf("aliased friendly path response = %d: %s", w.Code, w.Body.String())
+				}
+				if !strings.Contains(w.Body.String(), "friendly deletion path contains symlinked component") {
+					t.Fatalf("request refused before the shared friendly-effect component validator: %s", w.Body.String())
+				}
+				for _, marker := range []string{hubMarker, foreignMarker} {
+					if _, err := os.Stat(marker); err != nil {
+						t.Errorf("refusal did not preserve %q: %v", marker, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAPI_CacheDelete_ModelNameMayContainDatasetPrefix(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	repo, err := cache.Repo("owner/datasets--model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.Path(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo.Path(), "hub-sentinel"), []byte("hub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.FriendlyPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo.FriendlyPath(), "friendly-sentinel"), []byte("friendly"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{config: Config{CacheDir: cache.Root}}
+	req := httptest.NewRequest(http.MethodDelete, "/api/cache/owner/datasets--model", nil)
+	req.SetPathValue("repo", "owner/datasets--model")
+	w := httptest.NewRecorder()
+	srv.handleCacheDelete(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid model-name deletion = %d: %s", w.Code, w.Body.String())
 	}
 }
 

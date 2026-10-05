@@ -111,6 +111,33 @@ func TestManagedRootOwnerWalkUsesFreshPhysicalNestedFacts(t *testing.T) {
 	}
 }
 
+func TestManagedRootNestedProtectedFindsInverseAliasAndMissingDescendant(t *testing.T) {
+	base := t.TempDir()
+	effect := filepath.Join(base, "hub", "models--owner--model")
+	if err := os.MkdirAll(filepath.Join(effect, "application-data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "configured-alias")
+	if err := os.Symlink(filepath.Join(effect, "application-data"), alias); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	rootID := ManagedRootID(filepath.Join(base, "hub"), base)
+	set := NewManagedRootSet(base, []ManagedRootSpec{
+		{Path: filepath.Join(base, "hub"), Roles: ManagedRootHub | ManagedRootProtected},
+		{Path: filepath.Join(alias, "new-child"), Roles: ManagedRootProtected},
+	})
+	if nested, err := set.NestedProtectedRoots(rootID); err != nil || len(nested) != 1 {
+		t.Fatalf("inverse alias descendant: nested=%#v err=%v", nested, err)
+	}
+	target := filepath.Join(effect, "nested", "repo")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.WholeCopyAllowed(rootID, effect); err == nil {
+		t.Fatal("whole-copy eligibility ignored protected root below inverse alias and missing suffix")
+	}
+}
+
 func TestManagedRootGroupsMergeRestrictionsOnlyForProvenAliases(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(base, "cache")

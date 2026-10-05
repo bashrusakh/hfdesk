@@ -182,6 +182,13 @@ func (set *storageRootSet) WholeCopyAllowed(rootID, target string) error {
 	return set.domain.WholeCopyAllowed(rootID, target)
 }
 
+func (set *storageRootSet) LegacyHFDeleteAllowed(rootID, hubTarget, friendlyTarget, cacheRoot string) error {
+	if set.err != nil {
+		return set.err
+	}
+	return set.domain.LegacyHFDeleteAllowed(rootID, hubTarget, friendlyTarget, cacheRoot)
+}
+
 func (set *storageRootSet) RepoPhysicalCopies(repoID string, repoType hfdownloader.RepoType) (hfdownloader.RepoPhysicalCopySet, error) {
 	if set.err != nil {
 		return hfdownloader.RepoPhysicalCopySet{}, set.err
