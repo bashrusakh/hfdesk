@@ -71,9 +71,12 @@ pre-agent-steps:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
     run: |
       set -euo pipefail
+      PR_NUMBER="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+      case "$PR_NUMBER" in
+        ''|*[!0-9]*) echo "No numeric pull request number in event; skipping PR metadata context"; exit 0 ;;
+      esac
       dir=".policy/pr"; mkdir -p "$dir"
       meta="$(gh api "repos/$GITHUB_REPO/pulls/$PR_NUMBER" \
         --jq '{number, title, body, labels: [.labels[].name], base: {ref: .base.ref, sha: .base.sha}, head: {ref: .head.ref, sha: .head.sha}}')"
@@ -87,7 +90,6 @@ pre-agent-steps:
           head: {ref: $meta.head.ref, sha: $meta.head.sha},
           changed_filenames: $files, linked_issues: $linked}' > "$dir/${PR_NUMBER}.json"
       chmod 0444 "$dir/${PR_NUMBER}.json"
-      echo "PR_METADATA_CONTEXT=.policy/pr/${PR_NUMBER}.json" >> "$GITHUB_ENV"
       echo "Wrote PR metadata context for #${PR_NUMBER} (changed filenames only; no diff)"
 safe-outputs:
   report-failure-as-issue: false
