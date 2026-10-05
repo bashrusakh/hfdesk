@@ -127,6 +127,9 @@ type Settings struct {
 	//
 	// If empty, defaults to ~/.cache/huggingface (or HF_HOME env var).
 	CacheDir string
+	// HubDir freezes the exact Hub storage directory when nonempty. Empty
+	// retains normal ENV resolution at cache construction, even with CacheDir.
+	HubDir string
 
 	// StaleTimeout is the duration after which an incomplete download
 	// with no writes is considered stale and can be taken over by
@@ -375,6 +378,13 @@ func (s Settings) BuildHFCache() (*HFCache, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid stale-timeout %q: %w", s.StaleTimeout, err)
 		}
+	}
+	if s.HubDir != "" {
+		root := s.CacheDir
+		if root == "" {
+			root = DefaultCacheDir()
+		}
+		return NewHFCacheResolved(root, s.HubDir, staleTimeout), nil
 	}
 	return NewHFCache(s.CacheDir, staleTimeout), nil
 }

@@ -28,7 +28,7 @@ type DownloadManifest struct {
 	Repo     string `yaml:"repo" json:"repo"`           // "owner/name"
 	Branch   string `yaml:"branch" json:"branch"`       // Branch name (usually "main")
 	Commit   string `yaml:"commit" json:"commit"`       // Commit hash
-	RepoPath string `yaml:"repo_path" json:"repo_path"` // Relative path to hub cache (e.g., "hub/models--owner--repo")
+	RepoPath string `yaml:"repo_path" json:"repo_path"` // Relative to app root; absolute if Hub is on another volume.
 
 	// Timing
 	StartedAt   time.Time `yaml:"started_at" json:"started_at"`     // When download started

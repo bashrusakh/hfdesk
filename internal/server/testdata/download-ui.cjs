@@ -107,7 +107,9 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   const preview = calls.find(c => c.path === '/api/diskfree');
   assert(preview, `${entry}/${type}: disk preview missing`);
   assert(preview.body, `${entry}/${type}: default GET checks the wrong disk`);
-  assert.equal(preview.data.path, entry === 'form' ? manual || fixture.local || fixture.cache : expectedPath);
+  const appPath = entry === 'form' ? manual || fixture.local || fixture.cache : expectedPath;
+  const physicalPath = appPath === fixture.cache ? fixture.cache + '/hub' : appPath;
+  assert.equal(preview.data.path, physicalPath);
   assert.equal(preview.body.routeKey || '', entry === 'form' ? '' : expectedKey);
   const download = calls.find(c => c.path === '/api/download');
   if (low) {
@@ -116,7 +118,8 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   } else {
     assert(download, `${entry}/${type}: destination free, cache full must allow: ${JSON.stringify(messages)}`);
     assert.deepEqual(download.body, preview.body, 'guard and creation must use the identical request');
-    assert.equal(download.data.outputDir, preview.data.path, 'CreateJob destination must match disk preview');
+    assert.equal(download.data.outputDir, appPath, 'CreateJob retains the app/friendly root');
+    assert.equal(download.data.hubDir || download.data.outputDir, preview.data.path, 'Physical job destination must match disk preview');
     if (entry === 'quant') assert.equal(download.body.localRepo, 'fixture/parent');
   }
 }

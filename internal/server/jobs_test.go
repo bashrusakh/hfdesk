@@ -4,9 +4,12 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -346,6 +349,56 @@ func TestJobManager_CancelJob(t *testing.T) {
 			t.Error("Cancel should fail for nonexistent job")
 		}
 	})
+}
+
+// TestLifecyclePersistenceIsSynchronous pins the root cause behind the
+// legacy-restore flake. The original flake came from fire-and-forget
+// `go m.saveState()` writers spawned at job lifecycle boundaries: a writer
+// could resolve AppConfigDir() after another test changed the environment and
+// overwrite its freshly seeded jobs_state.json. main replaced that model with
+// a synchronous, serialized save through a fixed state path. This test proves
+// the lifecycle write is committed before CancelJob returns, so no state writer
+// can still be in flight afterwards.
+func TestLifecyclePersistenceIsSynchronous(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "jobs_state.json")
+	mgr := newJobManagerWithStatePath(Config{CacheDir: t.TempDir()}, nil, statePath)
+	registerTestJobManagerCleanup(t, mgr)
+
+	mgr.jobs["j1"] = &Job{
+		ID:             "j1",
+		Repo:           "owner/model",
+		Revision:       "main",
+		OutputDir:      t.TempDir(),
+		Status:         JobStatusPaused,
+		partialFilesMu: &sync.Mutex{},
+	}
+	if !mgr.CancelJob("j1") {
+		t.Fatal("CancelJob of a paused job failed")
+	}
+
+	// No WaitAll and no polling: the committed snapshot must already be on disk
+	// the moment CancelJob returns. Under the old async writer this read would
+	// race the goroutine that produced the cancellation.
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state not committed synchronously by CancelJob: %v", err)
+	}
+	var sf jobsStateFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		t.Fatalf("decode committed state: %v", err)
+	}
+	var found bool
+	for _, j := range sf.Jobs {
+		if j.ID == "j1" {
+			found = true
+			if j.Status != JobStatusCancelled {
+				t.Fatalf("persisted status = %s, want cancelled", j.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("cancelled job j1 not present in the committed state")
+	}
 }
 
 func TestJobStatus_Values(t *testing.T) {

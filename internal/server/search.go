@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -158,10 +159,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cacheDir := cfg.cacheRoot()
 
 	results := make([]SearchResult, 0, len(raw))
 	for _, m := range raw {
@@ -190,6 +188,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus
+		} else if hfdownloader.IsValidModelName(m.ID) {
+			repoType := hfdownloader.RepoTypeModel
+			if isDataset {
+				repoType = hfdownloader.RepoTypeDataset
+			}
+			rd, err := cfg.cache().Repo(m.ID, repoType)
+			if err == nil && hubRepoHasContent(rd) {
+				result.Cached, result.CacheSource, result.CacheStatus = true, "HF cache", "unknown"
+			}
 		}
 		results = append(results, result)
 	}
@@ -206,11 +213,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // param is accepted for UI compatibility but is validated against configured
 // directories to prevent arbitrary filesystem stat via the API.
 func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
-	cfg := s.snapshotConfig()
+	cfg := s.snapshotConfig().captureCacheEnvironment()
 
 	// Build the ordered list of configured candidate paths.
-	configured := []string{cfg.LocalDir, cfg.CacheDir, hfdownloader.DefaultCacheDir(), RunDir()}
-	configured = append(configured, routeDirs(cfg.DownloadRoutes)...)
+	routed := routeDirs(cfg.DownloadRoutes)
+	configured := []string{cfg.LocalDir, cfg.cache().HubDir(), cfg.cacheRoot(), cfg.cacheEnv.defaultRoot, RunDir()}
+	configured = append(configured, routed...)
 
 	// If the caller provides an explicit path, only honour it when it matches
 	// one of the configured directories (prevents arbitrary fs-stat via the API).
@@ -219,6 +227,18 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 		for _, c := range configured {
 			if c != "" && pathIdentityKey(requested) == pathIdentityKey(c) {
 				path = c
+				// Legacy clients pass cacheDir (R); cache capacity is measured
+				// at H, not the possibly unrelated friendly-view filesystem.
+				localPath := cfg.LocalDir != "" && pathIdentityKey(requested) == pathIdentityKey(cfg.LocalDir)
+				for _, dir := range routed {
+					if pathIdentityKey(requested) == pathIdentityKey(dir) {
+						localPath = true
+						break
+					}
+				}
+				if pathIdentityKey(c) == pathIdentityKey(cfg.cacheRoot()) && !localPath {
+					path = cfg.cache().HubDir()
+				}
 				break
 			}
 		}
@@ -235,7 +255,7 @@ func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeDiskFree(w, path)
+	writeDiskFree(w, path, cfg)
 }
 
 // handleDownloadDiskFree previews the same destination as CreateJob without
@@ -248,24 +268,37 @@ func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	_, _, path, err := resolveDownloadDestination(s.snapshotConfig(), req)
+	cfg := s.snapshotConfig()
+	_, localDir, path, err := resolveDownloadDestination(cfg, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
-	writeDiskFree(w, path)
+	if localDir == "" {
+		path = cfg.cache().HubDir()
+	} else {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to resolve destination", err.Error())
+			return
+		}
+	}
+	writeDiskFree(w, path, cfg)
 }
 
-func writeDiskFree(w http.ResponseWriter, path string) {
+func writeDiskFree(w http.ResponseWriter, path string, cfg Config) {
 	free, total, err := diskFreeBytes(path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":  path,
-		"free":  free,
-		"total": total,
+		"path":            path,
+		"free":            free,
+		"total":           total,
+		"cacheDir":        cfg.cacheRoot(),
+		"effectiveHubDir": cfg.cache().HubDir(),
+		"hubDirSource":    cfg.hubDirSource(),
 	})
 }
 

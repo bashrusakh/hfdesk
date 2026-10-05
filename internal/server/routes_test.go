@@ -71,6 +71,8 @@ func TestDownloadUIDestination(t *testing.T) {
 // in the test. A full scheduler slot keeps these jobs queued and off the network.
 func TestDownloadDiskFreeDestination(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HF_HOME", filepath.Join(root, "home"))
+	t.Setenv("HF_HUB_CACHE", "")
 	cache := filepath.Join(root, "cache")
 	local := filepath.Join(root, "local")
 	parent := filepath.Join(root, "llm")
@@ -128,10 +130,14 @@ func TestDownloadDiskFreeDestination(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if preview.Path != tt.want || job.OutputDir != preview.Path {
+			wantPhysical := tt.want
+			if job.LocalDir == "" {
+				wantPhysical = filepath.Join(tt.want, "hub")
+			}
+			if preview.Path != wantPhysical || job.OutputDir != tt.want || (job.LocalDir == "" && job.HubDir != preview.Path) {
 				t.Fatalf("preview=%q job=%q want=%q", preview.Path, job.OutputDir, tt.want)
 			}
-			free, total, err := diskFreeBytes(tt.want)
+			free, total, err := diskFreeBytes(wantPhysical)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1502,8 +1508,8 @@ func TestJobDestFreeze_LegacyRestoredJobRuns(t *testing.T) {
 	if restored.Status != JobStatusPaused {
 		t.Fatalf("restored status = %s, want paused", restored.Status)
 	}
-	if restored.OutputDir != "" {
-		t.Fatalf("legacy OutputDir should reload empty, got %q", restored.OutputDir)
+	if restored.OutputDir != dirA || restored.HubDir != filepath.Join(dirA, "hub") || restored.DestinationWarning == "" {
+		t.Fatalf("legacy destination should resolve once with a warning, got %+v", restored)
 	}
 	if !mgr.ResumeJob("legacy1") {
 		t.Fatal("ResumeJob of legacy job failed")

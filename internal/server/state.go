@@ -188,6 +188,7 @@ type HistoryEntry struct {
 	Revision  string    `json:"revision"`
 	IsDataset bool      `json:"isDataset,omitempty"`
 	OutputDir string    `json:"outputDir"`
+	HubDir    string    `json:"hubDir,omitempty"`
 	Status    JobStatus `json:"status"` // completed or failed
 	Error     string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
@@ -222,6 +223,7 @@ func AppendHistory(job *Job) error {
 		Revision:   job.Revision,
 		IsDataset:  job.IsDataset,
 		OutputDir:  job.OutputDir,
+		HubDir:     job.HubDir,
 		Status:     job.Status,
 		Error:      job.Error,
 		TotalFiles: job.Progress.TotalFiles,

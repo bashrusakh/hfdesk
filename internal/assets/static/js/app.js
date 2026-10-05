@@ -15,7 +15,21 @@
     wsConnected: false,
     ws: null,
     currentPage: 'analyze',
-    speedLimitLoaded: false
+    speedLimitLoaded: false,
+    // settingsLoadFailed is set only when the Settings metadata fetch fails.
+    // It gates saving so a failed/uninitialized load cannot POST empty values
+    // over the stored preferences. It stays false on a normal (including
+    // no-fetch) form so existing direct save paths keep working.
+    settingsLoadFailed: false,
+    // rawCacheDirAvailable is true only when the server returned the additive
+    // configuredCacheDir field. When false (older server), the form falls back
+    // to the legacy effective cacheDir for display and only submits cacheDir
+    // if the user actually changed it, so an unrelated save can never erase or
+    // materialize the stored preference.
+    rawCacheDirAvailable: false,
+    // loadedCacheDir snapshots the populated friendly-root field so the
+    // old-server fallback can tell an intentional edit from a pass-through.
+    loadedCacheDir: ''
   };
 
   // =========================================
@@ -1213,8 +1227,15 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
         badge.classList.add('storage-mode-local');
       } else {
-        badge.textContent = `Storage: HF cache → ${s.cacheDir}`;
-        badge.title = 'Downloads use the HuggingFace cache layout. The Cache browser also scans friendly and local model folders.';
+        // In cache mode the actual destination is the Hub path, which can
+        // differ from the friendly cache root (e.g. HF_HUB_CACHE). Show the
+        // real Hub destination, falling back to the legacy root for older
+        // servers that do not report it.
+        const hub = s.effectiveHubDir || s.cacheDir;
+        badge.textContent = `Storage: HF cache → ${hub}`;
+        badge.title = s.hubDirSource === 'HF_HUB_CACHE'
+          ? 'Downloads use the HuggingFace cache layout. Destination set by HF_HUB_CACHE in the server environment.'
+          : 'Downloads use the HuggingFace cache layout. The Cache browser also scans friendly and local model folders.';
         badge.classList.remove('storage-mode-local');
       }
       badge.hidden = false;
@@ -1863,7 +1884,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           </div>
           <h3>${cacheData.repos?.length === 0 ? 'Cache is Empty' : 'No Results'}</h3>
           <p>${message}</p>
-          ${cacheData.cacheDir ? `<p class="cache-dir-hint">Cache: ${escapeHtml(cacheData.cacheDir)}</p>` : ''}
+          ${(() => {
+            // Show the actual Hub destination when the server reports it; fall
+            // back to the legacy friendly root for older servers. Never label
+            // the friendly root as the Hub path when they differ.
+            const dir = cacheData.effectiveHubDir || cacheData.cacheDir;
+            const label = cacheData.effectiveHubDir ? 'Hub cache' : 'Cache';
+            return dir ? `<p class="cache-dir-hint">${label}: ${escapeHtml(dir)}</p>` : '';
+          })()}
         </div>
       `;
       return;
@@ -2317,10 +2345,24 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Actually delete the cache
   window.deleteCache = async function(repo, type) {
     try {
-      await api('DELETE', `/cache/${repo}?type=${type}`);
+      const result = await api('DELETE', `/cache/${repo}?type=${type}`);
       hideModal();
-      showToast(`Deleted ${repo} from cache`, 'success');
-      loadCache(); // Refresh the list
+      // The server can answer HTTP 200 with a structured partial-failure
+      // result: the Hub repository was removed but the friendly view could not
+      // be. Never claim a full deletion in that case; surface a concise reason
+      // from the reported errors and still refresh the list.
+      const errors = result && Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
+      const partial = (result && result.success === false) || errors.length > 0;
+      if (partial) {
+        const detail = errors.length ? `: ${String(errors[0]).slice(0, 200)}` : '';
+        const message = result && result.message
+          ? `${result.message}${detail}`
+          : `Cache entry for ${repo} was only partially removed${detail}`;
+        showToast(message, 'error');
+      } else {
+        showToast(`Deleted ${repo} from cache`, 'success');
+      }
+      loadCache(); // Refresh the list either way
     } catch (e) {
       showToast(`Failed to delete: ${e.message}`, 'error');
     }
@@ -2554,14 +2596,43 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   async function loadSettings() {
+    let data;
     try {
-      const data = await api('GET', '/settings');
-      state.settings = data;
-
-      const cacheDirInput = $('#cacheDirInput');
-      if (cacheDirInput) {
-        cacheDirInput.value = data.cacheDir || '';
+      data = await api('GET', '/settings');
+    } catch (e) {
+      // Only a failed metadata fetch is a hard failure. It gates saving so a
+      // broken load cannot POST empty/unknown values over stored preferences.
+      console.error('Failed to load settings:', e);
+      state.settingsLoadFailed = true;
+      renderHubDirField(null);
+      const hint = $('#hubDirHint');
+      if (hint) {
+        hint.textContent = 'Could not load storage settings from the server. Reload the page before saving.';
+        hint.classList.add('form-hint-error');
       }
+      return;
+    }
+    state.settings = data;
+    state.settingsLoadFailed = false;
+
+    // Populating the form is separated from the fetch: a partially missing DOM
+    // must not be treated as an unknown server state that blocks saving.
+    try {
+      // The visible Hub destination is server output (effectiveHubDir), never
+      // the editable preference. configuredCacheDir is the raw, possibly-empty
+      // app preference and is the only value that must round-trip on save.
+      // It may be empty by design, so presence must be tested by key, not by
+      // truthiness. Older servers omit it; fall back to the legacy effective
+      // cacheDir for display and never auto-submit that fallback as a clear.
+      const cacheDirInput = $('#cacheDirInput');
+      const hasRaw = Object.prototype.hasOwnProperty.call(data, 'configuredCacheDir');
+      state.rawCacheDirAvailable = hasRaw;
+      const initialCacheDir = (hasRaw ? data.configuredCacheDir : data.cacheDir) || '';
+      state.loadedCacheDir = initialCacheDir;
+      if (cacheDirInput) {
+        cacheDirInput.value = initialCacheDir;
+      }
+      renderHubDirField(data);
       const localScanDirs = $('#localScanDirs');
       if (localScanDirs) {
         localScanDirs.value = (data.localScanDirs || []).join('\n');
@@ -2622,8 +2693,49 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         $('#proxyNoEnvProxy').checked = false;
       }
     } catch (e) {
-      console.error('Failed to load settings:', e);
+      // Dom population problems are reported but must not block an otherwise
+      // successful metadata load from being saveable.
+      console.error('Failed to populate settings form:', e);
     }
+  }
+
+  // renderHubDirField shows the server's actual Hub destination as read-only
+  // output. The raw app preference never appears here, and the Hub path is
+  // never submitted: changing the friendly cache folder does not move Hub
+  // files, and the actual destination is set by the server environment.
+  function renderHubDirField(data) {
+    const input = $('#effectiveHubDirInput');
+    const hint = $('#hubDirHint');
+    if (!input) return;
+
+    const known = data && typeof data.effectiveHubDir === 'string' && data.effectiveHubDir !== '';
+    input.value = known ? data.effectiveHubDir : '';
+    input.title = known ? data.effectiveHubDir : '';
+
+    if (!hint) return;
+    hint.classList.remove('form-hint-error');
+    if (!known) {
+      // Older server (or load failure): no effectiveHubDir metadata. Show a
+      // neutral note; do not invent a source or precedence.
+      hint.textContent = 'Hub cache path is not reported by this server.';
+      return;
+    }
+    let text;
+    if (data.hubDirSource === 'HF_HUB_CACHE') {
+      text = 'Controlled by HF_HUB_CACHE in the server environment; change or remove that launch variable and restart to move it.';
+    } else if (data.hubDirSource === 'cacheDir') {
+      text = 'Derived from the friendly cache folder above; each repo lives under its "hub" subfolder.';
+    } else if (data.hubDirSource === 'HF_HOME') {
+      text = 'Derived from HF_HOME in the server environment; each repo lives under its "hub" subfolder.';
+    } else {
+      text = 'Default location; each repo lives under its "hub" subfolder.';
+    }
+    // Local mode redirects ordinary downloads to a flat local folder; say so
+    // rather than implying routed/local downloads land in the Hub path.
+    if (data.storageMode === 'local') {
+      text += ' Server is in local mode, so downloads write flat files to the local folder instead.';
+    }
+    hint.textContent = text;
   }
 
   function initSettingsPage() {
@@ -2714,6 +2826,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   async function saveSettings() {
+    // Refuse to save only when a load attempt failed; an explicit failure must
+    // not POST empty/unknown values over the stored preference.
+    if (state.settingsLoadFailed) {
+      showToast('Settings are not loaded yet. Reload the page before saving.', 'error');
+      return;
+    }
     const layout = $('#downloadLayout')?.value || 'cache';
     const defaultLocalDir = $('#localDirInput')?.value?.trim() || '';
     if (layout === 'local' && !defaultLocalDir) {
@@ -2739,7 +2857,6 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
 
     const body = {
-      cacheDir: $('#cacheDirInput')?.value?.trim() || '',
       localDir: layout === 'local' ? defaultLocalDir : '',
       localScanDirs: ($('#localScanDirs')?.value || '')
         .split(/\r?\n/)
@@ -2753,6 +2870,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       verify: $('#verify')?.value || 'size',
       endpoint: $('#endpoint')?.value || ''
     };
+
+    const cacheDirValue = $('#cacheDirInput')?.value?.trim() || '';
+    if (state.rawCacheDirAvailable) {
+      body.cacheDir = cacheDirValue;
+    } else if (cacheDirValue !== (state.loadedCacheDir || '').trim()) {
+      body.cacheDir = cacheDirValue;
+    }
 
     // The loaded mask is display-only. Only authored changes or Reset carry
     // token intent; an ordinary Save must preserve active and stored tokens.
@@ -2826,11 +2950,14 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   function resetSettings() {
-    if (!confirm('Reset all settings to defaults? This cannot be undone.')) return;
+    if (!confirm('Reset all settings to defaults? This clears the saved app preferences and cannot be undone. It does not change server environment paths (such as HF_HUB_CACHE) or move any cached files.')) return;
 
     const setVal = (id, val) => { const el = $(id); if (el) el.value = val; };
     const setChecked = (id, checked) => { const el = $(id); if (el) el.checked = checked; };
 
+    // Clears the raw app preference only. The read-only actual Hub cache field
+    // stays as the server reported it until the next settings reload; reset
+    // never claims to unset ENV or relocate cached files.
     setVal('#cacheDirInput', '');
     setVal('#localDirInput', '');
     setVal('#localScanDirs', '');
@@ -4078,6 +4205,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       const size = e.totalBytes ? formatBytes(e.totalBytes) : '—';
       const rev = e.revision && e.revision !== 'main' ? `<div class="history-repo-rev">@ ${escapeHtml(e.revision)}</div>` : '';
       const type = e.isDataset ? '<span class="model-tag" style="font-size:11px">dataset</span>' : '';
+      // Only surface the frozen Hub destination when it is a meaningful,
+      // independent location; the conventional "<friendly>/hub" is already
+      // implied by the friendly root and would just add noise.
+      const hub = meaningfulHubDir(e.hubDir, e.outputDir)
+        ? `<div class="history-dir-hub" title="${escapeHtml(e.hubDir)}">Hub: ${escapeHtml(e.hubDir)}</div>`
+        : '';
       return `
         <tr>
           <td>
@@ -4088,7 +4221,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           <td>${e.totalFiles ? e.totalFiles + ' files' : '—'}</td>
           <td>${size}</td>
           <td class="history-date" title="${e.endedAt || ''}">${date}</td>
-          <td><div class="history-dir" title="${escapeHtml(e.outputDir || '')}">${escapeHtml(e.outputDir || '—')}</div></td>
+          <td><div class="history-dir" title="${escapeHtml(e.outputDir || '')}">${escapeHtml(e.outputDir || '—')}</div>${hub}</td>
         </tr>`;
     }).join('');
 
@@ -4108,6 +4241,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           <tbody>${rows}</tbody>
         </table>
       </div>`;
+  }
+
+  // meaningfulHubDir reports whether a history row's frozen Hub destination
+  // (H) adds information beyond the shown friendly/app output dir (R). It
+  // returns false for the conventional "<R>/hub" derivation and for missing
+  // data, so ordinary rows keep their current single-line layout.
+  function meaningfulHubDir(hubDir, outputDir) {
+    const hub = (hubDir || '').trim();
+    if (!hub) return false;
+    const base = (outputDir || '').trim().replace(/[\\/]+$/, '');
+    if (!base) return true;
+    const conventional = (base + '/hub').replace(/\\/g, '/');
+    return hub.replace(/\\/g, '/').replace(/\/+$/, '') !== conventional;
   }
 
   function formatRelativeDate(iso) {

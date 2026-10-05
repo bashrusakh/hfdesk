@@ -24,10 +24,11 @@ import (
 type Config struct {
 	Addr        string
 	Port        int
-	Token       string // HuggingFace token
-	ModelsDir   string // Output directory for models (not configurable via API)
-	DatasetsDir string // Output directory for datasets (not configurable via API)
-	CacheDir    string // HuggingFace cache directory for v3 mode
+	Token       string            // HuggingFace token
+	ModelsDir   string            // Output directory for models (not configurable via API)
+	DatasetsDir string            // Output directory for datasets (not configurable via API)
+	CacheDir    string            // HuggingFace cache directory for v3 mode
+	cacheEnv    *cacheEnvironment // Startup paths; immutable across config snapshots.
 	// LocalDir, when set, puts the whole server in flat/local-file mode: every
 	// download writes real files into <LocalDir>/<owner>/<repo> instead of the
 	// HF cache layout. Set once at startup (serve --local-dir); not changeable
@@ -152,6 +153,7 @@ func (s *Server) withConfig(fn func(*Config)) (Config, uint64) {
 	defer s.configMu.Unlock()
 	c := s.config
 	fn(&c)
+	c.cacheEnv = s.config.cacheEnv
 	s.config = c
 	s.configGen++
 	return s.config, s.configGen
@@ -180,6 +182,7 @@ func (s *Server) consumeTokenWrite(intentGen uint64) {
 
 // New creates a new server with the given configuration.
 func New(cfg Config) *Server {
+	cfg = cfg.captureCacheEnvironment()
 	if isRedactedToken(cfg.Token) {
 		cfg.Token = ""
 	}

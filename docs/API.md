@@ -132,6 +132,23 @@ POST   /api/jobs/{id}/dismiss
 
 `dismiss` removes terminal jobs from the UI/state. Running or queued jobs must be cancelled first.
 
+Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
+`outputDir` keeps its existing meaning: the app/friendly root in cache mode,
+or the local output root in flat mode. Jobs and history record both roots;
+changing Settings or restarting with different ENV does not relocate new-format
+jobs, including queued, paused, retried, resumed, or requeued jobs. Deduplication
+includes the complete root association, so different friendly roots sharing one
+Hub remain distinct destinations.
+New jobs persist absolute physical paths, including relative local/route inputs,
+so another launch directory on restart cannot reinterpret their destinations.
+
+Legacy jobs without `hubDir` are resolved once on restore using their recorded
+`outputDir` (the current app root if absent) plus startup `HF_HUB_CACHE`, or
+`outputDir/hub` without that override. Their `destinationWarning` and a server
+warning explain that the historical Hub path is unknown. The resolved association
+is saved through normal state persistence. No old-cache search, file moves, or
+recovery of an unrecorded historical ENV path is performed.
+
 ## Settings
 
 ```http
@@ -155,6 +172,9 @@ Storage fields:
 ```json
 {
   "cacheDir": "I:\\huggingface",
+  "configuredCacheDir": "",
+  "effectiveHubDir": "J:\\shared-hf-store",
+  "hubDirSource": "HF_HUB_CACHE",
   "localDir": "D:\\Models",
   "localScanDirs": ["D:\\Models", "I:\\LM Studio\\models"],
   "downloadRoutes": {
@@ -167,7 +187,29 @@ Storage fields:
 }
 ```
 
-`cacheDir` controls where HF cache-layout downloads are written. When `localDir` is set, downloads use real files under `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots. `localScanDirs` are read-only model roots scanned as `<owner>/<model>` folders for the Cache browser and local badges in Hub search results.
+In GET responses, `cacheDir` remains the effective app/friendly root (R), for
+backward compatibility. `configuredCacheDir` is the raw preference, always
+present even when empty. Use that raw value to populate an editable app-root
+field and for unrelated form saves; do not materialize the effective default
+as a saved preference. The three new fields are output-only metadata, not
+editable settings. POST `cacheDir` still explicitly writes R, including a
+same-path write; empty clears the preference and omission preserves it.
+Effective metadata is ignored on POST and never persisted as preferences.
+
+R resolves from nonempty CLI `--cache-dir`, then selected config-file preference,
+then startup `HF_HOME`, then the existing `~/.cache/huggingface` default.
+`effectiveHubDir` is the exact Hub storage root (H): startup `HF_HUB_CACHE` when
+nonempty, otherwise R/hub. The override applies even with an explicit R; H may
+have any basename and be outside R. R named `hub` still normally contains a
+`hub` child. `hubDirSource` is `HF_HUB_CACHE`, `cacheDir`, `HF_HOME`, or `default`,
+describing H's derivation. Environment paths/defaults are captured at server
+startup, not re-read by getters or runners. Editing R with ENV H set changes
+friendly views, not Hub storage, and does not move existing files.
+
+When `localDir` is set, downloads use real files under
+`<localDir>/<owner>/<model>`, which matches LM Studio-style model roots.
+`localScanDirs` are independent read-only model roots scanned as `<owner>/<model>`
+folders for the Cache browser and local badges in Hub search results.
 
 `downloadRoutes` is an opt-in map from an internal route key to a destination directory. When a download request sends a `routeKey` that resolves in this map, the job is written to that folder instead of `localDir`/HF cache. Route destinations are also scanned by the Cache browser and accepted by `/api/diskfree?path=...`.
 
@@ -209,6 +251,25 @@ Cache entries may come from:
 - `filtered`
 - `unknown`
 
+`GET /api/cache` includes effective R as `cacheDir`, plus `effectiveHubDir` and
+`hubDirSource`. HF entries' `path` is under selected H, while `friendlyPath` is
+under associated R. A friendly manifest from a different Hub association does
+not establish completion in the selected Hub. Search badges can recognize usable
+Hub snapshot files without a friendly view; empty/partial-only Hub directories
+are not cached-content evidence. Independent local scan source priority remains
+unchanged.
+
+Rebuild and generated `R/rebuild.sh` use the same selected H/R association.
+Conventional R/hub scripts remain relocatable with their whole root; independent
+Hub scripts capture an absolute H, safely quoted, and regenerate when that
+association changes. They do not rediscover ambient ENV. Manifest `repo_path`
+is relative to R, or absolute when R/H are on different volumes.
+
+Delete removes only the selected repository under H and its friendly view under
+R, with separate confinement checks. Shared H deletion can affect other clients
+using that repository. Failure to remove the friendly view after Hub deletion
+returns `success: false` with `errors`, rather than hiding partial failure.
+
 ## Mirror
 
 ```http
@@ -220,7 +281,10 @@ POST   /api/mirror/push
 POST   /api/mirror/pull
 ```
 
-Mirror operations compare and synchronize cache roots to configured targets.
+Mirror operations compare and synchronize selected local H with the explicit
+target root's `hub` child, regardless of local ENV. Mapping, verification, and
+`deleteExtra` remain bounded to those Hub roots. Mirror diff retains `localPath`
+as R and adds local `effectiveHubDir` and `hubDirSource`.
 
 ## History and Disk
 
@@ -230,22 +294,30 @@ GET /api/diskfree?path=/path/to/cache
 POST /api/diskfree
 ```
 
-`GET /api/diskfree` defaults to global `localDir`, then configured `cacheDir`,
-then the default HF cache directory. An explicit `path` must match a configured
-directory (including download route directories).
+`GET /api/diskfree` defaults to global `localDir`, then selected H. An explicit
+`path` must match an allowed configured directory (including selected H, app R,
+captured default root, and download routes). A legacy request naming app R is
+measured at H and returns H as `path`; it must not report capacity on an unrelated
+friendly-view filesystem. Explicit local/route paths retain their behavior.
+When R is also a configured local/route destination, an explicit GET naming it
+retains that local-path meaning; cache previews without a selector still use H.
 
 `POST /api/diskfree` previews the effective download destination using optional
 `routeKey`, `localDir`, and `dataset` fields from the download request. `repo` is
 not required; other download fields are ignored. Resolution is identical to job
 creation: explicit `localDir` > configured route (fine key, then parent) > global
-`localDir` > configured/default HF cache. Datasets ignore `routeKey`; unknown
+`localDir` > selected exact H. Datasets ignore `routeKey`; unknown
 model selectors return `400`, even with an explicit `localDir`. An explicit
 `localDir` is accepted as on `POST /api/download`, independently of GET's browsing
-allowlist. The response is `{ "path": "...", "free": 123, "total": 456 }` with
+allowlist. The response includes `{ "path": "...", "free": 123, "total": 456 }` with
 byte counts; stat failures return `500`. This read-only check uses the nearest
 existing ancestor for a not-yet-created folder, creates no directories or jobs,
 and does not contact the Hub. It is advisory: settings and available space may
 change before creation; each job's destination remains frozen at creation.
+Disk responses additionally include current `cacheDir`, `effectiveHubDir`, and
+`hubDirSource` as storage metadata. In local mode these describe the inactive HF
+association, not the measured local `path`. Cache-mode preview `path` matches
+job `hubDir`, not legacy job `outputDir` (R).
 
 ## WebSocket
 

@@ -109,8 +109,14 @@ func TestJobManagerUsesFixedStatePathForLoadAndSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded) != 1 || loaded[0].Repo != "updated/model" || loaded[0].OutputDir != "" {
+	if len(loaded) != 1 || loaded[0].Repo != "updated/model" {
 		t.Fatalf("unexpected fixed-path persisted state: %#v", loaded)
+	}
+	// The seeded record is legacy (no LocalDir/HubDir): issue #76 resolves its
+	// complete destination once at restore, so a non-empty OutputDir/HubDir and
+	// a one-time warning are persisted rather than an empty OutputDir.
+	if loaded[0].OutputDir == "" || loaded[0].HubDir == "" || loaded[0].DestinationWarning == "" {
+		t.Fatalf("legacy destination not resolved and persisted: %#v", loaded[0])
 	}
 	m.mu.Lock()
 	m.jobs = make(map[string]*Job)

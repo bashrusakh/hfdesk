@@ -2447,6 +2447,19 @@ a {
   font-size: 12px;
 }
 
+/* Server-reported Hub destination. Read-only output the user can focus and
+   select to copy, but never edits or submits. Muted so it reads as a value,
+   not an input. */
+.settings-card .hub-dir-input[readonly] {
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  cursor: text;
+}
+
+.form-hint-error {
+  color: var(--color-error);
+}
+
 .settings-card .input-with-toggle input {
   padding-right: 42px;
 }
@@ -4135,6 +4148,20 @@ a {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Secondary frozen Hub destination (H), shown only when it differs
+   meaningfully from the friendly root (R) in .history-dir above. */
+.history-dir-hub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+  opacity: 0.85;
 }
 
 /* ============================================

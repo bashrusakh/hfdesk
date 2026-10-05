@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -30,25 +31,27 @@ const (
 
 // Job represents a download job.
 type Job struct {
-	ID         string            `json:"id"`
-	Repo       string            `json:"repo"`
-	Revision   string            `json:"revision"`
-	IsDataset  bool              `json:"isDataset,omitempty"`
-	Filters    []string          `json:"filters,omitempty"`
-	Excludes   []string          `json:"excludes,omitempty"`
-	OutputDir  string            `json:"outputDir"`
-	LocalDir   string            `json:"localDir,omitempty"`   // Effective local-dir for this job (per-request or server-global)
-	LocalRepo  string            `json:"localRepo,omitempty"`  // Override destination folder name (used for upstream mmproj)
-	Flat       bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
-	ExactMatch bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
-	Status     JobStatus         `json:"status"`
-	Phase      string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
-	Progress   JobProgress       `json:"progress"`
-	Error      string            `json:"error,omitempty"`
-	CreatedAt  time.Time         `json:"createdAt"`
-	StartedAt  *time.Time        `json:"startedAt,omitempty"`
-	EndedAt    *time.Time        `json:"endedAt,omitempty"`
-	Files      []JobFileProgress `json:"files,omitempty"`
+	ID                 string            `json:"id"`
+	Repo               string            `json:"repo"`
+	Revision           string            `json:"revision"`
+	IsDataset          bool              `json:"isDataset,omitempty"`
+	Filters            []string          `json:"filters,omitempty"`
+	Excludes           []string          `json:"excludes,omitempty"`
+	OutputDir          string            `json:"outputDir"`
+	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
+	DestinationWarning string            `json:"destinationWarning,omitempty"`
+	LocalDir           string            `json:"localDir,omitempty"`   // Effective local-dir for this job (per-request or server-global)
+	LocalRepo          string            `json:"localRepo,omitempty"`  // Override destination folder name (used for upstream mmproj)
+	Flat               bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
+	ExactMatch         bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
+	Status             JobStatus         `json:"status"`
+	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
+	Progress           JobProgress       `json:"progress"`
+	Error              string            `json:"error,omitempty"`
+	CreatedAt          time.Time         `json:"createdAt"`
+	StartedAt          *time.Time        `json:"startedAt,omitempty"`
+	EndedAt            *time.Time        `json:"endedAt,omitempty"`
+	Files              []JobFileProgress `json:"files,omitempty"`
 
 	// RouteKey is the download route key requested at creation (internal/audit
 	// only). The resolved destination lives in LocalDir; this field is never a
@@ -176,10 +179,11 @@ var errJobManagerPersistenceClosed = errors.New("job manager persistence is clos
 
 // NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
-	return newJobManagerWithStatePath(cfg, wsHub, JobsStatePath())
+	return newJobManagerWithStatePath(cfg.captureCacheEnvironment(), wsHub, JobsStatePath())
 }
 
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
+	cfg = cfg.captureCacheEnvironment()
 	m := &JobManager{
 		saveMu:           &sync.Mutex{},
 		jobs:             make(map[string]*Job),
@@ -224,8 +228,16 @@ func (m *JobManager) LoadState() {
 		m.mu.Unlock()
 		return
 	}
+	legacyResolved := false
 	for _, j := range jobs {
 		j.cancel = nil
+		if j.LocalDir == "" && j.HubDir == "" {
+			cache := m.config.cacheForRoot(j.OutputDir)
+			j.OutputDir, j.HubDir = cache.Root, cache.HubDir()
+			j.DestinationWarning = "Legacy job: historical Hub directory is unknown; destination resolved once from recorded app root and startup environment. No files were moved."
+			log.Printf("warning: job %s: %s", j.ID, j.DestinationWarning)
+			legacyResolved = true
+		}
 		// Ensure no zombie running/queued jobs survive a restart
 		if j.Status == JobStatusRunning || j.Status == JobStatusQueued {
 			j.Status = JobStatusPaused
@@ -242,6 +254,9 @@ func (m *JobManager) LoadState() {
 		m.jobs[j.ID] = j
 	}
 	m.mu.Unlock()
+	if legacyResolved {
+		m.saveStateAndLog()
+	}
 	log.Printf("restored %d job(s) from state file", len(jobs))
 }
 
@@ -465,6 +480,19 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		return nil, false, err
 	}
 	flat := effectiveLocalDir != ""
+	hubDir := ""
+	if flat {
+		// Persist physical local destinations too: a restart from another
+		// launch directory must not reinterpret a previously relative path.
+		effectiveLocalDir, err = filepath.Abs(effectiveLocalDir)
+		if err != nil {
+			return nil, false, err
+		}
+		outputDir = effectiveLocalDir
+	} else {
+		cache := cfg.cache()
+		outputDir, hubDir = cache.Root, cache.HubDir()
+	}
 
 	// The requested destination identity for dedup purposes: the frozen
 	// output root (flat local dir when set, cache root otherwise), compared
@@ -497,6 +525,8 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
 			pathIdentityKey(existing.OutputDir) == reqDestKey &&
+			existing.Flat == flat &&
+			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
 			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
@@ -516,6 +546,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		Filters:    req.Filters,
 		Excludes:   req.Excludes,
 		OutputDir:  outputDir,
+		HubDir:     hubDir,
 		LocalDir:   effectiveLocalDir,
 		LocalRepo:  req.LocalRepo,
 		Flat:       flat,
@@ -997,6 +1028,9 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 		log.Printf("warning: ignoring job manager config update while stopping")
 		return
 	}
+	// Startup storage ENV/defaults are immutable across config snapshots;
+	// preserve them so a settings update never re-reads ambient ENV.
+	cfg.cacheEnv = m.config.cacheEnv
 	m.opWG.Add(1)
 	m.config = cfg
 	if m.speedLimiter != nil {
@@ -1268,27 +1302,11 @@ func (m *JobManager) runJob(job *Job) {
 	// be a data race.
 	cfg := m.snapshotConfig()
 
-	// The destination was resolved and frozen into the job fields at
-	// CreateJob time (routes.go resolveDownloadDestination): cache mode
-	// carries the cache root in job.OutputDir, flat mode carries the
-	// resolved local folder in job.LocalDir (applied below). runJob must
-	// honor the frozen destination — re-snapshotting cfg.CacheDir here
-	// would move an existing job's downloads into a newly configured cache
-	// root while the job still reports its original OutputDir.
-	//
-	// Legacy state files persisted before OutputDir existed carry an empty
-	// value; those restored jobs keep their historical current-cache-root
-	// semantics by falling back to the configured or default cache.
-	cacheDir := job.OutputDir
-	if cacheDir == "" {
-		cacheDir = cfg.CacheDir
-	}
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cache := jobCache(cfg, job)
 
 	settings := hfdownloader.Settings{
-		CacheDir:           cacheDir, // Use HF cache structure
+		CacheDir:           cache.Root,
+		HubDir:             cache.HubDir(),
 		Concurrency:        cfg.Concurrency,
 		MaxActiveDownloads: cfg.MaxActive,
 		Token:              cfg.Token,
@@ -1365,6 +1383,7 @@ func (m *JobManager) runJob(job *Job) {
 	if job.LocalDir != "" {
 		settings.OutputDir = job.LocalDir
 		settings.CacheDir = ""
+		settings.HubDir = ""
 	}
 
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
@@ -1455,28 +1474,15 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		return
 	}
 	cfg := m.snapshotConfig()
-	// The paused job's runJob goroutine has already exited, so the settings
-	// the last run (or a future resume) will use may differ from the current
-	// cfg. Mirror runJob's destination-freeze chain exactly: frozen
-	// job.OutputDir for cache mode, frozen job.LocalDir for flat mode, and
-	// the configured/default cache only for legacy restored jobs whose
-	// OutputDir was empty — cleanup must validate dsts against the same
-	// root the artifacts were downloaded to.
-	cacheDir := job.OutputDir
-	if cacheDir == "" {
-		cacheDir = cfg.CacheDir
-	}
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cache := jobCache(cfg, job)
 	settings := hfdownloader.Settings{
-		CacheDir: cacheDir,
+		CacheDir: cache.Root,
+		HubDir:   cache.HubDir(),
 	}
 	if job.LocalDir != "" {
 		settings.OutputDir = job.LocalDir
 		settings.CacheDir = ""
-	} else if settings.CacheDir == "" {
-		settings.CacheDir = hfdownloader.DefaultCacheDir()
+		settings.HubDir = ""
 	}
 	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
 		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, err)

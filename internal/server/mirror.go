@@ -188,13 +188,10 @@ func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 
 	// Local cache
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cacheDir := cfg.cacheRoot()
 
 	// Scan both caches
-	localEntries, err := scanCacheForMirror(cacheDir)
+	localEntries, err := scanHubForMirror(cfg.cache().HubDir())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to scan local cache", err.Error())
 		return
@@ -291,9 +288,11 @@ func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"diffs":      diffs,
-		"localPath":  cacheDir,
-		"targetPath": targetPath,
+		"diffs":           diffs,
+		"localPath":       cacheDir,
+		"effectiveHubDir": cfg.cache().HubDir(),
+		"hubDirSource":    cfg.hubDirSource(),
+		"targetPath":      targetPath,
 		"summary": map[string]any{
 			"missing":          missingCount,
 			"missingSizeHuman": humanSizeBytes(missingSize),
@@ -338,12 +337,7 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 
 	// Local cache
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
-	result, err := mirrorSync(cacheDir, targetPath, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	result, err := mirrorSyncHubs(cfg.cache().HubDir(), filepath.Join(targetPath, "hub"), req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
 		return
@@ -375,13 +369,8 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 
 	// Local cache
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
 	// Pull is push in reverse (target -> local)
-	result, err := mirrorSync(targetPath, cacheDir, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	result, err := mirrorSyncHubs(filepath.Join(targetPath, "hub"), cfg.cache().HubDir(), req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
 		return
@@ -402,9 +391,11 @@ type mirrorEntry struct {
 
 // scanCacheForMirror scans the cache directory for mirror operations.
 func scanCacheForMirror(cacheDir string) ([]mirrorEntry, error) {
-	var entries []mirrorEntry
+	return scanHubForMirror(filepath.Join(cacheDir, "hub"))
+}
 
-	hubDir := filepath.Join(cacheDir, "hub")
+func scanHubForMirror(hubDir string) ([]mirrorEntry, error) {
+	var entries []mirrorEntry
 	if _, err := os.Stat(hubDir); os.IsNotExist(err) {
 		return entries, nil
 	}
@@ -435,6 +426,9 @@ func scanCacheForMirror(cacheDir string) ([]mirrorEntry, error) {
 
 		// Convert owner--repo to owner/repo
 		repoName = strings.Replace(repoName, "--", "/", 1)
+		if !hfdownloader.IsValidModelName(repoName) {
+			continue
+		}
 
 		// Get size by walking blobs directory
 		blobsDir := filepath.Join(hubDir, name, "blobs")
@@ -480,21 +474,22 @@ type MirrorSyncResult struct {
 	Message          string   `json:"message"`
 }
 
-// mirrorSync copies repos from source to destination.
-func mirrorSync(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExtra, force bool) (*MirrorSyncResult, error) {
+// mirrorSyncHubs receives exact independently trusted Hub roots. Remote target
+// roots are explicitly joined by callers and never resolved using local ENV.
+func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExtra, force bool) (*MirrorSyncResult, error) {
 	result := &MirrorSyncResult{
 		Success: true,
 		DryRun:  dryRun,
 	}
 
 	// Scan source
-	srcEntries, err := scanCacheForMirror(srcCache)
+	srcEntries, err := scanHubForMirror(srcCache)
 	if err != nil {
 		return nil, fmt.Errorf("scan source: %w", err)
 	}
 
 	// Scan destination
-	dstEntries, err := scanCacheForMirror(dstCache)
+	dstEntries, err := scanHubForMirror(dstCache)
 	if err != nil {
 		// Destination might not exist yet
 		dstEntries = nil
@@ -522,8 +517,10 @@ func mirrorSync(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExt
 			toCopy = append(toCopy, e)
 		} else if force {
 			// Check if destination needs update
-			relPath, _ := filepath.Rel(srcCache, e.Path)
-			dstPath := filepath.Join(dstCache, relPath)
+			dstPath, err := mirrorRepoDestination(e.Path, srcCache, dstCache)
+			if err != nil {
+				return nil, err
+			}
 			if needsUpdate, _ := compareRepoIntegrity(e.Path, dstPath); needsUpdate {
 				toCopy = append(toCopy, e)
 			}
@@ -587,6 +584,11 @@ func mirrorSync(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExt
 
 	// Delete extra repos
 	for _, e := range toDelete {
+		if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			result.Success = false
+			continue
+		}
 		if err := os.RemoveAll(e.Path); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.Repo, err))
 			result.Success = false
@@ -603,15 +605,9 @@ func mirrorSync(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExt
 
 // copyRepoCache copies a repo from source to destination cache.
 func copyRepoCache(repoPath, srcCache, dstCache string) error {
-	relPath, err := filepath.Rel(srcCache, repoPath)
+	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
-	}
-
-	// Guard: dstPath must remain inside dstCache (no ../ traversal via relPath).
-	dstPath, err := hfdownloader.SafeJoin(dstCache, relPath)
-	if err != nil {
-		return fmt.Errorf("path traversal: repo %q would escape destination cache: %w", relPath, err)
 	}
 
 	// Create destination directory
@@ -630,8 +626,17 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 
 		dst := filepath.Join(dstPath, rel)
+		// Existing destination directory links must never redirect writes
+		// outside the selected repository/Hub. Snapshot leaf links are replaced
+		// below, but their parents must be real directories.
+		if err := mirrorNoSymlinkPath(dstCache, filepath.Dir(dst)); err != nil {
+			return err
+		}
 
 		if info.IsDir() {
+			if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
+				return err
+			}
 			return os.MkdirAll(dst, info.Mode())
 		}
 
@@ -655,6 +660,9 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 
 		// Copy file
+		if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
+			return err
+		}
 		return copyFileForMirror(path, dst)
 	})
 }
@@ -687,12 +695,11 @@ func copyFileForMirror(src, dst string) error {
 
 // verifyRepoCache verifies that a copied repo matches the source.
 func verifyRepoCache(repoPath, srcCache, dstCache string) error {
-	relPath, err := filepath.Rel(srcCache, repoPath)
+	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
 	}
 
-	dstPath := filepath.Join(dstCache, relPath)
 	blobsDir := filepath.Join(repoPath, "blobs")
 
 	return filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
@@ -709,6 +716,12 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 
 		dstFile := filepath.Join(dstPath, rel)
+		if err := mirrorNoSymlinkPath(srcCache, path); err != nil {
+			return err
+		}
+		if err := mirrorNoSymlinkPath(dstCache, dstFile); err != nil {
+			return err
+		}
 		dstInfo, err := os.Stat(dstFile)
 		if err != nil {
 			return fmt.Errorf("missing blob %s: %w", rel, err)
@@ -720,6 +733,52 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 
 		return nil
 	})
+}
+
+// Mapping is relative to the exact Hub, never its parent or the friendly root.
+func mirrorRepoDestination(repoPath, srcHub, dstHub string) (string, error) {
+	rel, err := filepath.Rel(srcHub, repoPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", fmt.Errorf("repository outside source Hub: %s", repoPath)
+	}
+	if err := mirrorNoSymlinkPath(srcHub, repoPath); err != nil {
+		return "", err
+	}
+	dst, err := hfdownloader.SafeJoin(dstHub, rel)
+	if err != nil {
+		return "", err
+	}
+	if err := mirrorNoSymlinkPath(dstHub, dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// The explicitly selected Hub itself may be a trusted filesystem mount/link;
+// descendants may not redirect copy/delete/verification to another root.
+func mirrorNoSymlinkPath(hub, path string) error {
+	rel, err := filepath.Rel(hub, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path outside selected Hub: %s", path)
+	}
+	if rel == "." {
+		return nil
+	}
+	current := hub
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked mirror path: %s", current)
+		}
+	}
+	return nil
 }
 
 // compareRepoIntegrity compares source and destination repos.

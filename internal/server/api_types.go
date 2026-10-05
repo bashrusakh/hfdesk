@@ -50,6 +50,9 @@ type PlanFile struct {
 type SettingsResponse struct {
 	Token              string `json:"token,omitempty"`
 	CacheDir           string `json:"cacheDir"`
+	ConfiguredCacheDir string `json:"configuredCacheDir"`
+	EffectiveHubDir    string `json:"effectiveHubDir"`
+	HubDirSource       string `json:"hubDirSource"`
 	Concurrency        int    `json:"connections"`
 	MaxActive          int    `json:"maxActive"`
 	MultipartThreshold string `json:"multipartThreshold"`
