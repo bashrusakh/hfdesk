@@ -1,6 +1,6 @@
 # Phase 1 implementation record
 
-Status: phase 1 implementation complete; candidate remains local/uncommitted for parent reconciliation and independent review.
+Status: phase 1 implementation committed locally as `b4b7e4a`; parent reconciliation and independent review remain pending. Nothing has been pushed or published.
 
 Baseline supplied by workflow owner: `origin/main` SHA `29f7179fa54b7eea8b264bfa88cae4ec6053b37b`; task branch `feature/storage-root-ownership` created directly at that SHA. Old layout branches remain untouched and are not imported.
 
