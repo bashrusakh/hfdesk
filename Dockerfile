@@ -20,7 +20,7 @@
 #     -v /mnt/user/appdata/hfdesk:/data \
 #     hfdesk
 #
-# Run as an arbitrary UID without using the image user (enterprise/k8s):
+# Run as an arbitrary UID without using the image user (non-root/k8s):
 #   docker run --rm --user 568:568 -p 8080:8080 \
 #     -v hfdesk-data:/data hfdesk
 #
@@ -36,7 +36,8 @@
 # The container starts as root only so the entrypoint can honor PUID/PGID and
 # then drop privileges; the app process always runs as the requested UID/GID.
 # When started with --user or a k8s runAsUser, the entrypoint does not touch
-# users or ownership and just execs the app.
+# ownership and just execs the app. Both paths leave /etc/passwd and /etc/group
+# unchanged and use the configured numeric UID/GID, not an account name.
 #
 # Credits: Original Docker support suggested by cdeving (#50)
 # =============================================================================
@@ -90,8 +91,9 @@ RUN apk add --no-cache ca-certificates tzdata su-exec
 # Alpine reserves some IDs (for example gid 100 is "users" and uid 65534 is
 # "nobody"), so `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`
 # on a NAS/homelab host can collide with an existing entry. Rather than fail
-# the build, reuse the existing group/account for that ID and record its name;
-# the entrypoint remaps by the resolved name.
+# the build, reuse the existing group/account for that ID. This is build-time
+# handling only; runtime privilege dropping uses numeric IDs without remapping
+# any account.
 #
 # UID/GID must be numeric so the image never bakes a name into HFDESK_UID/GID
 # (which the entrypoint then rejects at runtime with exit 64). A non-numeric
@@ -130,9 +132,7 @@ RUN set -eu; \
     if [ "$hfdesk_user" = root ]; then \
       echo "error: UID $UID resolves to the root account; refusing to use it as the image user" >&2; \
       exit 1; \
-    fi; \
-    printf '%s\n' "$hfdesk_group" > /etc/hfdesk-group; \
-    printf '%s\n' "$hfdesk_user" > /etc/hfdesk-user
+    fi
 
 # Copy binary and entrypoint from builder
 COPY --from=builder /hfdesk /usr/local/bin/hfdesk

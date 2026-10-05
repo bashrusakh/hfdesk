@@ -10,10 +10,11 @@
 # file creation mask.
 #
 # When the container is started non-root (docker run --user 568:568, or a
-# Kubernetes securityContext.runAsUser/fsGroup), no user or ownership mutation
+# Kubernetes securityContext.runAsUser/fsGroup), no ownership mutation
 # is attempted and the app is exec'd directly. All writable state lives under
 # the fixed /data root, so the app never needs the image user or an /etc/passwd
-# entry.
+# entry. Neither startup path edits /etc/passwd or /etc/group: numeric IDs
+# are authoritative, even when they already belong to an image account.
 #
 # Security: /data is world-writable (mode 1777) so any UID can create its own
 # state. That also means every entry *inside* it is attacker-influenced: a
@@ -45,19 +46,6 @@ PGID="${PGID:-${HFDESK_GID:-1000}}"
 UMASK="${UMASK:-022}"
 
 APP_BIN="${HFDESK_BIN:-/usr/local/bin/hfdesk}"
-
-# Build-time account names. The Dockerfile creates the image user as "hfdesk"
-# when it can, but reuses an existing Alpine account/group when the requested
-# UID/GID collides with a reserved ID (for example gid 100 is "users"). It
-# records the resolved names here so the remap below targets the right entry.
-RESOLVED_USER="hfdesk"
-RESOLVED_GROUP="hfdesk"
-if [ -r /etc/hfdesk-user ]; then
-    RESOLVED_USER="$(cat /etc/hfdesk-user)"
-fi
-if [ -r /etc/hfdesk-group ]; then
-    RESOLVED_GROUP="$(cat /etc/hfdesk-group)"
-fi
 
 # Fixed writable data root. Keep in sync with the Dockerfile ENV defaults.
 # Not overridable: see the security note above.
@@ -91,28 +79,6 @@ case "$PGID" in
         exit 64
         ;;
 esac
-
-# Remap the resolved image account to the requested IDs. Alpine's BusyBox has
-# no usermod, so edit the account database directly. The passwd entry carries
-# the primary GID, so remap it whenever either the UID or the GID differs;
-# remapping on the UID alone would leave /etc/passwd with a stale GID after a
-# PGID-only change. Target the resolved account/group names because a colliding
-# build may have reused an existing Alpine entry instead of creating "hfdesk".
-#
-# Renumber the resolved group only when the requested GID is free. If another
-# group already owns it (for example the reserved Alpine "users" group at gid
-# 100), renumbering the resolved group would leave two group names for one GID,
-# making getgrgid/group lookups ambiguous. Reuse the existing group instead and
-# point the account's primary GID at it, mirroring the build-time reuse of
-# reserved accounts.
-existing_group="$(getent group "$PGID" 2>/dev/null | cut -d: -f1)"
-if [ -z "$existing_group" ] && [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
-    sed -i "s/^\(${RESOLVED_GROUP}:x:\)[0-9]*:/\1${PGID}:/" /etc/group
-fi
-if [ "$(id -u "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PUID" ] || \
-   [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
-    sed -i "s/^\(${RESOLVED_USER}:x:\)[0-9]*:[0-9]*:/\1${PUID}:${PGID}:/" /etc/passwd
-fi
 
 # Symlink-safe handling of the fixed data root.
 #

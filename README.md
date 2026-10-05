@@ -180,9 +180,11 @@ sets `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, and
 | `/data/.cache/huggingface` | Hugging Face cache (`HF_HOME`) |
 | `/data/Models`, `/data/Datasets` | LM Studio-style local downloads |
 
-The entrypoint does not pre-create these subdirectories: it hands the `/data`
-root itself to the app UID (world-writable, mode `1777`) and the app creates its
-own state directories as that UID. Jobs/history state always resolves through
+The entrypoint does not pre-create these subdirectories: root startup hands only
+the `/data` root itself to the app UID, while non-root startup changes no ownership.
+The image's `/data` is world-writable (sticky mode `1777`); a bind mount supplies
+its own permissions instead. The app creates its own state directories as the
+target UID. Jobs/history state always resolves through
 the per-user config directory above. A config file placed directly in the launch
 directory (`/data/hfdesk.json`) is still read first and saved there, but a fresh
 volume writes its config under `/data/.config/HFDesk`.
@@ -210,33 +212,70 @@ docker run --rm -p 8080:8080 \
 - `PUID` / `PGID` — UID/GID the app process runs as (default `1000`).
 - `UMASK` — file creation mask (default `022`).
 
-The container starts as root only so the entrypoint can apply these values,
-then drops privileges; the app process runs non-root unless you explicitly set
-`PUID=0`/`PGID=0`. The image has no `USER` directive, so `docker exec` enters
+The container starts as root to prepare only the fixed `/data` root (a
+nonrecursive, symlink-safe ownership change), then drops privileges numerically.
+`/etc/passwd` and `/etc/group` remain byte-identical to the image even when the
+requested IDs collide with existing accounts; no runtime username or home-directory
+lookup is needed. The app process runs non-root unless you explicitly set
+`PUID=0` (with `PGID=0` if the root group is also wanted). This root preparation
+mode needs permission to change `/data` ownership and set the process UID/GID;
+it is not the all-capabilities-dropped mode below. The image has no `USER`
+directive, so `docker exec` enters
 the container as root (the privilege drop applies to PID 1 only).
 
-### Run as an arbitrary UID (enterprise / Kubernetes)
+### Hardened non-root startup (Docker / Kubernetes)
 
-Pass `--user` (or set `securityContext.runAsUser`/`fsGroup`) and the entrypoint
-skips user/ownership changes entirely. Because all state lives under `/data`,
-no image user or `/etc/passwd` entry is required:
+Pass `--user` (or set Kubernetes `runAsUser`/`runAsGroup`) and the entrypoint
+execs the app directly without changing ownership or account databases.
+`PUID`/`PGID` do not override this identity. Explicit `HOME`, XDG, and HF paths
+above keep state under `/data`; no matching passwd/group entry is required.
+With a writable persistent `/data`, the app can use a read-only root filesystem,
+drop all capabilities, and prohibit privilege escalation:
 
 ```bash
-docker run --rm --user 568:568 -p 8080:8080 \
+docker run --rm --user 568:568 --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges -p 8080:8080 \
   -v hfdesk-data:/data \
   ghcr.io/bashrusakh/hfdesk:latest
 ```
 
 ```yaml
-securityContext:
-  runAsUser: 568
-  runAsGroup: 568
-  fsGroup: 568
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hfdesk
+spec:
+  securityContext: # Pod-level volume group (requires volume-driver support)
+    fsGroup: 568
+  containers:
+    - name: hfdesk
+      image: ghcr.io/bashrusakh/hfdesk:latest
+      securityContext: # Container-level identity and hardening
+        runAsUser: 568
+        runAsGroup: 568
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+        readOnlyRootFilesystem: true
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: hfdesk-data # Provision this writable PVC separately
 ```
 
-Note that `--user`/`fsGroup` only works with a named volume or a
-pre-permissioned host directory (or one whose ownership `fsGroup` sets); a bare
-`--user` over a root-owned `0755` bind mount cannot write.
+The mounted `/data` and any existing app subdirectories must be writable by the
+chosen UID/GID. A fresh Docker named volume inherits the image's `1777` data-root
+permissions; a bind mount or an existing volume must be prepared separately.
+Kubernetes `fsGroup` can provide group access only when the volume driver supports
+it; check storage permissions rather than assuming it fixes every mount. A bare
+`--user` over a root-owned `0755` bind mount cannot write. Non-root startup never
+repairs permissions. Keep custom HOME/XDG/HF path overrides on writable mounts.
 
 ### Build your own
 
@@ -248,7 +287,8 @@ docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
 
 If the requested UID/GID is already used by a reserved Alpine account or group
 (for example gid `100` is `users`), the build reuses that existing entry instead
-of failing; `PUID`/`PGID` still remap the app process at runtime.
+of failing. These build-time IDs become the default numeric runtime identity;
+`PUID`/`PGID` can select different IDs without rewriting the image accounts.
 
 ### Migrating from the old cache path
 

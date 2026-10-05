@@ -15,6 +15,7 @@
 - Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
 - Docker: all writable state (settings, jobs, history, HF cache, local models) now lives under a single `/data` root, so one volume persists everything; `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, `HF_HOME=/data/.cache/huggingface`, and `WORKDIR /data` (#61)
 - Docker: the container starts as root only to apply PUID/PGID, then drops privileges; the app process runs non-root (default UID/GID 1000) unless `PUID=0`/`PGID=0` is set explicitly (#61)
+- Docker: runtime UID/GID selection is numeric only and never modifies `/etc/passwd` or `/etc/group`, including account collisions; non-root startup supports a read-only root filesystem with all capabilities dropped and no-new-privileges when `/data` is writable (#71)
 
 ### Fixed
 
@@ -22,7 +23,7 @@
 - Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
 - Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
 - Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
-- Docker: `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)` no longer fails when the requested UID/GID collides with a reserved Alpine account or group (for example gid `100` is `users`); the image user reuses the existing entry and `PUID`/`PGID` still remap at runtime (#61)
+- Docker: `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)` no longer fails when the requested UID/GID collides with a reserved Alpine account or group (for example gid `100` is `users`); the image user reuses the existing entry at build time and `PUID`/`PGID` select the numeric runtime identity (#61)
 - Docker: the README example mounted the host cache to `/root/.cache/huggingface` while the image used `/home/hfdesk/.cache/huggingface`, so the Hugging Face cache was never persisted. Existing users must update their volume mount to `/data` (#61)
 
 ## [1.2.2] - 2026-06-29

@@ -44,7 +44,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Lint entrypoint syntax
-        run: sh -n docker/entrypoint.sh
+        run: |
+          sh -n docker/entrypoint.sh
+          sh -n docker/smoke-test.sh
 
       - name: Validate docker-compose.yml
         run: docker compose -f docker-compose.yml config --quiet
@@ -53,43 +55,12 @@ jobs:
         run: docker build -t hfdesk:ci .
 
       - name: Smoke-test entrypoint
+        run: sh docker/smoke-test.sh hfdesk:ci
+
+      - name: Build and smoke-test reserved build-time UID/GID
         run: |
-          set -eu
-          IMG=hfdesk:ci
-
-          # Default root->non-root drop: PID 1 runs as the image user.
-          docker run --rm -e HFDESK_BIN=/bin/sh "$IMG" \
-            -c 'test "$(id -u)" = 1000 && test "$(id -g)" = 1000'
-
-          # PUID/PGID remap.
-          docker run --rm -e PUID=1234 -e PGID=1235 -e HFDESK_BIN=/bin/sh "$IMG" \
-            -c 'test "$(id -u)" = 1234 && test "$(id -g)" = 1235'
-
-          # Remapping onto a reserved gid (100 -> users) must not leave a
-          # duplicate /etc/group entry.
-          docker run --rm -e PGID=100 -e HFDESK_BIN=/bin/sh "$IMG" \
-            -c 'test -z "$(cut -d: -f3 /etc/group | sort | uniq -d)"'
-
-          # Arbitrary --user path skips the remap and still writes /data.
-          docker run --rm --user 568:568 -e HFDESK_BIN=/bin/sh "$IMG" \
-            -c 'test "$(id -u)" = 568 && touch /data/.ci-probe'
-
-          # A symlinked /data must be refused with exit 65.
-          set +e
-          docker run --rm --entrypoint /bin/sh "$IMG" \
-            -c 'rm -rf /data && ln -s /tmp /data && exec /usr/local/bin/entrypoint.sh'
-          code=$?
-          set -e
-          test "$code" = 65
-
-          # Invalid UMASK/PUID must fail fast with exit 64.
-          for probe in UMASK=9999 PUID=abc; do
-            set +e
-            docker run --rm -e "$probe" -e HFDESK_BIN=/bin/sh "$IMG" -c 'true'
-            code=$?
-            set -e
-            test "$code" = 64
-          done
+          docker build --build-arg UID=65534 --build-arg GID=100 -t hfdesk:ci-reserved .
+          sh docker/smoke-test.sh hfdesk:ci-reserved
 
   # Exercise the native state-file replacement path added here. The full suite
   # has separate pre-existing Windows-compatibility gaps.
