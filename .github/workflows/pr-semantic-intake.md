@@ -11,8 +11,16 @@ permissions:
   issues: read
 engine:
   id: copilot
-  model: auto
+  model: glm-5.3-flash
   bare: true
+  env:
+    COPILOT_PROVIDER_BASE_URL: "https://ollama.com/v1"
+    COPILOT_PROVIDER_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+    COPILOT_PROVIDER_TYPE: openai
+models:
+  default-ai-credits-pricing:
+    input: 0.000001
+    output: 0.000001
 inlined-imports: true
 imports:
   - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@3d8b4095371aee673d32cd265b26b11ae23a62b7
@@ -21,10 +29,10 @@ checkout:
   repository: ${{ github.repository }}
   ref: ${{ github.event.pull_request.base.sha }}
 max-ai-credits: 8
-max-turns: 15
-timeout-minutes: 12
+max-turns: 40
+timeout-minutes: 20
 network:
-  allowed: [defaults, github]
+  allowed: [defaults, github, ollama.com]
 tools:
   github:
     mode: gh-proxy
