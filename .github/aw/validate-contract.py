@@ -5,14 +5,20 @@ No LLM. Checks, in order:
   1. every agentic workflow source imports the shared invariant and its core,
      pinned to the exact shared-package SHA;
   2. each triage workflow source declares the metadata-only capability surface:
-     checkout/status-comment/bash/cli-proxy/report-failure-as-issue pinned false,
-     no add-comment, an allowed-repos + min-integrity scoped github surface without
-     source/diff tools, no 'confirmed' in allowed label lists, and the required
-     type family in remove-labels;
+     checkout/status-comment/bash/cli-proxy pinned false, tools.edit pinned false
+     (no filesystem write capability), safe-outputs.report-failure-as-issue and
+     report-failed-jobs pinned false, no add-comment, tools.github.allowed-repos
+     equal to the repository expression exactly, tools.github.min-integrity
+     present, one of the gh-aw schema levels, and exactly the intended level,
+     no source/diff tools in the github allowed list, no 'confirmed' in allowed
+     label lists, and the required type family in remove-labels;
   3. each generated lock preserves those invariants (no add_comment, no forbidden
-     github tool grants, scoped allow-only guard policy, failure reports disabled,
-     no agent-job checkout, not staged) and stays structurally in sync with its
-     source (shared import pin + exact safe-output label lists);
+     github tool grants, an allow-only guard policy whose 'repos' is exactly the
+     repository expression and whose 'min-integrity' is exactly the intended
+     level, no residual agent write capability: no --allow-tool write and no
+     --allow-all-paths in the agent job, no report-failed-jobs machinery, failure
+     reports disabled, no agent-job checkout, not staged) and stays structurally
+     in sync with its source (shared import pin + exact safe-output label lists);
   4. every contract file referenced by .github/triage-policy.md exists;
   5. every workflow-managed label named by the policy currently exists
      (declared in .github/labels.yml and/or present in the live repository);
@@ -28,14 +34,28 @@ live but missing from the declared reference file is a warning: the reference fi
 a setup aid and may lag the authoritative live label set.
 
 Lock checks are textual (no YAML library) and deliberately conservative. Forbidden
-github tool names are matched on the real agent-visible grant surfaces (github(<tool>)
-allow-tool flags and the gh-aw-manifest mcp_servers 'github' tools list), not the whole
-file, because the inlined shared contract quotes some of those names in prohibition
-prose; the add_comment scan is whole-file and fail-closed. Lock currency compares the
-shared import pin(s) and the exact add-labels/remove-labels allowed lists from the
-GH_AW_SAFE_OUTPUTS_CONFIG / GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG JSON blobs; it cannot
-prove general compile currency (prompt text, tool schemas, job wiring) without running
-`gh aw compile`.
+github tool names are matched on the real agent-visible grant surfaces
+(github(<tool>) allow-tool flags and the gh-aw-manifest mcp_servers 'github' tools
+list), not the whole file, because the inlined shared contract quotes some of those
+names in prohibition prose; the add_comment scan is whole-file and fail-closed.
+
+What this validator does NOT guarantee:
+
+  - It cannot see the gh-aw compile step. It compares the shared import pin and the
+    exact add-labels/remove-labels allowed lists as a textual proxy; prompt text,
+    tool schemas, and general job wiring are not proven in sync. Run
+    `gh aw compile --strict` for that.
+  - It cannot prove what the runtime MCP gateway does. The guard policy is asserted
+    as a declaration (repos exactly the repository expression, min-integrity exactly
+    the intended level); it does not prove the gateway confines reads to that scope
+    at run time, and a runtime safety net may widen it.
+  - The min-integrity assertion is a match against INTENDED_MIN_INTEGRITY, a constant
+    in this file. It catches unreviewed weakening or re-strengthening of the declared
+    level, but it is not itself evidence that the declared level is the right security
+    posture; changing that is a deliberate decision that must update the constant.
+  - The `--allow-tool write` / `--allow-all-paths` scan is a substring check over the
+    agent job section. It catches those exact flags disappearing or reappearing; it
+    does not prove the absence of every other capability the engine could grant.
 
 Set VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 to skip the live repository label lookup
 (offline/test mode used by .github/aw/test_validate_contract.py); in that mode
@@ -80,6 +100,23 @@ FORBIDDEN_GITHUB_TOOLS = (
 # Universal semantic type family every triage workflow must be able to remove
 # (reconciliation capability: replace a clearly wrong managed type).
 REQUIRED_REMOVE_LABELS = ("bug", "enhancement", "documentation", "question", "refactor", "ci")
+
+# The exact repository-scope expression the guard policy must declare. A literal
+# owner/repo, "all", "public", or any wildcard pattern is a scope change (widening
+# or retargeting) and fails: a literal owner/repo cannot follow a repository
+# rename or transfer, and the widened forms are not the declared scope.
+REPO_SCOPE_EXPRESSION = "${{ github.repository }}"
+
+# The gh-aw v0.89.21 schema enum for tools.github.min-integrity, ordered from
+# most to least restrictive in the upstream documentation sense.
+MIN_INTEGRITY_LEVELS = ("merged", "approved", "unapproved", "none")
+
+# The intended min-integrity level. gh-aw rejects a guard policy that sets
+# allowed-repos without min-integrity, so the field cannot simply be dropped;
+# the level and this constant must be changed together, deliberately. A change
+# that does not update this constant fails validation, so both weakening and
+# re-strengthening are caught rather than silently accepted.
+INTENDED_MIN_INTEGRITY = "approved"
 
 SKIP_LIVE_LABELS_ENV = "VALIDATE_CONTRACT_SKIP_LIVE_LABELS"
 LOCK_SUFFIX = ".lock.yml"
@@ -286,6 +323,14 @@ def key_entry(text: str, key: str, indent: int) -> tuple[str, list[str]] | None:
     return None
 
 
+def _unquote(value: str) -> str:
+    """Strip one layer of matching single or double quotes from a scalar."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
 def string_list(tail: str, body: list[str]) -> list[str]:
     """Extract a YAML string list from a flow value (`[a, b]`) or block items."""
     if tail.startswith("["):
@@ -343,6 +388,17 @@ def check_triage_sources() -> None:
             r"^\s*report-failure-as-issue\s*:\s*false\s*$", fm, re.MULTILINE
         ):
             errors.append(f"{rel_path} must set 'report-failure-as-issue: false'")
+        if not re.search(
+            r"^\s*report-failed-jobs\s*:\s*false\s*$", fm, re.MULTILINE
+        ):
+            errors.append(
+                f"{rel_path} must set 'report-failed-jobs: false' "
+                "(no non-agent failure-issue diagnostics)"
+            )
+        if not re.search(r"^\s*edit\s*:\s*false\s*$", fm, re.MULTILINE):
+            errors.append(
+                f"{rel_path} must set 'edit: false' (no filesystem write capability)"
+            )
         if re.search(r"^\s*add-comment\s*:", fm, re.MULTILINE):
             errors.append(
                 f"{rel_path} must not declare an 'add-comment:' key (silent workflow)"
@@ -354,14 +410,40 @@ def check_triage_sources() -> None:
         if not github_body:
             errors.append(f"{rel_path} has no github tools block")
         else:
-            if not re.search(r"^\s*allowed-repos\s*:\s*\S", github_body, re.MULTILINE):
+            declared = re.search(
+                r"^\s*allowed-repos\s*:\s*(.+?)\s*$", github_body, re.MULTILINE
+            )
+            if not declared:
                 errors.append(
                     f"{rel_path} must declare allowed-repos in the github tools block"
                 )
-            if not re.search(r"^\s*min-integrity\s*:\s*\S", github_body, re.MULTILINE):
+            elif _unquote(declared.group(1)) != REPO_SCOPE_EXPRESSION:
+                errors.append(
+                    f"{rel_path} allowed-repos must be exactly "
+                    f"'{REPO_SCOPE_EXPRESSION}' (declared repository scope); "
+                    f"got '{_unquote(declared.group(1))}'"
+                )
+            level = re.search(
+                r"^\s*min-integrity\s*:\s*(.+?)\s*$", github_body, re.MULTILINE
+            )
+            if not level:
                 errors.append(
                     f"{rel_path} must declare min-integrity in the github tools block"
                 )
+            else:
+                value = _unquote(level.group(1))
+                if value not in MIN_INTEGRITY_LEVELS:
+                    errors.append(
+                        f"{rel_path} min-integrity must be one of "
+                        + ", ".join(MIN_INTEGRITY_LEVELS)
+                        + f"; got '{value}'"
+                    )
+                elif value != INTENDED_MIN_INTEGRITY:
+                    errors.append(
+                        f"{rel_path} min-integrity is '{value}' but the intended "
+                        f"level is '{INTENDED_MIN_INTEGRITY}' (capability change "
+                        "must be deliberate and reflected here)"
+                    )
             allowed = key_entry(github_body, "allowed", 4)
             exposed = set()
             if allowed is not None:
@@ -575,27 +657,43 @@ def check_triage_locks() -> None:
                 f"{lock_rel} has no github guard policy with an allow-only 'repos' scope"
             )
         else:
-            if not re.search(r'"min-integrity"\s*:\s*"[^"]+"', guard):
+            level = re.search(r'"min-integrity"\s*:\s*"([^"]*)"', guard)
+            if not level:
                 errors.append(
                     f"{lock_rel} guard policy must declare a non-empty min-integrity"
+                )
+            elif level.group(1) not in MIN_INTEGRITY_LEVELS:
+                errors.append(
+                    f"{lock_rel} guard policy min-integrity must be one of "
+                    + ", ".join(MIN_INTEGRITY_LEVELS)
+                    + f"; got '{level.group(1)}'"
+                )
+            elif level.group(1) != INTENDED_MIN_INTEGRITY:
+                errors.append(
+                    f"{lock_rel} guard policy min-integrity is "
+                    f"'{level.group(1)}' but the intended level is "
+                    f"'{INTENDED_MIN_INTEGRITY}'"
                 )
             repos = re.search(r'"repos"\s*:\s*"([^"]+)"', guard)
             if not repos:
                 errors.append(
                     f"{lock_rel} guard policy must scope 'repos' to the repository"
                 )
-            elif not (
-                re.fullmatch(r"\$\{\{\s*github\.repository\s*\}\}", repos.group(1))
-                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repos.group(1))
-            ):
+            elif repos.group(1) != REPO_SCOPE_EXPRESSION:
                 errors.append(
-                    f"{lock_rel} guard policy 'repos' must be the repository expression "
-                    f"or owner/repo form; got '{repos.group(1)}'"
+                    f"{lock_rel} guard policy 'repos' must be exactly "
+                    f"'{REPO_SCOPE_EXPRESSION}'; got '{repos.group(1)}'"
                 )
 
         if not re.search(r'GH_AW_FAILURE_REPORT_AS_ISSUE\s*:\s*"false"', text):
             errors.append(
                 f'{lock_rel} must set GH_AW_FAILURE_REPORT_AS_ISSUE: "false"'
+            )
+
+        if re.search(r'GH_AW_REPORT_FAILED_JOBS\s*:', text) or "report_failed_jobs" in text:
+            errors.append(
+                f"{lock_rel} must not contain the report-failed-jobs machinery "
+                "(non-agent failure diagnostics disabled)"
             )
 
         agent = job_section(text, "agent")
@@ -606,6 +704,13 @@ def check_triage_locks() -> None:
                 f"{lock_rel} agent job must not check out the repository "
                 "(actions/checkout found)"
             )
+        else:
+            for flag in ("--allow-tool write", "--allow-all-paths"):
+                if flag in agent:
+                    errors.append(
+                        f"{lock_rel} agent job must not grant '{flag}' "
+                        "(residual filesystem/write capability)"
+                    )
 
         if "GH_AW_SAFE_OUTPUTS_STAGED" in text:
             errors.append(

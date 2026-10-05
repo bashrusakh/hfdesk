@@ -228,9 +228,57 @@ class ContractValidatorTest(unittest.TestCase):
         self.mutate(ISSUE_MD, '    allowed-repos: "${{ github.repository }}"\n', "")
         self.assert_fails("must declare allowed-repos in the github tools block")
 
+    def test_allowed_repos_other_owner_repo_fails(self) -> None:
+        self.mutate(
+            ISSUE_MD,
+            '    allowed-repos: "${{ github.repository }}"\n',
+            '    allowed-repos: "attacker/other-repo"\n',
+        )
+        self.assert_fails("allowed-repos must be exactly")
+
+    def test_allowed_repos_widened_to_all_fails(self) -> None:
+        self.mutate(
+            BACKLOG_MD,
+            '    allowed-repos: "${{ github.repository }}"\n',
+            "    allowed-repos: all\n",
+        )
+        self.assert_fails("allowed-repos must be exactly")
+
+    def test_allowed_repos_widened_to_wildcard_fails(self) -> None:
+        self.mutate(
+            PR_MD,
+            '    allowed-repos: "${{ github.repository }}"\n',
+            '    allowed-repos: "bashrusakh/*"\n',
+        )
+        self.assert_fails("allowed-repos must be exactly")
+
     def test_min_integrity_missing_fails(self) -> None:
         self.mutate(ISSUE_MD, "    min-integrity: approved\n", "")
         self.assert_fails("must declare min-integrity in the github tools block")
+
+    def test_min_integrity_weakened_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, "    min-integrity: approved\n", "    min-integrity: none\n")
+                self.assert_fails("but the intended level is 'approved'")
+
+    def test_min_integrity_unknown_level_fails(self) -> None:
+        self.mutate(ISSUE_MD, "    min-integrity: approved\n", "    min-integrity: trusted\n")
+        self.assert_fails("min-integrity must be one of")
+
+    def test_edit_false_removed_fails(self) -> None:
+        self.mutate(ISSUE_MD, "  edit: false\n", "")
+        self.assert_fails("must set 'edit: false'")
+
+    def test_report_failed_jobs_flipped_true_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel,
+                    "  report-failed-jobs: false\n",
+                    "  report-failed-jobs: true\n",
+                )
+                self.assert_fails("must set 'report-failed-jobs: false'")
 
     def test_remove_labels_type_family_incomplete_fails(self) -> None:
         self.mutate(
@@ -280,11 +328,54 @@ class ContractValidatorTest(unittest.TestCase):
 
     def test_guard_repos_wildcard_fails(self) -> None:
         self.mutate(ISSUE_LOCK, '"repos": "${{ github.repository }}",', '"repos": "*",')
-        self.assert_fails("guard policy 'repos' must be the repository expression")
+        self.assert_fails("guard policy 'repos' must be exactly")
+
+    def test_guard_repos_literal_owner_repo_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            '"repos": "${{ github.repository }}",',
+            '"repos": "bashrusakh/hfdesk",',
+        )
+        self.assert_fails("guard policy 'repos' must be exactly")
 
     def test_guard_min_integrity_empty_fails(self) -> None:
         self.mutate(PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "",')
-        self.assert_fails("guard policy must declare a non-empty min-integrity")
+        self.assert_fails("guard policy min-integrity must be one of")
+
+    def test_guard_min_integrity_weakened_fails(self) -> None:
+        self.mutate(PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "none",')
+        self.assert_fails("guard policy min-integrity is 'none'")
+
+    def test_guard_min_integrity_unknown_level_fails(self) -> None:
+        self.mutate(
+            PR_LOCK, '"min-integrity": "approved",', '"min-integrity": "trusted",'
+        )
+        self.assert_fails("guard policy min-integrity must be one of")
+
+    def test_agent_allow_tool_write_reintroduced_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            "        # --allow-tool github(issue_read)\n",
+            "        # --allow-tool github(issue_read)\n        # --allow-tool write\n",
+        )
+        self.assert_fails("must not grant '--allow-tool write'")
+
+    def test_agent_allow_all_paths_reintroduced_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            "        # --allow-tool github(issue_read)\n",
+            "        # --allow-tool github(issue_read)\n        # --allow-all-paths\n",
+        )
+        self.assert_fails("must not grant '--allow-all-paths'")
+
+    def test_lock_report_failed_jobs_reintroduced_fails(self) -> None:
+        self.mutate(
+            BACKLOG_LOCK,
+            "      - name: Set runtime paths\n",
+            "      - name: Set runtime paths\n"
+            '        env:\n          GH_AW_REPORT_FAILED_JOBS: "true"\n',
+        )
+        self.assert_fails("must not contain the report-failed-jobs machinery")
 
     def test_lock_failure_flag_true_fails(self) -> None:
         self.mutate(BACKLOG_LOCK, 'GH_AW_FAILURE_REPORT_AS_ISSUE: "false"',

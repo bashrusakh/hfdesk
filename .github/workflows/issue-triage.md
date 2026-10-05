@@ -7,7 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: Issue number to triage when dispatched manually
+        description: >-
+          Informational issue number for a manual run. The triaged subject is the
+          triggering issue, or the internal Agentic Workflows dispatch context
+          (aw_context) for manual runs; this input alone does not select it.
         required: false
         type: string
   status-comment: false
@@ -44,9 +47,14 @@ network:
 tools:
   bash: false
   cli-proxy: false
+  edit: false
   github:
     mode: local
     toolsets: [issues]
+    # Declared repository scope for the agent-visible GitHub surface: the guard
+    # policy's 'repos' is the current repository. Declared scope only — it is not
+    # a runtime guarantee that reads stay confined to it. gh-aw rejects
+    # allowed-repos without min-integrity, so a level is retained below.
     allowed-repos: "${{ github.repository }}"
     min-integrity: approved
     # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
@@ -74,6 +82,7 @@ pre-agent-steps:
       echo "Resolved policy contract at $sha"
 safe-outputs:
   report-failure-as-issue: false
+  report-failed-jobs: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
     blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
@@ -135,10 +144,14 @@ outranks stale automated conclusions.
   or edit the issue. hfdesk authorizes no prerequisite/approval/decision-gate semantics
   for automation.
 
-This workflow is metadata-only and silent: it does not reproduce, validate, review
-code, read source/diff, or comment. When evidence is insufficient, preserve the affected
-managed metadata and use `noop` if a completion signal is required — there is no
-explanatory output channel. `needs-info` means metadata/routing information is missing;
-it never means implementation proof is missing.
+This workflow is metadata-only and silent: the agent produces no human-facing output — it
+does not reproduce, validate, review code, read source/diff, or comment — and the only
+repository writes it performs are the label safe outputs. When evidence is insufficient,
+preserve the affected managed metadata and use `noop` if a completion signal is required —
+the agent has no explanatory output channel. `needs-info` means metadata/routing
+information is missing; it never means implementation proof is missing. This scopes the
+silence claim to the agent and its safe outputs; operator diagnostics are separate, and
+gh-aw may still file run-failure or detection diagnostics as repository-level issues
+outside this workflow's agent and safe outputs.
 
 Use only this workflow's safe outputs (`add-labels`, `remove-labels`).
