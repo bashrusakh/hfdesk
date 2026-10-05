@@ -32,6 +32,31 @@ jobs:
       - name: Test
         run: go test ./...
 
+  # The Go jobs never touch the Docker surface. Exercise the real entrypoint
+  # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
+  # argument validation cannot regress silently.
+  docker:
+    name: Docker entrypoint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Lint entrypoint syntax
+        run: |
+          sh -n docker/entrypoint.sh
+          sh -n docker/smoke-test.sh
+
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Build image
+        run: docker build -t hfdesk:ci .
+
+      - name: Smoke-test entrypoint
+        run: sh docker/smoke-test.sh hfdesk:ci
+
   # Exercise the native state-file replacement path added here. The full suite
   # has separate pre-existing Windows-compatibility gaps.
   go-windows:
