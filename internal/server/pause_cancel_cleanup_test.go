@@ -78,7 +78,7 @@ func TestCancelJob_PausedCleansUpPartialFiles(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 
 	job, blobsDir := pausedJobWithPartialFiles(t, mgr, "pausecancel")
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
@@ -115,7 +115,7 @@ func TestDismissJob_PausedCleansUpPartialFiles(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 
 	job, blobsDir := pausedJobWithPartialFiles(t, mgr, "pausedismiss")
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
@@ -148,7 +148,7 @@ func TestCancelJob_RunningDoesNotTouchFiles(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 	t.Cleanup(func() { mgr.WaitAll(5 * time.Second) })
 
 	// Seed a partial file for a running job. The job has no entries
@@ -196,7 +196,7 @@ func TestCancelJob_PausedUnaffectedByMissingBlobs(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 
 	mgr.mu.Lock()
 	mgr.jobs["paused-empty"] = &Job{
@@ -229,7 +229,7 @@ func TestCancelJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 
 	// Both jobs share the same blobs directory (same repo). Job A
 	// is paused and about to be cancelled. Job B is still actively
@@ -315,7 +315,7 @@ func TestDismissJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	cacheDir := t.TempDir()
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(Config{CacheDir: cacheDir}, hub)
+	mgr := newTestJobManager(t, Config{CacheDir: cacheDir}, hub)
 
 	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--shared", "blobs")
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {

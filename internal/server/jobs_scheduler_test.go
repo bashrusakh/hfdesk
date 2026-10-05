@@ -19,7 +19,7 @@ func TestJobManager_DispatchRespectsMaxActive(t *testing.T) {
 	cfg := Config{CacheDir: t.TempDir(), MaxActive: 2}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 	t.Cleanup(func() {
 		for _, j := range mgr.ListJobs() {
 			mgr.CancelJob(j.ID)
@@ -72,7 +72,7 @@ func TestJobManager_LoweringMaxActiveRequeuesExcess(t *testing.T) {
 	cfg := Config{CacheDir: t.TempDir(), MaxActive: 4}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	now := time.Now()
 	for i := 0; i < 4; i++ {

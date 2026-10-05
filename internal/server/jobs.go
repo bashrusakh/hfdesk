@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log"
 	"sort"
 	"sync"
@@ -133,13 +134,24 @@ type JobFileProgress struct {
 
 // JobManager manages download jobs.
 type JobManager struct {
-	mu          sync.RWMutex
-	jobs        map[string]*Job
-	config      Config
-	listeners   []chan *Job
-	listenerMu  sync.RWMutex
-	wsHub       *WSHub
-	wsCoalescer *jobCoalescer
+	mu                sync.RWMutex
+	saveMu            sync.Locker
+	jobs              map[string]*Job
+	config            Config
+	statePath         string
+	persistStateFile  func(string, []*Job) error
+	loadStateFile     func(string) ([]*Job, error)
+	fenced            bool
+	stopping          bool
+	persistenceClosed bool
+	opWG              sync.WaitGroup
+	closeOnce         sync.Once
+	closeDone         chan struct{}
+	closeErr          error
+	listeners         []chan *Job
+	listenerMu        sync.RWMutex
+	wsHub             *WSHub
+	wsCoalescer       *jobCoalescer
 	// speedLimiter is the process-wide token bucket shared by every running
 	// job so the configured cap limits total bandwidth, not per-job. Always
 	// non-nil; a 0 limit means unlimited.
@@ -159,13 +171,25 @@ type JobManager struct {
 // bypass this gate and are sent immediately. See github issue #62.
 const wsBroadcastMinGap = 250 * time.Millisecond
 
+var errJobManagerStopping = errors.New("job manager is stopping")
+var errJobManagerPersistenceClosed = errors.New("job manager persistence is closed")
+
 // NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
+	return newJobManagerWithStatePath(cfg, wsHub, JobsStatePath())
+}
+
+func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	m := &JobManager{
-		jobs:         make(map[string]*Job),
-		config:       cfg,
-		wsHub:        wsHub,
-		speedLimiter: hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+		saveMu:           &sync.Mutex{},
+		jobs:             make(map[string]*Job),
+		config:           cfg,
+		statePath:        statePath,
+		persistStateFile: saveJobsState,
+		loadStateFile:    loadJobsState,
+		closeDone:        make(chan struct{}),
+		wsHub:            wsHub,
+		speedLimiter:     hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -178,7 +202,16 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 // LoadState restores jobs from jobs_state.json. Call once after NewJobManager,
 // before accepting requests. Errors are non-fatal (logged but not returned).
 func (m *JobManager) LoadState() {
-	jobs, err := LoadJobsState()
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	m.opWG.Add(1)
+	m.mu.Unlock()
+	defer m.opWG.Done()
+
+	jobs, err := m.loadStateFile(m.statePath)
 	if err != nil {
 		log.Printf("warning: could not load jobs state: %v", err)
 		return
@@ -187,6 +220,10 @@ func (m *JobManager) LoadState() {
 		return
 	}
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
 	for _, j := range jobs {
 		j.cancel = nil
 		// Ensure no zombie running/queued jobs survive a restart
@@ -208,9 +245,15 @@ func (m *JobManager) LoadState() {
 	log.Printf("restored %d job(s) from state file", len(jobs))
 }
 
-// saveStateLocked persists all jobs. Must NOT be called while m.mu is held
-// (it takes its own lock internally).
-func (m *JobManager) saveState() {
+// saveState serializes snapshot creation and commit so an older snapshot
+// cannot overwrite a newer one. It must not be called while m.mu is held.
+func (m *JobManager) saveState() error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if m.persistenceClosed {
+		return errJobManagerPersistenceClosed
+	}
+
 	m.mu.RLock()
 	snapshot := make([]*Job, 0, len(m.jobs))
 	for _, j := range m.jobs {
@@ -218,7 +261,78 @@ func (m *JobManager) saveState() {
 	}
 	m.mu.RUnlock()
 
-	if err := SaveJobsState(snapshot); err != nil {
+	return m.persistStateFile(m.statePath, snapshot)
+}
+
+// Quiesce fences scheduling while allowing already-admitted mutations to finish.
+func (m *JobManager) Quiesce() {
+	m.mu.Lock()
+	m.quiesceLocked()
+	m.mu.Unlock()
+}
+
+func (m *JobManager) quiesceLocked() { m.fenced = true }
+
+// Close rejects new mutations, drains accepted operations and runners, then
+// commits a fresh final state snapshot. A caller timeout does not stop the
+// close coordinator; subsequent calls can wait for the same result.
+func (m *JobManager) Close(ctx context.Context) error {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.fenced = true
+		m.stopping = true
+		var cancels []context.CancelFunc
+		var snapshots []*Job
+		for _, job := range m.jobs {
+			if job.Status != JobStatusRunning {
+				continue
+			}
+			job.Status = JobStatusPaused
+			if job.cancel != nil {
+				cancels = append(cancels, job.cancel)
+			}
+			snapshots = append(snapshots, m.cloneJobLocked(job))
+		}
+		m.mu.Unlock()
+
+		for _, cancel := range cancels {
+			cancel()
+		}
+		for _, snapshot := range snapshots {
+			m.notifyListeners(snapshot)
+		}
+		go m.finishClose()
+	})
+
+	select {
+	case <-m.closeDone:
+		return m.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *JobManager) finishClose() {
+	m.opWG.Wait()
+	m.runWG.Wait()
+
+	m.saveMu.Lock()
+	m.mu.RLock()
+	snapshot := make([]*Job, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		snapshot = append(snapshot, m.cloneJobLocked(job))
+	}
+	m.mu.RUnlock()
+	err := m.persistStateFile(m.statePath, snapshot)
+	m.persistenceClosed = true
+	m.saveMu.Unlock()
+
+	m.closeErr = err
+	close(m.closeDone)
+}
+
+func (m *JobManager) saveStateAndLog() {
+	if err := m.saveState(); err != nil {
 		log.Printf("warning: could not save jobs state: %v", err)
 	}
 }
@@ -374,6 +488,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	// the latter selects which files match, so two requests differing in
 	// either are different downloads even when the rest matches.
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return nil, false, errJobManagerStopping
+	}
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
@@ -412,6 +530,8 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		partialFilesMu: &sync.Mutex{},
 	}
 
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 	m.jobs[job.ID] = job
 	// Queue the job and let the scheduler start it only if we're under the
 	// max-active limit; otherwise it waits as 'queued'.
@@ -453,6 +573,10 @@ func (m *JobManager) ListJobs() []*Job {
 // CancelJob cancels a running or queued job.
 func (m *JobManager) CancelJob(id string) bool {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -463,6 +587,8 @@ func (m *JobManager) CancelJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 
 	wasPaused := job.Status == JobStatusPaused
 
@@ -484,13 +610,17 @@ func (m *JobManager) CancelJob(id string) bool {
 	}
 
 	m.notifyListeners(snapshot)
-	go m.saveState()
+	m.saveStateAndLog()
 	return true
 }
 
 // PauseJob pauses a running job.
 func (m *JobManager) PauseJob(id string) bool {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -501,6 +631,8 @@ func (m *JobManager) PauseJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 
 	if job.cancel != nil {
 		job.cancel()
@@ -510,13 +642,17 @@ func (m *JobManager) PauseJob(id string) bool {
 	m.mu.Unlock()
 
 	m.notifyListeners(snapshot)
-	go m.saveState()
+	m.saveStateAndLog()
 	return true
 }
 
 // ResumeJob resumes a paused job.
 func (m *JobManager) ResumeJob(id string) bool {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -527,6 +663,8 @@ func (m *JobManager) ResumeJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 
 	job.Status = JobStatusQueued
 	// Reset progress totals — the downloader will re-scan the repo and
@@ -562,6 +700,10 @@ func (m *JobManager) ResumeJob(id string) bool {
 // downloader, so a retry resumes where it left off.
 func (m *JobManager) RetryJob(id string) bool {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -572,6 +714,8 @@ func (m *JobManager) RetryJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 
 	job.Status = JobStatusQueued
 	job.Error = ""
@@ -596,12 +740,17 @@ func (m *JobManager) RetryJob(id string) bool {
 // DeleteJob removes a job from the list.
 func (m *JobManager) DeleteJob(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
 
 	job, ok := m.jobs[id]
 	if !ok {
+		m.mu.Unlock()
 		return false
 	}
+	m.opWG.Add(1)
 
 	// Cancel if running
 	if job.cancel != nil && (job.Status == JobStatusQueued || job.Status == JobStatusRunning) {
@@ -609,6 +758,8 @@ func (m *JobManager) DeleteJob(id string) bool {
 	}
 
 	delete(m.jobs, id)
+	m.mu.Unlock()
+	m.opWG.Done()
 	return true
 }
 
@@ -661,6 +812,10 @@ func (m *JobManager) DismissJob(id string) bool {
 // reason a dismissal failed, for use by the HTTP handler.
 func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return DismissJobNotFound, nil
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -672,9 +827,11 @@ func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 		return DismissJobStillActive, snapshot
 	}
 	wasPaused := job.Status == JobStatusPaused
+	m.opWG.Add(1)
 	snapshot := m.cloneJobLocked(job)
 	delete(m.jobs, id)
 	m.mu.Unlock()
+	defer m.opWG.Done()
 
 	// A dismissed paused job is a pure data-loss event: the runJob goroutine
 	// has already exited, so no in-flight cleanup will run, and the user
@@ -751,6 +908,9 @@ func (m *JobManager) effectiveMaxActive() int {
 // gate through which jobs become active, so the concurrent-download count
 // always respects the setting. Caller MUST hold m.mu.
 func (m *JobManager) dispatchLocked() {
+	if m.fenced {
+		return
+	}
 	limit := m.effectiveMaxActive()
 
 	active := 0
@@ -787,7 +947,7 @@ func (m *JobManager) dispatchLocked() {
 // actually reduces the number of concurrent downloads. Older (more-progressed)
 // downloads are kept running; the rest go back to 'queued' and the dispatcher
 // restarts them automatically as slots free up. Caller MUST hold m.mu.
-func (m *JobManager) enforceLimitLocked() {
+func (m *JobManager) enforceLimitLocked() ([]context.CancelFunc, []*Job) {
 	limit := m.effectiveMaxActive()
 
 	var running []*Job
@@ -797,7 +957,7 @@ func (m *JobManager) enforceLimitLocked() {
 		}
 	}
 	if len(running) <= limit {
-		return
+		return nil, nil
 	}
 
 	// Newest-started first, so the longest-running downloads keep going.
@@ -809,10 +969,12 @@ func (m *JobManager) enforceLimitLocked() {
 		return ta.After(*tb)
 	})
 
+	var cancels []context.CancelFunc
+	var snapshots []*Job
 	for i := 0; i < len(running)-limit; i++ {
 		j := running[i]
 		if j.cancel != nil {
-			j.cancel()
+			cancels = append(cancels, j.cancel)
 		}
 		// Re-queue (not pause) so the dispatcher auto-starts it again once a
 		// slot frees. Bump the generation so the in-flight runJob recognizes
@@ -820,8 +982,9 @@ func (m *JobManager) enforceLimitLocked() {
 		j.generation++
 		j.starting = false
 		j.Status = JobStatusQueued
-		m.notifyListeners(m.cloneJobLocked(j))
+		snapshots = append(snapshots, m.cloneJobLocked(j))
 	}
+	return cancels, snapshots
 }
 
 // UpdateConfig replaces the manager's config (called when settings change),
@@ -829,13 +992,26 @@ func (m *JobManager) enforceLimitLocked() {
 // queued jobs that a raised limit now allows.
 func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		log.Printf("warning: ignoring job manager config update while stopping")
+		return
+	}
+	m.opWG.Add(1)
 	m.config = cfg
 	if m.speedLimiter != nil {
 		m.speedLimiter.SetLimit(hfdownloader.ParseSize(cfg.MaxSpeed))
 	}
-	m.enforceLimitLocked()
+	cancels, snapshots := m.enforceLimitLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
+	defer m.opWG.Done()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, snapshot := range snapshots {
+		m.notifyListeners(snapshot)
+	}
 }
 
 // snapshotConfig returns a copy of the manager's config taken under the read
@@ -1048,12 +1224,19 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 
 // runJob executes the download job.
 func (m *JobManager) runJob(job *Job) {
-	defer m.runWG.Done()
-
 	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		m.runWG.Done()
+	}()
 
 	// Increment generation and store our generation number
 	m.mu.Lock()
+	if m.fenced {
+		job.starting = false
+		m.mu.Unlock()
+		return
+	}
 	job.cancel = cancel
 	job.generation++
 	myGeneration := job.generation // Track which generation we are
@@ -1228,7 +1411,7 @@ func (m *JobManager) runJob(job *Job) {
 	m.notifyListeners(endSnap)
 
 	// Persist state and record completed/failed jobs in history
-	go m.saveState()
+	m.saveStateAndLog()
 	if endSnap.Status == JobStatusCompleted || endSnap.Status == JobStatusFailed {
 		go func() {
 			if err := AppendHistory(endSnap); err != nil {

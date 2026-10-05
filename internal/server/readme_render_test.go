@@ -93,7 +93,7 @@ func TestHandleReadmeAsset_NormalizesSameHostRawToResolve(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	srv := New(Config{Endpoint: upstream.URL})
+	srv := newTestServerWithConfig(t, Config{Endpoint: upstream.URL})
 	assetURL := upstream.URL + "/owner/model/raw/main/assets/logo.png"
 	req := httptest.NewRequest(http.MethodGet, readmeAssetPath+"?url="+url.QueryEscape(assetURL), nil)
 	w := httptest.NewRecorder()
