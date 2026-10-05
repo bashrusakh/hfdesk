@@ -8,7 +8,7 @@ it does not replace `CONTRIBUTING.md`. See "Authoritative sources" below.
 
 The automation owns these label families and may add or remove only these labels:
 
-- Issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`, `refactor`, `ci`
+- Issue triage: `bug`, `enhancement`, `documentation`, `question`, `refactor`, `ci`, `needs-info`, `confirmed`, `duplicate`
 - PR semantic intake: `bug`, `enhancement`, `documentation`, `question`, `duplicate`, `refactor`, `ci`
 
 Allowed semantic issue/change types are limited to `bug`, `enhancement`,
