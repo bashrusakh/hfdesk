@@ -12,6 +12,9 @@ engine:
   id: copilot
   model: glm-5.3-flash
   bare: true
+  concurrency:
+    group: "gh-aw-triage-${{ github.repository }}"
+    queue: max
   env:
     COPILOT_PROVIDER_BASE_URL: "https://ollama.com/v1"
     COPILOT_PROVIDER_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -51,6 +54,7 @@ pre-agent-steps:
       echo "POLICY_SHA=$sha" >> "$GITHUB_ENV"
       echo "Resolved policy contract at $sha"
 safe-outputs:
+  report-failure-as-issue: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]

@@ -25,6 +25,9 @@ engine:
   id: copilot
   model: glm-5.3-flash
   bare: true
+  concurrency:
+    group: "gh-aw-triage-${{ github.repository }}"
+    queue: max
   env:
     COPILOT_PROVIDER_BASE_URL: "https://ollama.com/v1"
     COPILOT_PROVIDER_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -92,6 +95,7 @@ pre-agent-steps:
       chmod 0555 "${batch_dir}"
       printf 'Bounded backlog batch (%s items) at %s\n' "$(jq 'length' "${batch_dir}/batch.json" 2>/dev/null || echo 0)" "${batch_dir}/batch.json"
 safe-outputs:
+  report-failure-as-issue: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
