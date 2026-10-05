@@ -22,7 +22,7 @@ func TestJobManager_CreateJob(t *testing.T) {
 	hub := NewWSHub()
 	go hub.Run()
 
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	// Each CreateJob here spawns a runJob goroutine that tries to download
 	// from a non-existent HF repo. The downloader creates subdirectories
@@ -105,7 +105,7 @@ func TestJobManager_Deduplication(t *testing.T) {
 	hub := NewWSHub()
 	go hub.Run()
 
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	// Create first job
 	req := DownloadRequest{
@@ -141,7 +141,7 @@ func TestJobManager_DifferentFiltersNotDeduplicated(t *testing.T) {
 	hub := NewWSHub()
 	go hub.Run()
 
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	// Create first job with filter q4_k_m
 	job1, _, _ := mgr.CreateJob(DownloadRequest{
@@ -190,7 +190,7 @@ func TestJobManager_DifferentRevisionsNotDeduplicated(t *testing.T) {
 	hub := NewWSHub()
 	go hub.Run()
 
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	job1, _, _ := mgr.CreateJob(DownloadRequest{
 		Repo:     "revision/test",
@@ -223,7 +223,7 @@ func TestJobManager_ModelVsDatasetNotDeduplicated(t *testing.T) {
 	hub := NewWSHub()
 	go hub.Run()
 
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	job1, _, _ := mgr.CreateJob(DownloadRequest{
 		Repo:    "type/test",
@@ -253,7 +253,7 @@ func TestJobManager_GetJob(t *testing.T) {
 	cfg := Config{CacheDir: cacheDir}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	job, _, _ := mgr.CreateJob(DownloadRequest{Repo: "get/test"})
 
@@ -285,7 +285,7 @@ func TestJobManager_ListJobs(t *testing.T) {
 	cfg := Config{CacheDir: cacheDir}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 
 	// Create multiple jobs with unique repos
 	mgr.CreateJob(DownloadRequest{Repo: "list/test1"})
@@ -311,7 +311,7 @@ func TestJobManager_CancelJob(t *testing.T) {
 	cfg := Config{CacheDir: t.TempDir(), Endpoint: stall.URL}
 	hub := NewWSHub()
 	go hub.Run()
-	mgr := NewJobManager(cfg, hub)
+	mgr := newTestJobManager(t, cfg, hub)
 	t.Cleanup(func() { mgr.WaitAll(5 * time.Second) })
 
 	job, _, _ := mgr.CreateJob(DownloadRequest{Repo: "cancel/test"})

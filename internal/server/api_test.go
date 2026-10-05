@@ -23,24 +23,26 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
-var testCacheDir string
-
-func newTestServer() *Server {
-	if testCacheDir == "" {
-		testCacheDir = "/tmp/hfdesk_test_cache"
-	}
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
 	cfg := Config{
 		Addr:        "127.0.0.1",
 		Port:        0, // Random port
-		CacheDir:    testCacheDir,
+		CacheDir:    t.TempDir(),
 		Concurrency: 2,
 		MaxActive:   1,
 	}
-	return New(cfg)
+	return newTestServerWithConfig(t, cfg)
+}
+
+func newTestServerWithConfig(t *testing.T, cfg Config) *Server {
+	t.Helper()
+	hub := NewWSHub()
+	return &Server{config: cfg, jobs: newTestJobManager(t, cfg, hub), wsHub: hub}
 }
 
 func TestAPI_Health(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	req := httptest.NewRequest("GET", "/api/health", nil)
 	w := httptest.NewRecorder()
@@ -509,7 +511,7 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(Config{
+	srv := newTestServerWithConfig(t, Config{
 		Addr:        "127.0.0.1",
 		Port:        0,
 		CacheDir:    cacheDir,
@@ -857,7 +859,7 @@ func TestAPI_CacheHFFriendlyMetadata_ConfigSnapshot(t *testing.T) {
 }
 
 func TestAPI_GetSettings(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	req := httptest.NewRequest("GET", "/api/settings", nil)
 	w := httptest.NewRecorder()
@@ -871,8 +873,8 @@ func TestAPI_GetSettings(t *testing.T) {
 	var resp SettingsResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.CacheDir != testCacheDir {
-		t.Errorf("Expected cacheDir %s, got %s", testCacheDir, resp.CacheDir)
+	if resp.CacheDir != srv.config.CacheDir {
+		t.Errorf("Expected cacheDir %s, got %s", srv.config.CacheDir, resp.CacheDir)
 	}
 }
 
@@ -887,7 +889,7 @@ func TestAPI_DiskFreeDefaultsToLocalDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(Config{CacheDir: cacheDir, LocalDir: localDir})
+	srv := newTestServerWithConfig(t, Config{CacheDir: cacheDir, LocalDir: localDir})
 	req := httptest.NewRequest("GET", "/api/diskfree", nil)
 	w := httptest.NewRecorder()
 
@@ -910,7 +912,7 @@ func TestAPI_GetSettings_TokenMasked(t *testing.T) {
 		CacheDir: "/tmp/test_cache",
 		Token:    "hf_abcdefghijklmnop",
 	}
-	srv := New(cfg)
+	srv := newTestServerWithConfig(t, cfg)
 
 	req := httptest.NewRequest("GET", "/api/settings", nil)
 	w := httptest.NewRecorder()
@@ -930,7 +932,7 @@ func TestAPI_GetSettings_TokenMasked(t *testing.T) {
 }
 
 func TestAPI_UpdateSettings(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Update concurrency
 	body := `{"connections": 16, "maxActive": 8, "retries": 0, "verify": "sha256"}`
@@ -960,7 +962,7 @@ func TestAPI_UpdateSettings(t *testing.T) {
 }
 
 func TestAPI_UpdateSettings_UpdatesCacheDir(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Storage settings are editable via the API (see 2e75528); the value is
 	// trimmed before being applied.
@@ -1011,7 +1013,7 @@ func TestAPI_UpdateSettings_ValidatesMaxSpeed(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := newTestServer()
+			srv := newTestServer(t)
 			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
@@ -1046,7 +1048,7 @@ func TestAPI_UpdateSettings_ValidatesMultipartThreshold(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := newTestServer()
+			srv := newTestServer(t)
 			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
@@ -1069,7 +1071,7 @@ func TestAPI_UpdateSettings_ValidatesMultipartThreshold(t *testing.T) {
 // can't survive a restart with.
 func TestAPI_UpdateSettings_AtomicValidation(t *testing.T) {
 	t.Run("invalid maxSpeed does not apply concurrency", func(t *testing.T) {
-		srv := newTestServer()
+		srv := newTestServer(t)
 		origConcurrency := srv.config.Concurrency
 		origCacheDir := srv.config.CacheDir
 
@@ -1091,7 +1093,7 @@ func TestAPI_UpdateSettings_AtomicValidation(t *testing.T) {
 	})
 
 	t.Run("invalid multipartThreshold does not apply maxActive", func(t *testing.T) {
-		srv := newTestServer()
+		srv := newTestServer(t)
 		origMaxActive := srv.config.MaxActive
 
 		body := `{"maxActive": 8, "multipartThreshold": "xyz"}`
@@ -1110,7 +1112,7 @@ func TestAPI_UpdateSettings_AtomicValidation(t *testing.T) {
 }
 
 func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	tests := []struct {
 		name     string
@@ -1150,7 +1152,7 @@ func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {
 }
 
 func TestAPI_StartDownload_OutputIgnored(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Try to specify custom output path
 	body := `{"repo": "test/model", "output": "/etc/evil"}`
@@ -1171,13 +1173,13 @@ func TestAPI_StartDownload_OutputIgnored(t *testing.T) {
 	if resp.OutputDir == "/etc/evil" {
 		t.Error("Output path from request should be ignored!")
 	}
-	if resp.OutputDir != testCacheDir {
+	if resp.OutputDir != srv.config.CacheDir {
 		t.Errorf("Expected server-controlled HF cache output, got %s", resp.OutputDir)
 	}
 }
 
 func TestAPI_StartDownload_DatasetUsesSameCacheDir(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	body := `{"repo": "test/dataset", "dataset": true}`
 	req := httptest.NewRequest("POST", "/api/download", bytes.NewBufferString(body))
@@ -1190,13 +1192,13 @@ func TestAPI_StartDownload_DatasetUsesSameCacheDir(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 
 	// In v3, both models and datasets use the same HF cache directory
-	if resp.OutputDir != testCacheDir {
+	if resp.OutputDir != srv.config.CacheDir {
 		t.Errorf("Dataset should use HF cache dir, got %s", resp.OutputDir)
 	}
 }
 
 func TestAPI_StartDownload_DuplicateReturnsExisting(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	body := `{"repo": "dup/test"}`
 
@@ -1237,7 +1239,7 @@ func TestAPI_StartDownload_DuplicateReturnsExisting(t *testing.T) {
 }
 
 func TestAPI_ListJobs(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Create a job first
 	body := `{"repo": "list/test"}`
@@ -1265,7 +1267,7 @@ func TestAPI_ListJobs(t *testing.T) {
 }
 
 func TestAPI_ParseFiltersFromRepo(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	body := `{"repo": "owner/model:q4_0,q5_0"}`
 	req := httptest.NewRequest("POST", "/api/download", bytes.NewBufferString(body))
@@ -1288,7 +1290,7 @@ func TestAPI_ParseFiltersFromRepo(t *testing.T) {
 // --- Delete Cache Security Tests ---
 
 func TestAPI_CacheDelete_PathTraversal(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Test various path traversal attempts
 	tests := []struct {
@@ -1355,7 +1357,7 @@ func TestAPI_CacheDelete_PathTraversal(t *testing.T) {
 }
 
 func TestAPI_CacheDelete_InvalidCharacters(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	// Test invalid characters that could be used in attacks
 	// Note: Some characters (null byte, control chars) are rejected by the HTTP layer itself
@@ -1443,7 +1445,7 @@ func TestAPI_CacheDelete_ValidRepoFormat(t *testing.T) {
 		Concurrency: 2,
 		MaxActive:   1,
 	}
-	srv := New(cfg)
+	srv := newTestServerWithConfig(t, cfg)
 
 	// Valid format repos should pass validation (may return 404 if not found)
 	tests := []struct {
@@ -1916,7 +1918,7 @@ func TestIsValidRepoComponent(t *testing.T) {
 // and other read paths. Run with `go test -race` to catch any lock the
 // refactor missed: the test is meaningless without the race detector.
 func TestAPI_ConcurrentSettingsAccess(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	const writers = 4
 	const readers = 8
@@ -1979,7 +1981,7 @@ func TestAPI_ConcurrentSettingsAccess(t *testing.T) {
 // SaveConfigFile) must be dropped so the job manager and the persisted
 // file are not rolled back to the loser's older snapshot.
 func TestAPI_UpdateSettings_DropsStalePostLockSideEffects(t *testing.T) {
-	srv := newTestServer()
+	srv := newTestServer(t)
 
 	srv.config.MaxSpeed = "0"
 
@@ -2028,7 +2030,7 @@ func TestAPI_UpdateSettings_PersistedFileMatchesLatest(t *testing.T) {
 	cfgPath := ConfigPath()
 	_ = os.Remove(cfgPath)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	const writers = 4
 	var wg sync.WaitGroup
 
