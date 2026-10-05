@@ -8,7 +8,7 @@ it does not replace `CONTRIBUTING.md`. See "Authoritative sources" below.
 
 The automation owns these label families and may add or remove only these labels:
 
-- Issue triage: `bug`, `enhancement`, `documentation`, `question`, `refactor`, `ci`, `needs-info`, `confirmed`, `duplicate`
+- Issue triage: `bug`, `enhancement`, `documentation`, `question`, `refactor`, `ci`, `needs-info`, `duplicate`
 - PR semantic intake: `bug`, `enhancement`, `documentation`, `question`, `duplicate`, `refactor`, `ci`
 
 Allowed semantic issue/change types are limited to `bug`, `enhancement`,
@@ -50,6 +50,11 @@ Templates (`PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/*`) are input schemas and
 evidence, not retroactive mandatory checklists. A missing or unfilled template
 field is not by itself grounds for `needs-info`; label only on the substance of the
 report.
+
+## Metadata-only scope
+
+Triage is metadata-only — the automation does not reproduce, validate, review code, read
+source/diff, or comment; `needs-info` means metadata/routing information is missing.
 
 ## Policy precedence and drift
 

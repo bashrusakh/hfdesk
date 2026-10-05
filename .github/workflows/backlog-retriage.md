@@ -9,6 +9,7 @@ on:
         description: Optional comma-separated issue/PR numbers to reconcile. Empty selects a bounded stale batch.
         required: false
         type: string
+  status-comment: false
 # The weekly schedule is installed DISABLED until trials pass. A scheduled run is inert
 # until the repository variable BACKLOG_RETRIAGE_ENABLED is set to 'true'; manual
 # workflow_dispatch runs always proceed. Enable with:
@@ -38,17 +39,29 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@3d8b4095371aee673d32cd265b26b11ae23a62b7
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/backlog-retriage-core.md@3d8b4095371aee673d32cd265b26b11ae23a62b7
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@0f49ef7106f9963a7b64a5bb7dfad2078aa39f8b
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/backlog-retriage-core.md@0f49ef7106f9963a7b64a5bb7dfad2078aa39f8b
+checkout: false
 max-ai-credits: 10
-max-turns: 40
+max-turns: 20
 timeout-minutes: 20
 network:
   allowed: [defaults, github, ollama.com]
 tools:
+  bash: false
+  cli-proxy: false
   github:
-    mode: gh-proxy
-    toolsets: [issues, pull_requests]
+    mode: local
+    toolsets: [issues, pull_requests, labels]
+    allowed:
+      - issue_read
+      - list_issues
+      - search_issues
+      - find_duplicate
+      - get_pull_request
+      - get_pull_request_files
+      - list_pull_requests
+      - list_labels
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
@@ -97,14 +110,12 @@ pre-agent-steps:
 safe-outputs:
   report-failure-as-issue: false
   add-labels:
-    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 5
   remove-labels:
-    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
     max: 5
-  add-comment:
-    max: 1
 ---
 
 # Workflow 4 — Backlog Re-triage (hfdesk)
@@ -149,8 +160,9 @@ unchanged and identify it as needing deeper/human review.
 ## hfdesk managed label boundary
 
 - Managed across the union of hfdesk triage families: `bug`, `enhancement`,
-  `documentation`, `question`, `refactor`, `ci`, `needs-info`, `confirmed`,
-  `duplicate`.
+  `documentation`, `question`, `refactor`, `ci`, `needs-info`, `duplicate`.
+- `confirmed` is human/verification-owned and out of scope: this workflow does not own
+  it and must never add or remove it.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.
@@ -158,5 +170,9 @@ unchanged and identify it as needing deeper/human review.
   close/merge PRs, modify code, assign users, or post routine comments. hfdesk
   authorizes no prerequisite/approval/decision-gate semantics for automation.
 
+This workflow is metadata-only and silent: it does not reproduce, validate, review
+code, read source/diff, or comment. `needs-info` means metadata/routing information is
+missing.
+
 Prefer preserving an existing state over speculative churn. Use only this workflow's safe
-outputs (`add-labels`, `remove-labels`, `add-comment`).
+outputs (`add-labels`, `remove-labels`).
