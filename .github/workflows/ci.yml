@@ -56,3 +56,9 @@ jobs:
 
       - name: Test native state replacement
         run: go test ./internal/server -run 'Test(WindowsReplaceJobsStateFileUsesNativeReplacement|ReplaceJobsStateFile)' -v
+
+      - name: Test native storage ownership
+        run: go test ./pkg/hfdownloader -run '^(TestManagedRoot|TestRepoPhysicalCopies|TestWholeCopy)' -count=1 -v
+
+      - name: Test native server root ownership
+        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CaseDistinctRouteDestinations|LocalCacheRoots.*|API_CacheHFFriendlyMetadata_(Ownership|NoProjection)|API_CacheDelete_PathTraversal|WholeHubDelete.*|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly))$' -count=1 -v
