@@ -2719,13 +2719,22 @@ func fileMatchesCacheVariant(base, variant string) bool {
 }
 
 // collectLocalVariantFiles returns the absolute paths of the GGUF files inside
-// copyDir that belong to variant. It walks without following symlinks and skips
-// subtrees owned by a nested configured root (excluded), so a variant delete
-// never reaches outside the resolved copy.
-func collectLocalVariantFiles(copyDir, variant string, excluded []string) []string {
-	var files []string
-	walkLocalCacheRepo(copyDir, excluded, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+// copyDir that belong to variant, plus warnings for any traversal error it
+// could not read. It walks without following symlinks and skips subtrees owned
+// by a nested configured root (excluded), so a variant delete never reaches
+// outside the resolved copy. A traversal error (an unreadable entry or subtree)
+// truncates the set of files the walk can see; the warning records it so the
+// caller can surface an incomplete cleanup instead of a silent success.
+func collectLocalVariantFiles(copyDir, variant string, excluded []string) (files []string, warnings []string) {
+	_ = walkLocalCacheRepo(copyDir, excluded, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Report the unreadable entry/subtree rather than dropping it, and
+			// keep walking the readable remainder so the delete set stays as
+			// complete as the filesystem allows.
+			warnings = append(warnings, fmt.Sprintf("%s: %v", path, err))
+			return nil
+		}
+		if info.IsDir() {
 			return nil
 		}
 		// Never follow a symlinked file: it is an alias of other storage, not
@@ -2739,7 +2748,7 @@ func collectLocalVariantFiles(copyDir, variant string, excluded []string) []stri
 		files = append(files, path)
 		return nil
 	})
-	return files
+	return files, warnings
 }
 
 // collectLocalVariantTokens returns the distinct quantisation tokens a Local
@@ -2834,12 +2843,18 @@ func deleteLocalVariant(w http.ResponseWriter, repo, variant, copyDir string, ex
 		writeError(w, http.StatusBadRequest, "Unknown variant", "variant is not a detected artifact of this copy")
 		return
 	}
-	files := collectLocalVariantFiles(copyDir, variant, excluded)
+	files, walkWarnings := collectLocalVariantFiles(copyDir, variant, excluded)
 	if len(files) == 0 {
+		// A variant the copy advertises must resolve to at least one readable
+		// file; if the walk could see none, an unreadable subtree (reported in
+		// walkWarnings) is the likely cause. Still refuse, deleting nothing.
 		writeError(w, http.StatusBadRequest, "Unknown variant", "no files match this variant in the copy")
 		return
 	}
 	var failures []string
+	// A traversal error truncated the delete set: surface it as incomplete
+	// cleanup even though the files that were readable are still removed.
+	failures = append(failures, walkWarnings...)
 	var deleted int
 	var deletedBytes int64
 	for _, path := range files {
@@ -2955,9 +2970,17 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 			if linkAbs, aerr := filepath.Abs(link); aerr != nil || !strings.HasPrefix(linkAbs+string(filepath.Separator), hubPrefix) {
 				continue
 			}
-			if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-				if rerr := os.Remove(link); rerr != nil {
-					failures = append(failures, fmt.Sprintf("%s: snapshot link: %v", base, rerr))
+			if info, lerr := os.Lstat(link); lerr == nil {
+				if info.Mode()&os.ModeSymlink != 0 {
+					if rerr := os.Remove(link); rerr != nil {
+						failures = append(failures, fmt.Sprintf("%s: snapshot link: %v", base, rerr))
+					}
+				} else {
+					// A real (non-symlink) entry is payload, not this repo's
+					// link projection; leave it rather than delete shared
+					// storage, but surface it so the response is not a silent
+					// clean success after the hub blob was removed.
+					failures = append(failures, fmt.Sprintf("variant file left in place at %s", link))
 				}
 			}
 		}
@@ -2966,9 +2989,16 @@ func deleteHFVariant(w http.ResponseWriter, repoDir *hfdownloader.RepoDir, repo,
 			link := filepath.Join(friendlyRoot, filepath.FromSlash(f.Name))
 			if linkAbs, aerr := filepath.Abs(link); aerr == nil &&
 				strings.HasPrefix(linkAbs+string(filepath.Separator), friendlyPrefix) {
-				if info, lerr := os.Lstat(link); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-					if rerr := os.Remove(link); rerr != nil {
-						failures = append(failures, fmt.Sprintf("%s: friendly link: %v", base, rerr))
+				if info, lerr := os.Lstat(link); lerr == nil {
+					if info.Mode()&os.ModeSymlink != 0 {
+						if rerr := os.Remove(link); rerr != nil {
+							failures = append(failures, fmt.Sprintf("%s: friendly link: %v", base, rerr))
+						}
+					} else {
+						// Mirror the snapshot branch: preserve a real file and
+						// report the incomplete cleanup instead of silently
+						// leaving it behind.
+						failures = append(failures, fmt.Sprintf("variant file left in place at %s", link))
 					}
 				}
 			}
@@ -3096,12 +3126,38 @@ func (s *Server) handleCacheDeleteVariant(w http.ResponseWriter, cacheDir string
 		// route: a hub path outside the configured cache dir is not a deletable
 		// copy (e.g. an HF_HUB_CACHE override), so selective delete must refuse
 		// it too rather than operating on files outside the configured cache.
-		if absCacheDir, aerr := filepath.Abs(cacheDir); aerr == nil {
-			absHubPath, herr := filepath.Abs(repoDir.Path())
-			if herr != nil {
-				writeError(w, http.StatusInternalServerError, "Failed to resolve path", herr.Error())
+		//
+		// Layer 7 parity: repoDir.Path() and FriendlyPath() are lexical, so a
+		// top-level symlink at either one aliases another cached repo. The
+		// whole-copy routes reject such a leaf before deleting; selective delete
+		// must do the same before removing any variant blob, or it can remove an
+		// aliased repo's blob even though EvalSymlinks resolves within the cache.
+		absHubPath, herr := filepath.Abs(repoDir.Path())
+		if herr != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to resolve path", herr.Error())
+			return
+		}
+		if hubInfo, lerr := os.Lstat(absHubPath); lerr == nil {
+			if hubInfo.Mode()&os.ModeSymlink != 0 {
+				writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
 				return
 			}
+		} else if !os.IsNotExist(lerr) {
+			writeError(w, http.StatusInternalServerError, "Failed to check path", lerr.Error())
+			return
+		}
+		if friendlyPath := repoDir.FriendlyPath(); friendlyPath != "" {
+			if fInfo, lerr := os.Lstat(friendlyPath); lerr == nil {
+				if fInfo.Mode()&os.ModeSymlink != 0 {
+					writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
+					return
+				}
+			} else if !os.IsNotExist(lerr) {
+				writeError(w, http.StatusInternalServerError, "Failed to check path", lerr.Error())
+				return
+			}
+		}
+		if absCacheDir, aerr := filepath.Abs(cacheDir); aerr == nil {
 			if verr := validateHubDeletePath(absHubPath, absCacheDir, absCacheDir+string(filepath.Separator), repoType); verr != nil {
 				writeCacheDeleteError(w, verr)
 				return

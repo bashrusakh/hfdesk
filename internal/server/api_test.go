@@ -4714,3 +4714,213 @@ func TestAPI_CacheDelete_VariantHFEmptyBlobReported(t *testing.T) {
 		t.Errorf("other quant's blob must survive: %v", err)
 	}
 }
+
+// TestAPI_CacheDelete_VariantHFSymlinkedHubRejected is the layer-7 parity fix:
+// repoDir.Path() is lexical, so a hub path that is itself a top-level symlink
+// aliases another cached repo. A selective (variant) delete must reject that
+// leaf exactly like the whole-copy routes, before removing any blob; otherwise
+// EvalSymlinks resolves within the cache and the aliased repo's blob is lost.
+// The request must return 400 and leave the aliased repo's blob untouched.
+func TestAPI_CacheDelete_VariantHFSymlinkedHubRejected(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "qwen"
+
+	// The real repo the symlinked hub aliases; its blob must survive.
+	aliasedRepo := filepath.Join(cacheDir, "hub", "models--other--other")
+	writeCacheFiles(t, filepath.Join(aliasedRepo, "blobs"), "sha_go")
+
+	// hub/models--alice--qwen is a symlink to the aliased repo.
+	hubPath := filepath.Join(cacheDir, "hub", "models--alice--qwen")
+	if err := os.MkdirAll(filepath.Dir(hubPath), 0o755); err != nil {
+		t.Fatalf("mkdir hub: %v", err)
+	}
+	if err := os.Symlink(aliasedRepo, hubPath); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	// A friendly manifest for alice/qwen whose blob hash collides with the
+	// aliased repo's blob, so a fail-open delete would remove that blob.
+	friendlyDir := filepath.Join(cacheDir, "models", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "model",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			{Name: "model-Q4_K_M.gguf", Blob: "blobs/sha_go", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("variant delete on symlinked hub = %d, want 400. Body: %s", w.Code, w.Body.String())
+	}
+	// The aliased repo's blob and the symlink itself must both survive.
+	if _, err := os.Stat(filepath.Join(aliasedRepo, "blobs", "sha_go")); err != nil {
+		t.Errorf("aliased repo's blob must survive rejected delete: %v", err)
+	}
+	if _, err := os.Lstat(hubPath); err != nil {
+		t.Errorf("symlinked hub must survive rejected delete: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantHFRealEntryLeftReported verifies that a matching
+// manifest entry that is a REAL (non-symlink) file in the friendly view is not
+// deleted, but is surfaced as an incomplete-cleanup warning instead of being
+// silently skipped, while the hub blob removal still succeeds. This mirrors the
+// friendly whole-copy behavior that never removes shared storage silently.
+func TestAPI_CacheDelete_VariantHFRealEntryLeftReported(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	owner, name := "alice", "qwen"
+
+	hubRepo := filepath.Join(cacheDir, "hub", "models--alice--qwen")
+	writeCacheFiles(t, filepath.Join(hubRepo, "blobs"), "sha_go", "sha_keep")
+	friendlyDir := filepath.Join(cacheDir, "models", owner, name)
+	writeCacheFiles(t, friendlyDir, hfdownloader.ManifestFilename)
+
+	manifest := &hfdownloader.DownloadManifest{
+		Version: "1.0",
+		Type:    "model",
+		Repo:    owner + "/" + name,
+		Files: []hfdownloader.ManifestFile{
+			{Name: "model-Q4_K_M.gguf", Blob: "blobs/sha_go", Size: 1},
+			{Name: "model-Q8_0.gguf", Blob: "blobs/sha_keep", Size: 1},
+		},
+	}
+	if _, err := manifest.Write(friendlyDir); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// The matching entry exists in the friendly view as a REAL file, not a link.
+	realEntry := filepath.Join(friendlyDir, "model-Q4_K_M.gguf")
+	if err := os.WriteFile(realEntry, []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write real friendly entry: %v", err)
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceHFCache)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, owner+"/"+name, q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("variant delete with real friendly entry = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, meta := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true for a real matching entry, got %s", w.Body.String())
+	}
+	warnings, _ := meta["warnings"].([]string)
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "left in place") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a left-in-place warning, got %v", warnings)
+	}
+	// The real file must remain; the variant's hub blob is still removed.
+	if _, err := os.Stat(realEntry); err != nil {
+		t.Errorf("real friendly entry must be left in place: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_go")); !os.IsNotExist(err) {
+		t.Errorf("expected variant blob removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hubRepo, "blobs", "sha_keep")); err != nil {
+		t.Errorf("other quant's blob must survive: %v", err)
+	}
+}
+
+// TestAPI_CacheDelete_VariantLocalWalkErrorSurfaced verifies that an unreadable
+// subtree encountered while collecting a Local variant's files is surfaced as
+// cleanupIncomplete rather than silently truncating the delete set. The
+// readable matching file is still removed; the unreadable directory is not
+// traversed, so it must not be reported as a clean success.
+func TestAPI_CacheDelete_VariantLocalWalkErrorSurfaced(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix permission bits")
+	}
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	localDir := filepath.Join(root, "local")
+	repoDir := filepath.Join(localDir, "alice", "qwen")
+	writeCacheFiles(t, repoDir, "model-Q4_K_M.gguf")
+	// An unreadable subdirectory: the walk cannot list it and must report the
+	// traversal error instead of dropping it silently.
+	unreadable := filepath.Join(repoDir, "locked")
+	if err := os.Mkdir(unreadable, 0o000); err != nil {
+		t.Fatalf("mkdir unreadable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o755) })
+	if _, err := os.ReadDir(unreadable); err == nil {
+		t.Skip("process bypasses directory permissions")
+	}
+
+	srv := New(Config{
+		Addr:        "127.0.0.1",
+		Port:        0,
+		CacheDir:    cacheDir,
+		LocalDir:    localDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	})
+
+	info := cacheInfoForTest(t, srv, "alice/qwen")
+	localCopy := cacheCopyBySource(info.Copies, cacheSourceLocal)
+	if localCopy == nil {
+		t.Fatalf("local copy not listed: %#v", info.Copies)
+	}
+
+	q := url.Values{}
+	q.Set("type", "model")
+	q.Set("source", cacheSourceLocal)
+	q.Set("path", localCopy.Path)
+	q.Set("variant", "Q4_K_M")
+	w := deleteCacheReq(t, srv, "alice/qwen", q)
+	if w.Code != http.StatusOK {
+		t.Fatalf("variant delete with unreadable subtree = %d, want 200. Body: %s", w.Code, w.Body.String())
+	}
+	incomplete, meta := decodeDeleteSuccess(t, w)
+	if !incomplete {
+		t.Errorf("expected cleanupIncomplete=true for a traversal error, got %s", w.Body.String())
+	}
+	warnings, _ := meta["warnings"].([]string)
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "locked") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a traversal warning naming the unreadable path, got %v", warnings)
+	}
+	// The readable matching file is still removed.
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Errorf("expected readable variant file removed, stat err = %v", err)
+	}
+}
