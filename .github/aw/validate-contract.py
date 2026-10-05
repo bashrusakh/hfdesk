@@ -25,7 +25,7 @@ import re
 import subprocess
 import sys
 
-PIN = "3d8b4095371aee673d32cd265b26b11ae23a62b7"
+PIN = "30288988a387310ad90e49ba2f2a30252ebbec05"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 POLICY = os.path.join(REPO_ROOT, ".github", "triage-policy.md")
 LABELS_YML = os.path.join(REPO_ROOT, ".github", "labels.yml")
