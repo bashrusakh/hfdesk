@@ -98,7 +98,15 @@ esac
 # remapping on the UID alone would leave /etc/passwd with a stale GID after a
 # PGID-only change. Target the resolved account/group names because a colliding
 # build may have reused an existing Alpine entry instead of creating "hfdesk".
-if [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
+#
+# Renumber the resolved group only when the requested GID is free. If another
+# group already owns it (for example the reserved Alpine "users" group at gid
+# 100), renumbering the resolved group would leave two group names for one GID,
+# making getgrgid/group lookups ambiguous. Reuse the existing group instead and
+# point the account's primary GID at it, mirroring the build-time reuse of
+# reserved accounts.
+existing_group="$(getent group "$PGID" 2>/dev/null | cut -d: -f1)"
+if [ -z "$existing_group" ] && [ "$(id -g "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PGID" ]; then
     sed -i "s/^\(${RESOLVED_GROUP}:x:\)[0-9]*:/\1${PGID}:/" /etc/group
 fi
 if [ "$(id -u "$RESOLVED_USER" 2>/dev/null || echo x)" != "$PUID" ] || \
