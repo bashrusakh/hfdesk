@@ -4,9 +4,10 @@
 # your host user so downloaded models are owned by you (find them with
 # `id -u` / `id -g`).
 #
-# For private/gated models, pass a Hugging Face token with the `--token` flag
-# or set it in the HFDesk settings UI/API; the binary does not read an
-# HF_TOKEN environment variable. That state persists under /data/.config.
+# For private/gated models, the Hugging Face token is resolved as the `--token`
+# flag, then the `HF_TOKEN` environment variable, then the config file token.
+# Uncomment HF_TOKEN below (or pass `--token` / use the settings UI/API).
+# That state persists under /data.
 services:
   hfdesk:
     image: ghcr.io/bashrusakh/hfdesk:latest
@@ -17,6 +18,7 @@ services:
       PUID: "1000"
       PGID: "1000"
       UMASK: "022"
+      # HF_TOKEN: "hf_xxx"
     volumes:
       - ./hfdesk-data:/data
     restart: unless-stopped

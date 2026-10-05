@@ -170,13 +170,22 @@ go test ./... -race
 
 ## Docker
 
-The image keeps every writable path under one mounted data root, `/data`:
+The image keeps every writable path under one mounted data root, `/data`. It
+sets `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, and
+`HF_HOME=/data/.cache/huggingface`, and runs with `WORKDIR /data`:
 
 | Path | Contents |
 |---|---|
-| `/data/.config/HFDesk` | Settings and job/history state |
+| `/data/.config/HFDesk` | Settings, jobs, and history state (`$XDG_CONFIG_HOME/HFDesk`) |
 | `/data/.cache/huggingface` | Hugging Face cache (`HF_HOME`) |
 | `/data/Models`, `/data/Datasets` | LM Studio-style local downloads |
+
+The entrypoint does not pre-create these subdirectories: it hands the `/data`
+root itself to the app UID (world-writable, mode `1777`) and the app creates its
+own state directories as that UID. Jobs/history state always resolves through
+the per-user config directory above. A config file placed directly in the launch
+directory (`/data/hfdesk.json`) is still read first and saved there, but a fresh
+volume writes its config under `/data/.config/HFDesk`.
 
 Run it with a single volume:
 
@@ -243,15 +252,31 @@ of failing; `PUID`/`PGID` still remap the app process at runtime.
 
 ### Migrating from the old cache path
 
-Older images stored the cache at `/home/hfdesk/.cache/huggingface`, so the
-documented `-v ~/.cache/huggingface:/root/.cache/huggingface` mount never
-persisted anything. The cache now lives at `/data/.cache/huggingface`. Point
-your volume at `/data` (recommended), or move existing data:
+The previous image ran as the `hfdesk` user with
+`ENV HF_HOME=/home/hfdesk/.cache/huggingface`. That path was image-internal, so
+a container recreate lost it. Two mounts were documented:
+
+- The README mounted `~/.cache/huggingface:/root/.cache/huggingface`, but the
+  app ran as `hfdesk` with `HF_HOME` under `/home/hfdesk`, so that target was
+  never written to and persisted nothing.
+- The Dockerfile mounted
+  `~/.cache/huggingface:/home/hfdesk/.cache/huggingface`, which did match
+  `HF_HOME`; host `~/.cache/huggingface` was the real, persisted cache root.
+
+The new root is `/data/.cache/huggingface`. Point your volume at `/data`
+(recommended), or seed it from an old Dockerfile-style host cache root:
 
 ```bash
 mkdir -p /path/to/your/data/.cache
 mv ~/.cache/huggingface /path/to/your/data/.cache/huggingface
 ```
+
+With `HF_HUB_CACHE` unset, Hub repositories live in the root's `hub/` child
+(`/data/.cache/huggingface/hub`). A nonempty `HF_HUB_CACHE` selects the **exact
+Hub directory** instead, independent of `HF_HOME`; if you set it, put the old
+`hub/` contents at that path rather than under `HF_HOME`. See
+[Hub storage and friendly folders](#hub-storage-and-friendly-folders) for the
+full association rules.
 
 Switching `PUID`/`PGID` on a volume that already holds files owned by a
 previous UID leaves those files owned by the old UID: the entrypoint only hands

@@ -24,11 +24,14 @@
 #   docker run --rm --user 568:568 -p 8080:8080 \
 #     -v hfdesk-data:/data hfdesk
 #
-# With a HuggingFace token (for private/gated models), pass it with --token or
-# set it in the HFDesk settings UI/API. The binary does not read an HF_TOKEN
-# environment variable:
+# With a HuggingFace token (for private/gated models). The token is resolved as
+# the --token flag, then the HF_TOKEN environment variable, then the config file
+# token, so any of these works:
 #   docker run --rm -p 8080:8080 \
 #     -v hfdesk-data:/data hfdesk --token hf_xxx
+#   docker run --rm -p 8080:8080 \
+#     -e HF_TOKEN=hf_xxx -v hfdesk-data:/data hfdesk
+# You can also set it in the HFDesk settings UI/API.
 #
 # The container starts as root only so the entrypoint can honor PUID/PGID and
 # then drop privileges; the app process always runs as the requested UID/GID.
