@@ -8,12 +8,17 @@ it does not replace `CONTRIBUTING.md`. See "Authoritative sources" below.
 
 The automation owns these label families and may add or remove only these labels:
 
-- Issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`
-- PR semantic intake: `bug`, `enhancement`, `documentation`, `question`, `duplicate`
+- Issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`, `refactor`, `ci`
+- PR semantic intake: `bug`, `enhancement`, `documentation`, `question`, `duplicate`, `refactor`, `ci`
 
 Allowed semantic issue/change types are limited to `bug`, `enhancement`,
-`documentation`, and `question`. No area, component, risk, or priority taxonomy is
-authorized.
+`documentation`, `question`, `refactor`, and `ci`. No area, component, risk, or
+priority taxonomy is authorized.
+
+Contributor-first labeling: `CONTRIBUTING.md` is the source of truth for triage
+labels. Contributors apply the type label first; the automation only verifies the
+label and fills a missing or incorrect one. It must not relabel a correct human
+label.
 
 ## Reserved labels (human-owned)
 

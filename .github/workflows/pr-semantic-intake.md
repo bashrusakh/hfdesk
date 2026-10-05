@@ -57,7 +57,7 @@ pre-agent-steps:
 safe-outputs:
   staged: true
   add-labels:
-    allowed: ["bug", "enhancement", "documentation", "question", "duplicate"]
+    allowed: ["bug", "enhancement", "documentation", "question", "duplicate", "refactor", "ci"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 3
   remove-labels:
@@ -108,7 +108,7 @@ automated conclusions.
 ## hfdesk managed label boundary
 
 - Managed by PR semantic intake: `bug`, `enhancement`, `documentation`, `question`,
-  `duplicate`.
+  `duplicate`, `refactor`, `ci`.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.

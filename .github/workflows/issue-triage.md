@@ -53,7 +53,7 @@ pre-agent-steps:
 safe-outputs:
   staged: true
   add-labels:
-    allowed: ["bug", "needs-info", "confirmed", "duplicate"]
+    allowed: ["bug", "needs-info", "confirmed", "duplicate", "refactor", "ci"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 2
   remove-labels:
@@ -98,7 +98,8 @@ outranks stale automated conclusions.
 
 ## hfdesk managed label boundary
 
-- Managed by issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`.
+- Managed by issue triage: `bug`, `needs-info`, `confirmed`, `duplicate`, `refactor`,
+  `ci`.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.
