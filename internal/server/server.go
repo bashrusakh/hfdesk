@@ -454,3 +454,5 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// trial marker
