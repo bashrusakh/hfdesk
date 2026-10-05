@@ -5,6 +5,11 @@ on:
   issues:
     types: [opened, reopened]
   workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to triage when dispatched manually
+        required: false
+        type: string
   status-comment: false
 permissions:
   contents: read
@@ -26,12 +31,14 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@e2de4a989077b7fdf558ef5656040dc2e547e674
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@e2de4a989077b7fdf558ef5656040dc2e547e674
 checkout: false
 max-ai-credits: 5
 max-turns: 20
 timeout-minutes: 20
+concurrency:
+  job-discriminator: ${{ github.run_id }}
 network:
   allowed: [defaults, github, ollama.com]
 tools:
@@ -39,13 +46,15 @@ tools:
   cli-proxy: false
   github:
     mode: local
-    toolsets: [issues, labels]
+    toolsets: [issues]
+    allowed-repos: "${{ github.repository }}"
+    min-integrity: approved
+    # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
-      - issue_read
-      - list_issues
-      - search_issues
-      - find_duplicate
-      - list_labels
+      - name: issue_read
+        max-calls: 8
+      - name: search_issues
+        max-calls: 3
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
@@ -67,11 +76,12 @@ safe-outputs:
   report-failure-as-issue: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
-    blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
-    max: 2
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    max: 3
   remove-labels:
-    allowed: ["needs-info", "duplicate"]
-    max: 2
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    max: 3
 ---
 
 # Workflow 1 — Issue Triage (hfdesk)
@@ -111,6 +121,10 @@ outranks stale automated conclusions.
 
 - Managed by issue triage: `bug`, `enhancement`, `documentation`, `question`,
   `refactor`, `ci`, `needs-info`, `duplicate`.
+- Type reconciliation: preserve a correct contributor-applied type, fill a type that is
+  clearly missing, and replace a clearly incorrect managed type (remove the wrong type and
+  add the correct one). Make no change when the type is ambiguous — preserve the affected
+  state rather than churning it.
 - `confirmed` is human/verification-owned and out of scope: this workflow does not
   own it and must never add or remove it. It does not determine whether a report is
   technically real.
@@ -122,7 +136,9 @@ outranks stale automated conclusions.
   for automation.
 
 This workflow is metadata-only and silent: it does not reproduce, validate, review
-code, read source/diff, or comment. `needs-info` means metadata/routing information is
-missing.
+code, read source/diff, or comment. When evidence is insufficient, preserve the affected
+managed metadata and use `noop` if a completion signal is required — there is no
+explanatory output channel. `needs-info` means metadata/routing information is missing;
+it never means implementation proof is missing.
 
 Use only this workflow's safe outputs (`add-labels`, `remove-labels`).

@@ -5,6 +5,11 @@ on:
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, edited]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to triage when dispatched manually
+        required: false
+        type: string
   status-comment: false
 permissions:
   contents: read
@@ -27,12 +32,14 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/pr-intake-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@e2de4a989077b7fdf558ef5656040dc2e547e674
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/pr-intake-core.md@e2de4a989077b7fdf558ef5656040dc2e547e674
 checkout: false
 max-ai-credits: 8
 max-turns: 20
 timeout-minutes: 20
+concurrency:
+  job-discriminator: ${{ github.run_id }}
 network:
   allowed: [defaults, github, ollama.com]
 tools:
@@ -40,21 +47,23 @@ tools:
   cli-proxy: false
   github:
     mode: local
-    toolsets: [pull_requests, issues, labels]
+    toolsets: [issues, pull_requests]
+    allowed-repos: "${{ github.repository }}"
+    min-integrity: approved
+    # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
-      - get_pull_request
-      - get_pull_request_files
-      - list_pull_requests
-      - search_pull_requests
-      - issue_read
-      - search_issues
-      - list_labels
+      - name: issue_read
+        max-calls: 4
+      - name: search_issues
+        max-calls: 2
+      - name: search_pull_requests
+        max-calls: 2
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPO: ${{ github.repository }}
-      POLICY_REF: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch || 'main' }}
+      POLICY_REF: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
       CONTRACT_FILES: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md .github/PULL_REQUEST_TEMPLATE.md"
     run: |
       set -euo pipefail
@@ -67,15 +76,28 @@ pre-agent-steps:
       echo "POLICY_SHA=$sha" >> "$GITHUB_ENV"
       echo "Resolved policy contract at $sha"
   - name: Resolve PR metadata context (filenames only, no diff)
-    if: ${{ github.event.pull_request }}
+    if: ${{ github.event.pull_request || github.event_name == 'workflow_dispatch' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPO: ${{ github.repository }}
+      INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number || '' }}
     run: |
       set -euo pipefail
-      PR_NUMBER="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+      PR_NUMBER="${INPUT_PR_NUMBER:-}"
+      if [ -z "${PR_NUMBER}" ]; then
+        PR_NUMBER="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+      fi
       case "$PR_NUMBER" in
-        ''|*[!0-9]*) echo "No numeric pull request number in event; skipping PR metadata context"; exit 0 ;;
+        ''|*[!0-9]*)
+          {
+            echo "### PR metadata context not prepared"
+            echo ""
+            echo "No pull request number was available: the event carried no pull request and no \`pr_number\` input was supplied."
+            echo "Nothing was read or written. Re-run with the \`pr_number\` input set to triage a specific pull request."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "No resolvable pull request number (event had no PR and no pr_number input); failing closed" >&2
+          exit 1
+          ;;
       esac
       dir=".policy/pr"; mkdir -p "$dir"
       meta="$(gh api "repos/$GITHUB_REPO/pulls/$PR_NUMBER" \
@@ -95,17 +117,19 @@ safe-outputs:
   report-failure-as-issue: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "duplicate", "refactor", "ci"]
-    blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 3
   remove-labels:
-    allowed: ["duplicate"]
-    max: 1
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "duplicate"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    max: 3
 ---
 
 # Workflow 2 — PR Metadata Triage (hfdesk)
 
 Perform PR metadata triage for exactly one pull request: the PR that triggered this
-workflow. This is **metadata triage, not full code review**, and diff/file contents are
+workflow, or the PR named by the `pr_number` dispatch input when the workflow is started
+manually. This is **metadata triage, not full code review**, and diff/file contents are
 not used — only changed filenames are. This is the hfdesk deployment of **Workflow 2 —
 PR Metadata Triage**. Follow the imported `pr-intake-core.md` prompt core exactly for
 the mission, authority rules, and the mutation surface; this body only adds the
@@ -116,8 +140,10 @@ The pre-agent step "Resolve PR metadata context (filenames only, no diff)" has a
 written a size-bounded trusted PR metadata context file to
 `.policy/pr/<PR_NUMBER>.json` containing only: PR number, title, body, current labels,
 base/head identifiers, changed file PATHS/filenames, and deterministically extracted
-linked issue identifiers. Use that file as the PR metadata source. It contains no
-diff/patch text, and this workflow must never fetch or read a PR diff.
+linked issue identifiers. Use that file as the PR metadata source — the PR subject,
+changed filenames, labels, and base/head identifiers come only from that prepared file.
+It contains no diff/patch text, and this workflow must never fetch or read a PR diff,
+patch, or file listing through MCP tools.
 
 ## Mandatory contract invariant
 
@@ -127,13 +153,16 @@ authoritative repository policy, not as independent mandatory checklists. Curren
 repository policy outranks stale automated conclusions. Contract drift invalidates only
 conclusions it can materially affect.
 
-## Trusted Policy SHA (base branch, never the PR head)
+## Trusted Policy SHA (base branch head, never the PR head)
 
 The pre-agent step "Resolve repository policy contract at the trusted Policy SHA" has
-already resolved the Policy SHA as the authoritative **base-branch head**
-(`github.event.pull_request.base.sha`) and fetched the authoritative contract files
-read-only under `.policy/<POLICY_SHA>/`. `POLICY_SHA` is exported to the environment of
-this run.
+already resolved the Policy SHA from the authoritative **base branch** — the event PR's
+base branch when the run has a pull request, otherwise the default branch — so policy
+comes from the current base-branch head, never from the PR head and never from a stale
+event snapshot. Because that step resolves the branch name to its current head commit,
+a later push to the base branch is picked up by the next run. It fetched the authoritative
+contract files read-only under `.policy/<POLICY_SHA>/`. `POLICY_SHA` is exported to the
+environment of this run.
 
 A PR must not be able to redefine the policy used to evaluate itself: the head branch is
 never used as the policy source, and no PR-head code is checked out or executed.
@@ -152,6 +181,10 @@ automated conclusions.
 
 - Managed by PR metadata triage: `bug`, `enhancement`, `documentation`, `question`,
   `duplicate`, `refactor`, `ci`.
+- Type reconciliation: preserve a correct contributor-applied type, fill a type that is
+  clearly missing, and replace a clearly incorrect managed type (remove the wrong type and
+  add the correct one). Make no change when the type is ambiguous — preserve the affected
+  state rather than churning it.
 - `confirmed` is human/verification-owned and out of scope: this workflow does not own
   it and must never add or remove it.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
@@ -162,7 +195,9 @@ automated conclusions.
   prerequisite/approval/decision-gate semantics for automation.
 
 This workflow is metadata-only and silent: it does not reproduce, validate, review
-code, read source/diff, or comment. `needs-info` means metadata/routing information is
-missing.
+code, read source/diff, or comment. When evidence is insufficient, preserve the affected
+managed metadata and use `noop` if a completion signal is required — there is no
+explanatory output channel. `needs-info` means metadata/routing information is missing;
+it never means implementation proof is missing.
 
 Use only this workflow's safe outputs (`add-labels`, `remove-labels`).

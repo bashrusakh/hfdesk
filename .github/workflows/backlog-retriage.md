@@ -39,8 +39,8 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/backlog-retriage-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@e2de4a989077b7fdf558ef5656040dc2e547e674
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/backlog-retriage-core.md@e2de4a989077b7fdf558ef5656040dc2e547e674
 checkout: false
 max-ai-credits: 10
 max-turns: 20
@@ -52,16 +52,17 @@ tools:
   cli-proxy: false
   github:
     mode: local
-    toolsets: [issues, pull_requests, labels]
+    toolsets: [issues, pull_requests]
+    allowed-repos: "${{ github.repository }}"
+    min-integrity: approved
+    # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
-      - issue_read
-      - list_issues
-      - search_issues
-      - find_duplicate
-      - get_pull_request
-      - get_pull_request_files
-      - list_pull_requests
-      - list_labels
+      - name: issue_read
+        max-calls: 12
+      - name: search_issues
+        max-calls: 3
+      - name: search_pull_requests
+        max-calls: 3
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
@@ -111,10 +112,11 @@ safe-outputs:
   report-failure-as-issue: false
   add-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
-    blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 5
   remove-labels:
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 5
 ---
 
@@ -154,13 +156,17 @@ snapshots. The current Policy SHA outranks stale automated conclusions.
 
 Process only the bounded batch the pre-agent step wrote to
 `.policy/backlog/<POLICY_SHA>/batch.json` (at most 10 items). Do not expand the batch into
-an all-repository sweep. If one item needs disproportionate investigation, leave it
-unchanged and identify it as needing deeper/human review.
+an all-repository sweep. If one item needs disproportionate investigation, preserve the
+affected managed metadata and move on; use `noop` if a completion signal is required.
 
 ## hfdesk managed label boundary
 
 - Managed across the union of hfdesk triage families: `bug`, `enhancement`,
   `documentation`, `question`, `refactor`, `ci`, `needs-info`, `duplicate`.
+- Type reconciliation: preserve a correct contributor-applied type, fill a type that is
+  clearly missing, and replace a clearly incorrect managed type (remove the wrong type and
+  add the correct one). Make no change when the type is ambiguous — preserve the affected
+  state rather than churning it.
 - `confirmed` is human/verification-owned and out of scope: this workflow does not own
   it and must never add or remove it.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
@@ -171,8 +177,10 @@ unchanged and identify it as needing deeper/human review.
   authorizes no prerequisite/approval/decision-gate semantics for automation.
 
 This workflow is metadata-only and silent: it does not reproduce, validate, review
-code, read source/diff, or comment. `needs-info` means metadata/routing information is
-missing.
+code, read source/diff, or comment. When evidence is insufficient, preserve the affected
+managed metadata and use `noop` if a completion signal is required — there is no
+explanatory output channel. `needs-info` means metadata/routing information is missing;
+it never means implementation proof is missing.
 
 Prefer preserving an existing state over speculative churn. Use only this workflow's safe
 outputs (`add-labels`, `remove-labels`).
