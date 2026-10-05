@@ -2,7 +2,7 @@
 # HFDesk container entrypoint.
 #
 # Default behavior: the container starts as root and the entrypoint applies
-# PUID/PGID (default: the build-time image UID/GID, normally 1000) then drops
+# PUID/PGID (default: 1000) then drops
 # privileges with su-exec, so the app process runs non-root unless the caller
 # explicitly sets PUID=0/PGID=0.
 #
@@ -34,8 +34,8 @@
 # trivially true.
 #
 # Environment:
-#   PUID  - UID to run the app as (default: build-time image UID)
-#   PGID  - GID to run the app as (default: build-time image GID)
+#   PUID  - UID to run the app as (default: 1000)
+#   PGID  - GID to run the app as (default: 1000)
 #   UMASK - file creation mask for the app process (default: 022)
 #
 # Debug override:

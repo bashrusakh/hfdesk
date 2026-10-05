@@ -6,9 +6,6 @@
 # Build:
 #   docker build -t hfdesk .
 #
-#   Match your host user so mounted files are owned by you:
-#   docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
-#
 # Run Web Server (single /data volume for cache, state, and models):
 #   docker run --rm -p 8080:8080 \
 #     -v hfdesk-data:/data \
@@ -79,60 +76,9 @@ RUN BUILD_VERSION="${VERSION}" && \
 # =============================================================================
 FROM alpine:3.19
 
-# UID/GID for the image user. Override at build time to match your host user.
-ARG UID=1000
-ARG GID=1000
-
 # Install ca-certificates for HTTPS, tzdata for timezones, and su-exec for the
 # entrypoint privilege drop (Alpine has no su-exec/setpriv --reuid by default).
 RUN apk add --no-cache ca-certificates tzdata su-exec
-
-# Create (or reuse) the non-root image user/group with the build-time UID/GID.
-# Alpine reserves some IDs (for example gid 100 is "users" and uid 65534 is
-# "nobody"), so `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`
-# on a NAS/homelab host can collide with an existing entry. Rather than fail
-# the build, reuse the existing group/account for that ID. This is build-time
-# handling only; runtime privilege dropping uses numeric IDs without remapping
-# any account.
-#
-# UID/GID must be numeric so the image never bakes a name into HFDESK_UID/GID
-# (which the entrypoint then rejects at runtime with exit 64). A non-numeric
-# value is refused here at build time, and addgroup/adduser failures (for
-# example an out-of-range numeric ID) are checked explicitly so the build stops
-# with a clear error instead of a raw BusyBox message.
-RUN set -eu; \
-    case "$GID" in \
-      '' | *[!0-9]*) echo "error: GID must be a numeric id (got '$GID')" >&2; exit 1 ;; \
-    esac; \
-    case "$UID" in \
-      '' | *[!0-9]*) echo "error: UID must be a numeric id (got '$UID')" >&2; exit 1 ;; \
-    esac; \
-    if getent group "$GID" >/dev/null; then \
-      hfdesk_group="$(getent group "$GID" | cut -d: -f1)"; \
-    else \
-      if ! addgroup -g "$GID" hfdesk; then \
-        echo "error: cannot create group with GID $GID (out of range or already in use)" >&2; \
-        exit 1; \
-      fi; \
-      hfdesk_group=hfdesk; \
-    fi; \
-    if [ "$hfdesk_group" = root ]; then \
-      echo "error: GID $GID resolves to the root group; refusing to use it as the image group" >&2; \
-      exit 1; \
-    fi; \
-    if getent passwd "$UID" >/dev/null; then \
-      hfdesk_user="$(getent passwd "$UID" | cut -d: -f1)"; \
-    else \
-      if ! adduser -D -h /data -u "$UID" -G "$hfdesk_group" hfdesk; then \
-        echo "error: cannot create user with UID $UID (out of range or already in use)" >&2; \
-        exit 1; \
-      fi; \
-      hfdesk_user=hfdesk; \
-    fi; \
-    if [ "$hfdesk_user" = root ]; then \
-      echo "error: UID $UID resolves to the root account; refusing to use it as the image user" >&2; \
-      exit 1; \
-    fi
 
 # Copy binary and entrypoint from builder
 COPY --from=builder /hfdesk /usr/local/bin/hfdesk
@@ -142,25 +88,31 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # By default, writable application state lives under one data root. HFDesk
 # derives the HF cache from HF_HOME and its app config from
 # XDG_CONFIG_HOME/HOME, so pinning these lets any UID (including --user / k8s
-# runAsUser) write state without needing the image user or an /etc/passwd entry.
+# runAsUser) write state without needing a named image user or an /etc/passwd
+# entry.
 #
-# HFDESK_UID/HFDESK_GID expose the build-time ARGs so the entrypoint's default
-# PUID/PGID matches a custom `--build-arg UID/GID` image instead of forcing 1000.
+# HFDESK_UID/HFDESK_GID are only the entrypoint's default PUID/PGID identity
+# (1000); they no longer track a build-time ARG. The image creates no user or
+# group, and runtime identity is always configured numerically.
 ENV HOME=/data \
     XDG_CONFIG_HOME=/data/.config \
     HF_HOME=/data/.cache/huggingface \
-    HFDESK_UID=$UID \
-    HFDESK_GID=$GID
+    HFDESK_UID=1000 \
+    HFDESK_GID=1000
 
-# Create the single writable data root. `adduser -h /data` already owns it as
-# the image user, so it is the 1777 (sticky, world-writable) mode - not the
-# ownership - that lets an arbitrary `--user <uid>` create its own state.
+# Create the single writable data root. The image creates no user, so /data is
+# root-owned at build time; its 1777 (sticky, world-writable) mode is what lets
+# an arbitrary `--user <uid>` create its own state. On the root-drop path the
+# entrypoint first chowns /data to PUID:PGID (non-recursive, symlink-safe), so
+# the app UID owns it there; the literal 1777 mode covers the --user path, which
+# does not chown.
 #
 # Do NOT pre-create the app subdirs: a fresh named volume copies this
-# directory's contents, and subdirs owned by the image user at mode 0755 would
-# not be writable by an arbitrary UID. The entrypoint only owns the root itself
-# (never descending into the attacker-writable tree), and the app creates its
-# subdirs as the target UID. Model/cache trees are left to the app to create.
+# directory's contents, and subdirs created here at build time would be
+# root-owned at mode 0755 (no image user exists) and not writable by an
+# arbitrary UID. The entrypoint only owns the root itself (never descending
+# into the attacker-writable tree), and the app creates its subdirs as the
+# target UID. Model/cache trees are left to the app to create.
 RUN mkdir -p /data && chmod 1777 /data
 
 # Note: no USER directive. The entrypoint must start as root to apply
