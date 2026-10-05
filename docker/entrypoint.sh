@@ -128,4 +128,11 @@ chown -h "$PUID:$PGID" "$DATA_ROOT"
 
 # Drop privileges and exec the app as the requested UID/GID. The umask set
 # above is inherited through su-exec.
-exec su-exec "$PUID:$PGID" "$APP_BIN" "$@"
+#
+# HOME is re-pinned after su-exec on purpose: su-exec overwrites HOME from the
+# target UID's passwd entry (or "/" when that UID has no entry), which would
+# contradict the Dockerfile's HOME=/data for the documented NSS-less NAS IDs.
+# Setting it here, in the app process itself, keeps state under the fixed data
+# root without an NSS lookup and matches the non-root direct-exec path above,
+# which already inherits the container's HOME=/data.
+exec su-exec "$PUID:$PGID" env HOME="$DATA_ROOT" "$APP_BIN" "$@"

@@ -78,6 +78,23 @@ for mode in default arbitrary uid-only gid-only uid-collision gid-collision coll
     stop_app
     echo "PASS root startup $mode ($uid:$gid): HFDesk PID 1, unchanged accounts, graceful SIGTERM"
 done
+
+# The root privilege drop must pin HOME=/data even when the target UID has no
+# NSS entry (documented NAS IDs). su-exec sets HOME from the target passwd entry
+# and falls back to "/" when there is none, so the app must re-pin it. Read HOME
+# from the real app process (/proc/1/environ), not a docker-exec shell, which
+# would report its own environment.
+for probe in 1026 568; do
+    start_app -e PUID="$probe" -e PGID=100
+    # exec as the app UID: an exec-root shell without CAP_SYS_PTRACE cannot read
+    # /proc/1/environ once PID 1 has dropped to a different UID.
+    docker exec --user "$probe:100" "$CONTAINER" /bin/sh -ec '
+        tr "\0" "\n" < /proc/1/environ | grep -qx "HOME=/data"
+    '
+    assert_identity "$probe" 100
+    stop_app
+    echo "PASS root startup NSS-less PUID=$probe: PID 1 HOME=/data"
+done
 for ids in 568:568 65534:100; do
     start_app --user "$ids" -e PUID=4321 -e PGID=4322
     assert_identity "${ids%:*}" "${ids#*:}"

@@ -215,8 +215,11 @@ docker run --rm -p 8080:8080 \
 The container starts as root to prepare only the fixed `/data` root (a
 nonrecursive, symlink-safe ownership change), then drops privileges numerically.
 `/etc/passwd` and `/etc/group` remain byte-identical to the image even when the
-requested IDs collide with existing accounts; no runtime username or home-directory
-lookup is needed. The app process runs non-root unless you explicitly set
+requested IDs collide with existing accounts. The privilege drop re-pins
+`HOME=/data` in the app process itself, so `HOME` stays `/data` even when
+`PUID` has no `/etc/passwd` entry (the documented NAS IDs), instead of the `/`
+an NSS fallback would produce; no runtime username or home-directory lookup is
+needed. The app process runs non-root unless you explicitly set
 `PUID=0` (with `PGID=0` if the root group is also wanted). This root preparation
 mode needs permission to change `/data` ownership and set the process UID/GID;
 it is not the all-capabilities-dropped mode below. The image has no `USER`
