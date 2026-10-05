@@ -267,3 +267,5 @@ Known message types:
 - `job_update`
 - `event`
 - `status`
+
+> Tip: the API examples below assume the server runs on the default port.
