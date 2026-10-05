@@ -48,7 +48,8 @@ const (
 // It follows the official HuggingFace Hub cache structure.
 type HFCache struct {
 	// Root is the cache root directory (e.g., ~/.cache/huggingface)
-	Root string
+	Root   string
+	hubDir string // Resolved once; never reinterpret ambient ENV in accessors.
 
 	// StaleTimeout is the duration after which an .incomplete file
 	// with no writes is considered stale and can be taken over.
@@ -77,22 +78,37 @@ func NewHFCache(root string, staleTimeout time.Duration) *HFCache {
 	if root == "" {
 		root = DefaultCacheDir()
 	}
+	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"), staleTimeout)
+}
+
+// NewHFCacheResolved constructs a cache from an already selected root/Hub
+// association without consulting ENV. An empty hubDir means root/hub.
+// Callers freezing destinations must supply the resolved nonempty root.
+func NewHFCacheResolved(root, hubDir string, staleTimeout time.Duration) *HFCache {
+	// Cache instances carry physical paths, not paths that can silently change
+	// meaning if the caller later changes its working directory.
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	if hubDir == "" {
+		hubDir = filepath.Join(root, "hub")
+	}
+	if absolute, err := filepath.Abs(hubDir); err == nil {
+		hubDir = absolute
+	}
 	if staleTimeout == 0 {
 		staleTimeout = DefaultStaleTimeout
 	}
 	return &HFCache{
 		Root:         root,
+		hubDir:       hubDir,
 		StaleTimeout: staleTimeout,
 	}
 }
 
 // HubDir returns the path to the hub/ directory.
 func (c *HFCache) HubDir() string {
-	// Check HF_HUB_CACHE env for override
-	if hubCache := os.Getenv("HF_HUB_CACHE"); hubCache != "" {
-		return hubCache
-	}
-	return filepath.Join(c.Root, "hub")
+	return c.hubDir
 }
 
 // ModelsDir returns the path to the friendly models/ directory.

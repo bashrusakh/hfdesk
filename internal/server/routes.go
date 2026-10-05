@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // errInvalidRouteKey is returned when a model request supplies a
@@ -64,10 +62,7 @@ func resolveDownloadDestination(cfg Config, req DownloadRequest) (routeKey, loca
 	}
 	outputDir = localDir
 	if outputDir == "" {
-		outputDir = cfg.CacheDir
-		if outputDir == "" {
-			outputDir = hfdownloader.DefaultCacheDir()
-		}
+		outputDir = cfg.cacheRoot()
 	}
 	return routeKey, localDir, outputDir, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // RebuildScriptVersion is the current version of the embedded shell script.
@@ -28,6 +29,7 @@ const RebuildScript = `#!/bin/bash
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HUB_DIR="$SCRIPT_DIR/hub"
 CLEAN=false
 VERBOSE=false
 
@@ -92,6 +94,10 @@ process_repo() {
     if [ "$owner" = "$rest" ] || [ -z "$name" ]; then
         return 0  # Invalid format
     fi
+    # Never allow repository names to become path selectors.
+    if [[ ! "$owner" =~ ^[a-zA-Z0-9_.-]+$ || ! "$name" =~ ^[a-zA-Z0-9_.-]+$ || "$owner" == *..* || "$name" == *..* ]]; then
+        return 0
+    fi
 
     REPOS_SCANNED=$((REPOS_SCANNED + 1))
     log "Processing: $repo_type/$owner/$name"
@@ -119,6 +125,9 @@ process_repo() {
     fi
 
     local snapshot_dir="$repo_dir/snapshots/$commit"
+    if [[ "$commit" == *"/"* || "$commit" == *"\\"* || "$commit" == "." || "$commit" == ".." ]]; then
+        return 0
+    fi
     if [ ! -d "$snapshot_dir" ]; then
         log "  Snapshot directory missing: $commit"
         return 0
@@ -126,6 +135,10 @@ process_repo() {
 
     # Create friendly directory
     local friendly_dir="$SCRIPT_DIR/$repo_type/$owner/$name"
+    if [ -L "$SCRIPT_DIR/$repo_type" ] || [ -L "$SCRIPT_DIR/$repo_type/$owner" ] || [ -L "$friendly_dir" ]; then
+        echo "Refusing symlinked friendly directory: $friendly_dir" >&2
+        return 1
+    fi
     mkdir -p "$friendly_dir"
 
     # Create symlinks for all files in snapshot
@@ -139,16 +152,12 @@ process_repo() {
 
         # Calculate relative path from friendly location to snapshot
         local target_path="$file"
-        local rel_target="$(python3 -c "import os.path; print(os.path.relpath('$target_path', '$friendly_parent'))" 2>/dev/null || realpath --relative-to="$friendly_parent" "$target_path" 2>/dev/null)"
+        local rel_target="$(python3 -c 'import os.path, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$target_path" "$friendly_parent" 2>/dev/null || realpath --relative-to="$friendly_parent" "$target_path" 2>/dev/null)"
 
         if [ -z "$rel_target" ]; then
-            # Fallback: construct relative path manually
-            local depth=$(echo "$friendly_path" | tr -cd '/' | wc -c)
-            local prefix=""
-            for ((i=0; i<depth-2; i++)); do
-                prefix="../$prefix"
-            done
-            rel_target="${prefix}hub/$repo_name/snapshots/$commit/$rel_path"
+            # No relative-path utility: an exact absolute target remains usable
+            # for independent roots rather than guessing a hub/ layout.
+            rel_target="$target_path"
         fi
 
         # Check if symlink already exists and is correct
@@ -194,14 +203,14 @@ clean_orphans() {
 echo "Rebuilding friendly view from: $SCRIPT_DIR"
 
 # Check hub directory exists
-if [ ! -d "$SCRIPT_DIR/hub" ]; then
+if [ ! -d "$HUB_DIR" ]; then
     echo "No hub directory found. Nothing to rebuild."
     exit 0
 fi
 
 # Process all repos in hub/
-for repo_dir in "$SCRIPT_DIR/hub"/*; do
-    if [ -d "$repo_dir" ]; then
+for repo_dir in "$HUB_DIR"/*; do
+    if [ -d "$repo_dir" ] && [ ! -L "$repo_dir" ]; then
         process_repo "$repo_dir"
     fi
 done
@@ -229,18 +238,29 @@ fi
 func (c *HFCache) WriteRebuildScript() (string, error) {
 	scriptPath := filepath.Join(c.Root, "rebuild.sh")
 
-	content := fmt.Sprintf(RebuildScript, RebuildScriptVersion)
+	// Replace only the version marker, not shell percent expansions.
+	content := strings.Replace(RebuildScript, "v%s", "v"+RebuildScriptVersion, 1)
+	if filepath.Clean(c.HubDir()) != filepath.Join(filepath.Clean(c.Root), "hub") {
+		hub, err := filepath.Abs(c.HubDir())
+		if err != nil {
+			return "", err
+		}
+		quoted := "'" + strings.ReplaceAll(hub, "'", "'\"'\"'") + "'"
+		content = strings.Replace(content, `HUB_DIR="$SCRIPT_DIR/hub"`, "HUB_DIR="+quoted, 1)
+	}
 
 	// Check if script already exists and is current version
 	if existing, err := os.ReadFile(scriptPath); err == nil {
-		expectedHeader := fmt.Sprintf("# HFDownloader Rebuild Script v%s", RebuildScriptVersion)
-		if len(existing) > 100 && string(existing[:len(expectedHeader)+50]) == content[:len(expectedHeader)+50] {
+		if string(existing) == content {
 			// Script exists and is current version
 			return scriptPath, nil
 		}
 	}
 
 	// Write the script
+	if err := os.MkdirAll(c.Root, 0o755); err != nil {
+		return "", err
+	}
 	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
 		return "", fmt.Errorf("write rebuild script: %w", err)
 	}

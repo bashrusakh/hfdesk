@@ -705,8 +705,15 @@
                     </select>
                   </div>
                 </div>
+                <div class="settings-row settings-row-top" id="hubDirGroup">
+                  <label for="effectiveHubDirInput" title="The actual HuggingFace cache folder used for downloads. Read-only; set by the server environment.">Actual HF Hub cache</label>
+                  <div class="settings-control">
+                    <input type="text" id="effectiveHubDirInput" class="path-input hub-dir-input" readonly spellcheck="false" placeholder="Unavailable" aria-readonly="true" aria-describedby="hubDirHint">
+                    <p class="form-hint" id="hubDirHint"></p>
+                  </div>
+                </div>
                 <div class="settings-row" id="cacheDirGroup">
-                  <label for="cacheDirInput" title="Leave empty to use the standard HuggingFace cache.">HF cache directory</label>
+                  <label for="cacheDirInput" title="App / friendly cache root. Used for the friendly model views; without HF_HUB_CACHE the Hub cache is this root plus 'hub'.">Friendly cache folder</label>
                   <div class="settings-control">
                     <input type="text" id="cacheDirInput" class="path-input" placeholder="Default HuggingFace cache" spellcheck="false">
                   </div>

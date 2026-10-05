@@ -104,6 +104,33 @@ The Hugging Face token is resolved as the `--token` flag, then the `HF_TOKEN` en
 HF_TOKEN=hf_xxx hfdesk
 ```
 
+### Hub storage and friendly folders
+
+`--cache-dir` / saved `cache-dir` selects the app root for friendly `models/`
+and `datasets/` folders. Without that preference, `HF_HOME` or the existing
+`~/.cache/huggingface` default supplies the root. Hub repositories normally live
+in its `hub/` child, but nonempty `HF_HUB_CACHE` always selects the **exact Hub
+directory**, even with an explicit app root:
+
+```bash
+HF_HUB_CACHE=/mnt/shared-hf-store hfdesk --cache-dir /mnt/friendly-views
+```
+
+Those roots need not be adjacent. Changing the app root does not move Hub files
+or unset ENV. Server storage ENV/defaults are captured at startup; current cache,
+mirror, rebuild, delete, and disk checks use that association. Existing jobs
+freeze both destinations through pause/retry/requeue and restart. Legacy jobs
+without a recorded Hub path use a warned, one-time startup fallback: their old
+physical Hub cannot be recovered from the state file. No files are moved.
+
+The Settings API separately exposes raw preference, effective Hub path, and its
+source; see [API storage fields](docs/API.md#settings). Library `NewHFCache`
+captures ENV per construction, while `Settings.HubDir` / `NewHFCacheResolved`
+allow callers to reuse an already resolved association without reinterpreting
+Hub ENV. Generated rebuild scripts preserve that association; ordinary app-root
+scripts remain portable with the complete root, while external-H scripts retain
+the selected absolute Hub location.
+
 Proxy example:
 
 ```json

@@ -343,10 +343,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cacheDir := cfg.cacheRoot()
 
 	storageMode := "cache"
 	if cfg.LocalDir != "" {
@@ -356,6 +353,9 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	resp := SettingsResponse{
 		Token:              tokenStatus,
 		CacheDir:           cacheDir,
+		ConfiguredCacheDir: cfg.CacheDir,
+		EffectiveHubDir:    cfg.cache().HubDir(),
+		HubDirSource:       cfg.hubDirSource(),
 		Concurrency:        cfg.Concurrency,
 		MaxActive:          cfg.MaxActive,
 		MultipartThreshold: cfg.MultipartThreshold,
@@ -1200,16 +1200,13 @@ func findLocalCachedRepo(cacheDir, localDir string, localScanDirs []string, down
 // handleCacheList lists all cached repositories with rich metadata.
 func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
+	cacheDir := cfg.cacheRoot()
 
 	// Get query params
 	repoType := r.URL.Query().Get("type") // "model" or "dataset"
 	search := strings.ToLower(r.URL.Query().Get("search"))
 
-	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	cache := cfg.cache()
 	repoDirs, err := cache.ListRepos()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to list cache", err.Error())
@@ -1282,7 +1279,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		var downloadStatus string
 		friendlyPath := rd.FriendlyPath()
 		manifestPath := filepath.Join(friendlyPath, hfdownloader.ManifestFilename)
-		if m, err := hfdownloader.ReadManifest(manifestPath); err == nil {
+		if m, err := hfdownloader.ReadManifest(manifestPath); err == nil && manifestBelongsToRepo(cache, rd, m) {
 			// Parse command for filter flags
 			isFiltered, filters := parseCommandFilters(m.Command)
 
@@ -1375,9 +1372,11 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 	stats.TotalSizeHuman = humanSizeBytes(stats.TotalSize)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"repos":    repos,
-		"stats":    stats,
-		"cacheDir": cacheDir,
+		"repos":           repos,
+		"stats":           stats,
+		"cacheDir":        cacheDir,
+		"effectiveHubDir": cache.HubDir(),
+		"hubDirSource":    cfg.hubDirSource(),
 	})
 }
 
@@ -1394,12 +1393,8 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
-	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	cacheDir := cfg.cacheRoot()
+	cache := cfg.cache()
 
 	// Try as model first
 	repoDir, err := cache.Repo(repo, hfdownloader.RepoTypeModel)
@@ -1493,7 +1488,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	var downloadStatus string
 	friendlyPath := repoDir.FriendlyPath()
 	manifestPath := filepath.Join(friendlyPath, hfdownloader.ManifestFilename)
-	if m, err := hfdownloader.ReadManifest(manifestPath); err == nil {
+	if m, err := hfdownloader.ReadManifest(manifestPath); err == nil && manifestBelongsToRepo(cache, repoDir, m) {
 		// Parse command for filter flags
 		isFiltered, filters := parseCommandFilters(m.Command)
 
@@ -1572,10 +1567,6 @@ type RebuildResponse struct {
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
 
 	// Parse options from request body
 	var req struct {
@@ -1583,7 +1574,11 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = readJSON(r, &req) // Ignore errors, use defaults
 
-	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
+	cache := cfg.cache()
+	if _, err := cache.WriteRebuildScript(); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to write rebuild script", err.Error())
+		return
+	}
 
 	opts := hfdownloader.SyncOptions{
 		Clean:   req.Clean,
@@ -1665,12 +1660,8 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.snapshotConfig()
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
-	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
+	cacheDir := cfg.cacheRoot()
+	cache := cfg.cache()
 
 	// Find the repo directory
 	repoDir, err := cache.Repo(repo, repoType)
@@ -1690,6 +1681,11 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Ensure cache dir ends with separator to prevent /cache/huggingface-evil matching /cache/huggingface
 	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
+	absHubDir, err := filepath.Abs(cache.HubDir())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to resolve Hub path", err.Error())
+		return
+	}
 
 	absHubPath, err := filepath.Abs(hubPath)
 	if err != nil {
@@ -1715,19 +1711,20 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Security Layer 8: Verify path is within cache (using cleaned absolute path)
-	if !strings.HasPrefix(absHubPath+string(filepath.Separator), absCacheDirWithSep) {
+	if !hfdownloader.PathInside(absHubDir, absHubPath) || absHubPath == absHubDir {
 		writeError(w, http.StatusBadRequest, "Invalid path", "Path outside cache directory")
 		return
 	}
 
 	// Security Layer 9: Verify path follows expected HF cache structure
-	// Must be: {cacheDir}/hub/{models|datasets}--{owner}--{name}
+	// Must be exactly H/{models|datasets}--{owner}--{name}; H's parent
+	// is not trusted, even when it happens to contain the friendly root.
 	expectedPrefix := "models--"
 	if repoType == hfdownloader.RepoTypeDataset {
 		expectedPrefix = "datasets--"
 	}
-	hubSubpath, err := filepath.Rel(absCacheDir, absHubPath)
-	if err != nil || !strings.HasPrefix(hubSubpath, filepath.Join("hub", expectedPrefix)) {
+	hubSubpath, err := filepath.Rel(absHubDir, absHubPath)
+	if err != nil || hubSubpath != expectedPrefix+parts[0]+"--"+parts[1] {
 		writeError(w, http.StatusBadRequest, "Invalid path", "Path does not match expected cache structure")
 		return
 	}
@@ -1735,9 +1732,15 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// Security Layer 10: Resolve symlinks to verify final destination is also within cache
 	// This catches symlinks inside the directory structure
 	realHubPath, err := filepath.EvalSymlinks(absHubPath)
-	if err == nil && realHubPath != absHubPath {
-		// Path contained symlinks - verify resolved path is still within cache
-		if !strings.HasPrefix(realHubPath+string(filepath.Separator), absCacheDirWithSep) {
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Cannot resolve repository path safely")
+		return
+	}
+	if realHubPath != absHubPath {
+		// Keep the existing escape guard: a Hub/ancestor link must not
+		// redefine the trusted deletion root. Compare to selected H, not
+		// its parent and not a freshly trusted symlink target.
+		if !hfdownloader.PathInside(absHubDir, realHubPath) || realHubPath == absHubDir {
 			writeError(w, http.StatusBadRequest, "Invalid path", "Resolved path outside cache directory")
 			return
 		}
@@ -1752,8 +1755,10 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// Delete the friendly view directory (symlinks) with same security checks
 	if friendlyPath != "" {
 		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
-			// Log but don't fail - hub directory was successfully deleted
-			// The friendly path might not exist or might be invalid
+			if !os.IsNotExist(err) {
+				writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Hub repository deleted; friendly view removal failed", "errors": []string{err.Error()}})
+				return
+			}
 		}
 	}
 

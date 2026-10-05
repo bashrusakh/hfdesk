@@ -349,6 +349,13 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if useHFCache && !cfg.NoManifest {
 		manifestBuilder = NewManifestBuilder(job, cfg.Command)
 		manifestBuilder.SetCommit(plan.Commit)
+		// RepoPath describes the selected physical repository, relative to the
+		// friendly root when possible (absolute on different Windows volumes).
+		rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
+		if err != nil {
+			rel = repoDir.Path()
+		}
+		manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
 	}
 
 LOOP:
@@ -705,7 +712,11 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 
 func cleanupRoot(settings Settings, useHFCache bool) string {
 	if useHFCache {
-		return NewHFCache(settings.CacheDir, 0).HubDir()
+		cache, err := settings.BuildHFCache()
+		if err != nil {
+			return "" // Invalid settings must never widen cleanup's root.
+		}
+		return cache.HubDir()
 	}
 	return settings.OutputDir
 }
