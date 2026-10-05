@@ -200,7 +200,7 @@ docker run --rm -p 8080:8080 \
 
 ### Run as a specific UID/GID (NAS/homelab)
 
-The default image user is UID/GID `1000`. To run as another user and keep
+The default runtime UID/GID is `1000`. To run as another user and keep
 files owned by that user, set `PUID`/`PGID`:
 
 ```bash
@@ -283,16 +283,13 @@ repairs permissions. Keep custom HOME/XDG/HF path overrides on writable mounts.
 
 ### Build your own
 
-Match the image user to your host user at build time:
-
 ```bash
-docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
+docker build -t hfdesk .
 ```
 
-If the requested UID/GID is already used by a reserved Alpine account or group
-(for example gid `100` is `users`), the build reuses that existing entry instead
-of failing. These build-time IDs become the default numeric runtime identity;
-`PUID`/`PGID` can select different IDs without rewriting the image accounts.
+The image creates no user or group and accepts no `UID`/`GID` build arguments.
+Identity is configured numerically at runtime: `PUID`/`PGID` on the root-drop
+path, or `--user <uid>:<gid>` on the non-root path.
 
 ### Migrating from the old cache path
 

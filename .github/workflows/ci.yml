@@ -57,11 +57,6 @@ jobs:
       - name: Smoke-test entrypoint
         run: sh docker/smoke-test.sh hfdesk:ci
 
-      - name: Build and smoke-test reserved build-time UID/GID
-        run: |
-          docker build --build-arg UID=65534 --build-arg GID=100 -t hfdesk:ci-reserved .
-          sh docker/smoke-test.sh hfdesk:ci-reserved
-
   # Exercise the native state-file replacement path added here. The full suite
   # has separate pre-existing Windows-compatibility gaps.
   go-windows:
