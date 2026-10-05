@@ -6,15 +6,38 @@
 # Build:
 #   docker build -t hfdesk .
 #
-# Run Web Server:
+#   Match your host user so mounted files are owned by you:
+#   docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hfdesk .
+#
+# Run Web Server (single /data volume for cache, state, and models):
 #   docker run --rm -p 8080:8080 \
-#     -v ~/.cache/huggingface:/home/hfdesk/.cache/huggingface \
+#     -v hfdesk-data:/data \
 #     hfdesk --port 8080
 #
-# With HuggingFace token (for private/gated models):
-#   docker run --rm -e HF_TOKEN=hf_xxx -p 8080:8080 \
-#     -v ~/.cache/huggingface:/home/hfdesk/.cache/huggingface \
+# Run as a specific UID/GID (NAS/homelab):
+#   docker run --rm -p 8080:8080 \
+#     -e PUID=1026 -e PGID=100 -e UMASK=002 \
+#     -v /mnt/user/appdata/hfdesk:/data \
 #     hfdesk
+#
+# Run as an arbitrary UID without using the image user (non-root/k8s):
+#   docker run --rm --user 568:568 -p 8080:8080 \
+#     -v hfdesk-data:/data hfdesk
+#
+# With a HuggingFace token (for private/gated models). The token is resolved as
+# the --token flag, then the HF_TOKEN environment variable, then the config file
+# token, so any of these works:
+#   docker run --rm -p 8080:8080 \
+#     -v hfdesk-data:/data hfdesk --token hf_xxx
+#   docker run --rm -p 8080:8080 \
+#     -e HF_TOKEN=hf_xxx -v hfdesk-data:/data hfdesk
+# You can also set it in the HFDesk settings UI/API.
+#
+# The container starts as root only so the entrypoint can honor PUID/PGID and
+# then drop privileges; the app process always runs as the requested UID/GID.
+# When started with --user or a k8s runAsUser, the entrypoint does not touch
+# ownership and just execs the app. Both paths leave /etc/passwd and /etc/group
+# unchanged and use the configured numeric UID/GID, not an account name.
 #
 # Credits: Original Docker support suggested by cdeving (#50)
 # =============================================================================
@@ -56,32 +79,96 @@ RUN BUILD_VERSION="${VERSION}" && \
 # =============================================================================
 FROM alpine:3.19
 
-# Install ca-certificates for HTTPS
-RUN apk add --no-cache ca-certificates tzdata
+# UID/GID for the image user. Override at build time to match your host user.
+ARG UID=1000
+ARG GID=1000
 
-# Create non-root user
-RUN adduser -D -u 1000 hfdesk
+# Install ca-certificates for HTTPS, tzdata for timezones, and su-exec for the
+# entrypoint privilege drop (Alpine has no su-exec/setpriv --reuid by default).
+RUN apk add --no-cache ca-certificates tzdata su-exec
 
-# Copy binary from builder
+# Create (or reuse) the non-root image user/group with the build-time UID/GID.
+# Alpine reserves some IDs (for example gid 100 is "users" and uid 65534 is
+# "nobody"), so `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`
+# on a NAS/homelab host can collide with an existing entry. Rather than fail
+# the build, reuse the existing group/account for that ID. This is build-time
+# handling only; runtime privilege dropping uses numeric IDs without remapping
+# any account.
+#
+# UID/GID must be numeric so the image never bakes a name into HFDESK_UID/GID
+# (which the entrypoint then rejects at runtime with exit 64). A non-numeric
+# value is refused here at build time, and addgroup/adduser failures (for
+# example an out-of-range numeric ID) are checked explicitly so the build stops
+# with a clear error instead of a raw BusyBox message.
+RUN set -eu; \
+    case "$GID" in \
+      '' | *[!0-9]*) echo "error: GID must be a numeric id (got '$GID')" >&2; exit 1 ;; \
+    esac; \
+    case "$UID" in \
+      '' | *[!0-9]*) echo "error: UID must be a numeric id (got '$UID')" >&2; exit 1 ;; \
+    esac; \
+    if getent group "$GID" >/dev/null; then \
+      hfdesk_group="$(getent group "$GID" | cut -d: -f1)"; \
+    else \
+      if ! addgroup -g "$GID" hfdesk; then \
+        echo "error: cannot create group with GID $GID (out of range or already in use)" >&2; \
+        exit 1; \
+      fi; \
+      hfdesk_group=hfdesk; \
+    fi; \
+    if [ "$hfdesk_group" = root ]; then \
+      echo "error: GID $GID resolves to the root group; refusing to use it as the image group" >&2; \
+      exit 1; \
+    fi; \
+    if getent passwd "$UID" >/dev/null; then \
+      hfdesk_user="$(getent passwd "$UID" | cut -d: -f1)"; \
+    else \
+      if ! adduser -D -h /data -u "$UID" -G "$hfdesk_group" hfdesk; then \
+        echo "error: cannot create user with UID $UID (out of range or already in use)" >&2; \
+        exit 1; \
+      fi; \
+      hfdesk_user=hfdesk; \
+    fi; \
+    if [ "$hfdesk_user" = root ]; then \
+      echo "error: UID $UID resolves to the root account; refusing to use it as the image user" >&2; \
+      exit 1; \
+    fi
+
+# Copy binary and entrypoint from builder
 COPY --from=builder /hfdesk /usr/local/bin/hfdesk
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Create HuggingFace cache directory (v3 default) and legacy data directory
-RUN mkdir -p /home/hfdesk/.cache/huggingface/hub \
-             /home/hfdesk/.cache/huggingface/models \
-             /home/hfdesk/.cache/huggingface/datasets \
-             /data/Models /data/Datasets && \
-    chown -R hfdesk:hfdesk /home/hfdesk /data
+# By default, writable application state lives under one data root. HFDesk
+# derives the HF cache from HF_HOME and its app config from
+# XDG_CONFIG_HOME/HOME, so pinning these lets any UID (including --user / k8s
+# runAsUser) write state without needing the image user or an /etc/passwd entry.
+#
+# HFDESK_UID/HFDESK_GID expose the build-time ARGs so the entrypoint's default
+# PUID/PGID matches a custom `--build-arg UID/GID` image instead of forcing 1000.
+ENV HOME=/data \
+    XDG_CONFIG_HOME=/data/.config \
+    HF_HOME=/data/.cache/huggingface \
+    HFDESK_UID=$UID \
+    HFDESK_GID=$GID
 
-# Switch to non-root user
-USER hfdesk
+# Create the single writable data root. `adduser -h /data` already owns it as
+# the image user, so it is the 1777 (sticky, world-writable) mode - not the
+# ownership - that lets an arbitrary `--user <uid>` create its own state.
+#
+# Do NOT pre-create the app subdirs: a fresh named volume copies this
+# directory's contents, and subdirs owned by the image user at mode 0755 would
+# not be writable by an arbitrary UID. The entrypoint only owns the root itself
+# (never descending into the attacker-writable tree), and the app creates its
+# subdirs as the target UID. Model/cache trees are left to the app to create.
+RUN mkdir -p /data && chmod 1777 /data
 
-# Set HF_HOME for the container
-ENV HF_HOME=/home/hfdesk/.cache/huggingface
+# Note: no USER directive. The entrypoint must start as root to apply
+# PUID/PGID, then drops to the requested UID/GID. Starting with --user skips
+# the privilege drop entirely.
+WORKDIR /data
 
-WORKDIR /home/hfdesk
-
-# Default to showing help
-ENTRYPOINT ["/usr/local/bin/hfdesk"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD []
 
 # Expose web server port

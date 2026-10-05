@@ -27,6 +27,9 @@ cmd/hfdesk/versioninfo.json
 /Storage/
 /Datasets/
 
+# Docker compose example's local data dir
+/hfdesk-data/
+
 # Environment and IDE
 .graymatter/
 .env
