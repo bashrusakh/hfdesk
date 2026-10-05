@@ -2,23 +2,26 @@
 
 Canonical foundation: merged PR #95 on `main` (HF_HUB_CACHE wins over an explicit cacheDir). Issue #76 remains closed. PR #70 is superseded evidence only; its implementation and unpublished layout candidates are not a baseline.
 
-Current phase: **1, F3-F6 corrections implemented locally; independent/native
-evidence pending**. Source baseline HEAD is
-`9498fc344a308f26dd02b5c9bbcebb2380ccdf93` on `feature/storage-root-ownership`;
-the dirty worktree contains the final F4-F6 correction. Base and merge base are
-`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The authorized correction and CI
-follow-up are in the dirty worktree and are not yet committed.
+Current phase: **1; corrections remain incomplete pending independent/native
+evidence**. Historical source snapshot `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`
+and its dirty-worktree corrections are evidence only, not the current checkout.
+The current clean candidate at the start of this corrective stage was
+`8ee926f629a94f21b6e1127c7a9daaba846d8ec3` on `feature/storage-root-ownership`,
+based on `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` (also the merge base). It
+received a full review verdict of pass with notes and a fresh tester checkpoint
+covering 27 production HTTP scenarios; the portable model-fixture correspondence
+gap described in the implementation record remains under correction. Those
+earlier results do not cover the corrected tests/docs state or establish native
+mount behavior. The current focused test and evidence-record correction is
+uncommitted; its exact candidate and local test results must be recorded after
+validation. Independent review/test of that resulting candidate and native CI
+remain pending.
 
-The workflow owner reports 40 independent production scenarios passing the
-Linux C1-C14 boundary, including the safe C10 secondary permission failure.
-Preserve those corrections. The earlier full review required changes because F3
-showed ordinary bind-mount aliases invalidate resolved-name ancestor searches as
-proof of physical noncontainment. The corrected bounded effect-graph proof also
-requires explicit EOF after short successful reads, preserves missing-anchor
-identity separately from an existing protected root, and makes the native fixture
-enter a kernel-created private mount namespace before Go runtime startup. Go
-1.26.7 local evidence is implementation-local only; Go 1.24 native-mount CI,
-independent verification/review, Windows and macOS evidence remain pending.
+Earlier independent Linux production evidence covered 27 HTTP scenarios on
+`8ee926f`; separate earlier parent-reported C1-C14/40-scenario evidence applies
+to a prior candidate only. Neither substitutes for current portable model checks
+or native mount execution. Go 1.26.7 local evidence is implementation-local only;
+Go 1.24 native-mount CI and native Windows/macOS evidence remain pending.
 
 This plan covers the authorized Issue #63 replacement in four bounded phases:
 

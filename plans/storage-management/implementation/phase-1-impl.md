@@ -1,13 +1,19 @@
 # Phase 1 implementation record
 
-Status: **F3-F6 corrections implemented locally; independent/native evidence pending**.
+Status: **source corrections exist; acceptance evidence remains incomplete**.
 Earlier clean candidate `7dc62163e9ac5dffc5b126fcd18ce8ec7c212fee` received
 changes-required review; source baseline HEAD is
 `9498fc344a308f26dd02b5c9bbcebb2380ccdf93` and the dirty worktree carries
 F4-F6. Base and merge base are `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`.
-The parent-reported 40 independent
-Linux C1-C14 scenarios, including C10, were on the earlier candidate and do not
-cover bind namespaces. No native mount reproduction was possible on this host.
+The parent-reported 40 independent Linux C1-C14 scenarios, including C10, were
+on an earlier candidate and do not cover bind namespaces. The later clean
+candidate `8ee926f629a94f21b6e1127c7a9daaba846d8ec3` received full review
+**pass with notes** and fresh tester coverage of 27 production HTTP scenarios;
+these results are distinct from the older 40-scenario report. The tester noted
+a portable model-harness correspondence gap: ordinary modeled empty directories
+returned empty success before EOF, and positive model assertions could pass on
+an unrelated early refusal. No native mount reproduction was possible on this
+host.
 
 Historical source correction/integration:
 The correction is committed as `957498e59c3580b38d1c02f1f6d7c052d5de1070` on
@@ -252,3 +258,35 @@ native tests skip because this host denies private mount namespaces; required
 mode correctly fails on that capability denial and is not a mount pass.
 Independent tester/review, actual Go 1.24 private-namespace CI, native Windows
 and macOS evidence remain pending. Phase 1 is not complete.
+
+## Focused test/doc corrective stage — candidate 8ee926f
+
+The fixture correction changes ordinary empty modeled directories to return EOF
+on the first read, matching Go's `File.ReadDir(n)` contract. The explicit
+empty-success/no-EOF batch remains a malformed-reader control and must still
+refuse for zero progress. Protected-effect model tests now first require a
+complete observation reaching the expected protected path(s), then require the
+specific protected-intersection refusal rather than accepting any error. This
+strengthens the evidence direction from production facts (complete reached-path
+graph plus object match) to protected refusal; passing model assertions alone do
+not prove real bind-mount behavior. Existing short-success-then-later-protected,
+repeated namespace-view, missing-anchor and re-exposed-authorizing-root cases are
+retained. A completed disjoint graph is also explicitly allowed. No production,
+CI or native-fixture code is changed.
+
+At the start of this stage HEAD was clean `8ee926f629a94f21b6e1127c7a9daaba846d8ec3`
+on `feature/storage-root-ownership`, base/merge base
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The full review passed with notes;
+the independent tester's 27 production HTTP scenarios passed, with the model
+fixture gap above. On this uncommitted worktree based on `8ee926f`, Linux Go
+1.26.7 passed `go test ./pkg/hfdownloader -run
+'TestManagedRootEffectProof' -count=1`, `go test ./pkg/hfdownloader -count=1`, and
+`go test ./internal/server -count=1` with isolated HOME/XDG/APPDATA/LOCALAPPDATA/
+HF/TMP. The initially malformed fixture failed to compile because its helper
+parameter used the `ManagedRootID` function as a type; after correction, the
+focused model tests exposed incomplete stat facts in their namespace fixtures.
+Those fixtures were made coherent, and all three commands then passed. No
+production source or native fixture was changed. These results are local and
+bind to this uncommitted test/docs diff, not independent verification.
+Whole-candidate review/test, Go 1.24 native-mount CI, and native Windows/macOS
+evidence remain pending; no phase completion or Ready claim follows.

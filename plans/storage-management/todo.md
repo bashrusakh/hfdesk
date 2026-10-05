@@ -1,9 +1,22 @@
 # Todo
 
-- [ ] Phase 1: F3-F6 correction present locally at source HEAD
-  `9498fc344a308f26dd02b5c9bbcebb2380ccdf93` (base
-  `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`); independent/native evidence
-  remains blocking.
+- [ ] Phase 1: F3-F6 correction candidate `8ee926f629a94f21b6e1127c7a9daaba846d8ec3`
+  (base/merge base `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`); independent/native
+  evidence remains blocking. Earlier full review passed with notes and the fresh
+  tester covered 27 production HTTP scenarios, but the portable model-fixture
+  correspondence correction and its verification are this stage's work, not yet
+  independent evidence.
+  - [x] Correct ordinary empty-directory EOF behavior; require complete graph
+    reachability plus specific protected-intersection refusal in positive cases;
+    preserve allow for a completed disjoint graph. On the worktree based on
+    `8ee926f`, Linux Go 1.26.7 passed
+    `go test ./pkg/hfdownloader -run 'TestManagedRootEffectProof' -count=1`,
+    `go test ./pkg/hfdownloader -count=1`, and `go test ./internal/server -count=1`
+    in isolated HOME/XDG/APPDATA/LOCALAPPDATA/HF/TMP. This is implementation-local
+    coverage of the corrected tests and preserved package/server consumers, not
+    independent evidence; no production source or native fixture changed.
+  - [ ] Independent test/review of the resulting exact candidate and required
+    Go 1.24 native-mount CI remain pending.
   - [x] Trace F1 inverse external-child-alias ancestry and F2 secondary friendly
     cleanup bypass; record the shared model in `phases/phase-1.md` and
     `reviews/protected-roots-reassessment.md`. This is planning, not a fix.
@@ -52,10 +65,10 @@
 - [ ] Phase 3: reconciled inventory and deletion engine.
 - [ ] Phase 4: copy/artifact selectors, conditional API, UI, and docs.
 
-Known blockers: the F3-F6 source correction has implementation-local evidence only;
-independent integrated verification/review and the newly configured required
-native-mount Go 1.24 CI job have not run. This host cannot create a private mount
-namespace. Windows Go 1.24/remote CI remain pending, macOS behavior is unverified.
+Known blockers: the corrected portable-model tests/docs have implementation-local
+focused package and server coverage, but independent checkpointing is pending.
+The required native-mount Go 1.24 CI job has not run. This host cannot create a private mount namespace.
+Windows Go 1.24/remote CI remain pending, macOS behavior is unverified.
 The F1/F2 corrections at `957498e` and current C1-C14 passes must be preserved,
 but cannot be promoted to a complete filesystem-namespace proof. No layout PR,
 new deletion engine, mount-support policy change or publication is authorized.

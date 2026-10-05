@@ -9,6 +9,21 @@ historical evidence. The later bounded source correction and follow-ups are
 recorded in the resolution section. F1/F2 correction `957498e` and the complete
 Hub/friendly preflight remain preserved, not restarted.
 
+Current evidence update: clean candidate `8ee926f629a94f21b6e1127c7a9daaba846d8ec3`
+was the basis for a full review verdict of pass with notes and a fresh tester
+checkpoint covering 27 production HTTP scenarios. The tester identified a
+portable model-fixture correspondence gap (empty modeled directory reads and
+positive-case false acceptance on unrelated early errors); the focused
+test/documentation correction is uncommitted and implementation-local. The older
+40-scenario C1-C14 report below is historical and must not be conflated with that
+27-scenario checkpoint. On this uncommitted worktree based on `8ee926f`, Linux Go
+1.26.7 passed `go test ./pkg/hfdownloader -run
+'TestManagedRootEffectProof' -count=1`, `go test ./pkg/hfdownloader -count=1`, and
+`go test ./internal/server -count=1` with isolated HOME/XDG/APPDATA/LOCALAPPDATA/
+HF/TMP. These checks are not independent review of the corrected test/docs state,
+a native mount pass, or phase completion. Independent checkpoint and Go 1.24
+native-mount CI remain pending.
+
 ## Authority, current evidence and counterexample
 
 The unchanged phase-1 outcome is protection of every configured root/reservation

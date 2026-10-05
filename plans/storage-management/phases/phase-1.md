@@ -1,11 +1,13 @@
 # Phase 1 — root/path ownership
 
-Status: **F3-F6 corrections implemented locally; independent/native evidence pending**.
-Source baseline HEAD `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`; the dirty
-worktree carries F4-F6. Base and merge base are
-`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The earlier full review's F3
-counterexample remains the historical reason for correction; no native mount
-reproduction or universal proof has passed.
+Status: **F3-F6 corrections are not complete for acceptance; independent/native
+evidence pending**. The `9498fc344a308f26dd02b5c9bbcebb2380ccdf93` source snapshot
+and dirty worktree described below are historical. Current stage began from clean
+candidate `8ee926f629a94f21b6e1127c7a9daaba846d8ec3`, base/merge base
+`b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. Full review passed with notes and a
+fresh tester covered 27 production HTTP scenarios on that candidate; neither
+establishes native mount behavior or validates the portable model fixture. The
+F3 counterexample remains the historical reason for correction.
 
 ## Contract
 
@@ -195,3 +197,21 @@ F3-F6 corrections are in the current dirty worktree; full native/reviewer proof
 remains pending.
 See
 [`phase-1-impl.md`](../implementation/phase-1-impl.md) for evidence provenance.
+
+## Current corrective-stage evidence (candidate 8ee926f)
+
+The focused model correction makes ordinary empty modeled directories return
+explicit EOF, retains a deliberate empty-success/no-EOF refusal case, and checks
+that protected-object model cases completely reached the expected path and were
+refused specifically for protected intersection. This is intended to establish
+the semantic properties (complete relevant traversal and actual matched-object
+refusal), rather than treating an arbitrary early error as proof; a complete
+disjoint graph remains allowed. On the worktree
+based on `8ee926f`, Linux Go 1.26.7 passed `go test ./pkg/hfdownloader -run
+'TestManagedRootEffectProof' -count=1`, `go test ./pkg/hfdownloader -count=1`, and
+`go test ./internal/server -count=1` in isolated HOME/XDG/APPDATA/LOCALAPPDATA/
+HF/TMP. Focused and package coverage verifies the changed model cases plus
+existing downloader/server consumers. It does not alter production code or native
+mount fixtures. Independent review/test of the resulting exact candidate and the
+Go 1.24 native-mount CI job remain pending; Windows/macOS native behavior is
+unverified. Phase 1 is not complete.

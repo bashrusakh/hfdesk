@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,9 @@ func (h *observedHandle) readDir(int) ([]os.DirEntry, error) {
 		return nil, io.EOF
 	}
 	h.read = true
+	if len(h.entries) == 0 && h.err == nil {
+		return nil, io.EOF
+	}
 	return h.entries, h.err
 }
 
@@ -95,11 +99,13 @@ func TestManagedRootEffectProofContinuesAfterShortSuccessfulBatch(t *testing.T) 
 			filepath.Join(effect, "first"): first,
 			protectedPath:                  {info: protectedInfo},
 		},
-		stat: map[string]os.FileInfo{filepath.Join(base, "elsewhere", "reservation"): protectedInfo},
+		stat: map[string]os.FileInfo{
+			hub: mustStat(t, hub),
+			filepath.Join(base, "elsewhere", "reservation"): protectedInfo,
+		},
 	}
-	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
-		t.Fatal("short successful batch hid a later protected effect")
-	}
+	assertProtectedEffectReached(t, set, effect, filepath.Join(effect, "first"), protectedPath)
+	assertProtectedEffectRefused(t, set, ManagedRootID(hub, base), effect)
 }
 
 func TestManagedRootEffectProofRequiresEOFForCompletion(t *testing.T) {
@@ -110,7 +116,7 @@ func TestManagedRootEffectProofRequiresEOFForCompletion(t *testing.T) {
 	set.observe = &observedNamespace{dirs: map[string]observedDirectory{
 		effect: {info: root.info, batches: [][]os.DirEntry{{}}},
 	}}
-	if _, err := set.observeEffectDirectories(effect); err == nil {
+	if _, err := set.observeEffectDirectories(effect); err == nil || !strings.Contains(err.Error(), "no progress without EOF") {
 		t.Fatal("empty successful batch was mistaken for explicit exhaustion")
 	}
 }
@@ -128,6 +134,28 @@ func TestManagedRootEffectProofAcceptsShortBatchFollowedByEOF(t *testing.T) {
 	}}
 	if _, err := set.observeEffectDirectories(effect); err != nil {
 		t.Fatalf("short successful batch followed by EOF: %v", err)
+	}
+}
+
+func TestManagedRootEffectProofAllowsCompleteDisjointGraph(t *testing.T) {
+	base := t.TempDir()
+	effect := filepath.Join(base, "effect")
+	root, _ := modelObservedDir(t, effect)
+	protectedPath := filepath.Join(base, "protected")
+	_, protectedInfo := modelObservedDir(t, protectedPath)
+	set := NewManagedRootSet(base, []ManagedRootSpec{
+		{Path: protectedPath, Roles: ManagedRootProtected},
+	})
+	set.observe = &observedNamespace{
+		dirs: map[string]observedDirectory{effect: root},
+		stat: map[string]os.FileInfo{protectedPath: protectedInfo, base: mustStat(t, base)},
+	}
+	reached, err := set.observeEffectDirectories(effect)
+	if err != nil || len(reached) != 1 || filepath.Clean(reached[0].path) != filepath.Clean(effect) {
+		t.Fatalf("expected complete effect-only graph, reached=%v err=%v", reached, err)
+	}
+	if err := set.checkProtectedEffect(effect); err != nil {
+		t.Fatalf("complete disjoint graph was refused: %v", err)
 	}
 }
 
@@ -168,7 +196,7 @@ func TestManagedRootEffectProofFindsProtectedObjectInOtherNamespace(t *testing.T
 			effect: {info: rootDir.info, entries: []os.DirEntry{observedEntry{name: "application-data", info: childInfo}}},
 			inside: {info: childInfo},
 		},
-		stat: map[string]os.FileInfo{protectedAlias: childInfo},
+		stat: map[string]os.FileInfo{hub: mustStat(t, hub), protectedAlias: childInfo},
 	}
 	forward, _, err := containmentDistance(effect, protectedAlias)
 	if err != nil {
@@ -181,9 +209,8 @@ func TestManagedRootEffectProofFindsProtectedObjectInOtherNamespace(t *testing.T
 	if forward || reverse {
 		t.Fatalf("fixture does not preserve the old namespace-ancestor false negative: forward=%v reverse=%v", forward, reverse)
 	}
-	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
-		t.Fatal("effect proof missed a protected directory object exposed under an unrelated namespace parent")
-	}
+	assertProtectedEffectReached(t, set, effect, inside)
+	assertProtectedEffectRefused(t, set, ManagedRootID(hub, base), effect)
 }
 
 func TestManagedRootEffectProofRefusesIncompleteAndCycleObservations(t *testing.T) {
@@ -228,7 +255,7 @@ func TestManagedRootEffectProofRefusesIncompleteAndCycleObservations(t *testing.
 			}
 			set := NewManagedRootSet(base, []ManagedRootSpec{{Path: hub, Roles: ManagedRootHub | ManagedRootProtected}})
 			set.observe = tc.make(t, effect)
-			if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
+			if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil || !strings.Contains(err.Error(), "cannot prove protected-root disjointness") {
 				t.Fatal("incomplete effect observation authorized removal")
 			}
 		})
@@ -258,11 +285,12 @@ func TestManagedRootEffectProofKeepsDistinctViewsOfRepeatedObjects(t *testing.T)
 			secondView:    {info: viewInfo, entries: []os.DirEntry{observedEntry{name: "protected-child", info: protectedInfo}}},
 			protectedView: {info: protectedInfo},
 		},
-		stat: map[string]os.FileInfo{filepath.Join(base, "external-protected"): protectedInfo},
+		stat: map[string]os.FileInfo{
+			hub: mustStat(t, hub), filepath.Join(base, "external-protected"): protectedInfo,
+		},
 	}
-	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
-		t.Fatal("second namespace view of repeated object was pruned")
-	}
+	assertProtectedEffectReached(t, set, effect, firstView, secondView, protectedView)
+	assertProtectedEffectRefused(t, set, ManagedRootID(hub, base), effect)
 }
 
 func TestManagedRootEffectProofProtectsMissingReservationAnchor(t *testing.T) {
@@ -285,11 +313,13 @@ func TestManagedRootEffectProofProtectsMissingReservationAnchor(t *testing.T) {
 			effect: {info: effectInfo, entries: []os.DirEntry{observedEntry{name: "mounted-view", info: insideInfo}}},
 			inside: {info: insideInfo},
 		},
-		stat: map[string]os.FileInfo{filepath.Join(base, "reserved-view"): insideInfo},
+		stat: map[string]os.FileInfo{
+			hub: mustStat(t, hub), base: mustStat(t, base),
+			filepath.Join(base, "reserved-view"): insideInfo,
+		},
 	}
-	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
-		t.Fatal("missing protected reservation lost its existing mounted anchor")
-	}
+	assertProtectedEffectReached(t, set, effect, inside)
+	assertProtectedEffectRefused(t, set, ManagedRootID(hub, base), effect)
 }
 
 func TestManagedRootEffectProofDoesNotExemptReexposedAuthorizingRoot(t *testing.T) {
@@ -301,12 +331,39 @@ func TestManagedRootEffectProofDoesNotExemptReexposedAuthorizingRoot(t *testing.
 	}
 	hubInfo := mustStat(t, hub)
 	set := NewManagedRootSet(base, []ManagedRootSpec{{Path: hub, Roles: ManagedRootHub | ManagedRootProtected}})
-	set.observe = &observedNamespace{dirs: map[string]observedDirectory{
-		effect:                                  {info: mustStat(t, effect), entries: []os.DirEntry{observedEntry{name: "reexposed-root", info: hubInfo}}},
-		filepath.Join(effect, "reexposed-root"): {info: hubInfo},
-	}}
-	if err := set.WholeCopyAllowed(ManagedRootID(hub, base), effect); err == nil {
-		t.Fatal("authorizing root object re-exposed inside effect was exempted")
+	set.observe = &observedNamespace{
+		dirs: map[string]observedDirectory{
+			effect:                                  {info: mustStat(t, effect), entries: []os.DirEntry{observedEntry{name: "reexposed-root", info: hubInfo}}},
+			filepath.Join(effect, "reexposed-root"): {info: hubInfo},
+		},
+		stat: map[string]os.FileInfo{hub: hubInfo, base: mustStat(t, base)},
+	}
+	assertProtectedEffectReached(t, set, effect, filepath.Join(effect, "reexposed-root"))
+	assertProtectedEffectRefused(t, set, ManagedRootID(hub, base), effect)
+}
+
+func assertProtectedEffectReached(t *testing.T, set *ManagedRootSet, effect string, paths ...string) {
+	t.Helper()
+	reached, err := set.observeEffectDirectories(effect)
+	if err != nil {
+		t.Fatalf("effect graph was not completely observed: %v", err)
+	}
+	observed := make(map[string]bool, len(reached))
+	for _, dir := range reached {
+		observed[filepath.Clean(dir.path)] = true
+	}
+	for _, path := range paths {
+		if !observed[filepath.Clean(path)] {
+			t.Errorf("effect graph did not reach %q; reached %v", path, observed)
+		}
+	}
+}
+
+func assertProtectedEffectRefused(t *testing.T, set *ManagedRootSet, id, effect string) {
+	t.Helper()
+	err := set.WholeCopyAllowed(id, effect)
+	if err == nil || !strings.Contains(err.Error(), "deletion effect intersects protected managed root") {
+		t.Fatalf("expected a protected-object intersection refusal, got %v", err)
 	}
 }
 
