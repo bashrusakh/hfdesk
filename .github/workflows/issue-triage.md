@@ -5,6 +5,7 @@ on:
   issues:
     types: [opened, reopened]
   workflow_dispatch:
+  status-comment: false
 permissions:
   contents: read
   issues: read
@@ -25,17 +26,26 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@3d8b4095371aee673d32cd265b26b11ae23a62b7
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@3d8b4095371aee673d32cd265b26b11ae23a62b7
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
+checkout: false
 max-ai-credits: 5
-max-turns: 40
+max-turns: 20
 timeout-minutes: 20
 network:
   allowed: [defaults, github, ollama.com]
 tools:
+  bash: false
+  cli-proxy: false
   github:
-    mode: gh-proxy
-    toolsets: [issues]
+    mode: local
+    toolsets: [issues, labels]
+    allowed:
+      - issue_read
+      - list_issues
+      - search_issues
+      - find_duplicate
+      - list_labels
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
@@ -56,14 +66,12 @@ pre-agent-steps:
 safe-outputs:
   report-failure-as-issue: false
   add-labels:
-    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "confirmed", "duplicate"]
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
     blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 2
   remove-labels:
-    allowed: ["needs-info", "confirmed", "duplicate"]
+    allowed: ["needs-info", "duplicate"]
     max: 2
-  add-comment:
-    max: 1
 ---
 
 # Workflow 1 — Issue Triage (hfdesk)
@@ -102,7 +110,10 @@ outranks stale automated conclusions.
 ## hfdesk managed label boundary
 
 - Managed by issue triage: `bug`, `enhancement`, `documentation`, `question`,
-  `refactor`, `ci`, `needs-info`, `confirmed`, `duplicate`.
+  `refactor`, `ci`, `needs-info`, `duplicate`.
+- `confirmed` is human/verification-owned and out of scope: this workflow does not
+  own it and must never add or remove it. It does not determine whether a report is
+  technically real.
 - Human-reserved (never add or remove; never infer): `priority-*`, `codex-*`,
   `approved-for-fix`, `codex-fixing`, `ready-for-human-review`, `invalid`, `wontfix`,
   `good first issue`, `help wanted`, and anything not listed as managed.
@@ -110,4 +121,8 @@ outranks stale automated conclusions.
   or edit the issue. hfdesk authorizes no prerequisite/approval/decision-gate semantics
   for automation.
 
-Use only this workflow's safe outputs (`add-labels`, `remove-labels`, `add-comment`).
+This workflow is metadata-only and silent: it does not reproduce, validate, review
+code, read source/diff, or comment. `needs-info` means metadata/routing information is
+missing.
+
+Use only this workflow's safe outputs (`add-labels`, `remove-labels`).
