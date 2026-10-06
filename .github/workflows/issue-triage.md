@@ -5,6 +5,14 @@ on:
   issues:
     types: [opened, reopened]
   workflow_dispatch:
+    inputs:
+      issue_number:
+        description: >-
+          Informational issue number for a manual run. The triaged subject is the
+          triggering issue, or the internal Agentic Workflows dispatch context
+          (aw_context) for manual runs; this input alone does not select it.
+        required: false
+        type: string
   status-comment: false
 permissions:
   contents: read
@@ -13,6 +21,7 @@ engine:
   id: copilot
   model: glm-5.3-flash
   bare: true
+  args: ["--deny-tool", "shell"]
   concurrency:
     group: "gh-aw-triage-${{ github.repository }}"
     queue: max
@@ -26,26 +35,37 @@ models:
     output: 0.000001
 inlined-imports: true
 imports:
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@30288988a387310ad90e49ba2f2a30252ebbec05
-  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@30288988a387310ad90e49ba2f2a30252ebbec05
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/contract-invariant.md@e2de4a989077b7fdf558ef5656040dc2e547e674
+  - bashrusakh/repo-docs-sync/packages/ghaw-triage/workflows/issue-triage-core.md@e2de4a989077b7fdf558ef5656040dc2e547e674
 checkout: false
 max-ai-credits: 5
 max-turns: 20
 timeout-minutes: 20
+concurrency:
+  job-discriminator: ${{ github.run_id }}
 network:
   allowed: [defaults, github, ollama.com]
 tools:
   bash: false
   cli-proxy: false
+  edit: false
   github:
     mode: local
-    toolsets: [issues, labels]
+    toolsets: [issues]
+    # Declared scope only, not a runtime guarantee (a gateway safety net may widen it):
+    # 'repos' is the current repository — exactly the expression below. min-integrity: none
+    # is deliberate: triage must read reports from any contributor, and gh-aw docs prescribe
+    # 'none' for public-repo triage. Otherwise metadata-only (no shell/source/diff; safe
+    # outputs are label adds/removes only), so the injection surface is metadata-only. If
+    # abuse appears, add blocked-users / trusted-users / approval-labels.
+    allowed-repos: ["${{ github.repository }}"]
+    min-integrity: none
+    # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
     allowed:
-      - issue_read
-      - list_issues
-      - search_issues
-      - find_duplicate
-      - list_labels
+      - name: issue_read
+        max-calls: 8
+      - name: search_issues
+        max-calls: 3
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
     env:
@@ -65,13 +85,20 @@ pre-agent-steps:
       echo "Resolved policy contract at $sha"
 safe-outputs:
   report-failure-as-issue: false
+  report-failed-jobs: false
   add-labels:
+    # Disable issue-intent metadata (rationale/confidence/suggest) for label adds: the
+    # exposed tool schema drops those fields and the handler never routes a label through
+    # pending-suggestion review. hfdesk triage applies labels directly; a suggestion would
+    # be a silent no-op. (remove-labels has no suggestion path and rejects this key.)
+    issue-intent: false
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
-    blocked: ["priority-*", "codex-*", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
-    max: 2
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    max: 3
   remove-labels:
-    allowed: ["needs-info", "duplicate"]
-    max: 2
+    allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
+    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
+    max: 3
 ---
 
 # Workflow 1 — Issue Triage (hfdesk)
@@ -111,6 +138,10 @@ outranks stale automated conclusions.
 
 - Managed by issue triage: `bug`, `enhancement`, `documentation`, `question`,
   `refactor`, `ci`, `needs-info`, `duplicate`.
+- Type reconciliation: preserve a correct contributor-applied type, fill a type that is
+  clearly missing, and replace a clearly incorrect managed type (remove the wrong type and
+  add the correct one). Make no change when the type is ambiguous — preserve the affected
+  state rather than churning it.
 - `confirmed` is human/verification-owned and out of scope: this workflow does not
   own it and must never add or remove it. It does not determine whether a report is
   technically real.
@@ -121,8 +152,21 @@ outranks stale automated conclusions.
   or edit the issue. hfdesk authorizes no prerequisite/approval/decision-gate semantics
   for automation.
 
-This workflow is metadata-only and silent: it does not reproduce, validate, review
-code, read source/diff, or comment. `needs-info` means metadata/routing information is
-missing.
+This workflow is metadata-only and silent: the agent produces no human-facing output — it
+does not reproduce, validate, review code, read source/diff, or comment — and the only
+repository writes it performs are the label safe outputs. When evidence is insufficient,
+preserve the affected managed metadata and use `noop` if a completion signal is required —
+the agent has no explanatory output channel. `needs-info` means metadata/routing
+information is missing; it never means implementation proof is missing. The metadata
+baseline needed to classify and route a report is the semantic type, what is broken or the
+affected user-facing area, and the reported behavior; a report establishing neither the
+affected area nor the reported behavior (for example "doesn't work") is missing routing
+information, so `needs-info` applies even when the type is inferable. This scopes the
+silence claim to the agent and its safe outputs; operator diagnostics are separate, and
+gh-aw may still file run-failure or detection diagnostics as repository-level issues
+outside this workflow's agent and safe outputs.
 
-Use only this workflow's safe outputs (`add-labels`, `remove-labels`).
+Use only this workflow's safe outputs (`add-labels`, `remove-labels`). Request label adds and
+removes directly as plain label names; never attach `suggest`, `rationale`, or `confidence`
+intent metadata — this deployment does not use suggestion/intent review, and a suggested
+label is not applied.
