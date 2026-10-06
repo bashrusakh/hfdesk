@@ -18,6 +18,11 @@
   - [x] Attempt required-native `TestNativeMount*`; worker-marker negative case
     passed, but positive subprocess launch failed `operation not permitted` before
     namespace setup. No native mount/Go 1.24 pass is claimed.
+  - [x] Scope the Windows R selector to facts only; retain the two legacy DELETE
+    safety tests in source and exclude them from this facts-stage check.
+  - [ ] Remote run 37409513941: native Linux facts job passed; Windows facts job
+    failed only those two excluded safety assertions. Re-run candidate CI after
+    authorized publication; native Windows facts result remains pending.
   - [x] Historical source commit `4bcf7f9` was reviewed as requiring changes;
     archive A is not its ancestor. That review is not approval of corrected R.
   - [x] Commit corrected source/test/CI bytes and status snapshot as

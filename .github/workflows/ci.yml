@@ -111,8 +111,9 @@ jobs:
       - name: Smoke-test entrypoint
         run: sh docker/smoke-test.sh hfdesk:ci
 
-  # Exercise the native state-file replacement path added here. The full suite
-  # has separate pre-existing Windows-compatibility gaps.
+  # Exercise this R stage's native storage facts and state-file replacement.
+  # Legacy DELETE safety assertions remain in source for the successor safety
+  # stage; this selector does not claim to validate that delete behavior.
   go-windows:
     name: Go checks (Windows)
     runs-on: windows-latest
@@ -140,4 +141,4 @@ jobs:
         run: go test ./pkg/hfdownloader -run '^(Test(ManagedRoot|RepoPhysicalCopies|WholeCopy|ObserveNamespace|HubInternalNamespace|ManagedNamespace|Namespace))' -count=1 -v
 
       - name: Test native server root ownership
-        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CacheAndRoutePathsUseCapturedConfigBase|FindLocalCachedRepoPreservesFriendlySourcePriority|CaseDistinctRouteDestinations|LocalCacheRoots.*|LocalCachedRepos_(RootRestrictions|NestedRoots)|API_CacheListAndInfoPreserveValidLocalRepoIDs|API_CacheHFFriendlyMetadata_(Ownership|NoProjection|ConfigSnapshot)|API_CacheDelete_(PathTraversal|ValidRepoFormat|ModelNameMayContainDatasetPrefix)|WholeHubDelete.*|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly|JobDestFreeze_.*|CreateJob_DedupDestinationIdentity.*|SearchDoesNotReportSuccessForIncompleteNamespace))$' -count=1 -v
+        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CacheAndRoutePathsUseCapturedConfigBase|FindLocalCachedRepoPreservesFriendlySourcePriority|CaseDistinctRouteDestinations|LocalCacheRoots.*|LocalCachedRepos_(RootRestrictions|NestedRoots)|API_CacheListAndInfoPreserveValidLocalRepoIDs|API_CacheHFFriendlyMetadata_(Ownership|NoProjection|ConfigSnapshot)|API_CacheDelete_(PathTraversal|ValidRepoFormat)|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly|JobDestFreeze_.*|CreateJob_DedupDestinationIdentity.*|SearchDoesNotReportSuccessForIncompleteNamespace))$' -count=1 -v
