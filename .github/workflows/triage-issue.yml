@@ -17,6 +17,10 @@ on:
         description: "Informational issue number for a manual run."
         required: false
         type: string
+      aw_context:
+        description: "Agent caller context (used internally by Agentic Workflows): {\"item_type\":\"issue\",\"item_number\":N} selects the issue for a manual run."
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -31,3 +35,5 @@ jobs:
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
     with:
       contract_files: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md"
+      issue_number: ${{ github.event.inputs.issue_number }}
+      aw_context: ${{ github.event.inputs.aw_context }}

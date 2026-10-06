@@ -33,3 +33,4 @@ jobs:
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
     with:
       contract_files: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md .github/ISSUE_TEMPLATE/bug_report.yml .github/PULL_REQUEST_TEMPLATE.md .github/labels.yml"
+      item_numbers: ${{ github.event.inputs.item_numbers }}
