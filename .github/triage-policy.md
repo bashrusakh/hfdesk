@@ -62,6 +62,13 @@ evidence, not retroactive mandatory checklists. A missing or unfilled template
 field is not by itself grounds for `needs-info`; label only on the substance of the
 report.
 
+A report is sufficiently clear for metadata triage when its title/body establish the
+semantic type, what is broken or the affected user-facing area, and the reported
+behavior. A report that establishes neither the affected area nor the reported behavior
+— for example "doesn't work" or "something is broken" with no further substance — lacks
+the information needed for metadata routing, so `needs-info` applies even when the
+semantic type is inferable.
+
 ## Metadata-only scope
 
 Triage is metadata-only — the automation does not reproduce, validate, review code, read

@@ -157,7 +157,11 @@ does not reproduce, validate, review code, read source/diff, or comment — and 
 repository writes it performs are the label safe outputs. When evidence is insufficient,
 preserve the affected managed metadata and use `noop` if a completion signal is required —
 the agent has no explanatory output channel. `needs-info` means metadata/routing
-information is missing; it never means implementation proof is missing. This scopes the
+information is missing; it never means implementation proof is missing. The metadata
+baseline needed to classify and route a report is the semantic type, what is broken or the
+affected user-facing area, and the reported behavior; a report establishing neither the
+affected area nor the reported behavior (for example "doesn't work") is missing routing
+information, so `needs-info` applies even when the type is inferable. This scopes the
 silence claim to the agent and its safe outputs; operator diagnostics are separate, and
 gh-aw may still file run-failure or detection diagnostics as repository-level issues
 outside this workflow's agent and safe outputs.
