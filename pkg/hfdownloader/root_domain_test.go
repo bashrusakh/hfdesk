@@ -28,6 +28,21 @@ func TestManagedRootIdentityUsesCapturedLexicalBase(t *testing.T) {
 			t.Errorf("resolve valid observed ID %q/%q = %q, %v; want %q", id[0], id[1], got, err, want)
 		}
 	}
+	for _, component := range []struct {
+		owner, name string
+	}{
+		{owner: "C:relative", name: "repo"},
+		{owner: "owner", name: "C:relative"},
+	} {
+		volumeQualified := filepath.VolumeName(component.owner) != "" || filepath.VolumeName(component.name) != ""
+		got, err := set.Resolve(rootID, component.owner, component.name)
+		if volumeQualified && err == nil {
+			t.Errorf("resolve accepted volume-qualified component %q/%q: %q", component.owner, component.name, got)
+		}
+		if !volumeQualified && (err != nil || got != filepath.Join(missing, component.owner, component.name)) {
+			t.Errorf("resolve rejected ordinary colon-bearing component %q/%q: %q, %v", component.owner, component.name, got, err)
+		}
+	}
 	if err := os.MkdirAll(filepath.Join(missing, "owner", "repo"), 0o755); err != nil {
 		t.Fatal(err)
 	}

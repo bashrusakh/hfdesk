@@ -539,7 +539,7 @@ func (set *ManagedRootSet) Resolve(rootID, owner, name string) (string, error) {
 		return "", err
 	}
 	root, ok := set.Root(rootID)
-	if !ok || root.Roles&ManagedRootBrowse == 0 || !IsValidModelName(owner+"/"+name) || filepath.IsAbs(owner) || filepath.IsAbs(name) || filepath.VolumeName(owner+string(filepath.Separator)+name) != "" {
+	if !ok || root.Roles&ManagedRootBrowse == 0 || !IsValidModelName(owner+"/"+name) || filepath.IsAbs(owner) || filepath.IsAbs(name) || filepath.VolumeName(owner) != "" || filepath.VolumeName(name) != "" || filepath.VolumeName(owner+string(filepath.Separator)+name) != "" {
 		return "", errors.New("invalid managed-root repository path")
 	}
 	return filepath.Join(root.AbsolutePath, owner, name), nil
