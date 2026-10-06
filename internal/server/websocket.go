@@ -225,21 +225,22 @@ func (c *WSClient) writePump() {
 				return
 			}
 
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
+			// Every frame must carry exactly one JSON message. The frontend
+			// parses each frame with JSON.parse(event.data), so joining several
+			// messages into one frame makes it throw and drops the whole frame
+			// (including terminal job states).
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
-			w.Write(message)
 
-			// Batch any queued messages
+			// Drain any queued messages, still one WebSocket text frame each,
+			// so a burst does not force a syscall per select iteration.
 			n := len(c.send)
 			for i := 0; i < n; i++ {
-				w.Write([]byte("\n"))
-				w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
-				return
+				c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := c.conn.WriteMessage(websocket.TextMessage, <-c.send); err != nil {
+					return
+				}
 			}
 
 		case <-ticker.C:
