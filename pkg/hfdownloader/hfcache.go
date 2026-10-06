@@ -660,7 +660,8 @@ func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relative
 		}
 		if err := os.Rename(tempFile, blobPath); err != nil {
 			// Rename failed (cross-device?), try an atomic copy: stage in a
-			// sibling temp file, fsync, then rename into place. A cancelled or
+			// sibling temp file, then atomically rename it into place (no fsync,
+			// per the T1 tradeoff documented on copyFileAtomicCtx). A cancelled or
 			// failed copy must never leave a partial file at the FINAL blob
 			// path (which CheckBlob would report complete, poisoning the cache).
 			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
@@ -731,12 +732,23 @@ func copyFileCtx(ctx context.Context, src, dst string) error {
 }
 
 // copyFileAtomicCtx copies src to dst atomically: it streams into a sibling
-// temporary file in the same directory, fsyncs and closes it, then renames it
-// onto dst. On ctx cancellation or any error it removes the staging file and
-// leaves both src intact and dst absent/unchanged, so a cancelled copy can
-// never leave a partial file at dst. It is the durable-publish variant used for
-// cache blobs, where a partial file at the final path would be mistaken for a
-// complete blob.
+// temporary file in the same directory, closes it, then renames it onto dst. On
+// ctx cancellation or any error it removes the staging file and leaves both src
+// intact and dst absent/unchanged, so a cancelled copy can never leave a partial
+// file at dst. It is the publish variant used for cache blobs, where a partial
+// file at the final path would be mistaken for a complete blob.
+//
+// The staged bytes are copied to their final mode (matching what the same-device
+// rename path publishes) so a cross-device fallback does not change blob
+// permissions.
+//
+// Deliberately no fsync/Sync here: these bytes were already SHA-256/size
+// verified by the caller, and crash-durability of this copy-fallback is not a
+// stated requirement, whereas invariant T1 (every blocking finalization phase
+// must respond promptly to cancellation after a sibling's permanent error) is.
+// Sync is not ctx-cancellable, so a mandatory Sync could block fail-fast
+// termination on a long flush. The temp+rename still guarantees no partial file
+// is ever visible at the final path.
 func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -759,7 +771,17 @@ func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
 		staging.Close()
 		return err
 	}
-	if err := staging.Sync(); err != nil {
+
+	// Match the mode the same-device rename path publishes. The downloader
+	// creates the source temp at 0o644, but os.CreateTemp stages at 0600, so
+	// without this a cross-device copy would make blobs owner-only and break a
+	// shared HF cache (EACCES for other users/containers). Best-effort read of
+	// the source mode, falling back to 0644.
+	mode := os.FileMode(0o644)
+	if fi, statErr := os.Stat(src); statErr == nil {
+		mode = fi.Mode().Perm()
+	}
+	if err := staging.Chmod(mode); err != nil {
 		staging.Close()
 		return err
 	}

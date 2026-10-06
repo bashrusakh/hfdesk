@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -52,15 +53,51 @@ type backoff struct {
 	jitter time.Duration
 }
 
+// maxBackoffCeiling is a defensive ceiling on the configured backoff durations.
+// It bounds the arithmetic in Next even when a library caller passes an absurd
+// value (the settings boundary also rejects negatives, but not huge positives).
+// One hour is chosen because it is far beyond any useful retry pacing: retries
+// waiting longer than an hour are indistinguishable from a dead transfer, and
+// the stall watchdog/absolute attempt ceiling already bound termination. A
+// finite ceiling keeps Next's multiply and jitter additions from overflowing
+// int64 nanoseconds.
+const maxBackoffCeiling = time.Hour
+
+// saturatingMulDuration multiplies d by mult (mult > 0) and saturates at max
+// instead of overflowing int64 nanoseconds. It never returns a negative value.
+func saturatingMulDuration(d time.Duration, mult float64, max time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	// Saturate before the float multiply can overflow int64 nanoseconds:
+	// a product exceeding math.MaxInt64 would otherwise wrap negative.
+	if float64(d) > float64(math.MaxInt64)/mult {
+		return max
+	}
+	p := time.Duration(float64(d) * mult)
+	if p < 0 {
+		return max
+	}
+	return p
+}
+
 // newRetry creates a new backoff instance from settings.
 func newRetry(cfg Settings) *backoff {
 	init := 400 * time.Millisecond
 	max := 10 * time.Second
-	if d, err := time.ParseDuration(defaultString(cfg.BackoffInitial, "400ms")); err == nil {
+	if d, err := time.ParseDuration(defaultString(cfg.BackoffInitial, "400ms")); err == nil && d >= 0 {
 		init = d
 	}
-	if d, err := time.ParseDuration(defaultString(cfg.BackoffMax, "10s")); err == nil {
+	if d, err := time.ParseDuration(defaultString(cfg.BackoffMax, "10s")); err == nil && d >= 0 {
 		max = d
+	}
+	// Defensive clamp: a library caller passing an absurd duration still gets
+	// bounded, sane pacing.
+	if init > maxBackoffCeiling {
+		init = maxBackoffCeiling
+	}
+	if max > maxBackoffCeiling {
+		max = maxBackoffCeiling
 	}
 	if max < init {
 		max = init
@@ -68,12 +105,36 @@ func newRetry(cfg Settings) *backoff {
 	return &backoff{next: init, init: init, max: max, mult: 1.6, jitter: 120 * time.Millisecond}
 }
 
-// Next returns the next backoff duration.
+// Next returns the next backoff duration. Every value it returns or stores is
+// guaranteed to be >= 0 and <= b.max, even for extreme configured durations: the
+// exponential multiply and the jitter addition saturate rather than overflow
+// int64 nanoseconds (an overflowed negative delay would make retries burst with
+// no pacing).
 func (b *backoff) Next() time.Duration {
-	d := b.next + time.Duration(int64(b.jitter)*int64(time.Now().UnixNano()%3)/2)
-	b.next = time.Duration(float64(b.next) * b.mult)
+	// Jitter addition must not overflow: clamp b.next to max first (it is
+	// already <= max after every prior step, but an init == max is fine too),
+	// then add the (non-negative) jitter with saturation.
+	base := b.next
+	if base > b.max {
+		base = b.max
+	}
+	j := time.Duration(int64(b.jitter) * int64(time.Now().UnixNano()%3) / 2)
+	d := base + j
+	if d < base { // jitter addition overflowed
+		d = b.max
+	} else if d > b.max {
+		d = b.max
+	}
+	if d < 0 {
+		d = 0
+	}
+
+	b.next = saturatingMulDuration(base, b.mult, b.max)
 	if b.next > b.max {
 		b.next = b.max
+	}
+	if b.next < 0 {
+		b.next = 0
 	}
 	return d
 }

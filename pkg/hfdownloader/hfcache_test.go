@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -551,5 +552,34 @@ func TestRepoDir_EnsureFriendlyDir(t *testing.T) {
 	friendlyPath := repo.FriendlyPath()
 	if _, err := os.Stat(friendlyPath); os.IsNotExist(err) {
 		t.Errorf("friendly directory %s was not created", friendlyPath)
+	}
+}
+
+// TestCopyFileAtomicCtxPreservesMode verifies the cross-device copy fallback
+// publishes the blob with the source's permission bits (0644), matching what
+// the same-device rename path produces. Without this, os.CreateTemp's 0600
+// staging mode would leak to the final blob and break a shared HF cache.
+func TestCopyFileAtomicCtxPreservesMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	dst := filepath.Join(dir, "blob.bin")
+	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileAtomicCtx(context.Background(), src, dst); err != nil {
+		t.Fatalf("copyFileAtomicCtx: %v", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o644 {
+		t.Errorf("published mode = %o, want 0644 (matching the same-device rename path)", got)
 	}
 }
