@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/bashrusakh/hfdesk/releases"><img src="https://github.com/bashrusakh/hfdesk/actions/workflows/release.yml/badge.svg" alt="Release"></a>
-  <a href="https://pkg.go.dev/github.com/bashrusakh/hfdesk"><img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.24"></a>
+  <a href="https://pkg.go.dev/github.com/bashrusakh/hfdesk"><img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.25"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="Apache 2.0"></a>
 </p>
 

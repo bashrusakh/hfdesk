@@ -26,7 +26,7 @@ browser-only presentation belongs in `internal/assets/static`.
 
 ## Tech stack
 
-- Language: Go 1.24 (`go.mod` is source of truth)
+- Language: Go 1.25 (`go.mod` is source of truth)
 - Server: standard `net/http`
 - WebSocket: `github.com/gorilla/websocket`
 - Markdown README rendering: `goldmark` + `bluemonday`
