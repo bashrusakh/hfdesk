@@ -20,8 +20,8 @@
     namespace setup. No native mount/Go 1.24 pass is claimed.
   - [x] Historical source commit `4bcf7f9` was reviewed as requiring changes;
     archive A is not its ancestor. That review is not approval of corrected R.
-  - [ ] Commit corrected source/test/CI bytes and status snapshot; intended diff
-    is 4,899 additions plus deletions before status-doc edits.
+  - [x] Commit corrected source/test/CI bytes and status snapshot as
+    `ff66636`; complete base-to-candidate diff is 4,918 additions plus deletions.
   - [ ] Parent refreshes verification, reviews complete corrected R and rescope
     of owned Draft #111. Publication and Ready remain unauthorized.
 - [ ] Build Safety S from reviewed R, selectively recover only bounded guards,

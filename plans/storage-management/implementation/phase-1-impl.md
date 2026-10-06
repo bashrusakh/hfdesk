@@ -3,15 +3,17 @@
 ## Current candidate
 
 The reviewed historical R source commit is `4bcf7f976b1f8ad25e524de4a420a65bfeb6b2a0`;
-the current branch HEAD before local finalization is `1cc361afe65cbfb81de864e5c3e207d64e3d0751`.
+local finalization started from branch HEAD `1cc361afe65cbfb81de864e5c3e207d64e3d0751`
+and committed the corrected source/test/CI bytes as `ff666365266d839c3719a390334ebe4de9aaa604`.
 Both are on `feature/storage-root-ownership`, based on `0c876f38`; current
 base/merge-base is `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The worktree has
-11 intended source/test/CI files modified for R corrections. The 1cc review is
+11 intended source/test/CI correction files in that commit. The 1cc review is
 historical and requires changes: it identified three implementation/evidence
 correspondence gaps. The corrected dirty worktree is a new candidate, not the
 reviewed 1cc state; fresh whole-R review is pending. Base-to-HEAD is 4,751 lines;
 with the intended corrections it is 4,899 before this status-only doc update
-(<5,000). R is not a safety implementation and is not Ready.
+(<5,000; the committed status snapshot brings the full diff to 4,918 lines).
+R is not a safety implementation and is not Ready.
 
 Full WIP preservation A is committed locally at
 `a9931836a6517259884908d451f2975b62d2dcc0` on
