@@ -1,12 +1,12 @@
 module github.com/bashrusakh/hfdesk
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/yuin/goldmark v1.8.2
-	golang.org/x/net v0.49.0
+	golang.org/x/net v0.55.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
