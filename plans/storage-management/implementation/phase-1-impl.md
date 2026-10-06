@@ -2,10 +2,11 @@
 
 ## Current candidate
 
-The feature branch remains based on published `0c876f38` with fresh base
-`b4644b7`. The current uncommitted R candidate is limited to namespace facts,
-read-side integration, fact tests, and compact plan updates. It is not a safety
-implementation and is not Ready.
+R source commit `a35897a596908cd3b911e7da1c65676a481148b7` is on
+`feature/storage-root-ownership`, a descendant of published `0c876f38` with
+fresh base/merge base `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. Its complete
+base-to-candidate diff is 4,208 additions plus 373 deletions (4,581 total),
+below the 5,000-line limit. It is not a safety implementation and is not Ready.
 
 Full WIP preservation A is committed locally at
 `a9931836a6517259884908d451f2975b62d2dcc0` on
@@ -34,11 +35,11 @@ for Windows path semantics.
 
 ## Evidence and next stage
 
-On Linux Go 1.26.7, at feature HEAD `0c876f38` plus the current R worktree, the
-focused downloader/server tests, `go test ./...`, `go test ./... -race`,
-`go vet ./...`, `go build ./cmd/hfdesk`, Windows test cross-builds for downloader
-and server, and the existing Windows storage-selector tests passed. The selector
-run is Linux execution, not native Windows evidence.
+On Linux Go 1.26.7, against the R source content, the focused downloader/server
+tests, `go test ./...`, `go test ./... -race`, `go vet ./...`,
+`go build ./cmd/hfdesk`, Windows test cross-builds for downloader and server, and
+the existing Windows storage-selector tests passed. The selector run is Linux
+execution, not native Windows evidence.
 
 Required-native `TestNativeMount*` was attempted. The runtime worker-marker
 negative case passed, but launching the positive private-mount subprocess failed
