@@ -11,10 +11,10 @@ test is discarded. The copy contains:
 
 .github/labels.yml in the fixture is augmented with the managed labels that
 exist live but are not yet declared there (enhancement, documentation, question,
-refactor, ci). Tests run with VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1, so the live
-`gh label list` lookup is skipped and the declared file must be self-sufficient;
-without the augmentation the baseline copy could not pass offline. No `gh`
-process is ever started.
+refactor, ci; a no-op once the reference file declares them). Tests run with
+VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1, so the live `gh label list` lookup is skipped
+and the declared file must be self-sufficient; without the augmentation the
+baseline copy could not pass offline. No `gh` process is ever started.
 
 Run:
   python3 .github/aw/test_validate_contract.py
@@ -88,6 +88,25 @@ LOCK_ISSUE_INTENT_FALSE = '\\"issue_intent\\":false'
 FIXTURE_MANAGED_LABELS = (
     "bug", "enhancement", "documentation", "question",
     "refactor", "ci", "needs-info", "duplicate",
+)
+
+# An anchor line in each source inside safe-outputs, used to inject unexpected keys.
+SOURCE_SAFE_OUTPUTS_ANCHOR = "  report-failed-jobs: false\n"
+# The compiled safe-output surface: manifest tool list and both config key sets.
+LOCK_SAFEOUTPUTS_MANIFEST = (
+    '"name":"safeoutputs","tools":["add_labels","missing_data","missing_tool",'
+    '"noop","remove_labels"]'
+)
+LOCK_SAFEOUTPUTS_MANIFEST_WITH_ISSUE = (
+    '"name":"safeoutputs","tools":["add_labels","create_issue","missing_data",'
+    '"missing_tool","noop","remove_labels"]'
+)
+# A config-set insertion point: the escaped JSON key immediately before the
+# built-in incomplete-run diagnostics, present in both configs of every lock.
+LOCK_CONFIG_INSERT_ANCHOR = '\\"missing_data\\":{},'
+LOCK_GITHUB_READ_ONLY = '                  "GITHUB_READ_ONLY": "1",\n'
+LOCK_SINK_ACCEPT_BLOCK = (
+    '"accept": [\n                      "private:${{ github.repository }}"\n                    ],'
 )
 
 
@@ -603,6 +622,250 @@ class ContractValidatorTest(unittest.TestCase):
     def test_missing_lock_fails(self) -> None:
         os.remove(self.path(BACKLOG_LOCK))
         self.assert_fails("missing lock file .github/workflows/backlog-retriage.lock.yml")
+
+    # -- safe-output capability class (source + compiled) ------------------
+    #
+    # The metadata-only contract allows only the two failure switches and the two
+    # label outputs. Each case below fails closed: an unlisted key (comment/issue/
+    # discussion/PR-write or unknown) must not compile and pass green.
+
+    def test_create_issue_safe_output_added_in_source_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel,
+                    SOURCE_SAFE_OUTPUTS_ANCHOR,
+                    SOURCE_SAFE_OUTPUTS_ANCHOR + "  create-issue: {}\n",
+                )
+                self.assert_fails(
+                    "must not declare the write-capable safe-output 'create-issue'"
+                )
+
+    def test_update_issue_safe_output_added_in_source_fails(self) -> None:
+        self.mutate(
+            ISSUE_MD,
+            SOURCE_SAFE_OUTPUTS_ANCHOR,
+            SOURCE_SAFE_OUTPUTS_ANCHOR + "  update-issue: {}\n",
+        )
+        self.assert_fails(
+            "must not declare the write-capable safe-output 'update-issue'"
+        )
+
+    def test_create_pull_request_safe_output_added_in_source_fails(self) -> None:
+        self.mutate(
+            PR_MD,
+            SOURCE_SAFE_OUTPUTS_ANCHOR,
+            SOURCE_SAFE_OUTPUTS_ANCHOR + "  create-pull-request: {}\n",
+        )
+        self.assert_fails(
+            "must not declare the write-capable safe-output 'create-pull-request'"
+        )
+
+    def test_push_to_pr_branch_safe_output_added_in_source_fails(self) -> None:
+        self.mutate(
+            BACKLOG_MD,
+            SOURCE_SAFE_OUTPUTS_ANCHOR,
+            SOURCE_SAFE_OUTPUTS_ANCHOR + "  push-to-pull-request-branch: {}\n",
+        )
+        self.assert_fails(
+            "must not declare the write-capable safe-output "
+            "'push-to-pull-request-branch'"
+        )
+
+    def test_unexpected_safe_output_key_in_source_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel,
+                    SOURCE_SAFE_OUTPUTS_ANCHOR,
+                    SOURCE_SAFE_OUTPUTS_ANCHOR + "  some-future-output: {}\n",
+                )
+                self.assert_fails(
+                    "declares unexpected safe-output key 'some-future-output'"
+                )
+
+    def test_inline_flow_safe_outputs_form_fails(self) -> None:
+        # A flow/scalar safe-outputs value cannot be checked against the key
+        # allowlist, so it must not be accepted as equivalent to the block mapping.
+        text = self.read(ISSUE_MD)
+        start = text.index("safe-outputs:\n")
+        end = text.index("\n---", start)
+        self.write(
+            ISSUE_MD,
+            text[:start] + "safe-outputs: {add-comment: true}\n" + text[end + 1:],
+        )
+        self.assert_fails(
+            "must use a block mapping for safe-outputs (the inline flow/scalar form"
+        )
+
+    def test_lock_safeoutputs_manifest_create_issue_fails(self) -> None:
+        for rel in (ISSUE_LOCK, PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel,
+                    LOCK_SAFEOUTPUTS_MANIFEST,
+                    LOCK_SAFEOUTPUTS_MANIFEST_WITH_ISSUE,
+                )
+                self.assert_fails(
+                    "compiled safe-output tool set must be exactly "
+                    "[add_labels, missing_data, missing_tool, noop, remove_labels]"
+                )
+
+    def test_lock_safeoutputs_manifest_missing_entry_fails(self) -> None:
+        self.mutate(ISSUE_LOCK, LOCK_SAFEOUTPUTS_MANIFEST, '"name":"safeoutputs","tools":[]')
+        self.assert_fails("compiled safe-output tool set must be exactly")
+
+    def test_lock_config_create_issue_handler_fails(self) -> None:
+        # A lock-side injected create_issue handler in the compiled config key set.
+        for rel in (ISSUE_LOCK, PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel,
+                    LOCK_CONFIG_INSERT_ANCHOR,
+                    LOCK_CONFIG_INSERT_ANCHOR + '\\"create_issue\\":{},',
+                    occurrences=2,
+                )
+                self.assert_fails("carries unexpected safe-output handler(s): create_issue")
+
+    def test_lock_config_add_comment_handler_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            LOCK_CONFIG_INSERT_ANCHOR,
+            LOCK_CONFIG_INSERT_ANCHOR + '\\"add_comment\\":{},',
+            occurrences=2,
+        )
+        self.assert_fails("carries unexpected safe-output handler(s): add_comment")
+
+    def test_lock_config_update_issue_handler_fails(self) -> None:
+        self.mutate(
+            PR_LOCK,
+            LOCK_CONFIG_INSERT_ANCHOR,
+            LOCK_CONFIG_INSERT_ANCHOR + '\\"update_issue\\":{},',
+            occurrences=2,
+        )
+        self.assert_fails("carries unexpected safe-output handler(s): update_issue")
+
+    def test_lock_config_missing_required_handler_fails(self) -> None:
+        text = self.read(BACKLOG_LOCK)
+        self.write(BACKLOG_LOCK, text.replace(LOCK_CONFIG_INSERT_ANCHOR, "", 2))
+        self.assert_fails("is missing safe-output handler(s): missing_data")
+
+    def test_lock_handler_config_key_removed_fails(self) -> None:
+        text = self.read(PR_LOCK)
+        head, sep, tail = text.partition("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG")
+        self.assertTrue(sep, "handler config line not found")
+        self.write(PR_LOCK, head.rstrip("\n") + "\n")
+        self.assert_fails("has no GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG")
+
+    def test_lock_safeoutputs_manifest_entry_removed_fails(self) -> None:
+        text = self.read(ISSUE_LOCK)
+        marker = ',{"name":"safeoutputs","tools":["add_labels","missing_data","missing_tool","noop","remove_labels"]}'
+        self.assertIn(marker, text, "unexpected manifest shape")
+        self.write(ISSUE_LOCK, text.replace(marker, "}"))
+        self.assert_fails(
+            "must carry exactly one gh-aw-manifest 'safeoutputs' tools entry"
+        )
+
+    def test_lock_duplicate_github_server_block_fails(self) -> None:
+        # A duplicate server entry could widen the surface (last-wins in JSON), so a
+        # second 'github' block must fail even when the first one is intact.
+        self.mutate(
+            ISSUE_LOCK,
+            "              \"safeoutputs\": {",
+            "              \"github\": {\n"
+            "                \"type\": \"stdio\",\n"
+            "                \"env\": {\n"
+            "                  \"GITHUB_TOOLSETS\": \"all\"\n"
+            "                }\n"
+            "              },\n"
+            "              \"safeoutputs\": {",
+        )
+        self.assert_fails("must carry exactly one 'github' MCP server block")
+
+    def test_lock_duplicate_safeoutputs_server_block_fails(self) -> None:
+        self.mutate(
+            PR_LOCK,
+            "            \"gateway\": {",
+            "            \"safeoutputs\": {\n"
+            "              \"type\": \"stdio\",\n"
+            "              \"guard-policies\": {\n"
+            "                \"write-sink\": {\n"
+            "                  \"accept\": [\"private:attacker/other-repo\"]\n"
+            "                }\n"
+            "              }\n"
+            "            },\n"
+            "            \"gateway\": {",
+        )
+        self.assert_fails("must carry exactly one 'safeoutputs' MCP server block")
+
+    def test_lock_duplicate_safeoutputs_manifest_entry_fails(self) -> None:
+        marker = LOCK_SAFEOUTPUTS_MANIFEST
+        text = self.read(BACKLOG_LOCK)
+        self.assertEqual(text.count(marker), 1, "unexpected manifest shape")
+        self.write(
+            BACKLOG_LOCK,
+            text.replace(
+                marker,
+                marker
+                + ',{"name":"safeoutputs","tools":["add_labels","create_issue",'
+                '"missing_data","missing_tool","noop","remove_labels"]}',
+            ),
+        )
+        self.assert_fails(
+            "must carry exactly one gh-aw-manifest 'safeoutputs' tools entry"
+        )
+
+    def test_lock_github_read_only_removed_fails(self) -> None:
+        for rel in (ISSUE_LOCK, PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate(rel, LOCK_GITHUB_READ_ONLY, "")
+                self.assert_fails(
+                    'must carry GITHUB_READ_ONLY: "1" in the github server env'
+                )
+
+    def test_lock_github_read_only_reassigned_to_script_expression_fails(self) -> None:
+        # The env value must be the literal "1", not an expression that a later
+        # change could flip back to write mode.
+        self.mutate(
+            ISSUE_LOCK,
+            LOCK_GITHUB_READ_ONLY,
+            '                  "GITHUB_READ_ONLY": "${{ vars.ALLOW_WRITE }}",\n',
+        )
+        self.assert_fails(
+            'must carry GITHUB_READ_ONLY: "1" in the github server env'
+        )
+
+    def test_lock_sink_accept_wildcard_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            LOCK_SINK_ACCEPT_BLOCK,
+            '"accept": [\n                      "*"\n                    ],',
+        )
+        self.assert_fails("safeoutputs write-sink 'accept' must be exactly")
+
+    def test_lock_sink_accept_all_fails(self) -> None:
+        self.mutate(
+            PR_LOCK,
+            LOCK_SINK_ACCEPT_BLOCK,
+            '"accept": [\n                      "all"\n                    ],',
+        )
+        self.assert_fails("safeoutputs write-sink 'accept' must be exactly")
+
+    def test_lock_sink_accept_public_fails(self) -> None:
+        self.mutate(
+            BACKLOG_LOCK,
+            LOCK_SINK_ACCEPT_BLOCK,
+            '"accept": [\n                      "public"\n                    ],',
+        )
+        self.assert_fails("safeoutputs write-sink 'accept' must be exactly")
+
+    def test_lock_sink_accept_other_repo_fails(self) -> None:
+        self.mutate(
+            ISSUE_LOCK,
+            LOCK_SINK_ACCEPT_BLOCK,
+            '"accept": [\n                      "private:attacker/other-repo"\n                    ],',
+        )
+        self.assert_fails("safeoutputs write-sink 'accept' must be exactly")
 
     # -- pre-existing checks stay enforced ---------------------------------
 

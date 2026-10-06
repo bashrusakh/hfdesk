@@ -9,6 +9,9 @@ No LLM. Checks, in order:
      (no filesystem write capability), the engine-level shell denial
      (engine.args containing '--deny-tool shell'), safe-outputs
      report-failure-as-issue and report-failed-jobs pinned false, no add-comment,
+     a fail-closed safe-outputs allowlist permitting only the
+     report-failure-as-issue/report-failed-jobs/add-labels/remove-labels key
+     family (no comment/issue/discussion/PR-write class, no unknown key),
      safe-outputs.add-labels issue-intent false (no label suggestion routing),
      the direct-label prompt instruction, tools.github.toolsets exactly ['issues']
      (the 'pull_requests' toolset would expose patch-capable PR tools the declared
@@ -28,7 +31,11 @@ No LLM. Checks, in order:
      level, no residual agent write capability: no --allow-tool write and no
      --allow-all-paths in the agent job, the compiled '--deny-tool shell' flag in
      the agent invocation, add_labels issue_intent:false in both safe-output
-     configs, no report-failed-jobs machinery, failure reports disabled, no
+     configs, the compiled safe-output tool set exactly the read-only label
+     family (manifest tools and both config key sets), the github server env
+     carrying GITHUB_READ_ONLY, the safeoutputs write-sink 'accept' list confined
+     to the private repository form, no report-failed-jobs machinery, failure
+     reports disabled, no
      agent-job checkout, not staged) and stays structurally in sync with its source
      (shared import pin + exact safe-output label lists);
   4. every contract file referenced by .github/triage-policy.md exists;
@@ -77,6 +84,16 @@ What this validator does NOT guarantee:
     proves the compiled config requests the intent-free schema; the pinned runtime script
     (gh-aw-actions/setup, pinned in the lock manifest) is what actually strips the fields,
     so a change to that pin must be re-checked against that script.
+  - The safe-output surface assertion is textual on three compiled surfaces (the manifest
+    'safeoutputs' tool list, both config key sets, and the write-sink 'accept' list) plus
+    the manifest's GITHUB_READ_ONLY env flag. It proves which handlers the pinned compiler
+    enabled and declared; it cannot prove the runtime handler module behaves as its name
+    implies, so a pin change to gh-aw-actions/setup must be re-checked.
+  - The source safe-output allowlist parses block-mapping keys at depth 2 under a
+    'safe-outputs:' key. It rejects a comment/issue/discussion/PR-write class and any
+    unknown key, but a nesting trick the textual parser cannot see (for example a
+    different key shape that gh-aw itself understands but this parser does not) would not
+    be caught; `gh aw compile --strict` remains the schema-level check.
   - The toolsets assertion matches the declared list and the compiled GITHUB_TOOLSETS
     value against the intended set. It proves the workflow only requests the issue
     surface; it cannot prove how the pinned github-mcp-server builds its advertised
@@ -87,6 +104,10 @@ What this validator does NOT guarantee:
 Set VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 to skip the live repository label lookup
 (offline/test mode used by .github/aw/test_validate_contract.py); in that mode
 .github/labels.yml must declare every managed label because the live set is not read.
+The live lookup also degrades to a warning (rather than an error) when it is attempted
+but cannot run at all (no `gh` binary, no auth/network, unreadable repository), so the
+validator stays usable offline; when the live set IS readable, a managed label missing
+from both the declared file and the live repository remains a hard error.
 """
 
 from __future__ import annotations
@@ -191,6 +212,71 @@ LOCK_MANIFEST_GITHUB = re.compile(r'"name"\s*:\s*"github"\s*,\s*"tools"\s*:\s*\[
 SHARED_REF_SHA = re.compile(r"repo-docs-sync/[^\s@\"']+@([0-9a-f]{40})")
 LOCK_CONFIG_KEYS = ("GH_AW_SAFE_OUTPUTS_CONFIG", "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG")
 
+# The only safe-outputs keys a triage source may declare. An explicit allowlist,
+# not a forbidden list: any unlisted key (including a future comment/issue/
+# discussion/PR-write safe output, or a lock-side misconfiguration) fails closed
+# rather than compiling and passing green. The metadata-only contract has exactly
+# two failure-diagnostic switches and two label outputs.
+ALLOWED_SOURCE_SAFE_OUTPUT_KEYS = (
+    "report-failure-as-issue",
+    "report-failed-jobs",
+    "add-labels",
+    "remove-labels",
+)
+
+# Write-capable safe-output classes the agent surface must never expose. Named
+# separately from the allowlist only to report the precise capability family
+# instead of a generic 'unknown key'; the allowlist is the enforcing check.
+FORBIDDEN_SOURCE_SAFE_OUTPUT_KEYS = (
+    "add-comment",
+    "create-issue",
+    "update-issue",
+    "close-issue",
+    "create-discussion",
+    "update-discussion",
+    "create-pull-request",
+    "push-to-pull-request-branch",
+    "create-pull-request-review-comment",
+    "reply-to-pull-request-review-comment",
+    "submit-pull-request-review",
+    "create-agent-session",
+    "assign-to-user",
+    "create-code-scanning-alert",
+    "upload-asset",
+)
+
+# The exact compiled agent-visible safe-output tool set, parsed from the
+# gh-aw-manifest mcp_servers 'safeoutputs' entry. This is the surface the Copilot
+# CLI can call (the lock carries a single '--allow-tool safeoutputs' grant, so the
+# manifest tool list is the whole agent-visible write surface).
+REQUIRED_LOCK_SAFE_OUTPUT_TOOLS = (
+    "add_labels",
+    "missing_data",
+    "missing_tool",
+    "noop",
+    "remove_labels",
+)
+
+# The exact key set each compiled safe-output config may carry. It is the agent
+# tool set above plus two keys the pinned compiler always emits as operator
+# diagnostics, not agent tools: 'report_incomplete' records an agent incomplete
+# signal, and 'create_report_incomplete_issue' is handled in the conclusion job
+# (GH_AW_REPORT_INCOMPLETE_CREATE_ISSUE). Both are pre-existing on the base branch;
+# asserting an exact set (rather than 'no forbidden key') keeps a future
+# comment/issue/discussion/PR-write handler from slipping into either config.
+ALLOWED_LOCK_SAFE_OUTPUT_CONFIG_KEYS = tuple(
+    sorted(REQUIRED_LOCK_SAFE_OUTPUT_TOOLS)
+    + ["create_report_incomplete_issue", "report_incomplete"]
+)
+LOCK_MANIFEST_SAFEOUTPUTS = re.compile(
+    r'"name"\s*:\s*"safeoutputs"\s*,\s*"tools"\s*:\s*\[([^\]]*)\]'
+)
+
+# The only write-sink accept entry the safeoutputs MCP server may carry: the
+# private form of the current-repository expression. '*', 'all', or 'public'
+# would admit writes to other repositories or to public sinks.
+SAFE_OUTPUTS_SINK_ACCEPT = "private:" + REPO_SCOPE_EXPRESSION
+
 BACKTICK = re.compile(r"`([^`]+)`")
 LABEL_LIKE = re.compile(r"^[a-z0-9][a-z0-9 ._*-]*$")
 PATH_LIKE = re.compile(r"(/|\.md$|\.yml$|\.yaml$)")
@@ -228,9 +314,21 @@ def declared_labels() -> set[str]:
     return names
 
 
-def live_labels() -> set[str]:
+def live_labels() -> tuple[set[str], str]:
+    """Return (names, state) for the live repository label set.
+
+    `state` is one of:
+      - "live": the label list was read; a managed label absent from both the
+        declared file and this set is an error (fail-closed);
+      - "skipped": VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 explicitly asks for a
+        self-sufficient declared file, so a miss stays an error;
+      - "unavailable": the lookup was attempted but could not run (no `gh`, no
+        auth/network, unreadable repository). The caller degrades a declared-file
+        miss to a warning so the validator remains usable offline; it cannot tell
+        drift from a removed label without the live set.
+    """
     if os.environ.get(SKIP_LIVE_LABELS_ENV) == "1":
-        return set()
+        return set(), "skipped"
     repo = os.environ.get("GH_REPO", "")
     cmd = ["gh", "label", "list", "--limit", "200"]
     if repo:
@@ -240,13 +338,16 @@ def live_labels() -> set[str]:
             cmd, capture_output=True, text=True, timeout=60, check=True
         ).stdout
     except Exception as exc:  # noqa: BLE001 - report and degrade to declared-only
-        warnings.append(f"could not read live labels ({exc}); checking declared file only")
-        return set()
+        warnings.append(
+            f"could not read live labels ({exc}); checking declared file only "
+            "(missing declared labels are warnings until the live set is readable)"
+        )
+        return set(), "unavailable"
     names = set()
     for line in out.splitlines():
         if line.strip():
             names.add(line.split("\t", 1)[0].strip())
-    return names
+    return names, "live"
 
 
 def rel(path: str) -> str:
@@ -321,7 +422,7 @@ def check_labels() -> None:
         return
 
     declared = declared_labels()
-    live = live_labels()
+    live, live_state = live_labels()
     known = declared | live
 
     for label in sorted(managed):
@@ -331,6 +432,17 @@ def check_labels() -> None:
                     f"managed label '{label}' exists live but is missing from "
                     f"{rel(LABELS_YML)} (reference-set drift)"
                 )
+        elif live_state == "unavailable":
+            # The live label set could not be read (offline run or unavailable `gh`),
+            # so a declared-file miss cannot be distinguished from a label that exists
+            # live but is not declared here. Degrade to a warning so the validator is
+            # usable offline; with a readable live set (or the explicit offline test
+            # mode, where the declared file must be self-sufficient) this is an error.
+            warnings.append(
+                f"managed label '{label}' is not declared in {rel(LABELS_YML)} and "
+                "the live label set could not be read; cannot confirm it exists "
+                "(reference-set drift or removed/renamed label)"
+            )
         else:
             errors.append(
                 f"managed label '{label}' referenced by policy exists in neither "
@@ -476,6 +588,40 @@ def add_labels_issue_intent_false(fm: str) -> bool:
     )
 
 
+def source_safe_output_keys(fm: str) -> list[str] | None:
+    """Return the direct safe-outputs keys declared in the source frontmatter.
+
+    Returns None when there is no safe-outputs block, and the ordered key list
+    otherwise. The direct-child indentation is taken as the minimum indentation of
+    the block body, so the mapping is checked whatever consistent indent is used.
+    Used as an explicit allowlist gate: the metadata-only contract has exactly the
+    failure-diagnostic switches and the two label outputs, so any other key -
+    including a comment/issue/discussion/PR-write safe output - fails closed
+    instead of compiling green.
+    """
+    safe = key_entry(fm, "safe-outputs", 0)
+    if safe is None:
+        return None
+    body = [
+        line
+        for line in safe[1]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not body:
+        return []
+    child_indent = min(len(line) - len(line.lstrip(" ")) for line in body)
+    keys: list[str] = []
+    for line in body:
+        if len(line) - len(line.lstrip(" ")) != child_indent:
+            continue
+        stripped = line.strip()
+        if ":" not in stripped:
+            continue
+        key = stripped.split(":", 1)[0].strip()
+        keys.append(_unquote(key))
+    return keys
+
+
 def check_triage_sources() -> None:
     """Enforce the metadata-only capability surface on every triage source."""
     for md in WORKFLOWS:
@@ -517,6 +663,39 @@ def check_triage_sources() -> None:
             errors.append(
                 f"{rel_path} must not declare an 'add-comment:' key (silent workflow)"
             )
+
+        keys = source_safe_output_keys(fm)
+        if keys is None:
+            errors.append(
+                f"{rel_path} must declare a safe-outputs block with only the "
+                "metadata-only key family: "
+                + ", ".join(ALLOWED_SOURCE_SAFE_OUTPUT_KEYS)
+            )
+        else:
+            safe = key_entry(fm, "safe-outputs", 0)
+            if safe is not None and safe[0].strip():
+                errors.append(
+                    f"{rel_path} must use a block mapping for safe-outputs (the "
+                    "inline flow/scalar form cannot be checked against the "
+                    "metadata-only key allowlist)"
+                )
+            for key in keys:
+                if key in ALLOWED_SOURCE_SAFE_OUTPUT_KEYS:
+                    continue
+                if key in FORBIDDEN_SOURCE_SAFE_OUTPUT_KEYS:
+                    errors.append(
+                        f"{rel_path} must not declare the write-capable "
+                        f"safe-output '{key}' (metadata-only contract allows only "
+                        + ", ".join(ALLOWED_SOURCE_SAFE_OUTPUT_KEYS)
+                        + ")"
+                    )
+                else:
+                    errors.append(
+                        f"{rel_path} declares unexpected safe-output key '{key}' "
+                        "(the metadata-only allowlist is exactly: "
+                        + ", ".join(ALLOWED_SOURCE_SAFE_OUTPUT_KEYS)
+                        + ")"
+                    )
 
         tools = key_entry(fm, "tools", 0)
         github = key_entry("\n".join(tools[1]), "github", 2) if tools else None
@@ -760,6 +939,157 @@ def lock_issue_intent_disabled(text: str) -> bool:
     return found == len(LOCK_CONFIG_KEYS)
 
 
+def lock_config_key_sets(text: str) -> dict[str, list[str] | None]:
+    """Return the compiled safe-output config key set(s), or None when unparsable.
+
+    Both GH_AW_SAFE_OUTPUTS_CONFIG and GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG are parsed;
+    a key present with an unparsable value maps to None so the caller reports it,
+    and a key absent from the lock is simply omitted (the caller reports that too).
+    """
+    parsed: dict[str, list[str] | None] = {}
+    for key in LOCK_CONFIG_KEYS:
+        match = re.search(
+            r"^\s*" + re.escape(key) + r':\s*(".*")\s*$', text, re.MULTILINE
+        )
+        if not match:
+            continue
+        try:
+            config = json.loads(json.loads(match.group(1)))
+        except (TypeError, ValueError):
+            parsed[key] = None
+            continue
+        parsed[key] = sorted(config.keys()) if isinstance(config, dict) else None
+    return parsed
+
+
+def lock_server_blocks(text: str, name: str) -> list[str]:
+    """Return the bodies of every pretty-printed '<name>': { ... } JSON block.
+
+    The lock's MCP config is emitted at fixed indentation, so a block ends at the
+    next non-blank line indented no deeper than its key. Returning every match
+    (not just the first) lets the caller fail closed on a duplicate server entry,
+    which a JSON parser would otherwise silently resolve last-wins.
+    """
+    lines = text.splitlines()
+    pattern = re.compile(r'^(\s*)"' + re.escape(name) + r'"\s*:\s*\{\s*$')
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        body = []
+        for following in lines[index + 1:]:
+            if not following.strip():
+                body.append(following)
+                continue
+            if len(following) - len(following.lstrip(" ")) <= indent:
+                break
+            body.append(following)
+        blocks.append("\n".join(body))
+    return blocks
+
+
+def check_lock_safe_output_surface(lock_rel: str, text: str) -> None:
+    """Assert the compiled safe-output surface is exactly the read-only label family.
+
+    Three independent surfaces are checked, because any one of them can widen the
+    agent-visible write capability:
+      - the gh-aw-manifest mcp_servers 'safeoutputs' tools list (the compiled tool
+        surface; the agent job carries a single '--allow-tool safeoutputs' grant, so
+        the manifest list is the whole agent-visible safe-output surface);
+      - the GH_AW_SAFE_OUTPUTS_CONFIG and GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG key sets
+        (the enabled handler set; the pinned compiler always adds the two built-in
+        incomplete-run diagnostics, which are enabled by default with safe-outputs);
+      - the github server env GITHUB_READ_ONLY flag (read-only server mode) and the
+        safeoutputs write-sink 'accept' list (must stay confined to the private form
+        of the repository expression).
+    """
+    manifests = LOCK_MANIFEST_SAFEOUTPUTS.findall(text)
+    if len(manifests) != 1:
+        errors.append(
+            f"{lock_rel} must carry exactly one gh-aw-manifest 'safeoutputs' tools "
+            f"entry; found {len(manifests)}"
+        )
+    else:
+        tools = sorted(
+            piece
+            for piece in re.split(r"[,\s\"]+", manifests[0])
+            if piece
+        )
+        if tools != sorted(REQUIRED_LOCK_SAFE_OUTPUT_TOOLS):
+            errors.append(
+                f"{lock_rel} compiled safe-output tool set must be exactly "
+                f"[{', '.join(REQUIRED_LOCK_SAFE_OUTPUT_TOOLS)}]; got "
+                f"[{', '.join(tools)}] (a comment/issue/discussion/PR-write "
+                "handler or tool must not be agent-visible)"
+            )
+
+    parsed = lock_config_key_sets(text)
+    for key in LOCK_CONFIG_KEYS:
+        if key not in parsed:
+            errors.append(f"{lock_rel} has no {key}")
+            continue
+        keys = parsed[key]
+        if keys is None:
+            errors.append(f"{lock_rel} {key} is not a valid JSON config")
+            continue
+        unexpected = sorted(set(keys) - set(ALLOWED_LOCK_SAFE_OUTPUT_CONFIG_KEYS))
+        missing = sorted(set(ALLOWED_LOCK_SAFE_OUTPUT_CONFIG_KEYS) - set(keys))
+        if unexpected:
+            errors.append(
+                f"{lock_rel} {key} carries unexpected safe-output handler(s): "
+                + ", ".join(unexpected)
+                + " (only the read-only label family plus the built-in "
+                "incomplete-run diagnostics may be enabled)"
+            )
+        if missing:
+            errors.append(
+                f"{lock_rel} {key} is missing safe-output handler(s): "
+                + ", ".join(missing)
+            )
+
+    github_blocks = lock_server_blocks(text, "github")
+    if len(github_blocks) != 1:
+        errors.append(
+            f"{lock_rel} must carry exactly one 'github' MCP server block; found "
+            f"{len(github_blocks)} (a duplicate entry could widen the surface)"
+        )
+    elif not re.search(r'"GITHUB_READ_ONLY"\s*:\s*"1"', github_blocks[0]):
+        errors.append(
+            f'{lock_rel} must carry GITHUB_READ_ONLY: "1" in the github server env '
+            "(the pinned github MCP server would otherwise expose write tools)"
+        )
+
+    safeoutputs_blocks = lock_server_blocks(text, "safeoutputs")
+    if len(safeoutputs_blocks) != 1:
+        errors.append(
+            f"{lock_rel} must carry exactly one 'safeoutputs' MCP server block; "
+            f"found {len(safeoutputs_blocks)}"
+        )
+    else:
+        sinks = re.findall(
+            r'"accept"\s*:\s*\[(.*?)\]', safeoutputs_blocks[0], re.DOTALL
+        )
+        if len(sinks) != 1:
+            errors.append(
+                f"{lock_rel} must carry exactly one safeoutputs write-sink 'accept' "
+                f"list; found {len(sinks)}"
+            )
+        else:
+            entries = sorted(
+                piece.strip().strip("\"'")
+                for piece in sinks[0].split(",")
+                if piece.strip()
+            )
+            if entries != [SAFE_OUTPUTS_SINK_ACCEPT]:
+                errors.append(
+                    f"{lock_rel} safeoutputs write-sink 'accept' must be exactly "
+                    f"['{SAFE_OUTPUTS_SINK_ACCEPT}']; got {entries} (a wildcard, 'all', "
+                    "or 'public' sink admits writes outside the current repository)"
+                )
+
+
 def check_lock_currency(md: str, lock_text: str, lock_rel: str) -> None:
     """Lock currency without `gh aw`: shared pin + safe-output label lists.
 
@@ -838,6 +1168,8 @@ def check_triage_locks() -> None:
                 f"{lock_rel} exposes forbidden github tool(s): "
                 + ", ".join(sorted(exposed))
             )
+
+        check_lock_safe_output_surface(lock_rel, text)
 
         # The toolset selection is the capability root: the pinned github-mcp-server
         # advertises every tool of a requested toolset regardless of the per-tool
