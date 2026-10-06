@@ -5,11 +5,13 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -194,7 +196,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			LastModified:  m.LastModified,
 			CreatedAt:     m.CreatedAt,
 		}
-		if localRepo, localErr := findLocalCachedRepoWithNamespace(managedRoots, m.ID, isDataset, namespaceMemberships); localErr == nil {
+		localRepo, localErr := findLocalCachedRepoWithNamespace(managedRoots, m.ID, isDataset, namespaceMemberships)
+		if localErr != nil && !errors.Is(localErr, os.ErrNotExist) {
+			writeError(w, http.StatusInternalServerError, "Failed to inspect local cache", localErr.Error())
+			return
+		}
+		if localErr == nil {
 			result.Cached = true
 			result.CacheSource = localRepo.Source
 			result.CacheStatus = localRepo.DownloadStatus

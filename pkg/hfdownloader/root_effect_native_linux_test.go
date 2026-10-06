@@ -172,24 +172,29 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 				if friendly {
 					observedPath = friendlyPath
 				}
-				var occurrenceObserved, ownedRegionClaimed bool
+				var boundaryObserved, ownedRegionClaimed, contentLeaked bool
 				for _, membership := range memberships {
 					if filepath.Clean(membership.Path) != filepath.Clean(observedPath) {
 						continue
-					}
-					for _, entry := range membership.Entries {
-						if filepath.Clean(entry.Path) == filepath.Clean(mounted) && os.SameFile(entry.Info, mustStat(t, source)) {
-							occurrenceObserved = true
-						}
 					}
 					for _, region := range membership.Regions {
 						if filepath.Clean(region.Path) == filepath.Clean(mounted) && os.SameFile(region.Info, mustStat(t, source)) {
 							ownedRegionClaimed = true
 						}
 					}
+					for _, boundary := range membership.Boundaries {
+						if filepath.Clean(boundary.Path) == filepath.Clean(mounted) && os.SameFile(boundary.Info, mustStat(t, source)) && boundary.Pruned {
+							boundaryObserved = true
+						}
+					}
+					for _, entry := range membership.Entries {
+						if filepath.Dir(filepath.Clean(entry.Path)) == filepath.Clean(mounted) {
+							contentLeaked = true
+						}
+					}
 				}
-				if !occurrenceObserved || ownedRegionClaimed {
-					t.Fatalf("bind-mounted occurrence/owned-region facts mismatch for %q: occurrence=%v owned-region=%v", mounted, occurrenceObserved, ownedRegionClaimed)
+				if !boundaryObserved || ownedRegionClaimed || contentLeaked {
+					t.Fatalf("bind-mounted occurrence/owned-region facts mismatch for %q: boundary=%v owned-region=%v content-leaked=%v", mounted, boundaryObserved, ownedRegionClaimed, contentLeaked)
 				}
 				if _, err := os.Stat(filepath.Join(mounted, "keep.txt")); err != nil {
 					t.Fatalf("bind-mounted sentinel was not observable: %v", err)

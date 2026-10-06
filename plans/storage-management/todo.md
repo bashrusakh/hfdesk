@@ -18,9 +18,12 @@
   - [x] Attempt required-native `TestNativeMount*`; worker-marker negative case
     passed, but positive subprocess launch failed `operation not permitted` before
     namespace setup. No native mount/Go 1.24 pass is claimed.
-  - [x] Commit R source as `4bcf7f9`; base-to-candidate additions plus deletions
-    are 4,745 lines (< 5,000), and archive A is not its ancestor.
-  - [ ] Parent whole-R review/rescope of owned Draft #111.
+  - [x] Historical source commit `4bcf7f9` was reviewed as requiring changes;
+    archive A is not its ancestor. That review is not approval of corrected R.
+  - [ ] Commit corrected source/test/CI bytes and status snapshot; intended diff
+    is 4,899 additions plus deletions before status-doc edits.
+  - [ ] Parent refreshes verification, reviews complete corrected R and rescope
+    of owned Draft #111. Publication and Ready remain unauthorized.
 - [ ] Build Safety S from reviewed R, selectively recover only bounded guards,
   destructive integration and safety tests from A, implement E and close F7.
 - [ ] Start coordination/state work only after both root-stage foundations are

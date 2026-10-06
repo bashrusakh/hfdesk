@@ -113,6 +113,16 @@ type NamespaceMembership struct {
 	Directory              os.FileInfo
 	Regions                []NamespaceDirectoryRegion
 	Entries                []NamespaceEntry
+	Boundaries             []NamespaceBoundary
+}
+
+// NamespaceBoundary records a directory occurrence observed at an ownership
+// boundary. Its identity is descriptive only; children are not observed.
+type NamespaceBoundary struct {
+	Path        string
+	Info        os.FileInfo
+	OwnerRootID string
+	Pruned      bool
 }
 
 // NamespaceDirectoryRegion records one reachable directory occurrence. The
@@ -529,7 +539,7 @@ func (set *ManagedRootSet) Resolve(rootID, owner, name string) (string, error) {
 		return "", err
 	}
 	root, ok := set.Root(rootID)
-	if !ok || root.Roles&ManagedRootBrowse == 0 || !IsValidRepoComponent(owner) || !IsValidRepoComponent(name) {
+	if !ok || root.Roles&ManagedRootBrowse == 0 || !IsValidModelName(owner+"/"+name) || filepath.IsAbs(owner) || filepath.IsAbs(name) || filepath.VolumeName(owner+string(filepath.Separator)+name) != "" {
 		return "", errors.New("invalid managed-root repository path")
 	}
 	return filepath.Join(root.AbsolutePath, owner, name), nil
@@ -541,7 +551,7 @@ func (set *ManagedRootSet) WalkOwned(rootID, dir string, fn filepath.WalkFunc) e
 	if err := set.ready(); err != nil {
 		return err
 	}
-	return set.walkOwnedEntries(rootID, dir, nil, fn, nil, nil)
+	return set.walkOwnedEntries(rootID, dir, nil, fn, nil, nil, nil)
 }
 
 // SameDirectoryObjectFacts distinguishes known inequality from missing or

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 
@@ -55,15 +56,18 @@ func mustWorkingDirectory() string {
 	return base
 }
 
-func (root localCacheRoot) skipsOwner(owner string) bool {
+func (root localCacheRoot) skipsOwner(owner string) (bool, error) {
 	if root.SkipSpecial {
 		if root.set == nil {
-			return true
+			return false, errors.New("managed root is unavailable while checking owner")
 		}
 		allowed, err := root.set.domain.AllowsOwner(root.ID, owner)
-		return err != nil || !allowed
+		if err != nil {
+			return false, err
+		}
+		return !allowed, nil
 	}
-	return false
+	return false, nil
 }
 
 func newManagedRootSet(cacheDir, hubDir, localDir string, localScanDirs []string, routes map[string]string, base string) *storageRootSet {

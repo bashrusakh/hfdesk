@@ -56,7 +56,7 @@ type reachedDirectory struct {
 // walkOwnedEntries observes one configured namespace slot while excluding
 // entries owned by nested roots. Directory identities are revisited through
 // distinct paths because those paths can expose different namespace regions.
-func (set *ManagedRootSet) walkOwnedEntries(rootID, start string, expectedRoot os.FileInfo, fn filepath.WalkFunc, chargeComparisons, chargeWork func(int) error) error {
+func (set *ManagedRootSet) walkOwnedEntries(rootID, start string, expectedRoot os.FileInfo, fn filepath.WalkFunc, boundaryFn func(string, os.FileInfo, string) error, chargeComparisons, chargeWork func(int) error) error {
 	root, ok := set.Root(rootID)
 	if !ok {
 		return fmt.Errorf("unknown managed root %q", rootID)
@@ -88,8 +88,33 @@ func (set *ManagedRootSet) walkOwnedEntries(rootID, start string, expectedRoot o
 			return fmt.Errorf("owned walk depth exceeds %d", maxEffectDepth)
 		}
 		owned, err := set.ownedWalkPath(root, path, chargeComparisons)
-		if err != nil || !owned {
+		if err != nil {
 			return err
+		}
+		if !owned {
+			if expected == nil || !expected.IsDir() || boundaryFn == nil {
+				return nil
+			}
+			dir, openErr := observer.openDir(path)
+			if openErr != nil {
+				return fmt.Errorf("open ownership boundary %q: %w", path, openErr)
+			}
+			info, statErr := dir.stat()
+			closeErr := dir.close()
+			if statErr != nil {
+				return fmt.Errorf("identify ownership boundary %q: %w", path, statErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close ownership boundary %q: %w", path, closeErr)
+			}
+			if !info.IsDir() || !os.SameFile(info, expected) {
+				return fmt.Errorf("ownership boundary changed during observation: %q", path)
+			}
+			owner, ownerErr := set.OwnerForPath(path)
+			if ownerErr != nil {
+				return fmt.Errorf("resolve ownership boundary %q: %w", path, ownerErr)
+			}
+			return boundaryFn(path, info, owner.ID)
 		}
 		dir, err := observer.openDir(path)
 		if err != nil {

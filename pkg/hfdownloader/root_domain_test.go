@@ -17,8 +17,16 @@ func TestManagedRootIdentityUsesCapturedLexicalBase(t *testing.T) {
 	if path, err := set.Resolve(rootID, "owner", "repo"); err != nil || path != filepath.Join(missing, "owner", "repo") {
 		t.Fatalf("resolve = %q, %v", path, err)
 	}
-	if _, err := set.Resolve(rootID, "..", "outside"); err == nil {
-		t.Fatal("resolve accepted path traversal")
+	for _, id := range [][2]string{{"..", "outside"}, {"owner", ".."}, {"owner", "bad\\name"}, {"owner", "nested/name"}} {
+		if _, err := set.Resolve(rootID, id[0], id[1]); err == nil {
+			t.Errorf("resolve accepted unsafe repository path %q/%q", id[0], id[1])
+		}
+	}
+	for _, id := range [][2]string{{"owner", "My Model"}, {"ümlaut", "模型"}} {
+		want := filepath.Join(missing, id[0], id[1])
+		if got, err := set.Resolve(rootID, id[0], id[1]); err != nil || got != want {
+			t.Errorf("resolve valid observed ID %q/%q = %q, %v; want %q", id[0], id[1], got, err, want)
+		}
 	}
 	if err := os.MkdirAll(filepath.Join(missing, "owner", "repo"), 0o755); err != nil {
 		t.Fatal(err)

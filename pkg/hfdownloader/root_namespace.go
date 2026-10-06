@@ -357,20 +357,21 @@ func (set *ManagedRootSet) observeNamespaceSlot(root ManagedRoot, kind PhysicalC
 	if err := chargeComparisons(len(set.roots)); err != nil {
 		return NamespaceMembership{}, err
 	}
-	regions, entries, err := set.observeOwnedNamespaceEntries(root.ID, path, rootInfo, chargeComparisons, charge)
+	regions, entries, boundaries, err := set.observeOwnedNamespaceEntries(root.ID, path, rootInfo, chargeComparisons, charge)
 	if err != nil {
 		return NamespaceMembership{}, fmt.Errorf("observe owned namespace slot %q: %w", path, err)
 	}
 	return NamespaceMembership{
 		Root: root, OwnerRootID: owner.ID, Kind: kind, RepoID: repoID, RepoType: repoType,
 		TypeKnown: typeKnown, OwnedPathMatchObserved: ownedPathMatchObserved, Path: path, OwnedPath: ownedPath, Directory: rootInfo,
-		Regions: regions, Entries: entries,
+		Regions: regions, Entries: entries, Boundaries: boundaries,
 	}, nil
 }
 
-func (set *ManagedRootSet) observeOwnedNamespaceEntries(rootID, rootPath string, expected os.FileInfo, chargeComparisons func(int) error, charge func(int) error) ([]NamespaceDirectoryRegion, []NamespaceEntry, error) {
+func (set *ManagedRootSet) observeOwnedNamespaceEntries(rootID, rootPath string, expected os.FileInfo, chargeComparisons func(int) error, charge func(int) error) ([]NamespaceDirectoryRegion, []NamespaceEntry, []NamespaceBoundary, error) {
 	var regions []NamespaceDirectoryRegion
 	var entries []NamespaceEntry
+	var boundaries []NamespaceBoundary
 	seenRoot := false
 	err := set.walkOwnedEntries(rootID, rootPath, expected, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
@@ -387,16 +388,19 @@ func (set *ManagedRootSet) observeOwnedNamespaceEntries(rootID, rootPath string,
 			regions = append(regions, NamespaceDirectoryRegion{Path: path, Info: info})
 		}
 		return nil
+	}, func(path string, info os.FileInfo, ownerID string) error {
+		boundaries = append(boundaries, NamespaceBoundary{Path: path, Info: info, OwnerRootID: ownerID, Pruned: true})
+		return nil
 	}, chargeComparisons, charge)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if seenRoot {
-		return regions, entries, nil
+		return regions, entries, boundaries, nil
 	}
 	// The candidate path belongs to a nested configured root, so the enclosing
 	// root observes a distinct membership but no entries in that nested region.
-	return nil, nil, nil
+	return nil, nil, nil, nil
 }
 
 // NamespaceMembershipsFor filters only after complete managed-namespace

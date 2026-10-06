@@ -150,12 +150,16 @@ func TestManagedNamespaceRetainsRolesAndPrunesNestedOwnedRegion(t *testing.T) {
 		t.Fatalf("parent membership missing: %#v", all)
 	}
 	var parentOwn, nestedLeak bool
+	var nestedBoundary bool
 	for _, entry := range parentSlot[0].Entries {
 		parentOwn = parentOwn || entry.Info.Name() == "own.safetensors"
 		nestedLeak = nestedLeak || entry.Info.Name() == "child.gguf"
 	}
-	if !parentOwn || nestedLeak {
-		t.Fatalf("owned region facts mismatch: own=%v nested-leak=%v entries=%#v", parentOwn, nestedLeak, parentSlot[0].Entries)
+	for _, boundary := range parentSlot[0].Boundaries {
+		nestedBoundary = nestedBoundary || boundary.Path == nestedRoot && boundary.Pruned && boundary.OwnerRootID != ""
+	}
+	if !parentOwn || nestedLeak || !nestedBoundary {
+		t.Fatalf("owned region facts mismatch: own=%v nested-leak=%v nested-boundary=%v entries=%#v boundaries=%#v", parentOwn, nestedLeak, nestedBoundary, parentSlot[0].Entries, parentSlot[0].Boundaries)
 	}
 }
 

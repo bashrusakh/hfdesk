@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,79 @@ func TestScanLocalCachedRepos(t *testing.T) {
 	}
 	if found["owner/model"] != "Friendly view" {
 		t.Fatalf("expected friendly-view repo, got %#v", found)
+	}
+}
+
+func TestFindLocalCachedRepoPropagatesLateOwnerUnknown(t *testing.T) {
+	base := t.TempDir()
+	cacheDir := filepath.Join(base, "cache")
+	repo := filepath.Join(cacheDir, "ordinary", "raw")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "model.safetensors"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), "", nil, nil, base)
+	memberships, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(base, "cache-observed")
+	if err := os.Rename(cacheDir, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cacheDir, cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := findLocalCachedRepoWithNamespace(set, "ordinary/raw", false, memberships); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("late owner identity error became an absent repository: %v", err)
+	}
+}
+
+func TestObservedUnicodeAndWhitespaceReposResolveAndList(t *testing.T) {
+	base := t.TempDir()
+	local := filepath.Join(base, "local")
+	ids := [][2]string{{"owner", "My Model"}, {"ümlaut", "模型"}}
+	for _, id := range ids {
+		repo := filepath.Join(local, id[0], id[1])
+		if err := os.MkdirAll(repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "weights.safetensors"), []byte("weights"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "cache", "hub"), local, nil, nil, base)
+	memberships, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := scanLocalCachedReposWithNamespace(set.Roots(), memberships, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRoot, ok := set.Root(configuredPathID(local, base))
+	if !ok {
+		t.Fatal("local browse root was not configured")
+	}
+	for _, id := range ids {
+		repoID := id[0] + "/" + id[1]
+		resolved, err := set.domain.Resolve(localRoot.ID, id[0], id[1])
+		if err != nil || resolved != filepath.Join(local, id[0], id[1]) {
+			t.Fatalf("resolve observed ID %q = %q, %v", repoID, resolved, err)
+		}
+		found, err := findLocalCachedRepoWithNamespace(set, repoID, true, memberships)
+		if err != nil || found.Repo != repoID || found.Path != resolved {
+			t.Fatalf("detail lookup for %q = %#v, %v", repoID, found, err)
+		}
+		foundListed := false
+		for _, repo := range listed {
+			foundListed = foundListed || repo.Repo == repoID && repo.Path == resolved
+		}
+		if !foundListed {
+			t.Fatalf("list omitted resolved repo %q: %#v", repoID, listed)
+		}
 	}
 }
 

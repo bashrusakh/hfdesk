@@ -1066,7 +1066,14 @@ func findLocalCachedRepoWithNamespace(set *storageRootSet, repoID string, includ
 	})
 	for _, candidate := range candidates {
 		root, ok := set.Root(candidate.Root.ID)
-		if !candidate.OwnedPathMatchObserved || !ok || root.skipsOwner(parts[0]) {
+		if !candidate.OwnedPathMatchObserved || !ok {
+			continue
+		}
+		skip, err := root.skipsOwner(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("qualify local cache owner %q: %w", parts[0], err)
+		}
+		if skip {
 			continue
 		}
 		if !hasLocalWeightFileEntries(candidate.Entries) {
