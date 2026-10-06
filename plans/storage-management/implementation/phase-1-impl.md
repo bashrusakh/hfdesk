@@ -12,7 +12,7 @@ historical and requires changes: it identified three implementation/evidence
 correspondence gaps. The corrected dirty worktree is a new candidate, not the
 reviewed 1cc state; fresh whole-R review is pending. Base-to-HEAD is 4,751 lines;
 with the intended corrections it is 4,899 before this status-only doc update
-(<5,000; the final status-record update brings the full diff to 4,920 lines).
+(<5,000 additions plus deletions in the final base-to-candidate diff).
 R is not a safety implementation and is not Ready.
 
 Full WIP preservation A is committed locally at
