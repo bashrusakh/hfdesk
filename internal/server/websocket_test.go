@@ -99,14 +99,24 @@ func TestWSClient_WritePumpOneMessagePerFrame(t *testing.T) {
 		close(client.send)
 		<-wpDone
 	}))
-	defer srv.Close()
+	// Server cleanup is registered before the connection reaper below so the
+	// reaper runs first (t.Cleanup is LIFO): httptest.Server.Close must not run
+	// while the hijacked handler is still blocked inside the request.
+	t.Cleanup(srv.Close)
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	// Reap the server-side writePump on every exit path, including t.Fatalf.
+	// Closing our end breaks the handler's read loop; the handler then closes
+	// client.send and returns, which lets wpDone close. Waiting here joins the
+	// goroutine instead of leaving it parked on the 30s ping ticker.
+	t.Cleanup(func() {
+		conn.Close()
+		<-wpDone
+	})
 
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 
@@ -132,10 +142,4 @@ func TestWSClient_WritePumpOneMessagePerFrame(t *testing.T) {
 	if frames != 3 {
 		t.Fatalf("expected exactly 3 frames, got %d", frames)
 	}
-
-	// Disconnect so the handler's read loop breaks; that closes the send
-	// channel and lets writePump return. Await it before returning so the
-	// goroutine cannot survive past the test.
-	conn.Close()
-	<-wpDone
 }
