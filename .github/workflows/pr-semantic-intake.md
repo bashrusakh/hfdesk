@@ -49,7 +49,7 @@ tools:
   edit: false
   github:
     mode: local
-    toolsets: [issues, pull_requests]
+    toolsets: [issues]
     # Declared scope only, not a runtime guarantee (a gateway safety net may widen it):
     # 'repos' is the current repository — exactly the expression below. min-integrity: none
     # is deliberate: triage must read reports from any contributor, and gh-aw docs prescribe
@@ -59,12 +59,15 @@ tools:
     allowed-repos: ["${{ github.repository }}"]
     min-integrity: none
     # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
+    # No 'pull_requests' toolset: it exposes pull_request_read (with get_diff/get_files)
+    # and list_pull_requests, which the CLI does not filter down to the declared allowed
+    # list, so a PR-search capability would become agent-visible. The PR subject,
+    # changed filenames, labels, and linked issues come from the prepared
+    # .policy/pr/<n>.json; related/duplicate reasoning over PRs uses that metadata only.
     allowed:
       - name: issue_read
         max-calls: 4
       - name: search_issues
-        max-calls: 2
-      - name: search_pull_requests
         max-calls: 2
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
@@ -158,6 +161,13 @@ linked issue identifiers. Use that file as the PR metadata source — the PR sub
 changed filenames, labels, and base/head identifiers come only from that prepared file.
 It contains no diff/patch text, and this workflow must never fetch or read a PR diff,
 patch, or file listing through MCP tools.
+
+Related/duplicate/dependency/supersession reasoning over pull requests is bounded to that
+prepared context: this deployment exposes no PR-search or PR-list capability, so do not
+attempt or claim to look up other pull requests by search, list, or identifier. Judge
+relatedness from the supplied title, body, changed filenames, labels, and linked issue
+identifiers only; when that evidence cannot establish equivalence, preserve the affected
+state rather than speculating.
 
 ## Mandatory contract invariant
 

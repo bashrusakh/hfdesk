@@ -54,7 +54,7 @@ tools:
   edit: false
   github:
     mode: local
-    toolsets: [issues, pull_requests]
+    toolsets: [issues]
     # Declared scope only, not a runtime guarantee (a gateway safety net may widen it):
     # 'repos' is the current repository — exactly the expression below. min-integrity: none
     # is deliberate: triage must read reports from any contributor, and gh-aw docs prescribe
@@ -64,12 +64,16 @@ tools:
     allowed-repos: ["${{ github.repository }}"]
     min-integrity: none
     # max-calls is declared intent; gh-aw v0.89.21 currently drops it at compile time (no tool-call-limits in locks). Revisit when the compiler emits limits.
+    # No 'pull_requests' toolset: it exposes pull_request_read (with get_diff/get_files)
+    # and list_pull_requests, which the CLI does not filter down to the declared allowed
+    # list, so a PR-search capability would become agent-visible. Item metadata, including
+    # changed filenames where a batch item is a PR, comes from the prepared
+    # .policy/backlog/<POLICY_SHA>/batch.json; related/duplicate reasoning over PRs uses
+    # that supplied metadata only.
     allowed:
       - name: issue_read
         max-calls: 12
       - name: search_issues
-        max-calls: 3
-      - name: search_pull_requests
         max-calls: 3
 pre-agent-steps:
   - name: Resolve repository policy contract at the trusted Policy SHA
@@ -172,6 +176,12 @@ Process only the bounded batch the pre-agent step wrote to
 `.policy/backlog/<POLICY_SHA>/batch.json` (at most 10 items). Do not expand the batch into
 an all-repository sweep. If one item needs disproportionate investigation, preserve the
 affected managed metadata and move on; use `noop` if a completion signal is required.
+
+Related/duplicate/fixed/supersession reasoning over pull requests is bounded to the
+supplied batch metadata: this deployment exposes no PR-search or PR-list capability, so do
+not attempt or claim to look up pull requests outside the supplied batch by search, list,
+or identifier. Judge relatedness from the supplied titles, bodies, labels, and state
+only; when that evidence cannot establish equivalence, preserve the affected state.
 
 ## hfdesk managed label boundary
 

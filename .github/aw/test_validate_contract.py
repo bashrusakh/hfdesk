@@ -66,6 +66,14 @@ LOCK_REPOS_ARRAY_BLOCK = (
 SOURCE_ENGINE_ARGS = '  args: ["--deny-tool", "shell"]\n'
 LOCK_DENY_SHELL = "--deny-tool shell"
 
+# The github toolset selection: the capability root. The 'pull_requests' toolset makes
+# the pinned server advertise pull_request_read (get_diff/get_files) and
+# list_pull_requests regardless of the declared per-tool allow-tool narrowing.
+SOURCE_TOOLSETS_ISSUES = "    toolsets: [issues]\n"
+SOURCE_TOOLSETS_WITH_PRS = "    toolsets: [issues, pull_requests]\n"
+LOCK_TOOLSETS_ISSUES = '"GITHUB_TOOLSETS": "issues"'
+LOCK_TOOLSETS_WITH_PRS = '"GITHUB_TOOLSETS": "issues,pull_requests"'
+
 # The direct-label instruction in the deployment prompt bodies (a suggested label is
 # routed to pending review instead of applied, so it must never be used here).
 DIRECT_LABEL_INSTRUCTION = "never attach `suggest`, `rationale`, or `confidence`"
@@ -411,11 +419,80 @@ class ContractValidatorTest(unittest.TestCase):
     def test_forbidden_tool_readded_in_lock_manifest_fails(self) -> None:
         self.mutate(
             PR_LOCK,
-            '"name":"github","tools":["issue_read","search_issues","search_pull_requests"]',
-            '"name":"github","tools":["issue_read","search_issues","search_pull_requests",'
+            '"name":"github","tools":["issue_read","search_issues"]',
+            '"name":"github","tools":["issue_read","search_issues",'
             '"pull_request_read"]',
         )
         self.assert_fails("exposes forbidden github tool(s): pull_request_read")
+
+    def test_list_pull_requests_readded_in_lock_manifest_fails(self) -> None:
+        self.mutate(
+            PR_LOCK,
+            '"name":"github","tools":["issue_read","search_issues"]',
+            '"name":"github","tools":["issue_read","search_issues",'
+            '"list_pull_requests"]',
+        )
+        self.assert_fails("exposes forbidden github tool(s): list_pull_requests")
+
+    def test_search_pull_requests_readded_in_lock_manifest_fails(self) -> None:
+        self.mutate(
+            BACKLOG_LOCK,
+            '"name":"github","tools":["issue_read","search_issues"]',
+            '"name":"github","tools":["issue_read","search_issues",'
+            '"search_pull_requests"]',
+        )
+        self.assert_fails("exposes forbidden github tool(s): search_pull_requests")
+
+    # -- PR toolset exposure (capability root) ----------------------------
+
+    def test_pull_requests_toolset_readded_in_source_fails(self) -> None:
+        for rel in (PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, SOURCE_TOOLSETS_ISSUES, SOURCE_TOOLSETS_WITH_PRS)
+                self.assert_fails("toolsets must be exactly [issues]")
+
+    def test_pull_requests_toolset_only_in_source_fails(self) -> None:
+        self.mutate(
+            PR_MD, SOURCE_TOOLSETS_ISSUES, "    toolsets: [pull_requests]\n"
+        )
+        self.assert_fails("toolsets must be exactly [issues]")
+
+    def test_toolsets_missing_in_source_fails(self) -> None:
+        for rel in (PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, SOURCE_TOOLSETS_ISSUES, "")
+                self.assert_fails("must declare toolsets in the github tools block")
+
+    def test_search_pull_requests_readded_in_source_allowed_fails(self) -> None:
+        self.mutate(
+            PR_MD,
+            "      - name: search_issues\n        max-calls: 2\n",
+            "      - name: search_issues\n        max-calls: 2\n"
+            "      - name: search_pull_requests\n        max-calls: 2\n",
+        )
+        self.assert_fails(
+            "github allowed list exposes forbidden tool(s): search_pull_requests"
+        )
+
+    def test_pull_requests_toolset_readded_in_lock_fails(self) -> None:
+        for rel in (PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate(
+                    rel, LOCK_TOOLSETS_ISSUES, LOCK_TOOLSETS_WITH_PRS
+                )
+                self.assert_fails("GITHUB_TOOLSETS must be exactly 'issues'")
+
+    def test_toolsets_declaration_removed_in_lock_fails(self) -> None:
+        self.mutate(PR_LOCK, LOCK_TOOLSETS_ISSUES, "")
+        self.assert_fails("must carry exactly one GITHUB_TOOLSETS declaration")
+
+    def test_toolsets_declaration_duplicated_in_lock_fails(self) -> None:
+        self.mutate(
+            PR_LOCK,
+            LOCK_TOOLSETS_ISSUES,
+            LOCK_TOOLSETS_ISSUES + "\n                  " + LOCK_TOOLSETS_ISSUES,
+        )
+        self.assert_fails("must carry exactly one GITHUB_TOOLSETS declaration")
 
     def test_add_comment_in_lock_fails(self) -> None:
         self.mutate(

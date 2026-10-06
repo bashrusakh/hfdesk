@@ -10,14 +10,19 @@ No LLM. Checks, in order:
      (engine.args containing '--deny-tool shell'), safe-outputs
      report-failure-as-issue and report-failed-jobs pinned false, no add-comment,
      safe-outputs.add-labels issue-intent false (no label suggestion routing),
-     the direct-label prompt instruction, tools.github.allowed-repos declared as
+     the direct-label prompt instruction, tools.github.toolsets exactly ['issues']
+     (the 'pull_requests' toolset would expose patch-capable PR tools the declared
+     'allowed' narrowing cannot suppress), tools.github.allowed-repos declared as
      the single-element array ['${{ github.repository }}'] (a bare scalar string is
      rejected by the runtime gateway), tools.github.min-integrity present, one of
      the gh-aw schema levels, and exactly the intended level, no source/diff tools
-     in the github allowed list, no 'confirmed' in allowed label lists, and the
+     in the github allowed list including the PR-search/list tools
+     (pull_request_read, list_pull_requests, search_pull_requests), no 'confirmed'
+     in allowed label lists, and the
      required type family in remove-labels;
   3. each generated lock preserves those invariants (no add_comment, no forbidden
-     github tool grants, an allow-only guard policy whose 'repos' is the
+     github tool grants, compiled GITHUB_TOOLSETS exactly 'issues', an allow-only
+     guard policy whose 'repos' is the
      single-element array ['${{ github.repository }}'] and whose
      'min-integrity' is exactly the intended
      level, no residual agent write capability: no --allow-tool write and no
@@ -72,6 +77,12 @@ What this validator does NOT guarantee:
     proves the compiled config requests the intent-free schema; the pinned runtime script
     (gh-aw-actions/setup, pinned in the lock manifest) is what actually strips the fields,
     so a change to that pin must be re-checked against that script.
+  - The toolsets assertion matches the declared list and the compiled GITHUB_TOOLSETS
+    value against the intended set. It proves the workflow only requests the issue
+    surface; it cannot prove how the pinned github-mcp-server builds its advertised
+    tool list from that value, so the toolset-level prohibition rests on the server
+    version pinned in the lock manifest. A server upgrade must be re-checked against
+    the toolset-to-tool mapping (a staged trial is the end-to-end evidence).
 
 Set VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 to skip the live repository label lookup
 (offline/test mode used by .github/aw/test_validate_contract.py); in that mode
@@ -111,7 +122,23 @@ FORBIDDEN_GITHUB_TOOLS = (
     "search_code",
     "get_files",
     "pull_request_read",
+    "list_pull_requests",
+    "search_pull_requests",
 )
+
+# The only github MCP toolset the triage contract may request: the issue surface.
+# The 'pull_requests' toolset is forbidden because the pinned server
+# (github-mcp-server v1.12.2) advertises that toolset's tools in full - including
+# pull_request_read (whose method enum contains get_diff/get_files) and
+# list_pull_requests - and the compiled per-tool '--allow-tool github(<tool>)' grants
+# are not enforced by the Copilot CLI against toolset-exposed tools. Asking for the
+# toolset therefore creates a real agent-visible capability regardless of the
+# declared 'allowed' narrowing. Asserted as an exact intended set so any widening
+# or re-tightening is a deliberate change to this constant.
+REQUIRED_GITHUB_TOOLSETS = ("issues",)
+
+# The compiled toolsets value the docker-launched github MCP server reads.
+LOCK_TOOLSETS = re.compile(r'"GITHUB_TOOLSETS"\s*:\s*"([^"]*)"')
 
 # Universal semantic type family every triage workflow must be able to remove
 # (reconciliation capability: replace a clearly wrong managed type).
@@ -497,6 +524,24 @@ def check_triage_sources() -> None:
         if not github_body:
             errors.append(f"{rel_path} has no github tools block")
         else:
+            toolsets_entry = key_entry(github_body, "toolsets", 4)
+            if toolsets_entry is None:
+                errors.append(
+                    f"{rel_path} must declare toolsets in the github tools block"
+                )
+            else:
+                toolsets = string_list(toolsets_entry[0], toolsets_entry[1])
+                if toolsets != list(REQUIRED_GITHUB_TOOLSETS):
+                    errors.append(
+                        f"{rel_path} toolsets must be exactly "
+                        f"[{', '.join(REQUIRED_GITHUB_TOOLSETS)}]; got "
+                        f"[{', '.join(toolsets)}]. The 'pull_requests' toolset is "
+                        "forbidden: the pinned github-mcp-server advertises its tools "
+                        "in full (pull_request_read with get_diff/get_files, "
+                        "list_pull_requests) and the CLI does not enforce the "
+                        "declared 'allowed' narrowing against toolset-exposed tools, "
+                        "so the capability would be real."
+                    )
             declared = re.search(
                 r"^\s*allowed-repos\s*:\s*(.+?)\s*$", github_body, re.MULTILINE
             )
@@ -793,6 +838,26 @@ def check_triage_locks() -> None:
                 f"{lock_rel} exposes forbidden github tool(s): "
                 + ", ".join(sorted(exposed))
             )
+
+        # The toolset selection is the capability root: the pinned github-mcp-server
+        # advertises every tool of a requested toolset regardless of the per-tool
+        # allow-tool grants, so the compiled GITHUB_TOOLSETS value must be exactly the
+        # intended set.
+        toolsets = LOCK_TOOLSETS.findall(text)
+        if len(toolsets) != 1:
+            errors.append(
+                f"{lock_rel} must carry exactly one GITHUB_TOOLSETS declaration; "
+                f"found {len(toolsets)}"
+            )
+        else:
+            requested = [piece.strip() for piece in toolsets[0].split(",") if piece.strip()]
+            if requested != list(REQUIRED_GITHUB_TOOLSETS):
+                errors.append(
+                    f"{lock_rel} GITHUB_TOOLSETS must be exactly "
+                    f"'{','.join(REQUIRED_GITHUB_TOOLSETS)}'; got '{toolsets[0]}' "
+                    "(the 'pull_requests' toolset exposes pull_request_read/"
+                    "list_pull_requests regardless of the declared allowed list)"
+                )
 
         guard = guard_allow_only(text)
         if guard is None:
