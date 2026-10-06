@@ -747,29 +747,6 @@ func TestExactHubDeleteRetainsRootSymlinkGuard(t *testing.T) {
 	}
 }
 
-func TestWholeHubDeleteRefusesConfiguredNestedRoot(t *testing.T) {
-	base := isolateCacheState(t)
-	r, h := filepath.Join(base, "friendly"), filepath.Join(base, "selected-hub")
-	t.Setenv("HF_HUB_CACHE", h)
-	repo := filepath.Join(h, "models--owner--model")
-	nested := filepath.Join(repo, "application-data")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(nested, "keep.txt")
-	if err := os.WriteFile(marker, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s := New(Config{CacheDir: r, LocalScanDirs: []string{nested}})
-	w := cacheRequest(t, s, "DELETE", "/api/cache/owner/model", "")
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("nested configured root delete status=%d body=%s", w.Code, w.Body.String())
-	}
-	if got, err := os.ReadFile(marker); err != nil || string(got) != "keep" {
-		t.Fatalf("configured nested root was changed: %q %v", got, err)
-	}
-}
-
 func TestWholeHubDeleteKeepsExternalModelAndDatasetSupport(t *testing.T) {
 	for _, tc := range []struct {
 		typeName string

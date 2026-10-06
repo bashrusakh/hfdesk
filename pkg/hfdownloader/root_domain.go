@@ -15,18 +15,18 @@ import (
 	"syscall"
 )
 
-// ManagedRootRole describes how a configured path participates in storage
-// ownership. Roles are semantic; display labels and server configuration stay
-// in the adapter that constructs a ManagedRootSet.
+// ManagedRootRole classifies a configured path for namespace observation and
+// read-side behavior. Roles do not prove exclusive recursive ownership or
+// grant operation-specific authority.
 type ManagedRootRole uint32
 
 const (
 	ManagedRootBrowse            ManagedRootRole = 1 << iota // Read-only repository discovery.
-	ManagedRootProtected                                     // Must be protected from enclosing whole-copy operations.
-	ManagedRootLocal                                         // Root provides local owner/name repository candidates.
-	ManagedRootHub                                           // Root is the selected HF models/datasets Hub directory.
-	ManagedRootModelProjection                               // Root contains friendly model projections, not independent copies.
-	ManagedRootDatasetProjection                             // Root contains friendly dataset projections, not independent copies.
+	ManagedRootProtected                                     // Configured as protected for later operation-specific policy.
+	ManagedRootLocal                                         // Root enumerates Local owner/name slots with unknown type.
+	ManagedRootHub                                           // Root has a typed HF models/datasets namespace layout.
+	ManagedRootModelProjection                               // Root has a friendly model projection layout.
+	ManagedRootDatasetProjection                             // Root has a friendly dataset projection layout.
 )
 
 // ManagedRootRestriction is an OR-merged restriction carried by roots that
@@ -55,14 +55,14 @@ type ManagedRoot struct {
 	Restrictions ManagedRootRestriction
 }
 
-// ManagedRootGroup groups browse roots only when filesystem facts prove they
-// are the same directory; Members preserves their distinct configured IDs.
+// ManagedRootGroup groups browse roots whose directory objects compare equal.
+// Members preserves lexical IDs; grouping does not equate child namespace views.
 type ManagedRootGroup struct {
 	Root    ManagedRoot
 	Members []ManagedRoot
 }
 
-// PhysicalCopyKind classifies an existing destructive-unit candidate.
+// PhysicalCopyKind classifies the configured namespace where a slot was observed.
 type PhysicalCopyKind uint8
 
 const (
@@ -70,9 +70,9 @@ const (
 	PhysicalCopyHub                               // An exact models--owner--name/datasets--owner--name directory.
 )
 
-// RepoPhysicalCopy describes an existing physical repository directory.
-// RootIDs retains every configured lexical identity proven to refer to this
-// same physical directory.
+// RepoPhysicalCopy is a legacy read-side view of one repository directory slot.
+// RootIDs records configured lexical identities observed at that directory;
+// it does not establish exclusive recursive-view membership or authorization.
 type RepoPhysicalCopy struct {
 	Kind         PhysicalCopyKind
 	Path         string
@@ -81,8 +81,8 @@ type RepoPhysicalCopy struct {
 	Restrictions ManagedRootRestriction
 }
 
-// RepoProjection describes a friendly-view directory. It is deliberately not
-// a RepoPhysicalCopy and never grants delete-unit authority.
+// RepoProjection describes a friendly-view directory slot. It carries no
+// authority over the directory or any recursive effect.
 type RepoProjection struct {
 	Path         string
 	OwnerRootID  string
@@ -90,11 +90,43 @@ type RepoProjection struct {
 	Restrictions ManagedRootRestriction
 }
 
-// RepoPhysicalCopySet separates actual physical copies from friendly
-// projections, which never grant deletion authority.
+// RepoPhysicalCopySet preserves the legacy read DTO while exposing the
+// underlying logical namespace memberships separately.
 type RepoPhysicalCopySet struct {
 	Copies      []RepoPhysicalCopy
 	Projections []RepoProjection
+	Memberships []NamespaceMembership
+}
+
+// NamespaceMembership records one current logical slot and its observed
+// directory entries. It is descriptive evidence, not authorization.
+type NamespaceMembership struct {
+	Root                   ManagedRoot
+	OwnerRootID            string
+	Kind                   PhysicalCopyKind
+	RepoID                 string
+	RepoType               RepoType
+	TypeKnown              bool
+	OwnedPathMatchObserved bool
+	Path                   string
+	OwnedPath              string
+	Directory              os.FileInfo
+	Regions                []NamespaceDirectoryRegion
+	Entries                []NamespaceEntry
+}
+
+// NamespaceDirectoryRegion records one reachable directory occurrence. The
+// same object may appear at several paths with different child views.
+type NamespaceDirectoryRegion struct {
+	Path string
+	Info os.FileInfo
+}
+
+// NamespaceEntry records one current entry with lstat-style identity; symlinks
+// are leaves and are not traversed for their target contents.
+type NamespaceEntry struct {
+	Path string
+	Info os.FileInfo
 }
 
 // ManagedRootSet is an immutable snapshot of root definitions for one config
@@ -211,8 +243,9 @@ func (set *ManagedRootSet) Root(rootID string) (ManagedRoot, bool) {
 	return ManagedRoot{}, false
 }
 
-// AllowsOwner applies static and freshly observed same-object restrictions to
-// one owner entry. Unreadable alias facts are errors, not assumed distinct.
+// AllowsOwner is a browse-enumeration filter for reserved HF cache names. It
+// applies static and freshly observed same-object restrictions; it is not a
+// destructive eligibility or exclusive-ownership decision.
 func (set *ManagedRootSet) AllowsOwner(rootID, owner string) (bool, error) {
 	if err := set.ready(); err != nil {
 		return false, err
@@ -254,9 +287,7 @@ func (set *ManagedRootSet) ready() error {
 }
 
 // withinManagedRoot tests cleaned configured lexical identity with exact
-// component spelling. It does not establish physical containment when a path
-// component is a symlink; mutation callers must use the separate physical and
-// symlink checks below.
+// component spelling. It is not a filesystem ancestry observation.
 func withinManagedRoot(root, path string) bool {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
@@ -284,9 +315,10 @@ func withinManagedRoot(root, path string) bool {
 	return true
 }
 
-// containmentDistance first recognizes configured lexical ancestry, then
-// compares freshly resolved physical namespaces. Configured spellings remain
-// unchanged; resolved names are observations only.
+// containmentDistance recognizes configured lexical ancestry and then attempts
+// path-spelling filesystem observations. A negative result means only that
+// those observations did not establish ancestry; it is not proof of recursive
+// view disjointness. Configured spellings remain unchanged.
 func containmentDistance(parent, target string) (bool, int, error) {
 	if withinManagedRoot(parent, target) {
 		rel, _ := filepath.Rel(parent, target)
@@ -366,8 +398,9 @@ func resolveObservedPath(path string) (string, bool, error) {
 	}
 }
 
-// OwnerForPath selects the most-specific configured root using lexical
-// containment or fresh filesystem ancestry evidence.
+// OwnerForPath reports the most-specific configured namespace relation found
+// by lexical containment or current path-spelling observations. It does not
+// establish exclusive recursive ownership.
 func (set *ManagedRootSet) OwnerForPath(path string) (ManagedRoot, error) {
 	if err := set.ready(); err != nil {
 		return ManagedRoot{}, err
@@ -407,8 +440,8 @@ func ownerContainmentDistance(parent, target string) (bool, int, error) {
 	return containmentDistance(parent, target)
 }
 
-// NestedProtectedRoots returns protected roots below rootID. Unknown ancestry
-// is returned as an error rather than guessed.
+// NestedProtectedRoots observes protected roots intersecting the configured
+// root's current directory graph. Unknown reachability is returned as an error.
 func (set *ManagedRootSet) NestedProtectedRoots(rootID string) ([]ManagedRoot, error) {
 	if err := set.ready(); err != nil {
 		return nil, err
@@ -490,8 +523,7 @@ func (set *ManagedRootSet) NestedProtectedRoots(rootID string) ([]ManagedRoot, e
 	return nested, nil
 }
 
-// Resolve returns an exact owner/name path beneath a browsable configured root.
-// It does not grant destructive authority.
+// Resolve returns a lexical owner/name path beneath a browsable configured root.
 func (set *ManagedRootSet) Resolve(rootID, owner, name string) (string, error) {
 	if err := set.ready(); err != nil {
 		return "", err
@@ -503,38 +535,13 @@ func (set *ManagedRootSet) Resolve(rootID, owner, name string) (string, error) {
 	return filepath.Join(root.AbsolutePath, owner, name), nil
 }
 
-// WalkOwned walks only entries owned by rootID, skipping nested roots and
-// returning errors when physical ownership cannot be established.
+// WalkOwned reports entries observed in rootID's namespace, excluding regions
+// attributed to nested configured roots. It does not establish exclusive use.
 func (set *ManagedRootSet) WalkOwned(rootID, dir string, fn filepath.WalkFunc) error {
 	if err := set.ready(); err != nil {
 		return err
 	}
-	root, ok := set.Root(rootID)
-	if !ok {
-		return fmt.Errorf("unknown managed root %q", rootID)
-	}
-	return filepath.Walk(ConfiguredPath(dir, set.base), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		owner, ownerErr := set.OwnerForPath(path)
-		if ownerErr != nil {
-			return ownerErr
-		}
-		if owner.ID != root.ID {
-			same, err := set.SameDirectoryObjectFacts(owner.AbsolutePath, root.AbsolutePath)
-			if err != nil {
-				return err
-			}
-			if !same {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-		}
-		return fn(path, info, nil)
-	})
+	return set.walkOwnedEntries(rootID, dir, nil, fn, nil, nil)
 }
 
 // SameDirectoryObjectFacts distinguishes known inequality from missing or
@@ -575,8 +582,8 @@ func SameDirectoryPath(left, right string) (bool, error) {
 	return os.SameFile(leftInfo, rightInfo), nil
 }
 
-// BrowseRootGroups merges same-object browse aliases for discovery, retaining
-// lexical member IDs and OR-merging restrictions only on proven equality.
+// BrowseRootGroups groups roots with equal directory-object observations while
+// retaining each lexical root ID. Equal objects do not imply equal child views.
 func (set *ManagedRootSet) BrowseRootGroups() ([]ManagedRootGroup, error) {
 	if err := set.ready(); err != nil {
 		return nil, err
@@ -610,269 +617,6 @@ func (set *ManagedRootSet) BrowseRootGroups() ([]ManagedRootGroup, error) {
 		groups[group].Members = append(groups[group].Members, candidate)
 	}
 	return groups, nil
-}
-
-// WholeCopyAllowed performs non-mutating exact-shape, owner, nested-root, and
-// symlink-component checks for a whole physical copy.
-func (set *ManagedRootSet) WholeCopyAllowed(rootID, target string) error {
-	if err := set.ready(); err != nil {
-		return err
-	}
-	root, ok := set.Root(rootID)
-	if !ok {
-		return fmt.Errorf("unknown managed root %q", rootID)
-	}
-	if root.Roles&ManagedRootHub == 0 && root.Roles&(ManagedRootModelProjection|ManagedRootDatasetProjection) != 0 {
-		return errors.New("friendly projection is not an independent physical-copy unit")
-	}
-	target = ConfiguredPath(target, set.base)
-	rel, err := filepath.Rel(root.AbsolutePath, target)
-	if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return errors.New("whole-copy target is not below its configured root")
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	repoOwner, repoName := "", ""
-	if root.Roles&ManagedRootHub != 0 {
-		var ok bool
-		repoOwner, repoName, _, ok = parseHubRepoDirName(parts[0])
-		if len(parts) != 1 || !ok {
-			return errors.New("whole-copy target is not an exact Hub repository entry")
-		}
-	} else {
-		if len(parts) != 2 || !IsValidRepoComponent(parts[0]) || !IsValidRepoComponent(parts[1]) {
-			return errors.New("whole-copy target is not an exact owner/name repository entry")
-		}
-		repoOwner, repoName = parts[0], parts[1]
-	}
-	targetInfo, err := os.Lstat(target)
-	if err != nil {
-		return fmt.Errorf("cannot inspect whole-copy target: %w", err)
-	}
-	if !targetInfo.IsDir() || targetInfo.Mode()&os.ModeSymlink != 0 {
-		return errors.New("whole-copy target is not a real directory")
-	}
-	if root.Roles&ManagedRootHub == 0 {
-		for _, projection := range set.roots {
-			if projection.Roles&(ManagedRootModelProjection|ManagedRootDatasetProjection) == 0 {
-				continue
-			}
-			projectionPath := filepath.Join(projection.AbsolutePath, parts[0], parts[1])
-			projectionInfo, projectionErr := os.Stat(projectionPath)
-			if projectionErr != nil && !os.IsNotExist(projectionErr) {
-				return fmt.Errorf("cannot inspect friendly projection %q: %w", projectionPath, projectionErr)
-			}
-			if projectionErr == nil && os.SameFile(projectionInfo, targetInfo) {
-				return errors.New("target is a friendly projection, not an independent physical copy")
-			}
-		}
-		copies, err := set.RepoPhysicalCopies(repoOwner+"/"+repoName, RepoTypeModel)
-		if err != nil {
-			return fmt.Errorf("cannot establish physical-copy identity: %w", err)
-		}
-		for _, candidate := range copies.Copies {
-			if candidate.Kind != PhysicalCopyHub || !hasRootID(candidate.RootIDs, rootID) {
-				continue
-			}
-			if candidateInfo, statErr := os.Stat(candidate.Path); statErr == nil && os.SameFile(candidateInfo, targetInfo) {
-				return errors.New("target is an alias of the selected Hub physical copy")
-			} else if statErr != nil && !os.IsNotExist(statErr) {
-				return fmt.Errorf("cannot inspect selected Hub copy %q: %w", candidate.Path, statErr)
-			}
-		}
-	} else {
-		projectionRole := ManagedRootModelProjection
-		if strings.HasPrefix(parts[0], "datasets--") {
-			projectionRole = ManagedRootDatasetProjection
-		}
-		for _, projection := range set.roots {
-			if projection.Roles&projectionRole == 0 {
-				continue
-			}
-			projectionPath := filepath.Join(projection.AbsolutePath, repoOwner, repoName)
-			projectionInfo, projectionErr := os.Stat(projectionPath)
-			if projectionErr != nil && !os.IsNotExist(projectionErr) {
-				return fmt.Errorf("cannot inspect friendly projection %q: %w", projectionPath, projectionErr)
-			}
-			if projectionErr == nil && os.SameFile(projectionInfo, targetInfo) {
-				return errors.New("Hub target aliases a friendly projection path")
-			}
-		}
-	}
-	owner, err := set.OwnerForPath(target)
-	if err != nil {
-		return fmt.Errorf("cannot establish managed-root owner: %w", err)
-	}
-	if owner.ID != root.ID {
-		same, err := set.SameDirectoryObjectFacts(owner.AbsolutePath, root.AbsolutePath)
-		if err != nil {
-			return fmt.Errorf("cannot verify physical managed-root owner: %w", err)
-		}
-		if !same {
-			return fmt.Errorf("target is owned by managed root %s", owner.ID)
-		}
-	}
-	if err := rejectManagedSymlinkComponents(set.base, root.AbsolutePath, target); err != nil {
-		return err
-	}
-	if err := set.checkProtectedEffect(target); err != nil {
-		return err
-	}
-	return nil
-}
-
-// LegacyHFDeleteAllowed preflights the complete existing whole-HF deletion
-// unit before either its Hub copy or optional friendly subtree is removed.
-func (set *ManagedRootSet) LegacyHFDeleteAllowed(hubRootID, hubTarget, friendlyTarget, cacheRoot string) error {
-	if err := set.WholeCopyAllowed(hubRootID, hubTarget); err != nil {
-		return err
-	}
-	if friendlyTarget == "" {
-		return nil
-	}
-	owner, name, repoType, ok := parseHubRepoDirName(filepath.Base(hubTarget))
-	if !ok {
-		return errors.New("cannot establish friendly repository identity")
-	}
-	role := ManagedRootModelProjection
-	if repoType == RepoTypeDataset {
-		role = ManagedRootDatasetProjection
-	}
-	exists, err := ValidateLegacyFriendlyEffect(cacheRoot, friendlyTarget)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return nil
-	}
-	for _, projection := range set.roots {
-		if projection.Roles&role == 0 {
-			continue
-		}
-		rel, relErr := filepath.Rel(projection.AbsolutePath, friendlyTarget)
-		if relErr != nil || rel != filepath.Join(owner, name) {
-			continue
-		}
-		return set.checkProtectedEffect(friendlyTarget)
-	}
-	return errors.New("friendly deletion effect has no configured projection owner")
-}
-
-// ValidateLegacyFriendlyEffect verifies the existing legacy friendly path
-// without following symlinked components. A missing ordinary component is a
-// safely absent effect; errors and non-directory prefixes are unknown/refused.
-func ValidateLegacyFriendlyEffect(cacheRoot, friendlyTarget string) (bool, error) {
-	if !filepath.IsAbs(cacheRoot) || !filepath.IsAbs(friendlyTarget) {
-		return false, errors.New("friendly deletion paths must be absolute")
-	}
-	root := filepath.Clean(cacheRoot)
-	target := filepath.Clean(friendlyTarget)
-	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false, errors.New("friendly deletion effect is outside its cache root")
-	}
-	volumeRoot := filepath.VolumeName(target) + string(filepath.Separator)
-	components, err := filepath.Rel(volumeRoot, target)
-	if err != nil {
-		return false, fmt.Errorf("resolve friendly deletion components: %w", err)
-	}
-	current := volumeRoot
-	parts := strings.Split(components, string(filepath.Separator))
-	for i, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-		current = filepath.Join(current, part)
-		info, statErr := os.Lstat(current)
-		if os.IsNotExist(statErr) {
-			return false, nil
-		}
-		if statErr != nil {
-			return false, fmt.Errorf("inspect friendly deletion component %q: %w", current, statErr)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return false, fmt.Errorf("friendly deletion path contains symlinked component %q", current)
-		}
-		if i != len(parts)-1 && !info.IsDir() {
-			return false, fmt.Errorf("friendly deletion path has non-directory component %q", current)
-		}
-		if i == len(parts)-1 && !info.IsDir() {
-			return false, errors.New("friendly deletion effect is not a real directory")
-		}
-	}
-	return true, nil
-}
-
-func (set *ManagedRootSet) checkProtectedEffect(effect string) error {
-	// Keep positive namespace-ancestor evidence as an inexpensive conservative
-	// rejection, but never use a negative result as proof of disjointness.
-	for _, protected := range set.roots {
-		if protected.Roles&ManagedRootProtected == 0 {
-			continue
-		}
-		contains, _, err := containmentDistance(effect, protected.AbsolutePath)
-		if err != nil {
-			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
-		}
-		containedBy, distance, err := containmentDistance(protected.AbsolutePath, effect)
-		if err != nil {
-			return fmt.Errorf("cannot verify protected-root boundary: %w", err)
-		}
-		if contains || (containedBy && distance == 0) {
-			return fmt.Errorf("deletion effect intersects protected managed root %s", protected.ID)
-		}
-	}
-	reached, err := set.observeEffectDirectories(effect)
-	if err != nil {
-		return fmt.Errorf("cannot prove protected-root disjointness for deletion effect: %w", err)
-	}
-	comparisonBudget := maxEffectDirectories
-	for _, protected := range set.roots {
-		if protected.Roles&ManagedRootProtected == 0 {
-			continue
-		}
-		fact, err := protectedDirectoryFact(protected, set.effectObserver())
-		if err != nil {
-			return fmt.Errorf("cannot establish protected-root identity %s: %w", protected.ID, err)
-		}
-		intersects, err := effectIntersectsProtected(reached, fact, &comparisonBudget)
-		if err != nil {
-			return fmt.Errorf("cannot prove protected-root disjointness for deletion effect: %w", err)
-		}
-		if intersects {
-			return fmt.Errorf("deletion effect intersects protected managed root %s", protected.ID)
-		}
-	}
-	return nil
-}
-
-func rejectManagedSymlinkComponents(base, rootPath, target string) error {
-	inside, _, err := containmentDistance(rootPath, target)
-	if err != nil {
-		return err
-	}
-	if !inside {
-		return errors.New("target is outside its configured root")
-	}
-	if _, err := filepath.Rel(rootPath, target); err != nil {
-		return errors.New("target is not a direct managed entry")
-	}
-	volumeRoot := filepath.VolumeName(target) + string(filepath.Separator)
-	rel, err := filepath.Rel(volumeRoot, target)
-	if err != nil {
-		return fmt.Errorf("resolve managed path components: %w", err)
-	}
-	current := volumeRoot
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		info, statErr := os.Lstat(current)
-		if statErr != nil {
-			return fmt.Errorf("inspect managed path %q: %w", current, statErr)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinked managed path component %q (root %q, target %q, base %q)", current, rootPath, target, base)
-		}
-	}
-	return nil
 }
 
 // IsValidRepoComponent accepts the server's safe ASCII owner/name component
@@ -909,30 +653,10 @@ func parseHubRepoDirName(name string) (owner, repo string, repoType RepoType, ok
 	return "", "", "", false
 }
 
-func hasRootID(rootIDs []string, wanted string) bool {
-	for _, rootID := range rootIDs {
-		if rootID == wanted {
-			return true
-		}
-	}
-	return false
-}
-
-type physicalCandidate struct {
-	copy RepoPhysicalCopy
-	info os.FileInfo
-}
-
-type projectionCandidate struct {
-	projection RepoProjection
-	info       os.FileInfo
-}
-
-// RepoPhysicalCopies enumerates existing physical candidates for a repository.
-// Proven local/Hub aliases are grouped in Copies with all root IDs and merged
-// restrictions; friendly directories remain in the separate Projections list
-// unless the filesystem proves they are the same directory object.
-func (set *ManagedRootSet) RepoPhysicalCopies(repoID string, repoType RepoType) (RepoPhysicalCopySet, error) {
+// RepoPhysicalCopiesFromNamespace projects one requested ID from a complete
+// namespace observation. The memberships remain available without grouping so
+// callers can distinguish logical slots even when objects compare equal.
+func (set *ManagedRootSet) RepoPhysicalCopiesFromNamespace(repoID string, repoType RepoType, all []NamespaceMembership) (RepoPhysicalCopySet, error) {
 	if err := set.ready(); err != nil {
 		return RepoPhysicalCopySet{}, err
 	}
@@ -943,147 +667,44 @@ func (set *ManagedRootSet) RepoPhysicalCopies(repoID string, repoType RepoType) 
 	if repoType != RepoTypeModel && repoType != RepoTypeDataset {
 		return RepoPhysicalCopySet{}, errors.New("invalid repository type")
 	}
-	var local, hubs []physicalCandidate
-	var projections []projectionCandidate
-	for _, root := range set.roots {
-		var kind PhysicalCopyKind
-		var path string
-		isProjection := false
-		switch {
-		case root.Roles&ManagedRootHub != 0:
-			prefix := "models--"
-			if repoType == RepoTypeDataset {
-				prefix = "datasets--"
-			}
-			kind = PhysicalCopyHub
-			path = filepath.Join(root.AbsolutePath, prefix+parts[0]+"--"+parts[1])
-		case repoType == RepoTypeModel && root.Roles&ManagedRootModelProjection != 0,
-			repoType == RepoTypeDataset && root.Roles&ManagedRootDatasetProjection != 0:
-			isProjection = true
-			path = filepath.Join(root.AbsolutePath, parts[0], parts[1])
-		case root.Roles&ManagedRootLocal != 0 && root.Roles&(ManagedRootModelProjection|ManagedRootDatasetProjection) == 0:
-			allowed, ownerErr := set.AllowsOwner(root.ID, parts[0])
-			if ownerErr != nil {
-				return RepoPhysicalCopySet{}, ownerErr
-			}
-			if !allowed {
-				continue
-			}
-			kind = PhysicalCopyLocal
-			path = filepath.Join(root.AbsolutePath, parts[0], parts[1])
-		default:
+	matched := NamespaceMembershipsFor(all, repoID, repoType)
+	result := RepoPhysicalCopySet{Memberships: append([]NamespaceMembership(nil), matched...)}
+	for _, membership := range matched {
+		if !membership.OwnedPathMatchObserved {
 			continue
 		}
-		info, err := os.Stat(path)
-		if os.IsNotExist(err) {
-			continue
+		root, ok := set.Root(membership.Root.ID)
+		if !ok {
+			return RepoPhysicalCopySet{}, fmt.Errorf("namespace membership has unknown root %q", membership.Root.ID)
 		}
-		if err != nil {
-			return RepoPhysicalCopySet{}, fmt.Errorf("inspect repository candidate %q: %w", path, err)
+		owner, ok := set.Root(membership.OwnerRootID)
+		if !ok {
+			return RepoPhysicalCopySet{}, fmt.Errorf("namespace membership has unknown owner root %q", membership.OwnerRootID)
 		}
-		if !info.IsDir() {
-			continue
-		}
-		owner, err := set.OwnerForPath(path)
-		if err != nil {
-			return RepoPhysicalCopySet{}, fmt.Errorf("resolve repository candidate owner %q: %w", path, err)
-		}
-		if kind != PhysicalCopyHub {
-			ownedPath := filepath.Join(owner.AbsolutePath, parts[0], parts[1])
-			ownedInfo, ownedErr := os.Stat(ownedPath)
-			if os.IsNotExist(ownedErr) {
-				continue
-			}
-			if ownedErr != nil {
-				return RepoPhysicalCopySet{}, fmt.Errorf("inspect owned repository candidate %q: %w", ownedPath, ownedErr)
-			}
-			if !ownedInfo.IsDir() || !os.SameFile(info, ownedInfo) {
-				continue
-			}
-			path, info = ownedPath, ownedInfo
+		if membership.OwnedPath == "" {
+			return RepoPhysicalCopySet{}, fmt.Errorf("namespace membership has no owned path for %q", membership.Path)
 		}
 		rootIDs := []string{root.ID}
 		if owner.ID != root.ID {
-			rootIDs = appendUnique(rootIDs, owner.ID)
+			rootIDs = append(rootIDs, owner.ID)
 		}
-		if isProjection {
-			projections = append(projections, projectionCandidate{projection: RepoProjection{Path: path, OwnerRootID: owner.ID, RootIDs: rootIDs, Restrictions: root.Restrictions | owner.Restrictions}, info: info})
+		if membership.Kind == 0 {
+			result.Projections = append(result.Projections, RepoProjection{Path: membership.OwnedPath, OwnerRootID: owner.ID, RootIDs: rootIDs, Restrictions: root.Restrictions | owner.Restrictions})
 			continue
 		}
-		candidate := physicalCandidate{copy: RepoPhysicalCopy{Kind: kind, Path: path, OwnerRootID: owner.ID, RootIDs: rootIDs, Restrictions: root.Restrictions | owner.Restrictions}, info: info}
-		switch kind {
-		case PhysicalCopyHub:
-			hubs = append(hubs, candidate)
-		default:
-			local = append(local, candidate)
-		}
+		result.Copies = append(result.Copies, RepoPhysicalCopy{Kind: membership.Kind, Path: membership.OwnedPath, OwnerRootID: owner.ID, RootIDs: rootIDs, Restrictions: root.Restrictions | owner.Restrictions})
 	}
-	local = groupPhysicalCandidates(local)
-	hubs = groupPhysicalCandidates(hubs)
-	// Merge aliases across roles too: when an explicitly configured local root
-	// and the selected Hub name the same existing repository directory, they
-	// share one physical-copy record with combined root IDs/restrictions.
-	combined := append(append([]physicalCandidate(nil), hubs...), local...)
-	combined = groupPhysicalCandidates(combined)
-	hubs = hubs[:0]
-	local = local[:0]
-	for _, candidate := range combined {
-		if candidate.copy.Kind == PhysicalCopyHub {
-			hubs = append(hubs, candidate)
-		} else {
-			local = append(local, candidate)
-		}
-	}
-	result := RepoPhysicalCopySet{}
-	if len(hubs) == 1 {
-		hub := &hubs[0].copy
-		var projectionList []RepoProjection
-		for _, projection := range projections {
-			if os.SameFile(hubs[0].info, projection.info) {
-				// Only collapse a projection into the Hub physical unit when the
-				// filesystem proves it is the same directory object.
-				hub.RootIDs = appendUnique(hub.RootIDs, projection.projection.RootIDs...)
-				hub.Restrictions |= projection.projection.Restrictions
-				continue
-			}
-			projectionValue := projection.projection
-			// A configured local alias to a friendly projection is still not
-			// an independent physical copy or delete unit.
-			filtered := local[:0]
-			for _, candidate := range local {
-				if os.SameFile(candidate.info, projection.info) {
-					projectionValue.RootIDs = appendUnique(projectionValue.RootIDs, candidate.copy.RootIDs...)
-					projectionValue.Restrictions |= candidate.copy.Restrictions
-					continue
-				}
-				filtered = append(filtered, candidate)
-			}
-			local = filtered
-			projectionList = append(projectionList, projectionValue)
-		}
-		result.Copies = append(result.Copies, *hub)
-		result.Projections = append(result.Projections, projectionList...)
-	} else {
-		result.Copies = append(result.Copies, hubsToCopies(hubs)...)
-		for _, projection := range projections {
-			alias := -1
-			for i, candidate := range local {
-				if os.SameFile(candidate.info, projection.info) {
-					alias = i
-					break
-				}
-			}
-			projectionValue := projection.projection
-			if alias >= 0 {
-				projectionValue.RootIDs = appendUnique(projectionValue.RootIDs, local[alias].copy.RootIDs...)
-				projectionValue.Restrictions |= local[alias].copy.Restrictions
-				local = append(local[:alias], local[alias+1:]...)
-			}
-			result.Projections = append(result.Projections, projectionValue)
-		}
-	}
-	result.Copies = append(result.Copies, hubsToCopies(local)...)
 	return result, nil
+}
+
+// RepoPhysicalCopies returns the legacy display projection of current
+// namespace facts. It does not establish that a slot is an exclusive copy.
+func (set *ManagedRootSet) RepoPhysicalCopies(repoID string, repoType RepoType) (RepoPhysicalCopySet, error) {
+	all, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		return RepoPhysicalCopySet{}, err
+	}
+	return set.RepoPhysicalCopiesFromNamespace(repoID, repoType, all)
 }
 
 func safeRepoPathComponent(value string) bool {
@@ -1091,50 +712,6 @@ func safeRepoPathComponent(value string) bool {
 		return false
 	}
 	return filepath.VolumeName(value) == ""
-}
-
-func hubsToCopies(candidates []physicalCandidate) []RepoPhysicalCopy {
-	copies := make([]RepoPhysicalCopy, 0, len(candidates))
-	for _, candidate := range candidates {
-		copies = append(copies, candidate.copy)
-	}
-	return copies
-}
-
-func groupPhysicalCandidates(candidates []physicalCandidate) []physicalCandidate {
-	var groups []physicalCandidate
-	for _, candidate := range candidates {
-		index := -1
-		for i, group := range groups {
-			if os.SameFile(group.info, candidate.info) {
-				index = i
-				break
-			}
-		}
-		if index < 0 {
-			groups = append(groups, candidate)
-			continue
-		}
-		groups[index].copy.RootIDs = appendUnique(groups[index].copy.RootIDs, candidate.copy.RootIDs...)
-		groups[index].copy.Restrictions |= candidate.copy.Restrictions
-	}
-	return groups
-}
-
-func appendUnique(target []string, values ...string) []string {
-	for _, value := range values {
-		found := false
-		for _, existing := range target {
-			if existing == value {
-				found = true
-				break
-			}
-		}
-		if !found {
-			target = append(target, value)
-		}
-	}
-	return target
 }
 
 func isHubSpecialOwner(owner string) bool {

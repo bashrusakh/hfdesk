@@ -1,48 +1,51 @@
 # HFDesk storage management
 
-Canonical foundation: merged PR #95 on `main` (HF_HUB_CACHE wins over an explicit cacheDir). Issue #76 remains closed. PR #70 is superseded evidence only; its implementation and unpublished layout candidates are not a baseline.
+## Current phase and state
 
-Current phase: **1; corrections remain incomplete pending independent/native
-evidence**. Historical source snapshot `9498fc344a308f26dd02b5c9bbcebb2380ccdf93`
-and its dirty-worktree corrections are evidence only, not the current checkout.
-The current clean candidate at the start of this corrective stage was
-`8ee926f629a94f21b6e1127c7a9daaba846d8ec3` on `feature/storage-root-ownership`,
-based on `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e` (also the merge base). It
-received a full review verdict of pass with notes and a fresh tester checkpoint
-covering 27 production HTTP scenarios; the portable model-fixture correspondence
-gap described in the implementation record remains under correction. Those
-earlier results do not cover the corrected tests/docs state or establish native
-mount behavior. The current focused test and evidence-record correction is
-uncommitted; its exact candidate and local test results must be recorded after
-validation. Independent review/test of that resulting candidate and native CI
-remain pending.
+Phase 1 is split into two separately reviewed root-stage changes because the
+full safety work exceeded the candidate-size limit. It is **not complete**:
+F7 still blocks the root stack, and no downstream phase may begin until both
+root stages close it.
 
-Earlier independent Linux production evidence covered 27 HTTP scenarios on
-`8ee926f`; separate earlier parent-reported C1-C14/40-scenario evidence applies
-to a prior candidate only. Neither substitutes for current portable model checks
-or native mount execution. Go 1.26.7 local evidence is implementation-local only;
-Go 1.24 native-mount CI and native Windows/macOS evidence remain pending.
+- PR #111 feature branch: `feature/storage-root-ownership`, published/local
+  base `0c876f38afa5cce8dc1acc5d446c254683c3e3ef`; fresh main/base is
+  `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`.
+- R is the facts-only package: namespace/root observations and read-side
+  integration. It does not establish deletion eligibility.
+- Full authorized WIP is locally retained as archive A at
+  `a9931836a6517259884908d451f2975b62d2dcc0` on
+  `work/storage-root-full-wip`. A is not an ancestor of the feature branch and
+  must never be pushed or cherry-picked wholesale.
+- Safety successor S must be based on reviewed R and selectively recover only
+  its bounded safety components from A; S and the remaining F7 proof are not
+  implemented in this R assignment.
 
-This plan covers the authorized Issue #63 replacement in four bounded phases:
+## R facts contract
 
-1. Root/path ownership and eligibility (Issue #63, this branch).
-2. Repository coordination and managed HF state: native shared/exclusive leases, short metadata lock, RepoState outside hub, and shared extracted #80 atomic writer/confidence reconciliation.
-3. Reconciled inventory and deletion engine: strict model GGUF quant identity across shards/revisions, immutable durable plans, forward recovery, conservative GC, and safe whole-copy behavior; no UI.
-4. Re-enumerated opaque copy/artifact selectors, conditional requests, typed DTOs, safe UI, and docs; Fixes #63.
+Capture configured path identity lexically against the recorded base. Keep
+current declared root/namespace memberships distinct from filesystem object
+equality, owned-entry regions, copy context and friendly-view observations.
+Local type stays unknown when the Local namespace does not declare it. Unknown
+or incomplete reads are errors, not empty facts. List/details metadata use one
+bounded common namespace observation and preserve existing source priority,
+frozen-job/config behavior, #95 HF_HUB_CACHE precedence and read DTOs.
 
-Phases 2–4 are future work and are not part of this implementation package. Do not broaden phase 1 into transactional deletion or UI/API contract changes.
+R has no WholeCopy/LegacyHF admission API, destructive validation shim,
+delete-path consumer, or safety-refusal assertion. The legacy handler/cleanup
+remain byte-equivalent to the #95 base behavior; their pre-existing F7 gap is
+explicitly unresolved for S. No inventory, persistence, leases, transaction,
+new selector, API or UI design is introduced.
 
-Phase 1 must protect configured roots across the **complete intended legacy
-whole-HF destructive effect set**, including secondary friendly cleanup, before
-any removal. Configured-definition ancestry, observed physical ancestry and
-effect eligibility are separate claims. Unestablished physical noncontainment
-is unknown, not deletion permission. The bounded correction and verification
-model is in [phase 1](phases/phase-1.md) and the current
-[namespace-proof reassessment](reviews/mount-proof-reassessment.md).
-The earlier [symlink/effect-set reassessment](reviews/protected-roots-reassessment.md)
-is historical; its resolved-ancestor negative-proof hypothesis is superseded.
+## Sequence and gates
 
-Next safe action: run the integrated independent checkpoint and full stable-diff
-review against the committed candidate. Execute the
-required Go 1.24 private-namespace mount CI job before any Ready decision. Phase 2
-cannot use phase 1 as a completed foundation until these gates pass.
+1. Complete and commit R on the existing feature branch; keep A local and
+   separate. Prove base-to-R additions plus deletions are below 5,000 lines.
+2. Parent reviews R and rescope #111 metadata. No push, PR state change, Ready,
+   merge, or publication is authorized in this assignment.
+3. Only after R is reviewed, create S from that exact R and recover its bounded
+   guards/effect integration plus E. R and S must both close F7 before any
+   coordination/state phase begins.
+
+The future phase outline remains: repository coordination/managed state;
+reconciled inventory/delete engine without UI; then re-enumerated API/UI/docs.
+No work in those phases is part of R.

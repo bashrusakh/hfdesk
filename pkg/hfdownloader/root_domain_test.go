@@ -9,15 +9,6 @@ import (
 	"testing"
 )
 
-func containsRootID(rootIDs []string, wanted string) bool {
-	for _, rootID := range rootIDs {
-		if rootID == wanted {
-			return true
-		}
-	}
-	return false
-}
-
 func TestManagedRootIdentityUsesCapturedLexicalBase(t *testing.T) {
 	base := t.TempDir()
 	missing := filepath.Join(base, "models")
@@ -133,9 +124,6 @@ func TestManagedRootNestedProtectedFindsInverseAliasAndMissingDescendant(t *test
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := set.WholeCopyAllowed(rootID, effect); err == nil {
-		t.Fatal("whole-copy eligibility ignored protected root below inverse alias and missing suffix")
-	}
 }
 
 func TestManagedRootNestedProtectedKeepsMissingReservationUnderRootAlias(t *testing.T) {
@@ -204,7 +192,7 @@ func TestManagedRootGroupsMergeRestrictionsOnlyForProvenAliases(t *testing.T) {
 	}
 }
 
-func TestRepoPhysicalCopiesKeepsDistinctLocalAndGroupsOnlyProvenAliases(t *testing.T) {
+func TestNamespaceObservationRetainsDistinctLocalSlotsAndAliases(t *testing.T) {
 	base := t.TempDir()
 	first := filepath.Join(base, "first")
 	alias := filepath.Join(base, "alias")
@@ -224,27 +212,19 @@ func TestRepoPhysicalCopiesKeepsDistinctLocalAndGroupsOnlyProvenAliases(t *testi
 		{Path: alias, Roles: ManagedRootBrowse | ManagedRootProtected | ManagedRootLocal},
 		{Path: second, Roles: ManagedRootBrowse | ManagedRootProtected | ManagedRootLocal},
 	})
-	copies, err := set.RepoPhysicalCopies("owner/model", RepoTypeModel)
+	all, err := set.ObserveNamespaceMemberships()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(copies.Copies) != 2 {
-		t.Fatalf("copies = %#v; want alias group plus independent local copy", copies)
+	memberships := NamespaceMembershipsFor(all, "owner/model", RepoTypeModel)
+	if len(memberships) != 3 {
+		t.Fatalf("memberships = %#v; want all three logical root slots", memberships)
 	}
-	var grouped, distinct bool
-	for _, copy := range copies.Copies {
-		if copy.Kind != PhysicalCopyLocal {
-			t.Errorf("unexpected copy kind: %#v", copy)
-		}
-		if len(copy.RootIDs) == 2 {
-			grouped = true
-		}
-		if len(copy.RootIDs) == 1 {
-			distinct = true
-		}
+	if memberships[0].Root.ID == memberships[1].Root.ID || memberships[0].Root.ID == memberships[2].Root.ID || memberships[1].Root.ID == memberships[2].Root.ID {
+		t.Fatalf("distinct configured root identities were collapsed: %#v", memberships)
 	}
-	if !grouped || !distinct {
-		t.Fatalf("physical aliases and independent roots were not distinguished: %#v", copies)
+	if !os.SameFile(memberships[0].Directory, memberships[1].Directory) || os.SameFile(memberships[0].Directory, memberships[2].Directory) {
+		t.Fatalf("directory-object facts did not identify alias vs independent slot: %#v", memberships)
 	}
 }
 
@@ -267,15 +247,13 @@ func TestRepoPhysicalCopiesMergesCrossRoleAliasesButRetainsRootRestrictions(t *t
 		{Path: hub, Roles: ManagedRootHub | ManagedRootProtected},
 		{Path: localRoot, Roles: ManagedRootBrowse | ManagedRootLocal | ManagedRootProtected, Restrictions: ManagedRootSkipSpecial},
 	})
-	copies, err := set.RepoPhysicalCopies("owner/model", RepoTypeModel)
+	memberships, err := set.ObserveNamespaceMemberships()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(copies.Copies) != 1 || copies.Copies[0].Kind != PhysicalCopyHub || len(copies.Copies[0].RootIDs) != 2 || !containsRootID(copies.Copies[0].RootIDs, ManagedRootID(hub, base)) || !containsRootID(copies.Copies[0].RootIDs, ManagedRootID(localRoot, base)) || copies.Copies[0].Restrictions&ManagedRootSkipSpecial == 0 {
-		t.Fatalf("cross-role physical alias/restrictions were not merged: %#v", copies)
-	}
-	if err := set.WholeCopyAllowed(ManagedRootID(localRoot, base), localRepo); err == nil {
-		t.Fatal("symlink alias was treated as an independent local whole-copy unit")
+	matches := NamespaceMembershipsFor(memberships, "owner/model", RepoTypeModel)
+	if len(matches) != 2 || matches[0].Root.ID == matches[1].Root.ID || !os.SameFile(matches[0].Directory, matches[1].Directory) {
+		t.Fatalf("cross-role logical memberships and same-object facts were not retained: %#v", matches)
 	}
 }
 
@@ -299,7 +277,7 @@ func TestRepoPhysicalCopiesTreatFriendlyFoldersAsProjectionOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(copies.Copies) != 1 || copies.Copies[0].Kind != PhysicalCopyHub || copies.Copies[0].Path != hubRepo || len(copies.Projections) != 1 || copies.Projections[0].Path != projection {
-		t.Fatalf("Hub and non-destructive projection candidates = %#v", copies)
+		t.Fatalf("Hub and friendly projection observations = %#v", copies)
 	}
 	if err := os.RemoveAll(projection); err != nil {
 		t.Fatal(err)
@@ -315,8 +293,8 @@ func TestRepoPhysicalCopiesTreatFriendlyFoldersAsProjectionOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	projectionID := ManagedRootID(models, base)
-	if len(copies.Copies) != 1 || len(copies.Projections) != 0 || copies.Copies[0].Kind != PhysicalCopyHub || !containsRootID(copies.Copies[0].RootIDs, projectionID) {
-		t.Fatalf("same-object Hub/projection roles were not combined: %#v", copies)
+	if len(copies.Copies) != 1 || len(copies.Projections) != 1 || copies.Copies[0].Kind != PhysicalCopyHub || copies.Projections[0].RootIDs[0] != projectionID {
+		t.Fatalf("same-object Hub/projection memberships were not retained separately: %#v", copies)
 	}
 
 	if err := os.RemoveAll(hubRepo); err != nil {
@@ -333,11 +311,11 @@ func TestRepoPhysicalCopiesTreatFriendlyFoldersAsProjectionOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(orphanCopies.Copies) != 0 || len(orphanCopies.Projections) != 1 {
-		t.Fatalf("orphan projection became a physical/delete copy: %#v", orphanCopies)
+		t.Fatalf("orphan projection was not retained as a separate observed slot: %#v", orphanCopies)
 	}
 }
 
-func TestWholeCopyCannotTreatFriendlyProjectionAsLocalDeleteUnit(t *testing.T) {
+func TestNamespaceMembershipRetainsMixedProjectionAndLocalRoles(t *testing.T) {
 	base := t.TempDir()
 	models := filepath.Join(base, "models")
 	repo := filepath.Join(models, "owner", "model")
@@ -347,19 +325,24 @@ func TestWholeCopyCannotTreatFriendlyProjectionAsLocalDeleteUnit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "weights.gguf"), []byte("weights"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rootID := ManagedRootID(models, base)
 	set := NewManagedRootSet(base, []ManagedRootSpec{
 		{Path: models, Roles: ManagedRootBrowse | ManagedRootProtected | ManagedRootModelProjection},
 		{Path: models, Roles: ManagedRootBrowse | ManagedRootProtected | ManagedRootLocal},
 	})
-	if err := set.WholeCopyAllowed(rootID, repo); err == nil {
-		t.Fatal("friendly projection was accepted as an independent local delete unit")
-	}
-	copies, err := set.RepoPhysicalCopies("owner/model", RepoTypeModel)
+	memberships, err := set.ObserveNamespaceMemberships()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(copies.Copies) != 0 || len(copies.Projections) != 1 {
-		t.Fatalf("projection/local merged role became a physical delete copy: %#v", copies)
+	matches := NamespaceMembershipsFor(memberships, "owner/model", RepoTypeModel)
+	if len(matches) != 2 {
+		t.Fatalf("mixed namespace roles did not preserve both logical memberships: %#v", matches)
+	}
+	if matches[0].Root.ID != matches[1].Root.ID || matches[0].Kind == matches[1].Kind {
+		t.Fatalf("logical membership identities/roles were conflated: %#v", matches)
+	}
+	for _, membership := range matches {
+		if membership.Kind == PhysicalCopyLocal && membership.TypeKnown {
+			t.Fatalf("Local membership inferred repository type: %#v", membership)
+		}
 	}
 }

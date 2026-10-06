@@ -875,12 +875,6 @@ func TestManagedRootOwnershipThroughAliasAndNestedRoot(t *testing.T) {
 	if detailed.Path != listedChild.Path || detailed.Source != listedChild.Source || detailed.FileCount != listedChild.FileCount || detailed.Size != listedChild.Size || !reflect.DeepEqual(detailed.Quantizations, listedChild.Quantizations) {
 		t.Fatalf("list/detail ownership diverged: list=%#v details=%#v", listedChild, detailed)
 	}
-	if err := set.WholeCopyAllowed(parentRoot.ID, filepath.Join(alias, "routed", "inner", "model")); err == nil {
-		t.Fatal("parent root authorized copy owned by nested configured root")
-	}
-	if err := set.WholeCopyAllowed(childRoot.ID, childRepo); err != nil {
-		t.Fatalf("child root should own its exact repo copy: %v", err)
-	}
 }
 
 func TestFindLocalCachedRepoPreservesFriendlySourcePriority(t *testing.T) {
@@ -906,78 +900,6 @@ func TestFindLocalCachedRepoPreservesFriendlySourcePriority(t *testing.T) {
 	}
 	if repo.Source != "Friendly view" || repo.Path != friendlyRepo || repo.FileCount != 1 || repo.Size != int64(len("friendly")) || filepath.Base(repo.Files[0].Name) != "friendly.safetensors" {
 		t.Fatalf("friendly source priority/accounting changed: %#v", repo)
-	}
-}
-
-func TestManagedRootWholeCopyRefusesEnclosedRootAndSymlinks(t *testing.T) {
-	base := t.TempDir()
-	root := filepath.Join(base, "models")
-	target := filepath.Join(root, "owner", "model")
-	nested := filepath.Join(target, "nested")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), root, []string{nested}, nil, base)
-	rootID := configuredPathID(root, base)
-	if err := set.WholeCopyAllowed(rootID, target); err == nil {
-		t.Fatal("whole-copy eligibility allowed a target enclosing a configured root")
-	}
-
-	outside := filepath.Join(base, "outside")
-	if err := os.MkdirAll(filepath.Join(outside, "model"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	symlinkRoot := filepath.Join(base, "linked-models")
-	if err := os.Symlink(root, symlinkRoot); err != nil {
-		t.Skipf("directory symlink unavailable: %v", err)
-	}
-	symlinkSet := newManagedRootSet(filepath.Join(base, "cache2"), filepath.Join(base, "hub2"), symlinkRoot, nil, nil, base)
-	if err := symlinkSet.WholeCopyAllowed(configuredPathID(symlinkRoot, base), filepath.Join(symlinkRoot, "owner", "model")); err == nil {
-		t.Fatal("destructive eligibility accepted a symlinked configured root")
-	}
-	realParent := filepath.Join(base, "real-parent")
-	aliasedParent := filepath.Join(base, "aliased-parent")
-	intermediateRoot := filepath.Join(aliasedParent, "models")
-	intermediateRepo := filepath.Join(intermediateRoot, "owner", "model")
-	if err := os.MkdirAll(filepath.Join(realParent, "models", "owner", "model"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(realParent, aliasedParent); err != nil {
-		t.Skipf("directory symlink unavailable: %v", err)
-	}
-	intermediateSet := newManagedRootSet(filepath.Join(base, "cache-intermediate"), filepath.Join(base, "hub-intermediate"), intermediateRoot, nil, nil, base)
-	if err := intermediateSet.WholeCopyAllowed(configuredPathID(intermediateRoot, base), intermediateRepo); err == nil {
-		t.Fatal("destructive eligibility accepted a symlink in the configured root path")
-	}
-
-	componentRoot := filepath.Join(base, "components")
-	componentOutside := filepath.Join(base, "outside-components")
-	if err := os.MkdirAll(filepath.Join(componentOutside, "model"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(componentRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(componentOutside, filepath.Join(componentRoot, "owner")); err != nil {
-		t.Skipf("directory symlink unavailable: %v", err)
-	}
-	componentSet := newManagedRootSet(filepath.Join(base, "cache3"), filepath.Join(base, "hub3"), componentRoot, nil, nil, base)
-	if err := componentSet.WholeCopyAllowed(configuredPathID(componentRoot, base), filepath.Join(componentRoot, "owner", "model")); err == nil {
-		t.Fatal("destructive eligibility accepted a symlinked owner component")
-	}
-	leafRoot := filepath.Join(base, "leaf-components")
-	if err := os.MkdirAll(leafRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(leafRoot, "owner"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "model"), filepath.Join(leafRoot, "owner", "model")); err != nil {
-		t.Skipf("directory symlink unavailable: %v", err)
-	}
-	leafSet := newManagedRootSet(filepath.Join(base, "cache4"), filepath.Join(base, "hub4"), leafRoot, nil, nil, base)
-	if err := leafSet.WholeCopyAllowed(configuredPathID(leafRoot, base), filepath.Join(leafRoot, "owner", "model")); err == nil {
-		t.Fatal("destructive eligibility accepted a symlinked repository leaf")
 	}
 }
 

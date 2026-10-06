@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"path/filepath"
 	"strings"
 
@@ -65,16 +64,6 @@ func (root localCacheRoot) skipsOwner(owner string) bool {
 		return err != nil || !allowed
 	}
 	return false
-}
-
-func (root localCacheRoot) walk(dir string, fn filepath.WalkFunc) error {
-	if root.set == nil {
-		return errors.New("managed root adapter is not attached to its owner")
-	}
-	if root.set.err != nil {
-		return root.set.err
-	}
-	return root.set.domain.WalkOwned(root.ID, dir, fn)
 }
 
 func newManagedRootSet(cacheDir, hubDir, localDir string, localScanDirs []string, routes map[string]string, base string) *storageRootSet {
@@ -175,43 +164,39 @@ func (set *storageRootSet) Resolve(rootID, owner, name string) (string, error) {
 	return set.domain.Resolve(rootID, owner, name)
 }
 
-func (set *storageRootSet) WholeCopyAllowed(rootID, target string) error {
-	if set.err != nil {
-		return set.err
-	}
-	return set.domain.WholeCopyAllowed(rootID, target)
-}
-
-func (set *storageRootSet) LegacyHFDeleteAllowed(rootID, hubTarget, friendlyTarget, cacheRoot string) error {
-	if set.err != nil {
-		return set.err
-	}
-	return set.domain.LegacyHFDeleteAllowed(rootID, hubTarget, friendlyTarget, cacheRoot)
-}
-
 func (set *storageRootSet) RepoPhysicalCopies(repoID string, repoType hfdownloader.RepoType) (hfdownloader.RepoPhysicalCopySet, error) {
 	if set.err != nil {
 		return hfdownloader.RepoPhysicalCopySet{}, set.err
 	}
-	return set.domain.RepoPhysicalCopies(repoID, repoType)
+	memberships, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		return hfdownloader.RepoPhysicalCopySet{}, err
+	}
+	return set.RepoPhysicalCopiesFromNamespace(repoID, repoType, memberships)
 }
 
-func (set *storageRootSet) HasHubPhysicalCopy(repoID string, repoType hfdownloader.RepoType, path string) (bool, error) {
-	copies, err := set.RepoPhysicalCopies(repoID, repoType)
-	if err != nil {
-		return false, err
+func (set *storageRootSet) ObserveNamespaceMemberships() ([]hfdownloader.NamespaceMembership, error) {
+	if set.err != nil {
+		return nil, set.err
 	}
-	for _, candidate := range copies.Copies {
-		if candidate.Kind != hfdownloader.PhysicalCopyHub || hfdownloader.ConfiguredPathIdentity(candidate.Path, set.base) != hfdownloader.ConfiguredPathIdentity(path, set.base) {
-			continue
-		}
-		for _, rootID := range candidate.RootIDs {
-			if rootID == set.hubRootID {
-				return true, nil
-			}
+	return set.domain.ObserveNamespaceMemberships()
+}
+
+func (set *storageRootSet) RepoPhysicalCopiesFromNamespace(repoID string, repoType hfdownloader.RepoType, memberships []hfdownloader.NamespaceMembership) (hfdownloader.RepoPhysicalCopySet, error) {
+	if set.err != nil {
+		return hfdownloader.RepoPhysicalCopySet{}, set.err
+	}
+	return set.domain.RepoPhysicalCopiesFromNamespace(repoID, repoType, memberships)
+}
+
+func (set *storageRootSet) HubMembershipObserved(repoID string, repoType hfdownloader.RepoType, path string, memberships []hfdownloader.NamespaceMembership) bool {
+	for _, membership := range hfdownloader.NamespaceMembershipsFor(memberships, repoID, repoType) {
+		if membership.Kind == hfdownloader.PhysicalCopyHub && membership.Root.ID == set.hubRootID &&
+			hfdownloader.ConfiguredPathIdentity(membership.Path, set.base) == hfdownloader.ConfiguredPathIdentity(path, set.base) {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func localCacheRootFromDomain(set *storageRootSet, root hfdownloader.ManagedRoot) localCacheRoot {

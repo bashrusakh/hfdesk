@@ -15,8 +15,10 @@ import (
 
 const nativeMountChildEnv = "HFDESK_NATIVE_MOUNT_CHILD"
 
-// Run fixtures only in a private child mount namespace, never in the caller's
-// namespace. Required CI mode makes every setup limitation a test failure.
+// Keep the required CI selector stable while asserting factual reachability of
+// mounted namespace regions, not permission to remove them. The fixture runs
+// only in a private child mount namespace, never in the caller's namespace.
+// Required CI mode makes every setup limitation a test failure.
 func TestNativeMountProtectedRootReachability(t *testing.T) {
 	if os.Getenv(nativeMountChildEnv) == "1" {
 		runNativeMountProtectedRootCases(t)
@@ -107,7 +109,16 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 				name = "friendly-" + name
 			}
 			t.Run(name, func(t *testing.T) {
-				hub := filepath.Join(base, "cache", "hub")
+				caseRoot, err := os.MkdirTemp(base, "case-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.RemoveAll(caseRoot); err != nil {
+						t.Errorf("remove private fixture %q: %v", caseRoot, err)
+					}
+				}()
+				hub := filepath.Join(caseRoot, "cache", "hub")
 				repoName, projectionName, friendlyName, projectionRole := "models--owner--model", "models", "model", ManagedRootModelProjection
 				if dataset {
 					repoName, projectionName, friendlyName, projectionRole = "datasets--owner--dataset", "datasets", "dataset", ManagedRootDatasetProjection
@@ -116,7 +127,7 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 				if err := os.MkdirAll(target, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				cache := filepath.Join(base, "cache")
+				cache := filepath.Join(caseRoot, "cache")
 				friendlyPath := filepath.Join(cache, projectionName, "owner", friendlyName)
 				if err := os.MkdirAll(friendlyPath, 0o755); err != nil {
 					t.Fatal(err)
@@ -129,7 +140,7 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 				if err := os.Mkdir(mounted, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				source := filepath.Join(base, "protected")
+				source := filepath.Join(caseRoot, "protected")
 				if err := os.Mkdir(source, 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -153,16 +164,30 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 					{Path: filepath.Join(cache, projectionName), Roles: ManagedRootProtected | projectionRole},
 					{Path: source, Roles: ManagedRootProtected},
 				})
+				memberships, err := set.ObserveNamespaceMemberships()
+				if err != nil {
+					t.Fatalf("observe bind-mounted namespace membership: %v", err)
+				}
+				observedPath := target
 				if friendly {
-					err = set.LegacyHFDeleteAllowed(ManagedRootID(hub, base), target, friendlyPath, cache)
-				} else {
-					err = set.WholeCopyAllowed(ManagedRootID(hub, base), target)
+					observedPath = friendlyPath
 				}
-				if err == nil {
-					t.Fatal("actual bind-mounted protected object was accepted for recursive removal")
+				var regionObserved bool
+				for _, membership := range memberships {
+					if filepath.Clean(membership.Path) != filepath.Clean(observedPath) {
+						continue
+					}
+					for _, region := range membership.Regions {
+						if filepath.Clean(region.Path) == filepath.Clean(mounted) && os.SameFile(region.Info, mustStat(t, source)) {
+							regionObserved = true
+						}
+					}
 				}
-				if _, err := os.Stat(sentinel); err != nil {
-					t.Fatalf("protected sentinel was not preserved: %v", err)
+				if !regionObserved {
+					t.Fatalf("observed namespace facts omitted bind-mounted region %q", mounted)
+				}
+				if _, err := os.Stat(filepath.Join(mounted, "keep.txt")); err != nil {
+					t.Fatalf("bind-mounted sentinel was not observable: %v", err)
 				}
 			})
 		}
