@@ -172,19 +172,24 @@ func runNativeMountProtectedRootCases(t *testing.T) {
 				if friendly {
 					observedPath = friendlyPath
 				}
-				var regionObserved bool
+				var occurrenceObserved, ownedRegionClaimed bool
 				for _, membership := range memberships {
 					if filepath.Clean(membership.Path) != filepath.Clean(observedPath) {
 						continue
 					}
+					for _, entry := range membership.Entries {
+						if filepath.Clean(entry.Path) == filepath.Clean(mounted) && os.SameFile(entry.Info, mustStat(t, source)) {
+							occurrenceObserved = true
+						}
+					}
 					for _, region := range membership.Regions {
 						if filepath.Clean(region.Path) == filepath.Clean(mounted) && os.SameFile(region.Info, mustStat(t, source)) {
-							regionObserved = true
+							ownedRegionClaimed = true
 						}
 					}
 				}
-				if !regionObserved {
-					t.Fatalf("observed namespace facts omitted bind-mounted region %q", mounted)
+				if !occurrenceObserved || ownedRegionClaimed {
+					t.Fatalf("bind-mounted occurrence/owned-region facts mismatch for %q: occurrence=%v owned-region=%v", mounted, occurrenceObserved, ownedRegionClaimed)
 				}
 				if _, err := os.Stat(filepath.Join(mounted, "keep.txt")); err != nil {
 					t.Fatalf("bind-mounted sentinel was not observable: %v", err)

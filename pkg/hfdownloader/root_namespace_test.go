@@ -52,6 +52,55 @@ func TestObserveNamespaceMembershipsRetainsAllSlotsAndOwnedRegions(t *testing.T)
 	}
 }
 
+func TestObserveNamespaceMembershipsUsesRepoIDReadValidation(t *testing.T) {
+	base := t.TempDir()
+	local := filepath.Join(base, "local")
+	for _, id := range []string{"owner/My Model", "ümlaut/模型"} {
+		if err := os.MkdirAll(filepath.Join(local, filepath.FromSlash(id)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := NewManagedRootSet(base, []ManagedRootSpec{{Path: local, Roles: ManagedRootLocal | ManagedRootProtected}})
+	all, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"owner/My Model", "ümlaut/模型"} {
+		if got := len(NamespaceMembershipsFor(all, id, RepoTypeModel)); got != 1 {
+			t.Errorf("read namespace membership for %q = %d; want 1", id, got)
+		}
+	}
+	for _, name := range []string{"..", "bad\\name", "nested/name"} {
+		if _, _, _, ok := parseHubRepoDirName("models--owner--" + name); ok {
+			t.Errorf("Hub parser accepted unsafe/non-component repo %q", name)
+		}
+	}
+	if _, _, _, ok := parseHubRepoDirName("models--owner--My Model"); !ok {
+		t.Fatal("Hub parser rejected a valid repo ID component")
+	}
+	if _, _, typ, ok := parseHubRepoDirName("datasets--ümlaut--模型"); !ok || typ != RepoTypeDataset {
+		t.Fatal("Hub dataset parser rejected a valid Unicode repo ID")
+	}
+}
+
+func TestHubInternalNamespaceDoesNotBecomeLocalCopy(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "shared")
+	repo := filepath.Join(root, "models--owner--model")
+	if err := os.MkdirAll(filepath.Join(repo, "blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	set := NewManagedRootSet(base, []ManagedRootSpec{{Path: root, Roles: ManagedRootHub | ManagedRootLocal | ManagedRootProtected}})
+	all, err := set.ObserveNamespaceMemberships()
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := NamespaceMembershipsFor(all, "owner/model", RepoTypeModel)
+	if len(matches) != 1 || matches[0].Kind != PhysicalCopyHub || !matches[0].TypeKnown {
+		t.Fatalf("Hub namespace produced unexpected logical copies: %#v", matches)
+	}
+}
+
 func TestManagedNamespaceRetainsRolesAndPrunesNestedOwnedRegion(t *testing.T) {
 	base := t.TempDir()
 	dual := filepath.Join(base, "dual")

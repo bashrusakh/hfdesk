@@ -234,6 +234,7 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 		want               map[string]expectedRepo
 		absent             []string
 		relativeRoutes     bool
+		caseDistinctRoot   bool
 	}{
 		{
 			name: "local-and-fine", local: "models",
@@ -346,9 +347,46 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 			},
 			absent: []string{"LLM/GGUF"},
 		},
+		{
+			name: "case-distinct-nested-root", local: "models", caseDistinctRoot: true,
+			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
+			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/gguf/shards/model.safetensors"},
+			want: map[string]expectedRepo{
+				"owner/model": {path: "models/LLM/GGUF/owner/model", files: []string{"foo.gguf"}},
+				"LLM/gguf":    {path: "models/LLM/gguf", files: []string{"shards/model.safetensors"}},
+			},
+			absent: []string{"LLM/GGUF"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := t.TempDir()
+			if tc.caseDistinctRoot {
+				probe := filepath.Join(base, "case-probe")
+				upper, lower := filepath.Join(probe, "Probe"), filepath.Join(probe, "probe")
+				if err := os.MkdirAll(probe, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(upper, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(lower, 0o755); err != nil {
+					if os.IsExist(err) {
+						t.Skip("temporary filesystem aliases case-distinct directory names")
+					}
+					t.Fatalf("probe case-distinct directory support: %v", err)
+				}
+				upperInfo, err := os.Stat(upper)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lowerInfo, err := os.Stat(lower)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if os.SameFile(upperInfo, lowerInfo) {
+					t.Skip("temporary filesystem maps case-distinct directory names to one object")
+				}
+			}
 			if tc.relativeRoutes {
 				// Relative route paths use the process working directory. Keep this
 				// fixture on that volume for native Windows filepath.Rel semantics.
@@ -555,6 +593,48 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	}
 	if len(resp.Repos[0].Capabilities) != 1 || resp.Repos[0].Capabilities[0] != "vision" {
 		t.Fatalf("Capabilities = %#v, want [vision]", resp.Repos[0].Capabilities)
+	}
+}
+
+func TestAPI_CacheListAndInfoPreserveValidLocalRepoIDs(t *testing.T) {
+	cacheDir, localDir := t.TempDir(), t.TempDir()
+	ids := []string{"owner/My Model", "ümlaut/模型"}
+	for _, id := range ids {
+		repoDir := filepath.Join(localDir, filepath.FromSlash(id))
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, "weights.gguf"), []byte("weight"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := newTestServerWithConfig(t, Config{CacheDir: cacheDir, LocalDir: localDir})
+	w := httptest.NewRecorder()
+	srv.handleCacheList(w, httptest.NewRequest("GET", "/api/cache", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache list = %d: %s", w.Code, w.Body.String())
+	}
+	var listed struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		found := false
+		for _, repo := range listed.Repos {
+			found = found || repo.Repo == id
+		}
+		if !found {
+			t.Errorf("cache list omitted %q: %s", id, w.Body.String())
+		}
+		infoReq := httptest.NewRequest("GET", "/api/cache/", nil)
+		infoReq.SetPathValue("repo", id)
+		info := httptest.NewRecorder()
+		srv.handleCacheInfo(info, infoReq)
+		if info.Code != http.StatusOK {
+			t.Errorf("cache info for %q = %d: %s", id, info.Code, info.Body.String())
+		}
 	}
 }
 

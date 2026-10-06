@@ -190,7 +190,7 @@ func (set *ManagedRootSet) enumerateOwnerNameSlots(root ManagedRoot, kind Physic
 	var memberships []NamespaceMembership
 	for _, ownerEntry := range owners {
 		owner := ownerEntry.name
-		if !IsValidRepoComponent(owner) {
+		if !IsValidModelName(owner + "/placeholder") {
 			continue
 		}
 		ownerIsDir, dirErr := namespaceEntryIsDir(filepath.Join(root.AbsolutePath, owner), ownerEntry.info)
@@ -235,7 +235,7 @@ func (set *ManagedRootSet) enumerateOwnerNameSlots(root ManagedRoot, kind Physic
 		}
 		for _, repoEntry := range repos {
 			name := repoEntry.name
-			if !IsValidRepoComponent(name) {
+			if !IsValidModelName(owner + "/" + name) {
 				continue
 			}
 			path := filepath.Join(ownerPath, name)

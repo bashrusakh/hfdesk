@@ -137,7 +137,7 @@ jobs:
         run: go test ./internal/server -run 'Test(WindowsReplaceJobsStateFileUsesNativeReplacement|ReplaceJobsStateFile)' -v
 
       - name: Test native storage ownership
-        run: go test ./pkg/hfdownloader -run '^(TestManagedRoot|TestRepoPhysicalCopies|TestWholeCopy)' -count=1 -v
+        run: go test ./pkg/hfdownloader -run '^(Test(ManagedRoot|RepoPhysicalCopies|WholeCopy|ObserveNamespace|HubInternalNamespace|ManagedNamespace))' -count=1 -v
 
       - name: Test native server root ownership
-        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CacheAndRoutePathsUseCapturedConfigBase|FindLocalCachedRepoPreservesFriendlySourcePriority|CaseDistinctRouteDestinations|LocalCacheRoots.*|LocalCachedRepos_(RootRestrictions|NestedRoots)|API_CacheHFFriendlyMetadata_(Ownership|NoProjection|ConfigSnapshot)|API_CacheDelete_(PathTraversal|ValidRepoFormat|ProtectsNestedFriendlyRootsBeforeEitherRemoval|ProtectsInverseAliasNestedInHubBeforeRemoval|RefusesAliasedFriendlyComponentsBeforeHubRemoval|ModelNameMayContainDatasetPrefix)|WholeHubDelete.*|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly|JobDestFreeze_.*|CreateJob_DedupDestinationIdentity.*))$' -count=1 -v
+        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CacheAndRoutePathsUseCapturedConfigBase|FindLocalCachedRepoPreservesFriendlySourcePriority|CaseDistinctRouteDestinations|LocalCacheRoots.*|LocalCachedRepos_(RootRestrictions|NestedRoots)|API_CacheListAndInfoPreserveValidLocalRepoIDs|API_CacheHFFriendlyMetadata_(Ownership|NoProjection|ConfigSnapshot)|API_CacheDelete_(PathTraversal|ValidRepoFormat|ModelNameMayContainDatasetPrefix)|WholeHubDelete.*|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly|JobDestFreeze_.*|CreateJob_DedupDestinationIdentity.*|SearchDoesNotReportSuccessForIncompleteNamespace))$' -count=1 -v

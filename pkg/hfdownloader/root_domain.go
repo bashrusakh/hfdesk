@@ -646,7 +646,7 @@ func parseHubRepoDirName(name string) (owner, repo string, repoType RepoType, ok
 			if prefix == "datasets--" {
 				repoType = RepoTypeDataset
 			}
-			ok = found && IsValidRepoComponent(owner) && IsValidRepoComponent(repo)
+			ok = found && IsValidModelName(owner+"/"+repo)
 			return owner, repo, repoType, ok
 		}
 	}
