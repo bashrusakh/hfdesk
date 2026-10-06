@@ -74,6 +74,15 @@ func verifySHA256Ctx(ctx context.Context, path string, expected string) error {
 // shouldSkipLocal checks if a file already exists and matches expected hash/size.
 // Returns (skip, reason, error).
 func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
+	return shouldSkipLocalCtx(context.Background(), it, dst)
+}
+
+// shouldSkipLocalCtx is shouldSkipLocal bounded by ctx. A multi-GB LFS hash can
+// otherwise run to completion after a sibling's permanent error cancelled the
+// job; with ctx it aborts promptly. Successful skip behavior is unchanged: a
+// cancelled ctx returns ctx.Err() so the caller surfaces the cancellation
+// instead of skipping.
+func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
 	fi, err := os.Stat(dst)
 	if err != nil {
 		// no file
@@ -87,8 +96,11 @@ func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
 
 	// LFS with known sha: compute and compare
 	if it.LFS && it.SHA256 != "" {
-		if err := verifySHA256(dst, it.SHA256); err == nil {
+		if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
 			return true, "sha256 match", nil
+		} else if verr := ctx.Err(); verr != nil {
+			// Cancelled mid-verify: surface the cancellation, do not skip.
+			return false, "", verr
 		}
 		// size matched but sha mismatched -> re-download
 		return false, "", nil

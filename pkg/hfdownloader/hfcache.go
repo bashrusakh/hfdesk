@@ -659,8 +659,11 @@ func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relative
 			return nil, fmt.Errorf("create blobs directory: %w", err)
 		}
 		if err := os.Rename(tempFile, blobPath); err != nil {
-			// Rename failed (cross-device?), try copy
-			if err := copyFileCtx(ctx, tempFile, blobPath); err != nil {
+			// Rename failed (cross-device?), try an atomic copy: stage in a
+			// sibling temp file, fsync, then rename into place. A cancelled or
+			// failed copy must never leave a partial file at the FINAL blob
+			// path (which CheckBlob would report complete, poisoning the cache).
+			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
 				return nil, fmt.Errorf("move file to blob: %w", err)
 			}
 			os.Remove(tempFile)
@@ -705,7 +708,9 @@ func copyFile(src, dst string) error {
 }
 
 // copyFileCtx is copyFile bounded by ctx: the copy aborts promptly with the
-// context error if ctx is cancelled mid-copy.
+// context error if ctx is cancelled mid-copy. It writes directly to dst; use
+// copyFileAtomicCtx when dst is a durable artifact that must not be observed
+// half-written.
 func copyFileCtx(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -723,4 +728,43 @@ func copyFileCtx(ctx context.Context, src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// copyFileAtomicCtx copies src to dst atomically: it streams into a sibling
+// temporary file in the same directory, fsyncs and closes it, then renames it
+// onto dst. On ctx cancellation or any error it removes the staging file and
+// leaves both src intact and dst absent/unchanged, so a cancelled copy can
+// never leave a partial file at dst. It is the durable-publish variant used for
+// cache blobs, where a partial file at the final path would be mistaken for a
+// complete blob.
+func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	// Stage in the destination's directory so the final rename is atomic
+	// (same filesystem).
+	staging, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	stagingPath := staging.Name()
+	// Clean up the staging file on every non-success path. Once the rename
+	// succeeds the staging path no longer exists, so os.Remove is a no-op.
+	defer os.Remove(stagingPath)
+
+	if _, err := io.Copy(staging, contextReader{ctx: ctx, r: in}); err != nil {
+		staging.Close()
+		return err
+	}
+	if err := staging.Sync(); err != nil {
+		staging.Close()
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	return os.Rename(stagingPath, dst)
 }

@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1682,14 +1683,19 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_RestartAboveHwmNoFreeRefund exercises the multipart
-// refund rule: each part's first (advancing) 206 attempt refunds once, and the
-// following bodyless attempts must not refund, so the part terminates within the
-// absolute ceiling. Note: multipart has no truncation path, so an advancing
-// attempt always also updates hwm; the unconditional hwm update required by the
-// fix is therefore a defensive mirror of the single-file rule and is not
-// independently observable from an in-process part server. The single-file
-// TestDownloadSingle_RestartAboveHwmNoFreeRefund is the discriminating case.
+// TestDownloadMultipart_RestartAboveHwmNoFreeRefund pins the multipart
+// non-progress retry budget: each part performs exactly ONE advancing 206
+// attempt (which refunds once), followed only by BODYLESS attempts (no new
+// bytes -> no refund). The observed request count must therefore equal the
+// non-progress budget partCount*(Retries+1), not merely stay under the absolute
+// ceiling.
+//
+// Multipart has no truncation path, so the single-file "restart above the old
+// hwm then bodyless failure earns a free refund" counterexample cannot arise
+// here: a bodyless attempt never exceeds preHwm, so it can never refund under
+// any variant. This test therefore pins the current correct budget rule as a
+// regression guard; the discriminating case for the always-update-hwm fix is
+// the single-file TestDownloadSingle_RestartAboveHwmNoFreeRefund.
 func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-mpfree")
@@ -1700,9 +1706,9 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	const total = 100_000
 	const partCount = 2
 	var (
-		mu           sync.Mutex
-		partRequests int
-		seenStarts   = map[int64]int{}
+		mu       sync.Mutex
+		requests int
+		advanced = map[int]bool{} // part index -> already advanced once
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -1710,9 +1716,6 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 			w.Header().Set("Accept-Ranges", "bytes")
 			return
 		}
-		mu.Lock()
-		partRequests++
-		mu.Unlock()
 		start := int64(0)
 		if rng := r.Header.Get("Range"); rng != "" {
 			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
@@ -1720,36 +1723,36 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 				return
 			}
 		}
-		// Determine this part's attempt index by counting requests for the same
-		// requested start offset. The first attempt of each part advances and
-		// aborts; every later attempt for the same start is bodyless.
+		// Part 0 requests offsets below the midpoint; part 1 at/above it. Keying
+		// by part (not by the advancing start offset) lets each part perform its
+		// single advancing attempt exactly once.
+		partIdx := 0
+		if start >= total/2 {
+			partIdx = 1
+		}
 		mu.Lock()
-		seen := seenStarts[start]
-		seenStarts[start] = seen + 1
-		firstForStart := seen == 0
+		requests++
+		firstForPart := !advanced[partIdx]
+		advanced[partIdx] = true
 		mu.Unlock()
+
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
 		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
 		}
-		if firstForStart {
-			// First attempt at this offset: append a small prefix, then abort
-			// (a genuine advance that should refund once).
+		if firstForPart {
+			// The one advancing attempt for this part: append 500 bytes, abort.
 			w.Write(make([]byte, 500))
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
 			}
 		}
-		// Later attempts at the same offset are bodyless: no new bytes.
+		// All later attempts are bodyless: no new bytes, no refund.
 		panic(http.ErrAbortHandler)
 	}))
 	defer srv.Close()
-
-	oldMult := maxAttemptsPerRetry
-	maxAttemptsPerRetry = 3
-	defer func() { maxAttemptsPerRetry = oldMult }()
 
 	it := PlanItem{RelativePath: "mpfree.bin", URL: srv.URL + "/mpfree.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: partCount, Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
@@ -1768,14 +1771,11 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 		t.Fatal("downloadMultipart did not terminate")
 	}
 	mu.Lock()
-	n := partRequests
+	n := requests
 	mu.Unlock()
-	// Each part: one refunding advance followed by bodyless attempts that must
-	// not refund, so at most ceiling+1 requests per part (not an unbounded
-	// refill).
-	bound := partCount * (absoluteAttemptCeiling(cfg.Retries) + 1)
-	if n > bound {
-		t.Errorf("made %d part requests; want <= %d", n, bound)
+	want := partCount * (cfg.Retries + 1)
+	if n != want {
+		t.Errorf("made %d part requests; want exactly %d (one refunding advance per part, then only bodyless attempts)", n, want)
 	}
 }
 
@@ -2031,6 +2031,418 @@ func TestVerifyAndStoreCtxAbortPromptly(t *testing.T) {
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
 			t.Errorf("StoreDownloadedFileCtx took %v on a cancelled ctx", elapsed)
+		}
+	})
+}
+
+// --- Round 3: atomic blob publication + remaining T1 cancellation paths ---
+
+// TestCopyFileAtomicCtxAbortLeavesNoBlob verifies the atomic-publish primitive:
+// an aborted copy leaves NO file at dst, leaves the source intact, and a
+// subsequent successful copy produces the full content. This is the regression
+// guard for the round-2 non-atomic-publication regression, where a cancelled
+// copy wrote directly to the final blob path and a later CheckBlob treated the
+// partial residue as a complete blob.
+func TestCopyFileAtomicCtxAbortLeavesNoBlob(t *testing.T) {
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "src.bin")
+	dst := filepath.Join(tmpDir, "blob.bin")
+	payload := bytes.Repeat([]byte("a"), 8<<20) // 8 MiB
+	if err := os.WriteFile(src, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled: aborts on the first Read
+
+	start := time.Now()
+	if err := copyFileAtomicCtx(ctx, src, dst); err == nil {
+		t.Fatal("expected a cancellation error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("copyFileAtomicCtx took %v on a cancelled ctx", elapsed)
+	}
+
+	// No file at the final destination.
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("dst must not exist after an aborted atomic copy (stat err=%v)", err)
+	}
+	// Source intact.
+	if got, err := os.ReadFile(src); err != nil || !bytes.Equal(got, payload) {
+		t.Errorf("source must be intact after an aborted atomic copy (err=%v)", err)
+	}
+	// No staging residue in the destination directory.
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "src.bin" && e.Name() != "blob.bin" {
+			t.Errorf("unexpected staging residue left behind: %s", e.Name())
+		}
+	}
+
+	// A subsequent successful copy produces the full content.
+	if err := copyFileAtomicCtx(context.Background(), src, dst); err != nil {
+		t.Fatalf("successful atomic copy: %v", err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, payload) {
+		t.Errorf("dst content mismatch after successful copy (err=%v)", err)
+	}
+}
+
+// TestStoreDownloadedFileCtx_AbortDoesNotPoisonBlob verifies that a store whose
+// ctx is cancelled before/at hashing leaves no blob (so CheckBlob reports the
+// blob missing, not complete) and leaves the source intact; a later successful
+// store produces a valid complete blob.
+//
+// This test passes an EMPTY sha256, so the cancellation lands in the ctx-aware
+// hash (computeSHA256Ctx) BEFORE the store reaches its copy/rename path. It
+// therefore guards the pre-copy hash-abort boundary, not the atomic copy. The
+// atomic copy primitive itself (used by the cross-device fallback) is covered
+// discriminatingly by TestCopyFileAtomicCtxAbortLeavesNoBlob.
+func TestStoreDownloadedFileCtx_AbortDoesNotPoisonBlob(t *testing.T) {
+	settings := DefaultSettings()
+	settings.CacheDir = t.TempDir()
+	cache, err := settings.BuildHFCache()
+	if err != nil {
+		t.Fatalf("BuildHFCache: %v", err)
+	}
+	rd, err := cache.Repo("o/r", RepoTypeModel)
+	if err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.Repeat([]byte("b"), 8<<20) // 8 MiB
+	hash := fmt.Sprintf("%x", sha256.Sum256(body))
+	blobPath := rd.BlobPath(hash)
+
+	// A cancelled ctx plus an unknown sha256 forces a ctx-aware hash that aborts
+	// before any rename to the final blob path.
+	tempFile := filepath.Join(rd.BlobsDir(), "tmp-"+hash)
+	if err := os.WriteFile(tempFile, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := rd.StoreDownloadedFileCtx(ctx, tempFile, "weights.bin", "commit", "", "", true); err == nil {
+		t.Fatal("expected a cancellation error from the cancelled store")
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Errorf("blob must not exist after a cancelled store (stat err=%v)", err)
+	}
+	if status, _, _ := rd.CheckBlob(hash); status == BlobComplete {
+		t.Errorf("CheckBlob reported a cancelled store's residue as complete: %v", status)
+	}
+	// The caller's source (the temp partial) must be intact for a retry.
+	if got, err := os.ReadFile(tempFile); err != nil || !bytes.Equal(got, body) {
+		t.Errorf("source temp file must be intact after a cancelled store (err=%v)", err)
+	}
+
+	// A later successful store produces a valid complete blob with the right bytes.
+	if _, err := rd.StoreDownloadedFileCtx(context.Background(), tempFile, "weights.bin", "commit", hash, "", true); err != nil {
+		t.Fatalf("successful store: %v", err)
+	}
+	if status, _, _ := rd.CheckBlob(hash); status != BlobComplete {
+		t.Errorf("CheckBlob after successful store = %v, want complete", status)
+	}
+	if got, err := os.ReadFile(blobPath); err != nil || !bytes.Equal(got, body) {
+		t.Errorf("blob content mismatch after successful store (err=%v)", err)
+	}
+}
+
+// TestShouldSkipLocalCtxAbortsOnCancel verifies the local skip-verify path is
+// ctx-aware: an already-cancelled ctx returns the context error (so a sibling's
+// permanent error is not delayed by a multi-GB re-hash) while a legitimate hash
+// match still skips and a size-only match is unchanged.
+func TestShouldSkipLocalCtxAbortsOnCancel(t *testing.T) {
+	tmpDir := t.TempDir()
+	body := bytes.Repeat([]byte("c"), 8<<20)
+	dst := filepath.Join(tmpDir, "f.bin")
+	hash := fmt.Sprintf("%x", sha256.Sum256(body))
+	if err := os.WriteFile(dst, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("cancelled ctx aborts", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		it := PlanItem{RelativePath: "f.bin", Size: int64(len(body)), LFS: true, SHA256: hash}
+		start := time.Now()
+		skip, _, err := shouldSkipLocalCtx(ctx, it, dst)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+		if skip {
+			t.Error("must not skip on a cancelled ctx")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("shouldSkipLocalCtx took %v on a cancelled ctx", elapsed)
+		}
+	})
+
+	t.Run("hash match still skips", func(t *testing.T) {
+		it := PlanItem{RelativePath: "f.bin", Size: int64(len(body)), LFS: true, SHA256: hash}
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), it, dst)
+		if err != nil || !skip || reason != "sha256 match" {
+			t.Errorf("want skip/sha256 match, got skip=%v reason=%q err=%v", skip, reason, err)
+		}
+	})
+
+	t.Run("size-only match unchanged", func(t *testing.T) {
+		it := PlanItem{RelativePath: "f.bin", Size: int64(len(body))}
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), it, dst)
+		if err != nil || !skip || reason != "size match" {
+			t.Errorf("want skip/size match, got skip=%v reason=%q err=%v", skip, reason, err)
+		}
+	})
+}
+
+// TestDownload_VerifyHeadPermanentFailsFast verifies the verification HEAD path
+// classifies a permanent 401/403 and fails the whole job fast with the ORIGINAL
+// error, while a benign 404 (optional metadata absent) does NOT fail the job.
+func TestDownload_VerifyHeadPermanentFailsFast(t *testing.T) {
+	run := func(t *testing.T, headStatus int) (error, int) {
+		t.Helper()
+		var (
+			mu       sync.Mutex
+			fileGets int
+			headReqs int
+		)
+		body := []byte("non-lfs payload")
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/revision/"):
+				_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
+			case strings.Contains(r.URL.Path, "/tree/"):
+				_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: int64(len(body))}})
+			case strings.HasSuffix(r.URL.Path, "config.json") && r.Method == http.MethodHead:
+				mu.Lock()
+				headReqs++
+				mu.Unlock()
+				w.WriteHeader(headStatus)
+			case strings.HasSuffix(r.URL.Path, "config.json"):
+				mu.Lock()
+				fileGets++
+				mu.Unlock()
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				w.Write(body)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := Settings{
+			CacheDir:           t.TempDir(),
+			Endpoint:           srv.URL,
+			Concurrency:        1,
+			MaxActiveDownloads: 1,
+			Retries:            0,
+			StallTimeout:       "0",
+			Verify:             "sha256", // non-LFS + verify sha256 -> headForETag path
+		}
+		err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ProgressEvent) {})
+		mu.Lock()
+		defer mu.Unlock()
+		return err, headReqs
+	}
+
+	t.Run("403 HEAD fails fast with original error", func(t *testing.T) {
+		err, headReqs := run(t, http.StatusForbidden)
+		if err == nil {
+			t.Fatal("expected a permanent error from the verification HEAD")
+		}
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Errorf("error = %v, want ErrUnauthorized (403)", err)
+		}
+		if headReqs != 1 {
+			t.Errorf("verification HEAD issued %d times; want 1 (no retry storm)", headReqs)
+		}
+	})
+
+	t.Run("404 HEAD is a benign optional-metadata miss", func(t *testing.T) {
+		err, _ := run(t, http.StatusNotFound)
+		if err != nil {
+			t.Errorf("a 404 verification HEAD must NOT fail the job, got %v", err)
+		}
+	})
+}
+
+// TestDownload_SiblingAbortedDuringStorePhase verifies the integrated T1
+// boundary end to end: file B is forced into the hfcache store/verify phase (a
+// large local hash) and only THEN is a sibling file A allowed to fail with a
+// permanent 404. A's permanent 404 must fail the whole job promptly with A's
+// ORIGINAL error, and B's in-flight store must abort — leaving B's final blob
+// unpublished rather than completing a multi-GB hash/copy first.
+//
+// Ordering is deterministic, not sleep-based: B's own "file_finalizing" emit
+// (which precedes its store phase) releases A's handler to answer 404. The
+// blob-absence assertion is timing-independent; the bounded elapsed assertion
+// additionally pins "promptly".
+func TestDownload_SiblingAbortedDuringStorePhase(t *testing.T) {
+	// Large enough that B's store-side SHA-256 of the cached temp file is a real
+	// local phase that the ctx-aware store must interrupt.
+	const bigSize = 128 << 20 // 128 MiB
+	big := make([]byte, bigSize)
+	for i := range big {
+		big[i] = byte(i % 251)
+	}
+	bigHash := fmt.Sprintf("%x", sha256.Sum256(big))
+
+	// allowAFail is closed when B has reached its store/verify phase.
+	allowAFail := make(chan struct{})
+	var allowOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "a-missing.bin", Size: 1024},
+				{Type: "file", Path: "z-big.bin", Size: bigSize},
+			})
+		case strings.HasSuffix(r.URL.Path, "z-big.bin"):
+			w.Header().Set("Content-Length", strconv.Itoa(bigSize))
+			w.WriteHeader(http.StatusOK)
+			w.Write(big)
+		case strings.HasSuffix(r.URL.Path, "a-missing.bin"):
+			// Answer 404 only once B has entered its store/verify phase, so the
+			// permanent error lands while B is in the multi-GB local phase.
+			select {
+			case <-allowAFail:
+			case <-time.After(20 * time.Second):
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := Settings{
+		CacheDir:           t.TempDir(),
+		Endpoint:           srv.URL,
+		Concurrency:        1,
+		MaxActiveDownloads: 2,
+		Retries:            0,
+		StallTimeout:       "0",
+		Verify:             "none", // B is non-LFS: the store hashes it.
+	}
+
+	// Resolve B's final blob path so we can assert it was never published.
+	cache, err := cfg.BuildHFCache()
+	if err != nil {
+		t.Fatalf("BuildHFCache: %v", err)
+	}
+	rd, err := cache.Repo("o/r", RepoTypeModel)
+	if err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	blobPath := rd.BlobPath(bigHash)
+
+	emit := func(ev ProgressEvent) {
+		if ev.Path == "z-big.bin" && ev.Event == "file_finalizing" {
+			allowOnce.Do(func() { close(allowAFail) })
+		}
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, emit)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("error = %v, want ErrNotFound (the original permanent error)", err)
+		}
+		if elapsed := time.Since(start); elapsed > 6*time.Second {
+			t.Errorf("job took %v; a sibling store phase should have been aborted promptly", elapsed)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Download blocked on a sibling's store/verify phase after a permanent 404")
+	}
+
+	// Timing-independent discriminator: B's store must have aborted, so its
+	// final blob was never published.
+	if _, statErr := os.Stat(blobPath); !os.IsNotExist(statErr) {
+		t.Errorf("B's blob was published despite the sibling 404 (stat err=%v); its store was not aborted", statErr)
+	}
+	if status, _, _ := rd.CheckBlob(bigHash); status == BlobComplete {
+		t.Errorf("CheckBlob reports B complete after a sibling abort: %v", status)
+	}
+}
+
+// TestHeadForETag_InternalTimeoutIsBenignMiss verifies that headForETag's own
+// request timeout is NOT surfaced as a fail-fast error (which would fail a
+// whole file/job on a slow-but-successful HEAD against a cold mirror), while a
+// genuine CALLER cancellation IS surfaced promptly.
+func TestHeadForETag_InternalTimeoutIsBenignMiss(t *testing.T) {
+	const body = "etag payload"
+
+	// A HEAD server that sleeps before responding successfully. It exits early
+	// if the client's request context is done, so a cancelled client does not
+	// leave the handler blocked.
+	const handlerDelay = 300 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(handlerDelay):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("ETag", `"abc"`)
+		w.Header().Set("x-amz-meta-sha256", "deadbeef")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "f.bin", URL: srv.URL + "/f.bin", Size: int64(len(body))}
+
+	// Each subtest sets headForETagTimeout for its own scenario (restored via
+	// defer) so the internal timeout and the caller cancel cannot race.
+	t.Run("internal timeout is a benign miss", func(t *testing.T) {
+		old := headForETagTimeout
+		headForETagTimeout = 30 * time.Millisecond // fires well before handlerDelay
+		defer func() { headForETagTimeout = old }()
+
+		start := time.Now()
+		etag, sha, err := headForETag(context.Background(), srv.Client(), "", it)
+		if err != nil {
+			t.Fatalf("internal timeout must be a benign miss, got err=%v", err)
+		}
+		if etag != "" || sha != "" {
+			t.Errorf("benign miss must return empty metadata, got etag=%q sha=%q", etag, sha)
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("headForETag took %v; the internal timeout should have bounded it", elapsed)
+		}
+	})
+
+	t.Run("caller cancellation is surfaced promptly", func(t *testing.T) {
+		old := headForETagTimeout
+		headForETagTimeout = 5 * time.Second // internal timeout cannot fire first
+		defer func() { headForETagTimeout = old }()
+
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			time.Sleep(30 * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		_, _, err := headForETag(parent, srv.Client(), "", it)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled from the caller cancellation, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("headForETag took %v; a cancelled parent must abort promptly", elapsed)
 		}
 	})
 }

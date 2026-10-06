@@ -473,7 +473,7 @@ LOOP:
 				}
 				dst = safeDst
 				skipCheck = func() (bool, string, error) {
-					return shouldSkipLocal(it, dst)
+					return shouldSkipLocalCtx(fileCtx, it, dst)
 				}
 			}
 
@@ -569,7 +569,20 @@ LOOP:
 					return
 				}
 			} else if cfg.Verify == "sha256" {
-				_, remoteSha, _ := headForETag(fileCtx, httpc, cfg.Token, itForIO)
+				_, remoteSha, herr := headForETag(fileCtx, httpc, cfg.Token, itForIO)
+				if herr != nil {
+					// A permanent 401/403 (or cancellation) must fail the whole
+					// job fast with the ORIGINAL error. Absent optional metadata
+					// is not an error, so the ordinary miss path falls through.
+					if isFailFastError(herr) {
+						setFatalErr(fmt.Errorf("verify head %s: %w", finalRel, herr))
+					}
+					select {
+					case errCh <- fmt.Errorf("verify head %s: %w", finalRel, herr):
+					default:
+					}
+					return
+				}
 				if remoteSha != "" {
 					if err := verifySHA256Ctx(fileCtx, dst, remoteSha); err != nil {
 						select {
