@@ -17,12 +17,12 @@
     and selector runs are not native Windows evidence.
   - [x] Attempt required-native `TestNativeMount*`; worker-marker negative case
     passed, but positive subprocess launch failed `operation not permitted` before
-    namespace setup. No native mount/Go 1.24 pass is claimed.
+    namespace setup. No native mount/Go 1.25 pass is claimed.
   - [x] Scope the Windows R selector to facts only; retain the two legacy DELETE
     safety tests in source and exclude them from this facts-stage check.
-  - [ ] Remote run 37409513941: native Linux facts job passed; Windows facts job
-    failed only those two excluded safety assertions. Re-run candidate CI after
-    authorized publication; native Windows facts result remains pending.
+  - [ ] Current candidate integrates fresh `origin/main` `8d3f982` and pins the
+    required-native Linux job to Go 1.25; rerun native Linux/Windows CI after
+    authorized publication. Prior remote run is stale; native Windows remains pending.
   - [x] Historical source commit `4bcf7f9` was reviewed as requiring changes;
     archive A is not its ancestor. That review is not approval of corrected R.
   - [x] Commit corrected source/test/CI bytes and status snapshot as

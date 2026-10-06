@@ -2,18 +2,13 @@
 
 ## Current candidate
 
-The reviewed historical R source commit is `4bcf7f976b1f8ad25e524de4a420a65bfeb6b2a0`;
-local finalization started from branch HEAD `1cc361afe65cbfb81de864e5c3e207d64e3d0751`
-and committed the corrected source/test/CI bytes as `ff666365266d839c3719a390334ebe4de9aaa604`.
-Both are on `feature/storage-root-ownership`, based on `0c876f38`; current
-base/merge-base is `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. The worktree has
-11 intended source/test/CI correction files in that commit. The 1cc review is
-historical and requires changes: it identified three implementation/evidence
-correspondence gaps. The corrected dirty worktree is a new candidate, not the
-reviewed 1cc state; fresh whole-R review is pending. Base-to-HEAD is 4,751 lines;
-with the intended corrections it is 4,899 before this status-only doc update
-(<5,000 additions plus deletions in the final base-to-candidate diff).
-R is not a safety implementation and is not Ready.
+Historical review of `4bcf7f976b1f8ad25e524de4a420a65bfeb6b2a0` requires changes;
+corrected R at `caaa4e2cc5ed7ef817f5d453f3c802c81eebfae0` awaits fresh whole-R
+review. The ordinary integration merge is `ae057f3d320629b8d327fe817f771337f029989e`,
+with `origin/main` `8d3f9824959a5d2c4f089748f1f18fbf656233a5` as both base and
+merge-base. The remote feature head remains `caaa4e2`; no publication is included.
+The pre-amendment base diff is 4,946 additions plus deletions; keep the complete
+candidate below 5,000. R is not a safety implementation and is not Ready.
 
 Full WIP preservation A is committed locally at
 `a9931836a6517259884908d451f2975b62d2dcc0` on
@@ -66,10 +61,10 @@ execution, not native Windows evidence.
 Required-native `TestNativeMount*` was attempted. The runtime worker-marker
 negative case passed, but launching the positive private-mount subprocess failed
 with `operation not permitted` before namespace setup; no mount fixture ran. The
-available Go toolchain is 1.26.7, so Go 1.24 CI and native Windows/macOS behavior
+available Go toolchain is 1.26.7, so native Go 1.25 CI and Windows/macOS behavior
 remain unverified. The legacy handler/helper source slice was compared directly
 with `b4644b7` and is identical. These checks are historical and do not verify
 the corrected dirty candidate. The parent owns refreshed verification, new
-whole-R review and publication; native Windows/Go 1.24 checks remain pending.
+whole-R review and publication; native Windows/Go 1.25 checks remain pending.
 S must follow reviewed R and recover only bounded safety pieces
 from A; do not merge or cherry-pick A.

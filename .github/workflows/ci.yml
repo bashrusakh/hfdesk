@@ -46,7 +46,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache: true
 
       - name: Verify required native mount test selection
@@ -68,8 +68,8 @@ jobs:
           go_bin="$(command -v go)"
           go_version="$("$go_bin" version)"
           printf 'Configured toolchain: %s (%s)\n' "$go_bin" "$go_version"
-          if ! grep -Eq ' go1\.24([.[:space:]]|$)' <<<"$go_version"; then
-            echo 'Expected the setup-go Go 1.24 toolchain; refusing another Go version.' >&2
+          if ! grep -Eq ' go1\.25([.[:space:]]|$)' <<<"$go_version"; then
+            echo 'Expected the setup-go Go 1.25 toolchain; refusing another Go version.' >&2
             exit 1
           fi
           cleanup() { sudo rm -rf -- "$scratch"; }
@@ -84,7 +84,7 @@ jobs:
             HF_HOME="$scratch/cache" GOCACHE="$scratch/gocache" TMPDIR="$scratch/tmp" \
             GO_BIN="$go_bin" GOTOOLCHAIN=local \
             HFDESK_REQUIRE_NATIVE_MOUNTS=1 \
-            bash -euo pipefail -c 'version="$("$GO_BIN" version)"; printf "In namespace: %s (%s)\n" "$GO_BIN" "$version"; grep -Eq " go1\.24([.[:space:]]|$)" <<<"$version"; "$GO_BIN" test ./pkg/hfdownloader ./internal/server -run "^TestNativeMount" -count=1 -v'
+            bash -euo pipefail -c 'version="$("$GO_BIN" version)"; printf "In namespace: %s (%s)\n" "$GO_BIN" "$version"; grep -Eq " go1\.25([.[:space:]]|$)" <<<"$version"; "$GO_BIN" test ./pkg/hfdownloader ./internal/server -run "^TestNativeMount" -count=1 -v'
 
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
