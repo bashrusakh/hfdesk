@@ -2,10 +2,10 @@
 
 ## Current candidate
 
-R source commit `a35897a596908cd3b911e7da1c65676a481148b7` is on
+R source commit `4bcf7f976b1f8ad25e524de4a420a65bfeb6b2a0` is on
 `feature/storage-root-ownership`, a descendant of published `0c876f38` with
 fresh base/merge base `b4644b7ab33d58bf44de159b119cf5ae5ff8ea9e`. Its complete
-base-to-candidate diff is 4,208 additions plus 373 deletions (4,581 total),
+base-to-candidate diff is 4,381 additions plus 364 deletions (4,745 total),
 below the 5,000-line limit. It is not a safety implementation and is not Ready.
 
 Full WIP preservation A is committed locally at
@@ -29,9 +29,15 @@ pre-existing F7 gap remains for S.
 Guard/refusal tests and the previous native permission assertions are excluded
 from R (their source remains recoverable from A/base for S). The Linux native
 fixture retains the required test name and isolation worker, but now asserts
-observed bind-mounted namespace regions rather than removal permission. The
-existing relative-route test fixture now stays on the working-directory volume
-for Windows path semantics.
+observed bind-mounted entry occurrence without claiming that the nested entry
+belongs to the enclosing owned region. Namespace enumeration and Hub directory
+parsing use the existing read-side repo-ID validator, preserving valid Unicode
+and spaced names. Search observes the namespace once and returns an error for
+incomplete observations rather than reporting an uncached miss. Regression
+coverage also preserves case-distinct nested roots when the filesystem supports
+them and verifies valid local repo IDs through list/details. The existing
+relative-route test fixture now stays on the working-directory volume for
+Windows path semantics.
 
 ## Evidence and next stage
 
