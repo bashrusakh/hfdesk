@@ -56,6 +56,9 @@ func TestWSHub_ClientCount(t *testing.T) {
 func TestWSClient_WritePumpOneMessagePerFrame(t *testing.T) {
 	// A real connection keeps the gorilla message path faithful.
 	upgrader := websocket.Upgrader{}
+	// wpDone is closed when the server-side writePump returns so the test can
+	// await that goroutine instead of leaving it parked on the 30s ping ticker.
+	wpDone := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -78,16 +81,23 @@ func TestWSClient_WritePumpOneMessagePerFrame(t *testing.T) {
 			client.send <- msg
 		}
 
-		go client.writePump()
+		go func() {
+			defer close(wpDone)
+			client.writePump()
+		}()
 
 		// Block until the client disconnects so the handler returns and
-		// httptest.Server.Close does not wait forever; writePump then exits on
-		// the closed connection.
+		// httptest.Server.Close does not wait forever.
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
-				return
+				break
 			}
 		}
+		// Closing the send channel wakes an idle writePump (its receive then
+		// reports ok == false) so it returns at once instead of waiting for the
+		// next 30s ping tick; await it so no goroutine outlives the test.
+		close(client.send)
+		<-wpDone
 	}))
 	defer srv.Close()
 
@@ -122,4 +132,10 @@ func TestWSClient_WritePumpOneMessagePerFrame(t *testing.T) {
 	if frames != 3 {
 		t.Fatalf("expected exactly 3 frames, got %d", frames)
 	}
+
+	// Disconnect so the handler's read loop breaks; that closes the send
+	// channel and lets writePump return. Await it before returning so the
+	// goroutine cannot survive past the test.
+	conn.Close()
+	<-wpDone
 }
