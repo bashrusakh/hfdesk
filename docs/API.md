@@ -160,7 +160,7 @@ Settings include runtime paths, concurrency, verification, endpoint, proxy setti
 
 Download reliability settings:
 
-- `retries` — maximum retry attempts per file/part request.
+- `retries` — the NON-PROGRESS retry budget per file/part request. An attempt that advances the resume offset strictly past the highest offset already reached refunds this budget (and resets the backoff), so a legitimately slow/flaky transfer may retry more than `retries` times; an absolute ceiling (a fixed multiple of `retries`) still guarantees termination regardless of the server's behavior.
 - `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
 - `backoff-initial` / `backoff-max` bound the exponential retry delay (config-file fields, also surfaced as `backoffInitial` / `backoffMax` in `GET`/`POST /api/settings`). When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff; the resulting wait is capped at 5 minutes (`DefaultMaxRetryAfter`), so neither the server hint nor a larger local `backoff-max` can extend an individual retry wait beyond that.
 

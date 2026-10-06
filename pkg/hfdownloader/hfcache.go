@@ -1,6 +1,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -630,9 +631,16 @@ type StoreFileResult struct {
 //   - filterSubdir: optional filter subdirectory for friendly view
 //   - noFriendly: if true, skip creating friendly view symlink
 func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
+	return r.StoreDownloadedFileCtx(context.Background(), tempFile, relativePath, commit, sha256, filterSubdir, noFriendly)
+}
+
+// StoreDownloadedFileCtx is StoreDownloadedFile bounded by ctx. The SHA-256
+// computation and cross-device copy stop promptly on cancellation; existing
+// ctx-free callers keep using StoreDownloadedFile (context.Background()).
+func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
 	// Compute SHA256 if not provided
 	if sha256 == "" {
-		computed, err := computeSHA256(tempFile)
+		computed, err := computeSHA256Ctx(ctx, tempFile)
 		if err != nil {
 			return nil, fmt.Errorf("compute sha256: %w", err)
 		}
@@ -652,7 +660,7 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 		}
 		if err := os.Rename(tempFile, blobPath); err != nil {
 			// Rename failed (cross-device?), try copy
-			if err := copyFile(tempFile, blobPath); err != nil {
+			if err := copyFileCtx(ctx, tempFile, blobPath); err != nil {
 				return nil, fmt.Errorf("move file to blob: %w", err)
 			}
 			os.Remove(tempFile)
@@ -693,6 +701,12 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 
 // copyFile copies a file from src to dst.
 func copyFile(src, dst string) error {
+	return copyFileCtx(context.Background(), src, dst)
+}
+
+// copyFileCtx is copyFile bounded by ctx: the copy aborts promptly with the
+// context error if ctx is cancelled mid-copy.
+func copyFileCtx(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -705,7 +719,7 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, contextReader{ctx: ctx, r: in}); err != nil {
 		return err
 	}
 	return out.Close()

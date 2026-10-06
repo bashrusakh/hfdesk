@@ -1109,12 +1109,6 @@ func TestDownload_SiblingAbortedOnPermanentFileError(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_InternalAbortPreservesResumablePartial verifies T3 on the
-// single-file path: when downloadSingle exits because of an internal fail-fast
-// abort (its parent job/file context was canceled with the permanent error as
-// cause), it must NOT run cleanupPartialsOnCancel, so pre-existing resumable
-// bytes survive. A genuine user cancel with the same cleanup callback still
-// removes them (preserved behavior).
 // TestDownloadSingle_InternalAbortPreservesResumablePartial pins T3: an
 // internal abort (marked by the production abortCause sentinel) must preserve
 // resumable partial bytes, while a genuine user cancel still cleans up.
@@ -1594,4 +1588,449 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("growing-prefix multipart termination took %v", elapsed)
 	}
+}
+
+// --- Second-round T2/T3 regression tests ---
+
+// TestDownloadSingle_RestartAboveHwmNoFreeRefund pins the T2 fix for the
+// "restart above previous max earns a later free refund" counterexample.
+//
+// Sequence (Retries=2), mirroring the reviewer's steps:
+//  1. an ordinary 206 attempt reaches 1000 -> hwm=1000 (legitimate refund);
+//  2. an ignored-Range 200 truncates to 0 and reaches 2000, then aborts
+//     (truncatedRestart -> no refund, but 2000 is now the real high-water);
+//  3. a bodyless 503 writes nothing (pos stays 2000).
+//
+// Under the pre-fix rule hwm was only updated on the refunding attempt, so it
+// stayed 1000 and the bodyless attempt 3 saw pos>hwm -> a free refund for zero
+// new bytes; the loop then needed 4 requests instead of 3 to exhaust the
+// budget. With the fix hwm is updated unconditionally after every attempt, so
+// attempt 3 is not progress and the budget is exhausted after exactly
+// Retries+1 requests.
+func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-freefeat")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 20_000
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		switch n {
+		case 1:
+			// Ordinary 206 advance to 1000 (pos starts at 0, no truncation).
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", total-1, total))
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.WriteHeader(http.StatusPartialContent)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			w.Write(make([]byte, 1_000))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		case 2:
+			// Ignored-Range 200: truncates the resumed partial and restarts
+			// from zero, then reaches 2000 and aborts (a truncating restart).
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.WriteHeader(http.StatusOK)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			w.Write(make([]byte, 2_000))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		default:
+			// Bodyless throttling failure: writes nothing, so pos is unchanged.
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "free.bin", URL: srv.URL + "/free.bin", Size: total}
+	cfg := Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("downloadSingle did not terminate")
+	}
+	mu.Lock()
+	n := requests
+	mu.Unlock()
+	if n != cfg.Retries+1 {
+		t.Errorf("made %d requests; want exactly %d (a bodyless attempt after a truncating restart must not refund)", n, cfg.Retries+1)
+	}
+}
+
+// TestDownloadMultipart_RestartAboveHwmNoFreeRefund exercises the multipart
+// refund rule: each part's first (advancing) 206 attempt refunds once, and the
+// following bodyless attempts must not refund, so the part terminates within the
+// absolute ceiling. Note: multipart has no truncation path, so an advancing
+// attempt always also updates hwm; the unconditional hwm update required by the
+// fix is therefore a defensive mirror of the single-file rule and is not
+// independently observable from an in-process part server. The single-file
+// TestDownloadSingle_RestartAboveHwmNoFreeRefund is the discriminating case.
+func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-mpfree")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 100_000
+	const partCount = 2
+	var (
+		mu           sync.Mutex
+		partRequests int
+		seenStarts   = map[int64]int{}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		mu.Lock()
+		partRequests++
+		mu.Unlock()
+		start := int64(0)
+		if rng := r.Header.Get("Range"); rng != "" {
+			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+		}
+		// Determine this part's attempt index by counting requests for the same
+		// requested start offset. The first attempt of each part advances and
+		// aborts; every later attempt for the same start is bodyless.
+		mu.Lock()
+		seen := seenStarts[start]
+		seenStarts[start] = seen + 1
+		firstForStart := seen == 0
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
+		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		if firstForStart {
+			// First attempt at this offset: append a small prefix, then abort
+			// (a genuine advance that should refund once).
+			w.Write(make([]byte, 500))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+		}
+		// Later attempts at the same offset are bodyless: no new bytes.
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	oldMult := maxAttemptsPerRetry
+	maxAttemptsPerRetry = 3
+	defer func() { maxAttemptsPerRetry = oldMult }()
+
+	it := PlanItem{RelativePath: "mpfree.bin", URL: srv.URL + "/mpfree.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: partCount, Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("downloadMultipart did not terminate")
+	}
+	mu.Lock()
+	n := partRequests
+	mu.Unlock()
+	// Each part: one refunding advance followed by bodyless attempts that must
+	// not refund, so at most ceiling+1 requests per part (not an unbounded
+	// refill).
+	bound := partCount * (absoluteAttemptCeiling(cfg.Retries) + 1)
+	if n > bound {
+		t.Errorf("made %d part requests; want <= %d", n, bound)
+	}
+}
+
+// TestDownloadMultipart_FinalizationAbortBeforeAssembly verifies T3 on the
+// finalization boundary: when the part context is cancelled by an internal
+// abort at the moment assembly is about to begin, downloadMultipart must not
+// start assembling, must PRESERVE the resumable .part-NN files, must not leave
+// an incomplete dst.part or a final dst, and must return the cancellation. A
+// user cancel with the same callback still runs cleanupPartialsOnCancel.
+//
+// The cancel is triggered deterministically from the emit callback on the
+// "file_finalizing" event, which downloadMultipart emits after the
+// cancelled-while-parts-running guard and immediately before assembly starts —
+// no timing/sleep dependence.
+func TestDownloadMultipart_FinalizationAbortBeforeAssembly(t *testing.T) {
+	setup := func(t *testing.T) string {
+		t.Helper()
+		tmpDir := t.TempDir()
+		dst := filepath.Join(tmpDir, "blobs", "tmp-finabort")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Seed a complete part set plus layout so prepareMultipartResume keeps
+		// them and the part goroutines finish without any GET, reaching assembly.
+		full := bytes.Repeat([]byte("p"), 20_000)
+		if err := os.WriteFile(dst+".part-00", full[:10_000], 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst+".part-01", full[10_000:], 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(20_000, 2, 10_000)); err != nil {
+			t.Fatal(err)
+		}
+		return dst
+	}
+
+	run := func(t *testing.T, cause func() error) string {
+		t.Helper()
+		dst := setup(t)
+
+		ctx, cancel := context.WithCancelCause(context.Background())
+
+		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
+		cfg.CleanupPartialsOnCancel = func() bool { return true }
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Length", "20000")
+				w.Header().Set("Accept-Ranges", "bytes")
+				return
+			}
+			// Parts are already complete on disk, so no GET should occur.
+			http.Error(w, "unexpected part request", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		emit := func(ev ProgressEvent) {
+			if ev.Event == "file_finalizing" && ev.Message == "assembling parts" {
+				cancel(cause()) // abort exactly at the assembly boundary
+			}
+		}
+
+		it := PlanItem{RelativePath: "fin.bin", URL: srv.URL + "/fin.bin", Size: 20_000, AcceptRanges: true}
+		err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+		if err == nil {
+			t.Fatal("expected a cancellation error")
+		}
+		return dst
+	}
+
+	t.Run("internal abort preserves parts, removes incomplete dst.part", func(t *testing.T) {
+		dst := run(t, func() error { return abortError(errors.New("internal abort")) })
+		for _, p := range []string{dst + ".part-00", dst + ".part-01"} {
+			if fi, statErr := os.Stat(p); statErr != nil || fi.Size() == 0 {
+				t.Errorf("resumable %s was removed/modified (stat err=%v)", filepath.Base(p), statErr)
+			}
+		}
+		if _, statErr := os.Stat(dst + ".part"); !os.IsNotExist(statErr) {
+			t.Errorf("incomplete dst.part should not exist (stat err=%v)", statErr)
+		}
+		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+			t.Errorf("final dst should not exist (stat err=%v)", statErr)
+		}
+	})
+
+	t.Run("user cancel still cleans up", func(t *testing.T) {
+		dst := run(t, func() error { return context.Canceled })
+		if files, _ := multipartPartFiles(dst); len(files) != 0 {
+			t.Errorf("user-cancel cleanup should remove part files, got %v", files)
+		}
+	})
+
+	// Mid-assembly abort: cancel partCtx while the assembly io.Copy is running.
+	// Assembly is entered after all parts are complete; the poll below waits for
+	// the intermediate dst.part to appear (a 64 MiB per-part copy takes far
+	// longer than the 1 ms poll), then cancels. This exercises the
+	// io.Copy/contextReader cancellation path and removeIncompleteAssembly. The
+	// internal abort must preserve the resumable .part-NN files and remove the
+	// incomplete dst.part.
+	t.Run("mid-assembly abort preserves parts", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dst := filepath.Join(tmpDir, "blobs", "tmp-midabort")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		const partSize = 64 << 20 // 64 MiB per part: assembly takes well over 1ms
+		payload := bytes.Repeat([]byte("m"), partSize)
+		if err := os.WriteFile(dst+".part-00", payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst+".part-01", payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(2*partSize), 2, partSize)); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(nil)
+		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
+		cfg.CleanupPartialsOnCancel = func() bool { return true }
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Length", strconv.Itoa(2*partSize))
+				w.Header().Set("Accept-Ranges", "bytes")
+				return
+			}
+			http.Error(w, "unexpected part request", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		done := make(chan error, 1)
+		go func() {
+			it := PlanItem{RelativePath: "mid.bin", URL: srv.URL + "/mid.bin", Size: int64(2 * partSize), AcceptRanges: true}
+			done <- downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		}()
+
+		// Wait until assembly has created the intermediate dst.part, then abort.
+		waitDeadline := time.After(10 * time.Second)
+		cancelled := false
+		for !cancelled {
+			inProgress, err := os.Stat(dst + ".part")
+			if err == nil && inProgress.Size() > 0 {
+				cancel(abortError(errors.New("mid-assembly abort")))
+				cancelled = true
+				break
+			}
+			select {
+			case e := <-done:
+				t.Fatalf("downloadMultipart returned before the mid-assembly cancel landed: %v", e)
+			case <-waitDeadline:
+				t.Fatal("assembly never started; cannot exercise the mid-assembly path")
+			case <-time.After(time.Millisecond):
+			}
+		}
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("expected a cancellation error")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("downloadMultipart did not terminate after the mid-assembly abort")
+		}
+
+		// Resumable part files preserved; incomplete dst.part removed; no final.
+		for _, p := range []string{dst + ".part-00", dst + ".part-01"} {
+			if fi, statErr := os.Stat(p); statErr != nil || fi.Size() != partSize {
+				t.Errorf("resumable %s was removed/modified (stat err=%v)", filepath.Base(p), statErr)
+			}
+		}
+		if _, statErr := os.Stat(dst + ".part"); !os.IsNotExist(statErr) {
+			t.Errorf("incomplete dst.part should have been removed (stat err=%v)", statErr)
+		}
+		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+			t.Errorf("final dst should not exist (stat err=%v)", statErr)
+		}
+	})
+}
+
+// TestVerifyAndStoreCtx abort promptly on a cancelled context. This is the
+// deterministic unit coverage for the ctx-aware finalization helpers: a
+// multi-GB verify/store must not run to completion after a sibling's permanent
+// error cancelled the job.
+func TestVerifyAndStoreCtxAbortPromptly(t *testing.T) {
+	tmpDir := t.TempDir()
+	// A reasonably large file so hashing/copying takes measurable time.
+	big := filepath.Join(tmpDir, "big.bin")
+	data := bytes.Repeat([]byte("q"), 8<<20) // 8 MiB
+	if err := os.WriteFile(big, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	t.Run("verifySHA256Ctx", func(t *testing.T) {
+		start := time.Now()
+		err := verifySHA256Ctx(ctx, big, "")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected a context.Canceled error, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("verifySHA256Ctx took %v on a cancelled ctx", elapsed)
+		}
+	})
+
+	t.Run("computeSHA256Ctx", func(t *testing.T) {
+		start := time.Now()
+		if _, err := computeSHA256Ctx(ctx, big); !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected a context.Canceled error, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("computeSHA256Ctx took %v on a cancelled ctx", elapsed)
+		}
+	})
+
+	t.Run("copyFileCtx", func(t *testing.T) {
+		dstCopy := filepath.Join(tmpDir, "copy.bin")
+		start := time.Now()
+		if err := copyFileCtx(ctx, big, dstCopy); err == nil {
+			t.Fatal("expected a context error")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("copyFileCtx took %v on a cancelled ctx", elapsed)
+		}
+	})
+
+	t.Run("StoreDownloadedFileCtx", func(t *testing.T) {
+		settings := DefaultSettings()
+		settings.CacheDir = t.TempDir()
+		repo, err := settings.BuildHFCache()
+		if err != nil {
+			t.Fatalf("BuildHFCache: %v", err)
+		}
+		rd, err := repo.Repo("o/r", RepoTypeModel)
+		if err != nil {
+			t.Fatalf("Repo: %v", err)
+		}
+		if err := rd.EnsureDirs(); err != nil {
+			t.Fatal(err)
+		}
+		tempFile := filepath.Join(tmpDir, "store.bin")
+		if err := os.WriteFile(tempFile, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Empty sha256 forces a ctx-aware hash; the cancelled ctx aborts it.
+		start := time.Now()
+		if _, err := rd.StoreDownloadedFileCtx(ctx, tempFile, "store.bin", "commit", "", "", true); !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected a context.Canceled error, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("StoreDownloadedFileCtx took %v on a cancelled ctx", elapsed)
+		}
+	})
 }

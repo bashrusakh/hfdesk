@@ -552,7 +552,7 @@ LOOP:
 
 			// Verify after download
 			if it.LFS && it.SHA256 != "" {
-				if err := verifySHA256(dst, it.SHA256); err != nil {
+				if err := verifySHA256Ctx(fileCtx, dst, it.SHA256); err != nil {
 					select {
 					case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 					default:
@@ -571,7 +571,7 @@ LOOP:
 			} else if cfg.Verify == "sha256" {
 				_, remoteSha, _ := headForETag(fileCtx, httpc, cfg.Token, itForIO)
 				if remoteSha != "" {
-					if err := verifySHA256(dst, remoteSha); err != nil {
+					if err := verifySHA256Ctx(fileCtx, dst, remoteSha); err != nil {
 						select {
 						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 						default:
@@ -581,11 +581,13 @@ LOOP:
 				}
 			}
 
-			// For HF Cache mode: move to blob and create symlinks
+			// For HF Cache mode: move to blob and create symlinks. The store
+			// re-hashes/copies a large file, so pass the per-file context: a
+			// sibling's fail-fast abort must not wait for it to finish.
 			var finalSHA256 string
 			if useHFCache {
 				sha := it.SHA256
-				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.StoreDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -1036,6 +1038,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		// server, which would otherwise advance the high-water mark on every
 		// attempt).
 		truncatedRestart := false
+		// preHwm is the high-water mark as of the start of this attempt; the
+		// refund decision compares the final pos against it (see below).
+		preHwm := hwm
 
 		resp, err := httpc.Do(req)
 		if err != nil {
@@ -1095,12 +1100,20 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		attemptCancel()
 
 		// Refund the retry budget only when this attempt moved STRICTLY above
-		// the file's monotonic high-water mark AND did not truncate
+		// the high-water mark captured BEFORE the attempt AND did not truncate
 		// previously-resumable bytes (an ignored-Range 200 restart is
-		// destructive, not progress). The ceiling above still bounds how far
-		// refunds may extend the budget.
-		if pos > hwm && !truncatedRestart {
+		// destructive, not progress). preHwm is read before the attempt because
+		// hwm is otherwise updated unconditionally below: a restart that writes
+		// past the old mark must be recorded (so it cannot earn a later free
+		// refund from a bodyless failure) without itself granting a refund.
+		// The ceiling above still bounds how far refunds may extend the budget.
+		advanced := pos > preHwm && !truncatedRestart
+		// Always record the highest offset reached, regardless of refund
+		// eligibility, so a truncating restart's higher offset is never lost.
+		if pos > hwm {
 			hwm = pos
+		}
+		if advanced {
 			retry.reset()
 			remaining = attempts
 		}
@@ -1305,6 +1318,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 				addAuth(rq, token)
 				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
 
+				preHwm := hwm
 				var waitResp *http.Response
 
 				rs, err := httpc.Do(rq)
@@ -1364,9 +1378,16 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 				attemptCancel()
 
 				// Refund the retry budget only when this attempt moved STRICTLY
-				// above the part's high-water mark.
+				// above the high-water mark captured BEFORE the attempt.
+				// preHwm is read first because hwm is updated unconditionally
+				// below, so a restart's higher offset is recorded and can never
+				// later earn a free refund from a bodyless failure. Multipart
+				// has no truncation path.
+				advanced := pos > preHwm
 				if pos > hwm {
 					hwm = pos
+				}
+				if advanced {
 					retry.reset()
 					remaining = attempts
 				}
@@ -1478,27 +1499,59 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// multi-GB files. Signal it so the UI doesn't sit silently at 100%.
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "assembling parts"})
 
-	// Assemble parts
+	// Abort before touching the part files if the job/part context was
+	// cancelled between the guard above and here. Preserve the resumable
+	// .part-NN part files (they are the resumable data); an internal fail-fast
+	// abort must NOT run the user-cancel cleanup. Remove any incomplete
+	// intermediate dst.part this call may have created — none yet at this
+	// point, so just return the cancellation cause.
+	if cerr := partCtx.Err(); cerr != nil {
+		if !abortPartAttempt(partCtx) {
+			cleanupPartialsOnCancel(cfg, dst)
+		}
+		return cerr
+	}
+
+	// Assemble parts. The context-checking reader and the per-part check make
+	// the local copy stop promptly once a sibling's permanent error (or a user
+	// cancel) has cancelled partCtx, instead of hashing/stitching a multi-GB
+	// sibling to completion. An internal abort preserves the .part-NN files
+	// (resumable data) and removes the incomplete intermediate dst.part.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
 		return err
 	}
 
 	for i := 0; i < n; i++ {
+		if cerr := partCtx.Err(); cerr != nil {
+			out.Close()
+			removeIncompleteAssembly(cfg, dst, partCtx)
+			return cerr
+		}
 		p := tmpParts[i]
 		in, err := os.Open(p)
 		if err != nil {
 			out.Close()
+			removeIncompleteAssembly(cfg, dst, partCtx)
 			return err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		if _, err := io.Copy(out, contextReader{ctx: partCtx, r: in}); err != nil {
 			in.Close()
 			out.Close()
+			if cerr := partCtx.Err(); cerr != nil {
+				removeIncompleteAssembly(cfg, dst, partCtx)
+				return cerr
+			}
 			return err
 		}
 		in.Close()
 	}
 	out.Close()
+
+	if cerr := partCtx.Err(); cerr != nil {
+		removeIncompleteAssembly(cfg, dst, partCtx)
+		return cerr
+	}
 
 	if err := os.Rename(dst+".part", dst); err != nil {
 		return err
@@ -1510,4 +1563,20 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	_ = os.Remove(multipartLayoutMetaPath(dst))
 
 	return nil
+}
+
+// removeIncompleteAssembly handles a cancellation that landed during part
+// assembly. On an internal fail-fast abort it preserves the resumable .part-NN
+// part files and removes only the incomplete intermediate dst.part (which is
+// not resumable and would otherwise be a corrupt leftover). On a user cancel
+// it keeps the existing cleanupPartialsOnCancel semantics unchanged.
+func removeIncompleteAssembly(cfg Settings, dst string, ctx context.Context) {
+	if abortPartAttempt(ctx) {
+		// lgtm[go/path-injection]
+		if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup incomplete assembly %s: %v", dst+".part", err)
+		}
+		return
+	}
+	cleanupPartialsOnCancel(cfg, dst)
 }
