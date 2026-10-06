@@ -1,0 +1,33 @@
+name: Issue Triage
+
+# Thin caller shim for the reusable triage master in bashrusakh/.github, pinned at
+# e7add3fbe795d151702f9e13740bf9786aba5a84.
+# The contract is read from THIS repository, never from the master: the master resolves this
+# repository's default-branch head, fetches the contract_files below from it, and fails
+# closed before the agent starts when a listed file is missing.
+# The permissions are the union the called workflow's jobs require; issues:write and
+# pull-requests:write are the write scopes (actions:read/contents:read cover the rest).
+# Inert until merged: issues-triggered workflows only run from the default branch.
+on:
+  issues:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Informational issue number for a manual run."
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage:
+    uses: bashrusakh/.github/.github/workflows/triage-issue.lock.yml@e7add3fbe795d151702f9e13740bf9786aba5a84
+    secrets:
+      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+    with:
+      contract_files: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md"
