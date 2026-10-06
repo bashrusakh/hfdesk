@@ -21,6 +21,7 @@ engine:
   id: copilot
   model: glm-5.3-flash
   bare: true
+  args: ["--deny-tool", "shell"]
   concurrency:
     group: "gh-aw-triage-${{ github.repository }}"
     queue: max
@@ -86,6 +87,11 @@ safe-outputs:
   report-failure-as-issue: false
   report-failed-jobs: false
   add-labels:
+    # Disable issue-intent metadata (rationale/confidence/suggest) for label adds: the
+    # exposed tool schema drops those fields and the handler never routes a label through
+    # pending-suggestion review. hfdesk triage applies labels directly; a suggestion would
+    # be a silent no-op. (remove-labels has no suggestion path and rejects this key.)
+    issue-intent: false
     allowed: ["bug", "enhancement", "documentation", "question", "refactor", "ci", "needs-info", "duplicate"]
     blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", "good first issue", "help wanted", "~*", "*[bot]"]
     max: 3
@@ -156,4 +162,7 @@ silence claim to the agent and its safe outputs; operator diagnostics are separa
 gh-aw may still file run-failure or detection diagnostics as repository-level issues
 outside this workflow's agent and safe outputs.
 
-Use only this workflow's safe outputs (`add-labels`, `remove-labels`).
+Use only this workflow's safe outputs (`add-labels`, `remove-labels`). Request label adds and
+removes directly as plain label names; never attach `suggest`, `rationale`, or `confidence`
+intent metadata — this deployment does not use suggestion/intent review, and a suggested
+label is not applied.

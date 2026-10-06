@@ -61,6 +61,20 @@ LOCK_REPOS_ARRAY_BLOCK = (
     '"repos": [\n                      "${{ github.repository }}"\n                    ],'
 )
 
+# The engine-level shell denial: asserted as the adjacent pair in engine.args and as
+# the compiled CLI flag in the agent invocation.
+SOURCE_ENGINE_ARGS = '  args: ["--deny-tool", "shell"]\n'
+LOCK_DENY_SHELL = "--deny-tool shell"
+
+# The direct-label instruction in the deployment prompt bodies (a suggested label is
+# routed to pending review instead of applied, so it must never be used here).
+DIRECT_LABEL_INSTRUCTION = "never attach `suggest`, `rationale`, or `confidence`"
+
+# The config-level disable of label intent metadata on the add-labels safe output.
+# Lock configs embed JSON inside a YAML scalar, so the JSON quotes are backslash-escaped.
+SOURCE_ISSUE_INTENT_FALSE = "    issue-intent: false\n"
+LOCK_ISSUE_INTENT_FALSE = '\\"issue_intent\\":false'
+
 # Managed labels the policy expects the declared label file or the live repo to
 # provide; the fixture declares them all so the offline run is self-sufficient.
 FIXTURE_MANAGED_LABELS = (
@@ -304,6 +318,84 @@ class ContractValidatorTest(unittest.TestCase):
     def test_source_pin_drift_fails(self) -> None:
         self.mutate(ISSUE_MD, PIN, ZERO_SHA, occurrences=2)
         self.assert_fails("shared import pin drift")
+
+    # -- engine-level shell denial ----------------------------------------
+
+    def test_engine_deny_shell_removed_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, SOURCE_ENGINE_ARGS, "")
+                self.assert_fails("must declare the engine-level shell denial")
+
+    def test_engine_args_other_denial_fails(self) -> None:
+        self.mutate(
+            ISSUE_MD,
+            SOURCE_ENGINE_ARGS,
+            '  args: ["--deny-tool", "write"]\n',
+        )
+        self.assert_fails("must declare the engine-level shell denial")
+
+    def test_engine_args_scalar_form_fails(self) -> None:
+        # A scalar 'args' value cannot express the flag/value pair, so it must not pass.
+        self.mutate(ISSUE_MD, SOURCE_ENGINE_ARGS, '  args: "--deny-tool shell"\n')
+        self.assert_fails("must declare the engine-level shell denial")
+
+    def test_lock_deny_shell_removed_fails(self) -> None:
+        for rel in (ISSUE_LOCK, PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate(rel, LOCK_DENY_SHELL, "--deny-tool nosuchflag")
+                self.assert_fails("agent invocation must carry the engine-level shell denial")
+
+    # -- direct label output (no suggestion routing) ----------------------
+
+    def test_add_labels_issue_intent_false_removed_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, SOURCE_ISSUE_INTENT_FALSE, "")
+                self.assert_fails("must set 'issue-intent: false' under")
+
+    def test_add_labels_issue_intent_true_fails(self) -> None:
+        self.mutate(
+            ISSUE_MD,
+            SOURCE_ISSUE_INTENT_FALSE,
+            "    issue-intent: true\n",
+        )
+        self.assert_fails("must set 'issue-intent: false' under")
+
+    def test_issue_intent_key_elsewhere_in_safe_outputs_fails(self) -> None:
+        # The key must be inside add-labels, not merely present under safe-outputs.
+        self.mutate(ISSUE_MD, SOURCE_ISSUE_INTENT_FALSE, "")
+        self.mutate(
+            ISSUE_MD,
+            "safe-outputs:\n  report-failure-as-issue: false\n",
+            "safe-outputs:\n  report-failure-as-issue: false\n  issue-intent: false\n",
+        )
+        self.assert_fails("must set 'issue-intent: false' under")
+
+    def test_direct_label_instruction_removed_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate(rel, DIRECT_LABEL_INSTRUCTION, "prefer intent metadata")
+                self.assert_fails("must instruct the agent to request label changes directly")
+
+    def test_lock_issue_intent_false_removed_fails(self) -> None:
+        text = self.read(ISSUE_LOCK)
+        self.assertEqual(text.count(LOCK_ISSUE_INTENT_FALSE), 2, "unexpected config shape")
+        self.write(
+            ISSUE_LOCK,
+            text.replace(LOCK_ISSUE_INTENT_FALSE, '\\"issue_intent\\":true'),
+        )
+        self.assert_fails("must carry add_labels issue_intent:false in both safe-output configs")
+
+    def test_lock_issue_intent_false_in_one_config_only_fails(self) -> None:
+        text = self.read(ISSUE_LOCK)
+        head, sep, tail = text.partition("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG")
+        self.assertTrue(sep, "handler config line not found")
+        self.write(
+            ISSUE_LOCK,
+            head + sep + tail.replace(LOCK_ISSUE_INTENT_FALSE, '\\"issue_intent\\":true'),
+        )
+        self.assert_fails("must carry add_labels issue_intent:false in both safe-output configs")
 
     # -- generated lock negative cases ------------------------------------
 

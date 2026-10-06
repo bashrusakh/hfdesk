@@ -6,21 +6,26 @@ No LLM. Checks, in order:
      pinned to the exact shared-package SHA;
   2. each triage workflow source declares the metadata-only capability surface:
      checkout/status-comment/bash/cli-proxy pinned false, tools.edit pinned false
-     (no filesystem write capability), safe-outputs.report-failure-as-issue and
-     report-failed-jobs pinned false, no add-comment, tools.github.allowed-repos
-     declared as the single-element array ['${{ github.repository }}'] (a bare
-     scalar string is rejected by the runtime gateway), tools.github.min-integrity
-     present, one of the gh-aw schema levels, and exactly the intended level,
-     no source/diff tools in the github allowed list, no 'confirmed' in allowed
-     label lists, and the required type family in remove-labels;
+     (no filesystem write capability), the engine-level shell denial
+     (engine.args containing '--deny-tool shell'), safe-outputs
+     report-failure-as-issue and report-failed-jobs pinned false, no add-comment,
+     safe-outputs.add-labels issue-intent false (no label suggestion routing),
+     the direct-label prompt instruction, tools.github.allowed-repos declared as
+     the single-element array ['${{ github.repository }}'] (a bare scalar string is
+     rejected by the runtime gateway), tools.github.min-integrity present, one of
+     the gh-aw schema levels, and exactly the intended level, no source/diff tools
+     in the github allowed list, no 'confirmed' in allowed label lists, and the
+     required type family in remove-labels;
   3. each generated lock preserves those invariants (no add_comment, no forbidden
      github tool grants, an allow-only guard policy whose 'repos' is the
      single-element array ['${{ github.repository }}'] and whose
      'min-integrity' is exactly the intended
      level, no residual agent write capability: no --allow-tool write and no
-     --allow-all-paths in the agent job, no report-failed-jobs machinery, failure
-     reports disabled, no agent-job checkout, not staged) and stays structurally
-     in sync with its source (shared import pin + exact safe-output label lists);
+     --allow-all-paths in the agent job, the compiled '--deny-tool shell' flag in
+     the agent invocation, add_labels issue_intent:false in both safe-output
+     configs, no report-failed-jobs machinery, failure reports disabled, no
+     agent-job checkout, not staged) and stays structurally in sync with its source
+     (shared import pin + exact safe-output label lists);
   4. every contract file referenced by .github/triage-policy.md exists;
   5. every workflow-managed label named by the policy currently exists
      (declared in .github/labels.yml and/or present in the live repository);
@@ -58,6 +63,15 @@ What this validator does NOT guarantee:
   - The `--allow-tool write` / `--allow-all-paths` scan is a substring check over the
     agent job section. It catches those exact flags disappearing or reappearing; it
     does not prove the absence of every other capability the engine could grant.
+  - The engine-level shell assertion is textual on both sides: the source must contain
+    the argument pair '--deny-tool shell' in engine.args, and the lock must contain the
+    compiled '--deny-tool shell' flag in the agent job. It proves the denial reaches the
+    Copilot CLI invocation; it cannot prove how the CLI's approval gate behaves at run
+    time, so a staged trial remains the only end-to-end evidence for that.
+  - The issue-intent assertion is textual on the exposed config and on the source key. It
+    proves the compiled config requests the intent-free schema; the pinned runtime script
+    (gh-aw-actions/setup, pinned in the lock manifest) is what actually strips the fields,
+    so a change to that pin must be re-checked against that script.
 
 Set VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 to skip the live repository label lookup
 (offline/test mode used by .github/aw/test_validate_contract.py); in that mode
@@ -102,6 +116,22 @@ FORBIDDEN_GITHUB_TOOLS = (
 # Universal semantic type family every triage workflow must be able to remove
 # (reconciliation capability: replace a clearly wrong managed type).
 REQUIRED_REMOVE_LABELS = ("bug", "enhancement", "documentation", "question", "refactor", "ci")
+
+# The engine-level shell denial every triage workflow must pass to the Copilot CLI.
+# tools.bash: false makes gh-aw emit no shell(...) grant, but the Copilot CLI's own
+# approval gate can still decide to run read-only commands, so the workflow must also
+# deny the shell tool at the engine level. Asserted as the adjacent argument pair in
+# engine.args and as the compiled CLI flag in the agent job.
+REQUIRED_ENGINE_ARGS = ("--deny-tool", "shell")
+LOCK_DENY_SHELL = " ".join(REQUIRED_ENGINE_ARGS)
+
+# The deployment prompt bodies must tell the agent to request label changes directly.
+# The add-labels safe-output schema exposes optional rationale/confidence/suggest intent
+# metadata, and a suggested label is routed to pending review instead of applied, which
+# is a silent no-op for a workflow that must apply labels. The config-level lever
+# (safe-outputs.add-labels.issue-intent: false) removes those fields from the exposed
+# tool schema; this instruction keeps the agent from relying on intent review anyway.
+DIRECT_LABEL_INSTRUCTION = "never attach `suggest`, `rationale`, or `confidence`"
 
 # The exact repository-scope expression the guard policy must declare, in the
 # only runtime-accepted shape: a single-element array ['${{ github.repository }}'].
@@ -384,6 +414,41 @@ def triage_source_label_lists(fm: str) -> dict[str, list[str] | None]:
     return lists
 
 
+def engine_args(fm: str) -> list[str] | None:
+    """Parse the engine.args list, or None when the key is absent.
+
+    Returns [] for a present-but-empty value, so a removed denial is reported as a
+    missing argument rather than as a missing key.
+    """
+    engine = key_entry(fm, "engine", 0)
+    if engine is None:
+        return None
+    args = key_entry("\n".join(engine[1]), "args", 2)
+    if args is None:
+        return None
+    return string_list(args[0], args[1])
+
+
+def add_labels_issue_intent_false(fm: str) -> bool:
+    """True when safe-outputs.add-labels declares exactly 'issue-intent: false'.
+
+    Scoped to the add-labels block on purpose: gh-aw v0.89.21 only accepts the key
+    for issue-intent-capable safe outputs, and an unrelated top-level occurrence
+    (for example tools.comment-memory) must not satisfy this check.
+    """
+    safe = key_entry(fm, "safe-outputs", 0)
+    if safe is None:
+        return False
+    entry = key_entry("\n".join(safe[1]), "add-labels", 2)
+    if entry is None:
+        return False
+    return bool(
+        re.search(
+            r"^\s*issue-intent\s*:\s*false\s*$", "\n".join(entry[1]), re.MULTILINE
+        )
+    )
+
+
 def check_triage_sources() -> None:
     """Enforce the metadata-only capability surface on every triage source."""
     for md in WORKFLOWS:
@@ -503,6 +568,34 @@ def check_triage_sources() -> None:
                     "type family; missing: " + ", ".join(missing)
                 )
 
+        args = engine_args(fm)
+        joined = " ".join(args or [])
+        if args is None or not any(
+            args[index] == REQUIRED_ENGINE_ARGS[0]
+            and args[index + 1: index + 2] == [REQUIRED_ENGINE_ARGS[1]]
+            for index in range(len(args) - 1)
+        ):
+            errors.append(
+                f"{rel_path} must declare the engine-level shell denial "
+                f"'{LOCK_DENY_SHELL}' in engine.args (tools.bash: false alone does "
+                "not stop the Copilot CLI's own approval gate from running "
+                f"read-only commands); got '{joined}'"
+            )
+
+        if not add_labels_issue_intent_false(fm):
+            errors.append(
+                f"{rel_path} must set 'issue-intent: false' under "
+                "safe-outputs.add-labels (a suggested label is routed to pending "
+                "review instead of being applied)"
+            )
+
+        if DIRECT_LABEL_INSTRUCTION not in text:
+            errors.append(
+                f"{rel_path} must instruct the agent to request label changes "
+                f"directly ('{DIRECT_LABEL_INSTRUCTION}' ...); suggesting a label is "
+                "a silent no-op for this deployment"
+            )
+
 
 def job_section(text: str, job: str) -> str | None:
     """Return the block of a workflow job, from its header to the next job."""
@@ -595,6 +688,31 @@ def lock_safe_output_lists(text: str) -> dict[str, dict[str, list[str] | None] |
             )
         parsed[key] = entry
     return parsed
+
+
+def lock_issue_intent_disabled(text: str) -> bool:
+    """True when the compiled safe-output config disables add_labels issue-intent.
+
+    The compiler serializes `safe-outputs.add-labels.issue-intent: false` into the
+    handler config as `"issue_intent":false`; the runtime generator then strips the
+    rationale/confidence/suggest fields from the exposed add_labels schema. Both the
+    safe-outputs config and the handler config must carry it.
+    """
+    found = 0
+    for key in LOCK_CONFIG_KEYS:
+        match = re.search(
+            r"^\s*" + re.escape(key) + r':\s*(".*")\s*$', text, re.MULTILINE
+        )
+        if not match:
+            continue
+        try:
+            config = json.loads(json.loads(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+        section = config.get("add_labels")
+        if isinstance(section, dict) and section.get("issue_intent") is False:
+            found += 1
+    return found == len(LOCK_CONFIG_KEYS)
 
 
 def check_lock_currency(md: str, lock_text: str, lock_rel: str) -> None:
@@ -740,6 +858,12 @@ def check_triage_locks() -> None:
                         f"{lock_rel} agent job must not grant '{flag}' "
                         "(residual filesystem/write capability)"
                     )
+            if f"--deny-tool {REQUIRED_ENGINE_ARGS[1]}" not in agent:
+                errors.append(
+                    f"{lock_rel} agent invocation must carry the engine-level shell "
+                    f"denial '{LOCK_DENY_SHELL}' (tools.bash: false alone does not stop "
+                    "the Copilot CLI's own approval gate)"
+                )
 
         if "GH_AW_SAFE_OUTPUTS_STAGED" in text:
             errors.append(
@@ -753,6 +877,12 @@ def check_triage_locks() -> None:
             warnings.append(
                 f"{lock_rel} has no tool-call-limits; gh-aw v0.89.21 drops max-calls "
                 "at compile time, so declared per-tool call limits are not enforced"
+            )
+
+        if not lock_issue_intent_disabled(text):
+            errors.append(
+                f"{lock_rel} must carry add_labels issue_intent:false in both "
+                "safe-output configs (label suggestion routing must be off)"
             )
 
 
