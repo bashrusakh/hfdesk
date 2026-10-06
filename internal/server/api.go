@@ -362,6 +362,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		MaxSpeed:           cfg.MaxSpeed,
 		Verify:             cfg.Verify,
 		Retries:            cfg.Retries,
+		StallTimeout:       cfg.StallTimeout,
 		Endpoint:           cfg.Endpoint,
 		StorageMode:        storageMode,
 		LocalDir:           cfg.LocalDir,
@@ -404,6 +405,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		MaxSpeed           *string            `json:"maxSpeed,omitempty"`
 		Verify             *string            `json:"verify,omitempty"`
 		Retries            *int               `json:"retries,omitempty"`
+		StallTimeout       *string            `json:"stallTimeout,omitempty"`
 		Endpoint           *string            `json:"endpoint,omitempty"`
 		// Proxy settings
 		Proxy *struct {
@@ -428,6 +430,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var (
 		newMultipartThreshold string
 		newMaxSpeed           string
+		newStallTimeout       string
 		newDownloadRoutes     map[string]string
 	)
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
@@ -437,6 +440,17 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newMultipartThreshold = trimmed
+	}
+	// StallTimeout accepts a duration string; an explicit "0"/"0s" disables
+	// the watchdog. Empty is skipped (preserve), matching multipartThreshold.
+	if req.StallTimeout != nil && strings.TrimSpace(*req.StallTimeout) != "" {
+		trimmed := strings.TrimSpace(*req.StallTimeout)
+		d, err := time.ParseDuration(trimmed)
+		if err != nil || d < 0 {
+			writeError(w, http.StatusBadRequest, "Invalid stallTimeout", "expected a non-negative duration such as \"60s\", \"2m\", or \"0\" to disable")
+			return
+		}
+		newStallTimeout = trimmed
 	}
 	if req.MaxSpeed != nil {
 		trimmed := strings.TrimSpace(*req.MaxSpeed)
@@ -502,6 +516,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Retries != nil && *req.Retries >= 0 {
 			c.Retries = *req.Retries
+		}
+		if newStallTimeout != "" {
+			c.StallTimeout = newStallTimeout
 		}
 		if req.Endpoint != nil {
 			c.Endpoint = *req.Endpoint
@@ -578,6 +595,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		MaxSpeed:           finalCfg.MaxSpeed,
 		Verify:             finalCfg.Verify,
 		Retries:            &retries,
+		StallTimeout:       finalCfg.StallTimeout,
 		Endpoint:           finalCfg.Endpoint,
 		DownloadRoutes:     finalCfg.DownloadRoutes,
 	}

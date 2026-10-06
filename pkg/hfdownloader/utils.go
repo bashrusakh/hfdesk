@@ -46,6 +46,7 @@ func validate(job Job, cfg Settings) error {
 // backoff implements exponential backoff with jitter.
 type backoff struct {
 	next   time.Duration
+	init   time.Duration
 	max    time.Duration
 	mult   float64
 	jitter time.Duration
@@ -61,7 +62,10 @@ func newRetry(cfg Settings) *backoff {
 	if d, err := time.ParseDuration(defaultString(cfg.BackoffMax, "10s")); err == nil {
 		max = d
 	}
-	return &backoff{next: init, max: max, mult: 1.6, jitter: 120 * time.Millisecond}
+	if max < init {
+		max = init
+	}
+	return &backoff{next: init, init: init, max: max, mult: 1.6, jitter: 120 * time.Millisecond}
 }
 
 // Next returns the next backoff duration.
@@ -72,6 +76,13 @@ func (b *backoff) Next() time.Duration {
 		b.next = b.max
 	}
 	return d
+}
+
+// reset returns the backoff to its initial delay. It is used when an attempt
+// made real forward progress (advanced the resume offset), so the schedule
+// does not stay inflated after a healthy retry.
+func (b *backoff) reset() {
+	b.next = b.init
 }
 
 // sleepCtx waits for d or returns false if ctx is canceled first.

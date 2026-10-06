@@ -107,14 +107,53 @@ func BuildHTTPClient(proxy *ProxyConfig) (*http.Client, error) {
 	return buildHTTPProxyClient(proxy)
 }
 
-// buildHTTPProxyClient creates a client for HTTP/HTTPS proxies.
-func buildHTTPProxyClient(proxyCfg *ProxyConfig) (*http.Client, error) {
-	tr := &http.Transport{
+// Transport timeouts shared by every client HFDesk builds. Each bounds a
+// phase that can otherwise block forever: a connect that never completes, a
+// server that accepts the request but never sends response headers, and an
+// HTTP/2 connection that stays open while going silent (health-checked with a
+// ping). These are deliberately generous: the stall watchdog covers the
+// body-transfer phase, so these only need to break true hangs.
+const (
+	// defaultDialTimeout bounds establishing the TCP connection.
+	defaultDialTimeout = 30 * time.Second
+	// defaultResponseHeaderTimeout bounds waiting for response headers after
+	// the request is written.
+	defaultResponseHeaderTimeout = 60 * time.Second
+	// defaultHTTP2ReadIdleTimeout is how long an HTTP/2 connection may be
+	// read-idle before a health-check ping is sent.
+	defaultHTTP2ReadIdleTimeout = 30 * time.Second
+	// defaultHTTP2PingTimeout bounds waiting for the health-check ping reply;
+	// a missed reply closes the connection.
+	defaultHTTP2PingTimeout = 15 * time.Second
+)
+
+// newBaseTransport returns an http.Transport with dial, response-header and
+// HTTP/2 health-check deadlines on every phase that can block. It is the
+// shared base for both the HTTP-proxy and direct paths.
+func newBaseTransport() *http.Transport {
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		MaxIdleConns:          64,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
+		// Enable HTTP/2 even though DialContext/TLSClientConfig are set, and
+		// make it health-check a connection that goes silent.
+		ForceAttemptHTTP2: true,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: defaultHTTP2ReadIdleTimeout,
+			PingTimeout:     defaultHTTP2PingTimeout,
+		},
 	}
+}
+
+// buildHTTPProxyClient creates a client for HTTP/HTTPS proxies.
+func buildHTTPProxyClient(proxyCfg *ProxyConfig) (*http.Client, error) {
+	tr := newBaseTransport()
 
 	// Configure proxy
 	if proxyCfg != nil && proxyCfg.URL != "" {
@@ -177,10 +216,26 @@ func buildSOCKS5Client(proxyCfg *ProxyConfig) (*http.Client, error) {
 		}
 	}
 
-	// Create SOCKS5 dialer
-	dialer, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
+	// Create SOCKS5 dialer. Passing a ContextDialer as the forward dialer lets
+	// the SOCKS5 handshake (both the TCP connect to the proxy and the protocol
+	// exchange) inherit the request context and deadline, so an unresponsive
+	// proxy cannot hang the download. proxy.ContextDialer is asserted below.
+	forward := &net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	dialer, err := proxy.SOCKS5("tcp", host, auth, forward)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+	}
+
+	// Prefer the context-aware dial path when the dialer supports it. The
+	// proxy package always produces one, but keep the assertion explicit so a
+	// future change that returns a non-context dialer cannot silently
+	// reintroduce the hang.
+	ctxDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("SOCKS5 dialer does not support context deadlines")
 	}
 
 	// Build no_proxy list
@@ -193,23 +248,17 @@ func buildSOCKS5Client(proxyCfg *ProxyConfig) (*http.Client, error) {
 	}
 
 	// Create transport with SOCKS5 dialer
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// Check if we should bypass proxy
-			host, _, _ := net.SplitHostPort(addr)
-			if shouldBypassProxy(host, noProxyList) {
-				return (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext(ctx, network, addr)
-			}
-			// Use SOCKS5 proxy
-			return dialer.Dial(network, addr)
-		},
-		MaxIdleConns:          64,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+	tr := newBaseTransport()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Check if we should bypass proxy
+		bypassHost, _, _ := net.SplitHostPort(addr)
+		if shouldBypassProxy(bypassHost, noProxyList) {
+			return forward.DialContext(ctx, network, addr)
+		}
+		// Use SOCKS5 proxy; the request context/deadline is threaded through
+		// the whole handshake so a stalled proxy yields a deadline error
+		// instead of blocking forever.
+		return ctxDialer.DialContext(ctx, network, addr)
 	}
 
 	if proxyCfg.InsecureSkipVerify {

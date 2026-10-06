@@ -876,9 +876,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 
 	retry := newRetry(cfg)
+	stall := stallTimeout(cfg)
+	attempts := cfg.Retries
+	if attempts < 0 {
+		attempts = 0
+	}
+	remaining := attempts
+	attempt := 0
 	var lastErr error
 
-	for attempt := 0; attempt <= cfg.Retries; attempt++ {
+	for {
 		select {
 		case <-ctx.Done():
 			out.Close()
@@ -887,7 +894,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		default:
 		}
 
-		req, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
+		// Each attempt gets its own cancellable context so the stall
+		// watchdog can abort just this attempt (closing the connection or
+		// HTTP/2 stream) without cancelling the whole job.
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+
+		req, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 		addAuth(req, token)
 		if pos > 0 {
 			if it.Size > 0 {
@@ -896,6 +908,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				req.Header.Set("Range", fmt.Sprintf("bytes=%d-", pos))
 			}
 		}
+
+		startPos := pos
+		// waitResp carries a throttling response (429/503) whose Retry-After /
+		// RateLimit header must shape the next wait.
+		var waitResp *http.Response
 
 		resp, err := httpc.Do(req)
 		if err != nil {
@@ -906,22 +923,39 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			if pos > 0 && resp.StatusCode == http.StatusOK {
 				if err := out.Truncate(0); err != nil {
 					resp.Body.Close()
+					attemptCancel()
 					return err
 				}
 				if _, err := out.Seek(0, io.SeekStart); err != nil {
 					resp.Body.Close()
+					attemptCancel()
 					return err
 				}
 				pos = 0
 			}
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				lastErr = fmt.Errorf("bad status: %s", resp.Status)
+			if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil {
+				lastErr = apiErr
 				resp.Body.Close()
+				if apiErr.IsFailFast() {
+					// Permanent for the whole job: no retry, no request
+					// storm. Remove any empty partial this attempt created
+					// before returning the actionable error.
+					attemptCancel()
+					out.Close()
+					removeEmptyPartialFile(tmp)
+					return lastErr
+				}
+				waitResp = resp
 			} else {
-				pr := newProgressReader(cfg.SpeedLimiter.Reader(ctx, resp.Body), it.Size, it.RelativePath, emit)
+				// The stall watchdog wraps the raw network body BEFORE the
+				// speed limiter's pacing, so deliberate throttling is not
+				// mistaken for a stalled peer.
+				body := newStallReader(resp.Body, stall, attemptCancel)
+				pr := newProgressReader(cfg.SpeedLimiter.Reader(attemptCtx, body), it.Size, it.RelativePath, emit)
 				pr.downloaded = pos // emitted progress reflects cumulative bytes
 				_, cerr := io.Copy(out, pr)
 				resp.Body.Close()
+				attemptCancel()
 				if cerr == nil {
 					out.Close()
 					return os.Rename(tmp, dst)
@@ -934,21 +968,52 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				}
 			}
 		}
+		attemptCancel()
 
-		if attempt < cfg.Retries {
-			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-			if d := retry.Next(); !sleepCtx(ctx, d) {
+		// An attempt that advanced the resume offset made real progress, so
+		// refund the retry budget. A server that ignores Range and restarts
+		// from zero (pos unchanged or moved backwards) is NOT progress and
+		// must not be rewarded.
+		if pos > startPos {
+			retry.reset()
+			remaining = attempts
+		}
+
+		if remaining == 0 {
+			if ctx.Err() != nil {
 				out.Close()
 				cleanupPartialsOnCancel(cfg, dst)
 				return ctx.Err()
 			}
-		} else if ctx.Err() != nil {
+			break
+		}
+		remaining--
+		attempt++
+		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+		if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
 			out.Close()
 			cleanupPartialsOnCancel(cfg, dst)
 			return ctx.Err()
 		}
 	}
 	return lastErr
+}
+
+// removeEmptyPartialFile removes path when it exists and is empty. It is used
+// to clean up a zero-byte .part file that a fail-fast attempt created, without
+// touching a partial that predates the attempt and may hold resumable bytes.
+func removeEmptyPartialFile(path string) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if fi.Size() != 0 {
+		return
+	}
+	// lgtm[go/path-injection]
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup empty partial file %s: %v", path, err)
+	}
 }
 
 // downloadMultipart downloads a file using multiple parallel range requests.
@@ -960,7 +1025,16 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	// A permanent gated/private/missing response on HEAD fails the whole job
+	// immediately with the actionable message, before any part requests are
+	// issued. Non-permanent statuses keep the previous behavior (proceed and
+	// let the part loop classify them).
+	if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil && apiErr.IsFailFast() {
+		removeEmptyPartialFile(dst + ".part")
+		return apiErr
+	}
 
 	if it.Size == 0 {
 		if clen := resp.Header.Get("Content-Length"); clen != "" {
@@ -1053,28 +1127,43 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			}
 
 			retry := newRetry(cfg)
+			stall := stallTimeout(cfg)
+			attempts := cfg.Retries
+			if attempts < 0 {
+				attempts = 0
+			}
+			remaining := attempts
+			attempt := 0
 			var lastErr error
 
-			for attempt := 0; attempt <= cfg.Retries; attempt++ {
+			for {
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
 
-				rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
+				// Per-attempt context: the stall watchdog cancels only this
+				// part's attempt, leaving sibling parts and the job untouched.
+				attemptCtx, attemptCancel := context.WithCancel(ctx)
+
+				rq, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 				addAuth(rq, token)
 				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
+
+				startPos := pos
+				var waitResp *http.Response
 
 				rs, err := httpc.Do(rq)
 				if err != nil {
 					lastErr = err
-				} else if rs.StatusCode != 206 {
-					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
+				} else if rs.StatusCode == http.StatusPartialContent {
+					// The stall watchdog wraps the raw network body before the
+					// speed limiter's pacing.
+					body := newStallReader(rs.Body, stall, attemptCancel)
+					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(attemptCtx, body))
 					rs.Body.Close()
-				} else {
-					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(ctx, rs.Body))
-					rs.Body.Close()
+					attemptCancel()
 					if cerr == nil {
 						return
 					}
@@ -1084,13 +1173,45 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
 						pos = cur
 					}
+				} else {
+					// Any non-206 is a failure. A permanent 401/403/404 fails
+					// the whole job immediately; a throttling 429/503 shapes
+					// the next wait; a 200 means the server ignored Range (a
+					// multipart protocol violation) and is retried as before.
+					rs.Body.Close()
+					if apiErr := classifyFileResponse(rs, it.URL); apiErr != nil {
+						lastErr = apiErr
+						if apiErr.IsFailFast() {
+							attemptCancel()
+							removeEmptyPartialFile(tmp)
+							select {
+							case errCh <- lastErr:
+							default:
+							}
+							return
+						}
+						waitResp = rs
+					} else {
+						lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
+					}
+				}
+				attemptCancel()
+
+				// Refund the retry budget only when this attempt advanced the
+				// resume offset (see downloadSingle for the rationale).
+				if pos > startPos {
+					retry.reset()
+					remaining = attempts
 				}
 
-				if attempt < cfg.Retries {
-					emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-					if d := retry.Next(); !sleepCtx(ctx, d) {
-						return
-					}
+				if remaining == 0 {
+					break
+				}
+				remaining--
+				attempt++
+				emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+				if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
+					return
 				}
 			}
 

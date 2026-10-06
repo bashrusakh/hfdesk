@@ -27,18 +27,20 @@ func main() {
 	server.Version = Version
 
 	var (
-		port     int
-		cacheDir string
-		token    string
-		localDir string
-		openUI   bool
-		noOpen   bool
+		port         int
+		cacheDir     string
+		token        string
+		localDir     string
+		stallTimeout string
+		openUI       bool
+		noOpen       bool
 	)
 
 	flag.IntVar(&port, "port", 8080, "HTTP port")
 	flag.StringVar(&cacheDir, "cache-dir", "", "Hugging Face cache directory")
 	flag.StringVar(&token, "token", "", "Hugging Face token (also reads HF_TOKEN env)")
 	flag.StringVar(&localDir, "local-dir", "", "write real files into this directory instead of the HF cache layout")
+	flag.StringVar(&stallTimeout, "stall-timeout", "", "abort a stalled download read after this duration (e.g. 60s; 0 disables)")
 	flag.BoolVar(&openUI, "open", true, "open the web UI in the default browser")
 	flag.BoolVar(&noOpen, "no-open", false, "do not open the web UI automatically")
 	flag.Usage = func() {
@@ -54,6 +56,10 @@ func main() {
 	cfg.LocalDir = localDir
 	if err := server.ApplyConfigToServer(&cfg); err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	// CLI flag takes precedence over the persisted setting.
+	if stallTimeout != "" {
+		cfg.StallTimeout = stallTimeout
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -50,6 +50,7 @@ type ConfigFile struct {
 	MaxSpeed           string       `json:"max-speed,omitempty" yaml:"max-speed,omitempty"`
 	Verify             string       `json:"verify,omitempty" yaml:"verify,omitempty"`
 	Retries            *int         `json:"retries,omitempty" yaml:"retries,omitempty"`
+	StallTimeout       string       `json:"stall-timeout,omitempty" yaml:"stall-timeout,omitempty"`
 	Endpoint           string       `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
 	BackoffInitial     string       `json:"backoff-initial,omitempty" yaml:"backoff-initial,omitempty"`
 	BackoffMax         string       `json:"backoff-max,omitempty" yaml:"backoff-max,omitempty"`
@@ -333,6 +334,13 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	}
 	if fileCfg.Retries != nil && *fileCfg.Retries >= 0 {
 		serverCfg.Retries = *fileCfg.Retries
+	}
+	// StallTimeout: the config file applies whenever it carries a value; the
+	// CLI --stall-timeout flag is applied on top afterwards (see cmd/hfdesk),
+	// so an explicit flag still wins. Unlike MultipartThreshold there is no
+	// non-empty DefaultConfig sentinel to compare against safely.
+	if fileCfg.StallTimeout != "" {
+		serverCfg.StallTimeout = fileCfg.StallTimeout
 	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint

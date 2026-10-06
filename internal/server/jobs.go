@@ -1315,6 +1315,7 @@ func (m *JobManager) runJob(job *Job) {
 		Retries:            cfg.Retries,
 		BackoffInitial:     "400ms",
 		BackoffMax:         "10s",
+		StallTimeout:       cfg.StallTimeout,
 		Endpoint:           cfg.Endpoint,
 		Proxy:              cfg.Proxy,
 		MaxSpeed:           cfg.MaxSpeed,
