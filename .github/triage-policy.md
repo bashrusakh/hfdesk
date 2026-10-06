@@ -15,10 +15,21 @@ Allowed semantic issue/change types are limited to `bug`, `enhancement`,
 `documentation`, `question`, `refactor`, and `ci`. No area, component, risk, or
 priority taxonomy is authorized.
 
+The semantic **type** family is add-and-remove owned for the workflows that manage it:
+the automation preserves a correct contributor-applied type, fills a type that is clearly
+missing, and replaces a clearly incorrect managed type by removing the wrong type and
+adding the correct one. Ambiguity means preserve the affected state; there is no churn.
+
+`confirmed` is **not** automation-owned: it is human/verification-owned and is applied by
+a human only after reproduction or validation. No triage workflow may add or remove it.
+
+`needs-info` means metadata/routing information is missing from the report; it never means
+that implementation proof, reproduction steps, or a fix are missing.
+
 Contributor-first labeling: `CONTRIBUTING.md` is the source of truth for triage
-labels. Contributors apply the type label first; the automation only verifies the
-label and fills a missing or incorrect one. It must not relabel a correct human
-label.
+labels. Contributors apply the type label first; the automation verifies the label, fills
+a clearly missing one, and corrects a clearly wrong managed type. It must not relabel a
+correct human label.
 
 ## Reserved labels (human-owned)
 
@@ -50,6 +61,13 @@ Templates (`PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/*`) are input schemas and
 evidence, not retroactive mandatory checklists. A missing or unfilled template
 field is not by itself grounds for `needs-info`; label only on the substance of the
 report.
+
+A report is sufficiently clear for metadata triage when its title/body establish the
+semantic type, what is broken or the affected user-facing area, and the reported
+behavior. A report that establishes neither the affected area nor the reported behavior
+— for example "doesn't work" or "something is broken" with no further substance — lacks
+the information needed for metadata routing, so `needs-info` applies even when the
+semantic type is inferable.
 
 ## Metadata-only scope
 

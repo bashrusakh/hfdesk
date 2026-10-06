@@ -134,9 +134,18 @@ Apply exactly one **type** label:
 
 Automation-managed labels (do not apply by hand):
 
-- `needs-info` — required information is missing from the report.
-- `confirmed` — the report has been reproduced and validated.
+- `needs-info` — routing/metadata information is missing from the report.
 - `duplicate` — already tracked by another issue or pull request.
+
+Triage automation owns the **type** labels above (`bug`, `enhancement`, `documentation`,
+`question`, `refactor`, `ci`) plus `needs-info` and `duplicate`. It preserves a correct
+type label you applied, fills a clearly missing one, and replaces a clearly incorrect
+managed type by removing the wrong label and adding the right one; it does not churn
+ambiguous labels.
+
+`confirmed` is **human/verification-owned**, not automation-managed: it is applied by a
+maintainer after the report has been reproduced or validated. Do not expect triage
+automation to add or remove it.
 
 `priority-*` and other operational labels are maintainer-owned.
 
