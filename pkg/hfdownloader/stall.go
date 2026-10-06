@@ -18,13 +18,17 @@ const DefaultStallTimeout = 60 * time.Second
 // stallTimeout resolves the effective stall timeout from settings. An empty
 // value yields DefaultStallTimeout, so library callers that leave the field
 // unset get the protective default. A parsed value of 0 disables the watchdog;
-// an unparseable value falls back to the default rather than disabling it.
+// an unparseable OR NEGATIVE value falls back to the default rather than
+// disabling it, so a bad setting can never silently remove the protection.
 func stallTimeout(cfg Settings) time.Duration {
 	if cfg.StallTimeout == "" {
 		return DefaultStallTimeout
 	}
 	d, err := time.ParseDuration(cfg.StallTimeout)
 	if err != nil {
+		return DefaultStallTimeout
+	}
+	if d < 0 {
 		return DefaultStallTimeout
 	}
 	return d

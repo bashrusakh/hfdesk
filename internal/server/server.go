@@ -45,6 +45,8 @@ type Config struct {
 	Verify             string   // Verification mode: none, size, sha256
 	Retries            int      // Number of retry attempts
 	StallTimeout       string   // Abort a stalled body read after this long (empty = "60s" default, "0" disables)
+	BackoffInitial     string   // Initial retry backoff delay (empty = downloader default "400ms")
+	BackoffMax         string   // Maximum retry backoff delay (empty = downloader default "10s")
 	AllowedOrigins     []string // CORS origins
 	Endpoint           string   // Custom HuggingFace endpoint (e.g., for mirrors)
 
@@ -84,6 +86,8 @@ func DefaultConfig() Config {
 		Verify:             "size",
 		Retries:            4,
 		StallTimeout:       "60s",
+		BackoffInitial:     "400ms",
+		BackoffMax:         "10s",
 	}
 }
 

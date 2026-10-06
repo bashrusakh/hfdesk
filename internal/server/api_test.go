@@ -1216,6 +1216,133 @@ func TestStallTimeoutPersistsAndReloads(t *testing.T) {
 	}
 }
 
+// --- Backoff / negative-stall-timeout regression coverage ---
+
+// TestApplyConfigToServer_StallTimeoutRejectsNegative verifies finding #4 at the
+// config boundary: a negative or unparseable stall-timeout in the config file
+// must not silently disable the watchdog; "0"/"0s" stays a deliberate disable.
+func TestApplyConfigToServer_StallTimeoutRejectsNegative(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		want string
+	}{
+		{"negative rejected", "-5s", "60s"},
+		{"unparseable rejected", "soon", "60s"},
+		{"zero disables", "0", "0"},
+		{"zero-duration disables", "0s", "0s"},
+		{"valid applied", "90s", "90s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolateTokenConfig(t)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(`{"stall-timeout":"`+tc.file+`"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			if err := ApplyConfigToServer(&cfg); err != nil {
+				t.Fatalf("ApplyConfigToServer: %v", err)
+			}
+			if cfg.StallTimeout != tc.want {
+				t.Errorf("StallTimeout = %q, want %q", cfg.StallTimeout, tc.want)
+			}
+		})
+	}
+}
+
+// TestAPI_UpdateSettings_Backoff verifies the backoff fields are applied,
+// surfaced, validated, and persisted, closing finding #7 (they were previously
+// declared in the config file but never wired into the server).
+func TestAPI_UpdateSettings_Backoff(t *testing.T) {
+	t.Run("defaults are surfaced", func(t *testing.T) {
+		if got := DefaultConfig().BackoffInitial; got != "400ms" {
+			t.Errorf("DefaultConfig().BackoffInitial = %q, want 400ms", got)
+		}
+		if got := DefaultConfig().BackoffMax; got != "10s" {
+			t.Errorf("DefaultConfig().BackoffMax = %q, want 10s", got)
+		}
+	})
+
+	tests := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantInit string
+		wantMax  string
+	}{
+		{"valid pair", `{"backoffInitial":"250ms","backoffMax":"7s"}`, http.StatusOK, "250ms", "7s"},
+		{"trimmed", `{"backoffInitial":"  1s  "}`, http.StatusOK, "1s", "10s"},
+		{"invalid initial", `{"backoffInitial":"soon"}`, http.StatusBadRequest, "400ms", "10s"},
+		{"negative max", `{"backoffMax":"-1s"}`, http.StatusBadRequest, "400ms", "10s"},
+		{"empty preserves", `{"backoffInitial":""}`, http.StatusOK, "400ms", "10s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			srv.config.BackoffInitial = "400ms"
+			srv.config.BackoffMax = "10s"
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+			if w.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d. body=%s", w.Code, tt.wantCode, w.Body.String())
+			}
+			if srv.config.BackoffInitial != tt.wantInit || srv.config.BackoffMax != tt.wantMax {
+				t.Errorf("backoff = (%q, %q), want (%q, %q)", srv.config.BackoffInitial, srv.config.BackoffMax, tt.wantInit, tt.wantMax)
+			}
+			if tt.wantCode == http.StatusOK {
+				if got := srv.jobs.snapshotConfig().BackoffInitial; got != tt.wantInit {
+					t.Errorf("job manager BackoffInitial = %q, want %q", got, tt.wantInit)
+				}
+			}
+		})
+	}
+}
+
+// TestBackoffPersistsAndReloads verifies the backoff fields are persisted through
+// POST /api/settings and re-applied by ApplyConfigToServer on restart.
+func TestBackoffPersistsAndReloads(t *testing.T) {
+	path := isolateTokenConfig(t)
+	cfg := DefaultConfig()
+	cfg.CacheDir = t.TempDir()
+	s := New(cfg)
+	if resp := requireTokenSettingsOK(t, s, `{"backoffInitial":"250ms","backoffMax":"7s"}`); strings.Contains(resp, "warning") {
+		t.Fatalf("unexpected persistence warning: %s", resp)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !bytes.Contains(data, []byte("250ms")) || !bytes.Contains(data, []byte("7s")) {
+		t.Fatalf("backoff not persisted to config file: %s", data)
+	}
+
+	restarted := DefaultConfig()
+	if err := ApplyConfigToServer(&restarted); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if restarted.BackoffInitial != "250ms" || restarted.BackoffMax != "7s" {
+		t.Errorf("after reload backoff = (%q, %q), want (250ms, 7s)", restarted.BackoffInitial, restarted.BackoffMax)
+	}
+
+	// A bad file value must be rejected at the boundary, keeping the default.
+	if err := os.WriteFile(path, []byte(`{"backoff-initial":"soon","backoff-max":"-1s"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fresh := DefaultConfig()
+	if err := ApplyConfigToServer(&fresh); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if fresh.BackoffInitial != "400ms" || fresh.BackoffMax != "10s" {
+		t.Errorf("invalid file backoff regressed defaults: (%q, %q)", fresh.BackoffInitial, fresh.BackoffMax)
+	}
+}
+
 func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {
 	srv := newTestServer(t)
 

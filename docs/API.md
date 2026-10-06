@@ -162,7 +162,7 @@ Download reliability settings:
 
 - `retries` — maximum retry attempts per file/part request.
 - `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
-- `backoff-initial` / `backoff-max` (config file only) bound the exponential retry delay. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes.
+- `backoff-initial` / `backoff-max` bound the exponential retry delay (config-file fields, also surfaced as `backoffInitial` / `backoffMax` in `GET`/`POST /api/settings`). When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff; the resulting wait is capped at 5 minutes (`DefaultMaxRetryAfter`), so neither the server hint nor a larger local `backoff-max` can extend an individual retry wait beyond that.
 
 A permanent `401`, `403`, or `404` response for a file fails the whole job immediately with an actionable message (accept the repository terms / use a token with access, or file not found) and is never retried per file or part; `429`/`5xx` remain retryable.
 

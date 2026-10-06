@@ -4,21 +4,23 @@
 package hfdownloader
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultMaxRetryAfter caps how long a server-requested wait (Retry-After or
-// the Hub RateLimit header) may delay a retry. A hostile or misconfigured
-// server must not be able to park a download for an unbounded time.
+// DefaultMaxRetryAfter caps the TOTAL wait NextRetryWait returns — the larger
+// of the caller's local backoff and any server-requested wait (Retry-After or
+// the Hub RateLimit header). A hostile or misconfigured server must not be able
+// to park a download for an unbounded time.
 const DefaultMaxRetryAfter = 5 * time.Minute
 
 // RetryableStatus reports whether an HTTP status is transient and worth
-// retrying. It mirrors APIError.IsRetryable for callers that only hold the
-// status code, keeping status classification consistent across the downloader
-// and the repo tree/API layers.
+// retrying. It is the single source of truth for retryability classification:
+// APIError.IsRetryable delegates here, so the downloader and the repo tree/API
+// layers cannot drift.
 func RetryableStatus(code int) bool {
 	switch code {
 	case 429, 500, 502, 503, 504:
@@ -30,7 +32,8 @@ func RetryableStatus(code int) bool {
 
 // FailFastStatus reports whether an HTTP status is permanent for the whole
 // job: retrying it cannot succeed and only multiplies requests against a
-// gated, private, or missing resource. It mirrors APIError.IsFailFast.
+// gated, private, or missing resource. It is the single source of truth for
+// fail-fast classification: APIError.IsFailFast delegates here.
 func FailFastStatus(code int) bool {
 	switch code {
 	case 401, 403, 404:
@@ -76,7 +79,7 @@ func parseRetryAfterValue(v string, now time.Time) time.Duration {
 		if secs <= 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
+		return secondsToDuration(secs)
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := t.Sub(now); d > 0 {
@@ -84,6 +87,23 @@ func parseRetryAfterValue(v string, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+// secondsToDuration converts a non-negative seconds count to a time.Duration,
+// saturating at the maximum representable duration instead of overflowing.
+// Converting directly (time.Duration(secs) * time.Second) wraps for values
+// above ~9223372036 seconds and can produce a NEGATIVE hint, which would make
+// the caller ignore a huge but valid Retry-After/RateLimit value instead of
+// clamping it to the cap.
+func secondsToDuration(secs int) time.Duration {
+	if secs <= 0 {
+		return 0
+	}
+	const maxSeconds = int64(math.MaxInt64) / int64(time.Second)
+	if int64(secs) >= maxSeconds {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // parseRateLimitHeader parses the Hugging Face Hub RateLimit header, a
@@ -105,7 +125,7 @@ func parseRateLimitHeader(v string) time.Duration {
 		if err != nil || secs <= 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
+		return secondsToDuration(secs)
 	}
 	return 0
 }

@@ -363,6 +363,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		Verify:             cfg.Verify,
 		Retries:            cfg.Retries,
 		StallTimeout:       cfg.StallTimeout,
+		BackoffInitial:     cfg.BackoffInitial,
+		BackoffMax:         cfg.BackoffMax,
 		Endpoint:           cfg.Endpoint,
 		StorageMode:        storageMode,
 		LocalDir:           cfg.LocalDir,
@@ -406,6 +408,8 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Verify             *string            `json:"verify,omitempty"`
 		Retries            *int               `json:"retries,omitempty"`
 		StallTimeout       *string            `json:"stallTimeout,omitempty"`
+		BackoffInitial     *string            `json:"backoffInitial,omitempty"`
+		BackoffMax         *string            `json:"backoffMax,omitempty"`
 		Endpoint           *string            `json:"endpoint,omitempty"`
 		// Proxy settings
 		Proxy *struct {
@@ -431,6 +435,8 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		newMultipartThreshold string
 		newMaxSpeed           string
 		newStallTimeout       string
+		newBackoffInitial     string
+		newBackoffMax         string
 		newDownloadRoutes     map[string]string
 	)
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
@@ -451,6 +457,26 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newStallTimeout = trimmed
+	}
+	// Backoff fields share StallTimeout's duration contract: non-negative and
+	// parseable, so a bad value cannot silently disable retry pacing.
+	if req.BackoffInitial != nil && strings.TrimSpace(*req.BackoffInitial) != "" {
+		trimmed := strings.TrimSpace(*req.BackoffInitial)
+		d, err := time.ParseDuration(trimmed)
+		if err != nil || d < 0 {
+			writeError(w, http.StatusBadRequest, "Invalid backoffInitial", "expected a non-negative duration such as \"400ms\" or \"2s\"")
+			return
+		}
+		newBackoffInitial = trimmed
+	}
+	if req.BackoffMax != nil && strings.TrimSpace(*req.BackoffMax) != "" {
+		trimmed := strings.TrimSpace(*req.BackoffMax)
+		d, err := time.ParseDuration(trimmed)
+		if err != nil || d < 0 {
+			writeError(w, http.StatusBadRequest, "Invalid backoffMax", "expected a non-negative duration such as \"10s\" or \"1m\"")
+			return
+		}
+		newBackoffMax = trimmed
 	}
 	if req.MaxSpeed != nil {
 		trimmed := strings.TrimSpace(*req.MaxSpeed)
@@ -519,6 +545,12 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if newStallTimeout != "" {
 			c.StallTimeout = newStallTimeout
+		}
+		if newBackoffInitial != "" {
+			c.BackoffInitial = newBackoffInitial
+		}
+		if newBackoffMax != "" {
+			c.BackoffMax = newBackoffMax
 		}
 		if req.Endpoint != nil {
 			c.Endpoint = *req.Endpoint
@@ -596,6 +628,8 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Verify:             finalCfg.Verify,
 		Retries:            &retries,
 		StallTimeout:       finalCfg.StallTimeout,
+		BackoffInitial:     finalCfg.BackoffInitial,
+		BackoffMax:         finalCfg.BackoffMax,
 		Endpoint:           finalCfg.Endpoint,
 		DownloadRoutes:     finalCfg.DownloadRoutes,
 	}

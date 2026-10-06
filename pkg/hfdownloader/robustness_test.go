@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -677,6 +678,67 @@ func TestBuildSOCKS5Client_DialRespectsContext(t *testing.T) {
 	}
 }
 
+// TestBuildSOCKS5Client_HandshakeBoundedWithoutRequestDeadline verifies P1: the
+// transport bounds the FULL dial+handshake with its own deadline, independent
+// of the request context. Invoking the transport's DialContext directly with a
+// background context (no deadline) against an accept-but-never-speak proxy must
+// still return within a bounded time — before the fix it would hang forever.
+func TestBuildSOCKS5Client_HandshakeBoundedWithoutRequestDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	client, err := BuildHTTPClient(&ProxyConfig{URL: "socks5://" + ln.Addr().String(), NoEnvProxy: true})
+	if err != nil {
+		t.Fatalf("BuildHTTPClient: %v", err)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+
+	// Lower the package-level transport handshake timeout for a fast test.
+	old := socksHandshakeNanos.Swap(int64(250 * time.Millisecond))
+	defer socksHandshakeNanos.Store(old)
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	res := make(chan dialResult, 1)
+	start := time.Now()
+	go func() {
+		conn, err := tr.DialContext(context.Background(), "tcp", "example.invalid:80")
+		res <- dialResult{conn, err}
+	}()
+
+	// A regression (handshake bounded only by the request context) would block
+	// forever with a background ctx; fail instead of hanging.
+	select {
+	case r := <-res:
+		if r.err == nil {
+			r.conn.Close()
+			t.Fatal("expected the SOCKS5 handshake to fail against a non-responding proxy")
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("SOCKS5 handshake took %v with no request deadline; the transport must bound it", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SOCKS5 handshake hung with no request deadline; the transport did not bound it")
+	}
+}
+
 func TestRetryAfterFromResponse(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	mkResp := func(status int, hdr map[string]string) *http.Response {
@@ -778,6 +840,8 @@ func TestStallTimeoutSetting(t *testing.T) {
 		{"0", 0},
 		{"0s", 0},
 		{"garbage", DefaultStallTimeout},
+		{"-5s", DefaultStallTimeout},
+		{"-1m", DefaultStallTimeout},
 	}
 	for _, tc := range cases {
 		if got := stallTimeout(Settings{StallTimeout: tc.setting}); got != tc.want {
@@ -825,5 +889,709 @@ func TestBackoffReset(t *testing.T) {
 	got := b.Next()
 	if got < 10*time.Millisecond || got > 250*time.Millisecond {
 		t.Errorf("after reset, Next = %v, want ~10ms (initial)", got)
+	}
+}
+
+// TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund is the T2 oscillation
+// case: a server that ignores Range and alternates full-body responses between
+// offset 1000 and offset 0 must never exceed the file high-water mark, so the
+// retry budget is never refunded and the download terminates after exactly
+// Retries+1 attempts. Before the high-water-mark fix, each A->B transition
+// looked like progress and refilled the budget forever.
+func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-osc")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n := requests
+		requests++
+		mu.Unlock()
+		// Ignore any Range: always 200, but deliver 1000 bytes on even requests
+		// and 0 bytes on odd requests, then abort. The client truncates to 0 on
+		// each 200 and re-downloads, so the observed offset oscillates
+		// 1000 -> 0 -> 1000 -> 0. Once the high-water mark reaches 1000, no
+		// later 0->1000 transition exceeds it, so the budget cannot be refilled
+		// forever (the old per-attempt "pos > startPos" rule could).
+		w.Header().Set("Content-Length", "20000")
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		if n%2 == 0 {
+			w.Write(make([]byte, 1_000))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "osc.bin", URL: srv.URL + "/osc.bin", Size: 20_000}
+	cfg := Settings{
+		Retries:        3,
+		BackoffInitial: "5ms",
+		BackoffMax:     "10ms",
+		StallTimeout:   "0",
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	// Bound the test: a regression that refunds the budget forever would hang.
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected failure; oscillation must not loop forever")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("downloadSingle did not terminate; oscillation refilled the retry budget")
+	}
+	mu.Lock()
+	n := requests
+	mu.Unlock()
+	if n != cfg.Retries+1 {
+		t.Errorf("made %d requests; want exactly %d (oscillation must not refund the budget)", n, cfg.Retries+1)
+	}
+}
+
+// TestDownloadMultipart_PermanentPartAbortsSiblings verifies T1 on the
+// multipart path: when one part hits a permanent error, sibling parts must stop
+// promptly, the original permanent error must be returned, and the resumable
+// bytes must not be deleted (T3 — the internal abort is not a user cancel, so
+// cleanupPartialsOnCancel must not run).
+func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "100000")
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
+			// Part 0 is the permanent one: a 404 fails the whole file.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// Sibling part: advertise a body, flush headers, then withhold the body
+		// so it cannot finish on its own. The default client has no body
+		// timeout and StallTimeout is disabled, so only the fix's partCtx
+		// cancel (triggered by part 0's fail-fast) can unblock its io.Copy.
+		w.Header().Set("Content-Range", "bytes 50000-99999/100000")
+		w.Header().Set("Content-Length", "50000")
+		w.WriteHeader(http.StatusPartialContent)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		<-release
+	}))
+	// Close release before srv.Close (whose Close waits for the blocked
+	// handler): a single defer keeps the ordering deterministic.
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-partabort")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-seed resumable bytes in a part file together with a matching layout
+	// file, so prepareMultipartResume preserves them; they must then survive the
+	// fail-fast abort. Without matching metadata the pre-existing behavior
+	// discards stale parts before any network I/O, which would mask this check.
+	if err := os.WriteFile(dst+".part-01", bytes.Repeat([]byte("y"), 500), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(100_000, 2, 50_000)); err != nil {
+		t.Fatal(err)
+	}
+
+	it := PlanItem{RelativePath: "pa.bin", URL: srv.URL + "/pa.bin", Size: 100_000, AcceptRanges: true}
+	cfg := Settings{Concurrency: 2, Retries: 5, BackoffInitial: "5ms", BackoffMax: "10ms", StallTimeout: "0"}
+	// cleanupPartialsOnCancel being true is the user-cancel default; the
+	// internal abort must not consult it.
+	cfg.CleanupPartialsOnCancel = func() bool { return true }
+
+	done := make(chan error, 1)
+	go func() {
+		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("error = %v, want ErrNotFound (original permanent error)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("downloadMultipart did not terminate after a permanent part error; sibling part was not aborted")
+	}
+
+	// T3: the pre-existing resumable part bytes must not have been deleted.
+	if fi, err := os.Stat(dst + ".part-01"); err != nil || fi.Size() != 500 {
+		t.Errorf("resumable .part-01 was removed/modified by the internal abort (stat err=%v)", err)
+	}
+}
+
+// TestDownload_SiblingAbortedOnPermanentFileError verifies T1 on the job level:
+// a multi-file download where one file returns a permanent 404 must terminate
+// promptly with the 404, without waiting for a slow/stalled sibling file.
+func TestDownload_SiblingAbortedOnPermanentFileError(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "a-missing.bin", Size: 1024},
+				{Type: "file", Path: "z-slow.bin", Size: 10_000},
+			})
+		case strings.HasSuffix(r.URL.Path, "a-missing.bin"):
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "z-slow.bin"):
+			// Advertise a long body, then withhold it until released. Without
+			// the fix, Download would block here until the sibling finished.
+			w.Header().Set("Content-Length", "10000")
+			w.WriteHeader(http.StatusOK)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			<-release
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	cfg := Settings{
+		CacheDir:           t.TempDir(),
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		Retries:            3,
+		BackoffInitial:     "5ms",
+		BackoffMax:         "10ms",
+		StallTimeout:       "0",
+		Verify:             "none",
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("error = %v, want ErrNotFound", err)
+		}
+		if elapsed := time.Since(start); elapsed > 8*time.Second {
+			t.Errorf("job took %v; a stalled sibling should have been aborted promptly", elapsed)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("Download blocked on a stalled sibling after a permanent file error")
+	}
+}
+
+// TestDownloadSingle_InternalAbortPreservesResumablePartial verifies T3 on the
+// single-file path: when downloadSingle exits because of an internal fail-fast
+// abort (its parent job/file context was canceled with the permanent error as
+// cause), it must NOT run cleanupPartialsOnCancel, so pre-existing resumable
+// bytes survive. A genuine user cancel with the same cleanup callback still
+// removes them (preserved behavior).
+// TestDownloadSingle_InternalAbortPreservesResumablePartial pins T3: an
+// internal abort (marked by the production abortCause sentinel) must preserve
+// resumable partial bytes, while a genuine user cancel still cleans up.
+//
+// The internal-abort cases wrap BOTH an *APIError and a PLAIN error with the
+// production abortError(...) sentinel. The plain-error case is the discerning
+// one: the job-level path-traversal rejection is not an *APIError, so a
+// status-based detector would misread it as a user cancel and delete the bytes.
+// It also directly asserts abortPartAttempt's contract.
+func TestDownloadSingle_InternalAbortPreservesResumablePartial(t *testing.T) {
+	// Direct sentinel contract: abortPartAttempt keys off the sentinel type, not
+	// the wrapped error's HTTP status. A plain non-*APIError wrapped by the
+	// production helper must still be recognized; a bare user cancel must not.
+	t.Run("abortPartAttempt recognizes plain-error sentinel", func(t *testing.T) {
+		plain, cancelPlain := context.WithCancelCause(context.Background())
+		defer cancelPlain(nil)
+		cancelPlain(abortError(errors.New("path traversal: %q would escape output directory")))
+		if !abortPartAttempt(plain) {
+			t.Error("abortPartAttempt = false for abortError(plain); a status-based detector would delete resumable bytes")
+		}
+
+		user, cancelUser := context.WithCancelCause(context.Background())
+		defer cancelUser(nil)
+		cancelUser(context.Canceled)
+		if abortPartAttempt(user) {
+			t.Error("abortPartAttempt = true for context.Canceled; user cancel must stay distinct")
+		}
+	})
+
+	seedAndRun := func(t *testing.T, cause func() error) string {
+		t.Helper()
+		tmpDir := t.TempDir()
+		dst := filepath.Join(tmpDir, "blobs", "tmp-abortkeep")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst+".part", bytes.Repeat([]byte("z"), 2_000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancelCause(context.Background())
+		// Retries>0 with a long backoff keeps the goroutine parked in the
+		// ctx-aware sleep so the test can cancel deterministically at the
+		// cleanup decision point.
+		cfg := Settings{Retries: 5, BackoffInitial: "5s", BackoffMax: "5s", StallTimeout: "0"}
+		cfg.CleanupPartialsOnCancel = func() bool { return true }
+
+		done := make(chan error, 1)
+		go func() {
+			it := PlanItem{RelativePath: "keep.bin", URL: "http://127.0.0.1:1/keep.bin", Size: 100_000}
+			done <- downloadSingle(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		}()
+
+		// Give the goroutine time to fail its first attempt and enter the
+		// backoff sleep, then trigger the abort.
+		time.Sleep(200 * time.Millisecond)
+		cancel(cause())
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("downloadSingle did not return after cancel")
+		}
+		return dst
+	}
+
+	internalCases := []struct {
+		name  string
+		cause func() error
+	}{
+		{
+			name: "internal abort via APIError sentinel",
+			// The production fail-fast cancel sites use abortError(...).
+			cause: func() error { return abortError(&APIError{StatusCode: http.StatusForbidden}) },
+		},
+		{
+			name: "internal abort via plain-error sentinel (path traversal)",
+			// A non-*APIError internal abort, exactly like the job-level
+			// path-traversal rejection. A status-based detector would fail this.
+			cause: func() error { return abortError(errors.New("path traversal: would escape output directory")) },
+		},
+	}
+	for _, tc := range internalCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := seedAndRun(t, tc.cause)
+			if fi, err := os.Stat(dst + ".part"); err != nil || fi.Size() != 2_000 {
+				t.Errorf("resumable .part removed/modified by internal abort (stat err=%v)", err)
+			}
+		})
+	}
+
+	t.Run("user cancel still cleans up", func(t *testing.T) {
+		dst := seedAndRun(t, func() error { return context.Canceled })
+		if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
+			t.Errorf("user-cancel cleanup did not remove .part (stat err=%v)", err)
+		}
+	})
+}
+
+// TestSecondsToDurationSaturates verifies the overflow-safe conversion used for
+// parsed Retry-After / RateLimit seconds: values beyond the representable
+// duration must stay positive so NextRetryWait can clamp them to the cap,
+// rather than wrapping negative and being ignored.
+func TestSecondsToDurationSaturates(t *testing.T) {
+	if got := secondsToDuration(30); got != 30*time.Second {
+		t.Errorf("secondsToDuration(30) = %v, want 30s", got)
+	}
+	if got := secondsToDuration(0); got != 0 {
+		t.Errorf("secondsToDuration(0) = %v, want 0", got)
+	}
+	huge := secondsToDuration(9223372037)
+	if huge <= 0 {
+		t.Fatalf("secondsToDuration(9223372037) = %v; must not wrap negative", huge)
+	}
+	if got := NextRetryWait(nil, 0, DefaultMaxRetryAfter, time.Now()); got != 0 {
+		t.Errorf("NextRetryWait = %v, want 0", got)
+	}
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{"9223372037"}}}
+	if got := NextRetryWait(resp, 0, DefaultMaxRetryAfter, time.Now()); got != DefaultMaxRetryAfter {
+		t.Errorf("huge Retry-After: got %v, want cap %v", got, DefaultMaxRetryAfter)
+	}
+}
+
+// growingPrefixServer ignores Range and, on every request, streams a strictly
+// larger prefix of the body (n*step bytes) before aborting. When Size > 0 it
+// declares that full Content-Length and answers 200, so the client truncates
+// the partial and restarts from zero — yet each restart's final on-disk offset
+// exceeds the previous high-water mark, which is exactly the counterexample the
+// high-water-mark rule alone cannot bound.
+func growingPrefixServer(t *testing.T, declaredSize int64, step int64) (*httptest.Server, *int) {
+	t.Helper()
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		if declaredSize > 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(declaredSize, 10))
+		}
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// Stream a strictly growing prefix so pos advances every attempt.
+		w.Write(make([]byte, int64(n)*step))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+// TestDownloadSingle_GrowingPrefixBounded covers T2 termination end to end.
+//
+// The known/unknown-size subtests use a server that ignores Range and answers
+// 200, so the truncation guard (truncatedRestart) refuses to refund and bounds
+// the loop at Retries+1 requests; they prove the whole-job termination path.
+//
+// The append subtest uses a 206 server that never truncates, so the truncation
+// guard cannot fire and only the absolute attempt ceiling can bound it. That
+// subtest is the one that genuinely pins the ceiling: with the ceiling removed
+// it runs forever, and with only the truncation guard it would run forever too
+// (append attempts keep advancing the high-water mark and refunding).
+func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
+	const declaredSize = 1 << 30 // 1 GiB declared, but only small prefixes sent
+
+	// Lower the ceiling multiplier locally so the append subtest reaches the
+	// ceiling quickly. Tests mutating this package var must run sequentially
+	// (no t.Parallel) and always restore it.
+	oldMult := maxAttemptsPerRetry
+	maxAttemptsPerRetry = 4
+	defer func() { maxAttemptsPerRetry = oldMult }()
+
+	runGrowing200 := func(t *testing.T, size int64) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		dst := filepath.Join(tmpDir, "blobs", "tmp-growing")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		srv, requests := growingPrefixServer(t, declaredSize, 8_000)
+
+		cfg := Settings{
+			Retries:        3,
+			BackoffInitial: "1ms",
+			BackoffMax:     "1ms",
+			StallTimeout:   "0",
+		}
+		it := PlanItem{RelativePath: "grow.bin", URL: srv.URL + "/grow.bin", Size: size}
+
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		}()
+
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("downloadSingle did not terminate; no absolute ceiling")
+		}
+		if err == nil {
+			t.Fatal("expected failure from the growing-prefix server")
+		}
+		n := *requests
+		bound := absoluteAttemptCeiling(cfg.Retries)
+		if n > bound {
+			t.Errorf("made %d requests; want <= absolute ceiling %d", n, bound)
+		}
+		if n < 2 {
+			t.Errorf("made only %d requests; test server may not have exercised the loop", n)
+		}
+		if elapsed := time.Since(start); elapsed > 8*time.Second {
+			t.Errorf("growing-prefix termination took %v", elapsed)
+		}
+	}
+	t.Run("known size", func(t *testing.T) { runGrowing200(t, declaredSize) })
+	t.Run("unknown size", func(t *testing.T) { runGrowing200(t, 0) })
+
+	// Append shape: the server answers the Range with 206 and appends a strictly
+	// growing prefix, then aborts. It never truncates, so truncatedRestart is
+	// never set and the refund rule cannot bound the loop — only the absolute
+	// ceiling can. The request count must stay within the ceiling yet exceed the
+	// pure Retries budget (proving refunds happened before the ceiling fired).
+	t.Run("append shape pins the ceiling", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dst := filepath.Join(tmpDir, "blobs", "tmp-growing-append")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		const total = int64(1) << 40 // never reached
+		var (
+			mu       sync.Mutex
+			requests int
+		)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests++
+			n := requests
+			mu.Unlock()
+			start := int64(0)
+			if rng := r.Header.Get("Range"); rng != "" {
+				if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
+					http.Error(w, "bad range", http.StatusBadRequest)
+					return
+				}
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
+			w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			// Append a strictly growing prefix then abort: pos advances and the
+			// server never truncates, so the truncation guard cannot fire.
+			w.Write(make([]byte, int64(n)*100))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}))
+		defer srv.Close()
+
+		it := PlanItem{RelativePath: "grow.bin", URL: srv.URL + "/grow.bin", Size: total}
+		cfg := Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
+
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		}()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("expected failure from the growing-append server")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("downloadSingle did not terminate; no absolute ceiling")
+		}
+		mu.Lock()
+		n := requests
+		mu.Unlock()
+		// The loop breaks when attempt reaches ceiling, so at most ceiling+1
+		// requests are made.
+		bound := absoluteAttemptCeiling(cfg.Retries) + 1
+		if n > bound {
+			t.Errorf("made %d requests; want <= absolute ceiling %d", n, bound)
+		}
+		if n <= cfg.Retries+1 {
+			t.Errorf("made only %d requests; append refunds should have extended past the pure budget of %d", n, cfg.Retries+1)
+		}
+		if elapsed := time.Since(start); elapsed > 8*time.Second {
+			t.Errorf("growing-append termination took %v", elapsed)
+		}
+	})
+}
+
+// TestDownloadSingle_AppendCeilingBounded isolates the absolute ceiling on the
+// single-file path: a server that answers a Range request with 206 and streams a
+// strictly growing prefix (appending to the part, never truncating) advances the
+// high-water mark every attempt without triggering the truncation guard, so only
+// the absolute ceiling can terminate it.
+func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-append")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = int64(1) << 40 // declared size; never reached
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		start := int64(0)
+		if rng := r.Header.Get("Range"); rng != "" {
+			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
+		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// Append a strictly growing prefix then abort: pos advances, the server
+		// never truncates, and the file never reaches Size.
+		w.Write(make([]byte, int64(n)*100))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "app.bin", URL: srv.URL + "/app.bin", Size: total}
+	cfg := Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
+
+	oldMult := maxAttemptsPerRetry
+	maxAttemptsPerRetry = 4
+	defer func() { maxAttemptsPerRetry = oldMult }()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected failure from the growing-append server")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("downloadSingle did not terminate; no absolute ceiling")
+	}
+	mu.Lock()
+	n := requests
+	mu.Unlock()
+	bound := absoluteAttemptCeiling(cfg.Retries) + 1
+	if n > bound {
+		t.Errorf("made %d requests; want <= %d", n, bound)
+	}
+	if n < 2 {
+		t.Errorf("made only %d requests; the growing-append loop may not have run", n)
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("append-ceiling termination took %v", elapsed)
+	}
+}
+
+// TestDownloadMultipart_GrowingPrefixBounded verifies the absolute ceiling on
+// the multipart part loop: a part server that answers 206 but streams a
+// strictly growing prefix (and aborts) advances the part high-water mark every
+// attempt, so without the ceiling it would refund forever.
+func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-mpgrow")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 100_000
+	const partCount = 2
+	// Declare a body far larger than anything sent so a part can never finish;
+	// each attempt appends a strictly growing prefix then aborts, so the part's
+	// on-disk offset advances on every attempt (the counterexample for the
+	// refund rule alone).
+	const declaredBody = int64(1) << 40
+	const growthPerRequest = 100
+	var (
+		mu           sync.Mutex
+		partRequests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		mu.Lock()
+		partRequests++
+		n := partRequests
+		mu.Unlock()
+		start := int64(0)
+		if rng := r.Header.Get("Range"); rng != "" {
+			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+		}
+		// Ignore the requested range: always 206 with a huge declared body,
+		// stream a strictly growing prefix, then abort. The client appends to
+		// its part file at the current offset, so pos grows every attempt while
+		// the part never completes.
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, declaredBody-1, declaredBody))
+		w.Header().Set("Content-Length", strconv.FormatInt(declaredBody, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		w.Write(make([]byte, int64(n)*growthPerRequest))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "mp.bin", URL: srv.URL + "/mp.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: partCount, Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
+
+	// The per-attempt backoff jitter makes a production-sized ceiling (hundreds
+	// of attempts) too slow to exercise here; lower the multiplier for a fast,
+	// deterministic test while the enforcement logic stays identical.
+	oldMult := maxAttemptsPerRetry
+	maxAttemptsPerRetry = 4
+	defer func() { maxAttemptsPerRetry = oldMult }()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected failure from the growing-prefix multipart server")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("downloadMultipart did not terminate; no absolute ceiling")
+	}
+	mu.Lock()
+	n := partRequests
+	mu.Unlock()
+	// Two parts; each runs until its `attempt` index reaches the ceiling, so a
+	// part makes at most ceiling+1 requests.
+	bound := partCount * (absoluteAttemptCeiling(cfg.Retries) + 1)
+	if n > bound {
+		t.Errorf("made %d part requests; want <= %d", n, bound)
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("growing-prefix multipart termination took %v", elapsed)
 	}
 }

@@ -70,12 +70,7 @@ func (e *APIError) Error() string {
 
 // IsRetryable returns true if the error might succeed on retry.
 func (e *APIError) IsRetryable() bool {
-	switch e.StatusCode {
-	case 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	return RetryableStatus(e.StatusCode)
 }
 
 // IsFailFast returns true when the error is permanent for the whole job:
@@ -84,12 +79,7 @@ func (e *APIError) IsRetryable() bool {
 // 404 (not found) are permanent; every other status falls through to the
 // retryable/unknown classification.
 func (e *APIError) IsFailFast() bool {
-	switch e.StatusCode {
-	case 401, 403, 404:
-		return true
-	default:
-		return false
-	}
+	return FailFastStatus(e.StatusCode)
 }
 
 // Is implements errors.Is for common error comparisons.

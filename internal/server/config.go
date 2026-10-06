@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"gopkg.in/yaml.v3"
@@ -339,8 +340,26 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	// CLI --stall-timeout flag is applied on top afterwards (see cmd/hfdesk),
 	// so an explicit flag still wins. Unlike MultipartThreshold there is no
 	// non-empty DefaultConfig sentinel to compare against safely.
+	//
+	// A NEGATIVE or unparseable value must never silently disable the watchdog,
+	// so reject it here and keep the protective default rather than applying
+	// garbage. "0"/"0s" is a deliberate disable and is applied as-is.
 	if fileCfg.StallTimeout != "" {
-		serverCfg.StallTimeout = fileCfg.StallTimeout
+		if d, err := time.ParseDuration(fileCfg.StallTimeout); err == nil && d >= 0 {
+			serverCfg.StallTimeout = fileCfg.StallTimeout
+		}
+	}
+	// Backoff settings apply only when the file carries a valid non-negative
+	// duration; an invalid entry keeps the server default.
+	if fileCfg.BackoffInitial != "" {
+		if d, err := time.ParseDuration(fileCfg.BackoffInitial); err == nil && d >= 0 {
+			serverCfg.BackoffInitial = fileCfg.BackoffInitial
+		}
+	}
+	if fileCfg.BackoffMax != "" {
+		if d, err := time.ParseDuration(fileCfg.BackoffMax); err == nil && d >= 0 {
+			serverCfg.BackoffMax = fileCfg.BackoffMax
+		}
 	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint

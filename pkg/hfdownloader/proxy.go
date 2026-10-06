@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -126,6 +127,20 @@ const (
 	// a missed reply closes the connection.
 	defaultHTTP2PingTimeout = 15 * time.Second
 )
+
+// socksHandshakeNanos holds an override for the SOCKS5 dial+handshake timeout,
+// in nanoseconds. 0 means "use defaultDialTimeout". It is atomic because a
+// transport's DialContext goroutine may outlive the code that reads or changes
+// it (for example a test that lowers it, or an in-flight dial during shutdown).
+var socksHandshakeNanos atomic.Int64
+
+// socksHandshakeTimeout returns the effective SOCKS5 dial+handshake bound.
+func socksHandshakeTimeout() time.Duration {
+	if d := socksHandshakeNanos.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return defaultDialTimeout
+}
 
 // newBaseTransport returns an http.Transport with dial, response-header and
 // HTTP/2 health-check deadlines on every phase that can block. It is the
@@ -250,15 +265,23 @@ func buildSOCKS5Client(proxyCfg *ProxyConfig) (*http.Client, error) {
 	// Create transport with SOCKS5 dialer
 	tr := newBaseTransport()
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Bound the entire dial+handshake with a deadline derived here (at the
+		// transport owner), so it holds even when the caller's request context
+		// has no deadline (and cannot be removed by http.Transport wrapping it
+		// with context.WithoutCancel). Deriving from the incoming ctx keeps
+		// ordinary cancellation working.
+		dialCtx, cancel := context.WithTimeout(ctx, socksHandshakeTimeout())
+		defer cancel()
+
 		// Check if we should bypass proxy
 		bypassHost, _, _ := net.SplitHostPort(addr)
 		if shouldBypassProxy(bypassHost, noProxyList) {
-			return forward.DialContext(ctx, network, addr)
+			return forward.DialContext(dialCtx, network, addr)
 		}
-		// Use SOCKS5 proxy; the request context/deadline is threaded through
-		// the whole handshake so a stalled proxy yields a deadline error
-		// instead of blocking forever.
-		return ctxDialer.DialContext(ctx, network, addr)
+		// Use SOCKS5 proxy; dialCtx bounds both the TCP connect to the proxy
+		// and the SOCKS5 protocol exchange, so a stalled proxy yields a
+		// deadline error instead of blocking forever.
+		return ctxDialer.DialContext(dialCtx, network, addr)
 	}
 
 	if proxyCfg.InsecureSkipVerify {

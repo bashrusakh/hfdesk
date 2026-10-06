@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
@@ -57,8 +58,14 @@ func main() {
 	if err := server.ApplyConfigToServer(&cfg); err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	// CLI flag takes precedence over the persisted setting.
+	// CLI flag takes precedence over the persisted setting. Reject a negative
+	// or unparseable value: it must never silently disable the stall watchdog
+	// or be accepted as a bogus duration.
 	if stallTimeout != "" {
+		d, err := time.ParseDuration(stallTimeout)
+		if err != nil || d < 0 {
+			log.Fatalf("invalid --stall-timeout %q: expected a non-negative duration such as 60s or 0 to disable", stallTimeout)
+		}
 		cfg.StallTimeout = stallTimeout
 	}
 
