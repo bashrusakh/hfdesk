@@ -22,12 +22,7 @@ const DefaultMaxRetryAfter = 5 * time.Minute
 // APIError.IsRetryable delegates here, so the downloader and the repo tree/API
 // layers cannot drift.
 func RetryableStatus(code int) bool {
-	switch code {
-	case 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	return code == http.StatusTooManyRequests || code >= 500 && code <= 599
 }
 
 // FailFastStatus reports whether an HTTP status is permanent for the whole

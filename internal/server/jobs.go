@@ -1313,8 +1313,6 @@ func (m *JobManager) runJob(job *Job) {
 		MultipartThreshold: cfg.MultipartThreshold,
 		Verify:             cfg.Verify,
 		Retries:            cfg.Retries,
-		BackoffInitial:     cfg.BackoffInitial,
-		BackoffMax:         cfg.BackoffMax,
 		StallTimeout:       cfg.StallTimeout,
 		Endpoint:           cfg.Endpoint,
 		Proxy:              cfg.Proxy,

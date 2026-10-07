@@ -600,7 +600,7 @@ LOOP:
 			var finalSHA256 string
 			if useHFCache {
 				sha := it.SHA256
-				result, err := repoDir.StoreDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -937,17 +937,24 @@ func abortPartAttempt(ctx context.Context) bool {
 // package variable (not a public API) so tests can lower it deterministically.
 var maxAttemptsPerRetry = 100
 
-// absoluteAttemptCeiling returns the maximum number of retries allowed for one
-// file/part. The effective retry budget may be extended by progress refunds,
-// but never beyond this hard ceiling, so termination is guaranteed for every
-// server sequence. The high-water-mark rule (refund only when an attempt
-// advances the resume offset) already excludes ignored-Range restarts and
-// oscillation, but it is only a monotonic floor: a server that streams a
-// STRICTLY growing prefix and then aborts advances the mark every attempt, so
-// without this ceiling it would refund forever. retries<0 is treated as 0.
+// absoluteAttemptCeiling bounds retry attempts over the lifetime of one file or
+// part, including retries enabled by progress refunds. The limit is checked
+// after each request attempt returns; it does not bound a request that keeps
+// delivering data without returning. The high-water-mark rule refunds only
+// after non-truncating progress strictly beyond the previous mark. An ignored-
+// Range restart can record a higher mark but never refunds the budget, and a
+// later bodyless failure earns no refund from that mark. retries<0 is treated
+// as 0.
 func absoluteAttemptCeiling(retries int) int {
 	if retries < 0 {
 		retries = 0
+	}
+	if maxAttemptsPerRetry <= 0 {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if retries >= maxInt/maxAttemptsPerRetry {
+		return maxInt
 	}
 	return (retries + 1) * maxAttemptsPerRetry
 }
@@ -1002,14 +1009,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	attempt := 0
 	ceiling := absoluteAttemptCeiling(attempts)
 	var lastErr error
-	// Termination has two independent terms:
-	//  1. the high-water-mark refund rule: the budget is refunded only when an
-	//     attempt moves STRICTLY above hwm, so ignored-Range restarts and
-	//     oscillation never refill it; and
-	//  2. the absolute ceiling (absoluteAttemptCeiling): refunds may extend the
-	//     budget, but never beyond a hard maximum attempt count, so a server
-	//     that streams a strictly growing prefix and then aborts cannot loop
-	//     forever.
+	// The high-water mark prevents non-progress and ignored-Range restarts from
+	// refunding the budget. The separate lifetime retry ceiling limits retries
+	// once attempts return; it does not time-bound a request that keeps delivering
+	// data. An ignored-Range restart may record a higher mark but cannot earn a
+	// refund, so a following bodyless failure also earns none.
 	// hwm is the highest offset ever reached for this file, seeded with the
 	// initial on-disk offset.
 	hwm := pos
@@ -1085,6 +1089,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					attemptCancel()
 					out.Close()
 					removeEmptyPartialFile(tmp)
+					return lastErr
+				}
+				if !apiErr.IsRetryable() {
+					attemptCancel()
+					out.Close()
 					return lastErr
 				}
 				waitResp = resp
@@ -1377,6 +1386,21 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 							partCancel(abortError(lastErr))
 							out.Close()
 							removeEmptyPartialFile(tmp)
+							select {
+							case errCh <- lastErr:
+							default:
+							}
+							return
+						}
+						if !apiErr.IsRetryable() {
+							attemptCancel()
+							partErrMu.Lock()
+							if partErr == nil {
+								partErr = lastErr
+							}
+							partErrMu.Unlock()
+							partCancel(abortError(lastErr))
+							out.Close()
 							select {
 							case errCh <- lastErr:
 							default:

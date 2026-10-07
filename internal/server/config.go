@@ -349,18 +349,6 @@ func ApplyConfigToServer(serverCfg *Config) error {
 			serverCfg.StallTimeout = fileCfg.StallTimeout
 		}
 	}
-	// Backoff settings apply only when the file carries a valid non-negative
-	// duration; an invalid entry keeps the server default.
-	if fileCfg.BackoffInitial != "" {
-		if d, err := time.ParseDuration(fileCfg.BackoffInitial); err == nil && d >= 0 {
-			serverCfg.BackoffInitial = fileCfg.BackoffInitial
-		}
-	}
-	if fileCfg.BackoffMax != "" {
-		if d, err := time.ParseDuration(fileCfg.BackoffMax); err == nil && d >= 0 {
-			serverCfg.BackoffMax = fileCfg.BackoffMax
-		}
-	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint
 	}

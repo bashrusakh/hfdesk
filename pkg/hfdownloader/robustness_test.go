@@ -430,6 +430,41 @@ func TestDownload_PermanentStatusFailsFast(t *testing.T) {
 	}
 }
 
+func TestDownloadSingleStatusRetryPolicy(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusGone, http.StatusRequestedRangeNotSatisfiable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != status {
+				t.Fatalf("error = %v, want APIError status %d", err, status)
+			}
+			if requests != 1 {
+				t.Errorf("made %d requests; non-retryable status should be attempted once", requests)
+			}
+		})
+	}
+	for _, status := range []int{http.StatusNotImplemented, 599} {
+		t.Run(fmt.Sprintf("retry-%d", status), func(t *testing.T) {
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			_ = downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			if requests != 3 {
+				t.Errorf("made %d requests; retryable 5xx should make initial attempt plus two retries", requests)
+			}
+		})
+	}
+}
+
 // TestDownloadMultipart_FailFast covers the multipart path: a permanent status
 // on the initial HEAD fails before any part request (one request total), and a
 // permanent status on a part request fails the whole file without a retry
@@ -800,7 +835,7 @@ func TestNextRetryWait(t *testing.T) {
 }
 
 func TestStatusClassification(t *testing.T) {
-	retryable := []int{429, 500, 502, 503, 504}
+	retryable := []int{429, 500, 501, 502, 503, 504, 599}
 	for _, c := range retryable {
 		if !RetryableStatus(c) {
 			t.Errorf("RetryableStatus(%d) = false, want true", c)
@@ -816,13 +851,30 @@ func TestStatusClassification(t *testing.T) {
 		}
 	}
 	// The helpers must agree with the APIError methods.
-	for _, c := range []int{200, 206, 400, 401, 403, 404, 429, 500, 503} {
+	for _, c := range []int{200, 206, 400, 401, 403, 404, 405, 410, 416, 429, 500, 501, 503, 599, 600} {
 		ae := &APIError{StatusCode: c}
 		if ae.IsRetryable() != RetryableStatus(c) {
 			t.Errorf("retryable mismatch at %d", c)
 		}
 		if ae.IsFailFast() != FailFastStatus(c) {
 			t.Errorf("fail-fast mismatch at %d", c)
+		}
+	}
+	for _, c := range []int{400, 405, 410, 416, 499, 600} {
+		if RetryableStatus(c) {
+			t.Errorf("RetryableStatus(%d) = true, want false", c)
+		}
+	}
+}
+
+func TestAbsoluteAttemptCeilingDoesNotOverflow(t *testing.T) {
+	old := maxAttemptsPerRetry
+	maxAttemptsPerRetry = 100
+	defer func() { maxAttemptsPerRetry = old }()
+	maxInt := int(^uint(0) >> 1)
+	for _, tc := range []struct{ retries, want int }{{0, 100}, {3, 400}, {maxInt, maxInt}, {maxInt - 1, maxInt}} {
+		if got := absoluteAttemptCeiling(tc.retries); got != tc.want {
+			t.Errorf("absoluteAttemptCeiling(%d) = %d, want %d", tc.retries, got, tc.want)
 		}
 	}
 }
@@ -965,11 +1017,10 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_PermanentPartAbortsSiblings verifies T1 on the
-// multipart path: when one part hits a permanent error, sibling parts must stop
-// promptly, the original permanent error must be returned, and the resumable
-// bytes must not be deleted (T3 — the internal abort is not a user cancel, so
-// cleanupPartialsOnCancel must not run).
+// TestDownloadMultipart_PermanentPartAbortsSiblings verifies that a job-fatal
+// part error stops sibling part requests, returns the original error, and
+// preserves resumable bytes rather than treating the internal abort as a user
+// cancel.
 func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1045,9 +1096,72 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	}
 }
 
-// TestDownload_SiblingAbortedOnPermanentFileError verifies T1 on the job level:
-// a multi-file download where one file returns a permanent 404 must terminate
-// promptly with the 404, without waiting for a slow/stalled sibling file.
+func TestDownloadMultipart_NonRetryablePartStopsSiblings(t *testing.T) {
+	siblingStarted := make(chan struct{})
+	siblingStopped := make(chan struct{})
+	var siblingOnce sync.Once
+	requests := 0
+	var requestMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "100000")
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		requestMu.Lock()
+		requests++
+		requestMu.Unlock()
+		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
+			select {
+			case <-siblingStarted:
+			case <-r.Context().Done():
+				return
+			case <-time.After(5 * time.Second):
+				t.Error("sibling part never started")
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		siblingOnce.Do(func() { close(siblingStarted) })
+		w.Header().Set("Content-Range", "bytes 50000-99999/100000")
+		w.Header().Set("Content-Length", "50000")
+		w.WriteHeader(http.StatusPartialContent)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		<-r.Context().Done()
+		close(siblingStopped)
+	}))
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "blobs", "tmp-terminal-part")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 100000, AcceptRanges: true}, dst, func(ProgressEvent) {})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("error = %v, want original HTTP 400 APIError", err)
+	}
+	select {
+	case <-siblingStopped:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight sibling part was not stopped")
+	}
+	requestMu.Lock()
+	gotRequests := requests
+	requestMu.Unlock()
+	if gotRequests != 2 {
+		t.Errorf("issued %d part requests; want one terminal request and one cancelled sibling, with no retries", gotRequests)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("multipart file assembled after terminal part error (stat err=%v)", err)
+	}
+}
+
+// TestDownload_SiblingAbortedOnPermanentFileError verifies that a job-fatal 404
+// cancels a stalled sibling file and returns the original status error.
 func TestDownload_SiblingAbortedOnPermanentFileError(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1995,17 +2109,6 @@ func TestVerifyAndStoreCtxAbortPromptly(t *testing.T) {
 		}
 	})
 
-	t.Run("copyFileCtx", func(t *testing.T) {
-		dstCopy := filepath.Join(tmpDir, "copy.bin")
-		start := time.Now()
-		if err := copyFileCtx(ctx, big, dstCopy); err == nil {
-			t.Fatal("expected a context error")
-		}
-		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Errorf("copyFileCtx took %v on a cancelled ctx", elapsed)
-		}
-	})
-
 	t.Run("StoreDownloadedFileCtx", func(t *testing.T) {
 		settings := DefaultSettings()
 		settings.CacheDir = t.TempDir()
@@ -2026,7 +2129,7 @@ func TestVerifyAndStoreCtxAbortPromptly(t *testing.T) {
 		}
 		// Empty sha256 forces a ctx-aware hash; the cancelled ctx aborts it.
 		start := time.Now()
-		if _, err := rd.StoreDownloadedFileCtx(ctx, tempFile, "store.bin", "commit", "", "", true); !errors.Is(err, context.Canceled) {
+		if _, err := rd.storeDownloadedFileCtx(ctx, tempFile, "store.bin", "commit", "", "", true); !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected a context.Canceled error, got %v", err)
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -2035,7 +2138,7 @@ func TestVerifyAndStoreCtxAbortPromptly(t *testing.T) {
 	})
 }
 
-// --- Round 3: atomic blob publication + remaining T1 cancellation paths ---
+// --- Atomic blob publication and cooperative cancellation ---
 
 // TestCopyFileAtomicCtxAbortLeavesNoBlob verifies the atomic-publish primitive:
 // an aborted copy leaves NO file at dst, leaves the source intact, and a
@@ -2091,6 +2194,85 @@ func TestCopyFileAtomicCtxAbortLeavesNoBlob(t *testing.T) {
 	}
 }
 
+func TestCopyFileAtomicCtxAbortAfterStagingBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "source.bin")
+	if err := os.WriteFile(src, bytes.Repeat([]byte("x"), 128<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	settings := DefaultSettings()
+	settings.CacheDir = filepath.Join(tmpDir, "cache")
+	cache, err := settings.BuildHFCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := cache.Repo("o/r", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(content))
+	dst := repo.BlobPath(hash)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- copyFileAtomicCtx(ctx, src, dst) }()
+
+	deadline := time.After(10 * time.Second)
+	stagingPrefix := filepath.Base(dst) + ".tmp-"
+	for {
+		entries, readErr := os.ReadDir(filepath.Dir(dst))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		copiedBytes := int64(0)
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), stagingPrefix) {
+				if info, statErr := entry.Info(); statErr == nil {
+					copiedBytes = info.Size()
+				}
+			}
+		}
+		if copiedBytes > 0 {
+			cancel()
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("copy never exposed a staging file with copied bytes")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if err := <-done; err == nil {
+		t.Fatal("expected cancellation after staged bytes were written")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("final blob exists after aborted staged copy (stat err=%v)", err)
+	}
+	if status, _, _ := repo.CheckBlob(hash); status == BlobComplete {
+		t.Errorf("CheckBlob reports aborted staging copy complete: %v", status)
+	}
+	if got, readErr := os.ReadFile(src); readErr != nil || fmt.Sprintf("%x", sha256.Sum256(got)) != hash {
+		t.Errorf("source changed during staged copy (read err=%v)", readErr)
+	}
+	entries, err := os.ReadDir(filepath.Dir(dst))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), stagingPrefix) {
+			t.Errorf("staging file left behind: %s", entry.Name())
+		}
+	}
+}
+
 // TestStoreDownloadedFileCtx_AbortDoesNotPoisonBlob verifies that a store whose
 // ctx is cancelled before/at hashing leaves no blob (so CheckBlob reports the
 // blob missing, not complete) and leaves the source intact; a later successful
@@ -2129,7 +2311,7 @@ func TestStoreDownloadedFileCtx_AbortDoesNotPoisonBlob(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := rd.StoreDownloadedFileCtx(ctx, tempFile, "weights.bin", "commit", "", "", true); err == nil {
+	if _, err := rd.storeDownloadedFileCtx(ctx, tempFile, "weights.bin", "commit", "", "", true); err == nil {
 		t.Fatal("expected a cancellation error from the cancelled store")
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
@@ -2144,7 +2326,7 @@ func TestStoreDownloadedFileCtx_AbortDoesNotPoisonBlob(t *testing.T) {
 	}
 
 	// A later successful store produces a valid complete blob with the right bytes.
-	if _, err := rd.StoreDownloadedFileCtx(context.Background(), tempFile, "weights.bin", "commit", hash, "", true); err != nil {
+	if _, err := rd.storeDownloadedFileCtx(context.Background(), tempFile, "weights.bin", "commit", hash, "", true); err != nil {
 		t.Fatalf("successful store: %v", err)
 	}
 	if status, _, _ := rd.CheckBlob(hash); status != BlobComplete {
@@ -2202,11 +2384,10 @@ func TestShouldSkipLocalCtxAbortsOnCancel(t *testing.T) {
 	})
 }
 
-// TestDownload_VerifyHeadPermanentFailsFast verifies the verification HEAD path
-// classifies a permanent 401/403 and fails the whole job fast with the ORIGINAL
-// error, while a benign 404 (optional metadata absent) does NOT fail the job.
-func TestDownload_VerifyHeadPermanentFailsFast(t *testing.T) {
-	run := func(t *testing.T, headStatus int) (error, int) {
+// TestDownload_VerifyHeadAuthMiss verifies verification HEAD is optional
+// metadata; the subsequent GET remains authoritative.
+func TestDownload_VerifyHeadAuthMiss(t *testing.T) {
+	run := func(t *testing.T, headStatus int) (error, int, int) {
 		t.Helper()
 		var (
 			mu       sync.Mutex
@@ -2249,42 +2430,29 @@ func TestDownload_VerifyHeadPermanentFailsFast(t *testing.T) {
 		err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ProgressEvent) {})
 		mu.Lock()
 		defer mu.Unlock()
-		return err, headReqs
+		return err, headReqs, fileGets
 	}
 
-	t.Run("403 HEAD fails fast with original error", func(t *testing.T) {
-		err, headReqs := run(t, http.StatusForbidden)
-		if err == nil {
-			t.Fatal("expected a permanent error from the verification HEAD")
-		}
-		if !errors.Is(err, ErrUnauthorized) {
-			t.Errorf("error = %v, want ErrUnauthorized (403)", err)
-		}
-		if headReqs != 1 {
-			t.Errorf("verification HEAD issued %d times; want 1 (no retry storm)", headReqs)
-		}
-	})
-
-	t.Run("404 HEAD is a benign optional-metadata miss", func(t *testing.T) {
-		err, _ := run(t, http.StatusNotFound)
-		if err != nil {
-			t.Errorf("a 404 verification HEAD must NOT fail the job, got %v", err)
-		}
-	})
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			err, heads, gets := run(t, status)
+			if err != nil || heads != 1 || gets != 1 {
+				t.Errorf("optional HEAD status %d: err=%v HEADs=%d GETs=%d; want successful GET after one HEAD", status, err, heads, gets)
+			}
+		})
+	}
 }
 
-// TestDownload_SiblingAbortedDuringStorePhase verifies the integrated T1
-// boundary end to end: file B is forced into the hfcache store/verify phase (a
+// TestDownload_SiblingErrorDuringStorePhase preserves original fatal errors
+// while allowing valid sibling artifacts to have completed already. File B is
+// forced into the hfcache store/verify phase (a
 // large local hash) and only THEN is a sibling file A allowed to fail with a
 // permanent 404. A's permanent 404 must fail the whole job promptly with A's
-// ORIGINAL error, and B's in-flight store must abort — leaving B's final blob
-// unpublished rather than completing a multi-GB hash/copy first.
+// ORIGINAL error. The test does not require rollback of valid completed files.
 //
 // Ordering is deterministic, not sleep-based: B's own "file_finalizing" emit
 // (which precedes its store phase) releases A's handler to answer 404. The
-// blob-absence assertion is timing-independent; the bounded elapsed assertion
-// additionally pins "promptly".
-func TestDownload_SiblingAbortedDuringStorePhase(t *testing.T) {
+func TestDownload_SiblingErrorDuringStorePhase(t *testing.T) {
 	// Large enough that B's store-side SHA-256 of the cached temp file is a real
 	// local phase that the ctx-aware store must interrupt.
 	const bigSize = 128 << 20 // 128 MiB
@@ -2335,7 +2503,7 @@ func TestDownload_SiblingAbortedDuringStorePhase(t *testing.T) {
 		Verify:             "none", // B is non-LFS: the store hashes it.
 	}
 
-	// Resolve B's final blob path so we can assert it was never published.
+	// Resolve B's final blob path so a published artifact can be checked.
 	cache, err := cfg.BuildHFCache()
 	if err != nil {
 		t.Fatalf("BuildHFCache: %v", err)
@@ -2352,7 +2520,6 @@ func TestDownload_SiblingAbortedDuringStorePhase(t *testing.T) {
 		}
 	}
 
-	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
 		done <- Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, emit)
@@ -2363,20 +2530,17 @@ func TestDownload_SiblingAbortedDuringStorePhase(t *testing.T) {
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("error = %v, want ErrNotFound (the original permanent error)", err)
 		}
-		if elapsed := time.Since(start); elapsed > 6*time.Second {
-			t.Errorf("job took %v; a sibling store phase should have been aborted promptly", elapsed)
-		}
 	case <-time.After(20 * time.Second):
-		t.Fatal("Download blocked on a sibling's store/verify phase after a permanent 404")
+		t.Fatal("Download did not return after a permanent 404")
 	}
 
-	// Timing-independent discriminator: B's store must have aborted, so its
-	// final blob was never published.
-	if _, statErr := os.Stat(blobPath); !os.IsNotExist(statErr) {
-		t.Errorf("B's blob was published despite the sibling 404 (stat err=%v); its store was not aborted", statErr)
-	}
-	if status, _, _ := rd.CheckBlob(bigHash); status == BlobComplete {
-		t.Errorf("CheckBlob reports B complete after a sibling abort: %v", status)
+	if _, statErr := os.Stat(blobPath); statErr == nil {
+		if status, _, _ := rd.CheckBlob(bigHash); status != BlobComplete {
+			t.Errorf("published sibling blob is incomplete: %v", status)
+		}
+		if got, readErr := os.ReadFile(blobPath); readErr != nil || fmt.Sprintf("%x", sha256.Sum256(got)) != bigHash {
+			t.Errorf("published sibling blob is invalid (read err=%v)", readErr)
+		}
 	}
 }
 

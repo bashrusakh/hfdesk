@@ -89,11 +89,9 @@ var headForETagTimeout = 10 * time.Second
 
 // headForETag fetches ETag and SHA256 headers for a file.
 //
-// A permanent auth/gated response (401/403) is returned as an error so the
-// caller can fail the whole job fast instead of silently continuing. Any other
-// non-2xx status (e.g. 404, 429, 5xx) and any transient transport error are
-// treated as an optional-metadata miss — the file may simply have no remote
-// SHA to verify against — and yield no error. A genuine CALLER cancellation is
+// Any non-2xx status and any transient transport error are treated as an
+// optional-metadata miss — the file may simply have no remote SHA to verify
+// against — and yield no error. A genuine CALLER cancellation is
 // surfaced promptly so a cancelled job stops; the internal request timeout is
 // itself a benign miss, so a slow-but-successful HEAD on a cold mirror does not
 // fail the job.
@@ -115,9 +113,6 @@ func headForETag(parentCtx context.Context, httpc *http.Client, token string, it
 	}
 	defer resp.Body.Close()
 	if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil {
-		if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden {
-			return "", "", apiErr
-		}
 		return "", "", nil
 	}
 	return resp.Header.Get("ETag"), resp.Header.Get("x-amz-meta-sha256"), nil

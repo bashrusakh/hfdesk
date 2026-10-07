@@ -631,13 +631,12 @@ type StoreFileResult struct {
 //   - filterSubdir: optional filter subdirectory for friendly view
 //   - noFriendly: if true, skip creating friendly view symlink
 func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
-	return r.StoreDownloadedFileCtx(context.Background(), tempFile, relativePath, commit, sha256, filterSubdir, noFriendly)
+	return r.storeDownloadedFileCtx(context.Background(), tempFile, relativePath, commit, sha256, filterSubdir, noFriendly)
 }
 
-// StoreDownloadedFileCtx is StoreDownloadedFile bounded by ctx. The SHA-256
-// computation and cross-device copy stop promptly on cancellation; existing
-// ctx-free callers keep using StoreDownloadedFile (context.Background()).
-func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
+// storeDownloadedFileCtx is the context-bounded implementation used by the
+// downloader; the existing public context-free API remains unchanged.
+func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
 	// Compute SHA256 if not provided
 	if sha256 == "" {
 		computed, err := computeSHA256Ctx(ctx, tempFile)
@@ -660,8 +659,7 @@ func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relative
 		}
 		if err := os.Rename(tempFile, blobPath); err != nil {
 			// Rename failed (cross-device?), try an atomic copy: stage in a
-			// sibling temp file, then atomically rename it into place (no fsync,
-			// per the T1 tradeoff documented on copyFileAtomicCtx). A cancelled or
+			// sibling temp file, then atomically rename it into place. A cancelled or
 			// failed copy must never leave a partial file at the FINAL blob
 			// path (which CheckBlob would report complete, poisoning the cache).
 			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
@@ -705,14 +703,6 @@ func (r *RepoDir) StoreDownloadedFileCtx(ctx context.Context, tempFile, relative
 
 // copyFile copies a file from src to dst.
 func copyFile(src, dst string) error {
-	return copyFileCtx(context.Background(), src, dst)
-}
-
-// copyFileCtx is copyFile bounded by ctx: the copy aborts promptly with the
-// context error if ctx is cancelled mid-copy. It writes directly to dst; use
-// copyFileAtomicCtx when dst is a durable artifact that must not be observed
-// half-written.
-func copyFileCtx(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -725,7 +715,7 @@ func copyFileCtx(ctx context.Context, src, dst string) error {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, contextReader{ctx: ctx, r: in}); err != nil {
+	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
 	return out.Close()
@@ -742,13 +732,8 @@ func copyFileCtx(ctx context.Context, src, dst string) error {
 // rename path publishes) so a cross-device fallback does not change blob
 // permissions.
 //
-// Deliberately no fsync/Sync here: these bytes were already SHA-256/size
-// verified by the caller, and crash-durability of this copy-fallback is not a
-// stated requirement, whereas invariant T1 (every blocking finalization phase
-// must respond promptly to cancellation after a sibling's permanent error) is.
-// Sync is not ctx-cancellable, so a mandatory Sync could block fail-fast
-// termination on a long flush. The temp+rename still guarantees no partial file
-// is ever visible at the final path.
+// This provides atomic visibility, not crash durability: it does not fsync the
+// staged file or containing directory.
 func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
