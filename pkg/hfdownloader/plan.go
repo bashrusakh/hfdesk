@@ -36,13 +36,21 @@ func unsafeRepoPath(rel string) bool {
 }
 
 // unsafeBlobName reports whether a SHA256 value taken from the remote tree
-// API is malformed as a blob-name path component. The SHA is remote-controlled
-// (see the unsafeRepoPath rationale above) and is used verbatim as a
-// filesystem name (blobs/<sha> storage and the tmp-<sha> staging file), so a
-// value containing a path separator, an absolute/volume qualification, or one
-// normalising to "." / ".." / a parent would escape the cache root if joined.
-// Empty is a legitimate shape (a file without a hash) and is reported safe
-// here; callers must check for it before using the value as a path.
+// API is not acceptable as a canonical SHA-256 hash for the plan. The SHA is
+// remote-controlled (see the unsafeRepoPath rationale above) and is used
+// verbatim both as a filesystem name (blobs/<sha> storage and the tmp-<sha>
+// staging file) and as the expected digest in verification, so it must be
+// either empty (a file without a hash) or exactly 64 hex characters -- the
+// canonical SHA-256 form. The separator / absolute / traversal checks below
+// keep the path-safety property stated on its own guard; the length+hex check
+// subsumes them but is deliberately not the only check. Hex is accepted
+// case-insensitively; scanRepo lowercases accepted values before they enter
+// the plan. Everything else -- including 40-hex git-OID-shaped values and
+// "sha256:"-prefixed LFS pointer oids -- is rejected: neither can ever match
+// a computed 64-hex digest at verify time, so accepting them would only
+// defer a guaranteed verification failure while writing non-canonical cache
+// entries. Callers must still check for the empty shape before using the
+// value as a path.
 func unsafeBlobName(sha string) bool {
 	if sha == "" {
 		return false
@@ -51,7 +59,25 @@ func unsafeBlobName(sha string) bool {
 		return true
 	}
 	cleaned := path.Clean(sha)
-	return cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../")
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return true
+	}
+	return !canonicalSHA256(sha)
+}
+
+// canonicalSHA256 reports whether sha is exactly 64 hexadecimal characters,
+// the canonical SHA-256 digest representation, accepting upper or lower case.
+func canonicalSHA256(sha string) bool {
+	if len(sha) != 64 {
+		return false
+	}
+	for i := 0; i < len(sha); i++ {
+		c := sha[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // PathInside reports whether target resolves to base itself or to a location
@@ -269,23 +295,34 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		acceptRanges := isLFS
 
 		sha := n.Sha256
+		shaField := "sha256"
 		if sha == "" && n.LFS != nil {
 			// LFS files have SHA256 in either Sha256 field or Oid field (LFS spec uses oid)
 			sha = n.LFS.Sha256
+			shaField = "lfs.sha256"
 			if sha == "" {
 				sha = n.LFS.Oid
+				shaField = "lfs.oid"
 			}
 		}
 
 		// The SHA is remote-controlled too, and unlike n.Path it flows into
-		// filesystem paths verbatim (tmp-<sha> staging, blobs/<sha> storage).
-		// Reject malformed values before they reach the plan, failing the
-		// whole plan rather than silently skipping so a tampered tree is
-		// loud, not partial. Empty is a legitimate shape (files without a
-		// hash) and passes through unchanged.
+		// filesystem paths verbatim (tmp-<sha> staging, blobs/<sha> storage)
+		// and into verification as the expected digest. Only the canonical
+		// SHA-256 form may reach the plan: empty (a file without a hash) or
+		// 64 hex characters. Reject anything else before it reaches the
+		// plan, failing the whole plan rather than silently skipping so a
+		// tampered tree is loud, not partial. The error names the offending
+		// field so a malformed mirror response is diagnosable.
 		if unsafeBlobName(sha) {
-			return nil, fmt.Errorf("refusing unsafe sha256 from repo tree for %q: %q", rel, sha)
+			return nil, fmt.Errorf("refusing non-canonical sha256 from repo tree for %q (field %s): %q: want empty or 64 hex characters", rel, shaField, sha)
 		}
+		// Store the canonical lowercase spelling so every consumer of
+		// PlanItem.SHA256 (tmp-<sha> staging, blobs/<sha>, CheckBlob,
+		// verify, manifest) sees "" or lowercase hex no matter how the
+		// remote spelled the digest. ToLower is a no-op for lowercase input,
+		// so canonical values pass through byte-identical.
+		sha = strings.ToLower(sha)
 
 		// Case-insensitive dedup: filterMatches is intentionally case-insensitive
 		// (q4_k_m matches Q4_K_M), so two files that differ only in case both

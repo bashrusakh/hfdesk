@@ -131,17 +131,15 @@ func TestPlanRepoRejectsTraversalSHA(t *testing.T) {
 
 // TestPlanRepoKeepsLegitimateSHAs is the guard against an over-strict gate:
 // every SHA shape the tree API legitimately carries must pass through the
-// plan unchanged, including the empty (absent) shape and the LFS-spec
-// "sha256:"-prefixed oid.
+// plan unchanged: the empty (absent) shape and canonical 64-hex values in
+// any of the modeled fields (top-level sha256, lfs.sha256, lfs.oid).
 func TestPlanRepoKeepsLegitimateSHAs(t *testing.T) {
 	const hex64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	const hex40 = "a6344aac8c09253b3b630fb776ae94478aa0275b"
 	files := []hfNode{
 		{Type: "file", Path: "config.json", Size: 3},
 		{Type: "file", Path: "model.gguf", Size: 4, Sha256: hex64},
-		{Type: "file", Path: "a.bin", Size: 5, LFS: &hfLfsInfo{Sha256: hex40, Size: 5}},
+		{Type: "file", Path: "a.bin", Size: 5, LFS: &hfLfsInfo{Sha256: hex64, Size: 5}},
 		{Type: "file", Path: "b.bin", Size: 6, LFS: &hfLfsInfo{Oid: hex64, Size: 6}},
-		{Type: "file", Path: "c.bin", Size: 7, LFS: &hfLfsInfo{Oid: "sha256:" + hex64, Size: 7}},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
@@ -153,9 +151,8 @@ func TestPlanRepoKeepsLegitimateSHAs(t *testing.T) {
 	want := map[string]string{
 		"config.json": "",
 		"model.gguf":  hex64,
-		"a.bin":       hex40,
+		"a.bin":       hex64,
 		"b.bin":       hex64,
-		"c.bin":       "sha256:" + hex64,
 	}
 	if len(plan.Items) != len(want) {
 		t.Fatalf("got %d plan items, want %d", len(plan.Items), len(want))
@@ -169,6 +166,70 @@ func TestPlanRepoKeepsLegitimateSHAs(t *testing.T) {
 		if it.SHA256 != w {
 			t.Errorf("item %q SHA256 = %q, want %q (must pass through unchanged)", it.RelativePath, it.SHA256, w)
 		}
+	}
+}
+
+// TestPlanRepoRejectsNonCanonicalSHA is the canonical-form regression test:
+// a tree response whose SHA field carries anything other than empty or 64
+// hex characters must fail the whole plan loudly. The rejected shapes -- a
+// 40-hex git-OID value and an LFS-spec "sha256:"-prefixed oid -- can never
+// match a computed 64-hex digest at verify time, so the previous acceptance
+// only deferred a guaranteed verification failure while writing
+// non-canonical values into tmp-/blobs/ paths.
+func TestPlanRepoRejectsNonCanonicalSHA(t *testing.T) {
+	const hex64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	const hex40 = "a6344aac8c09253b3b630fb776ae94478aa0275b"
+	cases := []struct {
+		name string
+		node hfNode
+		bad  string // offending value the error must identify
+	}{
+		{"top-level sha256 is 40-hex", hfNode{Type: "file", Path: "weights.bin", Size: 10, Sha256: hex40}, hex40},
+		{"lfs sha256 is 40-hex", hfNode{Type: "file", Path: "weights.bin", Size: 10, LFS: &hfLfsInfo{Sha256: hex40, Size: 10}}, hex40},
+		{"lfs oid is 40-hex", hfNode{Type: "file", Path: "weights.bin", Size: 10, LFS: &hfLfsInfo{Oid: hex40, Size: 10}}, hex40},
+		{"lfs oid is sha256-prefixed", hfNode{Type: "file", Path: "weights.bin", Size: 10, LFS: &hfLfsInfo{Oid: "sha256:" + hex64, Size: 10}}, "sha256:" + hex64},
+		{"truncated hex", hfNode{Type: "file", Path: "weights.bin", Size: 10, Sha256: hex64[:63]}, hex64[:63]},
+		{"64 chars but not hex", hfNode{Type: "file", Path: "weights.bin", Size: 10, Sha256: strings.Repeat("g", 64)}, strings.Repeat("g", 64)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{c.node})
+			defer srv.Close()
+			_, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main"}, Settings{Endpoint: srv.URL})
+			if err == nil {
+				t.Fatal("PlanRepo accepted a non-canonical sha256 from the tree API")
+			}
+			if !strings.Contains(err.Error(), "sha256") {
+				t.Errorf("error should identify the sha256 field, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), c.bad) {
+				t.Errorf("error should identify the offending value %q, got: %v", c.bad, err)
+			}
+		})
+	}
+}
+
+// TestPlanRepoLowercasesUppercaseSHA pins the case-handling choice: hex is
+// accepted case-insensitively, but the plan stores the canonical lowercase
+// spelling so path/verify consumers only ever see "" or lowercase hex.
+func TestPlanRepoLowercasesUppercaseSHA(t *testing.T) {
+	const hexUpper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+	const hexLower = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	files := []hfNode{
+		{Type: "file", Path: "a.bin", Size: 5, Sha256: hexUpper},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main"}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo rejected uppercase canonical hex: %v", err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("got %d plan items, want 1", len(plan.Items))
+	}
+	if got := plan.Items[0].SHA256; got != hexLower {
+		t.Errorf("item SHA256 = %q, want lowercase %q", got, hexLower)
 	}
 }
 

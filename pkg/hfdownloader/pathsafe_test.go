@@ -3,7 +3,10 @@
 
 package hfdownloader
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestUnsafeRepoPath(t *testing.T) {
 	cases := []struct {
@@ -41,12 +44,23 @@ func TestUnsafeBlobName(t *testing.T) {
 		sha    string
 		unsafe bool
 	}{
-		// Legitimate SHA shapes must be accepted.
+		// Legitimate SHA shapes must be accepted: the absent hash and the
+		// canonical 64-hex SHA-256 form (either case; the plan lowercases
+		// accepted values before storing them).
 		{"", false},    // absent hash (files without one)
 		{hex64, false}, // lfs.sha256 / lfs.oid / top-level sha256 (plain hex)
-		{"a6344aac8c09253b3b630fb776ae94478aa0275b", false}, // git sha1-style hex
-		{"sha256:" + hex64, false},                          // LFS-spec prefixed oid
-		{"tmp-" + hex64, false},                             // staged-name-like value, still one local component
+		{"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855", false}, // hex, upper case
+
+		// Non-canonical hash shapes must be rejected: only "" or 64 hex
+		// characters may reach paths/verify. A 40-hex git-OID shape or an
+		// LFS-spec "sha256:"-prefixed oid can never match a computed 64-hex
+		// digest, so accepting them would guarantee a later verify failure
+		// plus non-canonical cache entries.
+		{"a6344aac8c09253b3b630fb776ae94478aa0275b", true}, // git sha1-style 40-hex
+		{"sha256:" + hex64, true},                          // LFS-spec prefixed oid
+		{"tmp-" + hex64, true},                             // staged-name-like value
+		{hex64[:63], true},                                 // truncated hex
+		{strings.Repeat("g", 64), true},                    // 64 chars, not hex
 
 		// Traversal / separator / absolute escapes must be rejected.
 		{"..", true},
