@@ -309,6 +309,186 @@ func TestDownloadMultipart_StalledPartRecoversAndAssembles(t *testing.T) {
 	}
 }
 
+// alwaysStallServer responds to every body request by declaring the full
+// length and then delivering no bytes at all, holding the connection open
+// until the client aborts the attempt. Every attempt therefore ends in a
+// stall, which lets tests exhaust the retry budget on stalls alone.
+func alwaysStallServer(t *testing.T, total int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" {
+			var start, end int64
+			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total-1))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.WriteHeader(http.StatusOK)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Deliver nothing further until the client aborts this attempt.
+		<-r.Context().Done()
+	}))
+}
+
+// TestDownloadSingle_StallExhaustedSurfacesStallError verifies the P2
+// contract on the single-file path: when every attempt is killed by the stall
+// watchdog and the retry budget runs out, the caller receives an explicit
+// stall error naming the effective timeout — not the misleading
+// "context canceled" produced by the watchdog's own attempt cancellation.
+// The retry ProgressEvent message must carry the stall wording as well.
+func TestDownloadSingle_StallExhaustedSurfacesStallError(t *testing.T) {
+	tmpDir := t.TempDir()
+	const total = 4_000
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-stallerr")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := alwaysStallServer(t, total)
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "stallerr.bin", URL: srv.URL + "/stallerr.bin", Size: int64(total)}
+	cfg := Settings{
+		Retries:        1, // two attempts, so a retry event must surface too
+		StallTimeout:   "150ms",
+		BackoffInitial: "5ms",
+		BackoffMax:     "10ms",
+	}
+
+	var retryMsgs []string
+	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+		func(ev ProgressEvent) {
+			if ev.Event == "retry" {
+				retryMsgs = append(retryMsgs, ev.Message)
+			}
+		})
+	if err == nil {
+		t.Fatal("expected an error when every attempt stalls")
+	}
+	if !strings.Contains(err.Error(), "transfer stalled") ||
+		!strings.Contains(err.Error(), "no data received") {
+		t.Errorf("error must identify the stall, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "150ms") {
+		t.Errorf("stall error must name the effective timeout, got %q", err.Error())
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("stall failure must not satisfy errors.Is(err, context.Canceled), got %q", err.Error())
+	}
+	var stallErr *StallError
+	if !errors.As(err, &stallErr) {
+		t.Errorf("stall failure must be a StallError, got %T: %q", err, err)
+	} else if stallErr.Timeout != 150*time.Millisecond {
+		t.Errorf("StallError.Timeout = %v, want 150ms", stallErr.Timeout)
+	}
+
+	// The retry event must carry the stall message, not "context canceled".
+	if len(retryMsgs) != 1 {
+		t.Fatalf("expected exactly one retry event, got %d: %v", len(retryMsgs), retryMsgs)
+	}
+	if !strings.Contains(retryMsgs[0], "transfer stalled") {
+		t.Errorf("retry message must carry the stall wording, got %q", retryMsgs[0])
+	}
+	if strings.Contains(retryMsgs[0], "context canceled") {
+		t.Errorf("retry message must not report a cancellation, got %q", retryMsgs[0])
+	}
+}
+
+// TestDownloadMultipart_StalledPartsSurfaceStallError verifies the same
+// contract through the multipart part-error aggregation: when every part's
+// attempts stall, the error drained from errCh must be the explicit stall
+// error, not the attempt context's "context canceled".
+func TestDownloadMultipart_StalledPartsSurfaceStallError(t *testing.T) {
+	tmpDir := t.TempDir()
+	const total = 24_000
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-partstallerr")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := alwaysStallServer(t, total)
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "partstallerr.bin", URL: srv.URL + "/partstallerr.bin", Size: int64(total), AcceptRanges: true}
+	cfg := Settings{
+		Concurrency:    2,
+		Retries:        0, // budget exhausted on the first stalled attempt
+		StallTimeout:   "150ms",
+		BackoffInitial: "5ms",
+		BackoffMax:     "10ms",
+	}
+
+	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	if err == nil {
+		t.Fatal("expected an error when every part stalls")
+	}
+	if !strings.Contains(err.Error(), "transfer stalled") ||
+		!strings.Contains(err.Error(), "no data received") {
+		t.Errorf("error must identify the stall, got %q", err.Error())
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("stall failure must not satisfy errors.Is(err, context.Canceled), got %q", err.Error())
+	}
+	var stallErr *StallError
+	if !errors.As(err, &stallErr) {
+		t.Errorf("stall failure must be a StallError, got %T: %q", err, err)
+	}
+}
+
+// TestDownloadSingle_GenuineCancelNotRelabelledAsStall is the contrast case
+// for classifyStall's precedence rule: when the caller cancels the job
+// context mid-stall while the watchdog has NOT fired, the result keeps the
+// genuine cancellation semantics — context.Canceled, never a StallError.
+func TestDownloadSingle_GenuineCancelNotRelabelledAsStall(t *testing.T) {
+	tmpDir := t.TempDir()
+	const total = 4_000
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-cancelstall")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := alwaysStallServer(t, total)
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "cancelstall.bin", URL: srv.URL + "/cancelstall.bin", Size: int64(total)}
+	cfg := Settings{
+		Retries:        0,
+		StallTimeout:   "5s", // watchdog armed but cannot fire before the cancel
+		BackoffInitial: "5ms",
+		BackoffMax:     "10ms",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("genuine cancellation must keep context.Canceled, got %v", err)
+	}
+	var stallErr *StallError
+	if errors.As(err, &stallErr) {
+		t.Errorf("genuine cancellation must not be relabelled as a stall, got %v", err)
+	}
+}
+
 // TestDownloadSingle_RetryAfterHonored verifies that a 429 with Retry-After: 2
 // makes the downloader wait the server-requested time (not just its local
 // backoff) and then succeed.

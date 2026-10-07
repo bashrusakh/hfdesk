@@ -1149,7 +1149,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					out.Close()
 					return os.Rename(tmp, dst)
 				}
-				lastErr = cerr
+				// If this attempt's stall watchdog fired, the failure is a
+				// stall, not a caller cancellation — classifyStall keeps a
+				// done parent context (genuine cancel) unchanged.
+				lastErr = classifyStall(ctx, body, cerr)
 				// Update pos to current file position so the next retry issues
 				// a Range request for the remaining bytes instead of duplicating.
 				if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
@@ -1434,7 +1437,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					if cerr == nil {
 						return
 					}
-					lastErr = cerr
+					// A fired stall watchdog marks this attempt's failure as
+					// a stall; a done partCtx keeps the genuine-cancel error
+					// (see classifyStall precedence).
+					lastErr = classifyStall(partCtx, body, cerr)
 					// Advance pos by what we actually wrote so the next retry
 					// Range request picks up from the correct offset.
 					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
