@@ -26,6 +26,7 @@
 - Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
 - Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
 - Docker: the README example mounted the host cache to `/root/.cache/huggingface` while the image used `/home/hfdesk/.cache/huggingface`, so the Hugging Face cache was never persisted. Existing users must update their volume mount to `/data` (#61)
+- Contain download destination and cache paths at their join boundaries, require canonical SHA-256 for remote hash values, honor `Retry-After` on size HEAD requests, and report stalled transfers as an explicit stall error instead of `context canceled` (#117)
 
 ## [1.2.2] - 2026-06-29
 
