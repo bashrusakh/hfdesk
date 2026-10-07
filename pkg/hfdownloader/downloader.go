@@ -325,7 +325,11 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Ensure destination root exists (only for legacy mode)
 	// HF cache mode already created directories via repoDir.EnsureDirs()
 	if !useHFCache {
-		if err := os.MkdirAll(destinationBase(job, cfg), 0o755); err != nil {
+		base, err := destinationBase(job, cfg)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(base, 0o755); err != nil {
 			return err
 		}
 	}
@@ -473,7 +477,16 @@ LOOP:
 				dst = safeDst
 			} else {
 				// Legacy mode: flat directory structure
-				base := destinationBase(job, cfg)
+				base, err := destinationBase(job, cfg)
+				if err != nil {
+					fatal := fmt.Errorf("path traversal: %w", err)
+					setFatalErr(fatal)
+					select {
+					case errCh <- fatal:
+					default:
+					}
+					return
+				}
 				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
 				// output directory via path traversal.
 				safeDst, err := SafeJoin(base, finalRel)

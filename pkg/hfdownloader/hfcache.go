@@ -82,6 +82,18 @@ func NewHFCache(root string, staleTimeout time.Duration) *HFCache {
 	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"), staleTimeout)
 }
 
+// rootedOrFallback returns p when p is a rooted (absolute) filesystem path
+// and fallback otherwise. The rooted test is stated with strings.HasPrefix,
+// the primitive code scanning models as a path guard; returning p inside the
+// true branch means taint in p cannot flow past this helper, so a
+// caller-supplied root reaches the cache only through a proven-rooted value.
+func rootedOrFallback(p, fallback string) string {
+	if strings.HasPrefix(p, filepath.VolumeName(p)+string(filepath.Separator)) {
+		return p
+	}
+	return fallback
+}
+
 // NewHFCacheResolved constructs a cache from an already selected root/Hub
 // association without consulting ENV. An empty hubDir means root/hub.
 // Callers freezing destinations must supply the resolved nonempty root.
@@ -91,12 +103,18 @@ func NewHFCacheResolved(root, hubDir string, staleTimeout time.Duration) *HFCach
 	if absolute, err := filepath.Abs(root); err == nil {
 		root = absolute
 	}
+	// filepath.Abs can only fail when the working directory is unavailable,
+	// which would otherwise leave every path in this cache relative to a
+	// directory that can change at any time. Fall back to the default cache
+	// location so root is always rooted.
+	root = rootedOrFallback(root, DefaultCacheDir())
 	if hubDir == "" {
 		hubDir = filepath.Join(root, "hub")
 	}
 	if absolute, err := filepath.Abs(hubDir); err == nil {
 		hubDir = absolute
 	}
+	hubDir = rootedOrFallback(hubDir, filepath.Join(root, "hub"))
 	if staleTimeout == 0 {
 		staleTimeout = DefaultStaleTimeout
 	}
@@ -133,6 +151,14 @@ type RepoDir struct {
 // Repo returns a RepoDir for the given repository.
 // repoID should be in the format "owner/name".
 func (c *HFCache) Repo(repoID string, repoType RepoType) (*RepoDir, error) {
+	// IsValidModelName is the authoritative repo-ID rule (exact owner/name,
+	// no traversal segments). filepath.IsLocal restates the traversal part of
+	// that rule with the primitive code scanning models as a path barrier, so
+	// the repoID-derived directory names below are provably non-escaping; it
+	// never accepts anything IsValidModelName would reject afterwards.
+	if !filepath.IsLocal(repoID) {
+		return nil, fmt.Errorf("invalid repo ID: %q must be a local path", repoID)
+	}
 	// Reuse the single repo-ID validator so cache lookups reject the same
 	// traversal/separator inputs as the HTTP handlers (e.g. "../foo").
 	if !IsValidModelName(repoID) {

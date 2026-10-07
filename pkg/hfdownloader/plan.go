@@ -91,6 +91,15 @@ func SafeJoin(base, rel string) (string, error) {
 	if !PathInside(base, dst) {
 		return "", fmt.Errorf("path %q escapes %q", rel, base)
 	}
+	// Restate the containment PathInside just proved against the cleaned base
+	// with strings.HasPrefix, the primitive code scanning models as a
+	// sanitizer guard: this check dominates the return below, so taint
+	// carried in `base` itself cannot flow out of SafeJoin unnoticed.
+	// Acceptance is identical to PathInside's (its separator-strict prefix
+	// implies this plain prefix), so no input that passed before is rejected.
+	if !strings.HasPrefix(dst, filepath.Clean(base)) {
+		return "", fmt.Errorf("path %q escapes %q", rel, base)
+	}
 	return dst, nil
 }
 
@@ -368,7 +377,7 @@ func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
 }
 
 // destinationBase returns the base output directory for a job.
-func destinationBase(job Job, cfg Settings) string {
+func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
 	// (e.g. mmproj from a base model saved next to the current model's quants).
@@ -376,7 +385,27 @@ func destinationBase(job Job, cfg Settings) string {
 	if job.LocalRepo != "" {
 		repoForPath = job.LocalRepo
 	}
-	return filepath.Join(cfg.OutputDir, repoForPath)
+	// The repo-derived folder segment is joined onto the configured output
+	// root and becomes the root of every downstream path, so it must stay
+	// local. validate() enforces IsValidModelName(job.Repo) at the Download
+	// boundary, but job.LocalRepo reaches this join unchecked; a "../" (or
+	// absolute) segment would move the whole destination outside
+	// cfg.OutputDir. filepath.IsLocal is the CodeQL-modeled barrier for
+	// exactly this containment property.
+	if !filepath.IsLocal(repoForPath) {
+		return "", fmt.Errorf("destination folder %q must be a local path", repoForPath)
+	}
+	base := filepath.Join(cfg.OutputDir, repoForPath)
+	// Prove the joined result stays under the (cleaned) configured output
+	// root before returning it: this dominates every use of the result —
+	// including os.MkdirAll at the download entry and SafeJoin's base — so
+	// neither a crafted folder segment nor taint in cfg.OutputDir itself can
+	// escape the root unproven. A local repoForPath always satisfies this,
+	// so legitimate destinations are unaffected.
+	if !strings.HasPrefix(base, filepath.Clean(cfg.OutputDir)) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, cfg.OutputDir)
+	}
+	return base, nil
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

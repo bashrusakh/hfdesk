@@ -223,6 +223,154 @@ func TestDownloadTraversalSHAStaysInsideCacheRoot(t *testing.T) {
 	}
 }
 
+// TestDestinationBaseRejectsTraversal pins the destination-base contract: the
+// repo-derived folder segment joined onto cfg.OutputDir must be local. job.Repo
+// is validated at the Download boundary, but LocalRepo and direct library
+// callers reach this join unchecked, so a "../" (or absolute) segment would
+// move the whole destination — and every downstream os.* path — outside the
+// configured output root.
+func TestDestinationBaseRejectsTraversal(t *testing.T) {
+	cfg := Settings{OutputDir: filepath.Join("home", "out")}
+	bad := []Job{
+		{Repo: "owner/../../escape"},
+		{Repo: "owner/model", LocalRepo: "../../escape"},
+		{Repo: "owner/model", LocalRepo: ".."},
+		{Repo: "owner/model", LocalRepo: "/abs/escape"},
+	}
+	for _, job := range bad {
+		got, err := destinationBase(job, cfg)
+		if err == nil {
+			t.Errorf("destinationBase(%+v) = %q, want error", job, got)
+		}
+	}
+	good := []struct {
+		job  Job
+		want string
+	}{
+		{Job{Repo: "owner/model"}, filepath.Join("home", "out", "owner", "model")},
+		{Job{Repo: "owner/model", LocalRepo: "vendor/model-a"}, filepath.Join("home", "out", "vendor", "model-a")},
+	}
+	for _, c := range good {
+		got, err := destinationBase(c.job, cfg)
+		if err != nil {
+			t.Errorf("destinationBase(%+v) unexpected error: %v", c.job, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("destinationBase(%+v) = %q, want %q", c.job, got, c.want)
+		}
+	}
+}
+
+// newMockHFFileServer serves the revision, tree, and file endpoints the
+// downloader needs for a single "file.bin" repository, mirroring the other
+// pathsafe end-to-end tests.
+func newMockHFFileServer(t *testing.T, body []byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.Contains(req.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": "commit123"})
+		case strings.Contains(req.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": "file.bin", "size": len(body)}})
+		case strings.Contains(req.URL.Path, "/raw/"), strings.Contains(req.URL.Path, "/resolve/"):
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			if req.Method != http.MethodHead {
+				_, _ = w.Write(body)
+			}
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestDownloadTraversalLocalRepoStaysInsideOutputDir exercises the actual
+// broken contract end to end in flat (local-dir) mode: a job whose LocalRepo
+// override contains traversal segments must fail loudly before any directory
+// or file is created outside the configured output root — previously the
+// override moved destinationBase itself outside the root and the download
+// happily wrote there.
+func TestDownloadTraversalLocalRepoStaysInsideOutputDir(t *testing.T) {
+	srv := newMockHFFileServer(t, []byte("payload"))
+
+	outRoot := filepath.Join(t.TempDir(), "out")
+	canaryRel := "../hfdesk-localrepo-escape-canary"
+	cfg := Settings{OutputDir: outRoot, Endpoint: srv.URL, Concurrency: 1}
+	err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main", LocalRepo: canaryRel}, cfg, nil)
+
+	escaped := filepath.Clean(filepath.Join(outRoot, canaryRel, "file.bin"))
+	if PathInside(outRoot, escaped) {
+		t.Fatalf("test payload does not escape the output root: %q", escaped)
+	}
+	if _, statErr := os.Stat(escaped); statErr == nil {
+		_ = os.Remove(escaped)
+		_ = os.Remove(filepath.Dir(escaped))
+		t.Errorf("file created outside the output root: %q", escaped)
+	}
+	if err == nil {
+		t.Fatal("Download accepted a traversal LocalRepo override")
+	}
+}
+
+// TestDownloadOutputDirTraversalSegmentsStayInsideCleanRoot pins the
+// preserved contract for the output-root leg: an output directory containing
+// ".." segments resolves to its cleaned location, and every file the
+// downloader writes stays inside that cleaned root.
+func TestDownloadOutputDirTraversalSegmentsStayInsideCleanRoot(t *testing.T) {
+	srv := newMockHFFileServer(t, []byte("payload"))
+
+	tmp := t.TempDir()
+	outRoot := filepath.Join(tmp, "a", "..", "b") // cleans to tmp/b
+	cfg := Settings{OutputDir: outRoot, Endpoint: srv.URL, Concurrency: 1}
+	if err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, nil); err != nil {
+		t.Fatalf("Download with traversal-segment output dir failed: %v", err)
+	}
+	cleanRoot := filepath.Clean(outRoot)
+	written := filepath.Join(cleanRoot, "owner", "model", "file.bin")
+	if _, err := os.Stat(written); err != nil {
+		t.Fatalf("expected file under cleaned output root: %v", err)
+	}
+	if !PathInside(cleanRoot, written) {
+		t.Errorf("file %q escaped the cleaned output root %q", written, cleanRoot)
+	}
+}
+
+// TestDownloadCacheDirTraversalSegmentsStaysInsideCleanRoot pins the
+// preserved contract for the cache-root leg: a cache directory containing
+// ".." segments resolves to its cleaned physical root and all cache content
+// stays inside it.
+func TestDownloadCacheDirTraversalSegmentsStaysInsideCleanRoot(t *testing.T) {
+	srv := newMockHFFileServer(t, []byte("payload"))
+
+	tmp := t.TempDir()
+	cacheRoot := filepath.Join(tmp, "c1", "..", "cache") // cleans to tmp/cache
+	cfg := Settings{CacheDir: cacheRoot, Endpoint: srv.URL, Concurrency: 1}
+	if err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, nil); err != nil {
+		t.Fatalf("Download with traversal-segment cache dir failed: %v", err)
+	}
+	cleanRoot := filepath.Clean(cacheRoot)
+	var outside []string
+	if err := filepath.Walk(cleanRoot, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !PathInside(cleanRoot, p) {
+			outside = append(outside, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk cleaned cache root: %v", err)
+	}
+	if len(outside) > 0 {
+		t.Errorf("cache content outside cleaned root: %v", outside)
+	}
+	if _, err := os.Stat(filepath.Join(cleanRoot, "hub")); err != nil {
+		t.Errorf("expected hub dir under cleaned cache root: %v", err)
+	}
+}
+
 func TestIsValidModelNameRejectsTraversal(t *testing.T) {
 	bad := []string{"../foo", "foo/..", "../..", "owner/..", "..\\name", "owner/na\x00me"}
 	for _, b := range bad {
