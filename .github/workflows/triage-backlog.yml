@@ -1,7 +1,8 @@
 name: Backlog Re-triage
 
-# Thin caller shim for the reusable triage master in bashrusakh/.github, pinned at
-# e7add3fbe795d151702f9e13740bf9786aba5a84.
+# Thin caller shim intentionally trusting bashrusakh/.github@main. Central updates
+# (including model/endpoint changes) apply automatically; this is not an immutable pin.
+# Provision TRIAGE_API_KEY for the central provider; forward only this named secret.
 # The contract is read from THIS repository, never from the master: the master resolves this
 # repository's default-branch head, fetches the contract_files below from it, and fails
 # closed before the agent starts when a listed file is missing.
@@ -28,9 +29,9 @@ permissions:
 
 jobs:
   triage:
-    uses: bashrusakh/.github/.github/workflows/triage-backlog.lock.yml@e7add3fbe795d151702f9e13740bf9786aba5a84
+    uses: bashrusakh/.github/.github/workflows/triage-backlog.lock.yml@main
     secrets:
-      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      TRIAGE_API_KEY: ${{ secrets.TRIAGE_API_KEY }}
     with:
       contract_files: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md .github/ISSUE_TEMPLATE/bug_report.yml .github/PULL_REQUEST_TEMPLATE.md .github/labels.yml"
       item_numbers: ${{ github.event.inputs.item_numbers }}
