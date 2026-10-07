@@ -178,9 +178,25 @@ func (r *RepoDir) SnapshotsDir() string {
 	return filepath.Join(r.Path(), "snapshots")
 }
 
+// invalidBlobName is the contained placeholder BlobPath returns when handed a
+// blob name that would escape the blobs directory. It is a fixed string (so a
+// tainted name can never influence the returned path) that cannot collide with
+// real blob names, which are hex digests.
+const invalidBlobName = "invalid-blob-name"
+
 // BlobPath returns the path where a blob with the given SHA256 should be stored.
+// The name is confined to the blobs directory the same way RefPath and
+// SnapshotDir confine theirs: SafeJoin rejects values that are not local
+// (filepath.IsLocal, the CodeQL-modeled path-injection barrier), so no blob
+// name can point outside blobs/. Malformed remote SHAs are already rejected
+// loudly by scanRepo; the placeholder below only covers a direct API misuse
+// because this method cannot return an error without breaking its callers.
 func (r *RepoDir) BlobPath(sha256 string) string {
-	return filepath.Join(r.BlobsDir(), sha256)
+	blobPath, err := SafeJoin(r.BlobsDir(), sha256)
+	if err != nil {
+		return filepath.Join(r.BlobsDir(), invalidBlobName)
+	}
+	return blobPath
 }
 
 // IncompletePath returns the path for an incomplete download.

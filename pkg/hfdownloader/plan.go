@@ -35,6 +35,25 @@ func unsafeRepoPath(rel string) bool {
 	return false
 }
 
+// unsafeBlobName reports whether a SHA256 value taken from the remote tree
+// API is malformed as a blob-name path component. The SHA is remote-controlled
+// (see the unsafeRepoPath rationale above) and is used verbatim as a
+// filesystem name (blobs/<sha> storage and the tmp-<sha> staging file), so a
+// value containing a path separator, an absolute/volume qualification, or one
+// normalising to "." / ".." / a parent would escape the cache root if joined.
+// Empty is a legitimate shape (a file without a hash) and is reported safe
+// here; callers must check for it before using the value as a path.
+func unsafeBlobName(sha string) bool {
+	if sha == "" {
+		return false
+	}
+	if strings.ContainsAny(sha, `/\`) || filepath.IsAbs(sha) || filepath.VolumeName(sha) != "" {
+		return true
+	}
+	cleaned := path.Clean(sha)
+	return cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../")
+}
+
 // PathInside reports whether target resolves to base itself or to a location
 // nested within base. Both paths are cleaned first, so "../" segments are
 // resolved before the comparison. This is the single home for the containment
@@ -59,6 +78,14 @@ func SafeJoin(base, rel string) (string, error) {
 	// letter), hiding what is really an absolute-path input.
 	if filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" {
 		return "", fmt.Errorf("path %q must be relative", rel)
+	}
+	// Reject non-local values ("", "..", escaping segments, and the platform's
+	// reserved names) before joining. filepath.IsLocal is the standard-library
+	// primitive CodeQL models as a go/path-injection sanitizer barrier, so this
+	// check makes the containment below legible to code scanning; the
+	// PathInside check remains the containment proof.
+	if !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("path %q must be local", rel)
 	}
 	dst := filepath.Clean(filepath.Join(base, rel))
 	if !PathInside(base, dst) {
@@ -239,6 +266,16 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			if sha == "" {
 				sha = n.LFS.Oid
 			}
+		}
+
+		// The SHA is remote-controlled too, and unlike n.Path it flows into
+		// filesystem paths verbatim (tmp-<sha> staging, blobs/<sha> storage).
+		// Reject malformed values before they reach the plan, failing the
+		// whole plan rather than silently skipping so a tampered tree is
+		// loud, not partial. Empty is a legitimate shape (files without a
+		// hash) and passes through unchanged.
+		if unsafeBlobName(sha) {
+			return nil, fmt.Errorf("refusing unsafe sha256 from repo tree for %q: %q", rel, sha)
 		}
 
 		// Case-insensitive dedup: filterMatches is intentionally case-insensitive

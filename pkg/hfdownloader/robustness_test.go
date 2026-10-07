@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -355,6 +357,246 @@ func TestDownloadSingle_RetryAfterHonored(t *testing.T) {
 	}
 	if elapsed > 6*time.Second {
 		t.Errorf("waited %v; Retry-After wait should not be inflated/capped oddly", elapsed)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Errorf("final content mismatch")
+	}
+}
+
+// TestDownloadMultipart_HeadRetryAfterHonored verifies that a throttling 429
+// with Retry-After on the multipart size HEAD makes the downloader wait the
+// server-requested time and reissue the HEAD instead of proceeding with the
+// throttled response, and that the download then completes.
+func TestDownloadMultipart_HeadRetryAfterHonored(t *testing.T) {
+	tmpDir := t.TempDir()
+	full := make([]byte, 8192)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-headra")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu    sync.Mutex
+		heads int
+		gets  int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			mu.Lock()
+			heads++
+			n := heads
+			mu.Unlock()
+			if n == 1 {
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		mu.Lock()
+		gets++
+		mu.Unlock()
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		content := full[start : end+1]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(full)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content)
+	}))
+	defer srv.Close()
+
+	// Size starts at 0, so the size can only be resolved by the HEAD after
+	// the throttled first attempt has been waited out and reissued.
+	it := PlanItem{RelativePath: "headra.bin", URL: srv.URL + "/headra.bin", AcceptRanges: true}
+	cfg := Settings{
+		Concurrency:    2,
+		Retries:        2,
+		BackoffInitial: "10ms",
+		BackoffMax:     "20ms",
+		StallTimeout:   "0", // disable the watchdog; this test is about waiting
+	}
+
+	start := time.Now()
+	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 2*time.Second {
+		t.Errorf("waited %v; expected to honor HEAD Retry-After: 2 (>=2s)", elapsed)
+	}
+	if elapsed > 6*time.Second {
+		t.Errorf("waited %v; HEAD Retry-After wait should not be inflated/capped oddly", elapsed)
+	}
+	mu.Lock()
+	h, g := heads, gets
+	mu.Unlock()
+	if h != 2 {
+		t.Errorf("issued %d HEADs; want 2 (throttled, waited, reissued)", h)
+	}
+	if g == 0 {
+		t.Errorf("no part requests observed; download did not proceed after the retried HEAD")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Errorf("final content mismatch")
+	}
+}
+
+// TestDownloadMultipart_HeadThrottledBudgetExhausted verifies that when the
+// multipart size HEAD stays throttled (429) beyond the configured retry
+// budget, the transient error is surfaced and no part requests are issued —
+// a throttled response is never silently accepted as a resolved HEAD.
+func TestDownloadMultipart_HeadThrottledBudgetExhausted(t *testing.T) {
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-headthr")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu    sync.Mutex
+		heads int
+		gets  int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			mu.Lock()
+			heads++
+			mu.Unlock()
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		mu.Lock()
+		gets++
+		mu.Unlock()
+		http.Error(w, "unexpected part request", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "headthr.bin", URL: srv.URL + "/headthr.bin", Size: 8192, AcceptRanges: true}
+	cfg := Settings{
+		Concurrency:    2,
+		Retries:        2,
+		BackoffInitial: "10ms",
+		BackoffMax:     "20ms",
+		StallTimeout:   "0",
+	}
+
+	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Errorf("error = %v, want ErrRateLimited (the exhausted transient error)", err)
+	}
+	mu.Lock()
+	h, g := heads, gets
+	mu.Unlock()
+	if h != 3 {
+		t.Errorf("issued %d HEADs; want 3 (initial attempt + Retries=2, bounded)", h)
+	}
+	if g != 0 {
+		t.Errorf("issued %d part requests despite an unresolved throttled HEAD; want 0", g)
+	}
+}
+
+// headCloseTracker records when the downloader closes a HEAD response body,
+// so the test can prove the body is released before the transfer starts.
+type headCloseTracker struct {
+	base   http.RoundTripper
+	mu     sync.Mutex
+	closed bool
+}
+
+func (t *headCloseTracker) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || req.Method != http.MethodHead {
+		return resp, err
+	}
+	resp.Body = &closeTrackingBody{ReadCloser: resp.Body, tracker: t}
+	return resp, nil
+}
+
+func (t *headCloseTracker) isClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+type closeTrackingBody struct {
+	io.ReadCloser
+	tracker *headCloseTracker
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.tracker.mu.Lock()
+	b.tracker.closed = true
+	b.tracker.mu.Unlock()
+	return b.ReadCloser.Close()
+}
+
+// TestDownloadMultipart_HeadBodyClosedBeforeTransfer verifies the multipart
+// size HEAD response body is closed as soon as its headers are consumed,
+// before the parallel transfer work begins — not when downloadMultipart
+// returns (which would hold that connection open for the whole download).
+func TestDownloadMultipart_HeadBodyClosedBeforeTransfer(t *testing.T) {
+	tmpDir := t.TempDir()
+	full := make([]byte, 4096)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-headclose")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := &headCloseTracker{base: http.DefaultTransport}
+	httpc := &http.Client{Transport: tracker}
+
+	var closedWhenFirstGET atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		closedWhenFirstGET.Store(tracker.isClosed())
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		content := full[start : end+1]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(full)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content)
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "headclose.bin", URL: srv.URL + "/headclose.bin", Size: int64(len(full)), AcceptRanges: true}
+	cfg := Settings{Concurrency: 2, Retries: 2, StallTimeout: "0"}
+
+	if err := downloadMultipart(context.Background(), httpc, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	if !closedWhenFirstGET.Load() {
+		t.Error("HEAD response body was still open when the first part request started")
 	}
 	got, err := os.ReadFile(dst)
 	if err != nil {

@@ -455,7 +455,22 @@ LOOP:
 					// Fallback: sanitize path to avoid collisions
 					tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
 				}
-				dst = filepath.Join(repoDir.BlobsDir(), tmpName)
+				// Guard: SafeJoin so the remote-controlled temp name (SHA256
+				// or path-derived) cannot escape the blobs directory — the
+				// same containment the legacy branch applies to finalRel.
+				// SafeJoin's filepath.IsLocal check also makes this barrier
+				// visible to CodeQL's go/path-injection analysis.
+				safeDst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
+				if err != nil {
+					fatal := fmt.Errorf("path traversal: %q would escape blobs directory", tmpName)
+					setFatalErr(fatal)
+					select {
+					case errCh <- fatal:
+					default:
+					}
+					return
+				}
+				dst = safeDst
 			} else {
 				// Legacy mode: flat directory structure
 				base := destinationBase(job, cfg)
@@ -571,9 +586,14 @@ LOOP:
 			} else if cfg.Verify == "sha256" {
 				_, remoteSha, herr := headForETag(fileCtx, httpc, cfg.Token, itForIO)
 				if herr != nil {
-					// A permanent 401/403 (or cancellation) must fail the whole
-					// job fast with the ORIGINAL error. Absent optional metadata
-					// is not an error, so the ordinary miss path falls through.
+					// headForETag maps every non-2xx status (401/403
+					// included) to an optional-metadata miss with no error,
+					// so the ordinary miss path falls through and the actual
+					// file request stays authoritative. Only a genuine
+					// caller cancellation surfaces here, and it must fail
+					// this file promptly instead of pretending verification
+					// succeeded; a fail-fast status error, should one ever
+					// surface, is escalated job-fatal below.
 					if isFailFastError(herr) {
 						setFatalErr(fmt.Errorf("verify head %s: %w", finalRel, herr))
 					}
@@ -722,8 +742,11 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
 	}
-	// dst is already guarded by SafeJoin for local mode and SHA256/BlobsDir
-	// derivation for HF cache mode upstream in Download().
+	// dst is derived upstream in Download() through SafeJoin in both modes:
+	// legacy mode joins the remote file path to the output directory, and HF
+	// cache mode joins the tmp-<sha> name to the blobs directory. SafeJoin
+	// rejects non-local values via filepath.IsLocal and proves containment
+	// with PathInside, so dst cannot name a file outside those roots.
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
@@ -813,8 +836,10 @@ func pathWithinRoot(root, path string) bool {
 // file at dst. The downloader normally writes partial bytes to
 // dst+".part" / dst+".part-NN" first, then renames assembled bytes to
 // dst before StoreDownloadedFile moves them into the final blob. dst is
-// already validated as residing inside the blobs dir at allocation time
-// in Download().
+// allocated in Download() via SafeJoin(blobsDir, tmpName), which rejects
+// non-local values (filepath.IsLocal) and proves containment with
+// PathInside, and scanRepo rejects malformed remote SHAs before they can
+// become a tmpName at all.
 func removeHFCacheTemp(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
@@ -1183,29 +1208,69 @@ func removeEmptyPartialFile(path string) {
 
 // downloadMultipart downloads a file using multiple parallel range requests.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
-	// HEAD to resolve size
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
-	addAuth(req, token)
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return err
+	// HEAD to resolve size, reissued only when the server throttles (429/503)
+	// and bounded by the same attempt/backoff conventions as the transfer
+	// loops: wait the larger of the server-requested Retry-After and the
+	// local backoff (capped at DefaultMaxRetryAfter) with a context-aware
+	// sleep so pause/cancel/shutdown stays prompt, then reissue the HEAD
+	// within the configured retry budget.
+	retry := newRetry(cfg)
+	remaining := cfg.Retries
+	if remaining < 0 {
+		remaining = 0
 	}
-	defer resp.Body.Close()
+	attempt := 0
+	for {
+		req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
+		addAuth(req, token)
+		resp, err := httpc.Do(req)
+		if err != nil {
+			return err
+		}
+		// A HEAD response carries headers only, so its body is closed
+		// immediately instead of being held open (via defer) for the whole
+		// parallel transfer. Status and headers stay readable after Close
+		// for the classification and size resolution below.
+		resp.Body.Close()
 
-	// A permanent gated/private/missing response on HEAD fails the whole job
-	// immediately with the actionable message, before any part requests are
-	// issued. Non-permanent statuses keep the previous behavior (proceed and
-	// let the part loop classify them).
-	if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil && apiErr.IsFailFast() {
-		removeEmptyPartialFile(dst + ".part")
-		return apiErr
-	}
+		apiErr := classifyFileResponse(resp, it.URL)
 
-	if it.Size == 0 {
-		if clen := resp.Header.Get("Content-Length"); clen != "" {
-			var n int64
-			fmt.Sscan(clen, &n)
-			it.Size = n
+		// A permanent gated/private/missing response on HEAD fails the whole
+		// job immediately with the actionable message, before any part
+		// requests are issued.
+		if apiErr != nil && apiErr.IsFailFast() {
+			removeEmptyPartialFile(dst + ".part")
+			return apiErr
+		}
+
+		// A throttling 429/503 must not be accepted as the resolved HEAD.
+		// Every other status keeps the previous behavior (proceed and let
+		// the part loop classify it).
+		if resp.StatusCode != http.StatusTooManyRequests &&
+			resp.StatusCode != http.StatusServiceUnavailable {
+			if it.Size == 0 {
+				if clen := resp.Header.Get("Content-Length"); clen != "" {
+					var n int64
+					fmt.Sscan(clen, &n)
+					it.Size = n
+				}
+			}
+			break
+		}
+
+		// Throttled: wait out the server-requested Retry-After (or the local
+		// backoff, whichever is larger) and reissue the HEAD. When the retry
+		// budget is exhausted, surface the transient error like an exhausted
+		// transfer retry instead of silently proceeding with a throttled
+		// response.
+		if remaining == 0 {
+			return apiErr
+		}
+		remaining--
+		attempt++
+		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: apiErr.Error()})
+		if d := NextRetryWait(resp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
+			return ctx.Err()
 		}
 	}
 	if it.Size == 0 {
