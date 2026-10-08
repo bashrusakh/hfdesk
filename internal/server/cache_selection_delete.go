@@ -18,7 +18,6 @@ import (
 
 type jobWriteActivity struct {
 	job       *Job
-	base      string
 	planned   map[string]struct{}
 	planKnown bool
 }
@@ -149,23 +148,44 @@ func mutationDirectoryIdentity(name string) (string, error) {
 
 func jobMayWriteSelectedPath(job *Job, target string) bool {
 	base := jobDestinationBase(job)
+	targetIdentity, targetErr := mutationEntryIdentity(target)
+	if targetErr != nil {
+		return true
+	}
 	if base == "" {
 		return true
 	}
-	baseIdentity, baseErr := mutationDirectoryIdentity(base)
-	targetIdentity, targetErr := mutationEntryIdentity(target)
-	if baseErr != nil || targetErr != nil {
+	if pathWithinWriterBase(base, targetIdentity) {
+		// Canonical directory names prove physical overlap, not the raw remote path
+		// spelling used by PlanRepo's path-based excludes. The basename is invariant
+		// across parent aliases, so it is safe for a negative filter decision; a
+		// directory-only exclude may conservatively classify this as a writer.
+		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
+	}
+	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
+		// Until the plan completes, its resolved commit and remote paths are
+		// unknown. Keep the frozen repository snapshots subtree reserved, but use
+		// only the basename for sound negative GGUF/filter decisions.
+		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
+	}
+	return false
+}
+
+func pathWithinWriterBase(base, targetIdentity string) bool {
+	baseIdentity, err := mutationDirectoryIdentity(base)
+	if err != nil {
 		return true
 	}
 	rel, err := filepath.Rel(baseIdentity, targetIdentity)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func jobSnapshotBase(job *Job) string {
+	repoPath := hfJobRepoPath(job)
+	if repoPath == "" {
+		return ""
 	}
-	// Canonical directory names prove physical overlap, not the raw remote path
-	// spelling used by PlanRepo's path-based excludes. The basename is invariant
-	// across parent aliases, so it is safe for a negative filter decision; a
-	// directory-only exclude may conservatively classify this as a writer.
-	return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
+	return filepath.Join(repoPath, "snapshots")
 }
 
 func sameMutationPath(a, b string) bool {
@@ -289,8 +309,16 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 }
 
 func hfJobRepoPath(job *Job) string {
-	if job == nil || job.Flat || job.LocalDir != "" {
+	repo, err := hfJobRepoDir(job)
+	if err != nil {
 		return ""
+	}
+	return repo.Path()
+}
+
+func hfJobRepoDir(job *Job) (*hfdownloader.RepoDir, error) {
+	if job == nil || job.Flat || job.LocalDir != "" {
+		return nil, fmt.Errorf("job does not use HF cache storage")
 	}
 	hub := job.HubDir
 	if hub == "" {
@@ -307,9 +335,43 @@ func hfJobRepoPath(job *Job) string {
 	cache := hfdownloader.NewHFCacheResolved(job.OutputDir, hub, 0)
 	repo, err := cache.Repo(repoID, repoType)
 	if err != nil {
-		return ""
+		return nil, err
 	}
-	return repo.Path()
+	return repo, nil
+}
+
+func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
+	if len(plan.Items) == 0 {
+		return nil, true
+	}
+	base := jobDestinationBase(job)
+	if base == "" {
+		return nil, false
+	}
+	var repo *hfdownloader.RepoDir
+	if !job.Flat && job.LocalDir == "" {
+		var err error
+		repo, err = hfJobRepoDir(job)
+		if err != nil {
+			return nil, false
+		}
+	}
+	entries := make([]string, 0, len(plan.Items)*2)
+	for _, item := range plan.Items {
+		friendly, err := hfdownloader.SafeJoin(base, item.RelativePath)
+		if err != nil {
+			return nil, false
+		}
+		entries = append(entries, friendly)
+		if repo != nil {
+			snapshot, err := repo.SnapshotPath(plan.Commit, item.RelativePath)
+			if err != nil {
+				return nil, false
+			}
+			entries = append(entries, snapshot)
+		}
+	}
+	return entries, true
 }
 
 func hfReservationConflictsJob(scopes []string, job *Job) bool {
@@ -485,7 +547,7 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	}
 	m.nextWriteID++
 	id := m.nextWriteID
-	m.runActivities[id] = &jobWriteActivity{job: job, base: jobDestinationBase(job), planned: make(map[string]struct{})}
+	m.runActivities[id] = &jobWriteActivity{job: job, planned: make(map[string]struct{})}
 	return id
 }
 
@@ -682,7 +744,12 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		for _, member := range fresh.Members {
 			entries = append(entries, hfdownloader.SelectedGGUFEntry{Path: member.Path, Versions: member.Versions})
 		}
-		result := rd.DeleteSelectedGGUF(entries, configuredHFProtectedRoots(cfg, rd)...)
+		protectedRoots, protectionComplete := configuredHFProtectedRoots(cfg, rd)
+		if !protectionComplete {
+			writeError(w, http.StatusConflict, "Location could not be verified", "A configured local root could not be safely resolved against HF storage")
+			return
+		}
+		result := rd.DeleteSelectedGGUF(entries, protectedRoots...)
 		retained := make([]string, 0, len(result.RetainedBlobs))
 		for _, blob := range result.RetainedBlobs {
 			retained = append(retained, filepath.Base(blob))

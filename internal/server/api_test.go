@@ -568,6 +568,27 @@ func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
 	}
 }
 
+func TestLocalCacheRoot_ExcludesRegisteredDescendantAlias(t *testing.T) {
+	outer := t.TempDir()
+	child := filepath.Join(outer, "owner", "model", "library")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "registered-library")
+	if err := os.Symlink(child, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	root := localCacheRoot{Path: outer}
+	got := root.excludedSubroots([]localCacheRoot{root, {Path: alias}})
+	want := []string{child}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("aliased configured descendant boundaries=%v, want %v", got, want)
+	}
+}
+
 func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	cacheDir := t.TempDir()
 	localDir := t.TempDir()

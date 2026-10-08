@@ -279,6 +279,13 @@ type Settings struct {
 	// path; OnPartialFile is for callers that need per-job scoping
 	// after the run ends (e.g. the server's pause → cancel cleanup).
 	OnPartialFile func(dst string, finalize bool)
+
+	// OnPlanComplete is called once after the repository plan has been
+	// successfully built and before any planned file is skipped or modified.
+	// The callback receives an independent copy, including the resolved commit
+	// used for snapshot paths. It is intended for callers that must reserve the
+	// concrete destinations for the full plan lifecycle.
+	OnPlanComplete func(plan Plan)
 }
 
 // ProgressEvent represents a progress update during download.

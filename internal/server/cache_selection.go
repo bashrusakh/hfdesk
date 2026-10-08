@@ -267,53 +267,73 @@ func hfSelectionFiles(rd *hfdownloader.RepoDir, protectedRoots []string) ([]cach
 
 // configuredHFProtectedRoots maps explicit configured local roots that fall
 // inside this repository's snapshot or friendly tree to lexical walk boundaries.
-// The implicit cache and models roots are deliberately not included.
-func configuredHFProtectedRoots(cfg Config, rd *hfdownloader.RepoDir) []string {
+// The implicit cache and models roots are deliberately not included. A false
+// completeness result means at least one configured root's identity could not
+// be established, so HF deletion must be refused even though known boundaries
+// remain available for best-effort listing.
+func configuredHFProtectedRoots(cfg Config, rd *hfdownloader.RepoDir) ([]string, bool) {
 	configured := append([]string(nil), cfg.LocalScanDirs...)
 	configured = append(configured, cfg.LocalDir)
 	configured = append(configured, routeDirs(cfg.DownloadRoutes)...)
+	type protectedTree struct {
+		lexical  string
+		physical string
+	}
+	trees := make([]protectedTree, 0, 2)
+	complete := true
+	for _, tree := range []string{rd.SnapshotsDir(), rd.FriendlyPath()} {
+		lexical, physical, ok := configuredRootIdentity(tree)
+		if !ok {
+			complete = false
+			continue
+		}
+		trees = append(trees, protectedTree{lexical: lexical, physical: physical})
+	}
 	var protected []string
 	seen := map[string]bool{}
+	add := func(boundary string) {
+		key := pathIdentityKey(filepath.Clean(boundary))
+		if !seen[key] {
+			seen[key] = true
+			protected = append(protected, key)
+		}
+	}
 	for _, root := range configured {
 		if root == "" {
 			continue
 		}
-		rootAbs, err := filepath.Abs(filepath.Clean(root))
-		if err != nil {
+		rootLexical, rootPhysical, rootOK := configuredRootIdentity(root)
+		if !rootOK {
+			complete = false
+			// Preserve a provable lexical boundary for best-effort display. If the
+			// configured alias is lexically elsewhere, its physical relationship
+			// cannot be inferred and deletion remains disabled by complete=false.
+			if rootLexical != "" {
+				for _, tree := range trees {
+					if withinLocalRoot(tree.lexical, rootLexical) {
+						add(rootLexical)
+					}
+				}
+			}
 			continue
 		}
-		rootPhysical := rootAbs
-		if resolved, e := filepath.EvalSymlinks(rootAbs); e == nil {
-			rootPhysical = resolved
-		}
-		for _, tree := range []string{rd.SnapshotsDir(), rd.FriendlyPath()} {
-			treeAbs, e := filepath.Abs(filepath.Clean(tree))
-			if e != nil {
+		for _, tree := range trees {
+			if rootPhysical != tree.physical && !withinLocalRoot(tree.physical, rootPhysical) {
 				continue
 			}
-			treePhysical := treeAbs
-			if resolved, e := filepath.EvalSymlinks(treeAbs); e == nil {
-				treePhysical = resolved
-			}
-			if pathIdentityKey(rootPhysical) != pathIdentityKey(treePhysical) && !withinLocalRoot(pathIdentityKey(treePhysical), pathIdentityKey(rootPhysical)) {
+			rel, err := filepath.Rel(tree.physical, rootPhysical)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+				complete = false
 				continue
 			}
-			rel, e := filepath.Rel(treePhysical, rootPhysical)
-			if e != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-				continue
-			}
-			boundary := treeAbs
+			boundary := tree.lexical
 			if rel != "." {
-				boundary = filepath.Join(treeAbs, rel)
+				boundary = filepath.Join(tree.lexical, rel)
 			}
-			key := pathIdentityKey(boundary)
-			if !seen[key] {
-				seen[key] = true
-				protected = append(protected, boundary)
-			}
+			add(boundary)
 		}
 	}
-	return protected
+	return protected, complete
 }
 
 func hfDeletionScopeWarning(rd *hfdownloader.RepoDir) string {
@@ -471,7 +491,14 @@ func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
 			locations = append(locations, cacheSelectionLocation{ID: id, Source: root.Source, Path: dir, Warning: "Could not inspect this configured location: " + err.Error(), DeleteReason: "Configured location could not be inspected", kind: "local"})
 			continue
 		}
-		files, warning := localSelectionFiles(dir, root.excludedSubroots(roots))
+		excluded, boundariesComplete := root.excludedSubrootsWithStatus(roots)
+		files, warning := localSelectionFiles(dir, excluded)
+		if !boundariesComplete {
+			if warning != "" {
+				warning += "; "
+			}
+			warning += "A configured scan-root boundary could not be safely resolved"
+		}
 		groups := makeSelectionGroups(id, files)
 		for i := range groups {
 			groups[i].CanDelete = allowed && warning == ""
@@ -490,8 +517,14 @@ func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
 	if rd, err := cache.Repo(repo, hfdownloader.RepoTypeModel); err == nil {
 		id := "hf-" + selectionHash(filepath.Clean(cache.HubDir()), repo, "model")
 		if info, statErr := os.Stat(rd.Path()); statErr == nil && info.IsDir() {
-			protectedRoots := configuredHFProtectedRoots(cfg, rd)
+			protectedRoots, protectionComplete := configuredHFProtectedRoots(cfg, rd)
 			files, warning := hfSelectionFiles(rd, protectedRoots)
+			if !protectionComplete {
+				if warning != "" {
+					warning += "; "
+				}
+				warning += "A configured local root could not be safely resolved against HF storage"
+			}
 			if scopeWarning := hfDeletionScopeWarning(rd); scopeWarning != "" {
 				if warning != "" {
 					warning += "; "

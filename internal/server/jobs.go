@@ -1418,22 +1418,32 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		settings.CacheDir = ""
 		settings.HubDir = ""
 	}
+	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
+		paths, complete := jobPlannedWriteEntries(job, plan)
+		m.mu.Lock()
+		if activity := m.runActivities[activityID]; activity != nil {
+			if complete {
+				activity.planned = make(map[string]struct{}, len(paths))
+				for _, planned := range paths {
+					if absolute, err := filepath.Abs(filepath.Clean(planned)); err == nil {
+						activity.planned[pathIdentityKey(absolute)] = struct{}{}
+					} else {
+						complete = false
+						break
+					}
+				}
+			}
+			activity.planKnown = complete
+			if !complete {
+				activity.planned = make(map[string]struct{})
+			}
+		}
+		m.mu.Unlock()
+	}
 
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
 		m.mu.Lock()
-		if activity := m.runActivities[activityID]; activity != nil {
-			switch evt.Event {
-			case "plan_item":
-				planned := filepath.Clean(filepath.Join(activity.base, filepath.FromSlash(evt.Path)))
-				if absolute, err := filepath.Abs(planned); err == nil {
-					activity.planned[pathIdentityKey(absolute)] = struct{}{}
-				}
-			case "file_start", "file_done", "finalizing", "done":
-				// Download emits every plan_item before starting any file work.
-				activity.planKnown = true
-			}
-		}
 		applyJobProgress(job, evt, time.Now())
 		progressSnap := m.cloneJobLocked(job)
 		m.mu.Unlock() // Unlock BEFORE notifying to avoid deadlock

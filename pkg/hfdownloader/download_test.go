@@ -126,6 +126,35 @@ func TestSettings_WithValues(t *testing.T) {
 	}
 }
 
+func TestDownloadPlanCompleteCallbackIncludesEmptyPlan(t *testing.T) {
+	srv := mockHFServerForPlan(t, nil)
+	defer srv.Close()
+	var called bool
+	var completed Plan
+	var planItems int
+	err := Download(context.Background(), Job{Repo: "owner/repo", Revision: "main"}, Settings{
+		CacheDir: filepath.Join(t.TempDir(), "cache"),
+		Endpoint: srv.URL,
+		OnPlanComplete: func(plan Plan) {
+			called = true
+			completed = plan
+		},
+	}, func(event ProgressEvent) {
+		if event.Event == "plan_item" {
+			planItems++
+		}
+	})
+	if err != nil {
+		t.Fatalf("Download with empty repository plan: %v", err)
+	}
+	if !called || completed.Commit != "deadbeef" || len(completed.Items) != 0 {
+		t.Fatalf("completion callback plan=%+v called=%t, want resolved empty plan", completed, called)
+	}
+	if planItems != 0 {
+		t.Fatalf("empty plan emitted %d plan_item events", planItems)
+	}
+}
+
 func TestProgressEvent_Types(t *testing.T) {
 	events := []ProgressEvent{
 		{Event: "scan_start", Message: "Starting scan"},

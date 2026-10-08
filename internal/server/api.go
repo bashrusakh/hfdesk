@@ -908,26 +908,96 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 	return roots
 }
 
-// excludedSubroots keeps all scan roots, but gives each configured descendant
-// exclusive ownership of its subtree. Absolute lexical keys also handle mixed
-// relative/absolute configuration without resolving symlinks.
-func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
-	rootPath, err := filepath.Abs(root.Path)
+// configuredRootIdentity resolves an existing configured directory through
+// symlinks. For an ordinary missing suffix, it resolves the nearest existing
+// directory and reconstructs the absent components so adding a missing scan
+// root does not make unrelated selections unavailable.
+func configuredRootIdentity(name string) (lexical, physical string, ok bool) {
+	lexical, err := filepath.Abs(filepath.Clean(name))
 	if err != nil {
-		return nil
+		return "", "", false
 	}
-	rootKey := pathIdentityKey(rootPath)
+	missing := []string{}
+	for current := lexical; ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink == 0 && !info.IsDir() {
+				return lexical, "", false
+			}
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil {
+				return lexical, "", false
+			}
+			target, targetErr := os.Stat(current)
+			if targetErr != nil || !target.IsDir() {
+				return lexical, "", false
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return pathIdentityKey(lexical), pathIdentityKey(filepath.Clean(resolved)), true
+		}
+		if !os.IsNotExist(statErr) {
+			return lexical, "", false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return lexical, "", false
+		}
+		missing = append(missing, filepath.Base(current))
+	}
+}
+
+// excludedSubrootsWithStatus projects every known descendant boundary into
+// the walker's lexical root namespace. Walking remains lexical (Walk does not
+// follow symlinked directories), while overlap ownership is established from
+// resolved configured directory identities.
+func (root localCacheRoot) excludedSubrootsWithStatus(roots []localCacheRoot) ([]string, bool) {
+	rootLexical, rootPhysical, rootOK := configuredRootIdentity(root.Path)
+	if !rootOK {
+		return nil, false
+	}
 	var excluded []string
+	seen := make(map[string]bool)
+	complete := true
+	add := func(candidate string) {
+		key := pathIdentityKey(filepath.Clean(candidate))
+		if !seen[key] {
+			seen[key] = true
+			excluded = append(excluded, key)
+		}
+	}
 	for _, candidate := range roots {
-		candidatePath, err := filepath.Abs(candidate.Path)
-		if err != nil {
+		candidateLexical, candidatePhysical, candidateOK := configuredRootIdentity(candidate.Path)
+		if !candidateOK {
+			complete = false
+			// Keep any provable lexical boundary for best-effort reads, but do not
+			// claim that an unresolved configured root is physically disjoint.
+			if abs, err := filepath.Abs(filepath.Clean(candidate.Path)); err == nil &&
+				pathIdentityKey(abs) != rootLexical && withinLocalRoot(rootLexical, pathIdentityKey(abs)) {
+				add(abs)
+			}
 			continue
 		}
-		candidateKey := pathIdentityKey(candidatePath)
-		if candidateKey != rootKey && withinLocalRoot(rootKey, candidateKey) {
-			excluded = append(excluded, candidateKey)
+		if candidateLexical != rootLexical && withinLocalRoot(rootLexical, candidateLexical) {
+			add(candidateLexical)
+		}
+		if candidatePhysical != rootPhysical && withinLocalRoot(rootPhysical, candidatePhysical) {
+			rel, err := filepath.Rel(rootPhysical, candidatePhysical)
+			if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				complete = false
+				continue
+			}
+			add(filepath.Join(rootLexical, rel))
 		}
 	}
+	return excluded, complete
+}
+
+// excludedSubroots is the best-effort boundary view used by metadata and
+// qualification scans. Selected deletion also consumes the completeness bit.
+func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
+	excluded, _ := root.excludedSubrootsWithStatus(roots)
 	return excluded
 }
 
@@ -1607,7 +1677,10 @@ type RebuildResponse struct {
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	release, ok := s.jobs.beginCacheMutation(filepath.Join(cfg.cacheRoot(), "models"))
+	release, ok := s.jobs.beginCacheMutation(
+		filepath.Join(cfg.cacheRoot(), "models"),
+		filepath.Join(cfg.cacheRoot(), "datasets"),
+	)
 	if !ok {
 		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
 		return
