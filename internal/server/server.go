@@ -258,10 +258,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
 	s.httpServer = &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        addr,
+		Handler:     handler,
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout arms a write deadline (now + WriteTimeout) when each
+		// request's headers are read, so it bounds handler compute plus the
+		// response write. The synchronous analyze/plan-preview handlers grant
+		// themselves 60s; this must stay above that budget (plus margin) or a
+		// complete result is computed but the response is cut off. A walk that
+		// exceeds the handler budget still fails loudly via its own context.
+		WriteTimeout: 70 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 	listener, err := net.Listen("tcp", addr)

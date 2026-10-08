@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
 const defaultEndpoint = "https://huggingface.co"
@@ -248,62 +250,63 @@ func (a *Analyzer) fetchFileTree(ctx context.Context, repo string, isDataset boo
 	return files, commit, err
 }
 
-// walkTree recursively walks the repository tree. When commitOut is non-nil
-// and still empty, the resolved commit SHA is captured from the X-Repo-Commit
-// response header that HuggingFace returns for the requested revision.
+// walkTree walks the repository tree through the shared hubtree walker
+// (issue #96): recursive=true with Link rel="next" pagination, per-directory
+// fallback for mirrors that ignore recursive, bounded malformed listings,
+// and bounded Retry-After/RateLimit-aware retries of 429/5xx/network errors.
+// When commitOut is non-nil and still empty, the resolved commit SHA is
+// captured from the X-Repo-Commit response header that HuggingFace returns
+// for the requested revision — from the first response that carries it, as
+// before. Terminal statuses fail immediately with the historical error
+// messages below.
 func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, revision, prefix string, commitOut *string, fn func(hfTreeNode) error) error {
-	reqURL := a.treeURL(repo, isDataset, revision, prefix)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return err
-	}
-	a.addAuth(req)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Capture the resolved commit from the first response that carries it.
-	if commitOut != nil && *commitOut == "" {
-		if c := resp.Header.Get("X-Repo-Commit"); c != "" {
-			*commitOut = c
-		}
-	}
-
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("unauthorized: repo requires token or you do not have access")
-	}
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("forbidden: please accept the repository terms at %s", a.repoURL(repo, isDataset))
-	}
-	if resp.StatusCode == 404 {
-		return fmt.Errorf("repository not found: %s", repo)
-	}
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("API error: %s", resp.Status)
-	}
-
-	var nodes []hfTreeNode
-	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	for _, n := range nodes {
-		switch n.Type {
-		case "directory", "tree":
-			if err := a.walkTree(ctx, repo, isDataset, revision, n.Path, commitOut, fn); err != nil {
-				return err
+	w := &hubtree.Walker{
+		TreeURL: func(p string) string {
+			return a.treeURL(repo, isDataset, revision, p)
+		},
+		Token:     a.token,
+		UserAgent: "hfdownloader/3",
+		Client:    a.client,
+		StatusErr: func(resp *http.Response) error {
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
+				return fmt.Errorf("unauthorized: repo requires token or you do not have access")
+			case http.StatusForbidden:
+				return fmt.Errorf("forbidden: please accept the repository terms at %s", a.repoURL(repo, isDataset))
+			case http.StatusNotFound:
+				return fmt.Errorf("repository not found: %s", repo)
+			default:
+				return fmt.Errorf("API error: %s", resp.Status)
 			}
-		default:
-			if err := fn(n); err != nil {
-				return err
+		},
+		DecodeErr: func(err error) error {
+			return fmt.Errorf("decode response: %w", err)
+		},
+		OnResponse: func(resp *http.Response) {
+			if commitOut != nil && *commitOut == "" {
+				if c := resp.Header.Get("X-Repo-Commit"); c != "" {
+					*commitOut = c
+				}
 			}
-		}
+		},
 	}
-	return nil
+	return w.Walk(ctx, prefix, func(n hubtree.Node) error {
+		return fn(toTreeNode(n))
+	})
+}
+
+// toTreeNode converts a shared hubtree node to the analyzer's node type
+// without losing any field.
+func toTreeNode(n hubtree.Node) hfTreeNode {
+	out := hfTreeNode{Type: n.Type, Path: n.Path, Size: n.Size}
+	if n.LFS != nil {
+		out.LFS = &struct {
+			Size   int64  `json:"size,omitempty"`
+			SHA256 string `json:"sha256,omitempty"`
+			OID    string `json:"oid,omitempty"`
+		}{Size: n.LFS.Size, SHA256: n.LFS.Sha256, OID: n.LFS.Oid}
+	}
+	return out
 }
 
 // treeURL builds the tree API URL.
@@ -343,8 +346,8 @@ type hfRefsResponse struct {
 }
 
 type hfRef struct {
-	Name      string `json:"name"`
-	Ref       string `json:"ref"`
+	Name         string `json:"name"`
+	Ref          string `json:"ref"`
 	TargetCommit string `json:"targetCommit"`
 }
 
