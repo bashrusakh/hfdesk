@@ -15,6 +15,132 @@ import (
 	"testing"
 )
 
+// Both production namespaces must fail closed while retaining same-origin
+// pagination, including authorization on every source request.
+func TestPlanRepo_PaginationOriginBoundary(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, token := range []string{"", "fake-token"} {
+			for _, form := range []string{"foreign absolute", "foreign network path", "foreign hostname", "absolute", "network path", "query", "root relative", "path relative"} {
+				t.Run(fmt.Sprintf("dataset=%v/token=%s/%s", dataset, token, form), func(t *testing.T) {
+					var foreign, treeReqs atomic.Int64
+					dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						foreign.Add(1)
+						_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "foreign.txt", Size: 1}})
+					}))
+					defer dst.Close()
+					api := "models"
+					if dataset {
+						api = "datasets"
+					}
+					treePath := "/api/" + api + "/owner/repo/tree/main"
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						wantAuth := ""
+						if token != "" {
+							wantAuth = "Bearer " + token
+						}
+						if r.Header.Get("Authorization") != wantAuth {
+							t.Error("source authorization changed")
+						}
+						if strings.Contains(r.URL.Path, "/revision/") {
+							_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+							return
+						}
+						page := treeReqs.Add(1)
+						if r.URL.Path != treePath || page > 2 || (page == 2 && r.URL.Query().Get("cursor") != "2") {
+							t.Errorf("unexpected tree request: %s", r.URL)
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
+						if page == 1 {
+							next := "?cursor=2"
+							switch form {
+							case "foreign absolute":
+								next = dst.URL + "/401/unauthorized/not%20found"
+							case "foreign network path":
+								next = strings.TrimPrefix(dst.URL, "http:") + "/page"
+							case "foreign hostname":
+								next = "http://" + strings.Replace(r.Host, "127.0.0.1", "localhost", 1) + treePath + next
+							case "absolute":
+								next = "http://" + r.Host + treePath + next
+							case "network path":
+								next = "//" + r.Host + treePath + next
+							case "root relative":
+								next = treePath + next
+							case "path relative":
+								next = "main" + next
+							}
+							w.Header().Set("Link", "<"+next+">; rel=next")
+						}
+						_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: fmt.Sprintf("f%d.txt", page), Size: page}})
+					}))
+					defer srv.Close()
+					plan, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main", IsDataset: dataset}, Settings{Endpoint: srv.URL, Token: token})
+					wantReqs := int64(2)
+					if strings.HasPrefix(form, "foreign") {
+						wantReqs = 1
+						if err == nil || err.Error() != "hubtree: cross-origin next pagination target" || plan != nil {
+							t.Errorf("plan = %v, error = %v; want cross-origin failure, no partial plan", plan, err)
+						}
+					} else if err != nil || plan == nil || len(plan.Items) != 2 || plan.Items[0].RelativePath != "f1.txt" || plan.Items[1].RelativePath != "f2.txt" || plan.Commit != "cafebabe" {
+						t.Errorf("same-origin plan = %v, error = %v; want both files and commit", plan, err)
+					}
+					if foreign.Load() != 0 || treeReqs.Load() != wantReqs {
+						t.Errorf("foreign/tree requests = %d/%d, want 0/%d", foreign.Load(), treeReqs.Load(), wantReqs)
+					}
+				})
+			}
+		}
+	}
+}
+
+// A later directory failure must invalidate the selected tree even after a
+// successful root file callback, including mirrors rejecting recursive=true.
+func TestPlanRepo_CrossOriginDirectoryFailsWholePlan(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, token := range []string{"", "fake-token"} {
+			for _, fallback := range []int{0, http.StatusBadRequest, http.StatusUnprocessableEntity} {
+				t.Run(fmt.Sprintf("dataset=%v/token=%s/fallback=%d", dataset, token, fallback), func(t *testing.T) {
+					var foreign, treeReqs atomic.Int64
+					dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						foreign.Add(1)
+						_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "sub/foreign.txt"}})
+					}))
+					defer dst.Close()
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if strings.Contains(r.URL.Path, "/revision/") {
+							_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+							return
+						}
+						treeReqs.Add(1)
+						if fallback != 0 && r.URL.Query().Has("recursive") {
+							w.WriteHeader(fallback)
+							return
+						}
+						nodes := []hfNode{{Type: "file", Path: "root.txt"}, {Type: "directory", Path: "sub"}}
+						if strings.HasSuffix(r.URL.Path, "/sub") {
+							w.Header().Set("Link", "<"+dst.URL+"/page>; rel=next")
+							nodes = []hfNode{{Type: "file", Path: "sub/local.txt"}}
+						}
+						_ = json.NewEncoder(w).Encode(nodes)
+					}))
+					defer srv.Close()
+					plan, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", IsDataset: dataset}, Settings{Endpoint: srv.URL, Token: token})
+					if err == nil || err.Error() != "hubtree: cross-origin next pagination target" || plan != nil {
+						t.Errorf("plan = %v, error = %v; want whole-plan failure", plan, err)
+					}
+					want := int64(2)
+					if fallback != 0 {
+						want++
+					}
+					if foreign.Load() != 0 || treeReqs.Load() != want {
+						t.Errorf("foreign/tree requests = %d/%d, want 0/%d", foreign.Load(), treeReqs.Load(), want)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestPlanRepo_PaginatedTreeReturnsEveryFile drives the full plan scan
 // against a fake Hub whose tree listing spans three pages behind Link
 // rel="next" (issue #96): every file must reach the plan, for models and

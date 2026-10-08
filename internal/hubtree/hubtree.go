@@ -9,7 +9,8 @@
 //
 //   - requests recursive=true so one call returns the whole subtree;
 //   - follows Link rel="next" until exhausted, resolving each target against
-//     the request URL and refusing to follow the same target twice;
+//     the request URL, requiring the original tree-request origin, and
+//     refusing to follow the same target twice;
 //   - falls back to per-directory listing for mirrors that ignore
 //     recursive=true, listing a directory explicitly only when no listed
 //     descendant proves the server already covered it;
@@ -151,6 +152,33 @@ type walkState struct {
 	budget      int             // remaining HTTP requests
 	maxRequests int             // original budget, for the error message
 	recursiveOK bool            // latched false once a server rejects ?recursive
+	origin      *treeOrigin     // captured once from the first built tree URL
+}
+
+// treeOrigin compares URL origins without DNS resolution or path/userinfo
+// policy. It does not change the HTTP client's existing redirect behavior.
+type treeOrigin struct {
+	scheme, hostname, port string
+}
+
+func originOf(u *url.URL) treeOrigin {
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	} else if n, err := strconv.Atoi(port); err == nil {
+		port = strconv.Itoa(n)
+	}
+	return treeOrigin{scheme: u.Scheme, hostname: u.Hostname(), port: port}
+}
+
+func (o treeOrigin) matches(u *url.URL) bool {
+	other := originOf(u)
+	return o.scheme == other.scheme && strings.EqualFold(o.hostname, other.hostname) && o.port == other.port
 }
 
 // walk lists one prefix and recurses into directories in listing order,
@@ -160,6 +188,7 @@ func (st *walkState) walk(ctx context.Context, prefix string) error {
 	if err != nil {
 		return err
 	}
+	var covered map[string]bool
 	for _, n := range nodes {
 		switch n.Type {
 		case "directory", "tree":
@@ -172,7 +201,11 @@ func (st *walkState) walk(ctx context.Context, prefix string) error {
 			}
 			// Only list a directory when no listed descendant proves the
 			// server already covered it (i.e. recursive=true worked).
-			if subtreeListed(nodes, child) || st.visited[child] {
+			if covered == nil {
+				// Build once from all successful pages, only when queried.
+				covered = coveredSubtrees(nodes)
+			}
+			if covered[child] || st.visited[child] {
 				continue
 			}
 			st.visited[child] = true
@@ -211,17 +244,24 @@ func cleanChildDir(prefix, dir string) (string, bool) {
 	return cleaned, true
 }
 
-// subtreeListed reports whether any node in the listing lies strictly under
-// dir, which proves the server returned the subtree (recursive listing
-// honored) and an explicit listing of dir would be redundant.
-func subtreeListed(nodes []Node, dir string) bool {
-	p := dir + "/"
+// coveredSubtrees indexes the raw prefixes before every slash in a complete
+// listing. covered[dir] is exactly any(strings.HasPrefix(n.Path, dir+"/")),
+// independent of node type. Do not clean paths here: traversal validates the
+// directory separately, while coverage has always compared raw server paths.
+func coveredSubtrees(nodes []Node) map[string]bool {
+	covered := make(map[string]bool)
 	for _, n := range nodes {
-		if strings.HasPrefix(n.Path, p) {
-			return true
+		for end := strings.LastIndexByte(n.Path, '/'); end >= 0; end = strings.LastIndexByte(n.Path[:end], '/') {
+			ancestor := n.Path[:end]
+			if covered[ancestor] {
+				// Every existing key already has all of its raw ancestors
+				// indexed. Reverse traversal avoids repeating shared chains.
+				break
+			}
+			covered[ancestor] = true
 		}
 	}
-	return false
+	return covered
 }
 
 // listAllPages fetches every page of one prefix's listing, following Link
@@ -281,10 +321,16 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 		if next == "" {
 			break
 		}
-		abs, err := resolveNext(u, next)
+		target, err := resolveNext(u, next)
 		if err != nil {
 			return nil, fmt.Errorf("hubtree: invalid next pagination target %q: %w", next, err)
 		}
+		if !st.origin.matches(target) {
+			// Do not echo attacker-controlled URL text: callers may classify
+			// errors by strings such as "401", "unauthorized", or "not found".
+			return nil, fmt.Errorf("hubtree: cross-origin next pagination target")
+		}
+		abs := target.String()
 		if st.seenPages[abs] {
 			return nil, fmt.Errorf("hubtree: pagination cycle at %q", abs)
 		}
@@ -302,6 +348,10 @@ func (st *walkState) pageURL(prefix string, recursive bool) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("hubtree: invalid tree URL %q: %w", raw, err)
+	}
+	if st.origin == nil {
+		origin := originOf(u)
+		st.origin = &origin
 	}
 	if recursive {
 		q := u.Query()
@@ -661,14 +711,14 @@ func linkHasRelNext(params string) (next, valid bool) {
 
 // resolveNext resolves a pagination target against the URL of the request
 // that carried the Link header.
-func resolveNext(baseURL, ref string) (string, error) {
+func resolveNext(baseURL, ref string) (*url.URL, error) {
 	b, err := url.Parse(baseURL)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	r, err := url.Parse(strings.TrimSpace(ref))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return b.ResolveReference(r).String(), nil
+	return b.ResolveReference(r), nil
 }

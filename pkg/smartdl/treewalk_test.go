@@ -15,6 +15,155 @@ import (
 	"testing"
 )
 
+// Exercise public Analyze so attacker text cannot turn a pagination failure
+// into namespace autodetection and successful partial analysis.
+func TestAnalyze_PaginationOriginBoundary(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, token := range []string{"", "fake-token"} {
+			for _, form := range []string{"foreign absolute", "foreign network path", "foreign hostname", "absolute", "network path", "query", "root relative", "path relative"} {
+				t.Run(fmt.Sprintf("dataset=%v/token=%s/%s", dataset, token, form), func(t *testing.T) {
+					var foreign, treeReqs, oppositeReqs atomic.Int64
+					dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						foreign.Add(1)
+						_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "foreign.txt", Size: 1}})
+					}))
+					defer dst.Close()
+					api := "models"
+					if dataset {
+						api = "datasets"
+					}
+					treePath := "/api/" + api + "/owner/repo/tree/main"
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						wantAuth := ""
+						if token != "" {
+							wantAuth = "Bearer " + token
+						}
+						if r.Header.Get("Authorization") != wantAuth {
+							t.Error("source authorization changed")
+						}
+						if r.URL.Path == "/api/datasets/owner/repo/tree/main" && !dataset {
+							oppositeReqs.Add(1)
+							// Successful opposite namespace must not hide a selected
+							// tree failure via classification of attacker URL text.
+							if strings.HasPrefix(form, "foreign") {
+								_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "dataset.txt"}})
+							} else {
+								w.WriteHeader(http.StatusNotFound)
+							}
+							return
+						}
+						if r.URL.Path == "/api/"+api+"/owner/repo/refs" {
+							_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+							return
+						}
+						page := treeReqs.Add(1)
+						if r.URL.Path != treePath || page > 2 || (page == 2 && r.URL.Query().Get("cursor") != "2") {
+							t.Errorf("unexpected tree request: %s", r.URL)
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
+						if page == 1 {
+							w.Header().Set("X-Repo-Commit", "cafebabe")
+							next := "?cursor=2"
+							switch form {
+							case "foreign absolute":
+								next = dst.URL + "/401/unauthorized/not%20found"
+							case "foreign network path":
+								next = strings.TrimPrefix(dst.URL, "http:") + "/page"
+							case "foreign hostname":
+								next = "http://" + strings.Replace(r.Host, "127.0.0.1", "localhost", 1) + treePath + next
+							case "absolute":
+								next = "http://" + r.Host + treePath + next
+							case "network path":
+								next = "//" + r.Host + treePath + next
+							case "root relative":
+								next = treePath + next
+							case "path relative":
+								next = "main" + next
+							}
+							w.Header().Set("Link", "<"+next+">; rel=next")
+						}
+						_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: fmt.Sprintf("f%d.txt", page), Size: page}})
+					}))
+					defer srv.Close()
+					a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: token})
+					info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+					wantReqs, wantOpposite := int64(2), int64(0)
+					if strings.HasPrefix(form, "foreign") {
+						wantReqs = 1
+						if err == nil || err.Error() != "fetch file tree: hubtree: cross-origin next pagination target" || info != nil {
+							t.Errorf("info = %v, error = %v; want pagination failure, no partial analysis", info, err)
+						}
+					} else {
+						if !dataset {
+							wantOpposite = 1
+						}
+						if err != nil || info == nil || info.FileCount != 2 || info.Files[0].Path != "f1.txt" || info.Files[1].Path != "f2.txt" || info.Commit != "cafebabe" || info.IsDataset != dataset {
+							t.Errorf("same-origin info = %v, error = %v; want both files and commit", info, err)
+						}
+					}
+					if foreign.Load() != 0 || treeReqs.Load() != wantReqs || oppositeReqs.Load() != wantOpposite {
+						t.Errorf("foreign/tree/opposite requests = %d/%d/%d, want 0/%d/%d", foreign.Load(), treeReqs.Load(), oppositeReqs.Load(), wantReqs, wantOpposite)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAnalyze_CrossOriginDirectoryFailsWholeAnalysis(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, token := range []string{"", "fake-token"} {
+			for _, fallback := range []int{0, http.StatusBadRequest, http.StatusUnprocessableEntity} {
+				t.Run(fmt.Sprintf("dataset=%v/token=%s/fallback=%d", dataset, token, fallback), func(t *testing.T) {
+					var foreign, treeReqs atomic.Int64
+					dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						foreign.Add(1)
+						_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "sub/foreign.txt"}})
+					}))
+					defer dst.Close()
+					api := "models"
+					if dataset {
+						api = "datasets"
+					}
+					treePath := "/api/" + api + "/owner/repo/tree/main"
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						treeReqs.Add(1)
+						if r.URL.Path != treePath && r.URL.Path != treePath+"/sub" {
+							t.Errorf("unexpected request after selected-tree failure: %s", r.URL)
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
+						if fallback != 0 && r.URL.Query().Has("recursive") {
+							w.WriteHeader(fallback)
+							return
+						}
+						nodes := []hfTreeNode{{Type: "file", Path: "root.txt"}, {Type: "directory", Path: "sub"}}
+						if strings.HasSuffix(r.URL.Path, "/sub") {
+							w.Header().Set("Link", "<"+dst.URL+"/401/unauthorized>; rel=next")
+							nodes = []hfTreeNode{{Type: "file", Path: "sub/local.txt"}}
+						}
+						_ = json.NewEncoder(w).Encode(nodes)
+					}))
+					defer srv.Close()
+					a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: token})
+					info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+					if err == nil || err.Error() != "fetch file tree: hubtree: cross-origin next pagination target" || info != nil {
+						t.Errorf("info = %v, error = %v; want whole-analysis failure", info, err)
+					}
+					want := int64(2)
+					if fallback != 0 {
+						want++
+					}
+					if foreign.Load() != 0 || treeReqs.Load() != want {
+						t.Errorf("foreign/tree requests = %d/%d, want 0/%d", foreign.Load(), treeReqs.Load(), want)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestFetchFileTree_PaginatedTree drives the analyzer's fetch against a fake
 // Hub whose tree listing spans three pages behind Link rel="next" (issue
 // #96): every file must reach the FileInfo list, for models and datasets

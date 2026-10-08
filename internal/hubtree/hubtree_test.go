@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +24,531 @@ func fileNode(p string, size int64) Node {
 	return Node{Type: "file", Path: p, Size: size}
 }
 
+// Advertised links are fresh requests, not redirects: reject the destination
+// before any request, even without credentials and after traversal transitions.
+func TestWalk_PaginationOriginBoundary(t *testing.T) {
+	for _, token := range []string{"", "fake-token"} {
+		for _, stage := range []string{"first page", "later page", "directory", "400 fallback", "422 fallback", "retry", "https downgrade"} {
+			t.Run(stage+"/token="+token, func(t *testing.T) {
+				var foreign, source atomic.Int64
+				dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					foreign.Add(1)
+					_ = json.NewEncoder(w).Encode([]Node{fileNode("foreign.bin", 1)})
+				}))
+				defer dst.Close()
+				srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					n := source.Add(1)
+					wantAuth := ""
+					if token != "" {
+						wantAuth = "Bearer " + token
+					}
+					if r.Header.Get("Authorization") != wantAuth {
+						t.Error("source authorization changed")
+					}
+					if n == 1 {
+						switch stage {
+						case "later page":
+							w.Header().Set("Link", `<?cursor=2>; rel=next`)
+							_ = json.NewEncoder(w).Encode([]Node{fileNode("first.bin", 1)})
+							return
+						case "directory":
+							_ = json.NewEncoder(w).Encode([]Node{dirNode("sub")})
+							return
+						case "400 fallback", "422 fallback":
+							status := http.StatusBadRequest
+							if stage == "422 fallback" {
+								status = http.StatusUnprocessableEntity
+							}
+							w.WriteHeader(status)
+							return
+						case "retry":
+							w.WriteHeader(http.StatusServiceUnavailable)
+							return
+						}
+					}
+					w.Header().Set("Link", "<"+dst.URL+"/401/unauthorized/not%20found>; rel=next")
+					_ = json.NewEncoder(w).Encode([]Node{fileNode("local.bin", 1)})
+				}))
+				if stage == "https downgrade" {
+					srv.StartTLS()
+				} else {
+					srv.Start()
+				}
+				defer srv.Close()
+				walker := testWalker(srv, nil)
+				walker.Client, walker.Token = srv.Client(), token
+				err := walker.Walk(context.Background(), "", func(Node) error {
+					t.Error("failed listing delivered a partial page")
+					return nil
+				})
+				if err == nil || err.Error() != "hubtree: cross-origin next pagination target" {
+					t.Errorf("error = %v, want stable cross-origin error without target text", err)
+				}
+				if got := foreign.Load(); got != 0 {
+					t.Errorf("foreign requests = %d, want zero", got)
+				}
+				wantSource := int64(2)
+				if stage == "first page" || stage == "https downgrade" {
+					wantSource = 1
+				}
+				if got := source.Load(); got != wantSource {
+					t.Errorf("source requests = %d, want %d", got, wantSource)
+				}
+			})
+		}
+	}
+}
+
 func dirNode(p string) Node {
 	return Node{Type: "directory", Path: p}
+}
+
+// Keep the original production predicate as the differential/benchmark oracle.
+func scanSubtreeListed(nodes []Node, dir string) bool {
+	p := dir + "/"
+	for _, n := range nodes {
+		if strings.HasPrefix(n.Path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCoveredSubtrees_EquivalentToOriginalScan(t *testing.T) {
+	paths := []string{"", "a", "a/", "a//", "a//b/file", "a/./b/file", "a/../b/file", `win\dir/file`, "deep/p/q/file", "A/file", "a2/file", "/a/file"}
+	atoms := []string{"", "a", "a2", "A", ".", "..", `win\dir`}
+	for _, a := range atoms {
+		for _, b := range atoms {
+			for _, c := range atoms {
+				paths = append(paths, a+"/"+b+"/"+c)
+			}
+		}
+	}
+	candidates := map[string]bool{"unlisted": true}
+	for _, p := range paths {
+		candidates[p] = true
+		// Include the exact cleaned queries made by traversal, not just
+		// the raw paths used to build the index.
+		for _, prefix := range []string{"", "a", "a2", `win\dir`} {
+			if child, ok := cleanChildDir(prefix, p); ok {
+				candidates[child] = true
+			}
+		}
+	}
+	var dirs []string
+	for dir := range candidates {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	checks := 0
+	check := func(nodes []Node, queries []string) {
+		t.Helper()
+		covered := coveredSubtrees(nodes)
+		for _, dir := range queries {
+			checks++
+			if got, want := covered[dir], scanSubtreeListed(nodes, dir); got != want {
+				t.Fatalf("coverage[%q] = %v, want scan %v; nodes = %v", dir, got, want, nodes)
+			}
+		}
+	}
+	check(nil, dirs)
+	types := []string{"file", "directory", "tree", "blob", "unknown", ""}
+	var all []Node
+	for _, p := range paths {
+		for _, typ := range types {
+			// Singleton cases cannot have another node accidentally supply
+			// coverage; every type must prove the same raw prefix predicate.
+			n := Node{Type: typ, Path: p}
+			check([]Node{n}, dirs)
+			all = append(all, n)
+		}
+	}
+	check(all, dirs)
+	for i := 0; i+1 < len(all); i++ {
+		check(all[i:i+2], dirs)
+	}
+	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
+		all[i], all[j] = all[j], all[i]
+	}
+	check(all, dirs) // input order cannot change early-break completeness
+	for _, f := range coverageFixtures() {
+		check(f.nodes, f.dirs)
+	}
+	t.Logf("%d deterministic index/scan equivalence checks", checks)
+}
+
+func TestWalk_CompleteListingCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		root     []Node
+		page2    []Node
+		children map[string][]Node
+		want     []string
+	}{
+		{
+			name: "descendant on later page",
+			root: []Node{dirNode("a")}, page2: []Node{fileNode("a/file", 1)},
+			want: []string{"request root", "request root page2", "file a/file"},
+		},
+		{
+			name: "directory alone is not coverage",
+			root: []Node{dirNode("a")}, children: map[string][]Node{"a": {fileNode("a/file", 1)}},
+			want: []string{"request root", "request a", "file a/file"},
+		},
+		{
+			name: "directory descendant covers parent",
+			root: []Node{dirNode("a"), {Type: "tree", Path: "a/b"}}, children: map[string][]Node{"a/b": {}},
+			want: []string{"request root", "request a/b"},
+		},
+		{
+			name: "raw trailing slash covers parent",
+			root: []Node{dirNode("a"), {Type: "unknown", Path: "a/"}},
+			want: []string{"request root", "file a/"},
+		},
+		{
+			name: "raw cleaned mismatch",
+			root: []Node{dirNode("x/../a"), fileNode("x/../a/file", 1)}, children: map[string][]Node{"a": {}},
+			want: []string{"request root", "request a", "file x/../a/file"},
+		},
+		{
+			name: "prefix a is not a2",
+			root: []Node{dirNode("a"), dirNode("a2"), fileNode("a2/file", 1)}, children: map[string][]Node{"a": {}},
+			want: []string{"request root", "request a", "file a2/file"},
+		},
+		{
+			name: "empty and duplicate directories",
+			root: []Node{dirNode(""), dirNode("a"), dirNode("a"), dirNode("a/.")}, children: map[string][]Node{"a": {}},
+			// a/. proves raw coverage of a, but its cleaned a still needs
+			// listing only if no raw descendant exists. Here all are covered.
+			want: []string{"request root"},
+		},
+		{
+			name: "duplicate empty directory listed once",
+			root: []Node{dirNode(""), dirNode("a"), dirNode("a")}, children: map[string][]Node{"a": {}},
+			want: []string{"request root", "request a"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var trace []string
+			record := func(s string) { mu.Lock(); trace = append(trace, s); mu.Unlock() }
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				prefix := strings.TrimPrefix(r.URL.Path, "/api/models/o/r/tree/main")
+				prefix = strings.TrimPrefix(prefix, "/")
+				label := prefix
+				if label == "" {
+					label = "root"
+				}
+				if r.URL.Query().Has("cursor") {
+					label += " page2"
+				}
+				record("request " + label)
+				nodes, ok := tc.children[prefix]
+				if prefix == "" {
+					ok, nodes = true, tc.root
+					if r.URL.Query().Has("cursor") {
+						nodes = tc.page2
+					} else if tc.page2 != nil {
+						w.Header().Set("Link", `<?cursor=2>; rel=next`)
+					}
+				}
+				if !ok {
+					t.Errorf("unexpected explicit directory listing %q", prefix)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(nodes)
+			}))
+			defer srv.Close()
+			err := testWalker(srv, nil).Walk(context.Background(), "", func(n Node) error {
+				record("file " + n.Path)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.Join(trace, "\n") != strings.Join(tc.want, "\n") {
+				t.Errorf("trace = %v, want %v", trace, tc.want)
+			}
+		})
+	}
+}
+
+func TestWalk_CoverageOrderAndCallbackFailure(t *testing.T) {
+	for _, failAt := range []string{"", "mirror/first", "mirror/deep/last"} {
+		t.Run("failAt="+failAt, func(t *testing.T) {
+			levels := map[string][]Node{
+				"":            {fileNode("root", 1), dirNode("recursive"), fileNode("recursive/file", 1), dirNode("mirror"), fileNode("tail", 1), dirNode("mirror")},
+				"mirror":      {fileNode("mirror/first", 1), dirNode("mirror/deep"), fileNode("mirror/end", 1), dirNode("mirror/deep")},
+				"mirror/deep": {fileNode("mirror/deep/last", 1)},
+			}
+			var mu sync.Mutex
+			var trace []string
+			record := func(s string) { mu.Lock(); trace = append(trace, s); mu.Unlock() }
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				prefix := strings.TrimPrefix(r.URL.Path, "/api/models/o/r/tree/main")
+				prefix = strings.TrimPrefix(prefix, "/")
+				record("request " + prefix)
+				nodes, ok := levels[prefix]
+				if !ok {
+					t.Errorf("unexpected listing %q", prefix)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(nodes)
+			}))
+			defer srv.Close()
+			sentinel := errors.New("callback failed")
+			err := testWalker(srv, nil).Walk(context.Background(), "", func(n Node) error {
+				record("file " + n.Path)
+				if n.Path == failAt {
+					return sentinel
+				}
+				return nil
+			})
+			if (failAt == "" && err != nil) || (failAt != "" && err != sentinel) {
+				t.Errorf("error = %v, want unchanged callback result", err)
+			}
+			want := []string{"request ", "file root", "file recursive/file", "request mirror", "file mirror/first", "request mirror/deep", "file mirror/deep/last", "file mirror/end", "file tail"}
+			if failAt == "mirror/first" {
+				want = want[:5]
+			} else if failAt == "mirror/deep/last" {
+				want = want[:7]
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.Join(trace, "\n") != strings.Join(want, "\n") {
+				t.Errorf("trace = %v, want %v (no callback rollback or further requests)", trace, want)
+			}
+		})
+	}
+}
+
+func TestWalk_CoverageIsListingLocal(t *testing.T) {
+	levels := map[string][]Node{
+		"":       {dirNode("x"), dirNode("y")},
+		"x":      {fileNode("y/deep/outside", 1)},
+		"y":      {dirNode("y/deep")},
+		"y/deep": {fileNode("y/deep/file", 1)},
+	}
+	var mu sync.Mutex
+	var trace []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := strings.TrimPrefix(r.URL.Path, "/api/models/o/r/tree/main")
+		prefix = strings.TrimPrefix(prefix, "/")
+		mu.Lock()
+		trace = append(trace, prefix)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(levels[prefix])
+	}))
+	defer srv.Close()
+	walker := testWalker(srv, nil)
+	for i := 0; i < 2; i++ {
+		assertFiles(t, walkFiles(t, walker), "y/deep/outside", "y/deep/file")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(trace, ","); got != ",x,y,y/deep,,x,y,y/deep" {
+		t.Errorf("requests = %q, want each listing and each Walk isolated", got)
+	}
+}
+
+func TestWalk_CoverageWaitsForAllPages(t *testing.T) {
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		if r.URL.Query().Get("cursor") == "2" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Link", `<?cursor=2>; rel=next`)
+		_ = json.NewEncoder(w).Encode([]Node{dirNode("a"), fileNode("root", 1)})
+	}))
+	defer srv.Close()
+	err := testWalker(srv, nil).Walk(context.Background(), "", func(Node) error {
+		t.Error("failed complete listing delivered a callback")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "404") || reqs.Load() != 2 {
+		t.Errorf("error = %v, requests = %d; want second-page failure, no child listing", err, reqs.Load())
+	}
+}
+
+func TestOriginOf(t *testing.T) {
+	for _, tc := range []struct {
+		name, base, target string
+		want               bool
+	}{
+		{"hostname case", "https://Hub.Example/tree", "https://hUB.eXAMPLE/page", true},
+		{"http default", "http://hub.example/tree", "http://hub.example:80/page", true},
+		{"https default", "https://hub.example:443/tree", "https://hub.example/page", true},
+		{"numeric port", "https://hub.example:0443/tree", "https://hub.example/page", true},
+		{"nondefault port", "https://hub.example:8443/tree", "https://hub.example:8443/page", true},
+		{"other port", "https://hub.example/tree", "https://hub.example:8443/page", false},
+		{"other host", "https://hub.example/tree", "https://other.example/page", false},
+		{"downgrade", "https://hub.example/tree", "http://hub.example/page", false},
+		{"scheme with same port", "https://hub.example:80/tree", "http://hub.example/page", false},
+		{"ipv6 default", "http://[::1]/tree", "http://[::1]:80/page", true},
+		{"ipv6 case", "https://[2001:DB8::A]:443/tree", "https://[2001:db8::a]/page", true},
+		{"ipv6 other port", "http://[::1]:8000/tree", "http://[::1]:8001/page", false},
+		{"ipv6 other host", "http://[::1]/tree", "http://[::2]/page", false},
+		{"userinfo is not origin", "https://hub.example/tree", "https://user:password@hub.example/page", true},
+		{"userinfo cannot disguise host", "https://hub.example/tree", "https://hub.example@other.example/page", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, err := url.Parse(tc.base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := url.Parse(tc.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := originOf(base).matches(target); got != tc.want {
+				t.Errorf("origin matches = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Only advertised fresh requests are constrained here. A redirect can still
+// run under the existing client policy, but cannot redefine the Walk's origin
+// or the base used to resolve its next link.
+func TestWalk_RedirectDoesNotRedefinePaginationOrigin(t *testing.T) {
+	for _, foreignNext := range []bool{false, true} {
+		t.Run(fmt.Sprintf("foreignNext=%v", foreignNext), func(t *testing.T) {
+			var destination, source atomic.Int64
+			dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				destination.Add(1)
+				next := "?cursor=2"
+				if foreignNext {
+					next = "http://" + r.Host + "/page"
+				}
+				if r.URL.Path == "/landing" {
+					w.Header().Set("Link", "<"+next+">; rel=next")
+				}
+				_ = json.NewEncoder(w).Encode([]Node{fileNode("first.bin", 1)})
+			}))
+			defer dst.Close()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				source.Add(1)
+				if r.URL.Query().Get("cursor") == "2" {
+					_ = json.NewEncoder(w).Encode([]Node{fileNode("second.bin", 2)})
+					return
+				}
+				http.Redirect(w, r, dst.URL+"/landing", http.StatusFound)
+			}))
+			defer srv.Close()
+			var files []string
+			err := testWalker(srv, nil).Walk(context.Background(), "", func(n Node) error {
+				files = append(files, n.Path)
+				return nil
+			})
+			wantSource := int64(2)
+			if foreignNext {
+				wantSource = 1
+				if err == nil || err.Error() != "hubtree: cross-origin next pagination target" || len(files) != 0 {
+					t.Errorf("error = %v, files = %v; want foreign-next failure", err, files)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertFiles(t, files, "first.bin", "second.bin")
+			}
+			if destination.Load() != 1 || source.Load() != wantSource {
+				t.Errorf("destination/source requests = %d/%d, want 1/%d (only existing redirect)", destination.Load(), source.Load(), wantSource)
+			}
+		})
+	}
+}
+
+// Later URL builds must not reset the first-built origin, even if a custom
+// builder changes its own endpoint during recursive fallback or traversal.
+func TestWalk_FirstBuiltOriginIsImmutable(t *testing.T) {
+	for _, stage := range []string{"directory", "400 fallback", "422 fallback"} {
+		t.Run(stage, func(t *testing.T) {
+			var destination atomic.Int64
+			dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				destination.Add(1)
+				w.Header().Set("Link", "<http://"+r.Host+"/next>; rel=next")
+				_ = json.NewEncoder(w).Encode([]Node{fileNode("sub/file.bin", 1)})
+			}))
+			defer dst.Close()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch stage {
+				case "400 fallback":
+					w.WriteHeader(http.StatusBadRequest)
+				case "422 fallback":
+					w.WriteHeader(http.StatusUnprocessableEntity)
+				default:
+					_ = json.NewEncoder(w).Encode([]Node{dirNode("sub")})
+				}
+			}))
+			defer srv.Close()
+			builds := 0
+			walker := &Walker{TreeURL: func(prefix string) string {
+				builds++
+				if builds == 1 {
+					return srv.URL + "/tree/main"
+				}
+				return dst.URL + "/tree/main/" + prefix
+			}}
+			err := walker.Walk(context.Background(), "", func(Node) error { return nil })
+			if err == nil || err.Error() != "hubtree: cross-origin next pagination target" {
+				t.Errorf("error = %v, want original-origin failure", err)
+			}
+			// The operator-provided builder is not restricted by this change;
+			// only its subsequent advertised next must be rejected.
+			if got := destination.Load(); got != 1 {
+				t.Errorf("destination requests = %d, want one built URL, no next", got)
+			}
+		})
+	}
+}
+
+func TestWalk_OriginIsPerWalk(t *testing.T) {
+	serve := func(label string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("cursor") == "" {
+				w.Header().Set("Link", "<http://"+r.Host+"/page?cursor=2>; rel=next")
+			}
+			_ = json.NewEncoder(w).Encode([]Node{fileNode(label+r.URL.Query().Get("cursor"), 1)})
+		}))
+	}
+	a, b := serve("a"), serve("b")
+	defer a.Close()
+	defer b.Close()
+	walker := &Walker{TreeURL: func(prefix string) string {
+		if prefix == "a" {
+			return a.URL + "/tree/main"
+		}
+		return b.URL + "/tree/main"
+	}}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		for _, prefix := range []string{"a", "b"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var files []string
+				err := walker.Walk(context.Background(), prefix, func(n Node) error {
+					files = append(files, n.Path)
+					return nil
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if len(files) != 2 || files[0] != prefix || files[1] != prefix+"2" {
+					t.Errorf("files = %v, want %s/%s2", files, prefix, prefix)
+				}
+			}()
+		}
+	}
+	wg.Wait()
 }
 
 // testWalker builds a Walker against a fake Hub rooted at the standard model
