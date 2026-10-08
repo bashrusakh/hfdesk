@@ -1,18 +1,6 @@
 # TODO
 
-## Current work: selected GGUF deletion
-
-- Implemented on the local feature branch: local and HF selected-group deletion,
-  including selection/confirmation UI and preservation of shared HF payloads.
-- Latest root-boundary and complete-writer-plan repair has passed local checks.
-- Pending: independent review and full verification of the new candidate after
-  this repair. Previous-candidate browser/integration evidence is not a substitute.
-- Native Windows/SMB behavior and exhaustive format coverage are not verified.
-- No push, PR metadata update, or Ready transition is part of the current task.
-
-## Other open items
-
-(no other open items)
+(no open items)
 
 ## Done
 
