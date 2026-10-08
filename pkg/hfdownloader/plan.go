@@ -85,13 +85,32 @@ func canonicalSHA256(sha string) bool {
 // resolved before the comparison. This is the single home for the containment
 // guard that the cache, mirror, and downloader call sites previously
 // open-coded as inline strings.HasPrefix checks.
+//
+// The separator-strict prefix below keeps a sibling that shares the base's
+// name (e.g. /tmp/models2 versus base /tmp/models) from matching: appending
+// a separator to both sides forces the comparison onto a component boundary.
+// A filesystem/volume root — "/" on Unix, a drive root such as "C:\" or a
+// UNC share root on Windows (filepath.VolumeName names its volume; Clean
+// keeps the root's trailing separator) — already ends in a separator after
+// filepath.Clean, so it must not receive a second one: base+sep would be
+// "//" (or "\\"), a prefix no path can ever match, which rejected every
+// destination legitimately inside the root as an escape. For a root the
+// cleaned root itself is the strict prefix: a root has no shallower sibling,
+// so any cleaned target carrying that prefix is inside it (relative targets
+// still fail the prefix, as before). filepath.Clean never leaves a trailing
+// separator on a non-root path, so non-root bases take the unchanged
+// separator-strict branch and keep byte-identical acceptance.
 func PathInside(base, target string) bool {
 	base = filepath.Clean(base)
 	target = filepath.Clean(target)
 	if target == base {
 		return true
 	}
-	return strings.HasPrefix(target+string(filepath.Separator), base+string(filepath.Separator))
+	sep := string(filepath.Separator)
+	if strings.HasSuffix(base, sep) {
+		return strings.HasPrefix(target, base)
+	}
+	return strings.HasPrefix(target+sep, base+sep)
 }
 
 // SafeJoin joins rel onto base and verifies the result stays within base,

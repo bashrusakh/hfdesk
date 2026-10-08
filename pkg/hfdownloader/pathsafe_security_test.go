@@ -32,6 +32,49 @@ func TestPathInside(t *testing.T) {
 			t.Errorf("PathInside(%q,%q)=%v want %v", base, c.target, got, c.want)
 		}
 	}
+
+	// Filesystem/volume root bases: filepath.Clean leaves the root's
+	// trailing separator in place ("/" on Unix; on Windows a drive root
+	// such as "C:\"), so the separator-strict prefix must not double it —
+	// the root itself and every cleaned absolute target are inside the
+	// root, while relative targets are not.
+	rootBase := string(filepath.Separator)
+	rootCases := []struct {
+		target string
+		want   bool
+	}{
+		{rootBase, true},
+		{filepath.Join(rootBase, "owner", "model"), true},
+		{filepath.Join(rootBase, "a", "b", "c"), true},
+		{"owner/model", false}, // relative target is not inside an absolute root
+	}
+	for _, c := range rootCases {
+		if got := PathInside(rootBase, c.target); got != c.want {
+			t.Errorf("PathInside(%q,%q)=%v want %v", rootBase, c.target, got, c.want)
+		}
+	}
+}
+
+// TestSafeJoinFilesystemRootBase pins the latent sibling of the same defect:
+// SafeJoin gates `rel` with filepath.IsLocal (rejecting absolute and
+// escaping values) and then proves containment with PathInside, so a
+// filesystem-root base must accept genuinely-local joins instead of
+// rejecting every destination under it as an escape. Escape attempts keep
+// failing at the IsLocal/absolute gates, before PathInside is consulted.
+func TestSafeJoinFilesystemRootBase(t *testing.T) {
+	rootBase := string(filepath.Separator)
+	got, err := SafeJoin(rootBase, filepath.Join("owner", "model"))
+	if err != nil {
+		t.Fatalf("SafeJoin with filesystem-root base: %v", err)
+	}
+	if want := filepath.Join(rootBase, "owner", "model"); got != want {
+		t.Errorf("SafeJoin(%q, owner/model) = %q, want %q", rootBase, got, want)
+	}
+	for _, rel := range []string{"../escape", "/abs/escape", ""} {
+		if _, err := SafeJoin(rootBase, rel); err == nil {
+			t.Errorf("SafeJoin(%q, %q) expected error, got nil", rootBase, rel)
+		}
+	}
 }
 
 func TestSafeJoin(t *testing.T) {
@@ -371,6 +414,66 @@ func TestDestinationBaseCwdShapedRootsStayInsideCwd(t *testing.T) {
 			t.Errorf("destinationBase with OutputDir %q = %q resolves to %q, outside resolved root %q", root, got, abs, rootAbs)
 		}
 	}
+}
+
+// TestDestinationBaseFilesystemRootsStayInsideRoot pins the sibling contract
+// of the cwd-shaped roots test: OutputDir values that resolve to a
+// filesystem root ("/", "/.", "/tmp/..") are legitimate roots, not escapes.
+// filepath.Abs collapses each of them to the root itself, and the joined
+// destination must be accepted and genuinely inside that root. The
+// separator-strict containment proof previously appended a second separator
+// to the already separator-terminated root (prefix "//"), so every
+// destination under it was rejected as escaping the root. cwd == "/" with a
+// cwd-shaped OutputDir resolves through the same Abs path, so it is
+// exercised here as well. destinationBase is pure path computation — no
+// directories are created — so this test touches no filesystem state
+// outside its chdir window.
+func TestDestinationBaseFilesystemRootsStayInsideRoot(t *testing.T) {
+	// Independent containment predicate (filepath.Rel form), deliberately
+	// NOT the PathInside predicate under test: the produced destination
+	// must be genuinely inside the resolved root.
+	inside := func(root, p string) bool {
+		rel, err := filepath.Rel(root, p)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	check := func(t *testing.T, root string) {
+		t.Helper()
+		got, err := destinationBase(Job{Repo: "owner/model"}, Settings{OutputDir: root})
+		if err != nil {
+			t.Errorf("destinationBase with OutputDir %q: %v", root, err)
+			return
+		}
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			t.Errorf("abs(%q): %v", root, err)
+			return
+		}
+		if want := filepath.Join(rootAbs, "owner", "model"); got != want {
+			t.Errorf("destinationBase with OutputDir %q = %q, want %q", root, got, want)
+		}
+		if !inside(rootAbs, got) {
+			t.Errorf("destinationBase with OutputDir %q = %q, not inside resolved root %q", root, got, rootAbs)
+		}
+	}
+	for _, root := range []string{"/", "/.", "/tmp/.."} {
+		check(t, root)
+	}
+
+	// cwd == "/" with a cwd-shaped OutputDir collapses to the same case:
+	// filepath.Abs(".") resolves against the root.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		t.Skipf("cannot chdir to filesystem root: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("restore cwd %q: %v", cwd, err)
+		}
+	}()
+	check(t, ".")
 }
 
 // newMockHFFileServer serves the revision, tree, and file endpoints the
