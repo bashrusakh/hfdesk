@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1107,6 +1108,167 @@ func TestAPI_UpdateSettings_AtomicValidation(t *testing.T) {
 			t.Errorf("MaxActive = %d, want %d (must not be partially applied)", srv.config.MaxActive, origMaxActive)
 		}
 	})
+}
+
+func TestAPI_UpdateSettings_StallTimeout(t *testing.T) {
+	// StallTimeout is a duration string with an explicit "0 = disabled"
+	// meaning. It must validate at the boundary (400 on garbage), persist
+	// through the config file, surface via GET, and default to "60s".
+	t.Run("default is 60s", func(t *testing.T) {
+		if got := DefaultConfig().StallTimeout; got != "60s" {
+			t.Errorf("DefaultConfig().StallTimeout = %q, want 60s", got)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		body      string
+		wantCode  int
+		wantStore string
+	}{
+		{"valid duration", `{"stallTimeout":"90s"}`, http.StatusOK, "90s"},
+		{"trimmed and stored", `{"stallTimeout":"  2m  "}`, http.StatusOK, "2m"},
+		{"zero disables", `{"stallTimeout":"0"}`, http.StatusOK, "0"},
+		{"empty preserves", `{"stallTimeout":""}`, http.StatusOK, ""},
+		{"invalid word", `{"stallTimeout":"soon"}`, http.StatusBadRequest, ""},
+		{"negative", `{"stallTimeout":"-5s"}`, http.StatusBadRequest, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			// Seed a non-empty value so "empty preserves" starts from 60s and
+			// the "store" assertion is meaningful.
+			srv.config.StallTimeout = "60s"
+			req := httptest.NewRequest("POST", "/api/settings", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleUpdateSettings(w, req)
+			if w.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d. body=%s", w.Code, tt.wantCode, w.Body.String())
+			}
+			want := tt.wantStore
+			if want == "" {
+				want = "60s" // empty/invalid never mutates the seeded value
+			}
+			if srv.config.StallTimeout != want {
+				t.Errorf("StallTimeout = %q, want %q", srv.config.StallTimeout, want)
+			}
+		})
+	}
+}
+
+func TestAPI_GetSettings_SurfacesStallTimeout(t *testing.T) {
+	srv := newTestServer(t)
+	srv.config.StallTimeout = "45s"
+	w := httptest.NewRecorder()
+	srv.handleGetSettings(w, httptest.NewRequest("GET", "/api/settings", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var resp SettingsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StallTimeout != "45s" {
+		t.Errorf("stallTimeout = %q, want 45s", resp.StallTimeout)
+	}
+}
+
+func TestAPI_SettingsDoesNotExposeLibraryBackoffControls(t *testing.T) {
+	srv := newTestServer(t)
+	w := httptest.NewRecorder()
+	srv.handleGetSettings(w, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET settings status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"backoffInitial", "backoffMax"} {
+		if _, found := response[key]; found {
+			t.Errorf("GET /api/settings unexpectedly exposes %q", key)
+		}
+	}
+}
+
+// TestStallTimeoutPersistsAndReloads guards the persistence contract: a
+// stallTimeout saved through POST /api/settings must survive a restart by being
+// re-applied by ApplyConfigToServer, and it must never regress an explicit
+// default just because the config file omits it.
+func TestStallTimeoutPersistsAndReloads(t *testing.T) {
+	path := isolateTokenConfig(t)
+
+	cfg := DefaultConfig()
+	cfg.CacheDir = t.TempDir()
+	s := New(cfg)
+	if resp := requireTokenSettingsOK(t, s, `{"stallTimeout":"90s"}`); strings.Contains(resp, "warning") {
+		t.Fatalf("unexpected persistence warning: %s", resp)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !bytes.Contains(data, []byte("90s")) {
+		t.Fatalf("stallTimeout not persisted to config file: %s", data)
+	}
+
+	// Fresh server + ApplyConfigToServer must observe the persisted value.
+	restarted := DefaultConfig()
+	if err := ApplyConfigToServer(&restarted); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if restarted.StallTimeout != "90s" {
+		t.Errorf("after reload StallTimeout = %q, want 90s", restarted.StallTimeout)
+	}
+
+	// A default config must keep its own 60s when the file omits the key.
+	os.Remove(path)
+	fresh := DefaultConfig()
+	if err := ApplyConfigToServer(&fresh); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if fresh.StallTimeout != "60s" {
+		t.Errorf("missing key regressed default: got %q, want 60s", fresh.StallTimeout)
+	}
+}
+
+// --- Backoff / negative-stall-timeout regression coverage ---
+
+// TestApplyConfigToServer_StallTimeoutRejectsNegative verifies finding #4 at the
+// config boundary: a negative or unparseable stall-timeout in the config file
+// must not silently disable the watchdog; "0"/"0s" stays a deliberate disable.
+func TestApplyConfigToServer_StallTimeoutRejectsNegative(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		want string
+	}{
+		{"negative rejected", "-5s", "60s"},
+		{"unparseable rejected", "soon", "60s"},
+		{"zero disables", "0", "0"},
+		{"zero-duration disables", "0s", "0s"},
+		{"valid applied", "90s", "90s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolateTokenConfig(t)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(`{"stall-timeout":"`+tc.file+`"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			if err := ApplyConfigToServer(&cfg); err != nil {
+				t.Fatalf("ApplyConfigToServer: %v", err)
+			}
+			if cfg.StallTimeout != tc.want {
+				t.Errorf("StallTimeout = %q, want %q", cfg.StallTimeout, tc.want)
+			}
+		})
+	}
 }
 
 func TestAPI_StartDownload_ValidatesRepo(t *testing.T) {

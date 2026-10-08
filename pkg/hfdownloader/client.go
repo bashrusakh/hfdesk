@@ -81,17 +81,40 @@ func quickHeadAcceptRanges(ctx context.Context, httpc *http.Client, token string
 	return true, strings.Contains(strings.ToLower(resp.Header.Get("Accept-Ranges")), "bytes")
 }
 
+// headForETagTimeout bounds how long the optional ETag/SHA HEAD may take before
+// it is treated as a benign optional-metadata miss. It is a package variable
+// (not a public API) so tests can lower it deterministically, mirroring
+// maxAttemptsPerRetry and socksHandshakeNanos.
+var headForETagTimeout = 10 * time.Second
+
 // headForETag fetches ETag and SHA256 headers for a file.
-func headForETag(ctx context.Context, httpc *http.Client, token string, it PlanItem) (etag string, remoteSha string, _ error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+//
+// Any non-2xx status and any transient transport error are treated as an
+// optional-metadata miss — the file may simply have no remote SHA to verify
+// against — and yield no error. A genuine CALLER cancellation is
+// surfaced promptly so a cancelled job stops; the internal request timeout is
+// itself a benign miss, so a slow-but-successful HEAD on a cold mirror does not
+// fail the job.
+func headForETag(parentCtx context.Context, httpc *http.Client, token string, it PlanItem) (etag string, remoteSha string, err error) {
+	reqCtx, cancel := context.WithTimeout(parentCtx, headForETagTimeout)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
+	req, _ := http.NewRequestWithContext(reqCtx, "HEAD", it.URL, nil)
 	addAuth(req, token)
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return "", "", err
+		// Check the CALLER's context, not the internally-derived reqCtx: an
+		// internal timeout (context.DeadlineExceeded from reqCtx) is NOT
+		// fail-fast and must be treated as a benign optional-metadata miss. Only
+		// a genuine parent cancellation is surfaced.
+		if cerr := parentCtx.Err(); cerr != nil {
+			return "", "", cerr
+		}
+		return "", "", nil
 	}
 	defer resp.Body.Close()
+	if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil {
+		return "", "", nil
+	}
 	return resp.Header.Get("ETag"), resp.Header.Get("x-amz-meta-sha256"), nil
 }
 
@@ -189,8 +212,8 @@ func pathEscapeAll(p string) string {
 
 // RepoInfo contains metadata about a HuggingFace repository.
 type RepoInfo struct {
-	SHA          string `json:"sha"`           // Commit hash
-	LastModified string `json:"lastModified"`  // ISO timestamp
+	SHA          string `json:"sha"`          // Commit hash
+	LastModified string `json:"lastModified"` // ISO timestamp
 }
 
 // fetchRepoInfo fetches repository metadata including the commit SHA for a given revision.
@@ -221,5 +244,3 @@ func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint stri
 	}
 	return &info, nil
 }
-
-

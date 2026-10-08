@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"gopkg.in/yaml.v3"
@@ -50,6 +51,7 @@ type ConfigFile struct {
 	MaxSpeed           string       `json:"max-speed,omitempty" yaml:"max-speed,omitempty"`
 	Verify             string       `json:"verify,omitempty" yaml:"verify,omitempty"`
 	Retries            *int         `json:"retries,omitempty" yaml:"retries,omitempty"`
+	StallTimeout       string       `json:"stall-timeout,omitempty" yaml:"stall-timeout,omitempty"`
 	Endpoint           string       `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
 	BackoffInitial     string       `json:"backoff-initial,omitempty" yaml:"backoff-initial,omitempty"`
 	BackoffMax         string       `json:"backoff-max,omitempty" yaml:"backoff-max,omitempty"`
@@ -333,6 +335,19 @@ func ApplyConfigToServer(serverCfg *Config) error {
 	}
 	if fileCfg.Retries != nil && *fileCfg.Retries >= 0 {
 		serverCfg.Retries = *fileCfg.Retries
+	}
+	// StallTimeout: the config file applies whenever it carries a value; the
+	// CLI --stall-timeout flag is applied on top afterwards (see cmd/hfdesk),
+	// so an explicit flag still wins. Unlike MultipartThreshold there is no
+	// non-empty DefaultConfig sentinel to compare against safely.
+	//
+	// A NEGATIVE or unparseable value must never silently disable the watchdog,
+	// so reject it here and keep the protective default rather than applying
+	// garbage. "0"/"0s" is a deliberate disable and is applied as-is.
+	if fileCfg.StallTimeout != "" {
+		if d, err := time.ParseDuration(fileCfg.StallTimeout); err == nil && d >= 0 {
+			serverCfg.StallTimeout = fileCfg.StallTimeout
+		}
 	}
 	if serverCfg.Endpoint == "" && fileCfg.Endpoint != "" {
 		serverCfg.Endpoint = fileCfg.Endpoint

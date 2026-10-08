@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
@@ -27,18 +28,20 @@ func main() {
 	server.Version = Version
 
 	var (
-		port     int
-		cacheDir string
-		token    string
-		localDir string
-		openUI   bool
-		noOpen   bool
+		port         int
+		cacheDir     string
+		token        string
+		localDir     string
+		stallTimeout string
+		openUI       bool
+		noOpen       bool
 	)
 
 	flag.IntVar(&port, "port", 8080, "HTTP port")
 	flag.StringVar(&cacheDir, "cache-dir", "", "Hugging Face cache directory")
 	flag.StringVar(&token, "token", "", "Hugging Face token (also reads HF_TOKEN env)")
 	flag.StringVar(&localDir, "local-dir", "", "write real files into this directory instead of the HF cache layout")
+	flag.StringVar(&stallTimeout, "stall-timeout", "", "abort a stalled download read after this duration (e.g. 60s; 0 disables)")
 	flag.BoolVar(&openUI, "open", true, "open the web UI in the default browser")
 	flag.BoolVar(&noOpen, "no-open", false, "do not open the web UI automatically")
 	flag.Usage = func() {
@@ -54,6 +57,16 @@ func main() {
 	cfg.LocalDir = localDir
 	if err := server.ApplyConfigToServer(&cfg); err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	// CLI flag takes precedence over the persisted setting. Reject a negative
+	// or unparseable value: it must never silently disable the stall watchdog
+	// or be accepted as a bogus duration.
+	if stallTimeout != "" {
+		d, err := time.ParseDuration(stallTimeout)
+		if err != nil || d < 0 {
+			log.Fatalf("invalid --stall-timeout %q: expected a non-negative duration such as 60s or 0 to disable", stallTimeout)
+		}
+		cfg.StallTimeout = stallTimeout
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -25,6 +25,7 @@ func TestDefaultSettings(t *testing.T) {
 		{"Retries", cfg.Retries, 4},
 		{"BackoffInitial", cfg.BackoffInitial, "400ms"},
 		{"BackoffMax", cfg.BackoffMax, "10s"},
+		{"StallTimeout", cfg.StallTimeout, "60s"},
 	}
 
 	for _, tt := range tests {

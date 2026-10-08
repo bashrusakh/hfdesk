@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -324,7 +325,11 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Ensure destination root exists (only for legacy mode)
 	// HF cache mode already created directories via repoDir.EnsureDirs()
 	if !useHFCache {
-		if err := os.MkdirAll(destinationBase(job, cfg), 0o755); err != nil {
+		base, err := destinationBase(job, cfg)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(base, 0o755); err != nil {
 			return err
 		}
 	}
@@ -335,6 +340,33 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(plan.Items))
+
+	// Job-scoped cancellable context. Every per-file context derives from it so
+	// that a permanent (fail-fast) file/part error — or a job-fatal security
+	// rejection — can terminate the whole job promptly instead of letting
+	// sibling files/parts keep downloading, retrying, or waiting until
+	// wg.Wait() returns. The cancel carries the original error as its cause, so
+	// a sibling that exits via its ctx path can tell an internal abort
+	// (preserve resumable bytes) apart from a user cancel/pause.
+	jobCtx, jobCancel := context.WithCancelCause(ctx)
+	defer jobCancel(nil)
+
+	// fatalErr records the first job-fatal error. It is surfaced to the caller
+	// in preference to the errCh drain so a sibling goroutine's "context
+	// canceled" (produced while unwinding from the abort) can never mask or
+	// precede the original permanent error.
+	var (
+		fatalMu  sync.Mutex
+		fatalErr error
+	)
+	setFatalErr := func(err error) {
+		fatalMu.Lock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+		fatalMu.Unlock()
+		jobCancel(abortError(err))
+	}
 
 	// To print "skip" only once per final path per run
 	var skipOnce sync.Map
@@ -362,7 +394,7 @@ LOOP:
 	for _, item := range plan.Items {
 		// Stop scheduling more work once canceled
 		select {
-		case <-ctx.Done():
+		case <-jobCtx.Done():
 			break LOOP
 		default:
 		}
@@ -372,7 +404,7 @@ LOOP:
 		// Acquire a slot or abort if canceled
 		select {
 		case lim <- token{}:
-		case <-ctx.Done():
+		case <-jobCtx.Done():
 			break LOOP
 		}
 
@@ -381,8 +413,10 @@ LOOP:
 			defer wg.Done()
 			defer func() { <-lim }()
 
-			// Per-file context; ensures all inner loops stop on cancellation
-			fileCtx, fileCancel := context.WithCancel(ctx)
+			// Per-file context; ensures all inner loops stop on cancellation.
+			// It derives from jobCtx so a fatal error in a sibling file also
+			// stops this one promptly.
+			fileCtx, fileCancel := context.WithCancel(jobCtx)
 			defer fileCancel()
 
 			finalRel := it.RelativePath
@@ -425,23 +459,49 @@ LOOP:
 					// Fallback: sanitize path to avoid collisions
 					tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
 				}
-				dst = filepath.Join(repoDir.BlobsDir(), tmpName)
+				// Guard: SafeJoin so the remote-controlled temp name (SHA256
+				// or path-derived) cannot escape the blobs directory — the
+				// same containment the legacy branch applies to finalRel.
+				// SafeJoin's filepath.IsLocal check also makes this barrier
+				// visible to CodeQL's go/path-injection analysis.
+				safeDst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
+				if err != nil {
+					fatal := fmt.Errorf("path traversal: %q would escape blobs directory", tmpName)
+					setFatalErr(fatal)
+					select {
+					case errCh <- fatal:
+					default:
+					}
+					return
+				}
+				dst = safeDst
 			} else {
 				// Legacy mode: flat directory structure
-				base := destinationBase(job, cfg)
+				base, err := destinationBase(job, cfg)
+				if err != nil {
+					fatal := fmt.Errorf("path traversal: %w", err)
+					setFatalErr(fatal)
+					select {
+					case errCh <- fatal:
+					default:
+					}
+					return
+				}
 				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
 				// output directory via path traversal.
 				safeDst, err := SafeJoin(base, finalRel)
 				if err != nil {
+					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
+					setFatalErr(fatal)
 					select {
-					case errCh <- fmt.Errorf("path traversal: %q would escape output directory", finalRel):
+					case errCh <- fatal:
 					default:
 					}
 					return
 				}
 				dst = safeDst
 				skipCheck = func() (bool, string, error) {
-					return shouldSkipLocal(it, dst)
+					return shouldSkipLocalCtx(fileCtx, it, dst)
 				}
 			}
 
@@ -499,8 +559,12 @@ LOOP:
 				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
 			if dlErr != nil {
+				fatal := fmt.Errorf("download %s: %w", finalRel, dlErr)
+				if isFailFastError(dlErr) {
+					setFatalErr(fatal)
+				}
 				select {
-				case errCh <- fmt.Errorf("download %s: %w", finalRel, dlErr):
+				case errCh <- fatal:
 				default:
 				}
 				return
@@ -516,7 +580,7 @@ LOOP:
 
 			// Verify after download
 			if it.LFS && it.SHA256 != "" {
-				if err := verifySHA256(dst, it.SHA256); err != nil {
+				if err := verifySHA256Ctx(fileCtx, dst, it.SHA256); err != nil {
 					select {
 					case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 					default:
@@ -533,9 +597,27 @@ LOOP:
 					return
 				}
 			} else if cfg.Verify == "sha256" {
-				_, remoteSha, _ := headForETag(fileCtx, httpc, cfg.Token, itForIO)
+				_, remoteSha, herr := headForETag(fileCtx, httpc, cfg.Token, itForIO)
+				if herr != nil {
+					// headForETag maps every non-2xx status (401/403
+					// included) to an optional-metadata miss with no error,
+					// so the ordinary miss path falls through and the actual
+					// file request stays authoritative. Only a genuine
+					// caller cancellation surfaces here, and it must fail
+					// this file promptly instead of pretending verification
+					// succeeded; a fail-fast status error, should one ever
+					// surface, is escalated job-fatal below.
+					if isFailFastError(herr) {
+						setFatalErr(fmt.Errorf("verify head %s: %w", finalRel, herr))
+					}
+					select {
+					case errCh <- fmt.Errorf("verify head %s: %w", finalRel, herr):
+					default:
+					}
+					return
+				}
 				if remoteSha != "" {
-					if err := verifySHA256(dst, remoteSha); err != nil {
+					if err := verifySHA256Ctx(fileCtx, dst, remoteSha); err != nil {
 						select {
 						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 						default:
@@ -545,11 +627,13 @@ LOOP:
 				}
 			}
 
-			// For HF Cache mode: move to blob and create symlinks
+			// For HF Cache mode: move to blob and create symlinks. The store
+			// re-hashes/copies a large file, so pass the per-file context: a
+			// sibling's fail-fast abort must not wait for it to finish.
 			var finalSHA256 string
 			if useHFCache {
 				sha := it.SHA256
-				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -586,17 +670,29 @@ LOOP:
 	wg.Wait()
 	close(errCh)
 
-	// Drain errors
-	var firstErr error
+	// Drain errors, but remember every error so the job-fatal error (if any)
+	// can take precedence over a sibling goroutine's "context canceled" that
+	// happened to land in errCh first.
+	drainedErr := error(nil)
 	for e := range errCh {
-		if e != nil {
-			firstErr = e
-			break
+		if e != nil && drainedErr == nil {
+			drainedErr = e
 		}
 	}
-	if firstErr != nil {
-		emit(ProgressEvent{Level: "error", Event: "error", Message: firstErr.Error()})
-		return firstErr
+
+	fatalMu.Lock()
+	jobFatal := fatalErr
+	fatalMu.Unlock()
+
+	// The original permanent (fail-fast) error is surfaced in preference to
+	// anything a sibling produced while unwinding from the abort.
+	if jobFatal != nil {
+		emit(ProgressEvent{Level: "error", Event: "error", Message: jobFatal.Error()})
+		return jobFatal
+	}
+	if drainedErr != nil {
+		emit(ProgressEvent{Level: "error", Event: "error", Message: drainedErr.Error()})
+		return drainedErr
 	}
 
 	if ctx.Err() != nil {
@@ -659,8 +755,11 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
 	}
-	// dst is already guarded by SafeJoin for local mode and SHA256/BlobsDir
-	// derivation for HF cache mode upstream in Download().
+	// dst is derived upstream in Download() through SafeJoin in both modes:
+	// legacy mode joins the remote file path to the output directory, and HF
+	// cache mode joins the tmp-<sha> name to the blobs directory. SafeJoin
+	// rejects non-local values via filepath.IsLocal and proves containment
+	// with PathInside, so dst cannot name a file outside those roots.
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
@@ -750,8 +849,10 @@ func pathWithinRoot(root, path string) bool {
 // file at dst. The downloader normally writes partial bytes to
 // dst+".part" / dst+".part-NN" first, then renames assembled bytes to
 // dst before StoreDownloadedFile moves them into the final blob. dst is
-// already validated as residing inside the blobs dir at allocation time
-// in Download().
+// allocated in Download() via SafeJoin(blobsDir, tmpName), which rejects
+// non-local values (filepath.IsLocal) and proves containment with
+// PathInside, and scanRepo rejects malformed remote SHAs before they can
+// become a tmpName at all.
 func removeHFCacheTemp(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
@@ -835,6 +936,67 @@ func RepoTypeFromJob(job Job) RepoType {
 	return RepoTypeModel
 }
 
+// isFailFastError reports whether err is a permanent file/part error (an
+// *APIError with a fail-fast status: 401/403/404). It is used to distinguish
+// "abort the whole job" from ordinary retryable/network failures when
+// registering the fatal error for a file.
+func isFailFastError(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.IsFailFast()
+}
+
+// abortCause wraps an internally-generated fail-fast error used as a context
+// cancellation cause. It marks the cancel as an internal abort (preserve
+// resumable bytes) independent of the wrapped error's concrete type, which may
+// be an *APIError (401/403/404) or a plain error such as the job-level
+// path-traversal rejection. Testing a dedicated sentinel rather than the
+// error's HTTP status also keeps it distinct from a user cancel/pause.
+type abortCause struct{ err error }
+
+func (a *abortCause) Error() string { return a.err.Error() }
+func (a *abortCause) Unwrap() error { return a.err }
+
+// abortError wraps err so it can be used as an internal-abort cancel cause.
+func abortError(err error) error { return &abortCause{err: err} }
+
+// abortPartAttempt reports whether ctx was canceled by an internal fail-fast
+// abort (see abortCause) rather than a user cancel/pause/shutdown. Returning
+// without calling cleanupPartialsOnCancel preserves the resumable
+// .part/.part-NN/.parts.json bytes for a later retry.
+func abortPartAttempt(ctx context.Context) bool {
+	var a *abortCause
+	return errors.As(context.Cause(ctx), &a)
+}
+
+// maxAttemptsPerRetry scales the configured retry budget into the absolute
+// per-file/per-part attempt ceiling below. It is deliberately generous: a
+// legitimately flaky long download that keeps advancing past many stalls must
+// still complete, so the ceiling tolerates many progress refunds. It is a
+// package variable (not a public API) so tests can lower it deterministically.
+var maxAttemptsPerRetry = 100
+
+// absoluteAttemptCeiling bounds retry attempts over the lifetime of one file or
+// part, including retries enabled by progress refunds. The limit is checked
+// after each request attempt returns; it does not bound a request that keeps
+// delivering data without returning. The high-water-mark rule refunds only
+// after non-truncating progress strictly beyond the previous mark. An ignored-
+// Range restart can record a higher mark but never refunds the budget, and a
+// later bodyless failure earns no refund from that mark. retries<0 is treated
+// as 0.
+func absoluteAttemptCeiling(retries int) int {
+	if retries < 0 {
+		retries = 0
+	}
+	if maxAttemptsPerRetry <= 0 {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if retries >= maxInt/maxAttemptsPerRetry {
+		return maxInt
+	}
+	return (retries + 1) * maxAttemptsPerRetry
+}
+
 // downloadSingle downloads a file in a single request.
 //
 // Resume behavior: if a .part file already exists from a previous interrupted
@@ -876,18 +1038,42 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 
 	retry := newRetry(cfg)
+	stall := stallTimeout(cfg)
+	attempts := cfg.Retries
+	if attempts < 0 {
+		attempts = 0
+	}
+	remaining := attempts
+	attempt := 0
+	ceiling := absoluteAttemptCeiling(attempts)
 	var lastErr error
+	// The high-water mark prevents non-progress and ignored-Range restarts from
+	// refunding the budget. The separate lifetime retry ceiling limits retries
+	// once attempts return; it does not time-bound a request that keeps delivering
+	// data. An ignored-Range restart may record a higher mark but cannot earn a
+	// refund, so a following bodyless failure also earns none.
+	// hwm is the highest offset ever reached for this file, seeded with the
+	// initial on-disk offset.
+	hwm := pos
 
-	for attempt := 0; attempt <= cfg.Retries; attempt++ {
+	for {
 		select {
 		case <-ctx.Done():
 			out.Close()
-			cleanupPartialsOnCancel(cfg, dst)
+			// An internal fail-fast abort must not delete resumable bytes.
+			if !abortPartAttempt(ctx) {
+				cleanupPartialsOnCancel(cfg, dst)
+			}
 			return ctx.Err()
 		default:
 		}
 
-		req, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
+		// Each attempt gets its own cancellable context so the stall
+		// watchdog can abort just this attempt (closing the connection or
+		// HTTP/2 stream) without cancelling the whole job.
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+
+		req, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 		addAuth(req, token)
 		if pos > 0 {
 			if it.Size > 0 {
@@ -897,6 +1083,20 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			}
 		}
 
+		// waitResp carries a throttling response (429/503) whose Retry-After /
+		// RateLimit header must shape the next wait.
+		var waitResp *http.Response
+		// truncatedRestart is set when the server ignored our Range and
+		// answered 200 while resumable bytes were present, forcing a restart
+		// from zero. That is destructive rather than progress, so it must not
+		// refund the budget (and it bounds the ignored-Range growing-prefix
+		// server, which would otherwise advance the high-water mark on every
+		// attempt).
+		truncatedRestart := false
+		// preHwm is the high-water mark as of the start of this attempt; the
+		// refund decision compares the final pos against it (see below).
+		preHwm := hwm
+
 		resp, err := httpc.Do(req)
 		if err != nil {
 			lastErr = err
@@ -904,29 +1104,55 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			// If we asked for a range but the server returned the whole body,
 			// throw away any existing partial bytes and start fresh.
 			if pos > 0 && resp.StatusCode == http.StatusOK {
+				truncatedRestart = true
 				if err := out.Truncate(0); err != nil {
 					resp.Body.Close()
+					attemptCancel()
 					return err
 				}
 				if _, err := out.Seek(0, io.SeekStart); err != nil {
 					resp.Body.Close()
+					attemptCancel()
 					return err
 				}
 				pos = 0
 			}
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				lastErr = fmt.Errorf("bad status: %s", resp.Status)
+			if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil {
+				lastErr = apiErr
 				resp.Body.Close()
+				if apiErr.IsFailFast() {
+					// Permanent for the whole job: no retry, no request
+					// storm. Remove any empty partial this attempt created
+					// before returning the actionable error.
+					attemptCancel()
+					out.Close()
+					removeEmptyPartialFile(tmp)
+					return lastErr
+				}
+				if !apiErr.IsRetryable() {
+					attemptCancel()
+					out.Close()
+					return lastErr
+				}
+				waitResp = resp
 			} else {
-				pr := newProgressReader(cfg.SpeedLimiter.Reader(ctx, resp.Body), it.Size, it.RelativePath, emit)
+				// The stall watchdog wraps the raw network body BEFORE the
+				// speed limiter's pacing, so deliberate throttling is not
+				// mistaken for a stalled peer.
+				body := newStallReader(resp.Body, stall, attemptCancel)
+				pr := newProgressReader(cfg.SpeedLimiter.Reader(attemptCtx, body), it.Size, it.RelativePath, emit)
 				pr.downloaded = pos // emitted progress reflects cumulative bytes
 				_, cerr := io.Copy(out, pr)
 				resp.Body.Close()
+				attemptCancel()
 				if cerr == nil {
 					out.Close()
 					return os.Rename(tmp, dst)
 				}
-				lastErr = cerr
+				// If this attempt's stall watchdog fired, the failure is a
+				// stall, not a caller cancellation — classifyStall keeps a
+				// done parent context (genuine cancel) unchanged.
+				lastErr = classifyStall(ctx, body, cerr)
 				// Update pos to current file position so the next retry issues
 				// a Range request for the remaining bytes instead of duplicating.
 				if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
@@ -934,39 +1160,133 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				}
 			}
 		}
+		attemptCancel()
 
-		if attempt < cfg.Retries {
-			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-			if d := retry.Next(); !sleepCtx(ctx, d) {
+		// Refund the retry budget only when this attempt moved STRICTLY above
+		// the high-water mark captured BEFORE the attempt AND did not truncate
+		// previously-resumable bytes (an ignored-Range 200 restart is
+		// destructive, not progress). preHwm is read before the attempt because
+		// hwm is otherwise updated unconditionally below: a restart that writes
+		// past the old mark must be recorded (so it cannot earn a later free
+		// refund from a bodyless failure) without itself granting a refund.
+		// The ceiling above still bounds how far refunds may extend the budget.
+		advanced := pos > preHwm && !truncatedRestart
+		// Always record the highest offset reached, regardless of refund
+		// eligibility, so a truncating restart's higher offset is never lost.
+		if pos > hwm {
+			hwm = pos
+		}
+		if advanced {
+			retry.reset()
+			remaining = attempts
+		}
+
+		if remaining == 0 || attempt >= ceiling {
+			if ctx.Err() != nil {
 				out.Close()
-				cleanupPartialsOnCancel(cfg, dst)
+				if !abortPartAttempt(ctx) {
+					cleanupPartialsOnCancel(cfg, dst)
+				}
 				return ctx.Err()
 			}
-		} else if ctx.Err() != nil {
+			break
+		}
+		remaining--
+		attempt++
+		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+		if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
 			out.Close()
-			cleanupPartialsOnCancel(cfg, dst)
+			if !abortPartAttempt(ctx) {
+				cleanupPartialsOnCancel(cfg, dst)
+			}
 			return ctx.Err()
 		}
 	}
 	return lastErr
 }
 
+// removeEmptyPartialFile removes path when it exists and is empty. It is used
+// to clean up a zero-byte .part file that a fail-fast attempt created, without
+// touching a partial that predates the attempt and may hold resumable bytes.
+func removeEmptyPartialFile(path string) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if fi.Size() != 0 {
+		return
+	}
+	// lgtm[go/path-injection]
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup empty partial file %s: %v", path, err)
+	}
+}
+
 // downloadMultipart downloads a file using multiple parallel range requests.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
-	// HEAD to resolve size
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
-	addAuth(req, token)
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return err
+	// HEAD to resolve size, reissued only when the server throttles (429/503)
+	// and bounded by the same attempt/backoff conventions as the transfer
+	// loops: wait the larger of the server-requested Retry-After and the
+	// local backoff (capped at DefaultMaxRetryAfter) with a context-aware
+	// sleep so pause/cancel/shutdown stays prompt, then reissue the HEAD
+	// within the configured retry budget.
+	retry := newRetry(cfg)
+	remaining := cfg.Retries
+	if remaining < 0 {
+		remaining = 0
 	}
-	resp.Body.Close()
+	attempt := 0
+	for {
+		req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
+		addAuth(req, token)
+		resp, err := httpc.Do(req)
+		if err != nil {
+			return err
+		}
+		// A HEAD response carries headers only, so its body is closed
+		// immediately instead of being held open (via defer) for the whole
+		// parallel transfer. Status and headers stay readable after Close
+		// for the classification and size resolution below.
+		resp.Body.Close()
 
-	if it.Size == 0 {
-		if clen := resp.Header.Get("Content-Length"); clen != "" {
-			var n int64
-			fmt.Sscan(clen, &n)
-			it.Size = n
+		apiErr := classifyFileResponse(resp, it.URL)
+
+		// A permanent gated/private/missing response on HEAD fails the whole
+		// job immediately with the actionable message, before any part
+		// requests are issued.
+		if apiErr != nil && apiErr.IsFailFast() {
+			removeEmptyPartialFile(dst + ".part")
+			return apiErr
+		}
+
+		// A throttling 429/503 must not be accepted as the resolved HEAD.
+		// Every other status keeps the previous behavior (proceed and let
+		// the part loop classify it).
+		if resp.StatusCode != http.StatusTooManyRequests &&
+			resp.StatusCode != http.StatusServiceUnavailable {
+			if it.Size == 0 {
+				if clen := resp.Header.Get("Content-Length"); clen != "" {
+					var n int64
+					fmt.Sscan(clen, &n)
+					it.Size = n
+				}
+			}
+			break
+		}
+
+		// Throttled: wait out the server-requested Retry-After (or the local
+		// backoff, whichever is larger) and reissue the HEAD. When the retry
+		// budget is exhausted, surface the transient error like an exhausted
+		// transfer retry instead of silently proceeding with a throttled
+		// response.
+		if remaining == 0 {
+			return apiErr
+		}
+		remaining--
+		attempt++
+		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: apiErr.Error()})
+		if d := NextRetryWait(resp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
+			return ctx.Err()
 		}
 	}
 	if it.Size == 0 {
@@ -993,6 +1313,22 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// Download parts in parallel
 	var wg sync.WaitGroup
 	errCh := make(chan error, n)
+
+	// Part-scoped cancellable context: a permanent (fail-fast) error on any one
+	// part cancels the whole file so sibling parts stop promptly instead of
+	// downloading/retrying/waiting until wg.Wait() returns. The cancel cause is
+	// an abortCause wrapping the original error (see abortError), which lets a
+	// sibling part that exits via its ctx path distinguish an internal abort
+	// from a user cancel/pause.
+	partCtx, partCancel := context.WithCancelCause(ctx)
+	defer partCancel(nil)
+
+	// partErr records the first permanent part error so the caller surfaces the
+	// original error rather than a sibling's "context canceled" from errCh.
+	var (
+		partErrMu sync.Mutex
+		partErr   error
+	)
 
 	for i := 0; i < n; i++ {
 		i := i
@@ -1053,44 +1389,138 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			}
 
 			retry := newRetry(cfg)
+			stall := stallTimeout(cfg)
+			attempts := cfg.Retries
+			if attempts < 0 {
+				attempts = 0
+			}
+			remaining := attempts
+			attempt := 0
+			ceiling := absoluteAttemptCeiling(attempts)
 			var lastErr error
+			// hwm is the highest offset ever reached for this part, seeded with
+			// the initial on-disk offset. The retry budget is refunded only when
+			// an attempt moves STRICTLY above it, so an ignored-Range restart or
+			// oscillation never refills the budget; the absolute ceiling then
+			// bounds a server that streams a strictly growing prefix (see
+			// downloadSingle for the two-term rationale).
+			hwm := pos
 
-			for attempt := 0; attempt <= cfg.Retries; attempt++ {
+			for {
 				select {
-				case <-ctx.Done():
+				case <-partCtx.Done():
 					return
 				default:
 				}
 
-				rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
+				// Per-attempt context: the stall watchdog cancels only this
+				// part's attempt, leaving sibling parts and the job untouched.
+				attemptCtx, attemptCancel := context.WithCancel(partCtx)
+
+				rq, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 				addAuth(rq, token)
 				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
+
+				preHwm := hwm
+				var waitResp *http.Response
 
 				rs, err := httpc.Do(rq)
 				if err != nil {
 					lastErr = err
-				} else if rs.StatusCode != 206 {
-					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
+				} else if rs.StatusCode == http.StatusPartialContent {
+					// The stall watchdog wraps the raw network body before the
+					// speed limiter's pacing.
+					body := newStallReader(rs.Body, stall, attemptCancel)
+					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(attemptCtx, body))
 					rs.Body.Close()
-				} else {
-					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(ctx, rs.Body))
-					rs.Body.Close()
+					attemptCancel()
 					if cerr == nil {
 						return
 					}
-					lastErr = cerr
+					// A fired stall watchdog marks this attempt's failure as
+					// a stall; a done partCtx keeps the genuine-cancel error
+					// (see classifyStall precedence).
+					lastErr = classifyStall(partCtx, body, cerr)
 					// Advance pos by what we actually wrote so the next retry
 					// Range request picks up from the correct offset.
 					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
 						pos = cur
 					}
+				} else {
+					// Any non-206 is a failure. A permanent 401/403/404 fails
+					// the whole job immediately; a throttling 429/503 shapes
+					// the next wait; a 200 means the server ignored Range (a
+					// multipart protocol violation) and is retried as before.
+					rs.Body.Close()
+					if apiErr := classifyFileResponse(rs, it.URL); apiErr != nil {
+						lastErr = apiErr
+						if apiErr.IsFailFast() {
+							// Permanent for the whole file/job: cancel sibling
+							// parts with the original error as the cause, record
+							// it for the caller, and return. Close out BEFORE
+							// removing the (possibly empty) partial so Windows
+							// can unlink the still-open file — mirroring the
+							// single-file ordering.
+							attemptCancel()
+							partErrMu.Lock()
+							if partErr == nil {
+								partErr = lastErr
+							}
+							partErrMu.Unlock()
+							partCancel(abortError(lastErr))
+							out.Close()
+							removeEmptyPartialFile(tmp)
+							select {
+							case errCh <- lastErr:
+							default:
+							}
+							return
+						}
+						if !apiErr.IsRetryable() {
+							attemptCancel()
+							partErrMu.Lock()
+							if partErr == nil {
+								partErr = lastErr
+							}
+							partErrMu.Unlock()
+							partCancel(abortError(lastErr))
+							out.Close()
+							select {
+							case errCh <- lastErr:
+							default:
+							}
+							return
+						}
+						waitResp = rs
+					} else {
+						lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
+					}
+				}
+				attemptCancel()
+
+				// Refund the retry budget only when this attempt moved STRICTLY
+				// above the high-water mark captured BEFORE the attempt.
+				// preHwm is read first because hwm is updated unconditionally
+				// below, so a restart's higher offset is recorded and can never
+				// later earn a free refund from a bodyless failure. Multipart
+				// has no truncation path.
+				advanced := pos > preHwm
+				if pos > hwm {
+					hwm = pos
+				}
+				if advanced {
+					retry.reset()
+					remaining = attempts
 				}
 
-				if attempt < cfg.Retries {
-					emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-					if d := retry.Next(); !sleepCtx(ctx, d) {
-						return
-					}
+				if remaining == 0 || attempt >= ceiling {
+					break
+				}
+				remaining--
+				attempt++
+				emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+				if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(partCtx, d) {
+					return
 				}
 			}
 
@@ -1138,6 +1568,18 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	close(tickerDone)
 	tickerWG.Wait()
 
+	// A permanent (fail-fast) part error cancels partCtx and is the error the
+	// caller must see; return it in preference to the sibling "context
+	// canceled" that the ctx check below would surface. An internal abort
+	// must NOT run cancel-cleanup (T3): only genuinely empty partials are
+	// removed, by the failing part itself, and resumable bytes are preserved.
+	partErrMu.Lock()
+	permanentErr := partErr
+	partErrMu.Unlock()
+	if permanentErr != nil {
+		return permanentErr
+	}
+
 	// If the context was cancelled while parts were running (pause / abort /
 	// timeout), return the cancellation error immediately. Part goroutines
 	// that exit via their ctx-aware retry/sleep path do NOT push to errCh,
@@ -1146,9 +1588,20 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// bogus "downloaded == total" progress emit below AND stops the
 	// assembly loop from stitching an incomplete part set into a corrupt
 	// final file and deleting the partial bytes the next resume needs.
-	if ctx.Err() != nil {
-		cleanupPartialsOnCancel(cfg, dst)
-		return ctx.Err()
+	//
+	// The guard keys off partCtx — the context a part fail-fast actually
+	// cancels (via abortCause) — not the file ctx, so it stays correct even
+	// if the cancel wiring changes. (A file fail-fast is already returned
+	// above via partErr, so this branch handles user cancel/pause and any
+	// internal abort of partCtx.)
+	if ctx.Err() != nil || partCtx.Err() != nil {
+		if !abortPartAttempt(partCtx) {
+			cleanupPartialsOnCancel(cfg, dst)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return partCtx.Err()
 	}
 
 	select {
@@ -1167,27 +1620,59 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// multi-GB files. Signal it so the UI doesn't sit silently at 100%.
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "assembling parts"})
 
-	// Assemble parts
+	// Abort before touching the part files if the job/part context was
+	// cancelled between the guard above and here. Preserve the resumable
+	// .part-NN part files (they are the resumable data); an internal fail-fast
+	// abort must NOT run the user-cancel cleanup. Remove any incomplete
+	// intermediate dst.part this call may have created — none yet at this
+	// point, so just return the cancellation cause.
+	if cerr := partCtx.Err(); cerr != nil {
+		if !abortPartAttempt(partCtx) {
+			cleanupPartialsOnCancel(cfg, dst)
+		}
+		return cerr
+	}
+
+	// Assemble parts. The context-checking reader and the per-part check make
+	// the local copy stop promptly once a sibling's permanent error (or a user
+	// cancel) has cancelled partCtx, instead of hashing/stitching a multi-GB
+	// sibling to completion. An internal abort preserves the .part-NN files
+	// (resumable data) and removes the incomplete intermediate dst.part.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
 		return err
 	}
 
 	for i := 0; i < n; i++ {
+		if cerr := partCtx.Err(); cerr != nil {
+			out.Close()
+			removeIncompleteAssembly(cfg, dst, partCtx)
+			return cerr
+		}
 		p := tmpParts[i]
 		in, err := os.Open(p)
 		if err != nil {
 			out.Close()
+			removeIncompleteAssembly(cfg, dst, partCtx)
 			return err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		if _, err := io.Copy(out, contextReader{ctx: partCtx, r: in}); err != nil {
 			in.Close()
 			out.Close()
+			if cerr := partCtx.Err(); cerr != nil {
+				removeIncompleteAssembly(cfg, dst, partCtx)
+				return cerr
+			}
 			return err
 		}
 		in.Close()
 	}
 	out.Close()
+
+	if cerr := partCtx.Err(); cerr != nil {
+		removeIncompleteAssembly(cfg, dst, partCtx)
+		return cerr
+	}
 
 	if err := os.Rename(dst+".part", dst); err != nil {
 		return err
@@ -1199,4 +1684,20 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	_ = os.Remove(multipartLayoutMetaPath(dst))
 
 	return nil
+}
+
+// removeIncompleteAssembly handles a cancellation that landed during part
+// assembly. On an internal fail-fast abort it preserves the resumable .part-NN
+// part files and removes only the incomplete intermediate dst.part (which is
+// not resumable and would otherwise be a corrupt leftover). On a user cancel
+// it keeps the existing cleanupPartialsOnCancel semantics unchanged.
+func removeIncompleteAssembly(cfg Settings, dst string, ctx context.Context) {
+	if abortPartAttempt(ctx) {
+		// lgtm[go/path-injection]
+		if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: cleanup incomplete assembly %s: %v", dst+".part", err)
+		}
+		return
+	}
+	cleanupPartialsOnCancel(cfg, dst)
 }

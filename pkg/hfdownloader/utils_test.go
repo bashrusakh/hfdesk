@@ -256,3 +256,50 @@ func TestSleepCtx(t *testing.T) {
 		}
 	})
 }
+
+// TestBackoffNoOverflow verifies that extreme configured backoff durations
+// never make Next return or store a negative/overflowed value. Before the fix,
+// `time.Duration(float64(b.next) * b.mult)` overflowed int64 nanoseconds for
+// huge backoffMax, producing a negative `next` and therefore ~0 delays (a retry
+// burst with no pacing).
+func TestBackoffNoOverflow(t *testing.T) {
+	// A duration at/near MaxInt64 nanoseconds, well above maxBackoffCeiling.
+	const huge = "9223372036854775807ns"
+	extremes := []Settings{
+		{BackoffInitial: huge, BackoffMax: huge},
+		{BackoffInitial: huge, BackoffMax: "1h"},
+		{BackoffInitial: "0", BackoffMax: huge},
+		{BackoffInitial: "-1s", BackoffMax: "-1s"},
+	}
+	for i, cfg := range extremes {
+		b := newRetry(cfg)
+		if b.max <= 0 || b.max > maxBackoffCeiling {
+			t.Errorf("case %d: max = %v, want (0, %v]", i, b.max, maxBackoffCeiling)
+		}
+		if b.init < 0 || b.init > b.max {
+			t.Errorf("case %d: init = %v out of [0, max=%v]", i, b.init, b.max)
+		}
+		prev := time.Duration(-1)
+		for n := 0; n < 60; n++ {
+			d := b.Next()
+			if d < 0 {
+				t.Fatalf("case %d: Next() = %v, must be >= 0", i, d)
+			}
+			if d > b.max {
+				t.Fatalf("case %d: Next() = %v exceeds max %v", i, d, b.max)
+			}
+			if n == 0 && b.max > 0 && b.init > 0 && d <= 0 {
+				t.Errorf("case %d: first Next() = %v, want > 0", i, d)
+			}
+			// Non-decreasing until it caps at max (only meaningful when the
+			// exponential base is non-zero; backoffInitial "0" is pure jitter).
+			if b.init > 0 && prev >= 0 && d < prev && prev < b.max {
+				t.Errorf("case %d: Next() decreased from %v to %v before capping", i, prev, d)
+			}
+			prev = d
+			if b.next < 0 || b.next > b.max {
+				t.Fatalf("case %d: internal next = %v out of [0, max=%v]", i, b.next, b.max)
+			}
+		}
+	}
+}
