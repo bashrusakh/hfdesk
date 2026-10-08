@@ -1,6 +1,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,6 +82,18 @@ func NewHFCache(root string, staleTimeout time.Duration) *HFCache {
 	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"), staleTimeout)
 }
 
+// rootedOrFallback returns p when p is a rooted (absolute) filesystem path
+// and fallback otherwise. The rooted test is stated with strings.HasPrefix,
+// the primitive code scanning models as a path guard; returning p inside the
+// true branch means taint in p cannot flow past this helper, so a
+// caller-supplied root reaches the cache only through a proven-rooted value.
+func rootedOrFallback(p, fallback string) string {
+	if strings.HasPrefix(p, filepath.VolumeName(p)+string(filepath.Separator)) {
+		return p
+	}
+	return fallback
+}
+
 // NewHFCacheResolved constructs a cache from an already selected root/Hub
 // association without consulting ENV. An empty hubDir means root/hub.
 // Callers freezing destinations must supply the resolved nonempty root.
@@ -90,12 +103,18 @@ func NewHFCacheResolved(root, hubDir string, staleTimeout time.Duration) *HFCach
 	if absolute, err := filepath.Abs(root); err == nil {
 		root = absolute
 	}
+	// filepath.Abs can only fail when the working directory is unavailable,
+	// which would otherwise leave every path in this cache relative to a
+	// directory that can change at any time. Fall back to the default cache
+	// location so root is always rooted.
+	root = rootedOrFallback(root, DefaultCacheDir())
 	if hubDir == "" {
 		hubDir = filepath.Join(root, "hub")
 	}
 	if absolute, err := filepath.Abs(hubDir); err == nil {
 		hubDir = absolute
 	}
+	hubDir = rootedOrFallback(hubDir, filepath.Join(root, "hub"))
 	if staleTimeout == 0 {
 		staleTimeout = DefaultStaleTimeout
 	}
@@ -132,6 +151,14 @@ type RepoDir struct {
 // Repo returns a RepoDir for the given repository.
 // repoID should be in the format "owner/name".
 func (c *HFCache) Repo(repoID string, repoType RepoType) (*RepoDir, error) {
+	// IsValidModelName is the authoritative repo-ID rule (exact owner/name,
+	// no traversal segments). filepath.IsLocal restates the traversal part of
+	// that rule with the primitive code scanning models as a path barrier, so
+	// the repoID-derived directory names below are provably non-escaping; it
+	// never accepts anything IsValidModelName would reject afterwards.
+	if !filepath.IsLocal(repoID) {
+		return nil, fmt.Errorf("invalid repo ID: %q must be a local path", repoID)
+	}
 	// Reuse the single repo-ID validator so cache lookups reject the same
 	// traversal/separator inputs as the HTTP handlers (e.g. "../foo").
 	if !IsValidModelName(repoID) {
@@ -177,9 +204,25 @@ func (r *RepoDir) SnapshotsDir() string {
 	return filepath.Join(r.Path(), "snapshots")
 }
 
+// invalidBlobName is the contained placeholder BlobPath returns when handed a
+// blob name that would escape the blobs directory. It is a fixed string (so a
+// tainted name can never influence the returned path) that cannot collide with
+// real blob names, which are hex digests.
+const invalidBlobName = "invalid-blob-name"
+
 // BlobPath returns the path where a blob with the given SHA256 should be stored.
+// The name is confined to the blobs directory the same way RefPath and
+// SnapshotDir confine theirs: SafeJoin rejects values that are not local
+// (filepath.IsLocal, the CodeQL-modeled path-injection barrier), so no blob
+// name can point outside blobs/. Malformed remote SHAs are already rejected
+// loudly by scanRepo; the placeholder below only covers a direct API misuse
+// because this method cannot return an error without breaking its callers.
 func (r *RepoDir) BlobPath(sha256 string) string {
-	return filepath.Join(r.BlobsDir(), sha256)
+	blobPath, err := SafeJoin(r.BlobsDir(), sha256)
+	if err != nil {
+		return filepath.Join(r.BlobsDir(), invalidBlobName)
+	}
+	return blobPath
 }
 
 // IncompletePath returns the path for an incomplete download.
@@ -630,9 +673,15 @@ type StoreFileResult struct {
 //   - filterSubdir: optional filter subdirectory for friendly view
 //   - noFriendly: if true, skip creating friendly view symlink
 func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
+	return r.storeDownloadedFileCtx(context.Background(), tempFile, relativePath, commit, sha256, filterSubdir, noFriendly)
+}
+
+// storeDownloadedFileCtx is the context-bounded implementation used by the
+// downloader; the existing public context-free API remains unchanged.
+func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
 	// Compute SHA256 if not provided
 	if sha256 == "" {
-		computed, err := computeSHA256(tempFile)
+		computed, err := computeSHA256Ctx(ctx, tempFile)
 		if err != nil {
 			return nil, fmt.Errorf("compute sha256: %w", err)
 		}
@@ -651,8 +700,11 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 			return nil, fmt.Errorf("create blobs directory: %w", err)
 		}
 		if err := os.Rename(tempFile, blobPath); err != nil {
-			// Rename failed (cross-device?), try copy
-			if err := copyFile(tempFile, blobPath); err != nil {
+			// Rename failed (cross-device?), try an atomic copy: stage in a
+			// sibling temp file, then atomically rename it into place. A cancelled or
+			// failed copy must never leave a partial file at the FINAL blob
+			// path (which CheckBlob would report complete, poisoning the cache).
+			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
 				return nil, fmt.Errorf("move file to blob: %w", err)
 			}
 			os.Remove(tempFile)
@@ -709,4 +761,59 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// copyFileAtomicCtx copies src to dst atomically: it streams into a sibling
+// temporary file in the same directory, closes it, then renames it onto dst. On
+// ctx cancellation or any error it removes the staging file and leaves both src
+// intact and dst absent/unchanged, so a cancelled copy can never leave a partial
+// file at dst. It is the publish variant used for cache blobs, where a partial
+// file at the final path would be mistaken for a complete blob.
+//
+// The staged bytes are copied to their final mode (matching what the same-device
+// rename path publishes) so a cross-device fallback does not change blob
+// permissions.
+//
+// This provides atomic visibility, not crash durability: it does not fsync the
+// staged file or containing directory.
+func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	// Stage in the destination's directory so the final rename is atomic
+	// (same filesystem).
+	staging, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	stagingPath := staging.Name()
+	// Clean up the staging file on every non-success path. Once the rename
+	// succeeds the staging path no longer exists, so os.Remove is a no-op.
+	defer os.Remove(stagingPath)
+
+	if _, err := io.Copy(staging, contextReader{ctx: ctx, r: in}); err != nil {
+		staging.Close()
+		return err
+	}
+
+	// Match the mode the same-device rename path publishes. The downloader
+	// creates the source temp at 0o644, but os.CreateTemp stages at 0600, so
+	// without this a cross-device copy would make blobs owner-only and break a
+	// shared HF cache (EACCES for other users/containers). Best-effort read of
+	// the source mode, falling back to 0644.
+	mode := os.FileMode(0o644)
+	if fi, statErr := os.Stat(src); statErr == nil {
+		mode = fi.Mode().Perm()
+	}
+	if err := staging.Chmod(mode); err != nil {
+		staging.Close()
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	return os.Rename(stagingPath, dst)
 }

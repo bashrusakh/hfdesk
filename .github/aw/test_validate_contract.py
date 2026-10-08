@@ -30,7 +30,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,6 +75,40 @@ SOURCE_TOOLSETS_ISSUES = "    toolsets: [issues]\n"
 SOURCE_TOOLSETS_WITH_PRS = "    toolsets: [issues, pull_requests]\n"
 LOCK_TOOLSETS_ISSUES = '"GITHUB_TOOLSETS": "issues"'
 LOCK_TOOLSETS_WITH_PRS = '"GITHUB_TOOLSETS": "issues,pull_requests"'
+
+# The human-owned label patterns every add-labels/remove-labels block must keep blocked.
+# The source blocks and both compiled lock configs must stay in exact set parity.
+LOCK_CONFIG_KEYS = ("GH_AW_SAFE_OUTPUTS_CONFIG", "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG")
+REQUIRED_BLOCKED_LABEL_PATTERNS = (
+    "priority-*",
+    "codex-*",
+    "confirmed",
+    "invalid",
+    "wontfix",
+    "good first issue",
+    "help wanted",
+    "~*",
+    "*[bot]",
+)
+SOURCE_BLOCKED_LINE = (
+    '    blocked: ["priority-*", "codex-*", "confirmed", "invalid", "wontfix", '
+    '"good first issue", "help wanted", "~*", "*[bot]"]\n'
+)
+# The regression shapes: one required owner pattern dropped, the list emptied, and a
+# blocked list that keeps allowed-style entries but drops the codex-* owner family.
+SOURCE_BLOCKED_MISSING_PRIORITY = (
+    '    blocked: ["codex-*", "confirmed", "invalid", "wontfix", '
+    '"good first issue", "help wanted", "~*", "*[bot]"]\n'
+)
+SOURCE_BLOCKED_MISSING_CONFIRMED = (
+    '    blocked: ["priority-*", "codex-*", "invalid", "wontfix", '
+    '"good first issue", "help wanted", "~*", "*[bot]"]\n'
+)
+SOURCE_BLOCKED_WITH_ALLOWED_ENTRIES_MISSING_CODEX = (
+    '    blocked: ["bug", "enhancement", "priority-*", "confirmed", "invalid", '
+    '"wontfix", "good first issue", "help wanted", "~*", "*[bot]"]\n'
+)
+SOURCE_BLOCKED_EMPTY = "    blocked: []\n"
 
 # The direct-label instruction in the deployment prompt bodies (a suggested label is
 # routed to pending review instead of applied, so it must never be used here).
@@ -185,6 +221,88 @@ class ContractValidatorTest(unittest.TestCase):
             f"expected {occurrences} occurrence(s) of {old[:60]!r} in {rel}",
         )
         self.write(rel, text.replace(old, new))
+
+    def update_lock_config(self, rel: str, key: str, callback) -> None:
+        """Apply `callback(config)` to one compiled safe-output JSON config in a lock.
+
+        The lock stores each config as a double-quoted YAML scalar whose payload is
+        JSON, so it is decoded, edited and re-encoded like the validator does. The
+        key must occur exactly once so an unexpected lock shape fails loudly instead
+        of silently mutating nothing.
+        """
+        text = self.read(rel)
+        match = re.search(
+            r"^(\s*" + re.escape(key) + r':\s*)(".*")(\s*)$', text, re.MULTILINE
+        )
+        self.assertIsNotNone(match, f"{key} not found in {rel}")
+        config = json.loads(json.loads(match.group(2)))
+        callback(config)
+        scalar = json.dumps(json.dumps(config, separators=(",", ":")))
+        self.write(
+            rel,
+            text[: match.start()] + match.group(1) + scalar + match.group(3)
+            + text[match.end():],
+        )
+
+    def mutate_blocked_array(
+        self, rel: str, name: str, old_pattern: str, new_pattern: str,
+        configs: tuple[str, ...] = LOCK_CONFIG_KEYS,
+    ) -> None:
+        """Rewrite one blocked pattern in a compiled `name` handler config.
+
+        Only the named configs are rewritten, which also allows building the
+        add-labels/remove-labels asymmetry case.
+        """
+        def edit(config: dict) -> None:
+            section = config.get(name.replace("-", "_"))
+            self.assertIsInstance(section, dict, f"{name} not found in {rel}")
+            blocked = section.get("blocked")
+            self.assertIsInstance(blocked, list, f"{name}.blocked not found in {rel}")
+            self.assertEqual(
+                blocked.count(old_pattern), 1,
+                f"expected one {old_pattern!r} in {name}.blocked of {rel}",
+            )
+            section["blocked"] = [
+                new_pattern if item == old_pattern else item for item in blocked
+            ]
+
+        for key in configs:
+            self.update_lock_config(rel, key, edit)
+
+    def drop_blocked_array(
+        self, rel: str, name: str, configs: tuple[str, ...] = LOCK_CONFIG_KEYS
+    ) -> None:
+        """Delete the `blocked` key from a compiled `name` handler config."""
+        def edit(config: dict) -> None:
+            section = config.get(name.replace("-", "_"))
+            self.assertIsInstance(section, dict, f"{name} not found in {rel}")
+            self.assertIn("blocked", section, f"{name}.blocked not found in {rel}")
+            del section["blocked"]
+
+        for key in configs:
+            self.update_lock_config(rel, key, edit)
+
+    def mutate_occurrence(
+        self, rel: str, old: str, new: str, occurrence: int, occurrences: int = 2
+    ) -> None:
+        """Replace the `occurrence`-th (1-based) `old` in `rel`, leaving others.
+
+        Used for the triage sources, where the add-labels and remove-labels blocks
+        carry identical blocked lists: occurrence 1 is add-labels and occurrence 2
+        is remove-labels in every workflow source (top-to-bottom frontmatter order).
+        Each caller asserts the block name in the validator message, so a reordered
+        source would fail the test rather than silently mutate the wrong block.
+        """
+        text = self.read(rel)
+        self.assertEqual(
+            text.count(old), occurrences,
+            f"expected {occurrences} occurrence(s) of {old[:60]!r} in {rel}",
+        )
+        index = -1
+        for _ in range(occurrence):
+            index = text.find(old, index + 1)
+            self.assertNotEqual(index, -1, f"occurrence {occurrence} of {old[:40]!r} missing")
+        self.write(rel, text[:index] + new + text[index + len(old):])
 
     def run_main(self) -> tuple[int, str]:
         """Run validate-contract main() on the fixture; return (code, output)."""
@@ -618,6 +736,193 @@ class ContractValidatorTest(unittest.TestCase):
         tail = tail.replace('\\"needs-info\\"', '\\"needsinfo\\"', 1)
         self.write(BACKLOG_LOCK, head + sep + tail)
         self.assert_fails("safe-output label drift in add-labels")
+
+    # -- blocked label ownership (source + compiled locks) ----------------
+    #
+    # The human-owned label patterns (priority-*, codex-*, confirmed, invalid,
+    # wontfix, good first issue, help wanted, ~*, *[bot]) must stay in BOTH the
+    # add-labels and remove-labels blocked lists of every source and of both
+    # compiled safe-output configs. Each case below is a regression that would
+    # otherwise pass every other validator check.
+
+    def test_source_blocked_list_removed_from_one_block_fails(self) -> None:
+        # A whole blocked list dropped from add-labels only.
+        self.mutate_occurrence(PR_MD, SOURCE_BLOCKED_LINE, "", occurrence=1)
+        self.assert_fails(
+            "must declare safe-outputs.add-labels.blocked listing the "
+            "human-owned label patterns"
+        )
+
+    def test_validator_required_blocked_pattern_constant_is_intact(self) -> None:
+        # The whole blocked-label contract rests on this constant. Trimming it would
+        # silently relax every source and lock assertion, so the exact expected set is
+        # pinned here independently of the validator's own definition.
+        self.assertEqual(
+            tuple(self.mod.REQUIRED_BLOCKED_LABEL_PATTERNS),
+            REQUIRED_BLOCKED_LABEL_PATTERNS,
+        )
+
+    def test_blocked_pattern_order_is_not_part_of_the_contract(self) -> None:
+        # Both the presence assertion and the source/lock parity comparison are set
+        # based, so a reordered but complete blocked list must still pass in the source
+        # and in both compiled configs.
+        reordered = (
+            '    blocked: ["*[bot]", "~*", "help wanted", "good first issue", '
+            '"wontfix", "invalid", "confirmed", "codex-*", "priority-*"]\n'
+        )
+        self.mutate(PR_MD, SOURCE_BLOCKED_LINE, reordered, occurrences=2)
+        code, output = self.run_main()
+        self.assertEqual(code, 0, output)
+
+        def reverse_blocked(config: dict) -> None:
+            for handler in ("add_labels", "remove_labels"):
+                config[handler]["blocked"] = list(reversed(config[handler]["blocked"]))
+
+        for key in LOCK_CONFIG_KEYS:
+            self.update_lock_config(PR_LOCK, key, reverse_blocked)
+        code, output = self.run_main()
+        self.assertEqual(code, 0, output)
+
+    def test_source_blocked_key_removed_from_both_blocks_fails(self) -> None:
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                text = self.read(rel)
+                self.assertEqual(text.count(SOURCE_BLOCKED_LINE), 2, "unexpected source shape")
+                self.write(rel, text.replace(SOURCE_BLOCKED_LINE, ""))
+                self.assert_fails(
+                    "must declare safe-outputs.add-labels.blocked listing the "
+                    "human-owned label patterns"
+                )
+
+    def test_source_blocked_missing_priority_fails(self) -> None:
+        # Priority is the maintainer-owned family: losing it hands triage the
+        # ability to apply priority-* labels, which is the reported gap.
+        for rel in (ISSUE_MD, PR_MD, BACKLOG_MD):
+            with self.subTest(rel=rel):
+                self.mutate_occurrence(
+                    rel, SOURCE_BLOCKED_LINE, SOURCE_BLOCKED_MISSING_PRIORITY,
+                    occurrence=1,
+                )
+                self.assert_fails(
+                    "safe-outputs.add-labels.blocked must keep every human-owned "
+                    "label pattern; missing: priority-*"
+                )
+
+    def test_source_blocked_missing_confirmed_fails(self) -> None:
+        self.mutate_occurrence(
+            BACKLOG_MD, SOURCE_BLOCKED_LINE, SOURCE_BLOCKED_MISSING_CONFIRMED,
+            occurrence=2,
+        )
+        self.assert_fails(
+            "safe-outputs.remove-labels.blocked must keep every human-owned label "
+            "pattern; missing: confirmed"
+        )
+
+    def test_source_blocked_emptied_fails(self) -> None:
+        self.mutate(
+            ISSUE_MD,
+            SOURCE_BLOCKED_LINE,
+            SOURCE_BLOCKED_EMPTY,
+            occurrences=2,
+        )
+        self.assert_fails(
+            "safe-outputs.add-labels.blocked must keep every human-owned label "
+            "pattern; missing: priority-*"
+        )
+
+    def test_source_blocked_keeping_allowed_entries_but_missing_codex_fails(self) -> None:
+        # The subtle regression: the list still contains label-shaped entries that
+        # appear in the allowed sets, so only a presence check on the owner family
+        # catches the dropped codex-* pattern.
+        self.mutate_occurrence(
+            PR_MD,
+            SOURCE_BLOCKED_LINE,
+            SOURCE_BLOCKED_WITH_ALLOWED_ENTRIES_MISSING_CODEX,
+            occurrence=1,
+        )
+        self.assert_fails(
+            "safe-outputs.add-labels.blocked must keep every human-owned label "
+            "pattern; missing: codex-*"
+        )
+
+    def test_lock_blocked_missing_pattern_fails(self) -> None:
+        # Lock-only regression: the compiled config silently loses an owner pattern
+        # while the source and every other compiled surface stay intact.
+        for rel in (ISSUE_LOCK, PR_LOCK, BACKLOG_LOCK):
+            with self.subTest(rel=rel):
+                self.mutate_blocked_array(rel, "add-labels", "priority-*", "priority-low")
+                self.assert_fails(
+                    "blocked list must keep every human-owned label pattern; "
+                    "missing: priority-*"
+                )
+
+    def test_lock_blocked_key_removed_fails(self) -> None:
+        self.drop_blocked_array(BACKLOG_LOCK, "remove-labels")
+        self.assert_fails("must carry the remove-labels blocked list")
+
+    def test_lock_blocked_emptied_fails(self) -> None:
+        def empty(config: dict) -> None:
+            config["remove_labels"]["blocked"] = []
+
+        for key in LOCK_CONFIG_KEYS:
+            self.update_lock_config(BACKLOG_LOCK, key, empty)
+        self.assert_fails(
+            "blocked list must keep every human-owned label pattern; missing: priority-*"
+        )
+
+    def test_lock_blocked_missing_confirmed_fails(self) -> None:
+        self.mutate_blocked_array(ISSUE_LOCK, "remove-labels", "confirmed", "verified")
+        self.assert_fails("missing: confirmed")
+
+    def test_lock_blocked_parity_drift_in_one_config_fails(self) -> None:
+        # Only the second compiled config loses priority-*: the lock's own surface
+        # check must catch it even though the first config still matches the source.
+        self.mutate_blocked_array(
+            PR_LOCK, "add-labels", "priority-*", "priority-low",
+            configs=("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",),
+        )
+        self.assert_fails(
+            "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG add-labels blocked list must keep "
+            "every human-owned label pattern; missing: priority-*"
+        )
+
+    def test_lock_blocked_extra_pattern_fails_parity(self) -> None:
+        # An extra blocked entry is also a capability change: it silently narrows
+        # what triage may touch and must not diverge from the declared source.
+        def append_extra(config: dict) -> None:
+            config["remove_labels"]["blocked"].append("triage-must-not-touch")
+
+        for key in LOCK_CONFIG_KEYS:
+            self.update_lock_config(PR_LOCK, key, append_extra)
+        self.assert_fails("safe-output blocked-label drift in remove-labels")
+
+    def test_source_blocked_add_remove_asymmetry_fails(self) -> None:
+        # Only remove-labels loses a pattern; add-labels stays intact, so the
+        # per-block assertion cannot be satisfied by a single correct sibling.
+        self.mutate_occurrence(
+            BACKLOG_MD, SOURCE_BLOCKED_LINE, SOURCE_BLOCKED_MISSING_PRIORITY,
+            occurrence=2,
+        )
+        code, output = self.run_main()
+        self.assertEqual(code, 1, output)
+        self.assertIn(
+            "safe-outputs.remove-labels.blocked must keep every human-owned label "
+            "pattern; missing: priority-*",
+            output,
+        )
+        self.assertNotIn(
+            "safe-outputs.add-labels.blocked must keep every human-owned label pattern",
+            output,
+        )
+
+    def test_lock_blocked_asymmetry_between_handlers_fails(self) -> None:
+        # add_labels keeps every pattern in both configs while remove_labels loses
+        # one: each handler is asserted independently.
+        self.mutate_blocked_array(BACKLOG_LOCK, "remove-labels", "confirmed", "verified")
+        code, output = self.run_main()
+        self.assertEqual(code, 1, output)
+        self.assertIn("remove-labels blocked list must keep every human-owned label pattern", output)
+        self.assertNotIn("add-labels blocked list must keep every human-owned label pattern", output)
 
     def test_missing_lock_fails(self) -> None:
         os.remove(self.path(BACKLOG_LOCK))

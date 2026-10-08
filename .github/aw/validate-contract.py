@@ -21,8 +21,11 @@ No LLM. Checks, in order:
      the gh-aw schema levels, and exactly the intended level, no source/diff tools
      in the github allowed list including the PR-search/list tools
      (pull_request_read, list_pull_requests, search_pull_requests), no 'confirmed'
-     in allowed label lists, and the
-     required type family in remove-labels;
+     in allowed label lists, the
+     required type family in remove-labels, and every human-owned label pattern
+     (priority-*, codex-*, confirmed, invalid, wontfix, good first issue, help
+     wanted, ~*, *[bot]) present in BOTH the add-labels and remove-labels blocked
+     lists (set semantics: order is not part of the contract);
   3. each generated lock preserves those invariants (no add_comment, no forbidden
      github tool grants, compiled GITHUB_TOOLSETS exactly 'issues', an allow-only
      guard policy whose 'repos' is the
@@ -31,13 +34,15 @@ No LLM. Checks, in order:
      level, no residual agent write capability: no --allow-tool write and no
      --allow-all-paths in the agent job, the compiled '--deny-tool shell' flag in
      the agent invocation, add_labels issue_intent:false in both safe-output
-     configs, the compiled safe-output tool set exactly the read-only label
+     configs, every human-owned blocked pattern present in both handlers' blocked
+     lists of both compiled safe-output configs, the compiled safe-output tool set
+     exactly the read-only label
      family (manifest tools and both config key sets), the github server env
      carrying GITHUB_READ_ONLY, the safeoutputs write-sink 'accept' list confined
      to the private repository form, no report-failed-jobs machinery, failure
      reports disabled, no
      agent-job checkout, not staged) and stays structurally in sync with its source
-     (shared import pin + exact safe-output label lists);
+     (shared import pin + exact safe-output label lists, allowed and blocked);
   4. every contract file referenced by .github/triage-policy.md exists;
   5. every workflow-managed label named by the policy currently exists
      (declared in .github/labels.yml and/or present in the live repository);
@@ -100,6 +105,17 @@ What this validator does NOT guarantee:
     tool list from that value, so the toolset-level prohibition rests on the server
     version pinned in the lock manifest. A server upgrade must be re-checked against
     the toolset-to-tool mapping (a staged trial is the end-to-end evidence).
+  - The blocked-label ownership assertion is a presence (set-membership) check of the
+    REQUIRED_BLOCKED_LABEL_PATTERNS constant against the source's add-labels/remove-labels
+    blocked lists and against the compiled add_labels/remove_labels 'blocked' arrays in
+    both lock configs (GH_AW_SAFE_OUTPUTS_CONFIG and GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG).
+    It proves those patterns are declared wherever the config shape is parsed; it cannot
+    prove the pinned runtime handler enforces the blocked list against every label-pattern
+    form GitHub accepts, so a pin change to gh-aw-actions/setup must be re-checked. It also
+    does not prove the blocked list is exhaustive: a human-owned label not named by the
+    constant (or a newly introduced label family) is not asserted and must be added to the
+    constant deliberately. The source-side check parses the same depth-2/depth-4 block
+    shape as the allowlist check, with the same textual-parser limitation.
 
 Set VALIDATE_CONTRACT_SKIP_LIVE_LABELS=1 to skip the live repository label lookup
 (offline/test mode used by .github/aw/test_validate_contract.py); in that mode
@@ -164,6 +180,25 @@ LOCK_TOOLSETS = re.compile(r'"GITHUB_TOOLSETS"\s*:\s*"([^"]*)"')
 # Universal semantic type family every triage workflow must be able to remove
 # (reconciliation capability: replace a clearly wrong managed type).
 REQUIRED_REMOVE_LABELS = ("bug", "enhancement", "documentation", "question", "refactor", "ci")
+
+# Human-owned label patterns every triage safe-output block must keep blocked, in
+# both add-labels and remove-labels: the maintainer priority/codex families, the
+# human-verification label 'confirmed', the human-reserved resolution labels
+# (invalid, wontfix, good first issue, help wanted), the maintainer namespace (~*)
+# and bot-applied labels (*[bot]). Membership is compared as a set: this is a
+# presence contract, not an ordering contract, so the declared order is not part
+# of it. Dropping any pattern re-exposes a human-owned label to triage automation.
+REQUIRED_BLOCKED_LABEL_PATTERNS = (
+    "priority-*",
+    "codex-*",
+    "confirmed",
+    "invalid",
+    "wontfix",
+    "good first issue",
+    "help wanted",
+    "~*",
+    "*[bot]",
+)
 
 # The engine-level shell denial every triage workflow must pass to the Copilot CLI.
 # tools.bash: false makes gh-aw emit no shell(...) grant, but the Copilot CLI's own
@@ -537,20 +572,35 @@ def repo_scope_entries(value: str) -> list[str] | None:
     return string_list(value, [])
 
 
-def triage_source_label_lists(fm: str) -> dict[str, list[str] | None]:
-    """Allowed label lists declared under safe-outputs.{add,remove}-labels."""
+def safe_output_lists(fm: str, field: str) -> dict[str, list[str] | None]:
+    """Label lists declared under safe-outputs.{add,remove}-labels.<field>.
+
+    `field` is 'allowed' (labels the handler may apply/remove) or 'blocked'
+    (label patterns it must never touch). A missing block entry maps to None so
+    the caller reports it.
+    """
     lists: dict[str, list[str] | None] = {}
     safe = key_entry(fm, "safe-outputs", 0)
     safe_body = "\n".join(safe[1]) if safe else ""
     for name in ("add-labels", "remove-labels"):
-        labels = None
+        values = None
         entry = key_entry(safe_body, name, 2) if safe else None
         if entry is not None:
-            allowed = key_entry("\n".join(entry[1]), "allowed", 4)
-            if allowed is not None:
-                labels = string_list(allowed[0], allowed[1])
-        lists[name] = labels
+            declared = key_entry("\n".join(entry[1]), field, 4)
+            if declared is not None:
+                values = string_list(declared[0], declared[1])
+        lists[name] = values
     return lists
+
+
+def triage_source_label_lists(fm: str) -> dict[str, list[str] | None]:
+    """Allowed label lists declared under safe-outputs.{add,remove}-labels."""
+    return safe_output_lists(fm, "allowed")
+
+
+def triage_source_blocked_lists(fm: str) -> dict[str, list[str] | None]:
+    """Blocked label patterns declared under safe-outputs.{add,remove}-labels."""
+    return safe_output_lists(fm, "blocked")
 
 
 def engine_args(fm: str) -> list[str] | None:
@@ -792,6 +842,27 @@ def check_triage_sources() -> None:
                     "type family; missing: " + ", ".join(missing)
                 )
 
+        blocked_lists = triage_source_blocked_lists(fm)
+        for name in ("add-labels", "remove-labels"):
+            blocked = blocked_lists[name]
+            if blocked is None:
+                errors.append(
+                    f"{rel_path} must declare safe-outputs.{name}.blocked listing "
+                    "the human-owned label patterns; missing: "
+                    + ", ".join(REQUIRED_BLOCKED_LABEL_PATTERNS)
+                )
+                continue
+            missing = [
+                pattern
+                for pattern in REQUIRED_BLOCKED_LABEL_PATTERNS
+                if pattern not in blocked
+            ]
+            if missing:
+                errors.append(
+                    f"{rel_path} safe-outputs.{name}.blocked must keep every "
+                    "human-owned label pattern; missing: " + ", ".join(missing)
+                )
+
         args = engine_args(fm)
         joined = " ".join(args or [])
         if args is None or not any(
@@ -884,12 +955,16 @@ def lock_grant_tokens(text: str) -> set[str]:
     return tokens
 
 
-def lock_safe_output_lists(text: str) -> dict[str, dict[str, list[str] | None] | None]:
-    """Parse the safe-output label lists out of the compiled lock config JSON.
+def lock_safe_output_lists(
+    text: str, field: str = "allowed"
+) -> dict[str, dict[str, list[str] | None] | None]:
+    """Parse a safe-output label list out of the compiled lock config JSON.
 
-    Each config value is a double-quoted YAML scalar holding JSON, so it is
-    decoded twice. Keys absent from the lock are omitted; a key present with an
-    unparsable value maps to None so the caller reports it.
+    `field` is 'allowed' (labels the handler may apply/remove) or 'blocked'
+    (label patterns it must never touch). Each config value is a double-quoted
+    YAML scalar holding JSON, so it is decoded twice. Keys absent from the lock
+    are omitted; a key present with an unparsable value maps to None so the
+    caller reports it.
     """
     parsed: dict[str, dict[str, list[str] | None] | None] = {}
     for key in LOCK_CONFIG_KEYS:
@@ -906,9 +981,9 @@ def lock_safe_output_lists(text: str) -> dict[str, dict[str, list[str] | None] |
         entry: dict[str, list[str] | None] = {}
         for name in ("add-labels", "remove-labels"):
             section = config.get(name.replace("-", "_"))
-            allowed = section.get("allowed") if isinstance(section, dict) else None
+            values = section.get(field) if isinstance(section, dict) else None
             entry[name] = (
-                [str(item) for item in allowed] if isinstance(allowed, list) else None
+                [str(item) for item in values] if isinstance(values, list) else None
             )
         parsed[key] = entry
     return parsed
@@ -988,6 +1063,44 @@ def lock_server_blocks(text: str, name: str) -> list[str]:
             body.append(following)
         blocks.append("\n".join(body))
     return blocks
+
+
+def lock_blocked_patterns(lock_rel: str, text: str) -> None:
+    """Assert every compiled add_labels/remove_labels block keeps the human-owned patterns.
+
+    Both compiled configs (GH_AW_SAFE_OUTPUTS_CONFIG and
+    GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG) are asserted, for both handlers, as
+    presence of every REQUIRED_BLOCKED_LABEL_PATTERNS entry. Presence (set
+    membership) is checked, not order. This is the lock-side twin of the source
+    assertion, so a lock compiled from - or edited to - a surface whose blocked
+    lists no longer protect those labels fails even when the source check is
+    bypassed.
+    """
+    parsed = lock_safe_output_lists(text, "blocked")
+    for key in LOCK_CONFIG_KEYS:
+        if key not in parsed:
+            continue  # absence reported by check_lock_safe_output_surface
+        entry = parsed[key]
+        if entry is None:
+            continue  # unparsable JSON reported by check_lock_safe_output_surface
+        for name in ("add-labels", "remove-labels"):
+            blocked = entry.get(name)
+            if blocked is None:
+                errors.append(
+                    f"{lock_rel} {key} must carry the {name} blocked list "
+                    "protecting the human-owned label patterns"
+                )
+                continue
+            missing = [
+                pattern
+                for pattern in REQUIRED_BLOCKED_LABEL_PATTERNS
+                if pattern not in blocked
+            ]
+            if missing:
+                errors.append(
+                    f"{lock_rel} {key} {name} blocked list must keep every "
+                    "human-owned label pattern; missing: " + ", ".join(missing)
+                )
 
 
 def check_lock_safe_output_surface(lock_rel: str, text: str) -> None:
@@ -1095,11 +1208,11 @@ def check_lock_currency(md: str, lock_text: str, lock_rel: str) -> None:
 
     The strongest textual proxy for compile currency is compared against the
     source: the shared import SHA(s) embedded in the lock header and the exact
-    allowed add/remove label names in the compiled safe-output config. Label
-    order is not compared (YAML arrays are unordered for this purpose); set
-    equality still catches added, removed, or renamed labels. General compile
-    currency (prompt text, tool schemas, job wiring) cannot be proven without
-    running `gh aw compile`.
+    allowed/blocked label lists in both compiled safe-output configs. Label and
+    pattern order is not compared (YAML arrays are unordered for this purpose);
+    set equality still catches added, removed, or renamed labels and dropped or
+    widened blocked patterns. General compile currency (prompt text, tool
+    schemas, job wiring) cannot be proven without running `gh aw compile`.
     """
     src_path = os.path.join(WORKFLOW_DIR, md)
     if not os.path.exists(src_path):
@@ -1120,33 +1233,41 @@ def check_lock_currency(md: str, lock_text: str, lock_rel: str) -> None:
         )
 
     source_lists = triage_source_label_lists(frontmatter(src))
+    source_blocked = triage_source_blocked_lists(frontmatter(src))
     parsed = lock_safe_output_lists(lock_text)
+    parsed_blocked = lock_safe_output_lists(lock_text, "blocked")
     if "GH_AW_SAFE_OUTPUTS_CONFIG" not in parsed:
         errors.append(f"{lock_rel} has no GH_AW_SAFE_OUTPUTS_CONFIG")
     for key, entry in sorted(parsed.items()):
         if entry is None:
             errors.append(f"{lock_rel} {key} is not a valid JSON config")
             continue
+        blocked_entry = parsed_blocked.get(key) or {}
         for name in ("add-labels", "remove-labels"):
-            lock_labels = entry.get(name)
-            source_labels = source_lists.get(name)
-            if source_labels is None:
-                continue  # source-side gap is reported by check_triage_sources
-            if lock_labels is None:
-                errors.append(f"{lock_rel} {key} is missing the {name} allowed list")
-                continue
-            if set(lock_labels) != set(source_labels):
-                missing = sorted(set(source_labels) - set(lock_labels))
-                extra = sorted(set(lock_labels) - set(source_labels))
-                details = []
-                if missing:
-                    details.append("missing " + ", ".join(missing))
-                if extra:
-                    details.append("unexpected " + ", ".join(extra))
-                errors.append(
-                    f"{lock_rel} safe-output label drift in {name} vs {rel(src_path)}: "
-                    + "; ".join(details)
-                )
+            for field, declared, compiled in (
+                ("allowed", source_lists.get(name), entry.get(name)),
+                ("blocked", source_blocked.get(name), blocked_entry.get(name)),
+            ):
+                if declared is None:
+                    continue  # source-side gap is reported by check_triage_sources
+                if compiled is None:
+                    errors.append(
+                        f"{lock_rel} {key} is missing the {name} {field} list"
+                    )
+                    continue
+                if set(compiled) != set(declared):
+                    missing = sorted(set(declared) - set(compiled))
+                    extra = sorted(set(compiled) - set(declared))
+                    details = []
+                    if missing:
+                        details.append("missing " + ", ".join(missing))
+                    if extra:
+                        details.append("unexpected " + ", ".join(extra))
+                    label = "label" if field == "allowed" else "blocked-label"
+                    errors.append(
+                        f"{lock_rel} safe-output {label} drift in {name} vs "
+                        f"{rel(src_path)}: " + "; ".join(details)
+                    )
 
 
 def check_triage_locks() -> None:
@@ -1170,6 +1291,7 @@ def check_triage_locks() -> None:
             )
 
         check_lock_safe_output_surface(lock_rel, text)
+        lock_blocked_patterns(lock_rel, text)
 
         # The toolset selection is the capability root: the pinned github-mcp-server
         # advertises every tool of a requested toolset regardless of the per-tool

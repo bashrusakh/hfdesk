@@ -35,18 +35,82 @@ func unsafeRepoPath(rel string) bool {
 	return false
 }
 
+// unsafeBlobName reports whether a SHA256 value taken from the remote tree
+// API is not acceptable as a canonical SHA-256 hash for the plan. The SHA is
+// remote-controlled (see the unsafeRepoPath rationale above) and is used
+// verbatim both as a filesystem name (blobs/<sha> storage and the tmp-<sha>
+// staging file) and as the expected digest in verification, so it must be
+// either empty (a file without a hash) or exactly 64 hex characters -- the
+// canonical SHA-256 form. The separator / absolute / traversal checks below
+// keep the path-safety property stated on its own guard; the length+hex check
+// subsumes them but is deliberately not the only check. Hex is accepted
+// case-insensitively; scanRepo lowercases accepted values before they enter
+// the plan. Everything else -- including 40-hex git-OID-shaped values and
+// "sha256:"-prefixed LFS pointer oids -- is rejected: neither can ever match
+// a computed 64-hex digest at verify time, so accepting them would only
+// defer a guaranteed verification failure while writing non-canonical cache
+// entries. Callers must still check for the empty shape before using the
+// value as a path.
+func unsafeBlobName(sha string) bool {
+	if sha == "" {
+		return false
+	}
+	if strings.ContainsAny(sha, `/\`) || filepath.IsAbs(sha) || filepath.VolumeName(sha) != "" {
+		return true
+	}
+	cleaned := path.Clean(sha)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return true
+	}
+	return !canonicalSHA256(sha)
+}
+
+// canonicalSHA256 reports whether sha is exactly 64 hexadecimal characters,
+// the canonical SHA-256 digest representation, accepting upper or lower case.
+func canonicalSHA256(sha string) bool {
+	if len(sha) != 64 {
+		return false
+	}
+	for i := 0; i < len(sha); i++ {
+		c := sha[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // PathInside reports whether target resolves to base itself or to a location
 // nested within base. Both paths are cleaned first, so "../" segments are
 // resolved before the comparison. This is the single home for the containment
 // guard that the cache, mirror, and downloader call sites previously
 // open-coded as inline strings.HasPrefix checks.
+//
+// The separator-strict prefix below keeps a sibling that shares the base's
+// name (e.g. /tmp/models2 versus base /tmp/models) from matching: appending
+// a separator to both sides forces the comparison onto a component boundary.
+// A filesystem/volume root — "/" on Unix, a drive root such as "C:\" or a
+// UNC share root on Windows (filepath.VolumeName names its volume; Clean
+// keeps the root's trailing separator) — already ends in a separator after
+// filepath.Clean, so it must not receive a second one: base+sep would be
+// "//" (or "\\"), a prefix no path can ever match, which rejected every
+// destination legitimately inside the root as an escape. For a root the
+// cleaned root itself is the strict prefix: a root has no shallower sibling,
+// so any cleaned target carrying that prefix is inside it (relative targets
+// still fail the prefix, as before). filepath.Clean never leaves a trailing
+// separator on a non-root path, so non-root bases take the unchanged
+// separator-strict branch and keep byte-identical acceptance.
 func PathInside(base, target string) bool {
 	base = filepath.Clean(base)
 	target = filepath.Clean(target)
 	if target == base {
 		return true
 	}
-	return strings.HasPrefix(target+string(filepath.Separator), base+string(filepath.Separator))
+	sep := string(filepath.Separator)
+	if strings.HasSuffix(base, sep) {
+		return strings.HasPrefix(target, base)
+	}
+	return strings.HasPrefix(target+sep, base+sep)
 }
 
 // SafeJoin joins rel onto base and verifies the result stays within base,
@@ -60,8 +124,25 @@ func SafeJoin(base, rel string) (string, error) {
 	if filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" {
 		return "", fmt.Errorf("path %q must be relative", rel)
 	}
+	// Reject non-local values ("", "..", escaping segments, and the platform's
+	// reserved names) before joining. filepath.IsLocal is the standard-library
+	// primitive CodeQL models as a go/path-injection sanitizer barrier, so this
+	// check makes the containment below legible to code scanning; the
+	// PathInside check remains the containment proof.
+	if !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("path %q must be local", rel)
+	}
 	dst := filepath.Clean(filepath.Join(base, rel))
 	if !PathInside(base, dst) {
+		return "", fmt.Errorf("path %q escapes %q", rel, base)
+	}
+	// Restate the containment PathInside just proved against the cleaned base
+	// with strings.HasPrefix, the primitive code scanning models as a
+	// sanitizer guard: this check dominates the return below, so taint
+	// carried in `base` itself cannot flow out of SafeJoin unnoticed.
+	// Acceptance is identical to PathInside's (its separator-strict prefix
+	// implies this plain prefix), so no input that passed before is rejected.
+	if !strings.HasPrefix(dst, filepath.Clean(base)) {
 		return "", fmt.Errorf("path %q escapes %q", rel, base)
 	}
 	return dst, nil
@@ -232,13 +313,34 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		acceptRanges := isLFS
 
 		sha := n.Sha256
+		shaField := "sha256"
 		if sha == "" && n.LFS != nil {
 			// LFS files have SHA256 in either Sha256 field or Oid field (LFS spec uses oid)
 			sha = n.LFS.Sha256
+			shaField = "lfs.sha256"
 			if sha == "" {
 				sha = n.LFS.Oid
+				shaField = "lfs.oid"
 			}
 		}
+
+		// The SHA is remote-controlled too, and unlike n.Path it flows into
+		// filesystem paths verbatim (tmp-<sha> staging, blobs/<sha> storage)
+		// and into verification as the expected digest. Only the canonical
+		// SHA-256 form may reach the plan: empty (a file without a hash) or
+		// 64 hex characters. Reject anything else before it reaches the
+		// plan, failing the whole plan rather than silently skipping so a
+		// tampered tree is loud, not partial. The error names the offending
+		// field so a malformed mirror response is diagnosable.
+		if unsafeBlobName(sha) {
+			return nil, fmt.Errorf("refusing non-canonical sha256 from repo tree for %q (field %s): %q: want empty or 64 hex characters", rel, shaField, sha)
+		}
+		// Store the canonical lowercase spelling so every consumer of
+		// PlanItem.SHA256 (tmp-<sha> staging, blobs/<sha>, CheckBlob,
+		// verify, manifest) sees "" or lowercase hex no matter how the
+		// remote spelled the digest. ToLower is a no-op for lowercase input,
+		// so canonical values pass through byte-identical.
+		sha = strings.ToLower(sha)
 
 		// Case-insensitive dedup: filterMatches is intentionally case-insensitive
 		// (q4_k_m matches Q4_K_M), so two files that differ only in case both
@@ -357,7 +459,7 @@ func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
 }
 
 // destinationBase returns the base output directory for a job.
-func destinationBase(job Job, cfg Settings) string {
+func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
 	// (e.g. mmproj from a base model saved next to the current model's quants).
@@ -365,7 +467,53 @@ func destinationBase(job Job, cfg Settings) string {
 	if job.LocalRepo != "" {
 		repoForPath = job.LocalRepo
 	}
-	return filepath.Join(cfg.OutputDir, repoForPath)
+	// The repo-derived folder segment is joined onto the configured output
+	// root and becomes the root of every downstream path, so it must stay
+	// local. validate() enforces IsValidModelName(job.Repo) at the Download
+	// boundary, but job.LocalRepo reaches this join unchecked; a "../" (or
+	// absolute) segment would move the whole destination outside
+	// cfg.OutputDir. filepath.IsLocal is the CodeQL-modeled barrier for
+	// exactly this containment property.
+	if !filepath.IsLocal(repoForPath) {
+		return "", fmt.Errorf("destination folder %q must be a local path", repoForPath)
+	}
+	// Normalize the configured output root to an absolute, cleaned path
+	// BEFORE the containment proof. The legacy OutputDir API accepts
+	// cwd-shaped roots (".", "./", "./Models"): filepath.Join cleans a root
+	// of "." away entirely, so proving against the raw configured string
+	// rejected those legitimate roots as escapes even though they never
+	// leave the working directory. Abs resolves every relative form —
+	// including "" and roots containing ".." segments — against the current
+	// working directory, giving the proof one stable root shape for
+	// relative, absolute, and traversal-containing configs alike. The
+	// preserved property is "destination never outside the effective
+	// (resolved) root".
+	root, err := filepath.Abs(cfg.OutputDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve output root %q: %w", cfg.OutputDir, err)
+	}
+	base := filepath.Join(root, repoForPath)
+	// Prove the joined result stays under the resolved output root before
+	// returning it: this dominates every use of the result — including
+	// os.MkdirAll at the download entry and SafeJoin's base — so neither a
+	// crafted folder segment nor taint in cfg.OutputDir itself can escape
+	// the root unproven. A local repoForPath always satisfies this, so
+	// legitimate destinations are unaffected.
+	if !PathInside(root, base) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
+	}
+	// Restate the containment PathInside just proved against the resolved
+	// root with strings.HasPrefix, the primitive code scanning models as a
+	// sanitizer guard: this check is evaluated on `base` itself and
+	// dominates the return below, so taint carried in the configured root
+	// cannot flow out of destinationBase unnoticed — the same restatement
+	// SafeJoin applies to its result. Acceptance is identical to
+	// PathInside's (root is already cleaned by Abs, and base is a cleaned
+	// join of root), so no input that passed before is rejected.
+	if !strings.HasPrefix(base, root) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
+	}
+	return base, nil
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

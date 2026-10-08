@@ -44,6 +44,7 @@ type Config struct {
 	MaxSpeed           string   // Global download speed cap, e.g. "2MB" (empty/"0" = unlimited)
 	Verify             string   // Verification mode: none, size, sha256
 	Retries            int      // Number of retry attempts
+	StallTimeout       string   // Abort a stalled body read after this long (empty = "60s" default, "0" disables)
 	AllowedOrigins     []string // CORS origins
 	Endpoint           string   // Custom HuggingFace endpoint (e.g., for mirrors)
 
@@ -82,6 +83,7 @@ func DefaultConfig() Config {
 		MultipartThreshold: "32MiB",
 		Verify:             "size",
 		Retries:            4,
+		StallTimeout:       "60s",
 	}
 }
 

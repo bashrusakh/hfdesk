@@ -70,12 +70,16 @@ func (e *APIError) Error() string {
 
 // IsRetryable returns true if the error might succeed on retry.
 func (e *APIError) IsRetryable() bool {
-	switch e.StatusCode {
-	case 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	return RetryableStatus(e.StatusCode)
+}
+
+// IsFailFast returns true when the error is permanent for the whole job:
+// retrying the same request cannot succeed and only multiplies requests
+// against a gated, private, or missing resource. 401/403 (auth/gated) and
+// 404 (not found) are permanent; every other status falls through to the
+// retryable/unknown classification.
+func (e *APIError) IsFailFast() bool {
+	return FailFastStatus(e.StatusCode)
 }
 
 // Is implements errors.Is for common error comparisons.
@@ -91,4 +95,3 @@ func (e *APIError) Is(target error) bool {
 		return false
 	}
 }
-

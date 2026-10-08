@@ -158,6 +158,14 @@ POST /api/settings
 
 Settings include runtime paths, concurrency, verification, endpoint, proxy settings, the HF cache directory, and extra local scan folders.
 
+Download reliability settings:
+
+- `retries` — the non-progress retry budget per file/part request. A non-truncating attempt that advances the on-disk resume offset strictly beyond the highest offset reached refunds this budget and resets the backoff. For a single-file transfer, a response that ignores Range with `200 OK` restarts the partial and does not refund the budget, even if that attempt writes beyond the previous high-water mark; the new high-water mark is still recorded, so a later bodyless failure earns no refund. Multipart transfers still require `206 Partial Content` and do not accept `200` as a part. Progress refunds can increase the number of retries, but a separate lifetime retry-count ceiling limits retries after individual attempts return. That ceiling does not bound the duration or bytes of a single request that continues delivering data.
+- `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
+- Retry backoff defaults to 400ms initially and 10s maximum. Library callers may override these values; the Settings API does not expose them. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes. Retries include `429` and all `5xx`; other `4xx` responses are terminal for that file, while `401`, `403`, and `404` fail the whole job. Optional verification `HEAD` metadata failures are ignored; the actual file request remains authoritative. Cache storage normally moves a completed temporary file into place by rename. If that rename fails, the fallback copies to a staging file in the destination directory and renames the completed stage into place; this prevents a partial fallback copy from appearing at the final blob path, but does not provide crash durability or rollback guarantees.
+
+A permanent `401`, `403`, or `404` response for a file fails the whole job immediately with an actionable message (accept the repository terms / use a token with access, or file not found). `429` and every `5xx` are retryable. Other `4xx` statuses fail only the affected file and are not retried. Multipart transfers still require `206 Partial Content`; a `200` response to a part-range request is not accepted as a part.
+
 Token handling:
 
 - `GET` omits `token` when unset, otherwise returns a display mask beginning with `********`. Only tokens longer than four bytes include a last-four-byte suffix; short tokens return just `********`.

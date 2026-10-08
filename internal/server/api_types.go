@@ -59,6 +59,7 @@ type SettingsResponse struct {
 	MaxSpeed           string `json:"maxSpeed"`
 	Verify             string `json:"verify"`
 	Retries            int    `json:"retries"`
+	StallTimeout       string `json:"stallTimeout"`
 	Endpoint           string `json:"endpoint,omitempty"`
 	// StorageMode is "local" when the server writes real files into LocalDir,
 	// or "cache" when it uses the HF cache layout. Set at startup, read-only.

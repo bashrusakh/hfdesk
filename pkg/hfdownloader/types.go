@@ -184,6 +184,15 @@ type Settings struct {
 	// If empty, defaults to "10s".
 	BackoffMax string
 
+	// StallTimeout aborts a body-read attempt that stops delivering bytes for
+	// this long, then retries from the current on-disk offset. Without it a
+	// stalled-but-open connection hangs the download forever.
+	//
+	// Accepts duration strings: "60s", "2m", etc. An empty value (library
+	// callers that leave it unset) uses the protective default of 60s; an
+	// explicit "0" or "0s" disables the watchdog.
+	StallTimeout string
+
 	// Token is the HuggingFace access token for private or gated repos.
 	// Get yours at: https://huggingface.co/settings/tokens
 	// The Settings struct does not read the environment itself; library
@@ -365,6 +374,7 @@ func DefaultSettings() Settings {
 		Retries:            4,
 		BackoffInitial:     "400ms",
 		BackoffMax:         "10s",
+		StallTimeout:       "60s",
 	}
 }
 
