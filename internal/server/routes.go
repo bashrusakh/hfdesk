@@ -151,10 +151,6 @@ func sanitizeDownloadRoutes(routes map[string]string) map[string]string {
 // Used to make routed destinations visible to the Cache browser and the
 // disk-free allowlist.
 func routeDirs(routes map[string]string) []string {
-	return routeDirsAt(routes, mustWorkingDirectory())
-}
-
-func routeDirsAt(routes map[string]string, base string) []string {
 	if len(routes) == 0 {
 		return nil
 	}
@@ -169,14 +165,8 @@ func routeDirsAt(routes map[string]string, base string) []string {
 		}
 		dirs = append(dirs, filepath.Clean(value))
 	}
-	// Sort by captured, case-preserving lexical identity before deduplication so
-	// maps always produce the same representative independent of iteration order.
-	sort.Slice(dirs, func(i, j int) bool {
-		left, right := pathIdentityKeyAt(dirs[i], base), pathIdentityKeyAt(dirs[j], base)
-		if left == right {
-			return dirs[i] < dirs[j]
-		}
-		return left < right
-	})
-	return cleanPathListAt(dirs, base)
+	// Sort before deduplication so case-equivalent Windows spellings have a
+	// deterministic representative independent of map iteration order.
+	sort.Strings(dirs)
+	return cleanPathList(dirs)
 }

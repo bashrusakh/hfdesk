@@ -136,17 +136,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if err != nil {
 		return nil, err
 	}
-
-	// GGUF-only mode: filters are set and at least one matches a .gguf file. A
-	// GGUF file embeds its own tokenizer and config, so the download should be
-	// just the chosen quant shards (plus any mmproj filter) — not the repo's
-	// config/tokenizer JSON, README, .gitattributes, or the fp16/ transformers
-	// metadata that ships alongside many GGUF repos. For non-GGUF downloads
-	// (e.g. a "safetensors" filter) those companion files are still required,
-	// so the original behavior is kept.
 	baseNames := make([]string, 0, len(fileNodes))
-	for _, n := range fileNodes {
-		baseNames = append(baseNames, strings.ToLower(filepath.Base(n.Path)))
+	for _, node := range fileNodes {
+		baseNames = append(baseNames, strings.ToLower(filepath.Base(node.Path)))
 	}
 	ggufMode := isGGUFFilterDownload(baseNames, job.Filters, job.ExactMatch)
 
@@ -181,6 +173,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// Determine which filter (if any) matches this file name, prefer the longest match
 		// Filter matching is case-insensitive (e.g., q4_0 matches Q4_0)
 		matchedFilter := ""
+		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
+		// original filter behavior for non-GGUF files, including explicitly
+		// requested companions.
+		if strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
+			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
+			continue
+		}
 		if ggufMode {
 			// Keep only files that match a filter: the selected quant's shards
 			// and any mmproj companion. Everything else is skipped.
@@ -263,6 +262,33 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		})
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil
+}
+
+// GGUFPathSelected reports whether a known relative GGUF filename survives the
+// same excludes and filter predicate used by PlanRepo. It is also used by the
+// job manager to prove that a queued filtered job cannot write a selected
+// local GGUF path before that job has been dispatched and planned.
+func GGUFPathSelected(relativePath string, filters, excludes []string, exact bool) bool {
+	name := strings.ToLower(filepath.Base(relativePath))
+	if !strings.HasSuffix(name, ".gguf") {
+		return false
+	}
+	rel := strings.ToLower(relativePath)
+	for _, ex := range excludes {
+		exLower := strings.ToLower(ex)
+		if strings.Contains(name, exLower) || strings.Contains(rel, exLower) {
+			return false
+		}
+	}
+	if len(filters) == 0 {
+		return true
+	}
+	for _, filter := range filters {
+		if filterMatches(name, strings.ToLower(filter), exact) {
+			return true
+		}
+	}
+	return false
 }
 
 // filterMatches reports whether filter fLower matches the file name nameLower

@@ -1,5 +1,20 @@
 # Todo
 
+## Текущее состояние (Packages 1, 2A, 2B, GGUF filter correction, 3A и 3B backend)
+
+- [x] Удалить общую root/namespace/effect-инфраструктуру из продуктовых read paths; вернуть ограниченный код к поведению `origin/main`, включая Windows dedup identity.
+- [x] Package 1: сохранить legacy DELETE-validator/friendly-cleanup и проверки main; не добавлять UI, quant API или quant-delete реализацию.
+- [x] Проверить `go test ./internal/server ./pkg/hfdownloader`, `go test ./...` и `git diff --check`.
+- [x] Package 2A: добавить read-only API списка конкретных мест и GGUF-групп, с выбором текущей локации и сохранением named HF snapshot versions; correction фиксирует полное filename identity, split template, link-only/HF warnings, typed local model lookup и регрессионные fixtures.
+- [x] Package 2B: UI-выбор места/группы в Details реализован как read-only; кнопка destructive Delete остаётся disabled.
+- [x] Package 3A: локальный `DELETE /api/cache-selection` удаляет только свежеподтверждённые GGUF members; старый whole-repository DELETE не переиспользован, HF write остаётся unsupported.
+- [x] Исправить фильтр GGUF: несовпавший GGUF исключается и при отсутствии совпавшей GGUF в дереве; проверены обычный и LFS Q4/Q5.
+- [x] Package 3A: writer exclusion для matching queued/new/active downloads и фактических rebuild/legacy-delete/mirror destination writes; matching queued jobs требуют ручной отмены, Q5 без совпадения не блокирует выбранный Q4.
+- [x] Package 3B backend: selected HF snapshot/friendly entry deletion, shared-blob preservation, exact fresh confirmation, and HF repository/friendly writer reservation; focused pkg/server tests pass.
+- [ ] Parent-owned: verify current UI's HF-specific confirmation copy and browser flow now that backend advertises HF delete capability; perform integration review and native Windows follow-up as applicable.
+
+Ниже сохранён исторический tracker предыдущего R/S/state/inventory-подхода. Его пункты и блокирующие статусы не описывают текущую цель; см. `plan.md`.
+
 - [ ] Complete facts-only R on `feature/storage-root-ownership` from `0c876f38`.
   - [x] Preserve all pre-split WIP on local archive A `a9931836` (not an R
     ancestor; never push/cherry-pick wholesale).

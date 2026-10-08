@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -164,6 +165,13 @@ type JobManager struct {
 	// can race a still-in-flight mkdir inside the downloader and fail
 	// with "directory not empty".
 	runWG sync.WaitGroup
+	// runActivities outlive visible job state and retain each run's immutable
+	// destination/plan until its downloader call has actually returned.
+	runActivities      map[uint64]*jobWriteActivity
+	deleteReservations map[uint64][]string
+	hfRepoReservations map[uint64][]string
+	mutationScopes     map[uint64][]string
+	nextWriteID        uint64
 }
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
@@ -184,15 +192,19 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	cfg = cfg.captureCacheEnvironment()
 	m := &JobManager{
-		saveMu:           &sync.Mutex{},
-		jobs:             make(map[string]*Job),
-		config:           cfg,
-		statePath:        statePath,
-		persistStateFile: saveJobsState,
-		loadStateFile:    loadJobsState,
-		closeDone:        make(chan struct{}),
-		wsHub:            wsHub,
-		speedLimiter:     hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+		saveMu:             &sync.Mutex{},
+		jobs:               make(map[string]*Job),
+		runActivities:      make(map[uint64]*jobWriteActivity),
+		deleteReservations: make(map[uint64][]string),
+		hfRepoReservations: make(map[uint64][]string),
+		mutationScopes:     make(map[uint64][]string),
+		config:             cfg,
+		statePath:          statePath,
+		persistStateFile:   saveJobsState,
+		loadStateFile:      loadJobsState,
+		closeDone:          make(chan struct{}),
+		wsHub:              wsHub,
+		speedLimiter:       hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -483,7 +495,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	if flat {
 		// Persist physical local destinations too: a restart from another
 		// launch directory must not reinterpret a previously relative path.
-		effectiveLocalDir = configuredPath(effectiveLocalDir, cfg.captureCacheEnvironment().cacheEnv.pathBase)
+		effectiveLocalDir, err = filepath.Abs(effectiveLocalDir)
+		if err != nil {
+			return nil, false, err
+		}
 		outputDir = effectiveLocalDir
 	} else {
 		cache := cfg.cache()
@@ -492,10 +507,9 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 
 	// The requested destination identity for dedup purposes: the frozen
 	// output root (flat local dir when set, cache root otherwise), compared
-	// with the startup-captured lexical base so equivalent relative/absolute
-	// config paths retain stable identity without filesystem case guesses.
-	pathBase := cfg.captureCacheEnvironment().cacheEnv.pathBase
-	reqDestKey := pathIdentityKeyAt(outputDir, pathBase)
+	// with pathIdentityKey so platform case/clean semantics match how the
+	// rest of the server compares configured paths.
+	reqDestKey := pathIdentityKey(outputDir)
 
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
@@ -521,9 +535,9 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
-			pathIdentityKeyAt(existing.OutputDir, pathBase) == reqDestKey &&
+			pathIdentityKey(existing.OutputDir) == reqDestKey &&
 			existing.Flat == flat &&
-			pathIdentityKeyAt(existing.HubDir, pathBase) == pathIdentityKeyAt(hubDir, pathBase) &&
+			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
 			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
@@ -556,6 +570,10 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		// can read it without a nil check; the tracker map is left
 		// nil until runJob wires it.
 		partialFilesMu: &sync.Mutex{},
+	}
+	if m.jobBlockedByDeleteLocked(job) {
+		m.mu.Unlock()
+		return nil, false, errSelectionWriterBusy
 	}
 
 	m.opWG.Add(1)
@@ -691,6 +709,10 @@ func (m *JobManager) ResumeJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	if m.jobBlockedByDeleteLocked(job) {
+		m.mu.Unlock()
+		return false
+	}
 	m.opWG.Add(1)
 	defer m.opWG.Done()
 
@@ -739,6 +761,10 @@ func (m *JobManager) RetryJob(id string) bool {
 	}
 
 	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
+		m.mu.Unlock()
+		return false
+	}
+	if m.jobBlockedByDeleteLocked(job) {
 		m.mu.Unlock()
 		return false
 	}
@@ -963,9 +989,15 @@ func (m *JobManager) dispatchLocked() {
 		if active >= limit {
 			break
 		}
+		// Preserve FIFO: a reservation can hold its matching oldest queued job,
+		// but the scheduler must not route around it to start a younger job.
+		if m.jobBlockedByDeleteLocked(j) {
+			break
+		}
 		j.starting = true
 		m.runWG.Add(1)
-		go m.runJob(j)
+		activityID := m.registerRunActivityLocked(j)
+		go m.runJob(j, activityID)
 		active++
 	}
 }
@@ -1254,10 +1286,15 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 }
 
 // runJob executes the download job.
-func (m *JobManager) runJob(job *Job) {
+func (m *JobManager) runJob(job *Job, activityID uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
+		if activityID != 0 {
+			m.mu.Lock()
+			delete(m.runActivities, activityID)
+			m.mu.Unlock()
+		}
 		m.runWG.Done()
 	}()
 
@@ -1386,6 +1423,18 @@ func (m *JobManager) runJob(job *Job) {
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
 		m.mu.Lock()
+		if activity := m.runActivities[activityID]; activity != nil {
+			switch evt.Event {
+			case "plan_item":
+				planned := filepath.Clean(filepath.Join(activity.base, filepath.FromSlash(evt.Path)))
+				if absolute, err := filepath.Abs(planned); err == nil {
+					activity.planned[pathIdentityKey(absolute)] = struct{}{}
+				}
+			case "file_start", "file_done", "finalizing", "done":
+				// Download emits every plan_item before starting any file work.
+				activity.planKnown = true
+			}
+		}
 		applyJobProgress(job, evt, time.Now())
 		progressSnap := m.cloneJobLocked(job)
 		m.mu.Unlock() // Unlock BEFORE notifying to avoid deadlock

@@ -337,7 +337,18 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 
 	// Local cache
 	cfg := s.snapshotConfig()
-	result, err := mirrorSyncHubs(cfg.cache().HubDir(), filepath.Join(targetPath, "hub"), req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	destination := filepath.Join(targetPath, "hub")
+	var release func()
+	if !req.DryRun {
+		var ok bool
+		release, ok = s.jobs.beginCacheMutation(destination)
+		if !ok {
+			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			return
+		}
+		defer release()
+	}
+	result, err := mirrorSyncHubs(cfg.cache().HubDir(), destination, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
 		return
@@ -370,7 +381,18 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 	// Local cache
 	cfg := s.snapshotConfig()
 	// Pull is push in reverse (target -> local)
-	result, err := mirrorSyncHubs(filepath.Join(targetPath, "hub"), cfg.cache().HubDir(), req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	destination := cfg.cache().HubDir()
+	var release func()
+	if !req.DryRun {
+		var ok bool
+		release, ok = s.jobs.beginCacheMutation(destination)
+		if !ok {
+			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			return
+		}
+		defer release()
+	}
+	result, err := mirrorSyncHubs(filepath.Join(targetPath, "hub"), destination, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
 		return

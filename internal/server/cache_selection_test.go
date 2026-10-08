@@ -1,0 +1,1715 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+)
+
+type cacheSelectionResponse struct {
+	Repo      string                   `json:"repo"`
+	Type      string                   `json:"type"`
+	Locations []cacheSelectionLocation `json:"locations"`
+}
+
+type testSelectedDeleteRequest struct {
+	Repo       string                 `json:"repo"`
+	Type       string                 `json:"type"`
+	LocationID string                 `json:"locationId"`
+	GroupID    string                 `json:"groupId"`
+	Members    []cacheSelectionMember `json:"members"`
+}
+
+func getSelection(t *testing.T, s *Server, repo, repoType, location string) (int, cacheSelectionResponse) {
+	t.Helper()
+	path := "/api/cache-selection?repo=" + url.QueryEscape(repo) + "&type=" + url.QueryEscape(repoType)
+	if location != "" {
+		path += "&locationId=" + url.QueryEscape(location)
+	}
+	w := cacheRequest(t, s, "GET", path, "")
+	var result cacheSelectionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode selection: %v: %s", err, w.Body.String())
+	}
+	return w.Code, result
+}
+
+func writeSelectionFile(t *testing.T, dir, name string) {
+	t.Helper()
+	path := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("gguf"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func symlinkOrSkip(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatalf("create symlink: %v", err)
+	}
+}
+
+func TestCacheSelectionLocalGroupsAndExplicitLocation(t *testing.T) {
+	root, other := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	for _, q := range []string{"Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"} {
+		writeSelectionFile(t, repoDir, "model-"+q+".gguf")
+	}
+	writeSelectionFile(t, repoDir, "alt-Q4_K_M.gguf")
+	writeSelectionFile(t, repoDir, "model-MTP-Q4_K_M.gguf")
+	writeSelectionFile(t, repoDir, "parts/model-Q4_K_M-00001-of-00002.gguf")
+	writeSelectionFile(t, repoDir, "parts/model-Q4_K_M-00002-of-00002.gguf")
+	writeSelectionFile(t, repoDir, "plain/model.gguf")
+	for _, name := range []string{"model-Q4_K_M.gguf", "model_Q4_K_M.gguf", "model-F16.gguf", "model-F32.gguf", "model.gguf", "model.GGUF", "split-X-00001-of-00002.gguf", "split-X-00002-of-00003.gguf", "split-X_00001_of_00002.gguf"} {
+		writeSelectionFile(t, repoDir, name)
+	}
+	writeSelectionFile(t, repoDir, "broken-Q4_K_M-00001-of-00002.gguf")
+	writeSelectionFile(t, repoDir, "invalid-00000-of-00000.gguf")
+	brokenLinkAdded := os.Symlink(filepath.Join(repoDir, "missing-target"), filepath.Join(repoDir, "missing-Q4_K_M.gguf")) == nil
+	for i := 0; i < 25; i++ {
+		writeSelectionFile(t, repoDir, fmt.Sprintf("many/extra-%02d.gguf", i))
+	}
+	otherRepo := filepath.Join(other, "owner", "model")
+	writeSelectionFile(t, otherRepo, "model-Q4_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root, other}})
+	code, got := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(got.Locations) != 2 {
+		t.Fatalf("selection=%d %+v", code, got)
+	}
+	if got.Type != "model" {
+		t.Fatalf("type=%q", got.Type)
+	}
+	loc := got.Locations[0]
+	if !strings.Contains(loc.Path, root) {
+		loc = got.Locations[1]
+	}
+	if len(loc.Groups) < 10 {
+		t.Fatalf("groups omitted files: got %d", len(loc.Groups))
+	}
+	if loc.Warning == "" || loc.CanDelete {
+		t.Fatalf("incompletely enumerated LocalScanDirs location must not advertise deletion: %+v", loc)
+	}
+	var completeLocation cacheSelectionLocation
+	for _, candidate := range got.Locations {
+		if strings.Contains(candidate.Path, other) {
+			completeLocation = candidate
+		}
+	}
+	if completeLocation.ID == "" || completeLocation.Warning != "" || !completeLocation.CanDelete {
+		t.Fatalf("fully enumerated configured LocalScanDirs root did not advertise deletion: %+v", completeLocation)
+	}
+	q4Count, manyCount, splitWarning, invalidWarning := 0, 0, false, false
+	paths := map[string]int{}
+	groupForPath := map[string]string{}
+	for _, g := range loc.Groups {
+		if g.ID == "" || len(g.Members) == 0 {
+			t.Errorf("invalid group: %+v", g)
+		}
+		if g.Quant == "Q4_K_M" {
+			q4Count++
+		}
+		if strings.HasPrefix(g.Label, "many/") {
+			manyCount++
+		}
+		if strings.Contains(g.Warning, "incomplete") {
+			splitWarning = true
+		}
+		if strings.Contains(g.Label, "invalid") && g.Warning != "" {
+			invalidWarning = true
+		}
+		for _, m := range g.Members {
+			paths[m.Path]++
+			groupForPath[m.Path] = g.ID
+		}
+	}
+	for _, name := range []string{"model-Q4_K_M.gguf", "model_Q4_K_M.gguf", "model-F16.gguf", "model-F32.gguf", "model.gguf", "model.GGUF", "split-X-00001-of-00002.gguf", "split-X-00002-of-00003.gguf", "split-X_00001_of_00002.gguf"} {
+		if paths[name] != 1 {
+			t.Errorf("%s appears in %d groups", name, paths[name])
+		}
+	}
+	for _, pair := range [][2]string{{"model-Q4_K_M.gguf", "model_Q4_K_M.gguf"}, {"model-F16.gguf", "model-F32.gguf"}, {"model.gguf", "model.GGUF"}, {"split-X-00001-of-00002.gguf", "split-X-00002-of-00003.gguf"}, {"split-X-00001-of-00002.gguf", "split-X_00001_of_00002.gguf"}} {
+		if groupForPath[pair[0]] == groupForPath[pair[1]] {
+			t.Errorf("distinct groups merged: %s and %s", pair[0], pair[1])
+		}
+	}
+	if q4Count < 4 {
+		t.Errorf("same-quant distinct families were merged: got %d Q4 groups", q4Count)
+	}
+	if manyCount != 25 {
+		t.Errorf("full member inventory truncated: found %d/25 groups", manyCount)
+	}
+	if !splitWarning {
+		t.Error("incomplete numbered shard set did not produce a warning")
+	}
+	if !invalidWarning {
+		t.Error("invalid numbered shard indices/totals did not produce a warning")
+	}
+	if brokenLinkAdded && loc.Warning == "" {
+		t.Error("unavailable local GGUF link did not produce a location warning")
+	}
+	code, selected := getSelection(t, s, "owner/model", "model", loc.ID)
+	if code != 200 || len(selected.Locations) != 1 || selected.Locations[0].ID != loc.ID {
+		t.Fatalf("explicit location retargeted: %d %+v", code, selected)
+	}
+	if code, _ := getSelection(t, s, "owner/model", "model", "local-not-current"); code != 400 {
+		t.Fatalf("stale selector status=%d", code)
+	}
+	if code, _ := getSelection(t, s, "owner/model", "dataset", ""); code != 400 {
+		t.Fatalf("dataset selector status=%d", code)
+	}
+}
+
+func TestSelectedDeleteRefusesOwnerSymlinkEscape(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	outsideRepo := filepath.Join(outside, "model")
+	writeSelectionFile(t, outsideRepo, "model-Q4_K_M.gguf")
+	if err := os.Symlink(outside, filepath.Join(root, "owner")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	code, selection := getSelection(t, s, "owner/model", "model", "")
+	if code != http.StatusOK || len(selection.Locations) != 1 {
+		t.Fatalf("selection status=%d locations=%+v", code, selection.Locations)
+	}
+	loc := selection.Locations[0]
+	if loc.CanDelete || len(loc.Groups) == 0 {
+		t.Fatalf("escaped owner must be visible but not deletable: %+v", loc)
+	}
+	group := loc.Groups[0]
+	body, err := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete through owner symlink status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outsideRepo, "model-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("outside file was changed: %v", err)
+	}
+}
+
+func TestSelectedDeleteAllowsConfiguredRootAlias(t *testing.T) {
+	actual, alias := t.TempDir(), filepath.Join(t.TempDir(), "registered-root")
+	writeSelectionFile(t, filepath.Join(actual, "owner", "model"), "model-Q4_K_M.gguf")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{alias}})
+	_, selection := getSelection(t, s, "owner/model", "model", "")
+	if len(selection.Locations) != 1 || !selection.Locations[0].CanDelete {
+		t.Fatalf("explicitly configured root alias was not admitted: %+v", selection.Locations)
+	}
+	loc, group := selection.Locations[0], selection.Locations[0].Groups[0]
+	body, err := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete through configured root alias status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(actual, "owner", "model", "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Fatalf("selected entry remains after authorized root-alias delete: %v", err)
+	}
+}
+
+func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.T) {
+	actual, alias := t.TempDir(), t.TempDir()
+	if err := os.Symlink(actual, filepath.Join(alias, "parent")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if !mutationPathsOverlap(filepath.Join(actual, "owner", "model", "Q4.gguf"), filepath.Join(alias, "parent", "owner", "model", "Q4.gguf")) {
+		t.Fatal("parent alias did not identify the same entry")
+	}
+	if !mutationDirectoryEntryOverlap(filepath.Join(alias, "parent"), filepath.Join(actual, "owner", "model", "Q4.gguf")) ||
+		!mutationDirectoryEntryOverlap(actual, filepath.Join(alias, "parent", "owner", "model", "Q4.gguf")) {
+		t.Fatal("directory/entry scope comparison missed an alias in one direction")
+	}
+	target := filepath.Join(actual, "payload.gguf")
+	leaf := filepath.Join(actual, "link-Q4.gguf")
+	if err := os.Symlink(target, leaf); err != nil {
+		t.Fatal(err)
+	}
+	got, err := mutationEntryIdentity(leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == pathIdentityKey(target) {
+		t.Fatalf("leaf identity followed symlink target: %q", got)
+	}
+}
+
+func TestMutationEntryIdentityFailsClosedForUnknownParentResolution(t *testing.T) {
+	root := t.TempDir()
+	loop := filepath.Join(root, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{loop, filepath.Join(root, "missing-target")} {
+		if prefix != loop {
+			if err := os.Symlink(filepath.Join(root, "does-not-exist"), prefix); err != nil {
+				t.Fatal(err)
+			}
+		}
+		path := filepath.Join(prefix, "child", "Q4.gguf")
+		if _, err := mutationEntryIdentity(path); err == nil {
+			t.Errorf("mutationEntryIdentity(%q) accepted unresolved symlink prefix", path)
+		}
+		if !mutationPathsOverlap(path, filepath.Join(t.TempDir(), "other", "Q4.gguf")) {
+			t.Errorf("unresolved path %q was treated as a proven non-overlap", path)
+		}
+	}
+	regular := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(regular, []byte("file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutationEntryIdentity(filepath.Join(regular, "child", "Q4.gguf")); err == nil {
+		t.Fatal("non-directory existing prefix was accepted as an ordinary missing suffix")
+	}
+}
+
+func TestJobDestinationBaseUsesFrozenLocalRepoAndDatasetNamespace(t *testing.T) {
+	job := &Job{OutputDir: "/cache", Repo: "upstream/source", LocalRepo: "owner/model", IsDataset: false}
+	if got, want := jobDestinationBase(job), filepath.Join("/cache", "models", "owner", "model"); got != want {
+		t.Fatalf("model destination=%q want %q", got, want)
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")) {
+		t.Fatal("redirected model destination was not recognized as a selected-path writer")
+	}
+	if jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "upstream", "source", "model-Q4_K_M.gguf")) {
+		t.Fatal("API repository spelling incorrectly authorized a different physical destination")
+	}
+	job.IsDataset = true
+	if got, want := jobDestinationBase(job), filepath.Join("/cache", "datasets", "owner", "model"); got != want {
+		t.Fatalf("dataset destination=%q want %q", got, want)
+	}
+	if jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")) {
+		t.Fatal("dataset writer leaked into the separate model namespace")
+	}
+}
+
+func TestJobAdmissionPredicateResolvesSelectedRootAliases(t *testing.T) {
+	actual, alias := t.TempDir(), filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	job := &Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}
+	target := filepath.Join(alias, "models", "owner", "model", "model-Q4_K_M.gguf")
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("shared writer predicate missed a selected entry beneath a configured-root alias")
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join(actual, "models", "owner", "model", "model-Q4_K_M.gguf")) {
+		t.Fatal("shared writer predicate missed the canonical spelling of the selected entry")
+	}
+	if jobMayWriteSelectedPath(job, filepath.Join(alias, "models", "owner", "model", "model-Q5_K_M.gguf")) {
+		t.Fatal("nonmatching Q5 was treated as a Q4 writer through the alias")
+	}
+
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: actual})
+	selectedLocalPath := filepath.Join(alias, "owner", "model", "model-Q4_K_M.gguf")
+	queued := &Job{ID: "queued-alias-q4", Repo: "upstream/source", OutputDir: actual, LocalDir: actual, LocalRepo: "owner/model", Flat: true, Filters: []string{"Q4_K_M"}, Status: JobStatusQueued}
+	s.jobs.mu.Lock()
+	s.jobs.jobs[queued.ID] = queued
+	s.jobs.mu.Unlock()
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{selectedLocalPath}); ok {
+		t.Fatal("queued writer using canonical root bypassed alias-spelled selection")
+	}
+	s.jobs.mu.Lock()
+	delete(s.jobs.jobs, queued.ID)
+	paused := *queued
+	paused.ID, paused.Status = "paused-alias-q4", JobStatusPaused
+	cancelled := *queued
+	cancelled.ID, cancelled.Status = "cancelled-alias-q4", JobStatusCancelled
+	s.jobs.jobs[paused.ID] = &paused
+	s.jobs.jobs[cancelled.ID] = &cancelled
+	s.jobs.mu.Unlock()
+	release, ok := s.jobs.reserveSelectedGGUF([]string{selectedLocalPath})
+	if !ok {
+		t.Fatal("could not reserve alias-spelled selected entry")
+	}
+	if s.jobs.ResumeJob(paused.ID) {
+		t.Fatal("paused canonical writer resumed through alias-spelled reservation")
+	}
+	if s.jobs.RetryJob(cancelled.ID) {
+		t.Fatal("cancelled canonical writer retried through alias-spelled reservation")
+	}
+	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new matching aliased writer crossed reservation: %v", err)
+	}
+	if jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}}, target) {
+		t.Fatal("nonmatching Q5 writer was blocked by Q4 reservation")
+	}
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+}
+
+func TestSelectedDeleteBlocksPrescanWriterWhenAliasChangesExcludedPath(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blocked := filepath.Join(repoDir, "blocked")
+	writeSelectionFile(t, blocked, "model-Q4_K_M.gguf")
+	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	hf, started, release := blockingRevisionServer(t, "live/model-Q4_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production run did not enter repository prescan")
+	}
+	body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("prescan raw live-path writer did not block DELETE: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(blocked, "model-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("pending writer's selected file was deleted: %v", err)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !s.jobs.CancelJob(job.ID) {
+		t.Fatal("could not cancel prescan test job")
+	}
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+}
+
+func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blockedDir := filepath.Join(repoDir, "blocked")
+	writeSelectionFile(t, blockedDir, "model-Q4_K_M.gguf")
+	if err := os.Symlink(blockedDir, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	selected := filepath.Join(blockedDir, "model-Q4_K_M.gguf")
+
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(`[{"type":"file","path":"live/model-Q4_K_M.gguf","size":5}]`))
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			_, _ = w.Write([]byte("data!"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hf.Close()
+
+	plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{
+		Repo: "upstream/source", Revision: "main", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"},
+	}, hfdownloader.Settings{Endpoint: hf.URL})
+	if err != nil {
+		t.Fatalf("production PlanRepo: %v", err)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "live/model-Q4_K_M.gguf" {
+		t.Fatalf("production plan paths=%+v, expected raw live path", plan.Items)
+	}
+
+	job := &Job{OutputDir: storage, Repo: "upstream/source", LocalRepo: "o/m", Flat: false, Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"}}
+	plannedOutput := filepath.Join(jobDestinationBase(job), filepath.FromSlash(plan.Items[0].RelativePath))
+	if got, err := mutationEntryIdentity(plannedOutput); err != nil || got != pathIdentityKey(selected) {
+		t.Fatalf("planned output identity=%q err=%v, selected entry=%q", got, err, selected)
+	}
+	if !jobMayWriteSelectedPath(job, selected) {
+		t.Fatal("physical alias component was incorrectly applied as the remote path exclusion")
+	}
+
+	runHF, started, releaseRun := blockingRevisionServer(t, "model-Q4_K_M.gguf")
+	defer runHF.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: runHF.URL, MaxActive: 1})
+	blocker, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocker did not enter production run")
+	}
+	queued, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"}})
+	if err != nil {
+		t.Fatalf("create queued matching writer: %v", err)
+	}
+	if queued.Status != JobStatusQueued {
+		t.Fatalf("matching writer status=%s, want queued", queued.Status)
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("queued production-path writer through live alias did not block selected deletion")
+	}
+	if !s.jobs.CancelJob(queued.ID) {
+		t.Fatal("could not cancel queued test writer")
+	}
+	s.jobs.mu.Lock()
+	paused := *queued
+	paused.ID, paused.Status = "paused-remote-live", JobStatusPaused
+	s.jobs.jobs[paused.ID] = &paused
+	s.jobs.mu.Unlock()
+	release, ok := s.jobs.reserveSelectedGGUF([]string{selected})
+	if !ok {
+		t.Fatal("could not reserve selected physical entry")
+	}
+	if s.jobs.ResumeJob(paused.ID) || s.jobs.RetryJob(queued.ID) {
+		t.Fatal("paused/retry admission crossed selected reservation for alias-excluded writer")
+	}
+	created, _, createErr := s.jobs.CreateJob(DownloadRequest{
+		Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"},
+	})
+	if !errors.Is(createErr, errSelectionWriterBusy) {
+		if created != nil {
+			_ = s.jobs.CancelJob(created.ID)
+		}
+		release()
+		t.Fatalf("matching aliased writer crossed selected reservation: job=%+v err=%v", created, createErr)
+	}
+	q5, _, err := s.jobs.CreateJob(DownloadRequest{
+		Repo: "upstream/source", Revision: "other", LocalRepo: "o/m", Filters: []string{"Q5_K_M"}, Excludes: []string{"blocked"},
+	})
+	if err != nil {
+		t.Fatalf("nonmatching Q5 was rejected by Q4 reservation: %v", err)
+	}
+	if q5.Status != JobStatusQueued {
+		t.Fatalf("Q5 status=%s, want queued behind blocker", q5.Status)
+	}
+	if !s.jobs.CancelJob(q5.ID) {
+		t.Fatal("could not cancel nonmatching Q5 test job")
+	}
+	release()
+	if !s.jobs.CancelJob(blocker.ID) {
+		t.Fatal("could not cancel blocking test job")
+	}
+	releaseRun()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+	if _, err := os.Stat(selected); err != nil {
+		t.Fatalf("reserved selected file changed: %v", err)
+	}
+}
+
+func TestSelectedCacheDeleteRemovesOnlyConfirmedLocalGroup(t *testing.T) {
+	root, other := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	for _, name := range []string{"model-Q2_K.gguf", "model-Q3_K_M.gguf", "model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "model-Q6_K.gguf", "model-Q8_0.gguf", "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf", "README.md"} {
+		writeSelectionFile(t, repoDir, name)
+	}
+	otherFile := filepath.Join(other, "owner", "model", "model-Q4_K_M.gguf")
+	writeSelectionFile(t, filepath.Dir(otherFile), filepath.Base(otherFile))
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root, other}})
+	code, selection := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(selection.Locations) != 2 {
+		t.Fatalf("selection=%d %+v", code, selection)
+	}
+	var selected cacheSelectionLocation
+	for _, loc := range selection.Locations {
+		if strings.Contains(loc.Path, root) {
+			selected = loc
+		}
+	}
+	var group cacheSelectionGroup
+	for _, g := range selected.Groups {
+		if len(g.Members) == 1 && g.Members[0].Path == "model-Q4_K_M.gguf" {
+			group = g
+			break
+		}
+	}
+	if group.ID == "" {
+		t.Fatalf("Q4 group not found: %+v", selected.Groups)
+	}
+	body, err := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: selected.ID, GroupID: group.ID, Members: group.Members})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != 200 {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	selectedPaths := map[string]bool{}
+	for _, member := range group.Members {
+		selectedPaths[member.Path] = true
+		if _, err := os.Stat(filepath.Join(repoDir, filepath.FromSlash(member.Path))); !os.IsNotExist(err) {
+			t.Errorf("selected file %s remains, err=%v", member.Path, err)
+		}
+	}
+	for _, name := range []string{"model-Q2_K.gguf", "model-Q3_K_M.gguf", "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf", "model-Q5_K_M.gguf", "model-Q6_K.gguf", "model-Q8_0.gguf", "README.md"} {
+		if selectedPaths[name] {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, name)); err != nil {
+			t.Errorf("unselected file %s changed: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Errorf("same file in other location changed: %v", err)
+	}
+}
+
+func TestSelectedCacheDeleteRejectsStaleMembersAndDeletesHFLocation(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	_, selection := getSelection(t, s, "owner/model", "model", "")
+	loc := selection.Locations[0]
+	g := loc.Groups[0]
+	stale, _ := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: loc.ID, GroupID: g.ID, Members: nil})
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(stale))
+	if w.Code == 200 {
+		t.Fatal("stale selection unexpectedly deleted the file")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("stale request changed file: %v", err)
+	}
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	hfFile := filepath.Join(rd.SnapshotsDir(), "version-1", "model-Q4_K_M.gguf")
+	if err := os.MkdirAll(filepath.Dir(hfFile), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hfFile, []byte("hf"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, withHF := getSelection(t, s, "owner/model", "model", "")
+	var hfLocation cacheSelectionLocation
+	for _, candidate := range withHF.Locations {
+		if strings.HasPrefix(candidate.ID, "hf-") {
+			hfLocation = candidate
+		}
+	}
+	if hfLocation.ID == "" || len(hfLocation.Groups) == 0 {
+		t.Fatalf("HF selection fixture missing: %+v", withHF.Locations)
+	}
+	hfGroup := hfLocation.Groups[0]
+	hfRequest, _ := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: hfLocation.ID, GroupID: hfGroup.ID, Members: hfGroup.Members})
+	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(hfRequest))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF selection delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(hfFile); !os.IsNotExist(err) {
+		t.Fatalf("selected HF entry remains, err=%v", err)
+	}
+}
+
+func TestSelectedHFDeletePreservesSharedPayloadAndOtherQuant(t *testing.T) {
+	cacheRoot := t.TempDir()
+	s := newTestServerWithConfig(t, Config{CacheDir: cacheRoot})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := func(version, name, contents string) *hfdownloader.StoreFileResult {
+		t.Helper()
+		temp := filepath.Join(t.TempDir(), "download")
+		if err := os.WriteFile(temp, []byte(contents), 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := rd.StoreDownloadedFile(temp, name, version, "", "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	q4a := store("version-a", "model-Q4_K_M.gguf", "shared payload")
+	store("version-b", "model-Q4_K_M.gguf", "shared payload")
+	q5 := store("version-b", "model-Q5_K_M.gguf", "shared payload")
+	unique := store("version-b", "model-Q3_K.gguf", "unshared payload")
+	readme := filepath.Join(rd.FriendlyPath(), "README.md")
+	if err := os.MkdirAll(filepath.Dir(readme), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readme, []byte("ordinary friendly file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	code, selection := getSelection(t, s, "owner/model", "model", "")
+	if code != http.StatusOK {
+		t.Fatalf("selection status=%d", code)
+	}
+	var location *cacheSelectionLocation
+	for i := range selection.Locations {
+		if strings.HasPrefix(selection.Locations[i].ID, "hf-") {
+			location = &selection.Locations[i]
+		}
+	}
+	if location == nil {
+		t.Fatalf("HF location missing: %+v", selection.Locations)
+	}
+	var group *cacheSelectionGroup
+	for i := range location.Groups {
+		if location.Groups[i].Members[0].Path == "model-Q4_K_M.gguf" {
+			group = &location.Groups[i]
+		}
+	}
+	if group == nil || len(group.Members) != 2 || len(group.Members[0].Versions) != 1 || len(group.Members[1].Versions) != 1 {
+		t.Fatalf("Q4 group should cover both snapshots: %+v", location.Groups)
+	}
+	body, _ := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: location.ID, GroupID: group.ID, Members: group.Members})
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HF delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(q4a.BlobPath); err != nil {
+		t.Fatalf("shared payload removed despite Q5 reference: %v", err)
+	}
+	if _, err := os.Stat(q5.SnapshotPath); err != nil {
+		t.Fatalf("other quant snapshot changed: %v", err)
+	}
+	if _, err := os.Stat(q5.FriendlyPath); err != nil {
+		t.Fatalf("other quant friendly link changed: %v", err)
+	}
+	if _, err := os.Lstat(q4a.SnapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("selected Q4 snapshot remains: %v", err)
+	}
+	if _, err := os.Lstat(q4a.FriendlyPath); !os.IsNotExist(err) {
+		t.Fatalf("selected Q4 friendly entry remains: %v", err)
+	}
+	if got, err := os.ReadFile(readme); err != nil || string(got) != "ordinary friendly file" {
+		t.Fatalf("ordinary friendly file changed: content=%q err=%v", got, err)
+	}
+	_, selection = getSelection(t, s, "owner/model", "model", location.ID)
+	location = nil
+	for i := range selection.Locations {
+		if strings.HasPrefix(selection.Locations[i].ID, "hf-") {
+			location = &selection.Locations[i]
+		}
+	}
+	if location == nil {
+		t.Fatal("refreshed HF location missing")
+	}
+	var q3 *cacheSelectionGroup
+	for i := range location.Groups {
+		if location.Groups[i].Members[0].Path == "model-Q3_K.gguf" {
+			q3 = &location.Groups[i]
+		}
+	}
+	if q3 == nil {
+		t.Fatal("unique payload group missing")
+	}
+	body, _ = json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: location.ID, GroupID: q3.ID, Members: q3.Members})
+	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unique HF delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(unique.BlobPath); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced selected payload remains, err=%v", err)
+	}
+}
+
+func TestSelectedHFDeleteRetainsPayloadForDirectFriendlyBlobLink(t *testing.T) {
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte("shared payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := rd.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobView := filepath.Join(rd.FriendlyPath(), "blob-view")
+	symlinkOrSkip(t, rd.BlobsDir(), blobView)
+	otherName := filepath.Join(rd.FriendlyPath(), "model-Q5_K_M.gguf")
+	symlinkOrSkip(t, filepath.Join(blobView, filepath.Base(stored.BlobPath)), otherName)
+	body := selectedHFGroupRequest(t, s, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"retainedPayloads"`) || !strings.Contains(w.Body.String(), "shared payloads needed") {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(stored.BlobPath); err != nil {
+		t.Fatalf("payload needed by retained friendly blob link was removed: %v", err)
+	}
+	if _, err := os.Lstat(otherName); err != nil {
+		t.Fatalf("unselected friendly blob link changed: %v", err)
+	}
+	if _, err := os.Stat(otherName); err != nil {
+		t.Fatalf("unselected friendly blob alias no longer resolves: %v", err)
+	}
+	if _, err := os.Lstat(stored.SnapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("selected snapshot entry remains: %v", err)
+	}
+}
+
+func TestSelectedHFDeleteRefusesRetainedFriendlySnapshotDependency(t *testing.T) {
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(rd.SnapshotsDir(), "version-a", "model-Q4_K_M.gguf")
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte("selected regular snapshot"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	friendly := filepath.Join(rd.FriendlyPath(), "model-Q4_K_M.gguf")
+	if err := os.MkdirAll(filepath.Dir(friendly), 0755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, snapshot, friendly)
+	snapshotView := filepath.Join(rd.FriendlyPath(), "snapshot-view")
+	symlinkOrSkip(t, filepath.Dir(snapshot), snapshotView)
+	otherName := filepath.Join(rd.FriendlyPath(), "model-Q5_K_M.gguf")
+	symlinkOrSkip(t, filepath.Join(snapshotView, filepath.Base(snapshot)), otherName)
+	body := selectedHFGroupRequest(t, s, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("dependent friendly name should refuse deletion, status=%d body=%s", w.Code, w.Body.String())
+	}
+	for _, name := range []string{snapshot, friendly, snapshotView, otherName} {
+		if _, err := os.Lstat(name); err != nil {
+			t.Fatalf("refused operation changed %s: %v", name, err)
+		}
+	}
+}
+
+func selectedHFGroupRequest(t *testing.T, s *Server, memberPath string) []byte {
+	t.Helper()
+	code, selection := getSelection(t, s, "owner/model", "model", "")
+	if code != http.StatusOK {
+		t.Fatalf("selection status=%d", code)
+	}
+	for _, loc := range selection.Locations {
+		if !strings.HasPrefix(loc.ID, "hf-") {
+			continue
+		}
+		for _, group := range loc.Groups {
+			for _, member := range group.Members {
+				if member.Path == memberPath {
+					body, err := json.Marshal(testSelectedDeleteRequest{Repo: "owner/model", Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return body
+				}
+			}
+		}
+	}
+	t.Fatalf("HF member %q missing", memberPath)
+	return nil
+}
+
+func TestHFSelectionExcludesConfiguredNestedSnapshotRoot(t *testing.T) {
+	cacheRoot := t.TempDir()
+	cache := Config{CacheDir: cacheRoot}.cache()
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(rd.SnapshotsDir(), "version-a", "library")
+	writeSelectionFile(t, nested, "vendor-Q4_K_M.gguf")
+	writeSelectionFile(t, filepath.Join(rd.SnapshotsDir(), "version-a"), "model-Q5_K_M.gguf")
+	alias := filepath.Join(t.TempDir(), "nested-root")
+	if err := os.Symlink(nested, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: cacheRoot, LocalScanDirs: []string{alias}})
+	_, got := getSelection(t, s, "owner/model", "model", "")
+	for _, loc := range got.Locations {
+		if !strings.HasPrefix(loc.ID, "hf-") {
+			continue
+		}
+		for _, group := range loc.Groups {
+			for _, member := range group.Members {
+				if strings.Contains(member.Path, "library/") || strings.Contains(member.Path, "vendor-Q4") {
+					t.Fatalf("configured local subtree was included in the outer HF selection: %+v", member)
+				}
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(nested, "vendor-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("configured descendant file changed during selection: %v", err)
+	}
+	body := selectedHFGroupRequest(t, s, "model-Q5_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("outer HF group deletion status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(nested, "vendor-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("configured descendant file changed by outer deletion: %v", err)
+	}
+}
+
+func TestHFSelectionReservationProtectsRepositoryAndFriendlyWriters(t *testing.T) {
+	cfg := Config{CacheDir: t.TempDir()}
+	cache := cfg.cache()
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, cfg)
+	release, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath())
+	if !ok {
+		t.Fatal("HF reservation failed")
+	}
+	defer release()
+	sameRepo := &Job{Repo: "owner/model", OutputDir: cache.Root, HubDir: cache.HubDir()}
+	if !s.jobs.jobBlockedByDeleteLocked(sameRepo) {
+		t.Fatal("same-repository HF writer was not blocked")
+	}
+	otherRepo := &Job{Repo: "owner/other", OutputDir: cache.Root, HubDir: cache.HubDir()}
+	if s.jobs.jobBlockedByDeleteLocked(otherRepo) {
+		t.Fatal("unrelated HF repository was blocked")
+	}
+	otherHubSharedFriendly := &Job{Repo: "owner/model", OutputDir: cache.Root, HubDir: filepath.Join(t.TempDir(), "hub")}
+	if !s.jobs.jobBlockedByDeleteLocked(otherHubSharedFriendly) {
+		t.Fatal("writer to selected friendly view was not blocked")
+	}
+	localSibling := &Job{Repo: "owner/model", OutputDir: filepath.Join(t.TempDir(), "local"), LocalDir: filepath.Join(t.TempDir(), "local"), Flat: true}
+	if s.jobs.jobBlockedByDeleteLocked(localSibling) {
+		t.Fatal("unrelated local writer was blocked")
+	}
+	queuedServer := newTestServerWithConfig(t, cfg)
+	queuedServer.jobs.mu.Lock()
+	queuedServer.jobs.jobs["queued-same-hub"] = &Job{ID: "queued-same-hub", Repo: "owner/model", OutputDir: cache.Root, HubDir: cache.HubDir(), Status: JobStatusQueued}
+	queuedServer.jobs.mu.Unlock()
+	if _, ok := queuedServer.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
+		t.Fatal("queued same-repository writer did not block HF deletion")
+	}
+	otherRepoServer := newTestServerWithConfig(t, cfg)
+	otherRepoServer.jobs.mu.Lock()
+	otherRepoServer.jobs.jobs["queued-other-repo"] = &Job{ID: "queued-other-repo", Repo: "owner/other", OutputDir: cache.Root, HubDir: cache.HubDir(), Status: JobStatusQueued}
+	otherRepoServer.jobs.mu.Unlock()
+	otherRelease, ok := otherRepoServer.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath())
+	if !ok {
+		t.Fatal("queued unrelated HF repository blocked selected deletion")
+	}
+	otherRelease()
+}
+
+func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
+	cfg := Config{CacheDir: t.TempDir()}
+	cache := cfg.cache()
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, job := range map[string]*Job{
+		"localRepo in the selected Hub": {
+			Repo: "upstream/source", LocalRepo: "owner/model", OutputDir: cache.Root, HubDir: cache.HubDir(),
+		},
+		"old friendly root but same Hub repository": {
+			Repo: "owner/model", OutputDir: t.TempDir(), HubDir: cache.HubDir(),
+		},
+		"flat actual destination inside selected repository": {
+			Repo: "different/source", LocalRepo: "inside", OutputDir: t.TempDir(), LocalDir: rd.Path(), Flat: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, job) {
+				t.Fatal("writer to selected HF state was not blocked")
+			}
+		})
+	}
+	otherDataset, err := cache.Repo("owner/model", hfdownloader.RepoTypeDataset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataset := &Job{Repo: "upstream/source", LocalRepo: "owner/model", IsDataset: true, OutputDir: cache.Root, HubDir: cache.HubDir()}
+	if hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, dataset) {
+		t.Fatal("dataset actual namespace was mistaken for the selected model namespace")
+	}
+	if !hfReservationConflictsJob([]string{otherDataset.Path(), filepath.Join(cache.DatasetsDir(), "owner", "model")}, dataset) {
+		t.Fatal("dataset LocalRepo destination was not recognized")
+	}
+}
+
+func TestSelectedDeleteUnlinksOnlyConfirmedFriendlyLeaf(t *testing.T) {
+	root, payloadDir := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(payloadDir, "weights.gguf")
+	if err := os.WriteFile(payload, []byte("weight payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repoDir, "model-Q4_K_M.gguf")
+	symlinkOrSkip(t, payload, link)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "without removing their weight targets") {
+		t.Fatalf("link-only delete response status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("selected link remains, err=%v", err)
+	}
+	if _, err := os.Stat(payload); err != nil {
+		t.Fatalf("link target was changed: %v", err)
+	}
+}
+
+func TestSelectedDeleteRemovesOnlyExactSplitMembersAndKeepsDirectories(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "split/model-Q4_K_M-00001-of-00002.gguf")
+	writeSelectionFile(t, repoDir, "split/model-Q4_K_M-00002-of-00002.gguf")
+	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	writeSelectionFile(t, repoDir, "model-Q5_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	body := selectedGroupRequest(t, s, "owner/model", root, "split/model-Q4_K_M-00001-of-00002.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("split delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	for _, name := range []string{"split/model-Q4_K_M-00001-of-00002.gguf", "split/model-Q4_K_M-00002-of-00002.gguf"} {
+		if _, err := os.Stat(filepath.Join(repoDir, filepath.FromSlash(name))); !os.IsNotExist(err) {
+			t.Errorf("split member %s remains, err=%v", name, err)
+		}
+	}
+	for _, name := range []string{"model-Q4_K_M.gguf", "model-Q5_K_M.gguf"} {
+		if _, err := os.Stat(filepath.Join(repoDir, name)); err != nil {
+			t.Errorf("unselected file %s changed: %v", name, err)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(repoDir, "split")); err != nil || !info.IsDir() {
+		t.Errorf("selected file's directory was removed: info=%v err=%v", info, err)
+	}
+}
+
+func TestSelectedDeleteRejectsChangedRootAndGroupComposition(t *testing.T) {
+	root, newRoot := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	s.configMu.Lock()
+	s.config.LocalScanDirs = []string{newRoot}
+	s.configMu.Unlock()
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("changed root accepted old selection: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("stale root request changed file: %v", err)
+	}
+
+	// Re-select against the new root, then mutate the same selected group's
+	// composition after confirmation; the old request must not expand to it.
+	writeSelectionFile(t, filepath.Join(newRoot, "owner", "model"), "model-Q4_K_M-00001-of-00002.gguf")
+	body = selectedGroupRequest(t, s, "owner/model", newRoot, "model-Q4_K_M-00001-of-00002.gguf")
+	writeSelectionFile(t, filepath.Join(newRoot, "owner", "model"), "model-Q4_K_M-00002-of-00002.gguf")
+	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("changed composition accepted old selection: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestSelectedDeleteReservationExcludesOwningRebuildAndLegacyDelete(t *testing.T) {
+	cacheRoot, payloadRoot := t.TempDir(), t.TempDir()
+	s := newTestServerWithConfig(t, Config{CacheDir: cacheRoot})
+	cache := s.snapshotConfig().cache()
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rd.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	friendlyRepo := rd.FriendlyPath()
+	if err := os.MkdirAll(friendlyRepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(payloadRoot, "weights.gguf")
+	if err := os.WriteFile(payload, []byte("weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(friendlyRepo, "model-Q4_K_M.gguf")
+	symlinkOrSkip(t, payload, link)
+	selectedPath := filepath.Join(friendlyRepo, "model-Q4_K_M.gguf")
+	release, ok := s.jobs.reserveSelectedGGUF([]string{selectedPath})
+	if !ok {
+		t.Fatal("could not reserve selected friendly link")
+	}
+	defer release()
+	w := cacheRequest(t, s, "POST", "/api/cache/rebuild", `{}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("rebuild crossed selected deletion: status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = cacheRequest(t, s, "DELETE", "/api/cache/owner/model?type=model", "")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("legacy whole-repo delete crossed selected deletion: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("selected friendly entry changed during refused writers: %v", err)
+	}
+	if _, err := os.Stat(rd.Path()); err != nil {
+		t.Fatalf("Hub repository changed during refused legacy delete: %v", err)
+	}
+}
+
+func TestSelectedDeleteReservationExcludesMirrorDestinationsButNotDryRun(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	targetRoot := t.TempDir()
+	targets := &hfdownloader.TargetsConfig{Targets: map[string]hfdownloader.Target{"remote": {Path: targetRoot}}}
+	if err := targets.Save(""); err != nil {
+		t.Fatal(err)
+	}
+
+	pushRoot := filepath.Join(targetRoot, "hub")
+	writeSelectionFile(t, filepath.Join(pushRoot, "owner", "model"), "model-Q4_K_M.gguf")
+	pushServer := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{pushRoot}})
+	if err := os.MkdirAll(pushServer.snapshotConfig().cache().HubDir(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	pushPath := filepath.Join(pushRoot, "owner", "model", "model-Q4_K_M.gguf")
+	releasePush, ok := pushServer.jobs.reserveSelectedGGUF([]string{pushPath})
+	if !ok {
+		t.Fatal("could not reserve mirror-push destination file")
+	}
+	w := cacheRequest(t, pushServer, "POST", "/api/mirror/push", `{"target":"remote"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("mirror push wrote through selected deletion: status=%d body=%s", w.Code, w.Body.String())
+	}
+	// Push reads the server's local Hub source, not the selected friendly/local
+	// source, so a dry run remains non-mutating and must not veto the reservation.
+	w = cacheRequest(t, pushServer, "POST", "/api/mirror/push", `{"target":"remote","dryRun":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("read-only mirror push dry-run was incorrectly blocked: status=%d body=%s", w.Code, w.Body.String())
+	}
+	releasePush()
+
+	pullCache := filepath.Join(t.TempDir(), "cache")
+	pullHub := filepath.Join(pullCache, "hub")
+	writeSelectionFile(t, filepath.Join(pullHub, "owner", "model"), "model-Q4_K_M.gguf")
+	pullServer := newTestServerWithConfig(t, Config{CacheDir: pullCache, LocalScanDirs: []string{pullHub}})
+	pullPath := filepath.Join(pullHub, "owner", "model", "model-Q4_K_M.gguf")
+	releasePull, ok := pullServer.jobs.reserveSelectedGGUF([]string{pullPath})
+	if !ok {
+		t.Fatal("could not reserve mirror-pull destination file")
+	}
+	w = cacheRequest(t, pullServer, "POST", "/api/mirror/pull", `{"target":"remote"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("mirror pull wrote through selected deletion: status=%d body=%s", w.Code, w.Body.String())
+	}
+	releasePull()
+}
+
+func TestLocalGGUFWriterPredicateMatchesProductionFilters(t *testing.T) {
+	for _, tc := range []struct {
+		path    string
+		filters []string
+		want    bool
+	}{
+		{"model-Q4_K_M.gguf", []string{"q5_k_m"}, false},
+		{"model-Q5_K_M.gguf", []string{"q5_k_m"}, true},
+		{"nested/model-Q4_K_M.gguf", []string{"q4_k_m"}, true},
+		{"model-Q4_K_M.gguf", nil, true},
+	} {
+		if got := hfdownloader.GGUFPathSelected(tc.path, tc.filters, nil, false); got != tc.want {
+			t.Errorf("GGUFPathSelected(%q,%v)=%v want %v", tc.path, tc.filters, got, tc.want)
+		}
+	}
+	if hfdownloader.GGUFPathSelected("nested/model-Q4_K_M.gguf", []string{"q4_k"}, nil, true) {
+		t.Error("exact filter incorrectly treated an underscore prefix as a whole segment")
+	}
+	if hfdownloader.GGUFPathSelected("nested/model-Q4_K_M.gguf", []string{"q4_k_m"}, []string{"nested"}, false) {
+		t.Error("excluded relative path was considered writable")
+	}
+}
+
+func blockingPlanServer(t *testing.T, file string) (*httptest.Server, <-chan struct{}, func()) {
+	t.Helper()
+	started := make(chan struct{}, 8)
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Logf("selected-delete test HTTP %s %s", r.Method, r.URL.Path)
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `[{"type":"file","path":%q,"size":5}]`, file)
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+				_, _ = w.Write([]byte("data!"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv, started, func() { close(gate) }
+}
+
+func blockingRevisionServer(t *testing.T, file string) (*httptest.Server, <-chan struct{}, func()) {
+	t.Helper()
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			started <- struct{}{}
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = fmt.Fprintf(w, `[{"type":"file","path":%q,"size":5}]`, file)
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			_, _ = w.Write([]byte("data!"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv, started, func() { close(gate) }
+}
+
+func selectedGroupRequest(t *testing.T, s *Server, repo, locationRoot, memberPath string) []byte {
+	t.Helper()
+	code, selection := getSelection(t, s, repo, "model", "")
+	if code != http.StatusOK {
+		t.Fatalf("selection status=%d", code)
+	}
+	for _, loc := range selection.Locations {
+		if !strings.Contains(loc.Path, locationRoot) {
+			continue
+		}
+		for _, group := range loc.Groups {
+			for _, member := range group.Members {
+				if member.Path == memberPath {
+					body, err := json.Marshal(testSelectedDeleteRequest{Repo: repo, Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return body
+				}
+			}
+		}
+	}
+	t.Fatalf("selected member %q not found in %q", memberPath, locationRoot)
+	return nil
+}
+
+func TestSelectedDeleteWaitsForActualQ4RunUnwind(t *testing.T) {
+	root := t.TempDir()
+	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
+	hf, started, release := blockingPlanServer(t, "model-Q4_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		got, _ := s.jobs.GetJob(job.ID)
+		t.Fatalf("real downloader did not reach the planned file: %+v", got)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete while actual Q4 run is writing status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("busy delete removed selected file: %v", err)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !s.jobs.CancelJob(job.ID) {
+		t.Fatal("cancel active job failed")
+	}
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedDeleteWaitsAfterCancelAndDismissUntilRunUnwinds(t *testing.T) {
+	root := t.TempDir()
+	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
+	hf, started, releaseDownload := blockingPlanServer(t, "model-Q4_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	persistEntered, persistRelease := make(chan struct{}), make(chan struct{})
+	var persistOnce sync.Once
+	s.jobs.persistStateFile = func(string, []*Job) error {
+		persistOnce.Do(func() {
+			close(persistEntered)
+			<-persistRelease
+		})
+		return nil
+	}
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real downloader did not reach the planned Q4 file")
+	}
+	cancelResult := make(chan bool, 1)
+	go func() { cancelResult <- s.jobs.CancelJob(job.ID) }()
+	select {
+	case <-persistEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation/unwind did not reach the controlled persistence boundary")
+	}
+	got, ok := s.jobs.GetJob(job.ID)
+	if !ok || got.Status != JobStatusCancelled {
+		t.Fatalf("job was not visibly cancelled before dismissal: %#v", got)
+	}
+	if result, _ := s.jobs.DismissJobResult(job.ID); result != DismissJobOK {
+		t.Fatalf("terminal cancelled job could not be dismissed: %v", result)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete crossed cancelled/dismissed but unwinding writer: status=%d body=%s", w.Code, w.Body.String())
+	}
+	close(persistRelease)
+	releaseDownload()
+	select {
+	case ok := <-cancelResult:
+		if !ok {
+			t.Fatal("cancel request failed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel request did not finish after persistence was released")
+	}
+	runDone := make(chan struct{})
+	go func() { s.jobs.runWG.Wait(); close(runDone) }()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled downloader did not unwind")
+	}
+	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete remained blocked after actual run unwind: status=%d body=%s", w.Code, w.Body.String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type selectedDeleteObservedSaveLocker struct {
+	mu     sync.Mutex
+	count  atomic.Int32
+	second chan struct{}
+	once   sync.Once
+}
+
+func (l *selectedDeleteObservedSaveLocker) Lock() {
+	if l.count.Add(1) == 2 {
+		l.once.Do(func() { close(l.second) })
+	}
+	l.mu.Lock()
+}
+
+func (l *selectedDeleteObservedSaveLocker) Unlock() { l.mu.Unlock() }
+
+func TestSelectedDeleteTracksBothRealGenerationsDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
+	hf, started, releaseDownload := blockingPlanServer(t, "model-Q4_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	locker := &selectedDeleteObservedSaveLocker{second: make(chan struct{})}
+	s.jobs.saveMu = locker
+	persistEntered, persistRelease := make(chan struct{}), make(chan struct{})
+	var persistOnce sync.Once
+	s.jobs.persistStateFile = func(string, []*Job) error {
+		persistOnce.Do(func() {
+			close(persistEntered)
+			<-persistRelease
+		})
+		return nil
+	}
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first real downloader generation did not start")
+	}
+	cancelResult := make(chan bool, 1)
+	go func() { cancelResult <- s.jobs.CancelJob(job.ID) }()
+	select {
+	case <-persistEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not reach persistence")
+	}
+	select {
+	case <-locker.second:
+		// The second state save is the other real operation (CancelJob and the
+		// unwinding run). The first retains saveMu, so the first run cannot exit.
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled run did not reach its serialized persistence boundary")
+	}
+	if got, ok := s.jobs.GetJob(job.ID); !ok || got.Status != JobStatusCancelled {
+		t.Fatalf("first generation is not terminal before Retry: %#v", got)
+	}
+	if !s.jobs.RetryJob(job.ID) {
+		t.Fatal("explicit Retry was rejected while the old cancelled run unwound")
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second real downloader generation did not start")
+	}
+	s.jobs.mu.RLock()
+	activeGenerations := len(s.jobs.runActivities)
+	s.jobs.mu.RUnlock()
+	if activeGenerations != 2 {
+		t.Fatalf("expected independent old/new run records, got %d", activeGenerations)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("one generation cleared another live target writer: status=%d body=%s", w.Code, w.Body.String())
+	}
+	close(persistRelease)
+	if !s.jobs.CancelJob(job.ID) {
+		t.Fatal("cancel second generation failed")
+	}
+	releaseDownload()
+	select {
+	case <-cancelResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first cancel request did not finish")
+	}
+	runDone := make(chan struct{})
+	go func() { s.jobs.runWG.Wait(); close(runDone) }()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("both downloader generations did not unwind")
+	}
+	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete stayed busy after both generations exited: status=%d body=%s", w.Code, w.Body.String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedDeleteAllowsActualNonOverlappingQ5Plan(t *testing.T) {
+	root := t.TempDir()
+	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
+	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q5_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		got, _ := s.jobs.GetJob(job.ID)
+		t.Fatalf("real downloader did not reach the planned Q5 file: %+v", got)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("non-overlapping Q5 plan blocked Q4 delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
+		t.Fatalf("Q4 remains after selected delete, err=%v", err)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !s.jobs.CancelJob(job.ID) {
+		t.Fatal("cancel active job failed")
+	}
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
+	root := t.TempDir()
+	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
+	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	running, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real blocker run did not start")
+	}
+	q4, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q5, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q5_k_m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q4.Status != JobStatusQueued || q5.Status != JobStatusQueued {
+		t.Fatalf("jobs did not remain queued behind blocker: Q4=%s Q5=%s", q4.Status, q5.Status)
+	}
+	target := filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{target}); ok {
+		t.Fatal("queued Q4 job did not veto deletion")
+	}
+	if !s.jobs.CancelJob(q4.ID) {
+		t.Fatal("could not manually cancel queued Q4 job")
+	}
+	releaseDelete, ok := s.jobs.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("queued Q5 job in same folder incorrectly vetoed Q4 deletion")
+	}
+	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new matching job crossed active deletion: %v", err)
+	}
+	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Revision: "other", Filters: []string{"q5_k_m"}}); err != nil {
+		t.Fatalf("non-overlapping new Q5 job was rejected: %v", err)
+	}
+	releaseDelete()
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !s.jobs.CancelJob(running.ID) {
+		t.Fatal("cancel active blocker failed")
+	}
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheSelectionLocalSymlinkIsVisibleAsLinkOnly(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, root, "outside/payload.gguf")
+	link := filepath.Join(repoDir, "alias-Q4_K_M.gguf")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, filepath.Join(root, "outside", "payload.gguf"), link)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	code, got := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(got.Locations) != 1 {
+		t.Fatalf("selection=%d %+v", code, got)
+	}
+	found := false
+	for _, g := range got.Locations[0].Groups {
+		for _, m := range g.Members {
+			if m.Path == "alias-Q4_K_M.gguf" {
+				found = true
+				if !m.LinkOnly || m.Message == "" {
+					t.Errorf("link lacks link-only explanation: %+v", m)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("valid named GGUF link omitted")
+	}
+}
+
+func TestCacheSelectionLocalLocationIDsSurviveRootReordering(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	writeSelectionFile(t, rootA, "owner/model/a.gguf")
+	writeSelectionFile(t, rootB, "owner/model/b.gguf")
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	first := newTestServerWithConfig(t, Config{CacheDir: cacheDir, LocalScanDirs: []string{rootA, rootB}})
+	second := newTestServerWithConfig(t, Config{CacheDir: cacheDir, LocalScanDirs: []string{rootB, rootA}})
+	_, one := getSelection(t, first, "owner/model", "model", "")
+	_, two := getSelection(t, second, "owner/model", "model", "")
+	idsByPath := func(locations []cacheSelectionLocation) map[string]string {
+		result := map[string]string{}
+		for _, location := range locations {
+			result[location.Path] = location.ID
+		}
+		return result
+	}
+	a, b := idsByPath(one.Locations), idsByPath(two.Locations)
+	if len(a) != 2 || len(b) != 2 {
+		t.Fatalf("expected both locations: first=%+v second=%+v", one, two)
+	}
+	for path, id := range a {
+		if b[path] != id {
+			t.Errorf("ID changed for %s: %s -> %s", path, id, b[path])
+		}
+	}
+}
+
+func TestCacheSelectionHFReadFailureWarns(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rd.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rd.BlobsDir(), []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	code, got := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(got.Locations) != 1 || got.Locations[0].Warning == "" {
+		t.Fatalf("read failure hidden: %d %+v", code, got)
+	}
+}
+
+func TestCacheSelectionHFNonDirectoryRepoWarns(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(rd.Path()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rd.Path(), []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	code, got := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(got.Locations) != 1 || got.Locations[0].Warning == "" {
+		t.Fatalf("non-directory HF path hidden: %d %+v", code, got)
+	}
+}
+
+func TestCacheSelectionHFIncludesNamedFilesAcrossSnapshots(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	cache := s.snapshotConfig().cache()
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"commit-a", "commit-b"} {
+		dir, err := rd.SnapshotDir(version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeSelectionFile(t, dir, "weights-Q4_K_M.gguf")
+		writeSelectionFile(t, dir, "model.gguf")
+		symlinkOrSkip(t, "weights-Q4_K_M.gguf", filepath.Join(dir, "alias.gguf"))
+	}
+	code, got := getSelection(t, s, "owner/model", "model", "")
+	if code != 200 || len(got.Locations) != 1 || got.Locations[0].Source != "HF cache" {
+		t.Fatalf("selection=%d %+v", code, got)
+	}
+	if len(got.Locations[0].Groups) != 3 {
+		t.Fatalf("groups=%+v", got.Locations[0].Groups)
+	}
+	for _, group := range got.Locations[0].Groups {
+		if len(group.Members) != 2 {
+			t.Errorf("group does not include both versions: %+v", group)
+		}
+		for _, member := range group.Members {
+			if len(member.Versions) != 1 {
+				t.Errorf("missing version ref: %+v", member)
+			}
+		}
+	}
+	for _, group := range got.Locations[0].Groups {
+		if strings.Contains(group.Label, "alias.gguf") && len(group.Members) != 2 {
+			t.Errorf("snapshot links were not included across versions: %+v", group)
+		}
+	}
+	if code, _ := getSelection(t, s, "owner/model", "model", "hf-invalid"); code != 400 {
+		t.Fatalf("stale HF selector status=%d", code)
+	}
+}

@@ -32,60 +32,6 @@ jobs:
       - name: Test
         run: go test ./...
 
-  # Bind-mount namespace cases cannot silently become a green skip. Keep the
-  # fixture inside a private mount namespace and require the tests themselves
-  # to confirm native mounts were created and exercised.
-  go-native-mounts:
-    name: Go checks (native Linux mounts)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.25"
-          cache: true
-
-      - name: Verify required native mount test selection
-        shell: bash
-        run: |
-          set -euo pipefail
-          selected="$(go test ./pkg/hfdownloader ./internal/server -list '^TestNativeMount')"
-          printf '%s\n' "$selected"
-          if ! grep -Fxq 'TestNativeMountProtectedRootReachability' <<<"$selected"; then
-            echo 'Required positive bind-mount fixture TestNativeMountProtectedRootReachability is missing; refusing a green job.' >&2
-            exit 1
-          fi
-
-      - name: Run required native mount cases in a private namespace
-        shell: bash
-        run: |
-          set -euo pipefail
-          scratch="$(mktemp -d "$RUNNER_TEMP/hfdesk-native-mounts.XXXXXX")"
-          go_bin="$(command -v go)"
-          go_version="$("$go_bin" version)"
-          printf 'Configured toolchain: %s (%s)\n' "$go_bin" "$go_version"
-          if ! grep -Eq ' go1\.25([.[:space:]]|$)' <<<"$go_version"; then
-            echo 'Expected the setup-go Go 1.25 toolchain; refusing another Go version.' >&2
-            exit 1
-          fi
-          cleanup() { sudo rm -rf -- "$scratch"; }
-          trap cleanup EXIT
-          mkdir -p "$scratch/home" "$scratch/config" "$scratch/cache" "$scratch/gocache" "$scratch/tmp"
-          if ! sudo unshare --mount --propagation private -- true; then
-            echo 'Runner cannot create a private mount namespace; native mount proof is required.' >&2
-            exit 1
-          fi
-          sudo unshare --mount --propagation private -- \
-            env HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" \
-            HF_HOME="$scratch/cache" GOCACHE="$scratch/gocache" TMPDIR="$scratch/tmp" \
-            GO_BIN="$go_bin" GOTOOLCHAIN=local \
-            HFDESK_REQUIRE_NATIVE_MOUNTS=1 \
-            bash -euo pipefail -c 'version="$("$GO_BIN" version)"; printf "In namespace: %s (%s)\n" "$GO_BIN" "$version"; grep -Eq " go1\.25([.[:space:]]|$)" <<<"$version"; "$GO_BIN" test ./pkg/hfdownloader ./internal/server -run "^TestNativeMount" -count=1 -v'
-
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
   # argument validation cannot regress silently.
@@ -111,9 +57,8 @@ jobs:
       - name: Smoke-test entrypoint
         run: sh docker/smoke-test.sh hfdesk:ci
 
-  # Exercise this R stage's native storage facts and state-file replacement.
-  # Legacy DELETE safety assertions remain in source for the successor safety
-  # stage; this selector does not claim to validate that delete behavior.
+  # Exercise the native state-file replacement path added here. The full suite
+  # has separate pre-existing Windows-compatibility gaps.
   go-windows:
     name: Go checks (Windows)
     runs-on: windows-latest
@@ -136,9 +81,3 @@ jobs:
 
       - name: Test native state replacement
         run: go test ./internal/server -run 'Test(WindowsReplaceJobsStateFileUsesNativeReplacement|ReplaceJobsStateFile)' -v
-
-      - name: Test native storage ownership
-        run: go test ./pkg/hfdownloader -run '^(Test(ManagedRoot|RepoPhysicalCopies|WholeCopy|ObserveNamespace|HubInternalNamespace|ManagedNamespace|Namespace))' -count=1 -v
-
-      - name: Test native server root ownership
-        run: go test ./internal/server -run '^(Test(ManagedRoot.*|ConfiguredPathIdentity|CacheAndRoutePathsUseCapturedConfigBase|FindLocalCachedRepoPreservesFriendlySourcePriority|CaseDistinctRouteDestinations|LocalCacheRoots.*|LocalCachedRepos_(RootRestrictions|NestedRoots)|API_CacheListAndInfoPreserveValidLocalRepoIDs|API_CacheHFFriendlyMetadata_(Ownership|NoProjection|ConfigSnapshot)|API_CacheDelete_(PathTraversal|ValidRepoFormat)|ExactHubConsumersAndConfinement|ManifestAssociationUsesPhysicalEvidenceOnly|JobDestFreeze_.*|CreateJob_DedupDestinationIdentity.*|SearchDoesNotReportSuccessForIncompleteNamespace))$' -count=1 -v

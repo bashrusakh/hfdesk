@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +31,78 @@ func newTestServer(t *testing.T) *Server {
 		MaxActive:   1,
 	}
 	return newTestServerWithConfig(t, cfg)
+}
+
+func TestCacheInfoHonorsExplicitRepositoryType(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	cache := s.snapshotConfig().cache()
+	for _, typ := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		rd, err := cache.Repo("owner/shared", typ)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(rd.Path(), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	modelOnly, err := cache.Repo("owner/model-only", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(modelOnly.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	request := func(query string) (int, CachedRepoInfo) {
+		path := "/api/cache/owner/shared" + query
+		w := cacheRequest(t, s, "GET", path, "")
+		var got CachedRepoInfo
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		return w.Code, got
+	}
+	for _, typ := range []string{"model", "dataset"} {
+		code, got := request("?type=" + typ)
+		if code != http.StatusOK || got.Type != typ {
+			t.Errorf("type=%s: status=%d response=%+v", typ, code, got)
+		}
+	}
+	if code, got := request(""); code != http.StatusOK || got.Type != "model" {
+		t.Errorf("legacy default: status=%d response=%+v", code, got)
+	}
+	if code, _ := request("?type=invalid"); code != http.StatusBadRequest {
+		t.Errorf("invalid explicit type status=%d", code)
+	}
+	w := cacheRequest(t, s, "GET", "/api/cache/owner/model-only?type=dataset", "")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("missing explicit dataset fell back to model: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCacheInfoExplicitModelIncludesLocalScanRepo(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	scanRoot := t.TempDir()
+	repoDir := filepath.Join(scanRoot, "owner", "manual")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "manual.gguf"), []byte("weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: []string{scanRoot}})
+	w := cacheRequest(t, s, "GET", "/api/cache/owner/manual?type=model", "")
+	var got CachedRepoInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || got.Type != "model" || got.Source != "Local" || got.Path != repoDir {
+		t.Fatalf("explicit model did not return local model: status=%d response=%+v body=%s", w.Code, got, w.Body.String())
+	}
+	w = cacheRequest(t, s, "GET", "/api/cache/owner/manual?type=dataset", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("explicit dataset fell back to local model: status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func newTestServerWithConfig(t *testing.T, cfg Config) *Server {
@@ -98,79 +169,6 @@ func TestScanLocalCachedRepos(t *testing.T) {
 	}
 	if found["owner/model"] != "Friendly view" {
 		t.Fatalf("expected friendly-view repo, got %#v", found)
-	}
-}
-
-func TestFindLocalCachedRepoPropagatesLateOwnerUnknown(t *testing.T) {
-	base := t.TempDir()
-	cacheDir := filepath.Join(base, "cache")
-	repo := filepath.Join(cacheDir, "ordinary", "raw")
-	if err := os.MkdirAll(repo, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "model.safetensors"), []byte("weights"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	set := newManagedRootSet(cacheDir, filepath.Join(cacheDir, "hub"), "", nil, nil, base)
-	memberships, err := set.ObserveNamespaceMemberships()
-	if err != nil {
-		t.Fatal(err)
-	}
-	backup := filepath.Join(base, "cache-observed")
-	if err := os.Rename(cacheDir, backup); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(cacheDir, cacheDir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := findLocalCachedRepoWithNamespace(set, "ordinary/raw", false, memberships); err == nil || errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("late owner identity error became an absent repository: %v", err)
-	}
-}
-
-func TestObservedUnicodeAndWhitespaceReposResolveAndList(t *testing.T) {
-	base := t.TempDir()
-	local := filepath.Join(base, "local")
-	ids := [][2]string{{"owner", "My Model"}, {"ümlaut", "模型"}}
-	for _, id := range ids {
-		repo := filepath.Join(local, id[0], id[1])
-		if err := os.MkdirAll(repo, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(repo, "weights.safetensors"), []byte("weights"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "cache", "hub"), local, nil, nil, base)
-	memberships, err := set.ObserveNamespaceMemberships()
-	if err != nil {
-		t.Fatal(err)
-	}
-	listed, err := scanLocalCachedReposWithNamespace(set.Roots(), memberships, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	localRoot, ok := set.Root(configuredPathID(local, base))
-	if !ok {
-		t.Fatal("local browse root was not configured")
-	}
-	for _, id := range ids {
-		repoID := id[0] + "/" + id[1]
-		resolved, err := set.domain.Resolve(localRoot.ID, id[0], id[1])
-		if err != nil || resolved != filepath.Join(local, id[0], id[1]) {
-			t.Fatalf("resolve observed ID %q = %q, %v", repoID, resolved, err)
-		}
-		found, err := findLocalCachedRepoWithNamespace(set, repoID, true, memberships)
-		if err != nil || found.Repo != repoID || found.Path != resolved {
-			t.Fatalf("detail lookup for %q = %#v, %v", repoID, found, err)
-		}
-		foundListed := false
-		for _, repo := range listed {
-			foundListed = foundListed || repo.Repo == repoID && repo.Path == resolved
-		}
-		if !foundListed {
-			t.Fatalf("list omitted resolved repo %q: %#v", repoID, listed)
-		}
 	}
 }
 
@@ -307,8 +305,8 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 		files              []string
 		want               map[string]expectedRepo
 		absent             []string
+		linuxOnly          bool
 		relativeRoutes     bool
-		caseDistinctRoot   bool
 	}{
 		{
 			name: "local-and-fine", local: "models",
@@ -422,7 +420,7 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 			absent: []string{"LLM/GGUF"},
 		},
 		{
-			name: "case-distinct-nested-root", local: "models", caseDistinctRoot: true,
+			name: "case-distinct", local: "models", linuxOnly: true,
 			routes: map[string]string{"llm/gguf": "models/LLM/GGUF"},
 			files:  []string{"models/LLM/GGUF/owner/model/foo.gguf", "models/LLM/gguf/shards/model.safetensors"},
 			want: map[string]expectedRepo{
@@ -433,48 +431,10 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.linuxOnly && runtime.GOOS != "linux" {
+				t.Skip("requires Linux case-sensitive directories")
+			}
 			base := t.TempDir()
-			if tc.caseDistinctRoot {
-				probe := filepath.Join(base, "case-probe")
-				upper, lower := filepath.Join(probe, "Probe"), filepath.Join(probe, "probe")
-				if err := os.MkdirAll(probe, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Mkdir(upper, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Mkdir(lower, 0o755); err != nil {
-					if os.IsExist(err) {
-						t.Skip("temporary filesystem aliases case-distinct directory names")
-					}
-					t.Fatalf("probe case-distinct directory support: %v", err)
-				}
-				upperInfo, err := os.Stat(upper)
-				if err != nil {
-					t.Fatal(err)
-				}
-				lowerInfo, err := os.Stat(lower)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if os.SameFile(upperInfo, lowerInfo) {
-					t.Skip("temporary filesystem maps case-distinct directory names to one object")
-				}
-			}
-			if tc.relativeRoutes {
-				// Relative route paths use the process working directory. Keep this
-				// fixture on that volume for native Windows filepath.Rel semantics.
-				cwd, err := os.Getwd()
-				if err != nil {
-					t.Fatal(err)
-				}
-				base, err = os.MkdirTemp(cwd, "hfdesk-relative-route-")
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = os.RemoveAll(base) })
-				t.Chdir(base)
-			}
 			path := func(relative string) string {
 				if relative == "" {
 					return ""
@@ -592,23 +552,18 @@ func TestLocalCachedRepos_NestedRoots(t *testing.T) {
 	}
 }
 
-func TestManagedRootSet_SubrootCaseIsLexical(t *testing.T) {
+func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
 	base := t.TempDir()
-	parent := filepath.Join(base, "Models")
-	child := filepath.Join(base, "models", "GGUF")
-	set := newManagedRootSet(filepath.Join(base, "cache"), filepath.Join(base, "hub"), parent, nil, map[string]string{"llm": child}, base)
-	var parentID string
-	for _, root := range set.roots {
-		if root.Path == parent {
-			parentID = root.ID
-		}
+	root := localCacheRoot{Path: filepath.Join(base, "Models")}
+	child := localCacheRoot{Path: filepath.Join(base, "models", "GGUF")}
+	roots := []localCacheRoot{root, child}
+	got := root.excludedSubroots(roots)
+	var want []string
+	if runtime.GOOS == "windows" {
+		want = []string{pathIdentityKey(child.Path)}
 	}
-	got, err := set.NestedProtectedRoots(parentID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Errorf("case-different lexical paths were treated as nested: %v", got)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("case-different parent: excluded = %v, want %v", got, want)
 	}
 }
 
@@ -667,48 +622,6 @@ func TestAPI_CacheList_IncludesLocalRepos(t *testing.T) {
 	}
 	if len(resp.Repos[0].Capabilities) != 1 || resp.Repos[0].Capabilities[0] != "vision" {
 		t.Fatalf("Capabilities = %#v, want [vision]", resp.Repos[0].Capabilities)
-	}
-}
-
-func TestAPI_CacheListAndInfoPreserveValidLocalRepoIDs(t *testing.T) {
-	cacheDir, localDir := t.TempDir(), t.TempDir()
-	ids := []string{"owner/My Model", "ümlaut/模型"}
-	for _, id := range ids {
-		repoDir := filepath.Join(localDir, filepath.FromSlash(id))
-		if err := os.MkdirAll(repoDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(repoDir, "weights.gguf"), []byte("weight"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	srv := newTestServerWithConfig(t, Config{CacheDir: cacheDir, LocalDir: localDir})
-	w := httptest.NewRecorder()
-	srv.handleCacheList(w, httptest.NewRequest("GET", "/api/cache", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("cache list = %d: %s", w.Code, w.Body.String())
-	}
-	var listed struct {
-		Repos []CachedRepoInfo `json:"repos"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range ids {
-		found := false
-		for _, repo := range listed.Repos {
-			found = found || repo.Repo == id
-		}
-		if !found {
-			t.Errorf("cache list omitted %q: %s", id, w.Body.String())
-		}
-		infoReq := httptest.NewRequest("GET", "/api/cache/", nil)
-		infoReq.SetPathValue("repo", id)
-		info := httptest.NewRecorder()
-		srv.handleCacheInfo(info, infoReq)
-		if info.Code != http.StatusOK {
-			t.Errorf("cache info for %q = %d: %s", id, info.Code, info.Body.String())
-		}
 	}
 }
 
@@ -1655,35 +1568,6 @@ func TestAPI_CacheDelete_ValidRepoFormat(t *testing.T) {
 					tt.wantCode, tt.repo, w.Code, w.Body.String())
 			}
 		})
-	}
-}
-
-func TestAPI_CacheDelete_ModelNameMayContainDatasetPrefix(t *testing.T) {
-	t.Setenv("HF_HUB_CACHE", "")
-	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
-	repo, err := cache.Repo("owner/datasets--model", hfdownloader.RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(repo.Path(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo.Path(), "hub-sentinel"), []byte("hub"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(repo.FriendlyPath(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo.FriendlyPath(), "friendly-sentinel"), []byte("friendly"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := &Server{config: Config{CacheDir: cache.Root}}
-	req := httptest.NewRequest(http.MethodDelete, "/api/cache/owner/datasets--model", nil)
-	req.SetPathValue("repo", "owner/datasets--model")
-	w := httptest.NewRecorder()
-	srv.handleCacheDelete(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("valid model-name deletion = %d: %s", w.Code, w.Body.String())
 	}
 }
 
