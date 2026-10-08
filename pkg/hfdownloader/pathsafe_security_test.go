@@ -292,6 +292,13 @@ func TestDownloadTraversalSHAStaysInsideCacheRoot(t *testing.T) {
 // configured output root.
 func TestDestinationBaseRejectsTraversal(t *testing.T) {
 	cfg := Settings{OutputDir: filepath.Join("home", "out")}
+	// The containment proof resolves the configured root to an absolute,
+	// cleaned path first, so legitimate destinations resolve under the
+	// effective root rather than echoing the configured spelling.
+	rootAbs, err := filepath.Abs(cfg.OutputDir)
+	if err != nil {
+		t.Fatalf("abs(%q): %v", cfg.OutputDir, err)
+	}
 	bad := []Job{
 		{Repo: "owner/../../escape"},
 		{Repo: "owner/model", LocalRepo: "../../escape"},
@@ -308,8 +315,8 @@ func TestDestinationBaseRejectsTraversal(t *testing.T) {
 		job  Job
 		want string
 	}{
-		{Job{Repo: "owner/model"}, filepath.Join("home", "out", "owner", "model")},
-		{Job{Repo: "owner/model", LocalRepo: "vendor/model-a"}, filepath.Join("home", "out", "vendor", "model-a")},
+		{Job{Repo: "owner/model"}, filepath.Join(rootAbs, "owner", "model")},
+		{Job{Repo: "owner/model", LocalRepo: "vendor/model-a"}, filepath.Join(rootAbs, "vendor", "model-a")},
 	}
 	for _, c := range good {
 		got, err := destinationBase(c.job, cfg)
@@ -319,6 +326,49 @@ func TestDestinationBaseRejectsTraversal(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("destinationBase(%+v) = %q, want %q", c.job, got, c.want)
+		}
+		if !PathInside(rootAbs, got) {
+			t.Errorf("destinationBase(%+v) = %q, outside effective root %q", c.job, got, rootAbs)
+		}
+	}
+}
+
+// TestDestinationBaseCwdShapedRootsStayInsideCwd pins the legacy-compat
+// contract for cwd-shaped output roots: Settings.OutputDir values of ".",
+// "./", and other relative forms must succeed and resolve inside the current
+// working directory. filepath.Join cleans a root of "." away entirely, so the
+// previous containment proof against the raw configured string rejected these
+// legitimate roots as escapes even though they never leave the working
+// directory.
+func TestDestinationBaseCwdShapedRootsStayInsideCwd(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for _, root := range []string{".", "./", "./Models"} {
+		cfg := Settings{OutputDir: root}
+		got, err := destinationBase(Job{Repo: "owner/model"}, cfg)
+		if err != nil {
+			t.Errorf("destinationBase with OutputDir %q: %v", root, err)
+			continue
+		}
+		abs, err := filepath.Abs(got)
+		if err != nil {
+			t.Errorf("abs(%q): %v", got, err)
+			continue
+		}
+		if !PathInside(cwd, abs) {
+			t.Errorf("destinationBase with OutputDir %q = %q resolves to %q, outside cwd %q", root, got, abs, cwd)
+		}
+		// The containment property: the destination never leaves the
+		// effective (resolved) root either.
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			t.Errorf("abs(%q): %v", root, err)
+			continue
+		}
+		if !PathInside(rootAbs, abs) {
+			t.Errorf("destinationBase with OutputDir %q = %q resolves to %q, outside resolved root %q", root, got, abs, rootAbs)
 		}
 	}
 }

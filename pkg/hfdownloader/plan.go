@@ -432,15 +432,41 @@ func destinationBase(job Job, cfg Settings) (string, error) {
 	if !filepath.IsLocal(repoForPath) {
 		return "", fmt.Errorf("destination folder %q must be a local path", repoForPath)
 	}
-	base := filepath.Join(cfg.OutputDir, repoForPath)
-	// Prove the joined result stays under the (cleaned) configured output
-	// root before returning it: this dominates every use of the result —
-	// including os.MkdirAll at the download entry and SafeJoin's base — so
-	// neither a crafted folder segment nor taint in cfg.OutputDir itself can
-	// escape the root unproven. A local repoForPath always satisfies this,
-	// so legitimate destinations are unaffected.
-	if !strings.HasPrefix(base, filepath.Clean(cfg.OutputDir)) {
-		return "", fmt.Errorf("destination %q escapes output root %q", base, cfg.OutputDir)
+	// Normalize the configured output root to an absolute, cleaned path
+	// BEFORE the containment proof. The legacy OutputDir API accepts
+	// cwd-shaped roots (".", "./", "./Models"): filepath.Join cleans a root
+	// of "." away entirely, so proving against the raw configured string
+	// rejected those legitimate roots as escapes even though they never
+	// leave the working directory. Abs resolves every relative form —
+	// including "" and roots containing ".." segments — against the current
+	// working directory, giving the proof one stable root shape for
+	// relative, absolute, and traversal-containing configs alike. The
+	// preserved property is "destination never outside the effective
+	// (resolved) root".
+	root, err := filepath.Abs(cfg.OutputDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve output root %q: %w", cfg.OutputDir, err)
+	}
+	base := filepath.Join(root, repoForPath)
+	// Prove the joined result stays under the resolved output root before
+	// returning it: this dominates every use of the result — including
+	// os.MkdirAll at the download entry and SafeJoin's base — so neither a
+	// crafted folder segment nor taint in cfg.OutputDir itself can escape
+	// the root unproven. A local repoForPath always satisfies this, so
+	// legitimate destinations are unaffected.
+	if !PathInside(root, base) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
+	}
+	// Restate the containment PathInside just proved against the resolved
+	// root with strings.HasPrefix, the primitive code scanning models as a
+	// sanitizer guard: this check is evaluated on `base` itself and
+	// dominates the return below, so taint carried in the configured root
+	// cannot flow out of destinationBase unnoticed — the same restatement
+	// SafeJoin applies to its result. Acceptance is identical to
+	// PathInside's (root is already cleaned by Abs, and base is a cleaned
+	// join of root), so no input that passed before is rejected.
+	if !strings.HasPrefix(base, root) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
 	}
 	return base, nil
 }
