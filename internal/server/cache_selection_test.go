@@ -954,7 +954,19 @@ func TestHFSelectionReservationProtectsRepositoryAndFriendlyWriters(t *testing.T
 	if !ok {
 		t.Fatal("queued unrelated HF repository blocked selected deletion")
 	}
+	// The synthetic queued record exists only to exercise reservation
+	// admission. Remove it before releasing the reservation, which dispatches
+	// queued jobs; a real dispatched job must be created through CreateJob so
+	// its run-lifecycle synchronization fields are initialized.
+	otherRepoServer.jobs.mu.Lock()
+	delete(otherRepoServer.jobs.jobs, "queued-other-repo")
+	otherRepoServer.jobs.mu.Unlock()
 	otherRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := otherRepoServer.jobs.Close(ctx); err != nil {
+		t.Fatalf("close unrelated queued-job test manager: %v", err)
+	}
 }
 
 func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
