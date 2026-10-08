@@ -165,7 +165,7 @@ func (st *walkState) walk(ctx context.Context, prefix string) error {
 		case "directory", "tree":
 			child, ok := cleanChildDir(prefix, n.Path)
 			if !ok {
-				// Malformed, empty, "."/"..", absolute, backslashed, or
+				// Malformed, empty, "."/"..", absolute, or
 				// outside-prefix directory: skip it so a hostile or broken
 				// listing cannot steer the walk into a loop.
 				continue
@@ -190,10 +190,12 @@ func (st *walkState) walk(ctx context.Context, prefix string) error {
 
 // cleanChildDir validates a directory node from a listing and returns the
 // cleaned path to list next. It reports false for anything that must not be
-// requested: empty, absolute, backslashed, ".", "..", "../"-prefixed after
+// requested: empty, absolute, ".", "..", "../"-prefixed after
 // cleaning, or not strictly under the prefix being listed.
+// Backslashes remain literal URL path characters: traverse those directories
+// as before, leaving file validation to the caller rather than hiding files.
 func cleanChildDir(prefix, dir string) (string, bool) {
-	if dir == "" || strings.HasPrefix(dir, "/") || strings.ContainsRune(dir, '\\') {
+	if dir == "" || strings.HasPrefix(dir, "/") {
 		return "", false
 	}
 	cleaned := path.Clean(dir)
@@ -272,21 +274,19 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 		resp.Body.Close()
 		nodes = append(nodes, page...)
 
-		next := nextLink(resp.Header.Get("Link"))
+		next, err := nextLink(resp.Header.Values("Link"))
+		if err != nil {
+			return nil, err
+		}
 		if next == "" {
 			break
 		}
 		abs, err := resolveNext(u, next)
 		if err != nil {
-			// An unparseable pagination target ends the walk rather than
-			// failing it: the header is optional metadata, and the old
-			// walker never looked at it at all.
-			break
+			return nil, fmt.Errorf("hubtree: invalid next pagination target %q: %w", next, err)
 		}
 		if st.seenPages[abs] {
-			// The server pointed back at a page we already consumed:
-			// stop instead of following the cycle forever.
-			break
+			return nil, fmt.Errorf("hubtree: pagination cycle at %q", abs)
 		}
 		st.seenPages[abs] = true
 		u = abs
@@ -505,56 +505,158 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// nextLink extracts the rel="next" target from a Link header. Link entries
-// are scanned as `<url>; params` groups (URLs only ever appear inside angle
-// brackets, so parameters can be read up to the next "<"). Returns "" when
-// there is no next link.
-func nextLink(header string) string {
-	for i := 0; i < len(header); {
-		start := strings.IndexByte(header[i:], '<')
-		if start < 0 {
-			return ""
+// nextLink reads all physical Link fields. Absence of next is normal
+// exhaustion; an identifiable but malformed/empty next is an error. Unrelated
+// malformed metadata does not invalidate a listing. Single-quoted relations
+// remain supported for compatibility with existing mirrors.
+func nextLink(headers []string) (string, error) {
+	for _, header := range headers {
+		for _, entry := range splitLinkParts(header, ',') {
+			entry = strings.TrimSpace(entry)
+			target, params := "", entry
+			validTarget := false
+			if strings.HasPrefix(entry, "<") {
+				if end := linkTargetEnd(entry[1:]); end >= 0 {
+					end++ // account for the opening angle bracket
+					target, params = entry[1:end], entry[end+1:]
+					validTarget = true
+				} else if start := strings.IndexByte(entry, ';'); start >= 0 {
+					// Recover parameters only to detect an advertised next in
+					// an unclosed target, never to follow that malformed entry.
+					params = entry[start:]
+				}
+			}
+			next, validRel := linkHasRelNext(params)
+			if !next {
+				continue
+			}
+			if !validTarget || !validRel {
+				return "", fmt.Errorf("hubtree: malformed next pagination link %q", entry)
+			}
+			if strings.TrimSpace(target) == "" {
+				return "", fmt.Errorf("hubtree: empty next pagination target")
+			}
+			return target, nil
 		}
-		start += i
-		end := strings.IndexByte(header[start:], '>')
-		if end < 0 {
-			return ""
-		}
-		end += start
-		target := header[start+1 : end]
-
-		params := header[end:]
-		if nxt := strings.IndexByte(params, '<'); nxt >= 0 {
-			params = params[:nxt]
-		}
-		// The comma between link entries is not part of the preceding
-		// relation value. Leave commas inside targets/quoted params intact.
-		params = strings.TrimSuffix(strings.TrimSpace(params), ",")
-		if linkHasRelNext(params) {
-			return target
-		}
-		i = end + 1
 	}
-	return ""
+	return "", nil
 }
 
-// linkHasRelNext reports whether a Link entry's parameter section declares
-// rel="next", rel='next', or rel=next.
-func linkHasRelNext(params string) bool {
-	for _, part := range strings.Split(params, ";") {
-		part = strings.TrimSpace(part)
-		if !strings.HasPrefix(part, "rel=") {
+// linkTargetEnd finds a closing angle bracket within a URI reference, not in
+// a later entry or quoted parameter of a malformed target.
+func linkTargetEnd(value string) int {
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '>':
+			return i
+		case '<', '"':
+			return -1
+		}
+	}
+	return -1
+}
+
+// splitLinkParts separates entries/parameters using parameter-key and value
+// boundaries. Only confirmed entry-start URI targets and quoted VALUES protect
+// delimiters; token characters in keys/bare values do not open quotes. Unclosed
+// angle targets remain inspectable for advertised-next error recovery.
+func splitLinkParts(value string, sep byte) []string {
+	var parts []string
+	start, keyStart := 0, 0
+	entryStart := sep == ','
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if entryStart {
+			if c == ' ' || c == '\t' {
+				continue
+			}
+			entryStart = false
+			if c == '<' {
+				if end := linkTargetEnd(value[i+1:]); end >= 0 {
+					i += end + 1
+					continue
+				}
+			}
+		}
+		if c == sep {
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+		switch c {
+		case ';', ',':
+			keyStart = i + 1
+			entryStart = c == ',' && sep == ','
+		case '=':
+			key := strings.TrimSpace(value[keyStart:i])
+			consumed, _, _ := readLinkValue(value[i+1:], key)
+			i += consumed
+		}
+	}
+	return append(parts, value[start:])
+}
+
+// readLinkValue consumes a parameter value up to its next unprotected
+// delimiter. Standard double-quoted values decode quoted pairs; single quotes
+// are a compatibility form only for rel. Apostrophes elsewhere remain legal
+// bare-token characters, even at value start. Splitting and relation evaluation
+// share this lexical rule so harmless metadata cannot hide pagination.
+func readLinkValue(value, key string) (consumed int, decoded string, valid bool) {
+	i := 0
+	for i < len(value) && (value[i] == ' ' || value[i] == '\t') {
+		i++
+	}
+	var quote byte
+	if i < len(value) && (value[i] == '"' || (value[i] == '\'' && strings.EqualFold(strings.TrimSpace(key), "rel"))) {
+		quote = value[i]
+	}
+	if quote == 0 {
+		for i < len(value) && value[i] != ';' && value[i] != ',' {
+			i++
+		}
+		return i, strings.TrimSpace(value[:i]), true
+	}
+	i++
+	var text strings.Builder
+	closed := false
+	for i < len(value) {
+		c := value[i]
+		i++
+		if c == '\\' {
+			if i == len(value) {
+				break
+			}
+			text.WriteByte(value[i])
+			i++
+		} else if c == quote {
+			closed = true
+			break
+		} else {
+			text.WriteByte(c)
+		}
+	}
+	endQuote := i
+	for i < len(value) && value[i] != ';' && value[i] != ',' {
+		i++
+	}
+	return i, text.String(), closed && strings.TrimSpace(value[endQuote:i]) == ""
+}
+
+// linkHasRelNext returns whether next is advertised and whether its relation
+// value is well formed. Quoted delimiters in unrelated parameters are ignored.
+func linkHasRelNext(params string) (next, valid bool) {
+	for _, part := range splitLinkParts(params, ';') {
+		key, value, found := strings.Cut(strings.TrimSpace(part), "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(key), "rel") {
 			continue
 		}
-		v := strings.TrimPrefix(part, "rel=")
-		v = strings.Trim(strings.TrimSpace(v), `"'`)
-		for _, rel := range strings.Fields(v) {
+		_, decoded, valid := readLinkValue(value, key)
+		for _, rel := range strings.Fields(decoded) {
 			if rel == "next" {
-				return true
+				return true, valid
 			}
 		}
 	}
-	return false
+	return false, true
 }
 
 // resolveNext resolves a pagination target against the URL of the request

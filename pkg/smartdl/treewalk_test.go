@@ -194,3 +194,178 @@ func TestFetchFileTree_TerminalFailsFast(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchFileTree_PaginationCompletion(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, tc := range []struct {
+			name     string
+			links    []string
+			cycle    bool
+			wantErr  bool
+			requests int64
+		}{
+			{name: "no next", requests: 1},
+			{name: "unrelated malformed prev", links: []string{`<broken; rel=prev`}, requests: 1},
+			{name: "invalid escape", links: []string{`</%zz>; rel=next`}, wantErr: true, requests: 1},
+			{name: "invalid host", links: []string{`<http://[::1>; rel=next`}, wantErr: true, requests: 1},
+			{name: "empty next", links: []string{`<>; rel=next`}, wantErr: true, requests: 1},
+			{name: "unclosed target", links: []string{`<?cursor=2; rel=next`}, wantErr: true, requests: 1},
+			{name: "self cycle", links: []string{`<?recursive=true>; rel=next`}, wantErr: true, requests: 1},
+			{name: "multiple page cycle", links: []string{`<?cursor=2>; rel=next`}, cycle: true, wantErr: true, requests: 2},
+			{name: "repeated fields", links: []string{`<?cursor=0>; rel=prev`, `<?cursor=2>; rel=next`}, requests: 2},
+			{name: "next first", links: []string{`<?cursor=2>; rel=next, <?cursor=0>; rel=prev`}, requests: 2},
+			{name: "next last", links: []string{`<?cursor=0>; rel=prev, <?cursor=2>; rel=next`}, requests: 2},
+			{name: "quoted delimiters", links: []string{`<?cursor=0>; title="ignore;rel=next,<not a target>"; rel=prev, <?cursor=2>; title="page, two"; rel="next alternate"`}, requests: 2},
+			{name: "reported apostrophe prev first", links: []string{`<?cursor=0>; title=owner's; rel=prev, <?cursor=2>; rel=next`}, requests: 2},
+			{name: "reported apostrophe next only", links: []string{`<?cursor=2>; title=owner's; rel=next`}, requests: 2},
+			{name: "leading apostrophe metadata", links: []string{`<?cursor=2>; title='owners; rel=next`}, requests: 2},
+			{name: "apostrophe parameter key", links: []string{`<?cursor=2>; owner's=metadata; rel=next`}, requests: 2},
+			{name: "single quoted relation with token metadata", links: []string{`<?cursor=2>; title=owner's; rel='alternate next'`}, requests: 2},
+			{name: "field state resets", links: []string{`<?cursor=0>; title="unfinished`, `<?cursor=2>; rel=next`}, requests: 2},
+			{name: "malformed next after token metadata", links: []string{`<broken; title=owner's; rel=next`}, wantErr: true, requests: 1},
+		} {
+			t.Run(fmt.Sprintf("dataset=%v/%s", dataset, tc.name), func(t *testing.T) {
+				var reqs atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !strings.Contains(r.URL.Path, "/tree/") {
+						t.Errorf("unexpected request: %s", r.URL)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					api := "models"
+					if dataset {
+						api = "datasets"
+					}
+					if r.URL.Path != "/api/"+api+"/owner/repo/tree/main" {
+						t.Errorf("unexpected tree API path: %s", r.URL.Path)
+					}
+					page := reqs.Add(1)
+					if page > 2 {
+						t.Error("pagination did not terminate within two requests")
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if page == 2 && r.URL.Query().Get("cursor") != "2" {
+						t.Errorf("followed wrong link: %s", r.URL)
+					}
+					if r.URL.Query().Get("cursor") == "" {
+						for _, link := range tc.links {
+							w.Header().Add("Link", link)
+						}
+					} else if tc.cycle {
+						w.Header().Set("Link", `<?recursive=true>; rel=next`)
+					}
+					_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: fmt.Sprintf("f%d.bin", page), Size: page}})
+				}))
+				defer srv.Close()
+				a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
+				files, _, err := a.fetchFileTree(context.Background(), "owner/repo", dataset, "main")
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("fetchFileTree error = %v, want error %v", err, tc.wantErr)
+				}
+				if got := reqs.Load(); got != tc.requests {
+					t.Errorf("requests = %d, want %d", got, tc.requests)
+				}
+				if !tc.wantErr && len(files) != int(tc.requests) {
+					t.Errorf("files = %d, want %d", len(files), tc.requests)
+				}
+			})
+		}
+	}
+}
+
+// The two reported headers must also survive the public analysis workflow.
+// Model autodetection probes the dataset route separately; that route is 404
+// here so it cannot hide pagination results behind ErrBothExist.
+func TestAnalyze_TokenMetadataPagination(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, header := range []string{
+			`<?cursor=0>; title=owner's; rel=prev, <?cursor=2>; rel=next`,
+			`<?cursor=2>; title=owner's; rel=next`,
+		} {
+			t.Run(fmt.Sprintf("dataset=%v/%s", dataset, header), func(t *testing.T) {
+				api := "models"
+				if dataset {
+					api = "datasets"
+				}
+				treePath := "/api/" + api + "/owner/repo/tree/main"
+				var reqs, missingDatasetReqs atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != treePath {
+						if !dataset && r.URL.Path == "/api/datasets/owner/repo/tree/main" {
+							missingDatasetReqs.Add(1)
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
+						if r.URL.Path == "/api/"+api+"/owner/repo/refs" {
+							_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+							return
+						}
+						t.Errorf("unexpected analysis request: %s", r.URL)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					page := reqs.Add(1)
+					if page == 1 {
+						w.Header().Set("Link", header)
+						w.Header().Set("X-Repo-Commit", "cafebabe")
+					} else if page != 2 || r.URL.Query().Get("cursor") != "2" {
+						t.Errorf("unexpected pagination request: %s", r.URL)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: fmt.Sprintf("f%d.txt", page), Size: page}})
+				}))
+				defer srv.Close()
+				a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
+				info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+				if err != nil {
+					t.Fatalf("Analyze: %v", err)
+				}
+				if info.FileCount != 2 || len(info.Files) != 2 || info.Files[0].Path != "f1.txt" || info.Files[1].Path != "f2.txt" || info.IsDataset != dataset || info.Commit != "cafebabe" {
+					t.Fatalf("incomplete analysis: %+v", info)
+				}
+				if got := reqs.Load(); got != 2 {
+					t.Errorf("selected API tree requests = %d, want 2", got)
+				}
+				wantMissing := int64(1)
+				if dataset {
+					wantMissing = 0
+				}
+				if got := missingDatasetReqs.Load(); got != wantMissing {
+					t.Errorf("opposite API probes = %d, want %d", got, wantMissing)
+				}
+			})
+		}
+	}
+}
+
+// Analysis retains literal repository paths; file-safety rejection belongs to
+// the downloader, not a new shared directory/callback policy.
+func TestFetchFileTree_BackslashDirectoryTraversal(t *testing.T) {
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		nodes := []hfTreeNode{{Type: "file", Path: "ok.bin"}, {Type: "directory", Path: `win\dir`}}
+		if strings.HasSuffix(r.URL.Path, `/win\dir`) {
+			if !strings.Contains(r.URL.EscapedPath(), "win%5Cdir") {
+				t.Errorf("backslash not escaped: %s", r.URL.EscapedPath())
+			}
+			nodes = []hfTreeNode{{Type: "file", Path: `win\dir/evil/file.bin`}}
+		} else if !strings.HasSuffix(r.URL.Path, "/tree/main") {
+			t.Errorf("unexpected request: %s", r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(nodes)
+	}))
+	defer srv.Close()
+	a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
+	files, _, err := a.fetchFileTree(context.Background(), "owner/repo", false, "main")
+	if err != nil || len(files) != 2 || files[1].Path != `win\dir/evil/file.bin` {
+		t.Fatalf("files = %v, error = %v; want both literal file paths", files, err)
+	}
+	if got := reqs.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2", got)
+	}
+}

@@ -161,13 +161,93 @@ func TestNextLink_MultipleRelations(t *testing.T) {
 		{"single quoted next first", `<?cursor=2>; rel='next', <?cursor=1>; rel='prev'`, "?cursor=2"},
 		{"relation list", `<?cursor=2>; rel="next alternate", <?cursor=1>; rel="prev"`, "?cursor=2"},
 		{"commas inside target and title", `<?cursor=a,b>; title="page, two"; rel="next", <?cursor=1>; rel="prev"`, "?cursor=a,b"},
+		{"quoted false relation and brackets", `<?cursor=1>; title="ignore;rel=next,<fake>"; rel=prev, <?cursor=2>; rel=next`, "?cursor=2"},
+		{"escaped quoted delimiters", `<?cursor=1>; title="ignore\";rel=next,<fake>"; rel=prev, <?cursor=2>; rel=next`, "?cursor=2"},
+		{"quoted false next only", `<?cursor=1>; title="ignore;rel=next,<fake>"; rel=prev`, ""},
+		{"malformed prev before next", `<broken; rel=prev, <?cursor=2>; rel=next`, "?cursor=2"},
+		{"parameter whitespace", `<?cursor=2>; rel = "next"`, "?cursor=2"},
 		{"no next", `<?cursor=1>; rel="prev", <?cursor=3>; rel="last"`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := nextLink(tc.header); got != tc.want {
-				t.Fatalf("nextLink(%q) = %q, want %q", tc.header, got, tc.want)
+			if got, err := nextLink([]string{tc.header}); err != nil || got != tc.want {
+				t.Fatalf("nextLink(%q) = %q, %v, want %q", tc.header, got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestNextLink_AdvertisedMalformedNext(t *testing.T) {
+	for _, header := range []string{
+		`<>; rel=next`,
+		`<   >; rel="next"`,
+		`<?cursor=2; rel=next`,
+		`<?cursor=2; rel=next; title="a>b"`,
+		`?cursor=2; rel=next`,
+		`<?cursor=2>; rel="next`,
+	} {
+		t.Run(header, func(t *testing.T) {
+			if next, err := nextLink([]string{header}); err == nil {
+				t.Fatalf("nextLink = %q, nil; want advertised-next error", next)
+			}
+		})
+	}
+}
+
+// Apostrophes are legal token characters, not context-free string delimiters.
+// Only parameter value starts can establish quoted metadata/relations.
+func TestNextLink_ValueBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers []string
+		want    string
+		wantErr bool
+	}{
+		{name: "reported prev first", headers: []string{`<?cursor=0>; title=owner's; rel=prev, <?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "reported next only", headers: []string{`<?cursor=2>; title=owner's; rel=next`}, want: "?cursor=2"},
+		{name: "leading apostrophe token", headers: []string{`<?cursor=2>; title='owners; rel=next`}, want: "?cursor=2"},
+		{name: "paired apostrophes in token", headers: []string{`<?cursor=2>; title='owners'; rel=next`}, want: "?cursor=2"},
+		{name: "interior apostrophe key", headers: []string{`<?cursor=2>; owner's=metadata; rel=next`}, want: "?cursor=2"},
+		{name: "leading apostrophe key", headers: []string{`<?cursor=2>; 'owners=metadata; rel=next`}, want: "?cursor=2"},
+		{name: "quoted value after apostrophe key", headers: []string{`<?cursor=0>; owner's="ignore,;rel=next,<fake>"; rel=prev, <?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "quoted value escaping", headers: []string{`<?cursor=0>; title="owner's \\path\"; rel=next,<fake>"; rel=prev, <?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "URI delimiters and apostrophe", headers: []string{`<?cursor=2&note=owner's,a;b>; rel=next`}, want: "?cursor=2&note=owner's,a;b"},
+		{name: "bare relation", headers: []string{`<?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "double quoted relation list", headers: []string{`<?cursor=2>; rel="alternate next"`}, want: "?cursor=2"},
+		{name: "single quoted relation list", headers: []string{`<?cursor=2>; rel='alternate next'`}, want: "?cursor=2"},
+		{name: "single quoted relation whitespace", headers: []string{`<?cursor=2>; rel = 'alternate next'`}, want: "?cursor=2"},
+		{name: "escaped relation", headers: []string{`<?cursor=2>; rel="ne\xt"`}, want: "?cursor=2"},
+		{name: "unclosed unrelated quote resets at field", headers: []string{`<?cursor=0>; title="unfinished`, `<?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "metadata with apostrophe no next", headers: []string{`<?cursor=0>; title=owner's; rel=prev`}},
+		{name: "URI-looking quoted metadata no next", headers: []string{`<?cursor=0>; title="<fake>;rel=next,other"; rel=prev`}},
+		{name: "malformed prev with apostrophe", headers: []string{`<broken; title=owner's; rel=prev, <?cursor=2>; rel=next`}, want: "?cursor=2"},
+		{name: "malformed next with apostrophe", headers: []string{`<broken; title=owner's; rel=next`}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := nextLink(tc.headers)
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("nextLink = %q, %v; want %q, error=%v", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestWalk_TargetDelimitersRemainLiteral(t *testing.T) {
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := reqs.Add(1)
+		if page == 1 {
+			w.Header().Set("Link", `<page,owner's;metadata?cursor=2>; rel=next`)
+		} else if page != 2 || r.URL.Path != "/api/models/o/r/tree/page,owner's;metadata" || r.URL.Query().Get("cursor") != "2" {
+			t.Errorf("unexpected pagination request: %s", r.URL)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]Node{fileNode(fmt.Sprintf("f%d.bin", page), page)})
+	}))
+	defer srv.Close()
+	assertFiles(t, walkFiles(t, testWalker(srv, nil)), "f1.bin", "f2.bin")
+	if got := reqs.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2", got)
 	}
 }
 
@@ -269,10 +349,13 @@ func TestWalk_MirrorIgnoresRecursive(t *testing.T) {
 }
 
 // TestWalk_MalformedDirectoriesTerminate pins the hostile-listing guard:
-// empty, ".", "..", "../x", "/", backslash, and self-echoing directory nodes
+// empty, ".", "..", "../x", "/", and self-echoing directory nodes
 // must not be requested or looped over, while valid directories still list.
 func TestWalk_MalformedDirectoriesTerminate(t *testing.T) {
-	malformed := []string{"", ".", "..", "../x", "/", "a/..", `win\dir`}
+	// Backslash directories are not malformed for traversal: skipping them
+	// would suppress the caller's existing unsafe-FILE validation. Their empty
+	// and unsafe-child cases are covered through PlanRepo below the adapter.
+	malformed := []string{"", ".", "..", "../x", "/", "a/.."}
 	var treeReqs atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.URL.Path, "/tree/") {
@@ -289,10 +372,10 @@ func TestWalk_MalformedDirectoriesTerminate(t *testing.T) {
 			for _, m := range malformed {
 				nodes = append(nodes, dirNode(m))
 			}
-			nodes = append(nodes, dirNode("good"))
+			nodes = append(nodes, dirNode("good"), dirNode("good"))
 		case "good":
 			// Self-echo: a listing that returns the directory being listed.
-			nodes = []Node{dirNode("good"), fileNode("good/ok2.bin", 2)}
+			nodes = []Node{dirNode("good"), dirNode("elsewhere"), dirNode("good/.."), fileNode("good/ok2.bin", 2)}
 		default:
 			t.Errorf("walker requested malformed/outside directory %q", prefix)
 			w.WriteHeader(http.StatusNotFound)
@@ -306,8 +389,54 @@ func TestWalk_MalformedDirectoriesTerminate(t *testing.T) {
 	got := walkFiles(t, testWalker(srv, nil))
 	assertFiles(t, got, "ok1.bin", "good/ok2.bin")
 
-	if n := treeReqs.Load(); n > 3 {
-		t.Errorf("tree requests = %d, want bounded (<= 3: root + good + no malformed)", n)
+	if n := treeReqs.Load(); n != 2 {
+		t.Errorf("tree requests = %d, want 2 (root + good, no repeats or malformed/outside-prefix)", n)
+	}
+}
+
+// Cancellation must reach the actual next-page/directory request, including
+// restored backslash traversal; silently skipping that traversal is not success.
+func TestWalk_CancelDuringFollowupRequest(t *testing.T) {
+	for _, directory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("directory=%v", directory), func(t *testing.T) {
+			var reqs atomic.Int64
+			entered := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if reqs.Add(1) == 1 {
+					if directory {
+						_ = json.NewEncoder(w).Encode([]Node{dirNode(`win\dir`)})
+					} else {
+						w.Header().Set("Link", `<?cursor=2>; rel=next`)
+						_ = json.NewEncoder(w).Encode([]Node{fileNode("a.bin", 1)})
+					}
+					return
+				}
+				if directory && !strings.Contains(r.URL.EscapedPath(), "win%5Cdir") {
+					t.Errorf("unexpected directory URL: %s", r.URL)
+				}
+				close(entered)
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			canceled := make(chan struct{})
+			go func() {
+				defer close(canceled)
+				select {
+				case <-entered:
+				case <-ctx.Done():
+				}
+				cancel()
+			}()
+			defer func() { cancel(); <-canceled }()
+			err := testWalker(srv, nil).Walk(ctx, "", func(Node) error { return nil })
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if got := reqs.Load(); got != 2 {
+				t.Errorf("requests = %d, want 2", got)
+			}
+		})
 	}
 }
 

@@ -185,3 +185,152 @@ func TestPlanRepo_TerminalTreeFailsFast(t *testing.T) {
 		})
 	}
 }
+
+// A successful plan requires exhaustion of advertised pagination, not just
+// consumption of the first page. Exercise the production adapter for both APIs.
+func TestPlanRepo_PaginationCompletion(t *testing.T) {
+	for _, dataset := range []bool{false, true} {
+		for _, tc := range []struct {
+			name     string
+			links    []string
+			cycle    bool
+			wantErr  bool
+			requests int64
+		}{
+			{name: "no next", requests: 1},
+			{name: "unrelated malformed prev", links: []string{`<broken; rel=prev`}, requests: 1},
+			{name: "invalid escape", links: []string{`</%zz>; rel=next`}, wantErr: true, requests: 1},
+			{name: "invalid host", links: []string{`<http://[::1>; rel=next`}, wantErr: true, requests: 1},
+			{name: "empty next", links: []string{`<>; rel=next`}, wantErr: true, requests: 1},
+			{name: "unclosed target", links: []string{`<?cursor=2; rel=next`}, wantErr: true, requests: 1},
+			{name: "self cycle", links: []string{`<?recursive=true>; rel=next`}, wantErr: true, requests: 1},
+			{name: "multiple page cycle", links: []string{`<?cursor=2>; rel=next`}, cycle: true, wantErr: true, requests: 2},
+			{name: "repeated fields", links: []string{`<?cursor=0>; rel=prev`, `<?cursor=2>; rel=next`}, requests: 2},
+			{name: "next first", links: []string{`<?cursor=2>; rel=next, <?cursor=0>; rel=prev`}, requests: 2},
+			{name: "next last", links: []string{`<?cursor=0>; rel=prev, <?cursor=2>; rel=next`}, requests: 2},
+			{name: "quoted delimiters", links: []string{`<?cursor=0>; title="ignore;rel=next,<not a target>"; rel=prev, <?cursor=2>; title="page, two"; rel="next alternate"`}, requests: 2},
+			{name: "reported apostrophe prev first", links: []string{`<?cursor=0>; title=owner's; rel=prev, <?cursor=2>; rel=next`}, requests: 2},
+			{name: "reported apostrophe next only", links: []string{`<?cursor=2>; title=owner's; rel=next`}, requests: 2},
+			{name: "leading apostrophe metadata", links: []string{`<?cursor=2>; title='owners; rel=next`}, requests: 2},
+			{name: "apostrophe parameter key", links: []string{`<?cursor=2>; owner's=metadata; rel=next`}, requests: 2},
+			{name: "single quoted relation with token metadata", links: []string{`<?cursor=2>; title=owner's; rel='alternate next'`}, requests: 2},
+			{name: "field state resets", links: []string{`<?cursor=0>; title="unfinished`, `<?cursor=2>; rel=next`}, requests: 2},
+			{name: "malformed next after token metadata", links: []string{`<broken; title=owner's; rel=next`}, wantErr: true, requests: 1},
+		} {
+			t.Run(fmt.Sprintf("dataset=%v/%s", dataset, tc.name), func(t *testing.T) {
+				var reqs atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.Contains(r.URL.Path, "/revision/") {
+						_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+						return
+					}
+					if !strings.Contains(r.URL.Path, "/tree/") {
+						t.Errorf("unexpected request: %s", r.URL)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					api := "models"
+					if dataset {
+						api = "datasets"
+					}
+					if r.URL.Path != "/api/"+api+"/owner/repo/tree/main" {
+						t.Errorf("unexpected tree API path: %s", r.URL.Path)
+					}
+					page := reqs.Add(1)
+					if page > 2 {
+						t.Error("pagination did not terminate within two requests")
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if page == 2 && r.URL.Query().Get("cursor") != "2" {
+						t.Errorf("followed wrong link: %s", r.URL)
+					}
+					if r.URL.Query().Get("cursor") == "" {
+						for _, link := range tc.links {
+							w.Header().Add("Link", link)
+						}
+					} else if tc.cycle {
+						w.Header().Set("Link", `<?recursive=true>; rel=next`)
+					}
+					_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: fmt.Sprintf("f%d.bin", page), Size: page}})
+				}))
+				defer srv.Close()
+				plan, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main", IsDataset: dataset}, Settings{Endpoint: srv.URL})
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("PlanRepo error = %v, want error %v", err, tc.wantErr)
+				}
+				if tc.wantErr && plan != nil {
+					t.Error("failed pagination returned a partial plan")
+				}
+				if got := reqs.Load(); got != tc.requests {
+					t.Errorf("requests = %d, want %d", got, tc.requests)
+				}
+				if !tc.wantErr && len(plan.Items) != int(tc.requests) {
+					t.Errorf("files = %d, want %d", len(plan.Items), tc.requests)
+				}
+			})
+		}
+	}
+}
+
+// Directory traversal must let the existing FILE guard reject unsafe children.
+// An empty backslash directory itself was not an error in the legacy walker.
+func TestPlanRepo_BackslashDirectoryPreservesFileValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		direct, childFile, wantErr bool
+		requests                   int64
+	}{
+		{name: "empty directory", requests: 2},
+		{name: "unsafe child file", childFile: true, wantErr: true, requests: 2},
+		{name: "direct unsafe file", direct: true, wantErr: true, requests: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reqs atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/revision/") {
+					_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+					return
+				}
+				reqs.Add(1)
+				nodes := []hfNode{{Type: "file", Path: "ok.bin", Size: 1}}
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/tree/main"):
+					if tc.direct {
+						nodes = append(nodes, hfNode{Type: "file", Path: `win\dir/evil/file.bin`})
+					} else {
+						nodes = append(nodes, hfNode{Type: "directory", Path: `win\dir`})
+					}
+				case strings.HasSuffix(r.URL.Path, `/tree/main/win\dir`):
+					if !strings.Contains(r.URL.EscapedPath(), "win%5Cdir") {
+						t.Errorf("backslash not escaped: %s", r.URL.EscapedPath())
+					}
+					nodes = []hfNode{}
+					if tc.childFile {
+						nodes = append(nodes, hfNode{Type: "file", Path: `win\dir/evil/file.bin`})
+					}
+				default:
+					t.Errorf("unexpected request: %s", r.URL)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(nodes)
+			}))
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main"}, Settings{Endpoint: srv.URL})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "refusing unsafe path from repo tree") {
+					t.Fatalf("error = %v, want unsafe FILE error", err)
+				}
+				if plan != nil {
+					t.Error("unsafe file returned a partial plan")
+				}
+			} else if err != nil || len(plan.Items) != 1 {
+				t.Fatalf("empty directory plan = %v, error = %v", plan, err)
+			}
+			if got := reqs.Load(); got != tc.requests {
+				t.Errorf("requests = %d, want %d", got, tc.requests)
+			}
+		})
+	}
+}
