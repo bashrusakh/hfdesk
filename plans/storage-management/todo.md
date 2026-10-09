@@ -6,7 +6,7 @@
 - [x] Независимая браузерная и интеграционная проверка предыдущего кандидата прошла: проверялись локальные варианты/места и сохранение соседей/ссылок, HF-версии и общий blob, выбор/подтверждение/обновление UI и адаптивные размеры. Это не проверка последнего исправления.
 - [x] Независимое review предыдущих исправлений завершено; прежний review исходного кандидата потребовал изменений, а последующие исправления были отдельно проверены. Это не закрывает review последнего изменения.
 - [x] Последнее исправление границ корней и полного плана writer-операций прошло implementation-local проверки.
-- [ ] Независимо проверить последнюю правку и полный новый кандидат после неё.
+- [x] Независимо проверить последнюю правку и полный кандидат `ead4c97a988e6b2a99a7e3590b693946ebcb1357` после неё: whole-diff review PASS с замечаниями без блокеров (26/26); свежая независимая browser/integration проверка прошла. Результаты привязаны к этому исходному HEAD и базе `97bdec0ba81b7ca30c3aba63315054eb273291ba`; см. `plan.md` §10.
 - [ ] Нативная Windows/SMB-проверка остаётся отдельным follow-up; здесь она не выполнялась. Внешние загрузки и исчерпывающий набор форматов также не проверялись.
 
 Следующие пункты описывают исторические Package-этапы, а не текущую готовность. Их старые статусы намеренно сохранены как запись промежуточных состояний; для актуального результата см. раздел выше и `plan.md`.
@@ -22,7 +22,8 @@
 - [x] Исправить фильтр GGUF: несовпавший GGUF исключается и при отсутствии совпавшей GGUF в дереве; проверены обычный и LFS Q4/Q5.
 - [x] Package 3A: writer exclusion для matching queued/new/active downloads и фактических rebuild/legacy-delete/mirror destination writes; matching queued jobs требуют ручной отмены, Q5 без совпадения не блокирует выбранный Q4.
 - [x] Package 3B backend: selected HF snapshot/friendly entry deletion, shared-blob preservation, exact fresh confirmation, and HF repository/friendly writer reservation; focused pkg/server tests pass.
-- [ ] Parent-owned: verify current UI's HF-specific confirmation copy and browser flow now that backend advertises HF delete capability; perform integration review and native Windows follow-up as applicable.
+- [x] Parent-owned: verify current UI's HF-specific confirmation copy and browser flow now that backend advertises HF delete capability; perform integration review and review of whole candidate. Review and candidate verification passed; see `plan.md` §10.
+- [ ] Parent-owned follow-up: native Windows/SMB verification. Not run; not a blocker for the completed local review/verification record.
 
 Ниже сохранён исторический tracker предыдущего R/S/state/inventory-подхода. Его пункты и блокирующие статусы не описывают текущую цель; см. `plan.md`.
 
