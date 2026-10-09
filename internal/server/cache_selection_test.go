@@ -800,6 +800,101 @@ func TestCompletePlanUsesActualSnapshotDestinations(t *testing.T) {
 	}
 }
 
+// A paginated production download must keep its write scope unknown until all
+// Hub tree pages have been scanned, then reserve the later-page target before
+// the first file transfer begins. This joins the Hub tree walker to the job
+// manager's complete-plan callback and selected-delete admission path.
+func TestPaginatedPlanReservesLaterPageBeforeTransfer(t *testing.T) {
+	storage := t.TempDir()
+	cache := hfdownloader.NewHFCache(storage, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(rd.SnapshotsDir(), "deadbeef", "owner", "model", "model-Q4_K_M.gguf")
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanRoot := filepath.Join(rd.SnapshotsDir(), "deadbeef")
+
+	pageStarted := make(chan struct{}, 1)
+	transferStarted := make(chan struct{}, 1)
+	releasePage := make(chan struct{})
+	releaseTransfer := make(chan struct{})
+	var releasePageOnce, releaseTransferOnce sync.Once
+	openPage := func() { releasePageOnce.Do(func() { close(releasePage) }) }
+	openTransfer := func() { releaseTransferOnce.Do(func() { close(releaseTransfer) }) }
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/") && r.URL.Query().Get("cursor") == "later":
+			pageStarted <- struct{}{}
+			select {
+			case <-releasePage:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write([]byte(`[{"type":"file","path":"owner/model/model-Q4_K_M.gguf","size":5}]`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			w.Header().Set("Link", "<"+"http://"+r.Host+r.URL.Path+"?cursor=later>; rel=next")
+			_, _ = w.Write([]byte(`[{"type":"file","path":"model-Q5_K_M.gguf","size":5},{"type":"file","path":"config.json","size":5}]`))
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			transferStarted <- struct{}{}
+			select {
+			case <-releaseTransfer:
+				_, _ = w.Write([]byte("data!"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hf.Close()
+	defer openPage()
+	defer openTransfer()
+
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, LocalScanDirs: []string{scanRoot}, Endpoint: hf.URL})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{
+		Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"q4_k_m"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pageStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("download did not request the later Hub tree page")
+	}
+
+	body := selectedGroupRequest(t, s, "owner/model", scanRoot, "model-Q4_K_M.gguf")
+	if w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)); w.Code != http.StatusConflict {
+		t.Fatalf("delete crossed a download with an incomplete paginated plan: status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	openPage()
+	select {
+	case <-transferStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("download did not begin the later-page Q4 transfer")
+	}
+	if w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)); w.Code != http.StatusConflict {
+		t.Fatalf("later-page planned snapshot was not protected before transfer: status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	if !s.jobs.CancelJob(job.ID) {
+		t.Fatal("could not cancel paginated test job")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+}
+
 func TestSelectedDeleteAndRebuildReserveDatasetFriendlyTree(t *testing.T) {
 	storage := t.TempDir()
 	datasetRoot := filepath.Join(storage, "datasets")
