@@ -1005,6 +1005,67 @@ func TestJobDestinationBaseUsesFrozenLocalRepoAndDatasetNamespace(t *testing.T) 
 	if jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")) {
 		t.Fatal("dataset writer leaked into the separate model namespace")
 	}
+	job.Flat, job.LocalDir, job.LocalRepo = true, "/flat", "nested/../custom/path"
+	if got, want := jobDestinationBase(job), filepath.Join("/flat", "custom", "path"); got != want {
+		t.Fatalf("normalized in-root flat destination=%q want %q", got, want)
+	}
+}
+
+func TestJobDestinationBaseUsesModeSpecificRepositoryRules(t *testing.T) {
+	for _, repo := range []string{"owner/..", "custom/deep/path", "a/../b", "owner/na\x00me"} {
+		job := &Job{OutputDir: "/cache", Repo: "owner/source", LocalRepo: repo}
+		if got := jobDestinationBase(job); got != "" {
+			t.Errorf("HF-cache destination accepted invalid repo %q as %q", repo, got)
+		}
+		if paths, complete := jobPlannedWriteEntries(job, hfdownloader.Plan{}); complete || len(paths) != 0 {
+			t.Errorf("invalid HF destination %q produced a complete empty plan: paths=%v complete=%v", repo, paths, complete)
+		}
+	}
+	for _, repo := range []string{"custom/deep/path", "a/../b"} {
+		job := &Job{LocalDir: "/local", OutputDir: "/local", Repo: "owner/source", LocalRepo: repo}
+		if got := jobDestinationBase(job); got == "" {
+			t.Errorf("flat destination rejected valid folder %q", repo)
+		}
+	}
+}
+
+func TestInvalidRestoredHFRepoCannotResumeRetryOrDispatch(t *testing.T) {
+	srv := newTestServer(t)
+	m := srv.jobs
+	base := Job{
+		Repo: "owner/source", LocalRepo: "owner/..", OutputDir: srv.config.CacheDir,
+		HubDir: filepath.Join(srv.config.CacheDir, "hub"), CreatedAt: time.Now(),
+	}
+	paused := base
+	paused.ID, paused.Status = "invalid-paused", JobStatusPaused
+	failed := base
+	failed.ID, failed.Status = "invalid-failed", JobStatusFailed
+	queued := base
+	queued.ID, queued.Status = "invalid-queued", JobStatusQueued
+	m.mu.Lock()
+	m.jobs[paused.ID] = &paused
+	m.jobs[failed.ID] = &failed
+	m.jobs[queued.ID] = &queued
+	m.mu.Unlock()
+
+	if m.ResumeJob(paused.ID) {
+		t.Fatal("invalid restored HF repo was resumed")
+	}
+	if m.RetryJob(failed.ID) {
+		t.Fatal("invalid restored HF repo was retried")
+	}
+	m.mu.Lock()
+	m.dispatchLocked()
+	got := m.jobs[queued.ID]
+	if got.Status != JobStatusQueued || got.starting {
+		m.mu.Unlock()
+		t.Fatalf("invalid restored HF repo was dispatched: status=%s starting=%v", got.Status, got.starting)
+	}
+	if len(m.runActivities) != 0 {
+		m.mu.Unlock()
+		t.Fatalf("invalid restored HF repo registered a writer: %#v", m.runActivities)
+	}
+	m.mu.Unlock()
 }
 
 func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
@@ -1033,7 +1094,7 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 }
 
 func TestJobPlannedWriteEntriesTreatsEmptyPlanAsComplete(t *testing.T) {
-	entries, complete := jobPlannedWriteEntries(&Job{}, hfdownloader.Plan{})
+	entries, complete := jobPlannedWriteEntries(&Job{OutputDir: t.TempDir(), Repo: "owner/model"}, hfdownloader.Plan{})
 	if !complete || len(entries) != 0 {
 		t.Fatalf("empty plan coverage entries=%v complete=%t, want empty complete coverage", entries, complete)
 	}
@@ -2063,6 +2124,9 @@ func TestSelectedDeleteWaitsForActualQ4RunUnwind(t *testing.T) {
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
 	hf, started, release := blockingPlanServer(t, "model-Q4_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
+	defer releaseGate()
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
 	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}})
 	if err != nil {
@@ -2082,12 +2146,15 @@ func TestSelectedDeleteWaitsForActualQ4RunUnwind(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")); err != nil {
 		t.Fatalf("busy delete removed selected file: %v", err)
 	}
-	release()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if current, ok := s.jobs.GetJob(job.ID); !ok || current.Status != JobStatusRunning {
+		t.Fatalf("expected download to remain active behind blocked response, got %#v", current)
+	}
 	if !s.jobs.CancelJob(job.ID) {
 		t.Fatal("cancel active job failed")
 	}
+	releaseGate()
 	if err := s.jobs.Close(ctx); err != nil {
 		t.Fatal(err)
 	}

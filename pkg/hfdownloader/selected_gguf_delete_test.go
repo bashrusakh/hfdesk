@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -78,6 +79,47 @@ func TestDeleteSelectedGGUFRetainsDirectFriendlyBlobDependency(t *testing.T) {
 	}
 	if len(result.RetainedBlobs) != 1 || result.RetainedBlobs[0] != blob {
 		t.Fatalf("retained payload reporting=%v, want %q", result.RetainedBlobs, blob)
+	}
+}
+
+func TestDeleteSelectedGGUFRetainsSnapshotWhenFriendlyUnlinkFails(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("directory permission denial is not reliable on Windows or when running as root")
+	}
+	repo, blob, snapshot, friendly := selectedDeleteFixture(t)
+	// Removing write permission makes unlinking the friendly name fail after
+	// the full preflight has succeeded for an unprivileged test process.
+	parent := filepath.Dir(friendly)
+	if err := os.Chmod(parent, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(parent, 0755); err != nil {
+			t.Errorf("restore friendly directory permissions: %v", err)
+		}
+	})
+	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+	if !result.Attempted || len(result.Errors) == 0 || len(result.Remaining) == 0 {
+		t.Fatalf("expected partial deletion after friendly unlink failure, got %+v", result)
+	}
+	if _, err := os.Lstat(friendly); err != nil {
+		t.Fatalf("friendly name did not remain after unlink failure: %v", err)
+	}
+	if _, err := os.Lstat(snapshot); err != nil {
+		t.Fatalf("selected snapshot was removed despite retained friendly name: %v", err)
+	}
+	if _, err := os.Stat(snapshot); err != nil {
+		t.Fatalf("retained snapshot no longer resolves to its payload: %v", err)
+	}
+	if _, err := os.Stat(blob); err != nil {
+		t.Fatalf("required blob was removed with retained snapshot: %v", err)
+	}
+	remaining := map[string]bool{}
+	for _, name := range result.Remaining {
+		remaining[name] = true
+	}
+	if !remaining[snapshot] || !remaining[friendly] {
+		t.Fatalf("partial result omits retained dependency: %+v", result)
 	}
 }
 

@@ -148,6 +148,33 @@ func SafeJoin(base, rel string) (string, error) {
 	return dst, nil
 }
 
+// DestinationBase joins a user-selected repository folder to its configured
+// root and proves the resulting path remains under that root. Unlike SafeJoin,
+// repository folder names may contain normalizing segments such as a/../b;
+// only absolute paths and paths that actually escape the root are rejected.
+func DestinationBase(root, folder string) (string, error) {
+	// Keep the platform-aware component rules used by the download path: these
+	// reject reserved names/characters in the repo component on platforms where
+	// they are not valid local paths, while still allowing in-root a/../b.
+	if !filepath.IsLocal(folder) {
+		return "", fmt.Errorf("destination folder %q must be local", folder)
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve output root %q: %w", root, err)
+	}
+	base := filepath.Clean(filepath.Join(rootAbs, folder))
+	if !PathInside(rootAbs, base) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, rootAbs)
+	}
+	// Preserve the modeled containment barrier used by the previous download
+	// destination check, after the component-boundary proof above.
+	if !strings.HasPrefix(base, rootAbs) {
+		return "", fmt.Errorf("destination %q escapes output root %q", base, rootAbs)
+	}
+	return base, nil
+}
+
 // PlanItem represents a single file in the download plan.
 type PlanItem struct {
 	RelativePath string `json:"path"`
@@ -467,53 +494,7 @@ func destinationBase(job Job, cfg Settings) (string, error) {
 	if job.LocalRepo != "" {
 		repoForPath = job.LocalRepo
 	}
-	// The repo-derived folder segment is joined onto the configured output
-	// root and becomes the root of every downstream path, so it must stay
-	// local. validate() enforces IsValidModelName(job.Repo) at the Download
-	// boundary, but job.LocalRepo reaches this join unchecked; a "../" (or
-	// absolute) segment would move the whole destination outside
-	// cfg.OutputDir. filepath.IsLocal is the CodeQL-modeled barrier for
-	// exactly this containment property.
-	if !filepath.IsLocal(repoForPath) {
-		return "", fmt.Errorf("destination folder %q must be a local path", repoForPath)
-	}
-	// Normalize the configured output root to an absolute, cleaned path
-	// BEFORE the containment proof. The legacy OutputDir API accepts
-	// cwd-shaped roots (".", "./", "./Models"): filepath.Join cleans a root
-	// of "." away entirely, so proving against the raw configured string
-	// rejected those legitimate roots as escapes even though they never
-	// leave the working directory. Abs resolves every relative form —
-	// including "" and roots containing ".." segments — against the current
-	// working directory, giving the proof one stable root shape for
-	// relative, absolute, and traversal-containing configs alike. The
-	// preserved property is "destination never outside the effective
-	// (resolved) root".
-	root, err := filepath.Abs(cfg.OutputDir)
-	if err != nil {
-		return "", fmt.Errorf("resolve output root %q: %w", cfg.OutputDir, err)
-	}
-	base := filepath.Join(root, repoForPath)
-	// Prove the joined result stays under the resolved output root before
-	// returning it: this dominates every use of the result — including
-	// os.MkdirAll at the download entry and SafeJoin's base — so neither a
-	// crafted folder segment nor taint in cfg.OutputDir itself can escape
-	// the root unproven. A local repoForPath always satisfies this, so
-	// legitimate destinations are unaffected.
-	if !PathInside(root, base) {
-		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
-	}
-	// Restate the containment PathInside just proved against the resolved
-	// root with strings.HasPrefix, the primitive code scanning models as a
-	// sanitizer guard: this check is evaluated on `base` itself and
-	// dominates the return below, so taint carried in the configured root
-	// cannot flow out of destinationBase unnoticed — the same restatement
-	// SafeJoin applies to its result. Acceptance is identical to
-	// PathInside's (root is already cleaned by Abs, and base is a cleaned
-	// join of root), so no input that passed before is rejected.
-	if !strings.HasPrefix(base, root) {
-		return "", fmt.Errorf("destination %q escapes output root %q", base, root)
-	}
-	return base, nil
+	return DestinationBase(cfg.OutputDir, repoForPath)
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

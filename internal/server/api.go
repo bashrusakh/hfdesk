@@ -79,6 +79,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	// Create and start the job (or return existing if duplicate)
 	job, wasExisting, err := s.jobs.CreateJob(req)
 	if err != nil {
+		if errors.Is(err, errInvalidDestination) {
+			writeError(w, http.StatusBadRequest, "Invalid destination", err.Error())
+			return
+		}
 		if errors.Is(err, errInvalidRouteKey) {
 			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 			return

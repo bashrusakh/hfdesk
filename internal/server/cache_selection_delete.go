@@ -23,7 +23,7 @@ type jobWriteActivity struct {
 }
 
 func jobDestinationBase(job *Job) string {
-	if job.Flat {
+	if job.Flat || job.LocalDir != "" {
 		root := job.LocalDir
 		if root == "" {
 			root = job.OutputDir
@@ -32,17 +32,28 @@ func jobDestinationBase(job *Job) string {
 		if job.LocalRepo != "" {
 			repo = job.LocalRepo
 		}
-		return filepath.Join(root, filepath.FromSlash(repo))
+		base, err := hfdownloader.DestinationBase(root, filepath.FromSlash(repo))
+		if err != nil {
+			return ""
+		}
+		return base
 	}
-	tree := "models"
-	if job.IsDataset {
-		tree = "datasets"
-	}
-	repo := job.Repo
+	repoID := job.Repo
 	if job.LocalRepo != "" {
-		repo = job.LocalRepo
+		repoID = job.LocalRepo
 	}
-	return filepath.Join(job.OutputDir, tree, filepath.FromSlash(repo))
+	repoType := hfdownloader.RepoTypeModel
+	if job.IsDataset {
+		repoType = hfdownloader.RepoTypeDataset
+	}
+	// Resolve through the HF cache owner so validation and the reservation path
+	// exactly match the repository/type and friendly view used by the writer.
+	// HFCache.Repo is a pure validation/path constructor; it performs no probes.
+	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir, 0).Repo(repoID, repoType)
+	if err != nil {
+		return ""
+	}
+	return repo.FriendlyPath()
 }
 
 // mutationEntryIdentity resolves symlinks in parent directories but preserves
@@ -148,11 +159,11 @@ func mutationDirectoryIdentity(name string) (string, error) {
 
 func jobMayWriteSelectedPath(job *Job, target string) bool {
 	base := jobDestinationBase(job)
+	if base == "" {
+		return false
+	}
 	targetIdentity, targetErr := mutationEntryIdentity(target)
 	if targetErr != nil {
-		return true
-	}
-	if base == "" {
 		return true
 	}
 	if pathWithinWriterBase(base, targetIdentity) {
@@ -341,12 +352,12 @@ func hfJobRepoDir(job *Job) (*hfdownloader.RepoDir, error) {
 }
 
 func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
-	if len(plan.Items) == 0 {
-		return nil, true
-	}
 	base := jobDestinationBase(job)
 	if base == "" {
 		return nil, false
+	}
+	if len(plan.Items) == 0 {
+		return nil, true
 	}
 	var repo *hfdownloader.RepoDir
 	if !job.Flat && job.LocalDir == "" {
@@ -375,12 +386,12 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 }
 
 func hfReservationConflictsJob(scopes []string, job *Job) bool {
-	if repo := hfJobRepoPath(job); repo != "" && mutationDirectoryEntryOverlap(scopes[0], repo) {
-		return true
-	}
 	base := jobDestinationBase(job)
 	if base == "" {
 		return false
+	}
+	if repo := hfJobRepoPath(job); repo != "" && mutationDirectoryEntryOverlap(scopes[0], repo) {
+		return true
 	}
 	for _, scope := range scopes {
 		if mutationDirectoryEntryOverlap(scope, base) {

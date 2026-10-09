@@ -104,6 +104,7 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
 - `routeKey` (optional) selects a configured download route (see Settings). It

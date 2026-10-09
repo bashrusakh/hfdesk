@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
@@ -571,6 +572,12 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		// nil until runJob wires it.
 		partialFilesMu: &sync.Mutex{},
 	}
+	// Validate the exact frozen output base using the same pure constructor as
+	// the downloader before any reservation check can inspect filesystem state.
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: repository folder escapes its configured root", errInvalidDestination)
+	}
 	if m.jobBlockedByDeleteLocked(job) {
 		m.mu.Unlock()
 		return nil, false, errSelectionWriterBusy
@@ -709,6 +716,10 @@ func (m *JobManager) ResumeJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return false
+	}
 	if m.jobBlockedByDeleteLocked(job) {
 		m.mu.Unlock()
 		return false
@@ -761,6 +772,10 @@ func (m *JobManager) RetryJob(id string) bool {
 	}
 
 	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
+		m.mu.Unlock()
+		return false
+	}
+	if jobDestinationBase(job) == "" {
 		m.mu.Unlock()
 		return false
 	}
@@ -987,6 +1002,12 @@ func (m *JobManager) dispatchLocked() {
 
 	for _, j := range queued {
 		if active >= limit {
+			break
+		}
+		// Restored legacy state can contain destinations that new requests
+		// reject. Do not inspect or dispatch such a job; keep FIFO ordering and
+		// leave its saved state available for explicit repair.
+		if jobDestinationBase(j) == "" {
 			break
 		}
 		// Preserve FIFO: a reservation can hold its matching oldest queued job,

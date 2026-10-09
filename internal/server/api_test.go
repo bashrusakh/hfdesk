@@ -1431,6 +1431,28 @@ func TestAPI_StartDownload_OutputIgnored(t *testing.T) {
 	}
 }
 
+func TestAPI_StartDownloadRejectsEscapingLocalRepo(t *testing.T) {
+	for _, localRepo := range []string{"../outside", "owner/..", "custom/deep/path", "a/../b", "owner/na\x00me"} {
+		t.Run(localRepo, func(t *testing.T) {
+			srv := newTestServer(t)
+			body, err := json.Marshal(DownloadRequest{Repo: "owner/model", LocalRepo: localRepo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest("POST", "/api/download", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleStartDownload(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400; body=%s", w.Code, w.Body.String())
+			}
+			if jobs := srv.jobs.ListJobs(); len(jobs) != 0 {
+				t.Fatalf("invalid destination was admitted: %+v", jobs)
+			}
+		})
+	}
+}
+
 func TestAPI_StartDownload_DatasetUsesSameCacheDir(t *testing.T) {
 	srv := newTestServer(t)
 

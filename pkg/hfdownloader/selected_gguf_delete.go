@@ -436,6 +436,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		}
 	}
 	result.Attempted = true
+	retainedSelected := make(map[string]bool)
 	for _, name := range friendly {
 		rel, _ := filepath.Rel(friendlyRoot, name)
 		if friendlyFS == nil {
@@ -443,6 +444,9 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			result.Remaining = append(result.Remaining, name)
 			if _, candidate := candidateBlobs[resolvedFriendlyTargets[name]]; candidate {
 				retainedCandidates[resolvedFriendlyTargets[name]] = true
+			}
+			if selectedPath, ok := selectedPathsByEntryID[resolvedFriendlyTargets[name]]; ok {
+				retainedSelected[selectedPath] = true
 			}
 			continue
 		}
@@ -453,6 +457,9 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			if _, candidate := candidateBlobs[resolvedFriendlyTargets[name]]; candidate {
 				retainedCandidates[resolvedFriendlyTargets[name]] = true
 			}
+			if selectedPath, ok := selectedPathsByEntryID[resolvedFriendlyTargets[name]]; ok {
+				retainedSelected[selectedPath] = true
+			}
 			continue
 		}
 		if e := friendlyFS.Remove(rel); e != nil {
@@ -461,12 +468,19 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			if _, candidate := candidateBlobs[resolvedFriendlyTargets[name]]; candidate {
 				retainedCandidates[resolvedFriendlyTargets[name]] = true
 			}
+			if selectedPath, ok := selectedPathsByEntryID[resolvedFriendlyTargets[name]]; ok {
+				retainedSelected[selectedPath] = true
+			}
 		} else {
 			result.Removed = append(result.Removed, name)
 		}
 	}
 	removedSelected := map[string]bool{}
 	for name := range selected {
+		if retainedSelected[name] {
+			result.Remaining = append(result.Remaining, name)
+			continue
+		}
 		rel, _ := filepath.Rel(snapshotRoot, name)
 		current, statErr := snapshotFS.Lstat(rel)
 		if statErr != nil || !os.SameFile(selectedInfos[name], current) {
