@@ -750,6 +750,10 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		result := rd.DeleteSelectedGGUF(entries, protectedRoots...)
+		if len(result.Errors) > 0 && !result.Attempted {
+			writeError(w, http.StatusConflict, "HF deletion refused", strings.Join(result.Errors, "; "))
+			return
+		}
 		retained := make([]string, 0, len(result.RetainedBlobs))
 		for _, blob := range result.RetainedBlobs {
 			retained = append(retained, filepath.Base(blob))
@@ -777,12 +781,12 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		if response.Remaining == nil {
 			response.Remaining = []string{}
 		}
-		if len(result.RetainedBlobs) > 0 {
-			response.Message = "Removed selected HF snapshot entries; shared payloads needed by other saved entries were retained"
-		} else if response.OK {
-			response.Message = "Removed the selected HF GGUF entries and unreferenced payloads"
-		} else {
+		if !response.OK {
 			response.Message = "HF deletion was partial; remaining entries and payloads were preserved where still referenced"
+		} else if len(result.RetainedBlobs) > 0 {
+			response.Message = "Removed selected HF snapshot entries; shared payloads needed by other saved entries were retained"
+		} else {
+			response.Message = "Removed the selected HF GGUF entries and unreferenced payloads"
 		}
 		status := http.StatusOK
 		if !response.OK {

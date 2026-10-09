@@ -1473,13 +1473,48 @@ func TestSelectedHFDeleteRefusesRetainedFriendlySnapshotDependency(t *testing.T)
 	symlinkOrSkip(t, filepath.Join(snapshotView, filepath.Base(snapshot)), otherName)
 	body := selectedHFGroupRequest(t, s, "model-Q4_K_M.gguf")
 	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
-	if w.Code != http.StatusMultiStatus {
+	if w.Code != http.StatusConflict || strings.Contains(w.Body.String(), "HF deletion was partial") || !strings.Contains(w.Body.String(), "retained friendly name depends on a selected snapshot entry") {
 		t.Fatalf("dependent friendly name should refuse deletion, status=%d body=%s", w.Code, w.Body.String())
 	}
 	for _, name := range []string{snapshot, friendly, snapshotView, otherName} {
 		if _, err := os.Lstat(name); err != nil {
 			t.Fatalf("refused operation changed %s: %v", name, err)
 		}
+	}
+}
+
+func TestSelectedHFDeleteReportsPartialAfterUnlinkAttempt(t *testing.T) {
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := rd.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := filepath.Dir(stored.SnapshotPath)
+	if err := os.Chmod(snapshotDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(snapshotDir, 0755)
+	body := selectedHFGroupRequest(t, s, "model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus || !strings.Contains(w.Body.String(), "HF deletion was partial") || !strings.Contains(w.Body.String(), "remaining") {
+		t.Fatalf("failed unlink should be reported as partial execution, status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(stored.SnapshotPath); err != nil {
+		t.Fatalf("failed snapshot unlink unexpectedly removed entry: %v", err)
+	}
+	if _, err := os.Stat(stored.BlobPath); err != nil {
+		t.Fatalf("payload needed by remaining snapshot was removed: %v", err)
 	}
 }
 

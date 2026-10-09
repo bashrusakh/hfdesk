@@ -25,6 +25,7 @@ type SelectedGGUFEntry struct {
 type SelectedGGUFDeleteResult struct {
 	Removed, Remaining, RetainedBlobs []string
 	Errors                            []string
+	Attempted                         bool
 }
 
 func cleanHFRelative(name string) bool {
@@ -434,6 +435,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			}
 		}
 	}
+	result.Attempted = true
 	for _, name := range friendly {
 		rel, _ := filepath.Rel(friendlyRoot, name)
 		if friendlyFS == nil {
