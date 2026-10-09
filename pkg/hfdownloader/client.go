@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
 // DefaultEndpoint is the default HuggingFace Hub URL.
@@ -118,46 +120,45 @@ func headForETag(parentCtx context.Context, httpc *http.Client, token string, it
 	return resp.Header.Get("ETag"), resp.Header.Get("x-amz-meta-sha256"), nil
 }
 
-// walkTree recursively walks the HuggingFace repo tree.
+// walkTree walks the HuggingFace repo tree through the shared hubtree walker
+// (issue #96): it requests recursive=true, follows Link rel="next"
+// pagination, falls back to per-directory listing for mirrors that ignore
+// recursive, bounds malformed listings, and retries 429/5xx/network errors
+// with Retry-After/RateLimit-aware, context-cancellable waits. 401/403 (and
+// every other terminal status) fail immediately with the historical error
+// messages below.
 func walkTree(ctx context.Context, httpc *http.Client, token, endpoint string, job Job, prefix string, fn func(hfNode) error) error {
-	reqURL := treeURL(endpoint, job, prefix)
-	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	addAuth(req, token)
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))
-	}
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))
-	}
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("tree API failed: %s", resp.Status)
-	}
-
-	var nodes []hfNode
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&nodes); err != nil {
-		return err
-	}
-
-	for _, n := range nodes {
-		switch n.Type {
-		case "directory", "tree":
-			if err := walkTree(ctx, httpc, token, endpoint, job, n.Path, fn); err != nil {
-				return err
+	w := &hubtree.Walker{
+		TreeURL: func(p string) string {
+			return treeURL(endpoint, job, p)
+		},
+		Token:     token,
+		UserAgent: "hfdesk/1",
+		Client:    httpc,
+		StatusErr: func(resp *http.Response) error {
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
+				return fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))
+			case http.StatusForbidden:
+				return fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))
+			default:
+				return fmt.Errorf("tree API failed: %s", resp.Status)
 			}
-		default:
-			if err := fn(n); err != nil {
-				return err
-			}
-		}
+		},
 	}
-	return nil
+	return w.Walk(ctx, prefix, func(n hubtree.Node) error {
+		return fn(toHfNode(n))
+	})
+}
+
+// toHfNode converts a shared hubtree node to the downloader's node type
+// without losing any field.
+func toHfNode(n hubtree.Node) hfNode {
+	out := hfNode{Type: n.Type, Path: n.Path, Size: n.Size, Sha256: n.Sha256}
+	if n.LFS != nil {
+		out.LFS = &hfLfsInfo{Oid: n.LFS.Oid, Size: n.LFS.Size, Sha256: n.LFS.Sha256}
+	}
+	return out
 }
 
 // URL builders - all accept endpoint to support custom mirrors
