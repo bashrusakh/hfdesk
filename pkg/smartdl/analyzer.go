@@ -6,6 +6,7 @@ package smartdl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -177,7 +178,9 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	// HuggingFace returns "not found" for missing repos, but also "unauthorized"
 	// when trying to access a datasets-only repo via the models API
 	isModelNotFound := func(err error) bool {
-		if err == nil {
+		// Structural pagination failure means an incomplete selected tree,
+		// not a missing namespace, regardless of URL/header diagnostic text.
+		if err == nil || errors.Is(err, hubtree.ErrPagination) {
 			return false
 		}
 		errStr := strings.ToLower(err.Error())

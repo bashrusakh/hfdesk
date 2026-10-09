@@ -6,14 +6,186 @@ package smartdl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
+
+// A successful opposite namespace must not hide a selected tree's structural
+// failure. Exercise both classifier uses and the intentionally optional probe.
+func TestAnalyze_StructuralPaginationClassification(t *testing.T) {
+	for _, word := range []string{"401", "unauthorized", "not found"} {
+		for _, kind := range []string{"invalid", "malformed", "cycle", "empty", "malformed relation", "origin"} {
+			for _, stage := range []string{"first", "later", "directory"} {
+				for _, mode := range []string{"model", "dataset", "fallback401", "fallback404", "optional"} {
+					t.Run(strings.Join([]string{word, kind, stage, mode}, "/"), func(t *testing.T) {
+						var selectedReqs, oppositeReqs, foreignReqs atomic.Int64
+						dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							foreignReqs.Add(1)
+							_, _ = w.Write([]byte(`[]`))
+						}))
+						defer dst.Close()
+						api := "models"
+						if mode != "model" {
+							api = "datasets"
+						}
+						treePath := "/api/" + api + "/owner/repo/tree/main"
+						srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if strings.Contains(r.URL.Path, "/tree/") && r.URL.Path != treePath && r.URL.Path != treePath+"/sub" {
+								oppositeReqs.Add(1)
+								if mode == "fallback401" {
+									w.WriteHeader(http.StatusUnauthorized)
+								} else if mode == "fallback404" {
+									w.WriteHeader(http.StatusNotFound)
+								} else {
+									_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "opposite.txt", Size: 7}})
+								}
+								return
+							}
+							if strings.HasSuffix(r.URL.Path, "/refs") {
+								_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+								return
+							}
+							page := selectedReqs.Add(1)
+							if page > 3 || (r.URL.Path != treePath && r.URL.Path != treePath+"/sub") {
+								t.Errorf("unexpected request: %s", r.URL)
+								w.WriteHeader(http.StatusBadRequest)
+								return
+							}
+							if stage == "later" && page == 1 {
+								w.Header().Set("Link", `<?cursor=2>; rel=next`)
+							} else if stage == "directory" && r.URL.Path == treePath {
+								_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "root.txt"}, {Type: "directory", Path: "sub"}})
+								return
+							} else {
+								link := ""
+								switch kind {
+								case "invalid":
+									link = "</" + word + "/%zz>; rel=next"
+								case "malformed":
+									link = "</" + word + "; rel=next"
+								case "cycle":
+									link = "<?recursive=true&cursor=" + url.QueryEscape(word) + ">; rel=next"
+								case "empty":
+									link = `<>; rel=next; title="` + word + `"`
+								case "malformed relation":
+									link = `</` + word + `>; rel="next`
+								case "origin":
+									link = "<" + dst.URL + "/" + strings.ReplaceAll(word, " ", "%20") + ">; rel=next"
+								}
+								w.Header().Set("Link", link)
+							}
+							_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "partial.txt", Size: 1}})
+						}))
+						defer srv.Close()
+						a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: "fake-token"})
+						info, err := a.Analyze(context.Background(), "owner/repo", mode == "dataset")
+						if mode == "optional" {
+							if err != nil || info == nil || info.IsDataset || info.FileCount != 1 || info.Files[0].Path != "opposite.txt" {
+								t.Errorf("optional probe: info = %v, error = %v; want successful model", info, err)
+							}
+						} else if info != nil || !errors.Is(err, hubtree.ErrPagination) {
+							t.Errorf("info = %v, error = %v; want structural failure, no analysis", info, err)
+						}
+						wantSelected, wantOpposite := int64(1), int64(0)
+						if stage != "first" {
+							wantSelected++
+						}
+						if kind == "cycle" {
+							wantSelected++
+						}
+						if mode == "fallback401" || mode == "fallback404" || mode == "optional" {
+							wantOpposite = 1
+						}
+						if selectedReqs.Load() != wantSelected || oppositeReqs.Load() != wantOpposite || foreignReqs.Load() != 0 {
+							t.Errorf("selected/opposite/foreign = %d/%d/%d, want %d/%d/0", selectedReqs.Load(), oppositeReqs.Load(), foreignReqs.Load(), wantSelected, wantOpposite)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestAnalyze_NamespaceFallbackPreserved(t *testing.T) {
+	// Keep ephemeral ports out of status diagnostics: the unchanged historical
+	// classifier can match "401" even in a forbidden repo URL. Dial only our Hub.
+	const endpoint = "http://hub.test"
+	for _, modelStatus := range []int{200, 401, 403, 404} {
+		for _, datasetStatus := range []int{200, 401, 403, 404} {
+			t.Run(fmt.Sprintf("model=%d/dataset=%d", modelStatus, datasetStatus), func(t *testing.T) {
+				var modelReqs, datasetReqs atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					status := 200
+					if r.URL.Path == "/api/models/owner/repo/tree/main" {
+						modelReqs.Add(1)
+						status = modelStatus
+					} else if r.URL.Path == "/api/datasets/owner/repo/tree/main" {
+						datasetReqs.Add(1)
+						status = datasetStatus
+					} else if strings.HasSuffix(r.URL.Path, "/refs") {
+						_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+						return
+					} else {
+						t.Errorf("unexpected request: %s", r.URL)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					w.WriteHeader(status)
+					if status == 200 {
+						_ = json.NewEncoder(w).Encode([]hfTreeNode{{Type: "file", Path: "data.txt", Size: 7}})
+					}
+				}))
+				defer srv.Close()
+				transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var dialer net.Dialer
+					return dialer.DialContext(ctx, network, srv.Listener.Addr().String())
+				}}
+				defer transport.CloseIdleConnections()
+				a := NewAnalyzer(AnalyzerOptions{Endpoint: endpoint, HTTPClient: &http.Client{Transport: transport}})
+				info, err := a.Analyze(context.Background(), "owner/repo", false)
+				switch {
+				case modelStatus == 403:
+					if info != nil || err == nil || !strings.Contains(err.Error(), "forbidden") {
+						t.Errorf("info = %v, error = %v; want forbidden", info, err)
+					}
+				case modelStatus == 200 && datasetStatus == 200:
+					if info != nil || !errors.Is(err, ErrBothExist) {
+						t.Errorf("info = %v, error = %v; want ErrBothExist", info, err)
+					}
+				case modelStatus == 200 || datasetStatus == 200:
+					if err != nil || info == nil || info.IsDataset != (modelStatus != 200) || info.FileCount != 1 || info.Files[0].Path != "data.txt" {
+						t.Errorf("info = %v, error = %v; want successful selected namespace", info, err)
+					}
+				default:
+					want := "repository not found as model or dataset: owner/repo"
+					if datasetStatus == 403 {
+						want = "forbidden: please accept the repository terms at " + endpoint + "/datasets/owner/repo"
+					}
+					if info != nil || err == nil || err.Error() != "fetch file tree: "+want {
+						t.Errorf("info = %v, error = %v; want %q", info, err, want)
+					}
+				}
+				wantDataset := int64(1)
+				if modelStatus == 403 {
+					wantDataset = 0
+				}
+				if modelReqs.Load() != 1 || datasetReqs.Load() != wantDataset {
+					t.Errorf("model/dataset = %d/%d, want 1/%d", modelReqs.Load(), datasetReqs.Load(), wantDataset)
+				}
+			})
+		}
+	}
+}
 
 // Exercise public Analyze so attacker text cannot turn a pagination failure
 // into namespace autodetection and successful partial analysis.

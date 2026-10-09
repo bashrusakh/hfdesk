@@ -24,6 +24,86 @@ func fileNode(p string, size int64) Node {
 	return Node{Type: "file", Path: p, Size: size}
 }
 
+func TestWalk_PaginationErrorScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, link, diagnostic string
+		structural             bool
+	}{
+		{"invalid next", `</401/%zz>; rel=next`, "hubtree: invalid next pagination target", true},
+		{"malformed next", `</unauthorized; rel=next`, "hubtree: malformed next pagination link", true},
+		{"empty next", `<>; rel=next`, "hubtree: empty next pagination target", true},
+		{"cycle", `<?recursive=true>; rel=next`, "hubtree: pagination cycle at", true},
+		{"origin", `<http://foreign.invalid/401>; rel=next`, "hubtree: cross-origin next pagination target", true},
+		{"401", "", "unauthorized", false},
+		{"403", "", "forbidden", false},
+		{"404", "", "not found", false},
+		{"decode", "", "unexpected EOF", false},
+		{"initial URL", "", "hubtree: invalid tree URL", false},
+		{"cancel", "", "context canceled", false},
+		{"budget", "", "hubtree: tree walk exceeded", false},
+		{"network", "", "tree request failed after 5 attempts", false},
+		{"callback", "", "callback 401 unauthorized not found", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.name == "401" || tc.name == "403" || tc.name == "404" {
+					status, _ := strconv.Atoi(tc.name)
+					w.WriteHeader(status)
+					return
+				}
+				if tc.name == "decode" {
+					_, _ = w.Write([]byte(`[{`))
+					return
+				}
+				w.Header().Set("Link", tc.link)
+				_ = json.NewEncoder(w).Encode([]Node{fileNode("data.txt", 1)})
+			}))
+			defer srv.Close()
+			walker := testWalker(srv, nil)
+			walker.StatusErr = func(resp *http.Response) error {
+				return errors.New(map[int]string{401: "unauthorized", 403: "forbidden", 404: "not found"}[resp.StatusCode])
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			switch tc.name {
+			case "initial URL":
+				walker.TreeURL = func(string) string { return srv.URL + "/401/%zz" }
+			case "cancel":
+				cancel()
+			case "budget":
+				old := maxWalkRequests
+				maxWalkRequests = 0
+				defer func() { maxWalkRequests = old }()
+			case "network":
+				srv.Close()
+			}
+			callbackErr := errors.New(tc.diagnostic)
+			err := walker.Walk(ctx, "", func(Node) error {
+				if tc.name == "callback" {
+					return callbackErr
+				}
+				t.Error("failed listing delivered a file")
+				return nil
+			})
+			if err == nil || !strings.HasPrefix(err.Error(), tc.diagnostic) {
+				t.Fatalf("error = %v, want diagnostic prefix %q", err, tc.diagnostic)
+			}
+			if errors.Is(err, ErrPagination) != tc.structural || errors.Is(fmt.Errorf("outer: %w", err), ErrPagination) != tc.structural {
+				t.Errorf("error = %v, structural = %v; want %v through wrapping", err, errors.Is(err, ErrPagination), tc.structural)
+			}
+			if tc.name == "invalid next" {
+				var escape url.EscapeError
+				if !errors.As(err, &escape) {
+					t.Errorf("lost underlying URL error: %v", err)
+				}
+			}
+			if tc.name == "callback" && err != callbackErr {
+				t.Errorf("callback error identity changed: %v", err)
+			}
+		})
+	}
+}
+
 // Advertised links are fresh requests, not redirects: reject the destination
 // before any request, even without credentials and after traversal transitions.
 func TestWalk_PaginationOriginBoundary(t *testing.T) {

@@ -33,6 +33,7 @@ package hubtree
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -65,6 +66,18 @@ const (
 // truncation: a legitimate repo walks far below it, while a hostile or
 // broken listing that keeps fabricating fresh directories stops here.
 var maxWalkRequests = 10000
+
+// ErrPagination identifies malformed/empty advertised next links, unresolved
+// next targets, pagination cycles and origin rejection. It does not classify
+// HTTP, transport, decoding, cancellation, budget or initial tree URL failures.
+var ErrPagination = errors.New("hubtree: structural pagination failure")
+
+// paginationError marks the known structural failures without changing their
+// diagnostic text or losing an underlying URL parse error.
+type paginationError struct{ error }
+
+func (e paginationError) Is(target error) bool { return target == ErrPagination }
+func (e paginationError) Unwrap() error        { return e.error }
 
 // LFS contains the LFS metadata a tree node may carry.
 type LFS struct {
@@ -323,16 +336,16 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 		}
 		target, err := resolveNext(u, next)
 		if err != nil {
-			return nil, fmt.Errorf("hubtree: invalid next pagination target %q: %w", next, err)
+			return nil, paginationError{fmt.Errorf("hubtree: invalid next pagination target %q: %w", next, err)}
 		}
 		if !st.origin.matches(target) {
 			// Do not echo attacker-controlled URL text: callers may classify
 			// errors by strings such as "401", "unauthorized", or "not found".
-			return nil, fmt.Errorf("hubtree: cross-origin next pagination target")
+			return nil, paginationError{fmt.Errorf("hubtree: cross-origin next pagination target")}
 		}
 		abs := target.String()
 		if st.seenPages[abs] {
-			return nil, fmt.Errorf("hubtree: pagination cycle at %q", abs)
+			return nil, paginationError{fmt.Errorf("hubtree: pagination cycle at %q", abs)}
 		}
 		st.seenPages[abs] = true
 		u = abs
@@ -581,10 +594,10 @@ func nextLink(headers []string) (string, error) {
 				continue
 			}
 			if !validTarget || !validRel {
-				return "", fmt.Errorf("hubtree: malformed next pagination link %q", entry)
+				return "", paginationError{fmt.Errorf("hubtree: malformed next pagination link %q", entry)}
 			}
 			if strings.TrimSpace(target) == "" {
-				return "", fmt.Errorf("hubtree: empty next pagination target")
+				return "", paginationError{fmt.Errorf("hubtree: empty next pagination target")}
 			}
 			return target, nil
 		}
