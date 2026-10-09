@@ -107,6 +107,26 @@ func safeDirectoryChain(name string) error {
 	return nil
 }
 
+func (r *RepoDir) isIncompleteBlobPath(name string) bool {
+	base := filepath.Base(name)
+	trimSuffix := strings.TrimSuffix
+	pathEqual := func(a, b string) bool { return a == b }
+	if runtime.GOOS == "windows" {
+		trimSuffix = func(s, suffix string) string {
+			if len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix) {
+				return s[:len(s)-len(suffix)]
+			}
+			return s
+		}
+		pathEqual = strings.EqualFold
+	}
+	if sha := trimSuffix(base, ".incomplete.meta"); sha != base && pathEqual(name, r.IncompleteMetaPath(sha)) {
+		return true
+	}
+	sha := trimSuffix(base, ".incomplete")
+	return sha != base && pathEqual(name, r.IncompletePath(sha))
+}
+
 // DeleteSelectedGGUF removes only confirmed names from all named snapshots,
 // their provably associated friendly links, and blob payloads with no remaining
 // direct snapshot references. It never removes directories or partial files.
@@ -267,6 +287,10 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			targetInfo, targetErr := os.Lstat(target)
 			if e != nil || !pathWithin(blobRoot, target) || targetErr != nil || !targetInfo.Mode().IsRegular() || targetInfo.Mode()&os.ModeSymlink != 0 {
 				result.Errors = append(result.Errors, "selected snapshot link is unsafe")
+				return result
+			}
+			if r.isIncompleteBlobPath(target) {
+				result.Errors = append(result.Errors, "selected snapshot link targets an incomplete blob")
 				return result
 			}
 			selectedTargets[name] = target

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +55,13 @@ func TestCleanHFRelativeUsesSlashNormalizedWirePaths(t *testing.T) {
 
 func TestDeleteSelectedGGUFRetainsDirectFriendlyBlobDependency(t *testing.T) {
 	repo, blob, snapshot, friendly := selectedDeleteFixture(t)
+	unrelatedPartial := repo.IncompletePath("unrelated")
+	unrelatedMeta := repo.IncompleteMetaPath("unrelated")
+	for _, name := range []string{unrelatedPartial, unrelatedMeta} {
+		if err := os.WriteFile(name, []byte("keep"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	otherName := filepath.Join(repo.FriendlyPath(), "model-Q5_K_M.gguf")
 	if err := os.Symlink(blob, otherName); err != nil {
 		t.Fatal(err)
@@ -72,7 +80,7 @@ func TestDeleteSelectedGGUFRetainsDirectFriendlyBlobDependency(t *testing.T) {
 	if _, err := os.Lstat(friendly); !os.IsNotExist(err) {
 		t.Fatalf("selected friendly projection remains: %v", err)
 	}
-	for _, name := range []string{blob, otherName, readme} {
+	for _, name := range []string{blob, otherName, readme, unrelatedPartial, unrelatedMeta} {
 		if _, err := os.Lstat(name); err != nil {
 			t.Fatalf("retained entry %q changed: %v", name, err)
 		}
@@ -258,6 +266,76 @@ func TestDeleteSelectedGGUFRejectsNestedBlobTargetBeforeAnyUnlink(t *testing.T) 
 	for _, name := range []string{snapshot, friendly, nested, decoy} {
 		if _, err := os.Lstat(name); err != nil {
 			t.Fatalf("refused operation changed %q: %v", name, err)
+		}
+	}
+}
+
+func TestDeleteSelectedGGUFRefusesIncompleteBlobTargetsBeforeAnyUnlink(t *testing.T) {
+	for _, suffix := range []string{".incomplete", ".incomplete.meta"} {
+		t.Run(suffix, func(t *testing.T) {
+			repo, _, snapshot, friendly := selectedDeleteFixture(t)
+			staging := repo.BlobPath("staging" + suffix)
+			if err := os.WriteFile(staging, []byte("resume state"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("..", "..", "blobs", filepath.Base(staging)), snapshot); err != nil {
+				t.Fatal(err)
+			}
+			result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+			if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
+				t.Fatalf("staging target was not refused during preflight: %+v", result)
+			}
+			for _, name := range []string{snapshot, friendly, staging} {
+				if _, err := os.Lstat(name); err != nil {
+					t.Fatalf("preflight refusal changed %q: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestIncompleteBlobPathClassifierFollowsPlatformCaseSemantics(t *testing.T) {
+	repo, _, _, _ := selectedDeleteFixture(t)
+	path := repo.IncompletePath("staging")
+	upperSuffix := strings.TrimSuffix(path, ".incomplete") + ".INCOMPLETE"
+	wantAlias := runtime.GOOS == "windows"
+	if got := repo.isIncompleteBlobPath(upperSuffix); got != wantAlias {
+		t.Fatalf("uppercase suffix classified=%v, want %v on %s", got, wantAlias, runtime.GOOS)
+	}
+	if !repo.isIncompleteBlobPath(path) {
+		t.Fatal("canonical incomplete data path was not classified")
+	}
+	meta := repo.IncompleteMetaPath("staging")
+	upperMeta := strings.TrimSuffix(meta, ".incomplete.meta") + ".INCOMPLETE.META"
+	if got := repo.isIncompleteBlobPath(upperMeta); got != wantAlias {
+		t.Fatalf("uppercase metadata suffix classified=%v, want %v on %s", got, wantAlias, runtime.GOOS)
+	}
+}
+
+func TestDeleteSelectedGGUFRefusesMixedIncompleteCompositionBeforeAnyUnlink(t *testing.T) {
+	repo, _, snapshot, friendly := selectedDeleteFixture(t)
+	staging := repo.BlobPath("staging.incomplete")
+	if err := os.WriteFile(staging, []byte("partial bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta := repo.IncompleteMetaPath("staging")
+	if err := os.WriteFile(meta, []byte("resume metadata"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(repo.SnapshotsDir(), "version-a", "model-Q5_K_M.gguf")
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", filepath.Base(staging)), other); err != nil {
+		t.Fatal(err)
+	}
+	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}, {Path: "model-Q5_K_M.gguf", Versions: []string{"version-a"}}})
+	if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
+		t.Fatalf("mixed staging composition was not refused during preflight: %+v", result)
+	}
+	for _, name := range []string{snapshot, friendly, other, repo.BlobPath("blob-a"), staging, meta} {
+		if _, err := os.Lstat(name); err != nil {
+			t.Fatalf("preflight refusal changed %q: %v", name, err)
 		}
 	}
 }

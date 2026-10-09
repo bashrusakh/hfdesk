@@ -1674,6 +1674,70 @@ func TestSelectedHFDeleteReportsPartialAfterUnlinkAttempt(t *testing.T) {
 	}
 }
 
+func TestSelectedHFDeleteRefusesIncompleteBlobTargetWithConflict(t *testing.T) {
+	for _, target := range []string{"data", "metadata"} {
+		t.Run(target, func(t *testing.T) {
+			s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+			rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rd.EnsureDirs(); err != nil {
+				t.Fatal(err)
+			}
+			temp := filepath.Join(t.TempDir(), "download")
+			if err := os.WriteFile(temp, []byte("completed payload"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := rd.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", "", "", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			partial := rd.IncompletePath("staging")
+			partialBytes := []byte("partial bytes")
+			if err := os.WriteFile(partial, partialBytes, 0644); err != nil {
+				t.Fatal(err)
+			}
+			meta := rd.IncompleteMetaPath("staging")
+			metaBytes := []byte("resume metadata")
+			if err := os.WriteFile(meta, metaBytes, 0644); err != nil {
+				t.Fatal(err)
+			}
+			selectedTarget := partial
+			if target == "metadata" {
+				selectedTarget = meta
+			}
+			if err := os.Remove(stored.SnapshotPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("..", "..", "blobs", filepath.Base(selectedTarget)), stored.SnapshotPath); err != nil {
+				t.Fatal(err)
+			}
+			// Build the selection from the exact staging-backed composition so its
+			// member size matches the request-time validation.
+			body := selectedHFGroupRequest(t, s, "model-Q4_K_M.gguf")
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "HF deletion refused") || !strings.Contains(w.Body.String(), "selected snapshot link targets an incomplete blob") || strings.Contains(w.Body.String(), "HF deletion was partial") {
+				t.Fatalf("staging target should be refused by preflight, status=%d body=%s", w.Code, w.Body.String())
+			}
+			for _, name := range []string{stored.SnapshotPath, stored.BlobPath, partial, meta, stored.FriendlyPath} {
+				if _, err := os.Lstat(name); err != nil {
+					t.Fatalf("refused request changed %s: %v", name, err)
+				}
+			}
+			for _, check := range []struct {
+				name string
+				want []byte
+			}{{partial, partialBytes}, {meta, metaBytes}, {stored.BlobPath, []byte("completed payload")}} {
+				got, err := os.ReadFile(check.name)
+				if err != nil || string(got) != string(check.want) {
+					t.Fatalf("refused request changed contents of %s: got=%q err=%v", check.name, got, err)
+				}
+			}
+		})
+	}
+}
+
 func selectedHFGroupRequest(t *testing.T, s *Server, memberPath string) []byte {
 	t.Helper()
 	code, selection := getSelection(t, s, "owner/model", "model", "")
