@@ -35,6 +35,7 @@ func TestAnalyzeAndPlanProxy(t *testing.T) {
 				return
 			}
 			var mu sync.Mutex
+			var originRequests int
 			proxyPaths := map[string]int{}
 			serveHub := func(w http.ResponseWriter, r *http.Request) {
 				switch {
@@ -56,7 +57,12 @@ func TestAnalyzeAndPlanProxy(t *testing.T) {
 					http.NotFound(w, r)
 				}
 			}
-			hub := httptest.NewServer(http.HandlerFunc(serveHub))
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				originRequests++
+				mu.Unlock()
+				serveHub(w, r)
+			}))
 			defer hub.Close()
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
@@ -102,9 +108,10 @@ func TestAnalyzeAndPlanProxy(t *testing.T) {
 			case "invalid":
 				cfg.Proxy = &hfdownloader.ProxyConfig{URL: "://bad", NoEnvProxy: true}
 			case "unreachable":
-				closed := httptest.NewServer(http.HandlerFunc(serveHub))
-				closed.Close()
-				cfg.Proxy = &hfdownloader.ProxyConfig{URL: closed.URL, NoEnvProxy: true}
+				// Destination port zero cannot host a listener: binding port zero
+				// allocates an ephemeral port instead. Unlike a closed test server's
+				// port, this destination cannot be reused by another test's listener.
+				cfg.Proxy = &hfdownloader.ProxyConfig{URL: "http://127.0.0.1:0", NoEnvProxy: true}
 			}
 			s := newTestServerWithConfig(t, cfg)
 			for _, action := range []string{"analyze", "plan", "dry-run", "readme", "search"} {
@@ -148,6 +155,9 @@ func TestAnalyzeAndPlanProxy(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
+			if (mode == "invalid" || mode == "unreachable") && originRequests != 0 {
+				t.Fatalf("proxy failure bypassed to origin: %d requests", originRequests)
+			}
 			if mode == "explicit" {
 				for _, path := range []string{"/api/models/owner/model/tree/main", "/api/datasets/owner/model/tree/main", "/api/models/owner/model/refs", "/owner/model/raw/main/config.json", "/owner/model/raw/main/README.md", "/api/models"} {
 					if proxyPaths[path] == 0 {
