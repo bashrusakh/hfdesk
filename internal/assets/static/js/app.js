@@ -322,7 +322,9 @@
 
     if (!res.ok) {
       const message = data.error_detail?.message || data.error || 'API error';
-      throw new Error(message);
+      const error = new Error(message);
+      error.details = data.error_detail?.details || data.details || '';
+      throw error;
     }
     return data;
   }
@@ -2517,9 +2519,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         retainedPayloads: result.retainedPayloads || []
       };
     } catch (error) {
+      const details = typeof error.details === 'string' ? error.details.trim() : '';
+      const reason = details && details !== error.message
+        ? `${error.message}: ${details}`
+        : error.message;
       outcome = {
         kind: 'error',
-        message: `Could not confirm deletion for ${context.group.label} in ${context.location.path}: ${error.message}. Refreshing current selection; no fallback deletion was attempted.`
+        message: `Could not confirm deletion for ${context.group.label} in ${context.location.path}: ${reason}. Refreshing current selection; no fallback deletion was attempted.`
       };
     }
 

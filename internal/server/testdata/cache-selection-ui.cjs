@@ -91,6 +91,13 @@ const context = {
       deletedBodies.push(call.body);
       if (pendingDelete) await pendingDelete.promise;
       if (deleteMode === 'conflict') return { ok: false, json: async () => ({ ok: false, error: 'Selected GGUF is busy', error_detail: { message: 'Selected GGUF is busy' } }) };
+      if (deleteMode.startsWith('refusal')) {
+        const payload = { ok: false, error: 'HF deletion refused', error_detail: { message: 'HF deletion refused' } };
+        if (deleteMode === 'refusal') payload.error_detail.details = 'retained friendly name depends on a selected snapshot entry <img src=x onerror=alert(1)>';
+        if (deleteMode === 'refusal-legacy') payload.details = 'Legacy API detail';
+        if (deleteMode === 'refusal-malformed') payload.error_detail.details = { reason: 'not plain text' };
+        return { ok: false, status: 409, json: async () => payload };
+      }
       if (deleteMode === 'partial') {
         call.status = 207;
         result = { ok: false, repo: call.body.repo, groupId: call.body.groupId, removed: [call.body.members[0].path], remaining: call.body.members.slice(1).map(member => member.path), errors: ['Fixture unlink failed'], linkOnlyEntries: call.body.members[0].linkOnly ? [call.body.members[0].path] : [], message: 'Fixture partial result' };
@@ -345,6 +352,39 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal(deletedBodies.length, beforeConflict + 1, 'conflict is not automatically retried');
   assert(modalHTML.includes('was not confirmed as removed') && modalHTML.includes('Selected GGUF is busy'));
   assert(modalHTML.includes('/scan/one'), 'conflict keeps the selected location in context');
+  deleteMode = 'success';
+
+  // A refusal includes the actionable backend reason, rendered as escaped text,
+  // while retaining the no-fallback and refresh behavior.
+  await openLocalDetails();
+  deleteMode = 'refusal';
+  const beforeRefusal = deletedBodies.length;
+  sequence = await startGroupConfirmation(0);
+  await confirmButton(sequence).click();
+  assert.equal(deletedBodies.length, beforeRefusal + 1, 'refusal is not automatically retried');
+  assert(modalHTML.includes('HF deletion refused'), 'the refusal title remains visible');
+  assert(!modalHTML.includes('HF deletion was partial'), 'a refusal is not presented as a partial deletion');
+  assert(modalHTML.includes('retained friendly name depends on a selected snapshot entry'));
+  assert(modalHTML.includes('&lt;img src=x onerror=alert(1)&gt;') && !modalHTML.includes('<img src=x'), 'refusal details are escaped');
+  assert(modalHTML.includes('no fallback deletion was attempted'));
+  assert(calls.some(call => call.method === 'DELETE' && call.path === '/api/cache-selection'));
+  assert(!calls.some(call => call.method === 'DELETE' && call.path !== '/api/cache-selection'));
+  deleteMode = 'success';
+
+  // Legacy top-level details remain readable; absent or malformed detail
+  // payloads fall back to the refusal title instead of exposing objects.
+  for (const [mode, expected, unexpected] of [
+    ['refusal-legacy', 'Legacy API detail', 'retained friendly name'],
+    ['refusal-malformed', 'HF deletion refused', '[object Object]'],
+    ['refusal-no-details', 'HF deletion refused', '[object Object]']
+  ]) {
+    await openLocalDetails();
+    deleteMode = mode;
+    sequence = await startGroupConfirmation(0);
+    await confirmButton(sequence).click();
+    assert(modalHTML.includes(expected), `${mode} shows its safe fallback/detail`);
+    assert(!modalHTML.includes(unexpected), `${mode} does not expose malformed or absent detail`);
+  }
   deleteMode = 'success';
 
   // If deletion removes the last group from one location, another repository
