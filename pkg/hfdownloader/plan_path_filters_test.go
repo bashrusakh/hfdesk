@@ -138,6 +138,24 @@ func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 }
 
+func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "weights/model.gguf", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "config.json", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/excluded-mixed", Revision: "main", Filters: []string{"weights/"}, Excludes: []string{".safetensors"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
+}
+
 func planPaths(plan *Plan) []string {
 	paths := make([]string, 0, len(plan.Items))
 	for _, item := range plan.Items {
