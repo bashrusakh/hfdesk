@@ -98,7 +98,8 @@ precision: `head_bits` is the declared width for head tensors and
 `mixed_precision` is set whenever the config carries precision evidence that
 contradicts uniform model-wide precision: per-expert width declarations
 (`expert_bits`, `routed_expert_bits`), tensor-group widths that differ from
-`bits` (`head_bits`, `vision_bits`, `mtp_bits`), or effective/aggregate
+`bits` or are present while model-wide `bits` is absent (`head_bits`,
+`vision_bits`, `mtp_bits`), or effective/aggregate
 precision evidence (`bits_per_weight`, `routed_expert_bits_avg`). An average is
 never treated as proof of uniformity. `bits_per_weight` is the EXL2 bits per
 weight (effective precision) and is only ever copied from the config: nominal
