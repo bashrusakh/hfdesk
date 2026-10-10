@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +155,46 @@ func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
 		t.Fatalf("PlanRepo: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
+}
+
+// TestPlanRepoRejectsNonCanonicalTreePath is the canonical-path intake
+// regression: a tree listing whose file path carries a non-canonical spelling
+// (a "." segment, an empty "//" segment, an in-root ".." segment, or a
+// trailing "/") must fail the whole plan loudly, naming the offending path and
+// its canonical form. SafeJoin cleans before joining, so two spellings of one
+// remote file would both be planned and the two transfers would race to write
+// a single cache entry (raw "Q5_K_M/../actual/model-Q4_K_M.gguf" next to the
+// cleaned "actual/model-Q4_K_M.gguf", or "weights//model.gguf" next to
+// "weights/model.gguf"). Dirty-key mirrors now fail loudly instead of being
+// silently rewritten.
+func TestPlanRepoRejectsNonCanonicalTreePath(t *testing.T) {
+	cases := []struct {
+		name string
+		node hfNode
+		want string // canonical form the error must also name
+	}{
+		{"dot segment", hfNode{Type: "file", Path: "foo/./bar.txt", Size: 10}, "foo/bar.txt"},
+		{"in-root parent segment", hfNode{Type: "file", Path: "a/../b.txt", Size: 10}, "b.txt"},
+		{"empty segment", hfNode{Type: "file", Path: "weights//model.gguf", LFS: &hfLfsInfo{Size: 10}}, "weights/model.gguf"},
+		{"quant alias traversal", hfNode{Type: "file", Path: "Q5_K_M/../actual/model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 10}}, "actual/model-Q4_K_M.gguf"},
+		{"trailing slash", hfNode{Type: "file", Path: "weights/model.gguf/", Size: 10}, "weights/model.gguf"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{c.node})
+			defer srv.Close()
+			_, err := PlanRepo(context.Background(), Job{Repo: "owner/repo", Revision: "main"}, Settings{Endpoint: srv.URL})
+			if err == nil {
+				t.Fatal("PlanRepo accepted a non-canonical tree path")
+			}
+			if !strings.Contains(err.Error(), "non-canonical") {
+				t.Errorf("error should identify the non-canonical path, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), c.node.Path) || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error should identify the offending path %q and its canonical form %q, got: %v", c.node.Path, c.want, err)
+			}
+		})
+	}
 }
 
 func planPaths(plan *Plan) []string {
