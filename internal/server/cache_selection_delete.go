@@ -637,11 +637,12 @@ type selectedDeleteRequest struct {
 // selectedDeleteHooks are per-server synchronization points for deterministic
 // endpoint tests. Production servers leave them nil.
 type selectedDeleteHooks struct {
-	beforeRootOpen func()
-	afterRootOpen  func()
-	afterFinalScan func()
-	beforeRemove   func(int)
-	removeEntry    func(*os.Root, string) error
+	beforeRootOpen    func()
+	afterRootOpen     func()
+	beforeIdentityPin func(string)
+	afterFinalScan    func()
+	beforeRemove      func(int)
+	removeEntry       func(*os.Root, string) error
 }
 
 type selectedDeleteResponse struct {
@@ -768,12 +769,13 @@ func pinSelectedEntry(root *os.Root, physicalRepo, name string, observed os.File
 		return nil, err
 	}
 	info, err := pin.Stat()
-	if err != nil || !os.SameFile(observed, info) {
+	if err != nil {
 		_ = pin.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("selected entry changed while its identity was being pinned")
+		return nil, err
+	}
+	if !os.SameFile(observed, info) || (observed.Mode()&os.ModeSymlink != 0) != linkOnly || (info.Mode()&os.ModeSymlink != 0) != linkOnly || (!linkOnly && observed.Size() != info.Size()) {
+		_ = pin.Close()
+		return nil, fmt.Errorf("selected entry changed while its identity was being captured")
 	}
 	return &selectedEntryIdentity{info: info, pin: pin}, nil
 }
@@ -784,7 +786,7 @@ func closeSelectedEntryIdentities(files []cacheSelectionFile) {
 	}
 }
 
-func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool) ([]cacheSelectionFile, string) {
+func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool, beforeIdentityPin func(string)) ([]cacheSelectionFile, string) {
 	var files []cacheSelectionFile
 	var warning string
 	excludedSet := make(map[string]bool, len(excluded))
@@ -817,6 +819,9 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 		relative := filepath.ToSlash(name)
 		var identity *selectedEntryIdentity
 		if pinPaths[relative] {
+			if beforeIdentityPin != nil {
+				beforeIdentityPin(relative)
+			}
 			identity, err = pinSelectedEntry(root, physicalRepo, relative, info, info.Mode()&os.ModeSymlink != 0)
 			if err != nil {
 				return err
@@ -1154,7 +1159,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	for _, member := range group.Members {
 		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = true
 	}
-	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths)
+	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin)
 	defer closeSelectedEntryIdentities(files)
 	if scanWarning != "" {
 		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)

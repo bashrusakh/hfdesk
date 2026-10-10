@@ -1757,6 +1757,35 @@ func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
 	}
 }
 
+func TestSelectedLocalDeleteRejectsSizeChangeDuringIdentityCapture(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeIdentityPin = func(name string) {
+		if name != first {
+			return
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, first), []byte("growth!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("size change during identity capture status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, first)); err != nil || string(data) != "growth!" {
+		t.Fatalf("changed selected entry was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("other shard changed: %v", err)
+	}
+}
+
 func TestSelectedLocalDeleteDetectsRenamedSameSizeReplacementBeforeFirstUnlink(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
