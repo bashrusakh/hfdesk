@@ -157,6 +157,231 @@ func mutationDirectoryIdentity(name string) (string, error) {
 	return mutationEntryIdentity(abs)
 }
 
+// writableAlias is a directory symlink inside a writable base whose fully
+// resolved destination stays inside that same base, so the alias participates
+// in a finite set of repository-relative spellings.
+type writableAlias struct {
+	location string // absolute path of the symlink entry itself
+	dest     string // absolute fully resolved destination directory
+	name     string // name of the entry inside its parent directory
+}
+
+// writableNamespaceInventory records the resolved identity of one writable
+// base and every directory alias it contains. ok=false (reported by the
+// constructor) marks a mapping that can no longer be proven complete: an
+// unreadable entry, a dangling or looping symlink, a resolution failure, or a
+// directory alias whose destination leaves the base all forbid a negative
+// pre-plan writer decision.
+type writableNamespaceInventory struct {
+	base    string
+	aliases []writableAlias
+}
+
+const (
+	maxWritableAliasDepth    = 64
+	maxWritableAliasSpelling = 32
+)
+
+var errWritableNamespaceUnknown = errors.New("writable namespace cannot be inventoried")
+
+// inventoryWritableNamespace resolves the writable base and enumerates every
+// directory alias below it. A base that does not exist yet is trivially
+// alias-free; every other failure is reported as an unknown mapping.
+func inventoryWritableNamespace(base string) (writableNamespaceInventory, bool) {
+	baseIdentity, err := mutationDirectoryIdentity(base)
+	if err != nil {
+		return writableNamespaceInventory{}, false
+	}
+	inv := writableNamespaceInventory{base: baseIdentity}
+	if _, err := os.Lstat(baseIdentity); err != nil {
+		if os.IsNotExist(err) {
+			return inv, true
+		}
+		return writableNamespaceInventory{}, false
+	}
+	var walk func(dir string, depth int) error
+	walk = func(dir string, depth int) error {
+		if depth > maxWritableAliasDepth {
+			return errWritableNamespaceUnknown
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				if err := walk(path, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				continue
+			}
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				// Dangling targets, loops, and permission failures make the
+				// mapping unknown; never derive a negative from them.
+				return err
+			}
+			target, err := os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+			if !target.IsDir() {
+				// Leaf entries (including friendly/snapshot file links into
+				// blobs) never reorganize directory spellings.
+				continue
+			}
+			rel, err := filepath.Rel(baseIdentity, resolved)
+			if err != nil {
+				return err
+			}
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				// An alias destination outside the writer base can redirect a
+				// repository path to an arbitrary physical target, so the
+				// mapping cannot be proven complete from inside this base.
+				return errWritableNamespaceUnknown
+			}
+			inv.aliases = append(inv.aliases, writableAlias{
+				location: path,
+				dest:     resolved,
+				name:     entry.Name(),
+			})
+		}
+		return nil
+	}
+	if err := walk(baseIdentity, 0); err != nil {
+		return writableNamespaceInventory{}, false
+	}
+	return inv, true
+}
+
+// relativeWithin returns the slash-normalized path of p relative to base when
+// p is lexically contained in base.
+func relativeWithin(base, p string) (string, bool) {
+	rel, err := filepath.Rel(base, p)
+	if err != nil || filepath.IsAbs(rel) {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if rel == "." {
+		return "", true
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// joinSlashPath joins non-empty slash-separated components.
+func joinSlashPath(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "/")
+}
+
+// selectedPathCandidates returns every repository-relative spelling through
+// which the target can be written from this writable namespace. The set starts
+// from the canonical containment (when the target's parent lies inside the
+// base) and is closed under the inventoried directory aliases, including
+// nested alias destinations and alias chains. ok=false means the spelling set
+// cannot be enumerated finitely, which also forbids a negative answer.
+func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity string) ([]string, bool) {
+	parent := filepath.Dir(targetIdentity)
+	spellings := map[string]map[string]struct{}{}
+	add := func(dir, spelling string) (bool, error) {
+		set, ok := spellings[dir]
+		if !ok {
+			set = map[string]struct{}{}
+			spellings[dir] = set
+		}
+		if _, exists := set[spelling]; exists {
+			return false, nil
+		}
+		if len(set) >= maxWritableAliasSpelling {
+			return false, errWritableNamespaceUnknown
+		}
+		set[spelling] = struct{}{}
+		return true, nil
+	}
+	seed := func(dir string) error {
+		spelling, ok := relativeWithin(inv.base, dir)
+		if !ok {
+			return nil
+		}
+		_, err := add(dir, spelling)
+		return err
+	}
+	// Canonical spellings: the target's parent when it lies inside the base
+	// (missing ordinary suffixes stay lexical), and each alias location.
+	if err := seed(parent); err != nil {
+		return nil, false
+	}
+	for _, alias := range inv.aliases {
+		if err := seed(filepath.Dir(alias.location)); err != nil {
+			return nil, false
+		}
+	}
+	// Close the spelling sets under the aliases: any spelling of an alias
+	// location can route through the alias into every reached directory, which
+	// then unlocks further aliases (nested destinations and chains included).
+	for {
+		pending := make([][2]string, 0, len(inv.aliases))
+		for _, alias := range inv.aliases {
+			prefixDir := filepath.Dir(alias.location)
+			for prefix := range spellings[prefixDir] {
+				for reached := range spellings {
+					relDest, ok := relativeWithin(alias.dest, reached)
+					if !ok {
+						continue
+					}
+					pending = append(pending, [2]string{reached, joinSlashPath(prefix, alias.name, relDest)})
+				}
+			}
+		}
+		changed := false
+		for _, candidate := range pending {
+			did, err := add(candidate[0], candidate[1])
+			if err != nil {
+				return nil, false
+			}
+			if did {
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	name := filepath.ToSlash(filepath.Base(targetIdentity))
+	snapshotNamespace := filepath.Base(filepath.Clean(inv.base)) == "snapshots"
+	candidates := make([]string, 0, len(spellings[parent])*2)
+	for spelling := range spellings[parent] {
+		candidate := joinSlashPath(spelling, name)
+		candidates = append(candidates, candidate)
+		// Snapshot paths are physically rooted at snapshots/<commit>, while
+		// the plan's RelativePath starts below that commit directory. The
+		// commit is not known until planning completes, so compare both
+		// spellings.
+		if snapshotNamespace {
+			if idx := strings.Index(candidate, "/"); idx >= 0 {
+				candidates = append(candidates, candidate[idx+1:])
+			}
+		}
+	}
+	return candidates, true
+}
+
 func jobMayWriteSelectedPath(job *Job, target string) bool {
 	base := jobDestinationBase(job)
 	if base == "" {
@@ -166,65 +391,61 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 	if targetErr != nil {
 		return true
 	}
-	if pathWithinWriterBase(base, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job)
+	bases := []string{base}
+	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && snapshotBase != base {
+		bases = append(bases, snapshotBase)
 	}
-	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job)
+	// A negative pre-plan answer requires a complete physical-to-repo mapping
+	// proof for every writable namespace of the job. Any unknown or outward
+	// mapping short-circuits to the conservative possible-writer answer.
+	inventories := make([]writableNamespaceInventory, 0, len(bases))
+	aliasesFound := false
+	for _, writableBase := range bases {
+		inv, ok := inventoryWritableNamespace(writableBase)
+		if !ok {
+			return true
+		}
+		if len(inv.aliases) > 0 {
+			aliasesFound = true
+		}
+		inventories = append(inventories, inv)
+	}
+	for _, inv := range inventories {
+		if jobMayWriteSelectedPathWithinBase(inv, targetIdentity, job) {
+			return true
+		}
+	}
+	// Exact path-shaped filters name one exact repository path. While the
+	// writable namespaces contain directory aliases, a canonical containment
+	// miss does not prove that this exact spelling resolves elsewhere, so the
+	// reservation stays conservative instead of deriving a negative from the
+	// filter shape alone.
+	if aliasesFound && hasPathFilter(job.Filters) {
+		return true
 	}
 	return false
 }
 
-func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bool {
-	baseIdentity, err := mutationDirectoryIdentity(base)
-	if err != nil {
+// jobMayWriteSelectedPathWithinBase reports whether any proven repository
+// spelling of the target inside one writable namespace survives the job's
+// filters and excludes.
+func jobMayWriteSelectedPathWithinBase(inv writableNamespaceInventory, targetIdentity string, job *Job) bool {
+	candidates, ok := inv.selectedPathCandidates(targetIdentity)
+	if !ok {
 		return true
-	}
-	rel, err := filepath.Rel(baseIdentity, targetIdentity)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return true
-	}
-	candidates := []string{filepath.ToSlash(rel)}
-	// Snapshot paths are physically rooted at snapshots/<commit>, while the
-	// plan's RelativePath starts below that commit directory. The commit is not
-	// known until planning completes, so compare both spellings.
-	if filepath.Base(filepath.Clean(base)) == "snapshots" {
-		parts := strings.Split(filepath.ToSlash(rel), "/")
-		if len(parts) > 1 {
-			candidates = append(candidates, strings.Join(parts[1:], "/"))
-		}
 	}
 	for _, candidate := range candidates {
 		if hfdownloader.GGUFPathSelected(candidate, job.Filters, job.Excludes, job.ExactMatch) {
 			return true
 		}
 	}
-	// The physical entry may be reached through a different repository-relative
-	// spelling (for example a symlinked directory or a frozen snapshot alias).
-	// A basename match is therefore enough to keep the deletion reservation
-	// conservative, while a canonical relative-path miss remains a valid
-	// negative decision for ordinary paths.
-	if hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch) {
-		return true
-	}
-	// A path-shaped filter cannot prove a negative before planning. The
-	// repository-relative spelling may be supplied by a directory alias that is
-	// not visible from this physical path (including a nested or sibling alias),
-	// so a miss in the spellings reconstructed above is not a complete proof.
-	// Keep this conservative rather than attempting a partial alias inventory.
-	if hasPathFilter(job.Filters) {
-		return true
-	}
-	// A slashless filter can also select a directory. Its complete set of
-	// spellings is not knowable without recursively inventorying aliases, so
-	// keep the reservation conservative as well. Filename/quant filters that
-	// have already proved a basename non-overlap remain allowed above.
-	if hasAmbiguousBareFilter(job.Filters) {
-		return true
-	}
 	return false
 }
 
+// hasPathFilter reports whether a filter names a path rather than a bare
+// name. It is only used to keep reservations conservative; a slashless filter
+// is never treated as proof of a negative, because bare filters also select
+// directory components.
 func hasPathFilter(filters []string) bool {
 	for _, filter := range filters {
 		if strings.ContainsAny(filepath.ToSlash(strings.TrimSpace(filter)), "/\\") {
@@ -232,32 +453,6 @@ func hasPathFilter(filters []string) bool {
 		}
 	}
 	return false
-}
-
-// hasAmbiguousBareFilter identifies filters whose spelling could denote either
-// a directory component or a filename fragment. Quant/extension-like filters
-// retain their basename proof; a plain directory name must remain conservative
-// because its complete alias spelling set is not inventoried.
-func hasAmbiguousBareFilter(filters []string) bool {
-	for _, filter := range filters {
-		filter = strings.TrimSpace(filepath.ToSlash(filter))
-		if filter == "" || strings.Contains(filter, "/") || strings.HasPrefix(filter, ".") {
-			continue
-		}
-		if !strings.ContainsAny(filter, "-_.") {
-			return true
-		}
-	}
-	return false
-}
-
-func pathWithinWriterBase(base, targetIdentity string) bool {
-	baseIdentity, err := mutationDirectoryIdentity(base)
-	if err != nil {
-		return true
-	}
-	rel, err := filepath.Rel(baseIdentity, targetIdentity)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func jobSnapshotBase(job *Job) string {

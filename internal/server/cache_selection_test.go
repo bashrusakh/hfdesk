@@ -1257,6 +1257,174 @@ func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
 	}
 }
 
+// TestSelectedDeleteBlocksPunctuatedBareDirectoryFilterThroughAlias covers the
+// strict pre-plan invariant for issue #98 bare directory filters: with
+// base/Q5_K_M aliased to base/actual, the exact filter Q5_K_M selects the
+// remote directory spelling Q5_K_M/model-Q4_K_M.gguf, so the physical target
+// base/actual/model-Q4_K_M.gguf must stay a possible writer in both
+// reservation orderings instead of proving a negative from filter punctuation.
+func TestSelectedDeleteBlocksPunctuatedBareDirectoryFilterThroughAlias(t *testing.T) {
+	storage := t.TempDir()
+	job := &Job{
+		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"Q5_K_M"}, ExactMatch: true,
+	}
+	base := jobDestinationBase(job)
+	actual := filepath.Join(base, "actual")
+	if err := os.MkdirAll(actual, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(actual, filepath.Join(base, "Q5_K_M")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	writeSelectionFile(t, actual, "model-Q4_K_M.gguf")
+	target := filepath.Join(actual, "model-Q4_K_M.gguf")
+
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("punctuated bare directory filter matched through an alias was treated as a proven non-match")
+	}
+
+	// writer -> delete: a queued matching writer vetoes the reservation.
+	writerFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	queued := *job
+	queued.ID, queued.Status = "punctuated-alias-writer", JobStatusQueued
+	writerFirst.jobs.mu.Lock()
+	writerFirst.jobs.jobs[queued.ID] = &queued
+	writerFirst.jobs.mu.Unlock()
+	if release, ok := writerFirst.jobs.reserveSelectedGGUF([]string{target}); ok {
+		release()
+		t.Fatal("selected deletion crossed a queued punctuated directory-filter writer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := writerFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	// delete -> Create/dispatch/Resume/Retry: every admission path stays
+	// blocked while the reservation is held.
+	deleteFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	release, ok := deleteFirst.jobs.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("could not reserve selected entry")
+	}
+	paused := *job
+	paused.ID, paused.Status = "punctuated-alias-paused", JobStatusPaused
+	cancelled := *job
+	cancelled.ID, cancelled.Status = "punctuated-alias-cancelled", JobStatusCancelled
+	deleteFirst.jobs.mu.Lock()
+	deleteFirst.jobs.jobs[paused.ID] = &paused
+	deleteFirst.jobs.jobs[cancelled.ID] = &cancelled
+	blocked := deleteFirst.jobs.jobBlockedByDeleteLocked(job)
+	deleteFirst.jobs.mu.Unlock()
+	if !blocked {
+		t.Fatal("queued punctuated directory-filter writer crossed selected deletion reservation")
+	}
+	if deleteFirst.jobs.ResumeJob(paused.ID) {
+		t.Fatal("paused punctuated directory-filter writer resumed through the reservation")
+	}
+	if deleteFirst.jobs.RetryJob(cancelled.ID) {
+		t.Fatal("cancelled punctuated directory-filter writer retried through the reservation")
+	}
+	if _, _, err := deleteFirst.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}, ExactMatch: true}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new punctuated directory-filter writer crossed reservation: %v", err)
+	}
+	release()
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := deleteFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+}
+
+// TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase covers the strict
+// pre-plan invariant for alias destinations outside the writer base: with
+// writerBase/weights aliased to another repository directory, the remote path
+// weights/model.gguf (selected by the filter weights/) physically lands on the
+// outside target, so neither reservation ordering may treat it as a proven
+// non-match.
+func TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase(t *testing.T) {
+	storage := t.TempDir()
+	job := &Job{
+		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"weights/"},
+	}
+	base := jobDestinationBase(job)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "other-repo")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(base, "weights")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	writeSelectionFile(t, outside, "model.gguf")
+	target := filepath.Join(outside, "model.gguf")
+
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("alias destination outside the writer base was treated as a proven non-match")
+	}
+
+	// writer -> delete
+	writerFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	queued := *job
+	queued.ID, queued.Status = "outside-alias-writer", JobStatusQueued
+	writerFirst.jobs.mu.Lock()
+	writerFirst.jobs.jobs[queued.ID] = &queued
+	writerFirst.jobs.mu.Unlock()
+	if release, ok := writerFirst.jobs.reserveSelectedGGUF([]string{target}); ok {
+		release()
+		t.Fatal("selected deletion crossed a queued writer aliased outside its base")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := writerFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	// delete -> Create/dispatch/Resume/Retry
+	deleteFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	release, ok := deleteFirst.jobs.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("could not reserve selected entry")
+	}
+	paused := *job
+	paused.ID, paused.Status = "outside-alias-paused", JobStatusPaused
+	cancelled := *job
+	cancelled.ID, cancelled.Status = "outside-alias-cancelled", JobStatusCancelled
+	deleteFirst.jobs.mu.Lock()
+	deleteFirst.jobs.jobs[paused.ID] = &paused
+	deleteFirst.jobs.jobs[cancelled.ID] = &cancelled
+	blocked := deleteFirst.jobs.jobBlockedByDeleteLocked(job)
+	deleteFirst.jobs.mu.Unlock()
+	if !blocked {
+		t.Fatal("queued outside-alias writer crossed selected deletion reservation")
+	}
+	if deleteFirst.jobs.ResumeJob(paused.ID) {
+		t.Fatal("paused outside-alias writer resumed through the reservation")
+	}
+	if deleteFirst.jobs.RetryJob(cancelled.ID) {
+		t.Fatal("cancelled outside-alias writer retried through the reservation")
+	}
+	if _, _, err := deleteFirst.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"weights/"}}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new outside-alias writer crossed reservation: %v", err)
+	}
+	release()
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := deleteFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+}
+
 func TestJobPlannedWriteEntriesTreatsEmptyPlanAsComplete(t *testing.T) {
 	entries, complete := jobPlannedWriteEntries(&Job{OutputDir: t.TempDir(), Repo: "owner/model"}, hfdownloader.Plan{})
 	if !complete || len(entries) != 0 {
