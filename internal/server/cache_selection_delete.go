@@ -175,6 +175,13 @@ type writableAlias struct {
 type writableNamespaceInventory struct {
 	base    string
 	aliases []writableAlias
+	// snapshotNamespace is the job-semantic namespace kind: it is set only
+	// when this inventory was built from the job's configured snapshot base
+	// (jobSnapshotBase) and is never derived from the resolved physical
+	// basename. A snapshot base aliased to a directory with another name must
+	// still strip the unknown commit prefix below, and a friendly base whose
+	// resolved basename happens to be "snapshots" must never do so.
+	snapshotNamespace bool
 }
 
 const (
@@ -364,22 +371,38 @@ func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity stri
 		}
 	}
 	name := filepath.ToSlash(filepath.Base(targetIdentity))
-	snapshotNamespace := filepath.Base(filepath.Clean(inv.base)) == "snapshots"
 	candidates := make([]string, 0, len(spellings[parent])*2)
 	for spelling := range spellings[parent] {
 		candidate := joinSlashPath(spelling, name)
 		candidates = append(candidates, candidate)
-		// Snapshot paths are physically rooted at snapshots/<commit>, while
-		// the plan's RelativePath starts below that commit directory. The
-		// commit is not known until planning completes, so compare both
-		// spellings.
-		if snapshotNamespace {
+		// A semantic snapshot namespace is physically rooted at
+		// snapshots/<commit>, while the plan's RelativePath starts below that
+		// commit directory. The commit is not known until planning completes,
+		// so compare both the full spelling and the suffix after the
+		// semantic snapshots/<commit> prefix. The snapshot kind comes from
+		// the job's configured snapshot base, never from a resolved physical
+		// basename: whenever the semantic base and its resolved/aliased
+		// identity diverge in a way that leaves the spelling closure
+		// incomplete (unreadable entries, dangling/looping symlinks, outward
+		// alias destinations, or spelling overflow), the inventory or the
+		// enumeration above already failed closed with the conservative
+		// possible-writer answer, so no negative is ever derived from a
+		// basename-resolved namespace type.
+		if inv.snapshotNamespace {
 			if idx := strings.Index(candidate, "/"); idx >= 0 {
 				candidates = append(candidates, candidate[idx+1:])
 			}
 		}
 	}
 	return candidates, true
+}
+
+// writableNamespaceBase pairs one writable base of the job with its
+// job-semantic namespace kind. The kind is decided by which configured job
+// base produced the path, never by inspecting a resolved physical basename.
+type writableNamespaceBase struct {
+	path     string
+	snapshot bool
 }
 
 func jobMayWriteSelectedPath(job *Job, target string) bool {
@@ -391,20 +414,21 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 	if targetErr != nil {
 		return true
 	}
-	bases := []string{base}
+	bases := []writableNamespaceBase{{path: base}}
 	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && snapshotBase != base {
-		bases = append(bases, snapshotBase)
+		bases = append(bases, writableNamespaceBase{path: snapshotBase, snapshot: true})
 	}
 	// A negative pre-plan answer requires a complete physical-to-repo mapping
 	// proof for every writable namespace of the job. Any unknown or outward
 	// mapping short-circuits to the conservative possible-writer answer.
 	inventories := make([]writableNamespaceInventory, 0, len(bases))
 	aliasesFound := false
-	for _, writableBase := range bases {
-		inv, ok := inventoryWritableNamespace(writableBase)
+	for _, writable := range bases {
+		inv, ok := inventoryWritableNamespace(writable.path)
 		if !ok {
 			return true
 		}
+		inv.snapshotNamespace = writable.snapshot
 		if len(inv.aliases) > 0 {
 			aliasesFound = true
 		}

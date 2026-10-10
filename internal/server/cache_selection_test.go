@@ -1425,6 +1425,116 @@ func TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase(t *testing.T) {
 	cancel()
 }
 
+// TestSelectedDeleteBlocksSnapshotBaseAliasWriter covers the pre-plan
+// snapshot-namespace regression: the job's snapshot base (jobSnapshotBase,
+// <repo>/snapshots) aliased to a physical directory whose basename is not
+// "snapshots" must keep its semantic snapshot kind. The unknown commit prefix
+// saved-commit/ is then still stripped below the resolved identity, so the
+// exact filter weights/model.gguf proves the overlap with the physical target
+// in both reservation orderings, matching the snapshot destination that
+// jobPlannedWriteEntries produces for commit saved-commit.
+func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
+	storage := t.TempDir()
+	cache := hfdownloader.NewHFCache(storage, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{
+		OutputDir: storage, HubDir: cache.HubDir(),
+		Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"weights/model.gguf"}, ExactMatch: true,
+	}
+	physical := filepath.Join(t.TempDir(), "physical")
+	writeSelectionFile(t, physical, "saved-commit/weights/model.gguf")
+	if err := os.MkdirAll(filepath.Dir(rd.SnapshotsDir()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Alias the job's snapshot base itself to a physical directory that does
+	// not resolve back to a "snapshots" basename.
+	symlinkOrSkip(t, physical, jobSnapshotBase(job))
+	target := filepath.Join(physical, "saved-commit", "weights", "model.gguf")
+
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("snapshot-base alias mapping was treated as a proven non-match")
+	}
+	job.Filters = []string{"Q5_K_M"}
+	if jobMayWriteSelectedPath(job, filepath.Join(physical, "saved-commit", "weights", "model-Q4_K_M.gguf")) {
+		t.Fatal("snapshot-base alias was treated as a possible writer for a proven non-overlapping quant")
+	}
+	job.Filters = []string{"weights/model.gguf"}
+
+	entries, complete := jobPlannedWriteEntries(job, hfdownloader.Plan{
+		Commit: "saved-commit",
+		Items:  []hfdownloader.PlanItem{{RelativePath: "weights/model.gguf"}},
+	})
+	if !complete {
+		t.Fatal("planned write-set was not complete")
+	}
+	overlap := false
+	for _, entry := range entries {
+		if sameMutationPath(entry, target) {
+			overlap = true
+			break
+		}
+	}
+	if !overlap {
+		t.Fatal("planned snapshot destination does not share the physical target identity")
+	}
+
+	// writer -> delete: a queued matching writer vetoes the reservation.
+	writerFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	queued := *job
+	queued.ID, queued.Status = "snapshot-base-alias-writer", JobStatusQueued
+	writerFirst.jobs.mu.Lock()
+	writerFirst.jobs.jobs[queued.ID] = &queued
+	writerFirst.jobs.mu.Unlock()
+	if release, ok := writerFirst.jobs.reserveSelectedGGUF([]string{target}); ok {
+		release()
+		t.Fatal("selected deletion crossed a queued snapshot-base alias writer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := writerFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	// delete -> Create/dispatch/Resume/Retry: every admission path stays
+	// blocked while the reservation is held.
+	deleteFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	release, ok := deleteFirst.jobs.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("could not reserve selected entry")
+	}
+	paused := *job
+	paused.ID, paused.Status = "snapshot-base-alias-paused", JobStatusPaused
+	cancelled := *job
+	cancelled.ID, cancelled.Status = "snapshot-base-alias-cancelled", JobStatusCancelled
+	deleteFirst.jobs.mu.Lock()
+	deleteFirst.jobs.jobs[paused.ID] = &paused
+	deleteFirst.jobs.jobs[cancelled.ID] = &cancelled
+	blocked := deleteFirst.jobs.jobBlockedByDeleteLocked(job)
+	deleteFirst.jobs.mu.Unlock()
+	if !blocked {
+		t.Fatal("queued snapshot-base alias writer crossed selected deletion reservation")
+	}
+	if deleteFirst.jobs.ResumeJob(paused.ID) {
+		t.Fatal("paused snapshot-base alias writer resumed through the reservation")
+	}
+	if deleteFirst.jobs.RetryJob(cancelled.ID) {
+		t.Fatal("cancelled snapshot-base alias writer retried through the reservation")
+	}
+	if _, _, err := deleteFirst.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"weights/model.gguf"}, ExactMatch: true}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new snapshot-base alias writer crossed reservation: %v", err)
+	}
+	release()
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := deleteFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+}
+
 func TestJobPlannedWriteEntriesTreatsEmptyPlanAsComplete(t *testing.T) {
 	entries, complete := jobPlannedWriteEntries(&Job{OutputDir: t.TempDir(), Repo: "owner/model"}, hfdownloader.Plan{})
 	if !complete || len(entries) != 0 {
