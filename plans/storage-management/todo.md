@@ -2,14 +2,21 @@
 
 ## Текущее состояние
 
-- [x] На исходном кандидате `45bdcd25415dc5f3d710f3d68129a22a2d6ae226` добавлена preflight-защита
-  выбранных HF targets, совпадающих с producer-shaped incomplete/download (`tmp-…`, part/multipart)
-  или atomic-copy (`<blob-key>.tmp-…`) staging. Отказ сохраняет всю подтверждённую смешанную группу;
-  несвязанные staging не блокируют удаление, а storage API не меняется. Fresh base для интеграции:
-  `origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b` обычно слит без конфликтов. После merge
-  прошли `go test ./...`, `go test ./... -race`, `go vet ./...`, build, Windows test cross-builds и
-  `git diff --check`; это implementation-local evidence. Независимые review/tester и публикация
-  принадлежат родительской сессии.
+- [x] Кодовый кандидат `353011b887ab783faff0041a5c07740aedc1f94a` (tree
+  `55dec4f3336334fb1c37c684e25f8f4f51c7c0ca`, base `origin/main`
+  `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`) добавляет producer-shaped preflight refusal для
+  неполных data/metadata targets, подтверждённого `tmp-download` namespace и производных part/
+  metadata/bare-verified temporary файлов, а также независимых `<blob-key>.tmp-…` atomic-copy stages.
+  Проверена также согласованная нормализация окон offsets/tail checks. Подтверждённая mixed-группа,
+  включая намеренно завершённые коллизии выбранных keys, отклоняется до попытки unlink; storage
+  creation не меняется, ordinary keys вне producer-shape и unrelated stages сохраняют поведение.
+  Независимый tester PASS: 232 fixture cases, 0 failures/skips, плюс live fresh HTTP causal-helper,
+  сохранность bytes/metadata/refs/modes/link identity при 409, producer collider + safe refusal,
+  ordinary 200/different refs/real permission 207/local leaf-only. Fixtures локальные и используют
+  production code, не внешний HF service или полный GUI. Fresh full Go normal/race/vet/build,
+  Node harness, read-only gofmt/diffcheck и Windows server/HF cross-build прошли на Go 1.26.7, не
+  Go 1.25. Whole-review PASS (28/28), interactions retraced; managed OCR не запускался. См. `plan.md`
+  §10 за evidence boundaries.
 - [x] После исходного HEAD `a8311c8495946cf4b965d0afc7b636e952ff31b4` добавлена узкая защита: выбранные HF snapshot targets с суффиксами `.incomplete` / `.incomplete.meta` отклоняются до unlink; тесты покрывают mixed composition, Windows-aware case semantics и HTTP 409 без изменения данных. Локальные focused helper/HTTP suites, `go test ./...`, affected-package race, vet/build и diffcheck прошли; Windows — только cross-build, не native run. Новое независимое review и финальная проверка кандидата ожидают родительскую сессию; свежий scanner result не заявляется.
 - [x] Локальное и HF-удаление выбранной GGUF-группы реализовано; UI даёт выбрать место/группу и подтверждает область удаления во всех сохранённых версиях выбранного HF-репозитория в выбранном месте. Shared payload остаётся, если нужен другой сохранённой версии/группе.
 - [x] Свежие независимые review целого diff (28/28, PASS) и проверка кандидата прошли на кодовом HEAD `59d070f7b197803cd7ab0d7fc8fea21d546f55f5` и базе `50813f00554628b4146512b898ab10f7c6662efe`; подробности и границы evidence — в `plan.md` §10. Эти результаты не относятся к последующему документационному commit.
@@ -17,7 +24,7 @@
 - [x] Исправленный кодовый кандидат прошёл независимую проверку: `go test ./...`, `go test ./... -race`, `go vet ./...`, build, Node-проверки и сценарии назначения/копирования; проверено отсутствие изменений вне ожидаемой области в сценариях до/после. Это не исчерпывающая проверка всех interleavings или форматов.
 - [x] Обычным merge включить свежий `origin/main` `50813f00554628b4146512b898ab10f7c6662efe` в ту же ветку PR #111; merge `112b809550e9da165115d6fba311712e6d1f9e57` сохраняет upstream-коммиты и исходную историю PR.
 - [x] Добавить server integration regression для реальной пагинации Hub → полного плана job → защиты выбранного snapshot до передачи; `go test ./...`, `go test ./... -race`, `go vet ./...`, build и `git diff --check` прошли на кандидате `2a56d25` поверх base `50813f00554628b4146512b898ab10f7c6662efe`.
-- [ ] Родительская сессия решает дальнейшую публикацию документационного кандидата и проверяет актуальные remote checks/CodeQL. Прежний SARIF разбирался локально, но новый CodeQL для кандидата не запускался; 7 High alerts старого remote HEAD остаются открытыми и не подавлены. Push и PR metadata остаются родительскими; PR Draft, Ready не разрешён.
+- [ ] Push документационного кандидата ещё не выполнен; дальнейшее решение о публикации и проверка актуальных remote checks принадлежат родительской сессии. Remote CI ожидает публикации; новый CodeQL не запускался, семь alerts старого remote HEAD не объявляются разрешёнными, подавленными или прошедшими. PR #111 остаётся Draft; Ready/merge исключены.
 - [x] Проверить сообщение о P1: `runJob` передаёт `AppendFilterSubdir: false` независимо от request flag. HTTP download с флагом `true` записал в фактический непрефиксированный target; DELETE этого target получил 409, DELETE гипотетического prefixed target — 200. Последний не был путём записи. Заявленный P1 для проверенного server flow не подтверждён; игнорирование флага остаётся отдельным follow-up, а не новой acceptance-функцией.
 - [ ] Нативная Windows/SMB-проверка остаётся отдельным follow-up; здесь она не выполнялась. Также не выполнялись свежий browser/mobile прогон, исчерпывающие interleaving-сценарии, проверка всех форматов и текущий CodeQL.
 

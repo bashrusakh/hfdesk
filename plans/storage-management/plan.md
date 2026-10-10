@@ -2,27 +2,34 @@
 
 ## Статус
 
-**Текущий статус (локальная ветка):** ветка `feature/storage-root-ownership` продолжает PR #111;
-исходный кандидат перед этим пакетом — `45bdcd25415dc5f3d710f3d68129a22a2d6ae226`, дерево
-`54f0038adbf7d802bbafbda708f23b44172fa823`. К нему добавлено узкое preflight-исправление:
-выбранная HF snapshot-ссылка на существующие incomplete-файлы, непустые `tmp-…` download stages
-(включая part/multipart формы) и независимые `<blob-key>.tmp-…` atomic-copy stages приводит к
-отказу до unlink; mixed members сохраняются. API/создание хранилища не меняются. Проверена также
-сосуществующая unrelated staging и Windows-aware нормализация. Точный свежий base —
-`origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b` — обычно слит в эту ветку без конфликтов;
-интегрированная кодовая версия прошла `go test ./...`, `go test ./... -race`, `go vet ./...`, build,
-Windows test cross-builds и `git diff --check`. SHA/tree кандидата приведены в handoff родительской
-сессии, а не зафиксированы здесь до финальной проверки. Это implementation-local evidence, не
-независимая проверка интегрированного кандидата, whole-PR review или свежий scanner result.
-Нативные Windows/SMB и browser/mobile не заявляются. PR остаётся Draft; публикация и Ready не разрешены.
+**Текущий статус (локальная ветка):** кодовый кандидат `353011b887ab783faff0041a5c07740aedc1f94a`
+(дерево `55dec4f3336334fb1c37c684e25f8f4f51c7c0ca`) на `feature/storage-root-ownership` содержит
+узкий producer-shaped preflight: выбранные HF snapshot targets с неполными данными/metadata,
+подтверждённым `tmp-download` namespace и производными part/metadata/bare-verified temporary файлами,
+а также независимый `<blob-key>.tmp-…` atomic-copy stage отклоняются до любых эффектов. Это покрывает
+обычные и намеренно завершённые коллизии выбранных ключей: подтверждённая mixed-группа целиком
+отклоняется до попытки unlink; создание хранилища не меняется, обычные ключи вне producer-shape и
+несвязанные стадии сохраняют прежнее поведение. Оконные offsets/tail checks нормализуются
+согласованно. Кодовый кандидат независимо проверен и whole-diff review прошёл PASS; подробности
+evidence и границы — ниже. Свежая база `origin/main` — `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`.
 
-Независимые review целого diff (28/28, PASS) и проверка кандидата (PASS), упомянутые ниже,
-относятся к их указанным историческим HEAD/base и не подтверждают этот новый кандидат. Нативные
-Windows/SMB, свежий browser/mobile прогон, исчерпывающие interleaving-сценарии и новый CodeQL не проверялись. Прежний SARIF был разобран
-локально: две Repo lexical-traversal flow получили model-gap assessment; ещё пять alerts включали
-файловые sinks с подтверждённым raw `LocalRepo` случаем и легитимными explicit roots. Исправление
-локального `LocalRepo` случая есть в исходниках, но не является новым CodeQL результатом. Семь
-High alerts старого remote HEAD остаются открытыми и не подавлены; все семь ложными не объявляются.
+Независимый tester на этом HEAD/base сообщил PASS: 232 внешних fixture cases без failures/skips,
+живой свежий HTTP causal-helper, сохранность bytes/metadata/refs/modes/link identity при 409,
+создание producer-shaped collider и safe refusal, обычный 200, разные refs, реальное permission 207
+и local leaf-only. Это контролируемые локальные fixtures на production code, не внешний HF service
+или полный GUI. Полные Go tests/race, vet/build, Node harness и Windows server/HF cross-build прошли;
+Go runner — 1.26.7, не проектный Go 1.25. Это не native Windows/SMB, свежая browser/mobile,
+scanner или remote CI проверка. Whole-review: PASS (28/28), с 8 свежими entries и 20 retained
+byte-identical; interactions retraced, managed OCR не запускался. Main PR #122 merged в
+`3643422`; свежие proxy/analyzer integration tests прошли.
+
+Опубликованный PR #111 HEAD остаётся старым `a8311c8495946cf4b965d0afc7b636e952ff31b4`; текущий
+remote CI ожидает публикации. Семь старых CodeQL alerts не объявляются разрешёнными, подавленными
+или прошедшими. Push ещё не выполнен; дальнейшее решение о публикации принадлежит родительской
+сессии. PR остаётся Draft; Ready/merge исключены. Нативные Windows/SMB и свежий browser/mobile не
+заявляются. Исходный root-proxy checkout сохранён; временный task worktree оставлен по одобрению
+пользователя. Tester-owned runtime/binaries/fixtures очищены; воспроизводимые source/logs сохранены
+в `/tmp/opencode/pr111-independent-353011b-Oc50Io`.
 
 Сообщение о P1 не подтверждено для фактического HTTP writer path: `runJob` передаёт
 `AppendFilterSubdir: false` независимо от request flag. HTTP download с флагом `true` был принят и
@@ -32,8 +39,8 @@ High alerts старого remote HEAD остаются открытыми и н
 проверенного server flow, но показывает игнорируемый request flag как отдельный follow-up; новое
 поведение флага не является частью текущего исправления.
 
-PR остаётся Draft. Документационный commit не меняет проверенные исходники; push/PR metadata
-остаются за родительской сессией, Ready не разрешён.
+Документационный commit не меняет проверенные исходники; push/PR metadata остаются за родительской
+сессией, Ready/merge исключены.
 Связанные задачи: [PR #111](https://github.com/bashrusakh/hfdesk/pull/111),
 [issue #63](https://github.com/bashrusakh/hfdesk/issues/63).
 
