@@ -167,17 +167,33 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 		return true
 	}
 	if pathWithinWriterBase(base, targetIdentity) {
-		// Canonical directory names prove physical overlap, not the raw remote path
-		// spelling used by PlanRepo's path-based excludes. The basename is invariant
-		// across parent aliases, so it is safe for a negative filter decision; a
-		// directory-only exclude may conservatively classify this as a writer.
-		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
+		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job)
 	}
 	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
-		// Until the plan completes, its resolved commit and remote paths are
-		// unknown. Keep the frozen repository snapshots subtree reserved, but use
-		// only the basename for sound negative GGUF/filter decisions.
-		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
+		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job)
+	}
+	return false
+}
+
+func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bool {
+	baseIdentity, err := mutationDirectoryIdentity(base)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(baseIdentity, targetIdentity)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true
+	}
+	if hfdownloader.GGUFPathSelected(filepath.ToSlash(rel), job.Filters, job.Excludes, job.ExactMatch) {
+		return true
+	}
+	// The physical entry may be reached through a different repository-relative
+	// spelling (for example a symlinked directory or a frozen snapshot alias).
+	// A basename match is therefore enough to keep the deletion reservation
+	// conservative, while a canonical relative-path miss remains a valid
+	// negative decision for ordinary paths.
+	if hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch) {
+		return true
 	}
 	return false
 }

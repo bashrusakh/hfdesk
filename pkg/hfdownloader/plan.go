@@ -251,7 +251,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	for _, n := range fileNodes {
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 	}
-	ggufMode := isGGUFFilterDownload(baseNames, job.Filters, job.ExactMatch)
+	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	matchedDirs := matchedFilterDirectories(fileNodes, job, ggufMode)
 
 	for _, n := range fileNodes {
@@ -557,12 +557,19 @@ func isFilterDelimiter(r rune) bool {
 // (for example, a selected directory), so mixed selections retain the normal
 // companion scope instead.
 func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
+	return isGGUFFilterDownloadWithExcludes(baseNames, filters, nil, exact)
+}
+
+func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exact bool) bool {
 	if len(filters) == 0 {
 		return false
 	}
 	matchedGGUF := false
 	matchedNonGGUF := false
 	for _, filePath := range baseNames {
+		if isExcludedPath(filePath, excludes) {
+			continue
+		}
 		for _, f := range filters {
 			if !filterMatchesPath(filePath, f, exact) {
 				continue

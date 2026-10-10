@@ -1093,6 +1093,67 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 	}
 }
 
+func TestSelectedDeleteReservationsUseRepoRelativeFilterPaths(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		filter string
+		target string
+	}{
+		{"friendly directory filter", "weights/", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf")},
+		{"friendly relative path filter", "weights/model.gguf", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf")},
+		{"snapshot directory filter", "weights/", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf")},
+		{"snapshot relative path filter", "weights/model.gguf", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &Job{OutputDir: cacheDir, HubDir: cache.HubDir(), Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{tc.filter}}
+			if !jobMayWriteSelectedPath(job, tc.target) {
+				t.Fatalf("writer was not recognized for filter %q and target %q", tc.filter, tc.target)
+			}
+
+			writerFirst := newTestServerWithConfig(t, Config{CacheDir: cacheDir})
+			queued := *job
+			queued.ID, queued.Status = "relative-filter-writer", JobStatusQueued
+			writerFirst.jobs.mu.Lock()
+			writerFirst.jobs.jobs[queued.ID] = &queued
+			writerFirst.jobs.mu.Unlock()
+			if release, ok := writerFirst.jobs.reserveSelectedGGUF([]string{tc.target}); ok {
+				release()
+				t.Fatal("selected deletion crossed a queued relative-path writer")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := writerFirst.jobs.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+
+			deleteFirst := newTestServerWithConfig(t, Config{CacheDir: cacheDir})
+			release, ok := deleteFirst.jobs.reserveSelectedGGUF([]string{tc.target})
+			if !ok {
+				t.Fatal("could not reserve selected entry")
+			}
+			deleteFirst.jobs.mu.Lock()
+			blocked := deleteFirst.jobs.jobBlockedByDeleteLocked(job)
+			deleteFirst.jobs.mu.Unlock()
+			release()
+			if !blocked {
+				t.Fatal("queued relative-path writer crossed selected deletion reservation")
+			}
+			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			if err := deleteFirst.jobs.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+		})
+	}
+}
+
 func TestJobPlannedWriteEntriesTreatsEmptyPlanAsComplete(t *testing.T) {
 	entries, complete := jobPlannedWriteEntries(&Job{OutputDir: t.TempDir(), Repo: "owner/model"}, hfdownloader.Plan{})
 	if !complete || len(entries) != 0 {
