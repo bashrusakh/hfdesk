@@ -4,10 +4,12 @@
 package smartdl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -124,8 +126,7 @@ func (a *Analyzer) AnalyzeWithRevision(ctx context.Context, repo string, isDatas
 
 	// Fetch and parse metadata files based on detected type
 	if err := a.fetchMetadata(ctx, repo, isDataset, info); err != nil {
-		// Non-fatal: continue with partial info
-		_ = err
+		return nil, err
 	}
 
 	// Run type-specific analysis
@@ -456,36 +457,17 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 	}
 
 	// 4. GPTQ/AWQ - quantize_config.json
-	if hasFile["quantize_config.json"] {
+	if hasRootFile(files, "quantize_config.json") && hasRootWeights(files) {
 		// Will refine to GPTQ vs AWQ when we parse the config
 		return TypeGPTQ
 	}
 
-	// 5. ONNX - presence of .onnx files
-	for _, ext := range extensions {
-		if ext == ".onnx" {
-			return TypeONNX
-		}
+	// 5. Transformers - root config.json + root safetensors/bin
+	if hasRootFile(files, "config.json") && hasRootWeights(files) {
+		return TypeTransformers
 	}
 
-	// 6. Transformers - config.json + safetensors/bin
-	if hasFile["config.json"] {
-		hasSafetensors := false
-		hasBin := false
-		for _, ext := range extensions {
-			if ext == ".safetensors" {
-				hasSafetensors = true
-			}
-			if ext == ".bin" {
-				hasBin = true
-			}
-		}
-		if hasSafetensors || hasBin {
-			return TypeTransformers
-		}
-	}
-
-	// 7. ONNX - presence of .onnx files (if not already detected as other type)
+	// 6. ONNX - presence of .onnx files (if not already detected as other type)
 	for _, ext := range extensions {
 		if ext == ".onnx" {
 			return TypeONNX
@@ -493,6 +475,30 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 	}
 
 	return TypeGeneric
+}
+
+// hasRootFile matches a root filename against the exact repository path.
+func hasRootFile(files []FileInfo, name string) bool {
+	for _, f := range files {
+		if f.Path == name {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRootWeights excludes nested exports and tokenizer data from root model detection.
+func hasRootWeights(files []FileInfo) bool {
+	for _, f := range files {
+		if strings.Contains(f.Path, "/") {
+			continue
+		}
+		name := strings.ToLower(f.Path)
+		if strings.HasSuffix(name, ".safetensors") || (strings.HasSuffix(name, ".bin") && !strings.Contains(name, "tokenizer")) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchMetadata fetches and parses relevant config files.
@@ -517,6 +523,9 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 		filesToFetch = []string{"config.json", "preprocessor_config.json", "processor_config.json"}
 	}
 
+	if !isDataset {
+		filesToFetch = append(filesToFetch, "quantization_config.json")
+	}
 	for _, path := range filesToFetch {
 		// Check if file exists
 		found := false
@@ -532,6 +541,18 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 
 		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path)
 		if err != nil {
+			if errors.Is(err, errMetadataTooLarge) && path == "quantization_config.json" {
+				data, headErr := decodeQuantizationHead(content)
+				if headErr == nil {
+					info.Metadata[path] = data
+					continue
+				}
+				return fmt.Errorf("metadata %s: %w: %v", path, err, headErr)
+			}
+			var readErr *metadataReadError
+			if errors.Is(err, errMetadataTooLarge) || errors.As(err, &readErr) {
+				return fmt.Errorf("metadata %s: %w", path, err)
+			}
 			continue // Non-fatal
 		}
 
@@ -566,11 +587,77 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 		return nil, fmt.Errorf("fetch %s: %s", path, resp.Status)
 	}
 
-	// Limit to 10MB for config files
-	const maxSize = 10 * 1024 * 1024
-	buf := make([]byte, maxSize)
-	n, _ := resp.Body.Read(buf)
-	return buf[:n], nil
+	content, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataSize+1))
+	if err != nil {
+		return nil, &metadataReadError{err}
+	}
+	if len(content) > maxMetadataSize {
+		return content[:maxMetadataSize], errMetadataTooLarge
+	}
+	return content, nil
+}
+
+const maxMetadataSize = 10 * 1024 * 1024
+
+var errMetadataTooLarge = errors.New("exceeds 10 MiB metadata limit")
+
+type metadataReadError struct{ error }
+
+func (e *metadataReadError) Unwrap() error { return e.error }
+
+// decodeQuantizationHead keeps only completed top-level fields. An incomplete
+// large trailing value is expected at the cap; malformed JSON is not recovery.
+func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
+	d := json.NewDecoder(bytes.NewReader(content))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("quantization head is not an object")
+	}
+	head := make(map[string]interface{})
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return nil, err
+		}
+		var value interface{}
+		if err := d.Decode(&value); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return nil, err
+		}
+		// A number at the cutoff may still be a prefix (4 of 4.5).
+		// Only a visible member delimiter proves the value is complete.
+		tail := bytes.TrimLeft(content[d.InputOffset():], " \t\r\n")
+		if len(tail) == 0 {
+			break
+		}
+		if tail[0] != ',' && tail[0] != '}' {
+			return nil, errors.New("invalid quantization field delimiter")
+		}
+		switch key {
+		case "quant_method":
+			if method, ok := value.(string); ok && method != "" {
+				head["quant_method"] = method
+			}
+		case "bits", "head_bits":
+			if _, ok := value.(float64); ok {
+				head[key.(string)] = value
+			}
+		}
+	}
+	if token, err := d.Token(); err == nil && token == json.Delim('}') {
+		if len(bytes.TrimSpace(content[d.InputOffset():])) != 0 {
+			return nil, errors.New("invalid trailing quantization data")
+		}
+	}
+	if len(head) == 0 {
+		return nil, errors.New("no completed quantization fields in bounded head")
+	}
+	return head, nil
 }
 
 // analyzeTypeSpecific runs type-specific analysis.
@@ -594,6 +681,9 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 	case TypeONNX:
 		info.ONNX = analyzeONNX(info.Files)
 	case TypeTransformers:
+		if _, ok := info.Metadata["quantization_config.json"]; ok {
+			info.Quantized = analyzeQuantized(info.Metadata)
+		}
 		// For transformers, first try to detect specialized types from metadata
 		specializedType := detectSpecializedType(info.Files, info.Metadata)
 		if specializedType != "" {
