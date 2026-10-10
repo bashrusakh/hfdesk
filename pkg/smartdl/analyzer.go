@@ -429,11 +429,9 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 
 	// Build file index for quick lookups
 	hasFile := make(map[string]bool)
-	rootFile := make(map[string]bool)
 	var extensions []string
 	for _, f := range files {
 		hasFile[f.Path] = true
-		rootFile[f.Path] = true
 		hasFile[f.Name] = true
 		ext := strings.ToLower(filepath.Ext(f.Name))
 		extensions = append(extensions, ext)
@@ -459,13 +457,13 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 	}
 
 	// 4. GPTQ/AWQ - quantize_config.json
-	if rootFile["quantize_config.json"] && hasRootWeights(files) {
+	if hasRootFile(files, "quantize_config.json") && hasRootWeights(files) {
 		// Will refine to GPTQ vs AWQ when we parse the config
 		return TypeGPTQ
 	}
 
 	// 5. Transformers - root config.json + root safetensors/bin
-	if rootFile["config.json"] && hasRootWeights(files) {
+	if hasRootFile(files, "config.json") && hasRootWeights(files) {
 		return TypeTransformers
 	}
 
@@ -477,6 +475,16 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 	}
 
 	return TypeGeneric
+}
+
+// hasRootFile matches a root filename against the exact repository path.
+func hasRootFile(files []FileInfo, name string) bool {
+	for _, f := range files {
+		if f.Path == name {
+			return true
+		}
+	}
+	return false
 }
 
 // hasRootWeights excludes nested exports and tokenizer data from root model detection.
