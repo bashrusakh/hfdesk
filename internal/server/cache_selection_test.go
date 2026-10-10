@@ -63,6 +63,28 @@ func writeSelectionFile(t *testing.T, dir, name string) {
 	}
 }
 
+func requireReplacementFixtureOperation(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skipf("Windows prevented replacing an entry while its identity handle was held: %v", err)
+	}
+	t.Fatal(err)
+}
+
+func registerJobManagerCleanup(t *testing.T, s *Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("close test job manager: %v", err)
+		}
+	})
+}
+
 func symlinkOrSkip(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {
@@ -1695,7 +1717,12 @@ func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
 	writeSelectionFile(t, repoDir, first)
 	writeSelectionFile(t, repoDir, second)
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
 	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	originalInfo, err := os.Lstat(filepath.Join(repoDir, first))
+	if err != nil {
+		t.Fatal(err)
+	}
 	// A same-size replacement after complete preflight must be detected before
 	// the first unlink, leaving the replacement untouched and returning 409.
 	s.selectedDeleteHooks.beforeRemove = func(i int) {
@@ -1703,11 +1730,14 @@ func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
 			return
 		}
 		path := filepath.Join(repoDir, first)
-		if err := os.Remove(path); err != nil {
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.WriteFile(path, []byte("new!"), 0644))
+		replacementInfo, err := os.Lstat(path)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte("new!"), 0644); err != nil {
-			t.Fatal(err)
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("replacement reused the selected inode despite the retained identity pin")
 		}
 	}
 	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
@@ -1727,6 +1757,44 @@ func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
 	}
 }
 
+func TestSelectedLocalDeleteDetectsRenamedSameSizeReplacementBeforeFirstUnlink(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		path := filepath.Join(repoDir, first)
+		replacement := path + ".replacement"
+		if err := os.WriteFile(replacement, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.Rename(replacement, path))
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("renamed same-size replacement status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, first)); err != nil || string(data) != "new!" {
+		t.Fatalf("renamed replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("unrelated shard changed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSelectedLocalDeleteReportsPartialAfterLaterMemberReplacement(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
@@ -1734,17 +1802,25 @@ func TestSelectedLocalDeleteReportsPartialAfterLaterMemberReplacement(t *testing
 	writeSelectionFile(t, repoDir, first)
 	writeSelectionFile(t, repoDir, second)
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
 	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	originalInfo, err := os.Lstat(filepath.Join(repoDir, second))
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.selectedDeleteHooks.beforeRemove = func(i int) {
 		if i != 1 {
 			return
 		}
 		path := filepath.Join(repoDir, second)
-		if err := os.Remove(path); err != nil {
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.WriteFile(path, []byte("new!"), 0644))
+		replacementInfo, err := os.Lstat(path)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte("new!"), 0644); err != nil {
-			t.Fatal(err)
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("later replacement reused the selected inode despite the retained identity pin")
 		}
 	}
 	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
@@ -1763,6 +1839,48 @@ func TestSelectedLocalDeleteReportsPartialAfterLaterMemberReplacement(t *testing
 	}
 	if data, err := os.ReadFile(filepath.Join(repoDir, second)); err != nil || string(data) != "new!" {
 		t.Fatalf("replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteReportsPartialAfterLaterRenameReplacement(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 1 {
+			return
+		}
+		path := filepath.Join(repoDir, second)
+		replacement := path + ".replacement"
+		if err := os.WriteFile(replacement, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.Rename(replacement, path))
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("later rename replacement status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != first || len(result.Remaining) != 1 || result.Remaining[0] != second {
+		t.Fatalf("partial response does not match actual effects: %+v", result)
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, second)); err != nil || string(data) != "new!" {
+		t.Fatalf("renamed replacement was removed or altered: data=%q err=%v", data, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2459,6 +2577,62 @@ func TestSelectedDeleteUnlinksOnlyConfirmedFriendlyLeaf(t *testing.T) {
 	}
 	if _, err := os.Stat(payload); err != nil {
 		t.Fatalf("link target was changed: %v", err)
+	}
+}
+
+func TestSelectedDeleteDetectsReplacedLinkEntryAndPreservesBothTargets(t *testing.T) {
+	root, payloadDir := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	firstTarget := filepath.Join(payloadDir, "first.gguf")
+	secondTarget := filepath.Join(payloadDir, "second.gguf")
+	if err := os.WriteFile(firstTarget, []byte("payload!"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondTarget, []byte("payload!"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repoDir, "model-Q4_K_M.gguf")
+	symlinkOrSkip(t, firstTarget, link)
+	originalLinkInfo, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, filepath.Base(link))
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		requireReplacementFixtureOperation(t, os.Remove(link))
+		requireReplacementFixtureOperation(t, os.Symlink(secondTarget, link))
+		replacementInfo, err := os.Lstat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalLinkInfo, replacementInfo) {
+			t.Fatal("replacement symlink reused the pinned link identity")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("replaced link status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if target, err := os.Readlink(link); err != nil || target != secondTarget {
+		t.Fatalf("replacement link changed: target=%q err=%v", target, err)
+	}
+	for _, target := range []string{firstTarget, secondTarget} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("link deletion changed target %s: %v", target, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

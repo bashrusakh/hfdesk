@@ -19,12 +19,12 @@ import (
 )
 
 type cacheSelectionMember struct {
-	Path     string      `json:"path"`
-	Versions []string    `json:"versions,omitempty"`
-	Size     int64       `json:"size"`
-	LinkOnly bool        `json:"linkOnly,omitempty"`
-	Message  string      `json:"message,omitempty"`
-	identity os.FileInfo `json:"-"`
+	Path     string                 `json:"path"`
+	Versions []string               `json:"versions,omitempty"`
+	Size     int64                  `json:"size"`
+	LinkOnly bool                   `json:"linkOnly,omitempty"`
+	Message  string                 `json:"message,omitempty"`
+	identity *selectedEntryIdentity `json:"-"`
 }
 
 type cacheSelectionGroup struct {
@@ -51,7 +51,21 @@ type cacheSelectionFile struct {
 	path, version string
 	size          int64
 	linkOnly      bool
-	identity      os.FileInfo
+	identity      *selectedEntryIdentity
+}
+
+type selectedEntryIdentity struct {
+	info os.FileInfo
+	// pin keeps the captured filesystem object alive through preflight and unlink,
+	// preventing its file ID/inode from being recycled for a replacement entry.
+	pin *os.File
+}
+
+func (i *selectedEntryIdentity) close() {
+	if i != nil && i.pin != nil {
+		_ = i.pin.Close()
+		i.pin = nil
+	}
 }
 
 var cacheShardSuffix = regexp.MustCompile(`(?i)([-_])(\d+)([-_]of[-_])(\d+)(\.gguf)$`)

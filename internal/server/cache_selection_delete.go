@@ -756,7 +756,35 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 // localSelectionFilesRoot is the delete path's authoritative enumeration. It
 // deliberately does not follow directory symlinks and never leaves the opened
 // repository root. The normal cache-selection scanner remains unchanged.
-func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string) ([]cacheSelectionFile, string) {
+func pinSelectedEntry(root *os.Root, physicalRepo, name string, observed os.FileInfo, linkOnly bool) (*selectedEntryIdentity, error) {
+	var pin *os.File
+	var err error
+	if linkOnly {
+		pin, err = openSelectedLinkEntry(physicalRepo, name)
+	} else {
+		pin, err = openSelectedRegularEntry(root, physicalRepo, name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	info, err := pin.Stat()
+	if err != nil || !os.SameFile(observed, info) {
+		_ = pin.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("selected entry changed while its identity was being pinned")
+	}
+	return &selectedEntryIdentity{info: info, pin: pin}, nil
+}
+
+func closeSelectedEntryIdentities(files []cacheSelectionFile) {
+	for i := range files {
+		files[i].identity.close()
+	}
+}
+
+func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool) ([]cacheSelectionFile, string) {
 	var files []cacheSelectionFile
 	var warning string
 	excludedSet := make(map[string]bool, len(excluded))
@@ -786,6 +814,14 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 		if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 			return nil
 		}
+		relative := filepath.ToSlash(name)
+		var identity *selectedEntryIdentity
+		if pinPaths[relative] {
+			identity, err = pinSelectedEntry(root, physicalRepo, relative, info, info.Mode()&os.ModeSymlink != 0)
+			if err != nil {
+				return err
+			}
+		}
 		size, linkOnly := info.Size(), info.Mode()&os.ModeSymlink != 0
 		if linkOnly {
 			// Root.Stat handles ordinary in-root links. For a relative link whose
@@ -797,6 +833,7 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 				parent := filepath.Join(physicalRepo, filepath.Dir(filepath.FromSlash(name)))
 				target, linkErr := root.Readlink(name)
 				if linkErr != nil {
+					identity.close()
 					warning = "A GGUF link could not be resolved; unavailable links are omitted"
 					return nil
 				}
@@ -807,12 +844,13 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 				}
 			}
 			if statErr != nil || !actual.Mode().IsRegular() {
+				identity.close()
 				warning = "A GGUF link could not be resolved; unavailable links are omitted"
 				return nil
 			}
 			size = actual.Size()
 		}
-		files = append(files, cacheSelectionFile{path: filepath.ToSlash(name), size: size, linkOnly: linkOnly, identity: info})
+		files = append(files, cacheSelectionFile{path: relative, size: size, linkOnly: linkOnly, identity: identity})
 		return nil
 	})
 	if err != nil {
@@ -1112,7 +1150,12 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
 		return
 	}
-	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded)
+	pinPaths := make(map[string]bool, len(group.Members))
+	for _, member := range group.Members {
+		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = true
+	}
+	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths)
+	defer closeSelectedEntryIdentities(files)
 	if scanWarning != "" {
 		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)
 		return
@@ -1144,7 +1187,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			}
 		}
 		info, statErr := root.Lstat(rel)
-		if statErr != nil || member.identity == nil || !os.SameFile(member.identity, info) || info.Size() != member.identity.Size() || info.IsDir() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
+		if statErr != nil || member.identity == nil || !os.SameFile(member.identity.info, info) || info.Size() != member.identity.info.Size() || info.IsDir() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
 			writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed during preflight")
 			return
 		}
@@ -1157,7 +1200,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			s.selectedDeleteHooks.beforeRemove(i)
 		}
 		info, statErr := root.Lstat(rels[i])
-		if statErr != nil || member.identity == nil || !os.SameFile(member.identity, info) || info.Size() != member.identity.Size() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
+		if statErr != nil || member.identity == nil || !os.SameFile(member.identity.info, info) || info.Size() != member.identity.info.Size() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
 			if len(result.Removed) == 0 {
 				writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed immediately before deletion")
 				return
