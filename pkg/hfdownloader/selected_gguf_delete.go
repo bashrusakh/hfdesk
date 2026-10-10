@@ -124,7 +124,34 @@ func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 		return true
 	}
 	sha := trimSuffix(base, ".incomplete")
-	return sha != base && pathEqual(name, r.IncompletePath(sha))
+	if sha != base && pathEqual(name, r.IncompletePath(sha)) {
+		return true
+	}
+	// The downloader's verification/transfer destination is blobs/tmp-<sha-or-
+	// path>, with single-part and multipart artifacts appended to that name.
+	// Separately, StoreDownloadedFile's atomic-copy fallback stages beside the
+	// final blob as <key>.tmp-<CreateTemp random string>. Keep both producer
+	// namespaces anchored; ordinary completed names with unrelated suffixes
+	// remain eligible.
+	stagingPrefix := "tmp-"
+	startsWithStagingPrefix := strings.HasPrefix(base, stagingPrefix)
+	if runtime.GOOS == "windows" {
+		startsWithStagingPrefix = len(base) >= len(stagingPrefix) && strings.EqualFold(base[:len(stagingPrefix)], stagingPrefix)
+	}
+	if startsWithStagingPrefix && len(base) > len(stagingPrefix) {
+		return true
+	}
+	return isAtomicCopyStagingName(base, runtime.GOOS == "windows")
+}
+
+func isAtomicCopyStagingName(base string, windows bool) bool {
+	marker := ".tmp-"
+	normalized := base
+	if windows {
+		normalized = strings.ToLower(base)
+	}
+	idx := strings.LastIndex(normalized, marker)
+	return idx > 0 && idx+len(marker) < len(normalized)
 }
 
 // DeleteSelectedGGUF removes only confirmed names from all named snapshots,

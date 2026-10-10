@@ -312,7 +312,13 @@ friendly link in that repository references it; shared payloads are retained
 and listed in `retainedPayloads`. Ordinary
 friendly files, other groups, versions, locations, metadata, partial files,
 and directories remain. Stale/unsafe selections and conflicting writers return
-`409`; the server does not cancel jobs. HF mutation excludes writers to the
+`409`; this also applies when a selected snapshot link targets a downloader
+staging name (`tmp-…`, including part/multipart metadata forms, or
+`<blob-key>.tmp-…` atomic-copy stages). The refusal precedes unlinking, leaving
+all confirmed members intact. Unrelated staging files do not by themselves
+prevent deleting a completed selection; ordinary opaque keys and `.part` /
+`.parts.json` names outside these producer-shaped namespaces remain eligible.
+The server does not cancel jobs. HF mutation excludes writers to the
 selected repository reference namespace and associated friendly view. Local
 queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
 unlink results use `207` and identify removed, remaining, and failed paths

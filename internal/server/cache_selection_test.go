@@ -1481,6 +1481,21 @@ func TestSelectedHFDeletePreservesSharedPayloadAndOtherQuant(t *testing.T) {
 	store("version-b", "model-Q4_K_M.gguf", "shared payload")
 	q5 := store("version-b", "model-Q5_K_M.gguf", "shared payload")
 	unique := store("version-b", "model-Q3_K.gguf", "unshared payload")
+	unrelatedDownloadStage := rd.BlobPath("tmp-" + strings.Repeat("9", 64))
+	if err := os.WriteFile(unrelatedDownloadStage, []byte("unrelated download staging"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedCopyStage, err := os.CreateTemp(rd.BlobsDir(), strings.Repeat("8", 64)+".tmp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedCopyStagePath := unrelatedCopyStage.Name()
+	if _, err := unrelatedCopyStage.Write([]byte("unrelated copy staging")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unrelatedCopyStage.Close(); err != nil {
+		t.Fatal(err)
+	}
 	readme := filepath.Join(rd.FriendlyPath(), "README.md")
 	if err := os.MkdirAll(filepath.Dir(readme), 0755); err != nil {
 		t.Fatal(err)
@@ -1523,6 +1538,11 @@ func TestSelectedHFDeletePreservesSharedPayloadAndOtherQuant(t *testing.T) {
 	}
 	if _, err := os.Stat(q5.FriendlyPath); err != nil {
 		t.Fatalf("other quant friendly link changed: %v", err)
+	}
+	for _, name := range []string{unrelatedDownloadStage, unrelatedCopyStagePath} {
+		if _, err := os.Lstat(name); err != nil {
+			t.Fatalf("unrelated producer staging was removed by completed-group deletion: %v", err)
+		}
 	}
 	if _, err := os.Lstat(q4a.SnapshotPath); !os.IsNotExist(err) {
 		t.Fatalf("selected Q4 snapshot remains: %v", err)
@@ -1733,6 +1753,113 @@ func TestSelectedHFDeleteRefusesIncompleteBlobTargetWithConflict(t *testing.T) {
 				if err != nil || string(got) != string(check.want) {
 					t.Fatalf("refused request changed contents of %s: got=%q err=%v", check.name, got, err)
 				}
+			}
+		})
+	}
+}
+
+func TestSelectedHFDeleteRefusesProducerStagingWithFreshConfirmation(t *testing.T) {
+	for _, stagingKind := range []string{"download-target", "publication-copy"} {
+		t.Run(stagingKind, func(t *testing.T) {
+			s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+			rd, err := s.snapshotConfig().cache().Repo("owner/model", hfdownloader.RepoTypeModel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rd.EnsureDirs(); err != nil {
+				t.Fatal(err)
+			}
+			members := []string{"model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"}
+			stored := make([]*hfdownloader.StoreFileResult, 0, len(members))
+			for i, member := range members {
+				temp := filepath.Join(t.TempDir(), "download")
+				payload := fmt.Sprintf("completed shard %d", i+1)
+				if err := os.WriteFile(temp, []byte(payload), 0644); err != nil {
+					t.Fatal(err)
+				}
+				entry, err := rd.StoreDownloadedFile(temp, member, "version-a", strings.Repeat(fmt.Sprintf("%x", i+1), 64), "", false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stored = append(stored, entry)
+			}
+			if err := rd.WriteRef("main", "version-a"); err != nil {
+				t.Fatal(err)
+			}
+			stagingBytes := []byte("still being produced")
+			stagingName := "tmp-" + strings.Repeat("d", 64)
+			if stagingKind == "publication-copy" {
+				staged, err := os.CreateTemp(rd.BlobsDir(), strings.Repeat("e", 64)+".tmp-*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				stagingName = filepath.Base(staged.Name())
+				if _, err := staged.Write(stagingBytes); err != nil {
+					t.Fatal(err)
+				}
+				if err := staged.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(rd.BlobPath(stagingName), stagingBytes, 0644); err != nil {
+				t.Fatal(err)
+			}
+			stageIndex := 0
+			if stagingKind == "publication-copy" {
+				stageIndex = 1
+			}
+			stageSnapshot := stored[stageIndex].SnapshotPath
+			if err := os.Remove(stageSnapshot); err != nil {
+				t.Fatal(err)
+			}
+			stageLink := filepath.Join("..", "..", "blobs", stagingName)
+			if err := os.Symlink(stageLink, stageSnapshot); err != nil {
+				t.Fatal(err)
+			}
+			friendlyLinks := make([]string, len(stored))
+			snapshotLinks := make([]string, len(stored))
+			for i, entry := range stored {
+				friendlyLinks[i], err = os.Readlink(entry.FriendlyPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshotLinks[i], err = os.Readlink(entry.SnapshotPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Confirmation is generated only after the mixed completed/staging
+			// composition exists, so a stale-size conflict cannot satisfy this case.
+			body := selectedHFGroupRequest(t, s, members[0])
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "HF deletion refused") || !strings.Contains(w.Body.String(), "selected snapshot link targets an incomplete blob") || strings.Contains(w.Body.String(), "Selection is stale") {
+				t.Fatalf("freshly confirmed producer staging composition was not specifically refused: status=%d body=%s", w.Code, w.Body.String())
+			}
+			for i, entry := range stored {
+				if _, err := os.Lstat(entry.SnapshotPath); err != nil {
+					t.Fatalf("snapshot %s changed: %v", entry.SnapshotPath, err)
+				}
+				if _, err := os.Lstat(entry.FriendlyPath); err != nil {
+					t.Fatalf("friendly link %s changed: %v", entry.FriendlyPath, err)
+				}
+				want := fmt.Sprintf("completed shard %d", i+1)
+				target, err := os.Readlink(entry.SnapshotPath)
+				if err != nil || target != snapshotLinks[i] {
+					t.Fatalf("snapshot link changed: target=%q want=%q err=%v", target, snapshotLinks[i], err)
+				}
+				if data, err := os.ReadFile(entry.BlobPath); err != nil || string(data) != want {
+					t.Fatalf("blob %s changed: data=%q err=%v", entry.BlobPath, data, err)
+				}
+				friendlyTarget, err := os.Readlink(entry.FriendlyPath)
+				if err != nil || friendlyTarget != friendlyLinks[i] {
+					t.Fatalf("friendly link text changed after refusal: got=%q want=%q err=%v", friendlyTarget, friendlyLinks[i], err)
+				}
+			}
+			if data, err := os.ReadFile(rd.BlobPath(stagingName)); err != nil || string(data) != string(stagingBytes) {
+				t.Fatalf("staging target changed: data=%q err=%v", data, err)
+			}
+			if ref, err := rd.ReadRef("main"); err != nil || ref != "version-a" {
+				t.Fatalf("ref changed after refused deletion: ref=%q err=%v", ref, err)
 			}
 		})
 	}

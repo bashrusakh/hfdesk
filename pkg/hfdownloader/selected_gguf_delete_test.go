@@ -297,6 +297,104 @@ func TestDeleteSelectedGGUFRefusesIncompleteBlobTargetsBeforeAnyUnlink(t *testin
 	}
 }
 
+func TestDeleteSelectedGGUFRefusesProducerShapedBlobTargetsBeforeAnyUnlink(t *testing.T) {
+	for _, blobName := range []string{
+		"tmp-" + strings.Repeat("a", 64),
+		"tmp-model_config.json",
+		"tmp-" + strings.Repeat("b", 64) + ".part",
+		"tmp-" + strings.Repeat("b", 64) + ".part-00",
+		"tmp-" + strings.Repeat("b", 64) + ".part-12",
+		"tmp-" + strings.Repeat("b", 64) + ".parts.json",
+		"tmp-" + strings.Repeat("b", 64) + ".parts.json.tmp",
+		"tmp-" + strings.Repeat("b", 64) + ".tmp-random-string",
+	} {
+		t.Run(blobName, func(t *testing.T) {
+			repo, _, snapshot, friendly := selectedDeleteFixture(t)
+			staging := repo.BlobPath(blobName)
+			if err := os.WriteFile(staging, []byte("producer state"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("..", "..", "blobs", blobName), snapshot); err != nil {
+				t.Fatal(err)
+			}
+			result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+			if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
+				t.Fatalf("producer target was not refused before effects: %+v", result)
+			}
+			for _, name := range []string{snapshot, friendly, staging, repo.BlobPath("blob-a")} {
+				if _, err := os.Lstat(name); err != nil {
+					t.Fatalf("preflight refusal changed %q: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
+	for _, key := range []string{strings.Repeat("c", 64), "opaque-key"} {
+		t.Run(key, func(t *testing.T) {
+			repo, _, snapshot, friendly := selectedDeleteFixture(t)
+			staged, err := os.CreateTemp(repo.BlobsDir(), key+".tmp-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			staging := staged.Name()
+			if _, err := staged.Write([]byte("copy-in-progress")); err != nil {
+				t.Fatal(err)
+			}
+			if err := staged.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("..", "..", "blobs", filepath.Base(staging)), snapshot); err != nil {
+				t.Fatal(err)
+			}
+			result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+			if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
+				t.Fatalf("CreateTemp publication target was not refused before effects: %+v", result)
+			}
+			for _, name := range []string{snapshot, friendly, staging} {
+				if _, err := os.Lstat(name); err != nil {
+					t.Fatalf("preflight refusal changed %q: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing.T) {
+	repo, err := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "tmp-" + strings.Repeat("f", 64)
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte("published collision"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", key, "", false)
+	if err != nil {
+		t.Fatalf("reserved collision must remain creatable through the public storage API: %v", err)
+	}
+	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+	if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
+		t.Fatalf("reserved collision was not refused at preflight: %+v", result)
+	}
+	for _, name := range []string{stored.SnapshotPath, stored.FriendlyPath, stored.BlobPath} {
+		if _, err := os.Lstat(name); err != nil {
+			t.Fatalf("collision refusal changed %s: %v", name, err)
+		}
+	}
+}
+
 func TestIncompleteBlobPathClassifierFollowsPlatformCaseSemantics(t *testing.T) {
 	repo, _, _, _ := selectedDeleteFixture(t)
 	path := repo.IncompletePath("staging")
@@ -312,6 +410,72 @@ func TestIncompleteBlobPathClassifierFollowsPlatformCaseSemantics(t *testing.T) 
 	upperMeta := strings.TrimSuffix(meta, ".incomplete.meta") + ".INCOMPLETE.META"
 	if got := repo.isIncompleteBlobPath(upperMeta); got != wantAlias {
 		t.Fatalf("uppercase metadata suffix classified=%v, want %v on %s", got, wantAlias, runtime.GOOS)
+	}
+}
+
+func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
+	repo, _, _, _ := selectedDeleteFixture(t)
+	for _, name := range []string{
+		"tmp-" + strings.Repeat("a", 64), // hash destination / verified intermediate
+		"tmp-model_config.json",          // path-fallback destination
+		"tmp-" + strings.Repeat("b", 64) + ".part",
+		"tmp-" + strings.Repeat("b", 64) + ".part-00",
+		"tmp-" + strings.Repeat("b", 64) + ".part-17",
+		"tmp-" + strings.Repeat("b", 64) + ".parts.json",
+		"tmp-" + strings.Repeat("b", 64) + ".parts.json.tmp",
+		"tmp-" + strings.Repeat("b", 64) + ".tmp-random-string",
+	} {
+		got := repo.isIncompleteBlobPath(repo.BlobPath(name))
+		if !got {
+			t.Errorf("producer staging path %q was not classified", name)
+		}
+	}
+	for _, name := range []string{"model.part", "model.parts.json", "abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-"} {
+		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); got {
+			t.Errorf("ordinary/non-producer blob path %q was classified", name)
+		}
+	}
+	for _, name := range []string{strings.Repeat("a", 64) + ".tmp-random", "opaque-key.tmp-random"} {
+		if !repo.isIncompleteBlobPath(repo.BlobPath(name)) {
+			t.Errorf("atomic publication staging path %q was not classified", name)
+		}
+	}
+	upper := repo.BlobPath("TMP-" + strings.Repeat("a", 64) + ".PART-00")
+	if got, want := repo.isIncompleteBlobPath(upper), runtime.GOOS == "windows"; got != want {
+		t.Fatalf("staging identity case behavior=%v, want %v on %s", got, want, runtime.GOOS)
+	}
+}
+
+func TestAtomicCopyStagingMatcherUsesConsistentWindowsNormalization(t *testing.T) {
+	// Exercise the Windows normalization branch deterministically on every host;
+	// Go's case conversion can change UTF-8 byte length in either direction.
+	expandingKey := strings.Repeat("Ⱥ", 16)
+	staged, err := os.CreateTemp(t.TempDir(), expandingKey+".tmp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdName := filepath.Base(staged.Name())
+	if err := staged.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !isAtomicCopyStagingName(createdName, true) {
+		t.Fatalf("actual CreateTemp producer name %q not recognized under Windows normalization", createdName)
+	}
+	for _, tc := range []struct {
+		name string
+		win  bool
+		want bool
+	}{
+		{strings.Repeat("Ⱥ", 16) + ".tmp-random-tail", true, true},
+		{"K.tmp-", true, false}, // Unicode fold shrinks the base; tail is still empty.
+		{"opaque.tmp-random-tail", true, true},
+		{"opaque.TMP-random-tail", false, false},
+		{"opaque.tmp-", false, false},
+		{".tmp-tail", true, false},
+	} {
+		if got := isAtomicCopyStagingName(tc.name, tc.win); got != tc.want {
+			t.Errorf("isAtomicCopyStagingName(%q, windows=%v)=%v, want %v", tc.name, tc.win, got, tc.want)
+		}
 	}
 }
 
