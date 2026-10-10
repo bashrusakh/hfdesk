@@ -7,13 +7,13 @@ import "strings"
 
 // Quantization method descriptions.
 var quantMethodDescriptions = map[string]string{
-	"gptq":        "GPTQ - GPU-accelerated post-training quantization",
-	"awq":         "AWQ - Activation-aware Weight Quantization",
-	"exl2":        "EXL2 - ExLlamaV2 mixed-precision quantization",
+	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
+	"awq":          "AWQ - Activation-aware Weight Quantization",
+	"exl2":         "EXL2 - ExLlamaV2 mixed-precision quantization",
 	"bitsandbytes": "bitsandbytes INT8/INT4 quantization",
-	"bnb":         "bitsandbytes INT8/INT4 quantization",
-	"hqq":         "HQQ - Half-Quadratic Quantization",
-	"eetq":        "EETQ - Easy and Efficient Quantization",
+	"bnb":          "bitsandbytes INT8/INT4 quantization",
+	"hqq":          "HQQ - Half-Quadratic Quantization",
+	"eetq":         "EETQ - Easy and Efficient Quantization",
 }
 
 // analyzeQuantized analyzes GPTQ/AWQ/EXL2 quantized models.
@@ -22,6 +22,9 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 
 	// Parse quantize_config.json
 	config, ok := metadata["quantize_config.json"].(map[string]interface{})
+	if !ok {
+		config, ok = metadata["quantization_config.json"].(map[string]interface{})
+	}
 	if !ok {
 		// Try config.json for some quantized models
 		config, ok = metadata["config.json"].(map[string]interface{})

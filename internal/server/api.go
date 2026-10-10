@@ -175,6 +175,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		OutputDir: outputDir,
 		Token:     cfg.Token,
 		Endpoint:  cfg.Endpoint,
+		Proxy:     cfg.Proxy,
 	}
 
 	// Collect plan items
@@ -665,9 +666,15 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	// Create analyzer
 	cfg := s.snapshotConfig()
+	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Analysis failed", err.Error())
+		return
+	}
 	opts := smartdl.AnalyzerOptions{
-		Token:    cfg.Token,
-		Endpoint: cfg.Endpoint,
+		Token:      cfg.Token,
+		Endpoint:   cfg.Endpoint,
+		HTTPClient: client,
 	}
 	analyzer := smartdl.NewAnalyzer(opts)
 

@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Analyze and plan/download previews honor the configured proxy and report proxy construction failures rather than falling back to direct planning requests (#104).
+- Read analyzer metadata completely within the 10 MiB cap, recover completed leading quantization fields from oversized configs, and report unrecoverable overflow/read failures; root Transformers weights take precedence over ONNX exports while specialized model detection is preserved (#105).
 - Recover stalled downloads and bound transport waits with deadlines; retry `429` and all `5xx`, fail non-retryable file responses without retrying, and keep optional verification metadata failures non-fatal (#97)
 - Keep exact `HF_HUB_CACHE` storage consistent across downloads, cache operations, mirror, rebuild scripts, cleanup, and disk previews; freeze complete job destinations across restart and expose raw app-root/effective Hub metadata without persisting inherited defaults (#76)
 - Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
