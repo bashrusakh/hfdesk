@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -30,7 +31,8 @@ type SyncResult struct {
 
 // Sync regenerates the friendly view (models/, datasets/) from the hub cache.
 // It scans all repos in hub/, reads their refs to find current commits,
-// and creates symlinks in the friendly view pointing to snapshot files.
+// repairs snapshot entries that are missing (see repairSnapshotEntries), and
+// creates friendly-view entries pointing at snapshot files.
 func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	result := &SyncResult{}
 
@@ -65,10 +67,9 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 		}
 
 		// Sync this repo's friendly view
-		created, updated, err := c.syncRepoFriendlyView(repoDir, opts)
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("sync %s: %w", entry.Name(), err))
-			continue
+		created, updated, repoErrs := c.syncRepoFriendlyView(repoDir, opts)
+		for _, e := range repoErrs {
+			result.Errors = append(result.Errors, fmt.Errorf("sync %s: %w", entry.Name(), e))
 		}
 
 		result.SymlinksCreated += created
@@ -113,10 +114,14 @@ func parseRepoDirName(dirName string) (RepoType, string, string, bool) {
 }
 
 // syncRepoFriendlyView syncs a single repo's friendly view.
-// Returns (created, updated, error).
-func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int, int, error) {
+// It first repairs snapshot entries that are missing (see repairSnapshotEntries),
+// then mirrors the snapshot into the friendly view.
+// Returns (created, updated, errors); per-entry failures are reported without
+// aborting the remaining entries.
+func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int, int, []error) {
 	created := 0
 	updated := 0
+	var errs []error
 
 	// Find the current commit from refs
 	// Try common refs: main, master
@@ -124,7 +129,7 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	for _, ref := range []string{"main", "master"} {
 		c, err := repoDir.ReadRef(ref)
 		if err != nil {
-			return 0, 0, fmt.Errorf("read ref %s: %w", ref, err)
+			return 0, 0, []error{fmt.Errorf("read ref %s: %w", ref, err)}
 		}
 		if c != "" {
 			commit = c
@@ -136,29 +141,47 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		// No refs found, try to find any snapshot
 		snapshots, err := repoDir.ListSnapshots()
 		if err != nil {
-			return 0, 0, fmt.Errorf("list snapshots: %w", err)
+			return 0, 0, []error{fmt.Errorf("list snapshots: %w", err)}
 		}
-		if len(snapshots) == 0 {
-			return 0, 0, nil // No snapshots, nothing to sync
+		if len(snapshots) > 0 {
+			commit = snapshots[0] // Use first available snapshot
 		}
-		commit = snapshots[0] // Use first available snapshot
 	}
+
+	if commit == "" {
+		// Blobs-only cache (for example one downloaded on a filesystem where
+		// link creation was skipped entirely): the offline download manifest
+		// still names the commit its blobs belong to.
+		if m := readRepoManifest(repoDir); m != nil {
+			commit = m.Commit
+		}
+	}
+
+	if commit == "" {
+		return 0, 0, nil // Nothing to sync
+	}
+
+	// Recreate snapshot entries a blobs-only or partially repaired cache is
+	// missing before mirroring them into the friendly view.
+	repaired, repairErrs := repoDir.repairSnapshotEntries(commit)
+	created += repaired
+	errs = append(errs, repairErrs...)
 
 	// Get snapshot directory
 	snapshotDir, err := repoDir.SnapshotDir(commit)
 	if err != nil {
-		return 0, 0, err
+		return created, updated, append(errs, err)
 	}
 	if _, err := os.Stat(snapshotDir); errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil // Snapshot doesn't exist
+		return created, updated, errs // Snapshot doesn't exist
 	}
 
 	// Ensure friendly directory exists
 	if err := repoDir.EnsureFriendlyDir(); err != nil {
-		return 0, 0, fmt.Errorf("ensure friendly dir: %w", err)
+		return created, updated, append(errs, fmt.Errorf("ensure friendly dir: %w", err))
 	}
 
-	// Walk snapshot and create friendly symlinks
+	// Walk snapshot and create friendly entries
 	err = filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -175,9 +198,7 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 			return err
 		}
 
-		// Check if friendly symlink already exists and is correct
 		friendlyPath := filepath.Join(repoDir.FriendlyPath(), relPath)
-		existingTarget, err := os.Readlink(friendlyPath)
 
 		snapshotPath, perr := repoDir.SnapshotPath(commit, relPath)
 		if perr != nil {
@@ -185,17 +206,24 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		}
 		expectedTarget, _ := filepath.Rel(filepath.Dir(friendlyPath), snapshotPath)
 
-		if err == nil && existingTarget == expectedTarget {
-			// Symlink exists and is correct
+		// Check if the friendly entry already exists and is correct
+		correct, cerr := cacheEntryCorrect(friendlyPath, snapshotPath, expectedTarget)
+		if cerr != nil {
+			errs = append(errs, fmt.Errorf("inspect friendly entry %s: %w", relPath, cerr))
+			return nil
+		}
+		if correct {
 			return nil
 		}
 
-		// Create or update symlink
-		if err := repoDir.CreateFriendlySymlink(commit, relPath, ""); err != nil {
-			return fmt.Errorf("create symlink for %s: %w", relPath, err)
+		// Create or update entry
+		_, statErr := os.Lstat(friendlyPath)
+		if err := repoDir.createFriendlySymlinkCtx(context.Background(), commit, relPath, ""); err != nil {
+			errs = append(errs, fmt.Errorf("create friendly entry for %s: %w", relPath, err))
+			return nil
 		}
 
-		if errors.Is(err, os.ErrNotExist) {
+		if statErr != nil {
 			created++
 		} else {
 			updated++
@@ -205,10 +233,97 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	})
 
 	if err != nil {
-		return created, updated, fmt.Errorf("walk snapshot: %w", err)
+		return created, updated, append(errs, fmt.Errorf("walk snapshot: %w", err))
 	}
 
-	return created, updated, nil
+	return created, updated, errs
+}
+
+// readRepoManifest returns the offline download manifest at this repo's
+// friendly view root when it belongs to this repository. A manifest from a
+// different repo must never be used as a repair mapping: its recorded paths
+// would be placed into an unrelated snapshot.
+func readRepoManifest(repoDir *RepoDir) *DownloadManifest {
+	m, err := ReadManifest(filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
+	if err != nil {
+		return nil
+	}
+	if !strings.EqualFold(m.Repo, repoDir.RepoID()) {
+		return nil
+	}
+	return m
+}
+
+// repairSnapshotEntries recreates snapshot entries the manifest records for
+// commit but the cache is missing (or holds as a dangling symlink). The
+// manifest is the offline relative path -> blob mapping written at download
+// time, so a blobs-only cache can be repaired without contacting the Hub.
+// Entries whose blob is absent, whose recorded path would escape the snapshot
+// directory, or whose manifest shape is unusable are skipped or reported;
+// existing snapshot entries (of any link kind) are left untouched.
+// Returns (created, errors).
+func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
+	created := 0
+	var errs []error
+
+	m := readRepoManifest(r)
+	if m == nil || m.Commit != commit {
+		return 0, nil
+	}
+
+	for _, f := range m.Files {
+		rel := filepath.ToSlash(f.Name)
+		if unsafeRepoPath(rel) {
+			errs = append(errs, fmt.Errorf("manifest path %q is not a usable repository path", f.Name))
+			continue
+		}
+		if !strings.HasPrefix(f.Blob, "blobs/") {
+			errs = append(errs, fmt.Errorf("manifest blob %q for %q is not a cache blob reference", f.Blob, f.Name))
+			continue
+		}
+		hash := strings.TrimPrefix(f.Blob, "blobs/")
+		if !canonicalSHA256(hash) {
+			errs = append(errs, fmt.Errorf("manifest blob %q for %q is not named by a canonical SHA-256", f.Blob, f.Name))
+			continue
+		}
+
+		info, err := os.Lstat(r.BlobPath(hash))
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			continue // No usable blob to link from
+		}
+
+		linkPath, err := r.SnapshotPath(commit, rel)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("manifest path %q would escape the snapshot directory: %w", f.Name, err))
+			continue
+		}
+		if !snapshotEntryNeedsRepair(linkPath) {
+			continue
+		}
+		if err := r.createSnapshotSymlink(context.Background(), commit, rel, hash); err != nil {
+			errs = append(errs, fmt.Errorf("repair snapshot entry %s: %w", rel, err))
+			continue
+		}
+		created++
+	}
+
+	return created, errs
+}
+
+// snapshotEntryNeedsRepair reports whether the snapshot entry at linkPath is
+// missing or a dangling symlink. A hard link or copy carries its content and
+// is left alone; repair recreates absent entries, it does not second-guess
+// existing ones.
+func snapshotEntryNeedsRepair(linkPath string) bool {
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		return true
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		_, err := os.Stat(linkPath) // follow the link
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return false
 }
 
 // cleanOrphanedSymlinks removes symlinks in friendly view that point to non-existent files.

@@ -48,6 +48,14 @@ func pathWithin(base, candidate string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
+// namedBlob is one bounded blob inventory entry: a regular file directly in
+// the repository's blobs/ directory, with its physical path identity.
+type namedBlob struct {
+	path string
+	info os.FileInfo
+	id   string
+}
+
 // physicalEntryIdentity resolves only parent directories, preserving the final
 // filename as an entry. This follows directory aliases without following a leaf
 // symlink, so reference checks identify the actual link/file name being retained.
@@ -155,8 +163,10 @@ func isAtomicCopyStagingName(base string, windows bool) bool {
 }
 
 // DeleteSelectedGGUF removes only confirmed names from all named snapshots,
-// their provably associated friendly links, and blob payloads with no remaining
-// direct snapshot references. It never removes directories or partial files.
+// their provably associated friendly entries (symlink chains, or hardlink/copy
+// fallback projections proven by shared file or identical content), and blob
+// payloads with no remaining direct snapshot references (link targets or
+// shared files). It never removes directories or partial files.
 func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots ...string) SelectedGGUFDeleteResult {
 	result := SelectedGGUFDeleteResult{Removed: []string{}, Remaining: []string{}, RetainedBlobs: []string{}, Errors: []string{}}
 	if len(entries) == 0 {
@@ -256,7 +266,33 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		result.Errors = append(result.Errors, "selection has no saved-version entries")
 		return result
 	}
-	// Complete bounded enumeration is required before any unlink.
+	// Complete bounded enumeration is required before any unlink. Regular
+	// snapshot entries created by the hardlink/copy fallback reference their
+	// payload by file identity instead of a link target, so the blob inventory
+	// is established up front for those reference checks.
+	var blobStore []namedBlob
+	blobDirEntries, err := os.ReadDir(blobRoot)
+	if err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		return result
+	}
+	for _, entry := range blobDirEntries {
+		blobPath := filepath.Join(blobRoot, entry.Name())
+		info, e := os.Lstat(blobPath)
+		if e != nil {
+			result.Errors = append(result.Errors, e.Error())
+			return result
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		id, e := physicalEntryIdentity(blobPath)
+		if e != nil {
+			result.Errors = append(result.Errors, blobPath+": payload identity could not be established")
+			return result
+		}
+		blobStore = append(blobStore, namedBlob{path: blobPath, info: info, id: id})
+	}
 	refs := map[string]map[string]bool{}
 	for _, version := range snapshots {
 		root := filepath.Join(snapshotRoot, version)
@@ -275,6 +311,17 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 				return e
 			}
 			if info.Mode()&os.ModeSymlink == 0 {
+				// A hard link entry references the payload it shares a file
+				// with; a copy entry is an independent file and references no
+				// payload, so removing a blob never invalidates it.
+				for _, blob := range blobStore {
+					if os.SameFile(info, blob.info) {
+						if refs[blob.id] == nil {
+							refs[blob.id] = map[string]bool{}
+						}
+						refs[blob.id][name] = true
+					}
+				}
 				return nil
 			}
 			target, e := hfLinkTarget(name)
@@ -303,6 +350,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 	selectedTargets := make(map[string]string, len(selected))
 	blobInfos := make(map[string]os.FileInfo, len(selected))
 	selectedPathsByEntryID := make(map[string]string, len(selected))
+	selectedIDByName := make(map[string]string, len(selected))
 	for name := range selected {
 		info, e := os.Lstat(name)
 		if e != nil || info.IsDir() || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0) {
@@ -322,6 +370,36 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			}
 			selectedTargets[name] = target
 			blobInfos[target] = targetInfo
+		} else {
+			// Hardlink/copy fallback entries carry no link target. The
+			// payload is associated first by file identity (a hard link shares
+			// the blob's file), then by content digest matching a blob's
+			// canonical name (a copy of a content-addressed blob). Only the
+			// actual selected entry's payload becomes a candidate; an entry
+			// whose payload cannot be proven is removed on its own and any
+			// same-named blob is retained.
+			var shared *namedBlob
+			for i := range blobStore {
+				if os.SameFile(info, blobStore[i].info) {
+					shared = &blobStore[i]
+					break
+				}
+			}
+			if shared != nil {
+				if r.isIncompleteBlobPath(shared.path) {
+					result.Errors = append(result.Errors, "selected snapshot entry resolves to an incomplete blob")
+					return result
+				}
+				selectedTargets[name] = shared.path
+				blobInfos[shared.path] = shared.info
+			} else if digest, herr := entryContentSHA256(name); herr == nil {
+				if candidate := r.BlobPath(digest); candidate != filepath.Join(blobRoot, invalidBlobName) {
+					if targetInfo, terr := os.Lstat(candidate); terr == nil && targetInfo.Mode().IsRegular() && targetInfo.Mode()&os.ModeSymlink == 0 {
+						selectedTargets[name] = candidate
+						blobInfos[candidate] = targetInfo
+					}
+				}
+			}
 		}
 		selectedInfos[name] = info
 		identity, e := physicalEntryIdentity(name)
@@ -330,6 +408,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			return result
 		}
 		selectedPathsByEntryID[identity] = name
+		selectedIDByName[name] = identity
 	}
 	candidateBlobs := make(map[string]string, len(selectedTargets))
 	candidateBlobInfos := make(map[string]os.FileInfo, len(selectedTargets))
@@ -381,6 +460,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 	friendlyLinks := map[string]string{}
 	friendlyInfos := map[string]os.FileInfo{}
 	friendlyEntryNames := map[string]string{}
+	friendlyRegular := map[string]os.FileInfo{}
 	err = filepath.WalkDir(friendlyRoot, func(name string, d fs.DirEntry, e error) error {
 		if os.IsNotExist(e) {
 			return nil
@@ -395,7 +475,22 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		if e != nil {
 			return e
 		}
+		identity, e := physicalEntryIdentity(name)
+		if e != nil {
+			return fmt.Errorf("friendly entry identity could not be established: %w", e)
+		}
 		if info.Mode()&os.ModeSymlink == 0 {
+			// Friendly entries created by the hardlink/copy fallback are
+			// regular files. They are collected for name+content resolution
+			// below and registered by identity so link chains through them
+			// can still be followed.
+			if info.Mode().IsRegular() {
+				friendlyRegular[name] = info
+				friendlyInfos[name] = info
+				if _, exists := friendlyEntryNames[identity]; !exists {
+					friendlyEntryNames[identity] = name
+				}
+			}
 			return nil
 		}
 		target, e := hfLinkTarget(name)
@@ -404,10 +499,6 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		}
 		friendlyLinks[name] = target
 		friendlyInfos[name] = info
-		identity, e := physicalEntryIdentity(name)
-		if e != nil {
-			return fmt.Errorf("friendly entry identity could not be established: %w", e)
-		}
 		if _, exists := friendlyEntryNames[identity]; !exists {
 			friendlyEntryNames[identity] = name
 		}
@@ -416,6 +507,34 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 	if err != nil {
 		result.Errors = append(result.Errors, "could not completely inspect friendly links: "+err.Error())
 		return result
+	}
+	// A regular (hardlink/copy) friendly projection resolves to a selected
+	// snapshot entry only when both the relative name and the content prove
+	// the association: name alone could authorize deleting unrelated data,
+	// content alone would authorize unrelated names. Matched projections are
+	// removable like their symlink counterparts, and a link chain landing on
+	// one inherits the same dependency check below.
+	selectedByRel := map[string][]string{}
+	for selName, rel := range selectedRemotePaths {
+		selectedByRel[rel] = append(selectedByRel[rel], selName)
+	}
+	regularSelectedID := map[string]string{}
+	for name, info := range friendlyRegular {
+		rel, e := filepath.Rel(friendlyRoot, name)
+		if e != nil {
+			result.Errors = append(result.Errors, name+": friendly path could not be validated")
+			return result
+		}
+		for _, selName := range selectedByRel[filepath.ToSlash(rel)] {
+			if !os.SameFile(info, selectedInfos[selName]) {
+				same, e := sameEntryContent(name, selName)
+				if e != nil || !same {
+					continue
+				}
+			}
+			regularSelectedID[name] = selectedIDByName[selName]
+			break
+		}
 	}
 	// Resolve bounded friendly-link chains so retained names cannot become
 	// dangling dependencies and direct friendly->blob views retain shared data.
@@ -427,6 +546,9 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		seen[name] = true
 		target, ok := friendlyLinks[name]
 		if !ok {
+			if id, matched := regularSelectedID[name]; matched {
+				return id, nil
+			}
 			return physicalEntryIdentity(name)
 		}
 		targetID, err := physicalEntryIdentity(target)
@@ -446,7 +568,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		}
 		return targetID, nil
 	}
-	resolvedFriendlyTargets := make(map[string]string, len(friendlyLinks))
+	resolvedFriendlyTargets := make(map[string]string, len(friendlyLinks)+len(regularSelectedID))
 	for name := range friendlyLinks {
 		target, e := resolveFriendly(name, map[string]bool{})
 		if e != nil {
@@ -454,6 +576,11 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			return result
 		}
 		resolvedFriendlyTargets[name] = target
+	}
+	for name, target := range regularSelectedID {
+		resolvedFriendlyTargets[name] = target
+	}
+	for name, target := range resolvedFriendlyTargets {
 		if selectedPath, ok := selectedPathsByEntryID[target]; ok {
 			rel, e := filepath.Rel(friendlyRoot, name)
 			if e != nil {
@@ -473,7 +600,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 			friendly = append(friendly, name)
 		}
 	}
-	// Identify eligible payloads from the actual selected symlink targets only.
+	// Identify eligible payloads from the actual selected targets only.
 	retainedCandidates := map[string]bool{}
 	removableFriendly := make(map[string]bool, len(friendly))
 	for _, name := range friendly {
@@ -483,6 +610,20 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		if _, candidate := candidateBlobs[target]; candidate {
 			if !removableFriendly[name] {
 				retainedCandidates[target] = true
+			}
+		}
+	}
+	// A retained regular (hardlink) friendly entry that shares a candidate
+	// payload's file keeps that payload visible under its name, exactly like a
+	// retained friendly symlink to the blob. Copy entries are independent
+	// files and are not payload references.
+	for name, info := range friendlyRegular {
+		if removableFriendly[name] {
+			continue
+		}
+		for blobID := range candidateBlobs {
+			if candidateBlobInfos[blobID] != nil && os.SameFile(info, candidateBlobInfos[blobID]) {
+				retainedCandidates[blobID] = true
 			}
 		}
 	}
