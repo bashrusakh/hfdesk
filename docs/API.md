@@ -323,7 +323,13 @@ selected repository reference namespace and associated friendly view. Local
 queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
 unlink results use `207` and identify removed, remaining, and failed paths
 (`errors`). A local symlink member is unlinked without following or deleting
-its target. The older `DELETE /api/cache/{owner}/{repo}` remains the separate
+its target. The authoritative delete-time enumeration and filesystem operations
+use one opened repository root and recheck each selected entry immediately
+before unlink; a detected configured-root alias change during admission is refused, and a later alias
+change does not redirect the operation to another location. The final identity
+check and unlink are not an atomic compare-and-remove against arbitrary external
+changes.
+The older `DELETE /api/cache/{owner}/{repo}` remains the separate
 whole-repository operation.
 
 `GET /api/cache/{owner}/{repo}?type=model|dataset` also honors an explicit

@@ -6,6 +6,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -182,6 +183,24 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 	return false
 }
 
+func jobMayWriteFrozenSelectedPath(job *Job, target string) bool {
+	base := jobDestinationBase(job)
+	if base == "" {
+		return false
+	}
+	target, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return true
+	}
+	if pathWithinWriterBase(base, target) {
+		return hfdownloader.GGUFPathSelected(filepath.Base(target), job.Filters, job.Excludes, job.ExactMatch)
+	}
+	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, target) {
+		return hfdownloader.GGUFPathSelected(filepath.Base(target), job.Filters, job.Excludes, job.ExactMatch)
+	}
+	return false
+}
+
 func pathWithinWriterBase(base, targetIdentity string) bool {
 	baseIdentity, err := mutationDirectoryIdentity(base)
 	if err != nil {
@@ -217,6 +236,33 @@ func mutationPathsOverlap(a, b string) bool {
 	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
 }
 
+// physicalEntryOverlap treats stored as an already-frozen physical entry key
+// and resolves only the newly arriving path. It must not re-resolve stored
+// through a lexical alias after admission.
+func physicalEntryOverlap(stored, incoming string) bool {
+	stored, err := filepath.Abs(filepath.Clean(stored))
+	if err != nil {
+		return true
+	}
+	incoming, err = mutationEntryIdentity(incoming)
+	if err != nil {
+		return true
+	}
+	return stored == incoming || withinLocalRoot(stored, incoming) || withinLocalRoot(incoming, stored)
+}
+
+func directoryOverlapsFrozenEntry(scope, frozenEntry string) bool {
+	dir, err := mutationDirectoryIdentity(scope)
+	if err != nil {
+		return true
+	}
+	entry, err := filepath.Abs(filepath.Clean(frozenEntry))
+	if err != nil {
+		return true
+	}
+	return withinLocalRoot(dir, entry) || withinLocalRoot(entry, dir)
+}
+
 func mutationDirectoryEntryOverlap(directory, entry string) bool {
 	dirPath, dirErr := mutationDirectoryIdentity(directory)
 	entryPath, entryErr := mutationEntryIdentity(entry)
@@ -233,7 +279,14 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		if err != nil {
 			return nil, false
 		}
-		clean = append(clean, abs)
+		// Freeze the selected entry's physical parent at admission. The final
+		// basename is intentionally retained as an entry (not followed when it
+		// is a symlink), so later root-alias changes cannot move this reservation.
+		identity, err := mutationEntryIdentity(abs)
+		if err != nil {
+			return nil, false
+		}
+		clean = append(clean, identity)
 	}
 	m.mu.Lock()
 	if m.stopping {
@@ -243,7 +296,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	entryConflicts := func(scopes []string) bool {
 		for _, a := range scopes {
 			for _, b := range clean {
-				if mutationPathsOverlap(a, b) {
+				if physicalEntryOverlap(a, b) {
 					return true
 				}
 			}
@@ -259,7 +312,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.hfRepoReservations {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if mutationDirectoryEntryOverlap(scope, entry) {
+				if directoryOverlapsFrozenEntry(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -269,7 +322,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.mutationScopes {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if mutationDirectoryEntryOverlap(scope, entry) {
+				if directoryOverlapsFrozenEntry(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -502,7 +555,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	for _, scopes := range m.deleteReservations {
 		for _, scope := range scopes {
 			for _, write := range clean {
-				if mutationDirectoryEntryOverlap(write, scope) {
+				if directoryOverlapsFrozenEntry(write, scope) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -544,7 +597,7 @@ func (m *JobManager) jobBlockedByDeleteLocked(job *Job) bool {
 	}
 	for _, targets := range m.deleteReservations {
 		for _, target := range targets {
-			if jobMayWriteSelectedPath(job, target) {
+			if jobMayWriteFrozenSelectedPath(job, target) {
 				return true
 			}
 		}
@@ -568,6 +621,16 @@ type selectedDeleteRequest struct {
 	LocationID string                 `json:"locationId"`
 	GroupID    string                 `json:"groupId"`
 	Members    []cacheSelectionMember `json:"members"`
+}
+
+// selectedDeleteHooks are per-server synchronization points for deterministic
+// endpoint tests. Production servers leave them nil.
+type selectedDeleteHooks struct {
+	beforeRootOpen func()
+	afterRootOpen  func()
+	afterFinalScan func()
+	beforeRemove   func(int)
+	removeEntry    func(*os.Root, string) error
 }
 
 type selectedDeleteResponse struct {
@@ -621,55 +684,205 @@ func safeSelectedRelative(name string) bool {
 	return clean == name && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
-func preflightSelectedLocalEntries(repoDir string, members []cacheSelectionMember) (*os.Root, []string, error) {
-	rootPath := filepath.Dir(filepath.Dir(repoDir))
-	root, err := os.OpenRoot(rootPath)
+// openSelectedLocalRepo admits a repository through its configured lexical
+// location, then keeps an os.Root anchored to that exact repository directory.
+// Comparing the opened directory with both observed bindings rejects an alias
+// retarget that races admission.
+func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string, error) {
+	base := filepath.Dir(filepath.Dir(repoDir))
+	before, err := os.Stat(base)
+	if err != nil || !before.IsDir() {
+		return nil, "", fmt.Errorf("configured local root is unavailable")
+	}
+	physicalBase, err := filepath.EvalSymlinks(base)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
-	relRepo, err := filepath.Rel(rootPath, repoDir)
-	if err != nil || relRepo == ".." || strings.HasPrefix(relRepo, ".."+string(filepath.Separator)) || filepath.IsAbs(relRepo) {
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, "", err
+	}
+	openedBase, openedErr := root.Stat(".")
+	afterBase, afterErr := os.Stat(base)
+	physicalBaseInfo, physicalErr := os.Stat(physicalBase)
+	if openedErr != nil || afterErr != nil || physicalErr != nil || !os.SameFile(before, openedBase) || !os.SameFile(openedBase, afterBase) || !os.SameFile(openedBase, physicalBaseInfo) {
 		root.Close()
-		return nil, nil, fmt.Errorf("selected repository is outside its configured root")
+		return nil, "", fmt.Errorf("configured local root changed while opening its deletion scope")
 	}
-	// Owner and model are part of the admitted root-relative namespace. Refuse
-	// traversal through either, even when the target happens to be in-root.
-	for _, component := range strings.Split(relRepo, string(filepath.Separator)) {
-		info, err := root.Lstat(component)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+	for _, component := range []string{filepath.Base(filepath.Dir(repoDir)), filepath.Base(repoDir)} {
+		before, statErr := root.Lstat(component)
+		if statErr != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
 			root.Close()
-			return nil, nil, fmt.Errorf("selected repository has an unsafe owner/model component")
+			return nil, "", fmt.Errorf("selected repository has an unsafe owner/model component")
 		}
-		next, err := root.OpenRoot(component)
-		if err != nil {
+		next, openErr := root.OpenRoot(component)
+		if openErr != nil {
 			root.Close()
-			return nil, nil, err
+			return nil, "", openErr
 		}
+		opened, openedErr := next.Stat(".")
+		after, afterErr := root.Lstat(component)
 		root.Close()
 		root = next
-	}
-	rels := make([]string, 0, len(members))
-	for _, member := range members {
-		if !safeSelectedRelative(member.Path) || !strings.EqualFold(filepath.Ext(member.Path), ".gguf") || isCacheMMProjFile(member.Path) {
+		if openedErr != nil || afterErr != nil || after.Mode()&os.ModeSymlink != 0 || !os.SameFile(before, opened) || !os.SameFile(opened, after) {
 			root.Close()
-			return nil, nil, fmt.Errorf("selected member is not a supported GGUF file")
+			return nil, "", fmt.Errorf("selected repository changed while opening its deletion scope")
 		}
-		rel := filepath.FromSlash(member.Path)
-		for dir := filepath.Dir(rel); dir != "."; dir = filepath.Dir(dir) {
-			info, err := root.Lstat(dir)
-			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-				root.Close()
-				return nil, nil, fmt.Errorf("selected file has an unsafe parent component")
+	}
+	physical := filepath.Join(physicalBase, filepath.Base(filepath.Dir(repoDir)), filepath.Base(repoDir))
+	opened, openedErr := root.Stat(".")
+	physicalInfo, statErr := os.Stat(physical)
+	if openedErr != nil || statErr != nil || !os.SameFile(opened, physicalInfo) {
+		root.Close()
+		return nil, "", fmt.Errorf("selected repository changed while opening its deletion scope")
+	}
+	return root, physical, nil
+}
+
+// localSelectionFilesRoot is the delete path's authoritative enumeration. It
+// deliberately does not follow directory symlinks and never leaves the opened
+// repository root. The normal cache-selection scanner remains unchanged.
+func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string) ([]cacheSelectionFile, string) {
+	var files []cacheSelectionFile
+	var warning string
+	excludedSet := make(map[string]bool, len(excluded))
+	for _, name := range excluded {
+		excludedSet[filepath.ToSlash(filepath.Clean(name))] = true
+	}
+	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." {
+			return nil
+		}
+		if excludedSet[filepath.ToSlash(filepath.Clean(name))] {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".gguf") {
+			return nil
+		}
+		info, err := root.Lstat(name)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		size, linkOnly := info.Size(), info.Mode()&os.ModeSymlink != 0
+		if linkOnly {
+			// Root.Stat handles ordinary in-root links. For a relative link whose
+			// target is outside this repository, resolve only read-only metadata
+			// from the already admitted physical parent; unlink still acts on the
+			// link entry alone.
+			actual, statErr := root.Stat(name)
+			if statErr != nil {
+				parent := filepath.Join(physicalRepo, filepath.Dir(filepath.FromSlash(name)))
+				target, linkErr := root.Readlink(name)
+				if linkErr != nil {
+					warning = "A GGUF link could not be resolved; unavailable links are omitted"
+					return nil
+				}
+				if filepath.IsAbs(target) {
+					actual, statErr = os.Stat(target)
+				} else {
+					actual, statErr = os.Stat(filepath.Join(parent, target))
+				}
+			}
+			if statErr != nil || !actual.Mode().IsRegular() {
+				warning = "A GGUF link could not be resolved; unavailable links are omitted"
+				return nil
+			}
+			size = actual.Size()
+		}
+		files = append(files, cacheSelectionFile{path: filepath.ToSlash(name), size: size, linkOnly: linkOnly, identity: info})
+		return nil
+	})
+	if err != nil {
+		return files, "Could not fully read this location: " + err.Error()
+	}
+	return files, warning
+}
+
+// selectedDeleteExclusions projects configured descendant ownership into the
+// admitted repository namespace. The selected root's physical identity is
+// supplied by its open handle; the selected alias is never re-resolved here.
+func selectedDeleteExclusions(cfg Config, selected *cacheSelectionLocation, physicalRepo string) ([]string, bool) {
+	roots := localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
+	selectedLexical, err := filepath.Abs(filepath.Clean(selected.Path))
+	if err != nil {
+		return nil, false
+	}
+	var excluded []string
+	seen := make(map[string]bool)
+	add := func(rel string) bool {
+		rel = filepath.Clean(rel)
+		if rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return false
+		}
+		key := filepath.ToSlash(rel)
+		if !seen[key] {
+			seen[key] = true
+			excluded = append(excluded, key)
+		}
+		return true
+	}
+	for _, candidate := range roots {
+		candidateLexical, absErr := filepath.Abs(filepath.Clean(candidate.Path))
+		if absErr != nil {
+			return nil, false
+		}
+		if pathIdentityKey(candidateLexical) == pathIdentityKey(selectedLexical) {
+			continue
+		}
+		if withinLocalRoot(selectedLexical, candidateLexical) {
+			rel, relErr := filepath.Rel(selectedLexical, candidateLexical)
+			if relErr != nil || !add(rel) {
+				return nil, false
 			}
 		}
-		info, err := root.Lstat(rel)
-		if err != nil || info.IsDir() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
-			root.Close()
-			return nil, nil, fmt.Errorf("selected entry changed since confirmation or is unsafe")
+		_, candidatePhysical, ok := configuredRootIdentity(candidate.Path)
+		if !ok {
+			return nil, false
 		}
-		rels = append(rels, rel)
+		if candidatePhysical != physicalRepo && withinLocalRoot(physicalRepo, candidatePhysical) {
+			rel, relErr := filepath.Rel(physicalRepo, candidatePhysical)
+			if relErr != nil || !add(rel) {
+				return nil, false
+			}
+		}
 	}
-	return root, rels, nil
+	return excluded, true
+}
+
+// selectedLocalLocationCandidate resolves the registered lexical root using
+// the same root order and location-ID derivation as cacheSelectionLocations,
+// without scanning the candidate through a path that could be retargeted.
+func selectedLocalLocationCandidate(cfg Config, repo, locationID string) *cacheSelectionLocation {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	for _, root := range localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes) {
+		if root.skipsOwner(parts[0]) {
+			continue
+		}
+		id := "local-" + selectionHash(filepath.Clean(root.Path), repo, "model")
+		if id == locationID {
+			return &cacheSelectionLocation{
+				ID: id, Source: root.Source,
+				Path:      filepath.Join(root.Path, parts[0], parts[1]),
+				CanDelete: isRegisteredLocalSelectionRoot(cfg, root.Path), kind: "local",
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Request) {
@@ -689,6 +902,39 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	cfg := s.config
+	var localRoot *os.Root
+	var localPhysicalRepo string
+	var localRelease func()
+	defer func() {
+		if localRoot != nil {
+			_ = localRoot.Close()
+		}
+		if localRelease != nil {
+			localRelease()
+		}
+	}()
+	if strings.HasPrefix(req.LocationID, "local-") {
+		candidate := selectedLocalLocationCandidate(cfg, req.Repo, req.LocationID)
+		if candidate == nil || !candidate.CanDelete {
+			writeError(w, http.StatusConflict, "Location is not eligible for local deletion", "This location is not a currently configured local scan or download root")
+			return
+		}
+		var err error
+		localRoot, localPhysicalRepo, err = openSelectedLocalRepo(candidate.Path, s.selectedDeleteHooks.beforeRootOpen)
+		if err != nil {
+			writeError(w, http.StatusConflict, "Selection is unsafe", err.Error())
+			return
+		}
+		if s.selectedDeleteHooks.afterRootOpen != nil {
+			s.selectedDeleteHooks.afterRootOpen()
+		}
+		opened, openedErr := localRoot.Stat(".")
+		bound, boundErr := os.Stat(candidate.Path)
+		if openedErr != nil || boundErr != nil || !os.SameFile(opened, bound) {
+			writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+			return
+		}
+	}
 	var selected *cacheSelectionLocation
 	for _, loc := range cacheSelectionLocations(cfg, req.Repo) {
 		if loc.ID == req.LocationID {
@@ -720,6 +966,14 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	if selected.Warning != "" {
 		writeError(w, http.StatusConflict, "Location could not be verified", selected.Warning)
 		return
+	}
+	if localRoot != nil {
+		opened, openedErr := localRoot.Stat(".")
+		bound, boundErr := os.Stat(selected.Path)
+		if openedErr != nil || boundErr != nil || !os.SameFile(opened, bound) {
+			writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+			return
+		}
 	}
 
 	if selected.kind == "hf" {
@@ -806,33 +1060,61 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, status, response)
 		return
 	}
-	paths := make([]string, 0, len(group.Members))
 	for _, member := range group.Members {
 		if !safeSelectedRelative(member.Path) {
 			writeError(w, http.StatusConflict, "Selection is unsafe", "A selected path is not a safe relative GGUF entry")
 			return
 		}
-		paths = append(paths, filepath.Join(selected.Path, filepath.FromSlash(member.Path)))
 	}
-	release, ok := s.jobs.reserveSelectedGGUF(paths)
+	if localRoot == nil {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured local deletion scope could not be opened")
+		return
+	}
+	root, physicalRepo := localRoot, localPhysicalRepo
+	openedInfo, openedErr := root.Stat(".")
+	boundInfo, boundErr := os.Stat(selected.Path)
+	if openedErr != nil || boundErr != nil || !os.SameFile(openedInfo, boundInfo) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+		return
+	}
+	physicalPaths := make([]string, 0, len(group.Members))
+	for _, member := range group.Members {
+		physicalPaths = append(physicalPaths, filepath.Join(physicalRepo, filepath.FromSlash(member.Path)))
+	}
+	var ok bool
+	localRelease, ok = s.jobs.reserveSelectedGGUF(physicalPaths)
 	if !ok {
+		localRelease = nil
 		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A queued or active operation may write this exact GGUF group; cancel the conflicting job and retry")
 		return
 	}
-	defer release()
-	// Re-enumerate after the reservation barrier: a writer may have completed
-	// after the original scan but before reserve acquired the manager lock.
-	current := cacheSelectionLocations(cfg, req.Repo)
+	// Recheck the configured binding at reservation admission. Subsequent
+	// enumeration and unlink remain anchored to the opened physical repository.
+	openedInfo, openedErr = root.Stat(".")
+	boundInfo, boundErr = os.Stat(selected.Path)
+	if openedErr != nil || boundErr != nil || !os.SameFile(openedInfo, boundInfo) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+		return
+	}
+	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo)
+	if !boundariesComplete {
+		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
+		return
+	}
+	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded)
+	if scanWarning != "" {
+		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)
+		return
+	}
+	if s.selectedDeleteHooks.afterFinalScan != nil {
+		s.selectedDeleteHooks.afterFinalScan()
+	}
+	freshGroups := makeSelectionGroups(selected.ID, files)
 	var fresh *cacheSelectionGroup
-	for _, loc := range current {
-		if loc.ID != req.LocationID || loc.kind != "local" || !loc.CanDelete {
-			continue
-		}
-		for i := range loc.Groups {
-			if loc.Groups[i].ID == req.GroupID {
-				fresh = &loc.Groups[i]
-				break
-			}
+	for i := range freshGroups {
+		if freshGroups[i].ID == req.GroupID {
+			fresh = &freshGroups[i]
+			break
 		}
 	}
 	if fresh == nil || !selectionCompositionEqual(group.Members, fresh.Members) {
@@ -840,20 +1122,55 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	group = fresh
-	root, rels, preflightErr := preflightSelectedLocalEntries(selected.Path, group.Members)
-	if preflightErr != nil {
-		writeError(w, http.StatusConflict, "Selection is unsafe", preflightErr.Error())
-		return
+	rels := make([]string, 0, len(group.Members))
+	for _, member := range group.Members {
+		rel := filepath.FromSlash(member.Path)
+		for dir := filepath.Dir(rel); dir != "."; dir = filepath.Dir(dir) {
+			parentInfo, parentErr := root.Lstat(dir)
+			if parentErr != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+				writeError(w, http.StatusConflict, "Selection is unsafe", "A selected file has an unsafe parent component")
+				return
+			}
+		}
+		info, statErr := root.Lstat(rel)
+		if statErr != nil || member.identity == nil || !os.SameFile(member.identity, info) || info.Size() != member.identity.Size() || info.IsDir() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
+			writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed during preflight")
+			return
+		}
+		rels = append(rels, rel)
 	}
-	defer root.Close()
 
 	result := selectedDeleteResponse{OK: true, Repo: req.Repo, GroupID: group.ID, Removed: []string{}, Remaining: []string{}}
 	for i, member := range group.Members {
-		if err := root.Remove(rels[i]); err != nil {
+		if s.selectedDeleteHooks.beforeRemove != nil {
+			s.selectedDeleteHooks.beforeRemove(i)
+		}
+		info, statErr := root.Lstat(rels[i])
+		if statErr != nil || member.identity == nil || !os.SameFile(member.identity, info) || info.Size() != member.identity.Size() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
+			if len(result.Removed) == 0 {
+				writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed immediately before deletion")
+				return
+			}
+			result.OK = false
+			result.Remaining = append(result.Remaining, member.Path)
+			result.Errors = append(result.Errors, member.Path+": selected entry changed immediately before deletion")
+			for _, remaining := range group.Members[i+1:] {
+				result.Remaining = append(result.Remaining, remaining.Path)
+			}
+			break
+		}
+		remove := root.Remove
+		if s.selectedDeleteHooks.removeEntry != nil {
+			remove = func(name string) error { return s.selectedDeleteHooks.removeEntry(root, name) }
+		}
+		if err := remove(rels[i]); err != nil {
 			result.OK = false
 			result.Remaining = append(result.Remaining, member.Path)
 			result.Errors = append(result.Errors, member.Path+": "+err.Error())
-			continue
+			for _, remaining := range group.Members[i+1:] {
+				result.Remaining = append(result.Remaining, remaining.Path)
+			}
+			break
 		}
 		result.Removed = append(result.Removed, member.Path)
 		if member.LinkOnly {

@@ -19,11 +19,12 @@ import (
 )
 
 type cacheSelectionMember struct {
-	Path     string   `json:"path"`
-	Versions []string `json:"versions,omitempty"`
-	Size     int64    `json:"size"`
-	LinkOnly bool     `json:"linkOnly,omitempty"`
-	Message  string   `json:"message,omitempty"`
+	Path     string      `json:"path"`
+	Versions []string    `json:"versions,omitempty"`
+	Size     int64       `json:"size"`
+	LinkOnly bool        `json:"linkOnly,omitempty"`
+	Message  string      `json:"message,omitempty"`
+	identity os.FileInfo `json:"-"`
 }
 
 type cacheSelectionGroup struct {
@@ -50,6 +51,7 @@ type cacheSelectionFile struct {
 	path, version string
 	size          int64
 	linkOnly      bool
+	identity      os.FileInfo
 }
 
 var cacheShardSuffix = regexp.MustCompile(`(?i)([-_])(\d+)([-_]of[-_])(\d+)(\.gguf)$`)
@@ -105,7 +107,7 @@ func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheS
 		memberKey := file.path + "\x00" + file.version
 		m := a.members[memberKey]
 		if m == nil {
-			m = &cacheSelectionMember{Path: file.path, Size: file.size, LinkOnly: file.linkOnly}
+			m = &cacheSelectionMember{Path: file.path, Size: file.size, LinkOnly: file.linkOnly, identity: file.identity}
 			if file.linkOnly {
 				m.Message = "Only this link is represented; its weight target will remain"
 			}
