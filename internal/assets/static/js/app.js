@@ -769,19 +769,26 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (data.quantized) {
       const q = data.quantized;
       // Precision must not be implied from a header field: `bits` is only a
-      // model-wide width when precision is uniform. When it is mixed, present
-      // the per-expert and head widths as the tensor-group widths they are.
+      // model-wide width when precision is uniform and the config was read
+      // completely. A partially read config leaves precision declarations past
+      // the metadata cut unknown, so present it as unverified instead of
+      // claiming uniform or mixed precision. Width rows show only declared
+      // widths: a 0 bound means the declaration was cut, not a 0-bit width.
+      const bitWidth = (n) => `${n}-bit`;
+      const expertWidth = (q.expert_bits_min || q.expert_bits_max)
+        ? (q.expert_bits_min && q.expert_bits_max && q.expert_bits_min !== q.expert_bits_max
+            ? `${q.expert_bits_min}–${q.expert_bits_max}-bit`
+            : bitWidth(q.expert_bits_min || q.expert_bits_max))
+        : '';
+      const widthRows = (expertWidth ? `<div class="analysis-stat"><div class="analysis-stat-label">Per-Expert Widths</div><div class="analysis-stat-value">${expertWidth}</div></div>` : '')
+        + (q.head_bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Head Width</div><div class="analysis-stat-value">${bitWidth(q.head_bits)}</div></div>` : '');
       let precisionRow = '';
       if (q.mixed_precision) {
-        const bitWidth = (n) => `${n}-bit`;
-        const expertWidth = (q.expert_bits_min || q.expert_bits_max)
-          ? (q.expert_bits_min && q.expert_bits_max && q.expert_bits_min !== q.expert_bits_max
-              ? `${q.expert_bits_min}–${q.expert_bits_max}-bit`
-              : bitWidth(q.expert_bits_min || q.expert_bits_max))
-          : '';
-        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Mixed</div></div>`
-          + (expertWidth ? `<div class="analysis-stat"><div class="analysis-stat-label">Per-Expert Widths</div><div class="analysis-stat-value">${expertWidth}</div></div>` : '')
-          + (q.head_bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Head Width</div><div class="analysis-stat-value">${bitWidth(q.head_bits)}</div></div>` : '');
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Mixed${q.config_partial ? ' (config partially read)' : ''}</div></div>`
+          + widthRows;
+      } else if (q.config_partial) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unverified — config partially read (10 MiB limit)</div></div>`
+          + widthRows;
       } else if (q.bits) {
         precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
       }
