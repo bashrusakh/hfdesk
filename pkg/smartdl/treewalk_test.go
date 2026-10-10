@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/internal/hubtree"
@@ -184,6 +185,25 @@ func TestAnalyze_NamespaceFallbackPreserved(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAnalyze_TransportPort401IsNotAuthorization(t *testing.T) {
+	transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40123}, Err: syscall.ECONNREFUSED}
+	}}
+	defer transport.CloseIdleConnections()
+	a := NewAnalyzer(AnalyzerOptions{
+		Endpoint:   "http://hub.test:40123",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+
+	info, err := a.Analyze(context.Background(), "owner/repo", false)
+	if info != nil || err == nil {
+		t.Fatalf("info = %v, error = %v; want transport failure", info, err)
+	}
+	if !strings.Contains(err.Error(), "40123") || strings.Contains(err.Error(), "repository not found as model or dataset") {
+		t.Fatalf("error = %v; want original transport failure, not namespace fallback", err)
 	}
 }
 
