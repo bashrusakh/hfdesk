@@ -1104,15 +1104,18 @@ func TestSelectedDeleteReservationsUseRepoRelativeFilterPaths(t *testing.T) {
 		name   string
 		filter string
 		target string
+		exact  bool
 	}{
-		{"friendly directory filter", "weights/", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf")},
-		{"friendly relative path filter", "weights/model.gguf", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf")},
-		{"snapshot directory filter", "weights/", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf")},
-		{"snapshot relative path filter", "weights/model.gguf", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf")},
+		{"friendly directory filter", "weights/", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf"), false},
+		{"friendly relative path filter", "weights/model.gguf", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf"), false},
+		{"friendly exact relative path filter", "weights/model.gguf", filepath.Join(jobDestinationBase(&Job{OutputDir: cacheDir, Repo: "upstream/source", LocalRepo: "owner/model"}), "weights", "model.gguf"), true},
+		{"snapshot directory filter", "weights/", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf"), false},
+		{"snapshot relative path filter", "weights/model.gguf", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf"), false},
+		{"snapshot exact relative path filter", "weights/model.gguf", filepath.Join(rd.SnapshotsDir(), "saved-version", "weights", "model.gguf"), true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			job := &Job{OutputDir: cacheDir, HubDir: cache.HubDir(), Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{tc.filter}}
+			job := &Job{OutputDir: cacheDir, HubDir: cache.HubDir(), Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{tc.filter}, ExactMatch: tc.exact}
 			if !jobMayWriteSelectedPath(job, tc.target) {
 				t.Fatalf("writer was not recognized for filter %q and target %q", tc.filter, tc.target)
 			}
@@ -1151,6 +1154,67 @@ func TestSelectedDeleteReservationsUseRepoRelativeFilterPaths(t *testing.T) {
 			}
 			cancel()
 		})
+	}
+}
+
+func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *testing.T) {
+	storage := t.TempDir()
+	job := &Job{
+		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"weights/model.gguf"}, ExactMatch: true,
+	}
+	actual := filepath.Join(jobDestinationBase(job), "actual")
+	if err := os.MkdirAll(actual, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(jobDestinationBase(job), "weights")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	physical := filepath.Join(actual, "model.gguf")
+	if !jobMayWriteSelectedPath(job, physical) {
+		t.Fatal("internal directory alias was treated as a proven non-match")
+	}
+
+	job.Filters = []string{"Q5_K_M"}
+	if jobMayWriteSelectedPath(job, filepath.Join(actual, "model-Q4_K_M.gguf")) {
+		t.Fatal("known non-overlapping quant was blocked through an internal alias")
+	}
+
+	cache := hfdownloader.NewHFCache(storage, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.Filters = []string{"weights/model.gguf"}
+	job.HubDir = cache.HubDir()
+	snapshot := filepath.Join(rd.SnapshotsDir(), "unknown-commit", "weights", "model.gguf")
+	if !jobMayWriteSelectedPath(job, snapshot) {
+		t.Fatal("snapshot path filter was not matched below the unknown commit prefix")
+	}
+}
+
+func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
+	storage := t.TempDir()
+	alias := filepath.Join(storage, "models", "owner", "model", "weights")
+	if err := os.MkdirAll(filepath.Dir(alias), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(storage, "missing-target"), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	job := &Job{
+		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"weights/model.gguf"}, ExactMatch: true,
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "model.gguf")) {
+		t.Fatal("unresolved alias parent was treated as a proven non-match")
 	}
 }
 

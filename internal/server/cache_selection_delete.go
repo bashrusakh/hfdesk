@@ -167,15 +167,15 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 		return true
 	}
 	if pathWithinWriterBase(base, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job)
+		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job, pathMappingMayBeAliased(base, targetIdentity))
 	}
 	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job)
+		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job, true)
 	}
 	return false
 }
 
-func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bool {
+func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job, mappingMayBeAliased bool) bool {
 	baseIdentity, err := mutationDirectoryIdentity(base)
 	if err != nil {
 		return true
@@ -184,8 +184,20 @@ func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bo
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return true
 	}
-	if hfdownloader.GGUFPathSelected(filepath.ToSlash(rel), job.Filters, job.Excludes, job.ExactMatch) {
-		return true
+	candidates := []string{filepath.ToSlash(rel)}
+	// Snapshot paths are physically rooted at snapshots/<commit>, while the
+	// plan's RelativePath starts below that commit directory. The commit is not
+	// known until planning completes, so compare both spellings.
+	if filepath.Base(filepath.Clean(base)) == "snapshots" {
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		if len(parts) > 1 {
+			candidates = append(candidates, strings.Join(parts[1:], "/"))
+		}
+	}
+	for _, candidate := range candidates {
+		if hfdownloader.GGUFPathSelected(candidate, job.Filters, job.Excludes, job.ExactMatch) {
+			return true
+		}
 	}
 	// The physical entry may be reached through a different repository-relative
 	// spelling (for example a symlinked directory or a frozen snapshot alias).
@@ -195,7 +207,61 @@ func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bo
 	if hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch) {
 		return true
 	}
+	// A symlinked directory can make the physical path lose the repository
+	// spelling used by the plan (weights -> actual). If a path-shaped filter
+	// missed every proven spelling, do not turn that uncertain inversion into a
+	// false negative. Filename/quant filters remain exact and can still prove a
+	// known non-overlap above.
+	if mappingMayBeAliased && hasPathFilter(job.Filters) {
+		return true
+	}
 	return false
+}
+
+func hasPathFilter(filters []string) bool {
+	for _, filter := range filters {
+		if strings.ContainsAny(filepath.ToSlash(strings.TrimSpace(filter)), "/\\") {
+			return true
+		}
+	}
+	return false
+}
+
+// pathMappingMayBeAliased reports whether a directory symlink can provide a
+// second repository-relative spelling for targetIdentity. Read failures are
+// conservative: inability to prove the inverse mapping must not authorize a
+// selected deletion.
+func pathMappingMayBeAliased(base, targetIdentity string) bool {
+	baseIdentity, err := mutationDirectoryIdentity(base)
+	if err != nil {
+		return true
+	}
+	current := filepath.Dir(targetIdentity)
+	parent := filepath.Dir(current)
+	for {
+		entries, readErr := os.ReadDir(parent)
+		if readErr != nil {
+			return true
+		}
+		for _, entry := range entries {
+			if entry.Type()&os.ModeSymlink == 0 {
+				continue
+			}
+			alias := filepath.Join(parent, entry.Name())
+			resolved, evalErr := filepath.EvalSymlinks(alias)
+			if evalErr != nil {
+				return true
+			}
+			if pathIdentityKey(resolved) == pathIdentityKey(current) {
+				return true
+			}
+		}
+		if current == baseIdentity || !pathWithinWriterBase(baseIdentity, current) {
+			return false
+		}
+		current = parent
+		parent = filepath.Dir(current)
+	}
 }
 
 func pathWithinWriterBase(base, targetIdentity string) bool {
