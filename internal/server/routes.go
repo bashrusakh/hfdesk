@@ -14,6 +14,7 @@ import (
 // routeKey outside the closed, server-defined key set. Handlers map it to
 // HTTP 400 rather than treating the value as a destination path.
 var errInvalidRouteKey = errors.New("invalid routeKey")
+var errInvalidDestination = errors.New("invalid destination")
 
 // routeKeys is the closed, server-owned set of download-route keys. Keys are
 // an internal/advanced-API detail; the dashboard renders human labels for

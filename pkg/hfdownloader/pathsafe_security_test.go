@@ -360,6 +360,7 @@ func TestDestinationBaseRejectsTraversal(t *testing.T) {
 	}{
 		{Job{Repo: "owner/model"}, filepath.Join(rootAbs, "owner", "model")},
 		{Job{Repo: "owner/model", LocalRepo: "vendor/model-a"}, filepath.Join(rootAbs, "vendor", "model-a")},
+		{Job{Repo: "owner/model", LocalRepo: "a/../b"}, filepath.Join(rootAbs, "b")},
 	}
 	for _, c := range good {
 		got, err := destinationBase(c.job, cfg)
@@ -372,6 +373,17 @@ func TestDestinationBaseRejectsTraversal(t *testing.T) {
 		}
 		if !PathInside(rootAbs, got) {
 			t.Errorf("destinationBase(%+v) = %q, outside effective root %q", c.job, got, rootAbs)
+		}
+	}
+}
+
+func TestDestinationBasePreservesPlatformLocality(t *testing.T) {
+	for _, folder := range []string{"NUL", "CON", "owner/name:stream", "name\x00suffix"} {
+		if filepath.IsLocal(folder) {
+			continue
+		}
+		if got, err := DestinationBase(t.TempDir(), folder); err == nil {
+			t.Errorf("DestinationBase accepted platform-nonlocal folder %q as %q", folder, got)
 		}
 	}
 }

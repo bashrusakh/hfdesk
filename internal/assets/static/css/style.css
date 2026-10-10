@@ -2162,6 +2162,58 @@ a {
   margin-bottom: 12px;
 }
 
+.cache-selection-group {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  margin-top: 10px;
+}
+
+.cache-selection-group-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.cache-selection-group details summary,
+#cacheSelectionLocation {
+  cursor: pointer;
+}
+
+#cacheSelectionSection {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+#cacheSelectionLocation {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.cache-selection-group ul {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+.cache-selection-group li {
+  margin: 6px 0;
+}
+
+.cache-selection-warning {
+  color: var(--color-warning, var(--color-error));
+}
+
+.cache-selection-readonly {
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
 .cache-detail-grid {
   display: grid;
   gap: 12px;

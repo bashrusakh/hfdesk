@@ -34,6 +34,78 @@ func newTestServer(t *testing.T) *Server {
 	return newTestServerWithConfig(t, cfg)
 }
 
+func TestCacheInfoHonorsExplicitRepositoryType(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir()})
+	cache := s.snapshotConfig().cache()
+	for _, typ := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
+		rd, err := cache.Repo("owner/shared", typ)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(rd.Path(), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	modelOnly, err := cache.Repo("owner/model-only", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(modelOnly.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	request := func(query string) (int, CachedRepoInfo) {
+		path := "/api/cache/owner/shared" + query
+		w := cacheRequest(t, s, "GET", path, "")
+		var got CachedRepoInfo
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		return w.Code, got
+	}
+	for _, typ := range []string{"model", "dataset"} {
+		code, got := request("?type=" + typ)
+		if code != http.StatusOK || got.Type != typ {
+			t.Errorf("type=%s: status=%d response=%+v", typ, code, got)
+		}
+	}
+	if code, got := request(""); code != http.StatusOK || got.Type != "model" {
+		t.Errorf("legacy default: status=%d response=%+v", code, got)
+	}
+	if code, _ := request("?type=invalid"); code != http.StatusBadRequest {
+		t.Errorf("invalid explicit type status=%d", code)
+	}
+	w := cacheRequest(t, s, "GET", "/api/cache/owner/model-only?type=dataset", "")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("missing explicit dataset fell back to model: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCacheInfoExplicitModelIncludesLocalScanRepo(t *testing.T) {
+	hub := t.TempDir()
+	t.Setenv("HF_HUB_CACHE", hub)
+	scanRoot := t.TempDir()
+	repoDir := filepath.Join(scanRoot, "owner", "manual")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "manual.gguf"), []byte("weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: []string{scanRoot}})
+	w := cacheRequest(t, s, "GET", "/api/cache/owner/manual?type=model", "")
+	var got CachedRepoInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || got.Type != "model" || got.Source != "Local" || got.Path != repoDir {
+		t.Fatalf("explicit model did not return local model: status=%d response=%+v body=%s", w.Code, got, w.Body.String())
+	}
+	w = cacheRequest(t, s, "GET", "/api/cache/owner/manual?type=dataset", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("explicit dataset fell back to local model: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func newTestServerWithConfig(t *testing.T, cfg Config) *Server {
 	t.Helper()
 	hub := NewWSHub()
@@ -493,6 +565,27 @@ func TestLocalCacheRoot_SubrootCaseSemantics(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("case-different parent: excluded = %v, want %v", got, want)
+	}
+}
+
+func TestLocalCacheRoot_ExcludesRegisteredDescendantAlias(t *testing.T) {
+	outer := t.TempDir()
+	child := filepath.Join(outer, "owner", "model", "library")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "registered-library")
+	if err := os.Symlink(child, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	root := localCacheRoot{Path: outer}
+	got := root.excludedSubroots([]localCacheRoot{root, {Path: alias}})
+	want := []string{child}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("aliased configured descendant boundaries=%v, want %v", got, want)
 	}
 }
 
@@ -1335,6 +1428,28 @@ func TestAPI_StartDownload_OutputIgnored(t *testing.T) {
 	}
 	if resp.OutputDir != srv.config.CacheDir {
 		t.Errorf("Expected server-controlled HF cache output, got %s", resp.OutputDir)
+	}
+}
+
+func TestAPI_StartDownloadRejectsEscapingLocalRepo(t *testing.T) {
+	for _, localRepo := range []string{"../outside", "owner/..", "custom/deep/path", "a/../b", "owner/na\x00me"} {
+		t.Run(localRepo, func(t *testing.T) {
+			srv := newTestServer(t)
+			body, err := json.Marshal(DownloadRequest{Repo: "owner/model", LocalRepo: localRepo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest("POST", "/api/download", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.handleStartDownload(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400; body=%s", w.Code, w.Body.String())
+			}
+			if jobs := srv.jobs.ListJobs(); len(jobs) != 0 {
+				t.Fatalf("invalid destination was admitted: %+v", jobs)
+			}
+		})
 	}
 }
 
