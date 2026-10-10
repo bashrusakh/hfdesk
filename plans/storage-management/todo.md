@@ -6,8 +6,10 @@
   выбранных HF targets, совпадающих с producer-shaped incomplete/download (`tmp-…`, part/multipart)
   или atomic-copy (`<blob-key>.tmp-…`) staging. Отказ сохраняет всю подтверждённую смешанную группу;
   несвязанные staging не блокируют удаление, а storage API не меняется. Fresh base для интеграции:
-  `origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`. Итоговое merge и проверки ещё ожидаются;
-  независимые review/tester и публикация принадлежат родительской сессии.
+  `origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b` обычно слит без конфликтов. После merge
+  прошли `go test ./...`, `go test ./... -race`, `go vet ./...`, build, Windows test cross-builds и
+  `git diff --check`; это implementation-local evidence. Независимые review/tester и публикация
+  принадлежат родительской сессии.
 - [x] После исходного HEAD `a8311c8495946cf4b965d0afc7b636e952ff31b4` добавлена узкая защита: выбранные HF snapshot targets с суффиксами `.incomplete` / `.incomplete.meta` отклоняются до unlink; тесты покрывают mixed composition, Windows-aware case semantics и HTTP 409 без изменения данных. Локальные focused helper/HTTP suites, `go test ./...`, affected-package race, vet/build и diffcheck прошли; Windows — только cross-build, не native run. Новое независимое review и финальная проверка кандидата ожидают родительскую сессию; свежий scanner result не заявляется.
 - [x] Локальное и HF-удаление выбранной GGUF-группы реализовано; UI даёт выбрать место/группу и подтверждает область удаления во всех сохранённых версиях выбранного HF-репозитория в выбранном месте. Shared payload остаётся, если нужен другой сохранённой версии/группе.
 - [x] Свежие независимые review целого diff (28/28, PASS) и проверка кандидата прошли на кодовом HEAD `59d070f7b197803cd7ab0d7fc8fea21d546f55f5` и базе `50813f00554628b4146512b898ab10f7c6662efe`; подробности и границы evidence — в `plan.md` §10. Эти результаты не относятся к последующему документационному commit.

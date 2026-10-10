@@ -9,11 +9,12 @@
 (включая part/multipart формы) и независимые `<blob-key>.tmp-…` atomic-copy stages приводит к
 отказу до unlink; mixed members сохраняются. API/создание хранилища не меняются. Проверена также
 сосуществующая unrelated staging и Windows-aware нормализация. Точный свежий base —
-`origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`; его обычное merge в эту ветку и итоговые
-свежие проверки ещё ожидаются. Локальные результаты относятся к конкретным SHA/tree, перечисленным
-в handoff родительской сессии; они не являются независимой проверкой интегрированного кандидата,
-новым whole-PR review или свежим scanner result. Нативные Windows/SMB и browser/mobile не заявляются.
-PR остаётся Draft; публикация и Ready не разрешены.
+`origin/main` `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b` — обычно слит в эту ветку без конфликтов;
+интегрированная кодовая версия прошла `go test ./...`, `go test ./... -race`, `go vet ./...`, build,
+Windows test cross-builds и `git diff --check`. SHA/tree кандидата приведены в handoff родительской
+сессии, а не зафиксированы здесь до финальной проверки. Это implementation-local evidence, не
+независимая проверка интегрированного кандидата, whole-PR review или свежий scanner result.
+Нативные Windows/SMB и browser/mobile не заявляются. PR остаётся Draft; публикация и Ready не разрешены.
 
 Независимые review целого diff (28/28, PASS) и проверка кандидата (PASS), упомянутые ниже,
 относятся к их указанным историческим HEAD/base и не подтверждают этот новый кандидат. Нативные
