@@ -2,7 +2,7 @@
 
 ## Статус
 
-**Текущий статус (локальная ветка):** кодовый кандидат `353011b887ab783faff0041a5c07740aedc1f94a`
+**Снимок публикации и проверки от 2026-10-10:** кодовый источник `353011b887ab783faff0041a5c07740aedc1f94a`
 (дерево `55dec4f3336334fb1c37c684e25f8f4f51c7c0ca`) на `feature/storage-root-ownership` содержит
 узкий producer-shaped preflight: выбранные HF snapshot targets с неполными данными/metadata,
 подтверждённым `tmp-download` namespace и производными part/metadata/bare-verified temporary файлами,
@@ -23,11 +23,14 @@ scanner или remote CI проверка. Whole-review: PASS (28/28), с 8 св
 byte-identical; interactions retraced, managed OCR не запускался. Main PR #122 merged в
 `3643422`; свежие proxy/analyzer integration tests прошли.
 
-Опубликованный PR #111 HEAD остаётся старым `a8311c8495946cf4b965d0afc7b636e952ff31b4`; текущий
-remote CI ожидает публикации. Семь старых CodeQL alerts не объявляются разрешёнными, подавленными
-или прошедшими. Push ещё не выполнен; дальнейшее решение о публикации принадлежит родительской
-сессии. PR остаётся Draft; Ready/merge исключены. Нативные Windows/SMB и свежий browser/mobile не
-заявляются. Исходный root-proxy checkout сохранён; временный task worktree оставлен по одобрению
+Проверенный исходный код — `353011b887ab783faff0041a5c07740aedc1f94a` (base
+`cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`); тестовый отчёт относится к этому source, а предыдущий
+документационный snapshot был `46b8d0893435b3b4476d9b00a20278ef71fb2789`. PR #111 был переведён
+в Draft для одобренного исправления тестовых fixtures и этих документов. Это датированный снимок;
+текущим remote source/state является GitHub. Новая публикация, Ready и условный merge принадлежат
+родительской сессии. Свежих remote checks для этой будущей публикации ещё нет; старые CodeQL alerts
+не объявляются разрешёнными, подавленными или прошедшими без нового evidence. Нативные Windows/SMB
+и свежий browser/mobile не заявляются. Исходный root-proxy checkout сохранён; временный task worktree оставлен по одобрению
 пользователя. Tester-owned runtime/binaries/fixtures очищены; воспроизводимые source/logs сохранены
 в `/tmp/opencode/pr111-independent-353011b-Oc50Io`.
 
@@ -39,8 +42,8 @@ remote CI ожидает публикации. Семь старых CodeQL aler
 проверенного server flow, но показывает игнорируемый request flag как отдельный follow-up; новое
 поведение флага не является частью текущего исправления.
 
-Документационный commit не меняет проверенные исходники; push/PR metadata остаются за родительской
-сессией, Ready/merge исключены.
+Документационные и тестовые изменения не меняют production-исходники; последующая публикация,
+Ready и условный merge остаются за родительской сессией.
 Связанные задачи: [PR #111](https://github.com/bashrusakh/hfdesk/pull/111),
 [issue #63](https://github.com/bashrusakh/hfdesk/issues/63).
 
@@ -321,11 +324,11 @@ false-positive disposition. Ещё пять alerts включали файлов
 повторять старые counts как доказательство всего исторического tracker. PR остаётся Draft; Ready
 и merge не заявляются.
 
-## Версии для разработчика
+## Исторические версии для разработчика
 
 Состояния разделены; сведения о коде относятся к указанным версиям:
 - Проверенный родительской сессией `origin/main`: `45d4de0c9d08fcc44dc1a24a00c7c703cface892`.
-- Опубликованный HEAD PR #111 (устаревший относительно проверенного исходного кандидата): `0b4e3fb3a6b9f2f74e44ca967ca7c6f9e2f9031b`.
+- Опубликованный HEAD PR #111 на дату той записи (не текущая remote-state claim): `0b4e3fb3a6b9f2f74e44ca967ca7c6f9e2f9031b`.
 - Общий предок для сравнения: `8d3f9824959a5d2c4f089748f1f18fbf656233a5`.
 - Место записи документа: `feature/storage-root-safety` на `2648eb73518fe185bd26e558a73b56254b6cbb76`.
 - В рабочем дереве уже было 13 пользовательских изменений; они не являются доказательством состояния main или PR.

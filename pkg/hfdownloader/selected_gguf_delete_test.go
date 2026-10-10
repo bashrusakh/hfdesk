@@ -11,9 +11,18 @@ import (
 	"testing"
 )
 
+func selectedDeleteCacheRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve physical test temp root: %v", err)
+	}
+	return filepath.Join(root, "cache")
+}
+
 func selectedDeleteFixture(t *testing.T) (*RepoDir, string, string, string) {
 	t.Helper()
-	cache := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0)
+	cache := NewHFCache(selectedDeleteCacheRoot(t), 0)
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +212,7 @@ func TestDeleteSelectedGGUFRetainsBlobDependencyThroughFriendlyDirectoryAlias(t 
 }
 
 func TestDeleteSelectedGGUFRefusesRegularSnapshotDependencyThroughFriendlyDirectoryAlias(t *testing.T) {
-	repo, err := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +377,7 @@ func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
 }
 
 func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing.T) {
-	repo, err := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
