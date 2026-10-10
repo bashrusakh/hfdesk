@@ -167,15 +167,15 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 		return true
 	}
 	if pathWithinWriterBase(base, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job, pathMappingMayBeAliased(base, targetIdentity))
+		return jobMayWriteSelectedPathWithinBase(base, targetIdentity, job)
 	}
 	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
-		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job, true)
+		return jobMayWriteSelectedPathWithinBase(snapshotBase, targetIdentity, job)
 	}
 	return false
 }
 
-func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job, mappingMayBeAliased bool) bool {
+func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job) bool {
 	baseIdentity, err := mutationDirectoryIdentity(base)
 	if err != nil {
 		return true
@@ -207,12 +207,19 @@ func jobMayWriteSelectedPathWithinBase(base, targetIdentity string, job *Job, ma
 	if hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch) {
 		return true
 	}
-	// A symlinked directory can make the physical path lose the repository
-	// spelling used by the plan (weights -> actual). If a path-shaped filter
-	// missed every proven spelling, do not turn that uncertain inversion into a
-	// false negative. Filename/quant filters remain exact and can still prove a
-	// known non-overlap above.
-	if mappingMayBeAliased && hasPathFilter(job.Filters) {
+	// A path-shaped filter cannot prove a negative before planning. The
+	// repository-relative spelling may be supplied by a directory alias that is
+	// not visible from this physical path (including a nested or sibling alias),
+	// so a miss in the spellings reconstructed above is not a complete proof.
+	// Keep this conservative rather than attempting a partial alias inventory.
+	if hasPathFilter(job.Filters) {
+		return true
+	}
+	// A slashless filter can also select a directory. Its complete set of
+	// spellings is not knowable without recursively inventorying aliases, so
+	// keep the reservation conservative as well. Filename/quant filters that
+	// have already proved a basename non-overlap remain allowed above.
+	if hasAmbiguousBareFilter(job.Filters) {
 		return true
 	}
 	return false
@@ -227,41 +234,21 @@ func hasPathFilter(filters []string) bool {
 	return false
 }
 
-// pathMappingMayBeAliased reports whether a directory symlink can provide a
-// second repository-relative spelling for targetIdentity. Read failures are
-// conservative: inability to prove the inverse mapping must not authorize a
-// selected deletion.
-func pathMappingMayBeAliased(base, targetIdentity string) bool {
-	baseIdentity, err := mutationDirectoryIdentity(base)
-	if err != nil {
-		return true
-	}
-	current := filepath.Dir(targetIdentity)
-	parent := filepath.Dir(current)
-	for {
-		entries, readErr := os.ReadDir(parent)
-		if readErr != nil {
+// hasAmbiguousBareFilter identifies filters whose spelling could denote either
+// a directory component or a filename fragment. Quant/extension-like filters
+// retain their basename proof; a plain directory name must remain conservative
+// because its complete alias spelling set is not inventoried.
+func hasAmbiguousBareFilter(filters []string) bool {
+	for _, filter := range filters {
+		filter = strings.TrimSpace(filepath.ToSlash(filter))
+		if filter == "" || strings.Contains(filter, "/") || strings.HasPrefix(filter, ".") {
+			continue
+		}
+		if !strings.ContainsAny(filter, "-_.") {
 			return true
 		}
-		for _, entry := range entries {
-			if entry.Type()&os.ModeSymlink == 0 {
-				continue
-			}
-			alias := filepath.Join(parent, entry.Name())
-			resolved, evalErr := filepath.EvalSymlinks(alias)
-			if evalErr != nil {
-				return true
-			}
-			if pathIdentityKey(resolved) == pathIdentityKey(current) {
-				return true
-			}
-		}
-		if current == baseIdentity || !pathWithinWriterBase(baseIdentity, current) {
-			return false
-		}
-		current = parent
-		parent = filepath.Dir(current)
 	}
+	return false
 }
 
 func pathWithinWriterBase(base, targetIdentity string) bool {

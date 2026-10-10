@@ -1197,6 +1197,42 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 	}
 }
 
+func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T) {
+	storage := t.TempDir()
+	job := &Job{
+		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
+		Filters: []string{"weights"}, ExactMatch: true,
+	}
+	base := jobDestinationBase(job)
+	physical := filepath.Join(base, "physical", "nested")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "physical"), filepath.Join(base, "weights")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "model.gguf")) {
+		t.Fatal("bare directory filter missed a sibling alias spelling")
+	}
+
+	nestedAlias := filepath.Join(base, "physical", "weights")
+	if err := os.Symlink(filepath.Join(base, "physical", "nested"), nestedAlias); err != nil {
+		t.Fatal(err)
+	}
+	job.Filters = []string{"weights/model.gguf"}
+	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "model.gguf")) {
+		t.Fatal("full path filter missed a nested alias destination")
+	}
+
+	job.Filters = []string{"Q5_K_M"}
+	if jobMayWriteSelectedPath(job, filepath.Join(base, "canonical", "model-Q4_K_M.gguf")) {
+		t.Fatal("canonical filename with no matching quant was not allowed to prove non-overlap")
+	}
+}
+
 func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
 	storage := t.TempDir()
 	alias := filepath.Join(storage, "models", "owner", "model", "weights")
@@ -1215,6 +1251,9 @@ func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
 	}
 	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "model.gguf")) {
 		t.Fatal("unresolved alias parent was treated as a proven non-match")
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join(jobDestinationBase(job), "missing-parent", "model.gguf")) {
+		t.Fatal("missing parent mapping was treated as a proven non-match")
 	}
 }
 
