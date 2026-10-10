@@ -17,8 +17,16 @@ func TestUnsafeRepoPath(t *testing.T) {
 		{"model.safetensors", false},
 		{"subdir/model.bin", false},
 		{"a/b/c/config.json", false},
-		{"foo/./bar.txt", false}, // cleans to foo/bar.txt, stays in root
-		{"a/../b.txt", false},    // cleans to b.txt, stays in root
+
+		// Non-canonical in-root spellings must be rejected: SafeJoin cleans
+		// them before joining, so two raw spellings of one remote file would
+		// both be planned and race to write a single cache entry. The plan's
+		// accepted domain is exactly the canonical spelling.
+		{"foo/./bar.txt", true},                      // "." segment, cleans to foo/bar.txt
+		{"a/../b.txt", true},                         // in-root "..", cleans to b.txt
+		{"weights//model.gguf", true},                // empty segment, cleans to weights/model.gguf
+		{"Q5_K_M/../actual/model-Q4_K_M.gguf", true}, // in-root ".." alias, cleans to actual/model-Q4_K_M.gguf
+		{"weights/model.gguf/", true},                // trailing slash, cleans to weights/model.gguf
 
 		// Traversal / absolute / separator escapes must be rejected.
 		{"", true},

@@ -14,13 +14,19 @@ import (
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
-// would escape the repository root if joined onto a local directory. The path
-// list is remote-controlled (and the endpoint is operator-configurable via
-// --endpoint, so a malicious or MITM'd mirror can return anything), and the
-// path flows unchecked into file writes (filepath.Join(base, rel)) and symlink
-// creation. Anything absolute, containing a "\\" (Windows separator / drive
-// escape), or normalising to "" / "." / ".." / a "../" prefix is rejected to
-// prevent arbitrary-file-write.
+// would escape the repository root if joined onto a local directory, or is not
+// in canonical form. The path list is remote-controlled (and the endpoint is
+// operator-configurable via --endpoint, so a malicious or MITM'd mirror can
+// return anything), and the path flows unchecked into file writes
+// (filepath.Join(base, rel)) and symlink creation. Anything absolute,
+// containing a "\\" (Windows separator / drive escape), or normalising to ""
+// / "." / ".." / a "../" prefix is rejected to prevent arbitrary-file-write.
+// Beyond escape safety, the accepted domain is canonical spellings only: a
+// path whose raw spelling differs from its path.Clean form ("." segment,
+// empty "//" segment, in-root ".." segment, or trailing "/") would be silently
+// rewritten by the downstream SafeJoin/Join into a different physical
+// spelling, so two raw tree paths could plan duplicate writes of one cache
+// entry. Callers fail the plan loudly on the dirty spelling instead.
 func unsafeRepoPath(rel string) bool {
 	if rel == "" {
 		return true
@@ -32,7 +38,8 @@ func unsafeRepoPath(rel string) bool {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return true
 	}
-	return false
+	// Canonical-form check: rel must already be its own cleaned spelling.
+	return cleaned != rel
 }
 
 // unsafeBlobName reports whether a SHA256 value taken from the remote tree
@@ -236,8 +243,17 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if n.Type == "file" || n.Type == "blob" {
 			// Reject path-traversal entries before they reach any filesystem
 			// operation downstream. Fail the whole plan rather than silently
-			// skipping so a tampered tree is loud, not partial.
+			// skipping so a tampered tree is loud, not partial. A non-canonical
+			// but in-root spelling (".", "//", an in-root "..", or a trailing
+			// "/") is reported as such, naming the canonical form the caller
+			// would have rewritten it to: SafeJoin cleans before joining, so
+			// two spellings of one remote file would both be planned and the
+			// two transfers would race to write a single cache entry. The
+			// plan's accepted domain is exactly the canonical spelling.
 			if unsafeRepoPath(n.Path) {
+				if cleaned := path.Clean(n.Path); cleaned != n.Path && cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") {
+					return fmt.Errorf("refusing non-canonical path from repo tree: %q: want %q", n.Path, cleaned)
+				}
 				return fmt.Errorf("refusing unsafe path from repo tree: %q", n.Path)
 			}
 			fileNodes = append(fileNodes, n)
@@ -248,10 +264,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		return nil, err
 	}
 	baseNames := make([]string, 0, len(fileNodes))
-	for _, node := range fileNodes {
-		baseNames = append(baseNames, strings.ToLower(filepath.Base(node.Path)))
+	for _, n := range fileNodes {
+		baseNames = append(baseNames, strings.ToLower(n.Path))
 	}
-	ggufMode := isGGUFFilterDownload(baseNames, job.Filters, job.ExactMatch)
+	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
+	matchedDirs := matchedFilterDirectories(fileNodes, job, ggufMode)
 
 	for _, n := range fileNodes {
 		rel := n.Path
@@ -295,7 +312,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// Keep only files that match a filter: the selected quant's shards
 			// and any mmproj companion. Everything else is skipped.
 			for _, f := range job.Filters {
-				if filterMatches(nameLower, strings.ToLower(f), job.ExactMatch) {
+				if filterMatchesPath(rel, f, job.ExactMatch) {
 					if len(f) > len(matchedFilter) {
 						matchedFilter = f
 					}
@@ -304,21 +321,26 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			if matchedFilter == "" {
 				continue
 			}
-		} else if isLFS && len(job.Filters) > 0 {
+		} else if len(job.Filters) > 0 {
 			for _, f := range job.Filters {
-				fLower := strings.ToLower(f)
-				if filterMatches(nameLower, fLower, job.ExactMatch) {
+				if filterMatchesPath(rel, f, job.ExactMatch) {
 					if len(f) > len(matchedFilter) {
 						matchedFilter = f
 					}
 				}
 			}
-			// If filters provided and none matched, skip typical large LFS blobs
+			// Filters select payloads by their full repo-relative path. An unmatched
+			// LFS entry is payload for planning purposes, regardless of extension:
+			// mirrors may store configs and other metadata as LFS pointers too.
 			if matchedFilter == "" {
-				ln := strings.ToLower(name)
-				ext := strings.ToLower(filepath.Ext(name))
-				if ext == ".bin" || ext == ".act" || ext == ".safetensors" || ext == ".zip" || strings.HasSuffix(ln, ".gguf") || strings.HasSuffix(ln, ".ggml") {
+				if isLFS {
 					continue
+				}
+				dir := path.Dir(strings.ReplaceAll(rel, "\\", "/"))
+				if dir != "." {
+					if _, ok := matchedDirs[dir]; !ok {
+						continue
+					}
 				}
 			}
 		}
@@ -396,6 +418,49 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
 
+// matchedFilterDirectories returns the directories that contain a matched file
+// or an ancestor of one. They define the companion scope for active non-GGUF
+// filters: root files remain shared companions, while unrelated component
+// metadata does not leak into the plan. GGUF mode intentionally has no
+// companion scope because it is matched-only.
+func matchedFilterDirectories(fileNodes []hfNode, job Job, ggufMode bool) map[string]struct{} {
+	dirs := make(map[string]struct{})
+	if len(job.Filters) == 0 || ggufMode {
+		return dirs
+	}
+	for _, n := range fileNodes {
+		if isExcludedPath(n.Path, job.Excludes) {
+			continue
+		}
+		matched := false
+		for _, filter := range job.Filters {
+			if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			dirs[dir] = struct{}{}
+		}
+	}
+	return dirs
+}
+
+func isExcludedPath(rel string, excludes []string) bool {
+	nameLower := strings.ToLower(filepath.Base(rel))
+	relLower := strings.ToLower(rel)
+	for _, ex := range excludes {
+		exLower := strings.ToLower(ex)
+		if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
+			return true
+		}
+	}
+	return false
+}
+
 // GGUFPathSelected reports whether a known relative GGUF filename survives the
 // same excludes and filter predicate used by PlanRepo. It is also used by the
 // job manager to prove that a queued filtered job cannot write a selected
@@ -405,18 +470,14 @@ func GGUFPathSelected(relativePath string, filters, excludes []string, exact boo
 	if !strings.HasSuffix(name, ".gguf") {
 		return false
 	}
-	rel := strings.ToLower(relativePath)
-	for _, ex := range excludes {
-		exLower := strings.ToLower(ex)
-		if strings.Contains(name, exLower) || strings.Contains(rel, exLower) {
-			return false
-		}
+	if isExcludedPath(relativePath, excludes) {
+		return false
 	}
 	if len(filters) == 0 {
 		return true
 	}
 	for _, filter := range filters {
-		if filterMatches(name, strings.ToLower(filter), exact) {
+		if filterMatchesPath(relativePath, filter, exact) {
 			return true
 		}
 	}
@@ -457,6 +518,45 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 	return false
 }
 
+// filterMatchesPath matches a filter against the complete repository-relative
+// path. Substring mode intentionally retains the historical broad matching,
+// while exact mode treats directory components, filename segments, extensions,
+// and explicit directory prefixes as separate forms.
+func filterMatchesPath(rel, filter string, exact bool) bool {
+	rel = strings.ToLower(strings.ReplaceAll(rel, "\\", "/"))
+	filter = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+	if rel == "" || filter == "" {
+		return false
+	}
+	if !exact {
+		return strings.Contains(rel, filter)
+	}
+
+	// A trailing slash is an explicit directory selection. It must start at a
+	// path component boundary, so "unet/" does not select "myunet/".
+	if strings.HasSuffix(filter, "/") {
+		dir := strings.TrimSuffix(filter, "/")
+		return rel == dir || strings.HasPrefix(rel, dir+"/") || strings.Contains(rel, "/"+dir+"/")
+	}
+	// Extension filters are written as ".safetensors" and select that exact
+	// extension without making the leading dot a filename delimiter.
+	if strings.HasPrefix(filter, ".") && !strings.Contains(filter[1:], "/") {
+		return strings.HasSuffix(rel, filter)
+	}
+	// A slash-containing filter is a complete relative path form.
+	if strings.Contains(filter, "/") {
+		return rel == filter
+	}
+
+	parts := strings.Split(rel, "/")
+	for _, part := range parts[:len(parts)-1] {
+		if part == filter {
+			return true
+		}
+	}
+	return filterMatches(parts[len(parts)-1], filter, true)
+}
+
 // isFilterDelimiter reports whether r separates segments for exact-match
 // filtering. Underscores are intentionally NOT delimiters because quantization
 // names contain them (e.g. Q6_K, Q4_K_M).
@@ -464,28 +564,41 @@ func isFilterDelimiter(r rune) bool {
 	return r == '-' || r == '.' || r == ' '
 }
 
-// isGGUFFilterDownload reports whether the given filters target a .gguf file in
-// the supplied set of file base names (all expected lowercased). When true the
+// isGGUFFilterDownload reports whether the given filters select only .gguf files
+// in the supplied set of file paths (all expected lowercased). When true the
 // download is treated as GGUF-only: because a GGUF file is self-contained, the
 // plan keeps just the filter-matched files (the chosen quant's shards plus any
 // mmproj companion) and drops config/tokenizer JSON, README, .gitattributes and
-// fp16/ transformers metadata. For non-GGUF filters (e.g. "safetensors") this
-// returns false so those companion files are still downloaded.
+// fp16/ transformers metadata. A filter can match both GGUF and non-GGUF files
+// (for example, a selected directory), so mixed selections retain the normal
+// companion scope instead.
 func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
+	return isGGUFFilterDownloadWithExcludes(baseNames, filters, nil, exact)
+}
+
+func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exact bool) bool {
 	if len(filters) == 0 {
 		return false
 	}
-	for _, base := range baseNames {
-		if !strings.HasSuffix(base, ".gguf") {
+	matchedGGUF := false
+	matchedNonGGUF := false
+	for _, filePath := range baseNames {
+		if isExcludedPath(filePath, excludes) {
 			continue
 		}
 		for _, f := range filters {
-			if filterMatches(base, strings.ToLower(f), exact) {
-				return true
+			if !filterMatchesPath(filePath, f, exact) {
+				continue
 			}
+			if strings.HasSuffix(filePath, ".gguf") {
+				matchedGGUF = true
+			} else {
+				matchedNonGGUF = true
+			}
+			break
 		}
 	}
-	return false
+	return matchedGGUF && !matchedNonGGUF
 }
 
 // destinationBase returns the base output directory for a job.
