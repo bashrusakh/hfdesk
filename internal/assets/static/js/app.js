@@ -768,12 +768,29 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     if (data.quantized) {
       const q = data.quantized;
+      // Precision must not be implied from a header field: `bits` is only a
+      // model-wide width when precision is uniform. When it is mixed, present
+      // the per-expert and head widths as the tensor-group widths they are.
+      let precisionRow = '';
+      if (q.mixed_precision) {
+        const bitWidth = (n) => `${n}-bit`;
+        const expertWidth = (q.expert_bits_min || q.expert_bits_max)
+          ? (q.expert_bits_min && q.expert_bits_max && q.expert_bits_min !== q.expert_bits_max
+              ? `${q.expert_bits_min}–${q.expert_bits_max}-bit`
+              : bitWidth(q.expert_bits_min || q.expert_bits_max))
+          : '';
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Mixed</div></div>`
+          + (expertWidth ? `<div class="analysis-stat"><div class="analysis-stat-label">Per-Expert Widths</div><div class="analysis-stat-value">${expertWidth}</div></div>` : '')
+          + (q.head_bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Head Width</div><div class="analysis-stat-value">${bitWidth(q.head_bits)}</div></div>` : '');
+      } else if (q.bits) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
+      }
       typeInfoHtml = `
         <div class="analysis-section">
           <h4>Quantized Model Information</h4>
           <div class="analysis-grid">
             ${q.method ? `<div class="analysis-stat"><div class="analysis-stat-label">Method</div><div class="analysis-stat-value">${escapeHtml(q.method.toUpperCase())}</div></div>` : ''}
-            ${q.bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>` : ''}
+            ${precisionRow}
             ${q.group_size ? `<div class="analysis-stat"><div class="analysis-stat-label">Group Size</div><div class="analysis-stat-value">${q.group_size}</div></div>` : ''}
             ${q.backends?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Backends</div><div class="analysis-stat-value">${q.backends.slice(0,3).join(', ')}</div></div>` : ''}
           </div>
