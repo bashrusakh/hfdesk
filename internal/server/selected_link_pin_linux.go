@@ -29,3 +29,5 @@ func openSelectedLinkEntry(physicalRepo, name string) (*os.File, error) {
 func openSelectedRegularEntry(_ *os.Root, physicalRepo, name string) (*os.File, error) {
 	return openSelectedPathEntry(physicalRepo, name)
 }
+
+func shouldHardLinkSelectedEntry(error) bool { return false }

@@ -18,3 +18,5 @@ func openSelectedLinkEntry(_, _ string) (*os.File, error) {
 func openSelectedRegularEntry(root *os.Root, _, name string) (*os.File, error) {
 	return root.Open(name)
 }
+
+func shouldHardLinkSelectedEntry(error) bool { return false }

@@ -4,6 +4,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -640,6 +642,10 @@ type selectedDeleteHooks struct {
 	beforeRootOpen    func()
 	afterRootOpen     func()
 	beforeIdentityPin func(string)
+	forceHardLinkPin  bool
+	beforeHardLinkPin func(source, destination string) error
+	removeHardLinkPin func(*os.Root, string) error
+	closeHardLinkRoot func(*os.Root) error
 	afterFinalScan    func()
 	beforeRemove      func(int)
 	removeEntry       func(*os.Root, string) error
@@ -757,7 +763,159 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 // localSelectionFilesRoot is the delete path's authoritative enumeration. It
 // deliberately does not follow directory symlinks and never leaves the opened
 // repository root. The normal cache-selection scanner remains unchanged.
-func pinSelectedEntry(root *os.Root, physicalRepo, name string, observed os.FileInfo, linkOnly bool) (*selectedEntryIdentity, error) {
+type selectedHardLinkPin struct {
+	name    string
+	info    os.FileInfo
+	created bool
+}
+
+// selectedEntryPinSet owns every request-local identity resource from the
+// moment it is created until cleanup is explicitly finalized before response.
+type selectedEntryPinSet struct {
+	root              *os.Root
+	forceHardLink     bool
+	beforeHardLink    func(source, destination string) error
+	removeHardLink    func(*os.Root, string) error
+	closeHardLinkRoot func(*os.Root) error
+	handles           []*os.File
+	hardLinks         []*selectedHardLinkPin
+	containerName     string
+	containerInfo     os.FileInfo
+	containerRoot     *os.Root
+	containerCreated  bool
+	cleaned           bool
+}
+
+func newSelectedEntryPinSet(root *os.Root, hooks selectedDeleteHooks) *selectedEntryPinSet {
+	return &selectedEntryPinSet{
+		root:              root,
+		forceHardLink:     hooks.forceHardLinkPin,
+		beforeHardLink:    hooks.beforeHardLinkPin,
+		removeHardLink:    hooks.removeHardLinkPin,
+		closeHardLinkRoot: hooks.closeHardLinkRoot,
+	}
+}
+
+func (p *selectedEntryPinSet) ensureHardLinkContainer() error {
+	if p.containerCreated {
+		if p.containerRoot == nil {
+			return fmt.Errorf("temporary identity-pin container %q is unavailable", p.containerName)
+		}
+		return nil
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			return fmt.Errorf("create temporary identity-pin name: %w", err)
+		}
+		name := ".hfdesk-delete-pin-" + hex.EncodeToString(random)
+		if err := p.root.Mkdir(name, 0700); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return fmt.Errorf("create temporary identity-pin container %q: %w", name, err)
+		}
+		// Record ownership immediately after the exclusive mkdir succeeds.
+		p.containerName = name
+		p.containerCreated = true
+		info, err := p.root.Lstat(name)
+		if err != nil {
+			return fmt.Errorf("capture temporary identity-pin container %q: %w", name, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("temporary identity-pin container %q changed during creation", name)
+		}
+		if info.Mode().Perm()&0077 != 0 {
+			return fmt.Errorf("temporary identity-pin container %q is not private", name)
+		}
+		p.containerInfo = info
+		containerRoot, err := p.root.OpenRoot(name)
+		if err != nil {
+			return fmt.Errorf("open temporary identity-pin container %q: %w", name, err)
+		}
+		opened, statErr := containerRoot.Stat(".")
+		if statErr != nil || !os.SameFile(info, opened) {
+			_ = containerRoot.Close()
+			if statErr != nil {
+				return fmt.Errorf("verify temporary identity-pin container %q: %w", name, statErr)
+			}
+			return fmt.Errorf("temporary identity-pin container %q changed while opening", name)
+		}
+		p.containerRoot = containerRoot
+		return nil
+	}
+	return fmt.Errorf("could not allocate an exclusive temporary identity-pin container")
+}
+
+func (p *selectedEntryPinSet) verifyHardLinkContainerBinding() error {
+	if p.containerRoot == nil || p.containerInfo == nil {
+		return fmt.Errorf("temporary identity-pin container %q has no verified binding", p.containerName)
+	}
+	current, err := p.root.Lstat(p.containerName)
+	if err != nil {
+		return fmt.Errorf("verify temporary identity-pin container %q: %w", p.containerName, err)
+	}
+	if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(p.containerInfo, current) {
+		return fmt.Errorf("temporary identity-pin container %q binding changed", p.containerName)
+	}
+	opened, err := p.containerRoot.Stat(".")
+	if err != nil || !os.SameFile(p.containerInfo, opened) {
+		if err != nil {
+			return fmt.Errorf("verify opened temporary identity-pin container %q: %w", p.containerName, err)
+		}
+		return fmt.Errorf("opened temporary identity-pin container %q binding changed", p.containerName)
+	}
+	return nil
+}
+
+func (p *selectedEntryPinSet) pinByHardLink(name string) (*selectedEntryIdentity, error) {
+	if err := p.ensureHardLinkContainer(); err != nil {
+		return nil, err
+	}
+	if err := p.verifyHardLinkContainerBinding(); err != nil {
+		return nil, err
+	}
+	pinName := fmt.Sprintf("entry-%08d.pin", len(p.hardLinks))
+	destination := filepath.ToSlash(filepath.Join(p.containerName, pinName))
+	if p.beforeHardLink != nil {
+		if err := p.beforeHardLink(name, destination); err != nil {
+			return nil, fmt.Errorf("create temporary identity pin %q: %w", destination, err)
+		}
+	}
+	if err := p.verifyHardLinkContainerBinding(); err != nil {
+		return nil, err
+	}
+	if err := p.root.Link(filepath.FromSlash(name), filepath.FromSlash(destination)); err != nil {
+		return nil, fmt.Errorf("create temporary identity pin %q: %w", destination, err)
+	}
+	record := &selectedHardLinkPin{name: pinName, created: true}
+	// Link success creates a resource immediately; register it before any stat.
+	p.hardLinks = append(p.hardLinks, record)
+	info, err := p.containerRoot.Lstat(pinName)
+	if err != nil {
+		return nil, fmt.Errorf("capture temporary identity pin %q: %w", destination, err)
+	}
+	record.info = info
+	if err := p.verifyHardLinkContainerBinding(); err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("temporary identity pin %q is not a regular file", destination)
+	}
+	sourceInfo, err := p.root.Lstat(filepath.FromSlash(name))
+	if err != nil {
+		return nil, fmt.Errorf("verify selected source for temporary identity pin %q: %w", destination, err)
+	}
+	if !sourceInfo.Mode().IsRegular() || !os.SameFile(info, sourceInfo) || info.Size() != sourceInfo.Size() {
+		return nil, fmt.Errorf("selected source changed while temporary identity pin %q was created", destination)
+	}
+	return &selectedEntryIdentity{info: info}, nil
+}
+
+func (p *selectedEntryPinSet) pin(root *os.Root, physicalRepo, name string, linkOnly bool) (*selectedEntryIdentity, error) {
+	if !linkOnly && p.forceHardLink {
+		return p.pinByHardLink(name)
+	}
 	var pin *os.File
 	var err error
 	if linkOnly {
@@ -766,27 +924,103 @@ func pinSelectedEntry(root *os.Root, physicalRepo, name string, observed os.File
 		pin, err = openSelectedRegularEntry(root, physicalRepo, name)
 	}
 	if err != nil {
+		if !linkOnly && shouldHardLinkSelectedEntry(err) {
+			return p.pinByHardLink(name)
+		}
 		return nil, err
 	}
+	// Own the open handle before its metadata check so every error path closes it.
+	p.handles = append(p.handles, pin)
 	info, err := pin.Stat()
 	if err != nil {
-		_ = pin.Close()
 		return nil, err
 	}
-	if !os.SameFile(observed, info) || (observed.Mode()&os.ModeSymlink != 0) != linkOnly || (info.Mode()&os.ModeSymlink != 0) != linkOnly || (!linkOnly && observed.Size() != info.Size()) {
-		_ = pin.Close()
+	sourceInfo, err := root.Lstat(filepath.FromSlash(name))
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(info, sourceInfo) || (sourceInfo.Mode()&os.ModeSymlink != 0) != linkOnly || (info.Mode()&os.ModeSymlink != 0) != linkOnly || (!linkOnly && info.Size() != sourceInfo.Size()) {
 		return nil, fmt.Errorf("selected entry changed while its identity was being captured")
 	}
 	return &selectedEntryIdentity{info: info, pin: pin}, nil
 }
 
-func closeSelectedEntryIdentities(files []cacheSelectionFile) {
-	for i := range files {
-		files[i].identity.close()
+func (p *selectedEntryPinSet) cleanup() []string {
+	if p.cleaned {
+		return nil
 	}
+	p.cleaned = true
+	var failures []string
+	for _, handle := range p.handles {
+		if err := handle.Close(); err != nil {
+			failures = append(failures, "close selected-entry identity handle: "+err.Error())
+		}
+	}
+	for _, pin := range p.hardLinks {
+		if !pin.created {
+			continue
+		}
+		artifact := filepath.ToSlash(filepath.Join(p.containerName, pin.name))
+		if p.containerRoot == nil || pin.info == nil {
+			failures = append(failures, fmt.Sprintf("could not verify temporary identity pin %q; possible artifact remains", artifact))
+			continue
+		}
+		current, err := p.containerRoot.Lstat(pin.name)
+		if os.IsNotExist(err) {
+			failures = append(failures, fmt.Sprintf("temporary identity pin %q binding disappeared; possible renamed artifact remains", artifact))
+			continue
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("inspect temporary identity pin %q: %v", artifact, err))
+			continue
+		}
+		if !os.SameFile(pin.info, current) {
+			failures = append(failures, fmt.Sprintf("temporary identity pin %q binding changed; possible artifact remains", artifact))
+			continue
+		}
+		remove := p.containerRoot.Remove
+		if p.removeHardLink != nil {
+			remove = func(name string) error { return p.removeHardLink(p.containerRoot, name) }
+		}
+		if err := remove(pin.name); err != nil {
+			failures = append(failures, fmt.Sprintf("remove temporary identity pin %q (possible artifact remains): %v", artifact, err))
+		}
+	}
+	if p.containerRoot != nil {
+		closeRoot := p.containerRoot.Close
+		if p.closeHardLinkRoot != nil {
+			closeRoot = func() error { return p.closeHardLinkRoot(p.containerRoot) }
+		}
+		if err := closeRoot(); err != nil {
+			failures = append(failures, fmt.Sprintf("close temporary identity-pin container %q: %v", p.containerName, err))
+		}
+		p.containerRoot = nil
+	}
+	if p.containerCreated {
+		if p.containerInfo == nil {
+			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q could not be safely identified; possible artifact remains", p.containerName))
+			return failures
+		}
+		current, err := p.root.Lstat(p.containerName)
+		if os.IsNotExist(err) || err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(p.containerInfo, current) {
+			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q binding changed; possible artifact remains", p.containerName))
+			return failures
+		}
+		if err := p.root.Remove(p.containerName); err != nil {
+			failures = append(failures, fmt.Sprintf("remove temporary identity-pin container %q (possible artifact remains): %v", p.containerName, err))
+		}
+	}
+	return failures
 }
 
-func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool, beforeIdentityPin func(string)) ([]cacheSelectionFile, string) {
+func withPinCleanupDetails(details string, failures []string) string {
+	if len(failures) == 0 {
+		return details
+	}
+	return details + "; temporary identity-pin cleanup: " + strings.Join(failures, "; ")
+}
+
+func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool, beforeIdentityPin func(string), pins *selectedEntryPinSet) ([]cacheSelectionFile, string) {
 	var files []cacheSelectionFile
 	var warning string
 	excludedSet := make(map[string]bool, len(excluded))
@@ -819,15 +1053,25 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 		relative := filepath.ToSlash(name)
 		var identity *selectedEntryIdentity
 		if pinPaths[relative] {
+			rel := filepath.FromSlash(relative)
+			for dir := filepath.Dir(rel); dir != "."; dir = filepath.Dir(dir) {
+				parentInfo, parentErr := root.Lstat(dir)
+				if parentErr != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+					return fmt.Errorf("selected file has an unsafe parent component")
+				}
+			}
 			if beforeIdentityPin != nil {
 				beforeIdentityPin(relative)
 			}
-			identity, err = pinSelectedEntry(root, physicalRepo, relative, info, info.Mode()&os.ModeSymlink != 0)
+			identity, err = pins.pin(root, physicalRepo, relative, info.Mode()&os.ModeSymlink != 0)
 			if err != nil {
 				return err
 			}
 		}
 		size, linkOnly := info.Size(), info.Mode()&os.ModeSymlink != 0
+		if !linkOnly && identity != nil {
+			size = identity.info.Size()
+		}
 		if linkOnly {
 			// Root.Stat handles ordinary in-root links. For a relative link whose
 			// target is outside this repository, resolve only read-only metadata
@@ -838,7 +1082,6 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 				parent := filepath.Join(physicalRepo, filepath.Dir(filepath.FromSlash(name)))
 				target, linkErr := root.Readlink(name)
 				if linkErr != nil {
-					identity.close()
 					warning = "A GGUF link could not be resolved; unavailable links are omitted"
 					return nil
 				}
@@ -849,7 +1092,6 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 				}
 			}
 			if statErr != nil || !actual.Mode().IsRegular() {
-				identity.close()
 				warning = "A GGUF link could not be resolved; unavailable links are omitted"
 				return nil
 			}
@@ -1159,10 +1401,10 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	for _, member := range group.Members {
 		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = true
 	}
-	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin)
-	defer closeSelectedEntryIdentities(files)
+	pins := newSelectedEntryPinSet(root, s.selectedDeleteHooks)
+	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin, pins)
 	if scanWarning != "" {
-		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)
+		writeError(w, http.StatusConflict, "Location could not be verified", withPinCleanupDetails(scanWarning, pins.cleanup()))
 		return
 	}
 	if s.selectedDeleteHooks.afterFinalScan != nil {
@@ -1177,7 +1419,8 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if fresh == nil || !selectionCompositionEqual(group.Members, fresh.Members) {
-		writeError(w, http.StatusConflict, "Selection is stale", "The selected GGUF group changed while deletion was being reserved; refresh before deleting")
+		details := "The selected GGUF group changed while deletion was being reserved; refresh before deleting"
+		writeError(w, http.StatusConflict, "Selection is stale", withPinCleanupDetails(details, pins.cleanup()))
 		return
 	}
 	group = fresh
@@ -1187,13 +1430,15 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		for dir := filepath.Dir(rel); dir != "."; dir = filepath.Dir(dir) {
 			parentInfo, parentErr := root.Lstat(dir)
 			if parentErr != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
-				writeError(w, http.StatusConflict, "Selection is unsafe", "A selected file has an unsafe parent component")
+				details := "A selected file has an unsafe parent component"
+				writeError(w, http.StatusConflict, "Selection is unsafe", withPinCleanupDetails(details, pins.cleanup()))
 				return
 			}
 		}
 		info, statErr := root.Lstat(rel)
 		if statErr != nil || member.identity == nil || !os.SameFile(member.identity.info, info) || info.Size() != member.identity.info.Size() || info.IsDir() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
-			writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed during preflight")
+			details := "A selected GGUF entry changed during preflight"
+			writeError(w, http.StatusConflict, "Selection is stale", withPinCleanupDetails(details, pins.cleanup()))
 			return
 		}
 		rels = append(rels, rel)
@@ -1207,7 +1452,8 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		info, statErr := root.Lstat(rels[i])
 		if statErr != nil || member.identity == nil || !os.SameFile(member.identity.info, info) || info.Size() != member.identity.info.Size() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
 			if len(result.Removed) == 0 {
-				writeError(w, http.StatusConflict, "Selection is stale", "A selected GGUF entry changed immediately before deletion")
+				details := "A selected GGUF entry changed immediately before deletion"
+				writeError(w, http.StatusConflict, "Selection is stale", withPinCleanupDetails(details, pins.cleanup()))
 				return
 			}
 			result.OK = false
@@ -1237,6 +1483,15 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			result.LinkOnlyEntries = append(result.LinkOnlyEntries, member.Path)
 		}
 	}
+	cleanupErrors := pins.cleanup()
+	if len(cleanupErrors) > 0 {
+		result.OK = false
+		result.Errors = append(result.Errors, cleanupErrors...)
+		if len(result.Removed) == 0 {
+			writeError(w, http.StatusConflict, "Selected GGUF deletion was refused", strings.Join(result.Errors, "; "))
+			return
+		}
+	}
 	if result.OK {
 		if result.LinkOnly {
 			result.Message = "Removed the selected GGUF entries; link-only entries were unlinked without removing their weight targets"
@@ -1246,7 +1501,11 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
-	result.Message = "Some selected entries could not be removed; other files and directories were left unchanged"
+	if len(cleanupErrors) > 0 {
+		result.Message = "Selected deletion was partial; identity-pin cleanup issues and any remaining entries are listed in errors"
+	} else {
+		result.Message = "Some selected entries could not be removed; other files and directories were left unchanged"
+	}
 	writeJSON(w, http.StatusMultiStatus, result)
 }
 

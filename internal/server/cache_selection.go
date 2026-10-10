@@ -56,16 +56,7 @@ type cacheSelectionFile struct {
 
 type selectedEntryIdentity struct {
 	info os.FileInfo
-	// pin keeps the captured filesystem object alive through preflight and unlink,
-	// preventing its file ID/inode from being recycled for a replacement entry.
-	pin *os.File
-}
-
-func (i *selectedEntryIdentity) close() {
-	if i != nil && i.pin != nil {
-		_ = i.pin.Close()
-		i.pin = nil
-	}
+	pin  *os.File
 }
 
 var cacheShardSuffix = regexp.MustCompile(`(?i)([-_])(\d+)([-_]of[-_])(\d+)(\.gguf)$`)

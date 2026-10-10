@@ -325,10 +325,22 @@ unlink results use `207` and identify removed, remaining, and failed paths
 (`errors`). A local symlink member is unlinked without following or deleting
 its target. The authoritative delete-time enumeration and filesystem operations
 use one opened repository root and recheck each selected entry immediately
-before unlink; a detected configured-root alias change during admission is refused, and a later alias
-change does not redirect the operation to another location. The final identity
+before unlink; a detected configured-root alias change during admission is
+refused, and a later alias change does not redirect the operation to another
+location. The final identity
 check and unlink are not an atomic compare-and-remove against arbitrary external
 changes.
+On Darwin, when a selected regular file cannot be opened for identity pinning,
+the server may retain it with a hard link inside a private, request-local
+mode-0700 directory on the same filesystem. If filesystem or directory
+permissions prevent that pin, deletion is refused with `409` before selected
+entries are unlinked. Pin cleanup is attempted before the response: cleanup
+failure before selected effects remains a `409` with artifact diagnostics;
+cleanup failure after selected effects returns `207`, with `removed` and
+`remaining` describing only selected entries and `errors` identifying cleanup
+failures and any possible pin artifacts. A process crash can leave the private
+pin directory behind; HFDesk does not scan for or automatically remove such
+orphaned directories.
 The older `DELETE /api/cache/{owner}/{repo}` remains the separate
 whole-repository operation.
 
