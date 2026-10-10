@@ -304,15 +304,18 @@ and exact member composition (paths, saved versions, size, and link role) with
 the confirmation. Request paths are not used as deletion authority. Local
 deletion removes only selected GGUF entries. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
-friendly symlinks whose relative names match the selected remote paths and
-which resolve to those entries. Other friendly names are preserved; if one
-depends on a selected snapshot entry, deletion is refused before unlinking.
+friendly entries whose relative names match the selected remote paths and
+which provably resolve to those entries: symlinks by their link chain, and
+hardlink/copy fallback entries by shared file or identical content. Other
+friendly names are preserved; if one depends on a selected snapshot entry,
+deletion is refused before unlinking.
 It removes a blob payload only when no other named snapshot entry or retained
-friendly link in that repository references it; shared payloads are retained
+friendly entry in that repository references it (link target or shared file);
+shared payloads are retained
 and listed in `retainedPayloads`. Ordinary
 friendly files, other groups, versions, locations, metadata, partial files,
 and directories remain. Stale/unsafe selections and conflicting writers return
-`409`; this also applies when a selected snapshot link targets a downloader
+`409`; this also applies when a selected snapshot entry resolves to a downloader
 staging name (`tmp-…`, including part/multipart metadata forms, or
 `<blob-key>.tmp-…` atomic-copy stages). The refusal precedes unlinking, leaving
 all confirmed members intact. Unrelated staging files do not by themselves
