@@ -378,19 +378,30 @@ func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity stri
 		// A semantic snapshot namespace is physically rooted at
 		// snapshots/<commit>, while the plan's RelativePath starts below that
 		// commit directory. The commit is not known until planning completes,
-		// so compare both the full spelling and the suffix after the
-		// semantic snapshots/<commit> prefix. The snapshot kind comes from
-		// the job's configured snapshot base, never from a resolved physical
-		// basename: whenever the semantic base and its resolved/aliased
-		// identity diverge in a way that leaves the spelling closure
-		// incomplete (unreadable entries, dangling/looping symlinks, outward
-		// alias destinations, or spelling overflow), the inventory or the
-		// enumeration above already failed closed with the conservative
+		// and it may be multi-component (e.g. the revision-name fallback
+		// "feature/v2" when the revision-info lookup fails), so compare every
+		// suffix after the first k = 1..n-1 leading components of the full
+		// spelling, not just the suffix after the first component. Any suffix
+		// that does not correspond to the real commit prefix only adds an
+		// over-conservative possible-writer answer, which is safe; deriving a
+		// negative from a one-component strip would not be. The snapshot kind
+		// comes from the job's configured snapshot base, never from a resolved
+		// physical basename: whenever the semantic base and its
+		// resolved/aliased identity diverge in a way that leaves the spelling
+		// closure incomplete (unreadable entries, dangling/looping symlinks,
+		// outward alias destinations, or spelling overflow), the inventory or
+		// the enumeration above already failed closed with the conservative
 		// possible-writer answer, so no negative is ever derived from a
 		// basename-resolved namespace type.
 		if inv.snapshotNamespace {
-			if idx := strings.Index(candidate, "/"); idx >= 0 {
-				candidates = append(candidates, candidate[idx+1:])
+			rest := candidate
+			for {
+				idx := strings.Index(rest, "/")
+				if idx < 0 {
+					break
+				}
+				rest = rest[idx+1:]
+				candidates = append(candidates, rest)
 			}
 		}
 	}

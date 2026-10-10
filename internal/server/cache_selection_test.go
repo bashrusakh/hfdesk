@@ -1535,6 +1535,112 @@ func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
 	cancel()
 }
 
+// TestSelectedDeleteBlocksMultiComponentRevisionSnapshotWriter covers the
+// pre-plan snapshot-namespace regression for revision-name fallback commits:
+// when the revision-info lookup fails, a slash-bearing revision ("feature/v2")
+// survives as the plan commit, so the writer's snapshot destination is
+// snapshots/feature/v2/<relative> while the plan's RelativePath starts below
+// the whole commit prefix. Stripping only the first leading component leaves
+// "v2/weights/model.gguf" and wrongly proves a negative against the exact
+// filter weights/model.gguf; every proper suffix of the full spelling must be
+// treated as a possible repository-relative spelling so both reservation
+// orderings stay conservative, matching the snapshot destination that
+// jobPlannedWriteEntries produces for commit feature/v2.
+func TestSelectedDeleteBlocksMultiComponentRevisionSnapshotWriter(t *testing.T) {
+	storage := t.TempDir()
+	cache := hfdownloader.NewHFCache(storage, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{
+		OutputDir: storage, HubDir: cache.HubDir(),
+		Repo: "upstream/source", LocalRepo: "owner/model", Revision: "feature/v2",
+		Filters: []string{"weights/model.gguf"}, ExactMatch: true,
+	}
+	target := filepath.Join(rd.SnapshotsDir(), "feature", "v2", "weights", "model.gguf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("gguf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("multi-component revision snapshot path was treated as a proven non-match")
+	}
+
+	entries, complete := jobPlannedWriteEntries(job, hfdownloader.Plan{
+		Commit: "feature/v2",
+		Items:  []hfdownloader.PlanItem{{RelativePath: "weights/model.gguf"}},
+	})
+	if !complete {
+		t.Fatal("planned write-set was not complete")
+	}
+	overlap := false
+	for _, entry := range entries {
+		if sameMutationPath(entry, target) {
+			overlap = true
+			break
+		}
+	}
+	if !overlap {
+		t.Fatal("planned snapshot destination does not share the physical target identity")
+	}
+
+	// writer -> delete: a queued matching writer vetoes the reservation.
+	writerFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	queued := *job
+	queued.ID, queued.Status = "multi-revision-writer", JobStatusQueued
+	writerFirst.jobs.mu.Lock()
+	writerFirst.jobs.jobs[queued.ID] = &queued
+	writerFirst.jobs.mu.Unlock()
+	if release, ok := writerFirst.jobs.reserveSelectedGGUF([]string{target}); ok {
+		release()
+		t.Fatal("selected deletion crossed a queued multi-component revision writer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := writerFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	// delete -> Create/dispatch/Resume/Retry: every admission path stays
+	// blocked while the reservation is held.
+	deleteFirst := newTestServerWithConfig(t, Config{CacheDir: storage})
+	release, ok := deleteFirst.jobs.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("could not reserve selected entry")
+	}
+	paused := *job
+	paused.ID, paused.Status = "multi-revision-paused", JobStatusPaused
+	cancelled := *job
+	cancelled.ID, cancelled.Status = "multi-revision-cancelled", JobStatusCancelled
+	deleteFirst.jobs.mu.Lock()
+	deleteFirst.jobs.jobs[paused.ID] = &paused
+	deleteFirst.jobs.jobs[cancelled.ID] = &cancelled
+	blocked := deleteFirst.jobs.jobBlockedByDeleteLocked(job)
+	deleteFirst.jobs.mu.Unlock()
+	if !blocked {
+		t.Fatal("queued multi-component revision writer crossed selected deletion reservation")
+	}
+	if deleteFirst.jobs.ResumeJob(paused.ID) {
+		t.Fatal("paused multi-component revision writer resumed through the reservation")
+	}
+	if deleteFirst.jobs.RetryJob(cancelled.ID) {
+		t.Fatal("cancelled multi-component revision writer retried through the reservation")
+	}
+	if _, _, err := deleteFirst.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Revision: "feature/v2", Filters: []string{"weights/model.gguf"}, ExactMatch: true}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new multi-component revision writer crossed reservation: %v", err)
+	}
+	release()
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := deleteFirst.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+}
+
 func TestJobPlannedWriteEntriesTreatsEmptyPlanAsComplete(t *testing.T) {
 	entries, complete := jobPlannedWriteEntries(&Job{OutputDir: t.TempDir(), Repo: "owner/model"}, hfdownloader.Plan{})
 	if !complete || len(entries) != 0 {
