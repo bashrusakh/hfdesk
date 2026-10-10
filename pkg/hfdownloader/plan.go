@@ -14,13 +14,19 @@ import (
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
-// would escape the repository root if joined onto a local directory. The path
-// list is remote-controlled (and the endpoint is operator-configurable via
-// --endpoint, so a malicious or MITM'd mirror can return anything), and the
-// path flows unchecked into file writes (filepath.Join(base, rel)) and symlink
-// creation. Anything absolute, containing a "\\" (Windows separator / drive
-// escape), or normalising to "" / "." / ".." / a "../" prefix is rejected to
-// prevent arbitrary-file-write.
+// would escape the repository root if joined onto a local directory, or is not
+// in canonical form. The path list is remote-controlled (and the endpoint is
+// operator-configurable via --endpoint, so a malicious or MITM'd mirror can
+// return anything), and the path flows unchecked into file writes
+// (filepath.Join(base, rel)) and symlink creation. Anything absolute,
+// containing a "\\" (Windows separator / drive escape), or normalising to ""
+// / "." / ".." / a "../" prefix is rejected to prevent arbitrary-file-write.
+// Beyond escape safety, the accepted domain is canonical spellings only: a
+// path whose raw spelling differs from its path.Clean form ("." segment,
+// empty "//" segment, in-root ".." segment, or trailing "/") would be silently
+// rewritten by the downstream SafeJoin/Join into a different physical
+// spelling, so two raw tree paths could plan duplicate writes of one cache
+// entry. Callers fail the plan loudly on the dirty spelling instead.
 func unsafeRepoPath(rel string) bool {
 	if rel == "" {
 		return true
@@ -32,7 +38,8 @@ func unsafeRepoPath(rel string) bool {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return true
 	}
-	return false
+	// Canonical-form check: rel must already be its own cleaned spelling.
+	return cleaned != rel
 }
 
 // unsafeBlobName reports whether a SHA256 value taken from the remote tree
@@ -236,8 +243,17 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if n.Type == "file" || n.Type == "blob" {
 			// Reject path-traversal entries before they reach any filesystem
 			// operation downstream. Fail the whole plan rather than silently
-			// skipping so a tampered tree is loud, not partial.
+			// skipping so a tampered tree is loud, not partial. A non-canonical
+			// but in-root spelling (".", "//", an in-root "..", or a trailing
+			// "/") is reported as such, naming the canonical form the caller
+			// would have rewritten it to: SafeJoin cleans before joining, so
+			// two spellings of one remote file would both be planned and the
+			// two transfers would race to write a single cache entry. The
+			// plan's accepted domain is exactly the canonical spelling.
 			if unsafeRepoPath(n.Path) {
+				if cleaned := path.Clean(n.Path); cleaned != n.Path && cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") {
+					return fmt.Errorf("refusing non-canonical path from repo tree: %q: want %q", n.Path, cleaned)
+				}
 				return fmt.Errorf("refusing unsafe path from repo tree: %q", n.Path)
 			}
 			fileNodes = append(fileNodes, n)
