@@ -251,6 +251,17 @@ func physicalEntryOverlap(stored, incoming string) bool {
 	return stored == incoming || withinLocalRoot(stored, incoming) || withinLocalRoot(incoming, stored)
 }
 
+func plannedEntriesConflict(frozenEntries, plannedPaths []string) bool {
+	for _, frozen := range frozenEntries {
+		for _, planned := range plannedPaths {
+			if physicalEntryOverlap(frozen, planned) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func directoryOverlapsFrozenEntry(scope, frozenEntry string) bool {
 	dir, err := mutationDirectoryIdentity(scope)
 	if err != nil {
@@ -331,7 +342,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	}
 	for _, activity := range m.runActivities {
 		if activity.planKnown {
-			if entryConflicts(mapKeys(activity.planned)) {
+			if plannedEntriesConflict(clean, mapKeys(activity.planned)) {
 				m.mu.Unlock()
 				return nil, false
 			}

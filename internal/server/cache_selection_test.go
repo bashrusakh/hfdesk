@@ -1230,6 +1230,105 @@ func TestSelectedDeleteBlocksPrescanWriterWhenAliasChangesExcludedPath(t *testin
 	}
 }
 
+func TestSelectedDeleteExcludesPlannedWriterThroughAliasAfterPlan(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		writerQuant string
+		writerFile  string
+		wantStatus  int
+	}{
+		{name: "matching Q4 conflicts", writerQuant: "Q4_K_M", writerFile: "model-Q4_K_M.gguf", wantStatus: http.StatusConflict},
+		{name: "nonmatching Q5 remains allowed", writerQuant: "Q5_K_M", writerFile: "model-Q5_K_M.gguf", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := t.TempDir()
+			repoDir := filepath.Join(storage, "models", "o", "m")
+			blocked := filepath.Join(repoDir, "blocked")
+			selectedFile := filepath.Join(blocked, "model-Q4_K_M.gguf")
+			writeSelectionFile(t, blocked, filepath.Base(selectedFile))
+			if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+				if runtime.GOOS == "windows" && os.IsPermission(err) {
+					t.Skipf("symlink privilege unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			hf, started, release := blockingPlanServer(t, "live/"+tc.writerFile)
+			defer hf.Close()
+			var releaseOnce sync.Once
+			releaseGate := func() { releaseOnce.Do(release) }
+			s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL, MaxActive: 1})
+			job, _, err := s.jobs.CreateJob(DownloadRequest{
+				Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{tc.writerQuant}, Excludes: []string{"blocked"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				releaseGate()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := s.jobs.Close(ctx); err != nil {
+					t.Errorf("close test job manager: %v", err)
+				}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("real downloader did not reach the planned transfer")
+			}
+			s.jobs.mu.Lock()
+			planned := false
+			for _, activity := range s.jobs.runActivities {
+				if activity.job.ID == job.ID && activity.planKnown {
+					planned = true
+					break
+				}
+			}
+			s.jobs.mu.Unlock()
+			if !planned {
+				t.Fatal("transfer began before the production run registered its completed plan")
+			}
+
+			body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != tc.wantStatus {
+				t.Errorf("delete while planned %s transfer is held: status=%d body=%s, want %d", tc.writerQuant, w.Code, w.Body.String(), tc.wantStatus)
+			}
+			if tc.wantStatus == http.StatusConflict {
+				if _, err := os.Stat(selectedFile); err != nil {
+					t.Errorf("conflicting planned writer's selected entry was removed: %v", err)
+				}
+			} else if _, err := os.Stat(selectedFile); !os.IsNotExist(err) {
+				t.Errorf("nonconflicting Q5 writer prevented selected Q4 deletion: %v", err)
+			}
+
+			releaseGate()
+			deadline := time.After(5 * time.Second)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				current, ok := s.jobs.GetJob(job.ID)
+				if ok && (current.Status == JobStatusCompleted || current.Status == JobStatusFailed) {
+					if current.Status != JobStatusCompleted {
+						t.Errorf("planned writer did not complete: %+v", current)
+					}
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("planned writer did not finish after transfer release")
+				case <-ticker.C:
+				}
+			}
+			written := filepath.Join(blocked, tc.writerFile)
+			data, err := os.ReadFile(written)
+			if err != nil || string(data) != "data!" {
+				t.Errorf("planned transfer output=%q err=%v, want recreated/written data", data, err)
+			}
+		})
+	}
+}
+
 func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	storage := t.TempDir()
 	repoDir := filepath.Join(storage, "models", "o", "m")
