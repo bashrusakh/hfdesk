@@ -392,8 +392,26 @@ type QuantizedInfo struct {
 	// MethodDescription is a human-readable description of the method.
 	MethodDescription string `json:"method_description,omitempty"`
 
-	// Bits is the quantization bit width.
+	// Bits is the quantization bit width when the config declares uniform
+	// model-wide precision. It stays 0 when MixedPrecision is true: a header
+	// bits field then describes only part of the model and must not be read
+	// as model-wide precision (the literal value remains in Metadata).
 	Bits int `json:"bits"`
+
+	// MixedPrecision indicates the config declares non-uniform precision,
+	// e.g. per-tensor-group and/or per-expert widths such as EXL3 head_bits
+	// and expert_bits. HeadBits and ExpertBitsMin/Max describe those groups
+	// and do not describe every tensor.
+	MixedPrecision bool `json:"mixed_precision,omitempty"`
+
+	// HeadBits is the bit width the config declares for head tensors
+	// (EXL3 head_bits): a tensor-group width, not model-wide precision.
+	HeadBits float64 `json:"head_bits,omitempty"`
+
+	// ExpertBitsMin and ExpertBitsMax bound the per-expert bit widths declared
+	// in the config's expert_bits mapping (EXL3), which vary per expert.
+	ExpertBitsMin float64 `json:"expert_bits_min,omitempty"`
+	ExpertBitsMax float64 `json:"expert_bits_max,omitempty"`
 
 	// GroupSize is the quantization group size.
 	GroupSize int `json:"group_size,omitempty"`

@@ -71,6 +71,30 @@ Important response fields:
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
 
+Quantized models expose a `quantized` projection in the response (also for
+quantization-only repositories that have a root `quantization_config.json` but
+no root architecture config):
+
+```json
+"quantized": {
+  "method": "exl3",
+  "method_description": "EXL3 - ExLlamaV3 quantization",
+  "bits": 0,
+  "head_bits": 16,
+  "expert_bits_min": 3,
+  "expert_bits_max": 4,
+  "mixed_precision": true
+}
+```
+
+`method` is the literal `quant_method` from the repository's quantization
+config. `bits` is the model-wide bit width and is only set when the config
+declares uniform precision. When `mixed_precision` is true, `bits` is `0` and
+must not be read as model-wide precision: `head_bits` is the declared width for
+head tensors and `expert_bits_min`/`expert_bits_max` bound the per-expert
+widths. The literal config header remains available under `metadata`. Unknown
+methods keep their name with an empty `method_description` and no `backends`.
+
 ## Plan
 
 ```http

@@ -343,6 +343,16 @@ func (a *Analyzer) rawURL(repo string, isDataset bool, revision, path string) st
 	return fmt.Sprintf("%s/%s/raw/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
 }
 
+// resolveURL builds the LFS-resolving file URL. Git-LFS-backed files are stored
+// as pointer stubs under /raw/; /resolve/ serves the actual bytes, matching the
+// downloader's LFS routing (pkg/hfdownloader lfsURL).
+func (a *Analyzer) resolveURL(repo string, isDataset bool, revision, path string) string {
+	if isDataset {
+		return fmt.Sprintf("%s/datasets/%s/resolve/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
+	}
+	return fmt.Sprintf("%s/%s/resolve/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
+}
+
 // hfRefsResponse represents the HuggingFace refs API response.
 type hfRefsResponse struct {
 	Branches []hfRef `json:"branches"`
@@ -527,11 +537,13 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 		filesToFetch = append(filesToFetch, "quantization_config.json")
 	}
 	for _, path := range filesToFetch {
-		// Check if file exists
+		// Check if the file exists and whether it is Git-LFS-backed.
 		found := false
+		isLFS := false
 		for _, f := range info.Files {
 			if f.Path == path {
 				found = true
+				isLFS = f.IsLFS
 				break
 			}
 		}
@@ -539,7 +551,7 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 			continue
 		}
 
-		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path)
+		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path, isLFS)
 		if err != nil {
 			if errors.Is(err, errMetadataTooLarge) && path == "quantization_config.json" {
 				data, headErr := decodeQuantizationHead(content)
@@ -567,10 +579,39 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 	return nil
 }
 
-// fetchFile fetches raw file content from the repository.
-func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, revision, path string) ([]byte, error) {
+// fetchFile fetches file content from the repository. Git-LFS-backed files are
+// fetched through /resolve/ so the actual bytes are returned instead of the
+// pointer stub that /raw/ serves (issue #123). A pointer stub from a file the
+// tree did not mark as LFS is retried through /resolve/ once; a pointer that
+// persists is an explicit failure and is never interpreted as file content.
+// Authentication keeps the default net/http redirect policy, which drops
+// Authorization on the cross-host CDN hop /resolve/ introduces.
+func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, revision, path string, isLFS bool) ([]byte, error) {
 	reqURL := a.rawURL(repo, isDataset, revision, path)
+	if isLFS {
+		reqURL = a.resolveURL(repo, isDataset, revision, path)
+	}
 
+	content, err := a.fetchFileFrom(ctx, reqURL, path)
+	if err != nil && !errors.Is(err, errMetadataTooLarge) {
+		return nil, err
+	}
+	if isLFSPointer(content) && !isLFS {
+		// Unmarked LFS file: /raw/ served the pointer stub, so the content is
+		// known to be missing; failing to replace it must stay explicit.
+		content, err = a.fetchFileFrom(ctx, a.resolveURL(repo, isDataset, revision, path), path)
+		if err != nil && !errors.Is(err, errMetadataTooLarge) {
+			return nil, &metadataReadError{fmt.Errorf("git-lfs pointer served instead of file content: %w", err)}
+		}
+	}
+	if isLFSPointer(content) {
+		return nil, &metadataReadError{errors.New("git-lfs pointer served instead of file content")}
+	}
+	return content, err
+}
+
+// fetchFileFrom reads one file's content under the metadata size bound.
+func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -597,6 +638,13 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 	return content, nil
 }
 
+// isLFSPointer reports whether content is a Git LFS pointer stub (the pointer
+// format of the Git LFS v1 spec) rather than actual file content.
+func isLFSPointer(content []byte) bool {
+	first, _, _ := bytes.Cut(content, []byte("\n"))
+	return string(bytes.TrimSpace(first)) == "version https://git-lfs.github.com/spec/v1"
+}
+
 const maxMetadataSize = 10 * 1024 * 1024
 
 var errMetadataTooLarge = errors.New("exceeds 10 MiB metadata limit")
@@ -605,8 +653,10 @@ type metadataReadError struct{ error }
 
 func (e *metadataReadError) Unwrap() error { return e.error }
 
-// decodeQuantizationHead keeps only completed top-level fields. An incomplete
-// large trailing value is expected at the cap; malformed JSON is not recovery.
+// decodeQuantizationHead keeps only completed top-level fields useful for the
+// quantization projection (quant_method, bits, head_bits, expert_bits). An
+// incomplete large trailing value is expected at the cap; malformed JSON is not
+// recovery.
 func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 	d := json.NewDecoder(bytes.NewReader(content))
 	token, err := d.Token()
@@ -646,6 +696,12 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		case "bits", "head_bits":
 			if _, ok := value.(float64); ok {
 				head[key.(string)] = value
+			}
+		case "expert_bits":
+			// Per-expert widths: an object keyed by expert or a single width.
+			switch value.(type) {
+			case map[string]interface{}, float64:
+				head["expert_bits"] = value
 			}
 		}
 	}
@@ -704,6 +760,15 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 			// Re-run analysis for the specialized type
 			a.analyzeTypeSpecific(info)
 			return
+		}
+		// Quantization-only repositories (root weights plus a root
+		// quantization_config.json, no root architecture config) stay
+		// generic; project their quantization info without reclassifying
+		// or changing selectable items (issue #123).
+		if hasRootWeights(info.Files) {
+			if _, ok := info.Metadata["quantization_config.json"]; ok {
+				info.Quantized = analyzeQuantized(info.Metadata)
+			}
 		}
 	}
 

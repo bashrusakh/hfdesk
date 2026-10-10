@@ -12,12 +12,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
 
+// lfsPointerBody is the pointer stub the Hub serves under /raw/ for
+// Git-LFS-backed files (issue #123): it is text, never the file's JSON.
+const lfsPointerBody = "version https://git-lfs.github.com/spec/v1\noid sha256:2eac9dd74828b4240701601b08df6d1c75d9445d441ea2669388b7e3c1a4cf8a\nsize 32272712\n"
+
 // Run the complete analyzer so later specialization cannot undo initial detection.
-func analyzeFixture(t *testing.T, paths []string, metadata map[string]string, dataset bool) (*RepoInfo, error) {
+// raw and resolved bodies are keyed by base name and served strictly at /raw/
+// and /resolve/ respectively (anything else 404s), so a fetch-path regression
+// fails instead of silently passing. lfs marks tree entries as Git-LFS-backed;
+// their /raw/ bodies should be the pointer stub and their /resolve/ bodies the
+// actual bytes.
+func analyzeFixtureFiles(t *testing.T, paths []string, lfs map[string]bool, raw, resolved map[string]string, dataset bool) (*RepoInfo, error) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -26,15 +36,27 @@ func analyzeFixture(t *testing.T, paths []string, metadata map[string]string, da
 				http.NotFound(w, r)
 				return
 			}
-			nodes := make([]hfTreeNode, 0, len(paths))
+			nodes := make([]map[string]interface{}, 0, len(paths))
 			for _, path := range paths {
-				nodes = append(nodes, hfTreeNode{Type: "file", Path: path, Size: 100})
+				node := map[string]interface{}{"type": "file", "path": path, "size": 100}
+				if lfs[path] {
+					node["size"] = 130
+					node["lfs"] = map[string]interface{}{"size": 100, "sha256": "sha256sum"}
+				}
+				nodes = append(nodes, node)
 			}
 			json.NewEncoder(w).Encode(nodes)
 		case strings.HasSuffix(r.URL.Path, "/refs"):
 			io.WriteString(w, `{"branches":[{"name":"main","targetCommit":"abc"}]}`)
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			body, ok := resolved[filepath.Base(r.URL.Path)]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			io.WriteString(w, body)
 		case strings.Contains(r.URL.Path, "/raw/"):
-			body, ok := metadata[filepath.Base(r.URL.Path)]
+			body, ok := raw[filepath.Base(r.URL.Path)]
 			if !ok {
 				http.NotFound(w, r)
 				return
@@ -46,6 +68,13 @@ func analyzeFixture(t *testing.T, paths []string, metadata map[string]string, da
 	}))
 	defer srv.Close()
 	return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/model", dataset)
+}
+
+// analyzeFixture analyzes a repository with no LFS files; content is served
+// only at /raw/, so the fetch path stays pinned.
+func analyzeFixture(t *testing.T, paths []string, metadata map[string]string, dataset bool) (*RepoInfo, error) {
+	t.Helper()
+	return analyzeFixtureFiles(t, paths, nil, metadata, nil, dataset)
 }
 
 func TestAnalyzeRootTypePrecedence(t *testing.T) {
@@ -119,7 +148,7 @@ func TestFetchFileReadsWholeChunkedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 	a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
-	got, err := a.fetchFile(context.Background(), "owner/model", false, "main", "config.json")
+	got, err := a.fetchFile(context.Background(), "owner/model", false, "main", "config.json", false)
 	if err != nil || string(got) != body {
 		t.Fatalf("read %d/%d bytes: %v", len(got), len(body), err)
 	}
@@ -161,8 +190,14 @@ func TestAnalyzeMetadataLimits(t *testing.T) {
 				t.Fatal("metadata missing")
 			}
 			if tc.name == "recover EXL3" {
-				if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" || info.Quantized.Bits != 4 || len(info.Quantized.Backends) != 0 {
+				q := info.Quantized
+				if info.Type != TypeTransformers || q == nil || q.Method != "exl3" || len(q.Backends) != 0 {
 					t.Fatalf("incorrect EXL3 result: %+v", info)
+				}
+				// head_bits 6 != bits 4 is mixed precision: the header bits
+				// must not be presented as model-wide precision.
+				if q.Bits != 0 || !q.MixedPrecision || q.HeadBits != 6 {
+					t.Fatalf("header bits presented as model-wide precision: %+v", q)
 				}
 				if info.Metadata[tc.path].(map[string]interface{})["head_bits"] != float64(6) {
 					t.Fatal("head_bits missing")
@@ -219,7 +254,7 @@ func TestFetchFileBoundsOverflowRead(t *testing.T) {
 	a := NewAnalyzer(AnalyzerOptions{HTTPClient: &http.Client{Transport: metadataRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Body: body, Header: make(http.Header)}, nil
 	})}})
-	content, err := a.fetchFile(context.Background(), "owner/model", false, "main", "config.json")
+	content, err := a.fetchFile(context.Background(), "owner/model", false, "main", "config.json", false)
 	if !errors.Is(err, errMetadataTooLarge) || len(content) != maxMetadataSize || body.read != maxMetadataSize+1 {
 		t.Fatalf("unbounded/incorrect read: returned=%d read=%d err=%v", len(content), body.read, err)
 	}
@@ -234,6 +269,9 @@ func TestDecodeQuantizationHeadCompletedFields(t *testing.T) {
 		{"trailing array", `{"quant_method":"exl3","bits":4,"head_bits":6,"layers":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6)}, false},
 		{"incomplete number", `{"quant_method":"exl3","bits":4`, map[string]interface{}{"quant_method": "exl3"}, false},
 		{"incomplete method", `{"quant_method":"exl`, nil, true},
+		{"completed expert_bits", `{"quant_method":"exl3","bits":4,"expert_bits":{"0":{"gu":4,"down":3}},"tail":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}}, false},
+		{"expert_bits scalar", `{"quant_method":"exl3","expert_bits":3.51,"tail":[`, map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, false},
+		{"truncated expert_bits", `{"quant_method":"exl3","expert_bits":{"0":{"gu":4`, map[string]interface{}{"quant_method": "exl3"}, false},
 		{"nested method", `{"layers":{"quant_method":"exl3"},"tail":[`, nil, true},
 		{"syntax corruption", `{"quant_method":"exl3","layers":[!`, nil, true},
 		{"trailing corruption", `{"quant_method":"exl3"}garbage`, nil, true},
@@ -249,14 +287,193 @@ func TestDecodeQuantizationHeadCompletedFields(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got) != len(tc.want) {
+			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("head=%v, want %v", got, tc.want)
 			}
-			for key, value := range tc.want {
-				if got[key] != value {
-					t.Fatalf("head=%v, want %v", got, tc.want)
-				}
-			}
 		})
+	}
+}
+
+// pinnedExl3Config mirrors the real EXL3 quantization_config.json schema (issue
+// #123): per-expert widths vary and only part of the model is quantized, so the
+// header "bits" is not model-wide precision.
+const pinnedExl3Config = `{"quant_method":"exl3","version":"dsv41-routeB-3p5","bits":4,"head_bits":16,"codebook":"mul1","out_scales":"always","expert_bits":{"0":{"gu":4,"down":4},"1":{"gu":4,"down":3},"2":{"gu":3,"down":3}},"quantized_modules":"layers.N.ffn.experts.E.{w1,w3,w2} only; every other tensor is the original checkpoint's"}`
+
+// quantOnlyPaths is the pinned quantization-only repository shape: root
+// weights only plus a root quantization_config.json, no root config.json.
+func quantOnlyPaths() []string {
+	paths := []string{"quantization_config.json"}
+	for i := 1; i <= 48; i++ {
+		paths = append(paths, fmt.Sprintf("model-%05d-of-00048.safetensors", i))
+	}
+	return paths
+}
+
+// Issue #123: a quantization-only repository with an LFS-backed config must
+// expose its quantization info. The Hub serves the pointer stub at /raw/ and
+// the actual JSON at /resolve/.
+func TestAnalyzeQuantOnlyLFSRepo(t *testing.T) {
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": pinnedExl3Config}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Classification and selectable/download behavior stay unchanged.
+	if info.Type != TypeGeneric {
+		t.Fatalf("type = %s, want %s", info.Type, TypeGeneric)
+	}
+	if len(info.SelectableItems) != 0 {
+		t.Fatalf("selectable items changed: %+v", info.SelectableItems)
+	}
+	q := info.Quantized
+	if q == nil {
+		t.Fatalf("quantization info lost: %+v", info)
+	}
+	if q.Method != "exl3" {
+		t.Fatalf("method = %q, want exl3", q.Method)
+	}
+	if IsGPTQ(q) || info.Type == TypeGPTQ || info.Type == TypeAWQ {
+		t.Fatalf("GPTQ misclassification: %s %+v", info.Type, q)
+	}
+	if len(q.Backends) != 0 {
+		t.Fatalf("invented backends: %v", q.Backends)
+	}
+	// Pinned mixed/per-expert precision: the header bits 4 must not be
+	// presented as model-wide precision, and the per-expert 3..4 bit widths
+	// must be visible.
+	if !q.MixedPrecision || q.Bits != 0 {
+		t.Fatalf("header bits presented as model-wide precision: %+v", q)
+	}
+	if q.HeadBits != 16 || q.ExpertBitsMin != 3 || q.ExpertBitsMax != 4 {
+		t.Fatalf("mixed/per-expert precision lost: %+v", q)
+	}
+	meta, ok := info.Metadata["quantization_config.json"].(map[string]interface{})
+	if !ok || meta["quant_method"] != "exl3" {
+		t.Fatalf("LFS pointer interpreted as JSON or metadata lost: %+v", info.Metadata)
+	}
+}
+
+// Oversized pinned config: the bounded head keeps the completed leading
+// fields (including expert_bits) without reading the whole config.
+func TestAnalyzeQuantOnlyOversizedConfig(t *testing.T) {
+	body := `{"quant_method":"exl3","bits":4,"head_bits":16,"expert_bits":{"0":{"gu":4,"down":3},"1":{"gu":3,"down":3}},"tensor_storage":{"` + strings.Repeat("x", maxMetadataSize) + `"}}`
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Type != TypeGeneric {
+		t.Fatalf("type = %s, want %s", info.Type, TypeGeneric)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "exl3" || len(q.Backends) != 0 {
+		t.Fatalf("incorrect oversized result: %+v", info.Quantized)
+	}
+	if !q.MixedPrecision || q.Bits != 0 || q.HeadBits != 16 {
+		t.Fatalf("header bits presented as model-wide precision: %+v", q)
+	}
+	if q.ExpertBitsMin != 3 || q.ExpertBitsMax != 4 {
+		t.Fatalf("completed expert_bits dropped: %+v", q)
+	}
+	if info.Metadata["quantization_config.json"].(map[string]interface{})["quant_method"] != "exl3" {
+		t.Fatal("recovered head missing")
+	}
+}
+
+// Real pinned order: expert_bits is huge and truncated at the bound. The
+// completed head fields still reach the projection and stay explicit.
+func TestAnalyzeQuantOnlyOversizedTruncatedExpertBits(t *testing.T) {
+	body := `{"quant_method":"exl3","version":"dsv41-routeB-3p5","bits":4,"head_bits":16,"expert_bits":{"0":{"gu":4,` + strings.Repeat(" ", maxMetadataSize)
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "exl3" || len(q.Backends) != 0 {
+		t.Fatalf("incorrect oversized result: %+v", info.Quantized)
+	}
+	// head_bits 16 != bits 4 is already mixed; the truncated expert_bits map
+	// must not be invented.
+	if !q.MixedPrecision || q.Bits != 0 || q.HeadBits != 16 {
+		t.Fatalf("header bits presented as model-wide precision: %+v", q)
+	}
+	if q.ExpertBitsMin != 0 || q.ExpertBitsMax != 0 {
+		t.Fatalf("invented expert widths: %+v", q)
+	}
+}
+
+// Unknown methods keep their literal name: no mislabeling, no description and
+// no backend claims.
+func TestAnalyzeQuantOnlyUnknownMethod(t *testing.T) {
+	body := `{"quant_method":"quipsharp","bits":4,"head_bits":8,"expert_bits":{"0":{"gu":4,"down":4}}}`
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "quipsharp" {
+		t.Fatalf("literal method lost: %+v", info.Quantized)
+	}
+	if q.MethodDescription != "" || len(q.Backends) != 0 {
+		t.Fatalf("unknown method mislabeled: %+v", q)
+	}
+	if !q.MixedPrecision || q.Bits != 0 {
+		t.Fatalf("header bits presented as model-wide precision: %+v", q)
+	}
+}
+
+// A file the tree did not mark as LFS whose /raw/ body is a pointer stub is
+// retried through /resolve/ once instead of losing the metadata.
+func TestAnalyzeUnmarkedLFSFallback(t *testing.T) {
+	paths := []string{"config.json", "model.safetensors", "quantization_config.json"}
+	info, err := analyzeFixtureFiles(t, paths, nil,
+		map[string]string{"config.json": `{"model_type":"llama"}`, "quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": `{"quant_method":"exl3","bits":4,"head_bits":6}`}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Type != TypeTransformers {
+		t.Fatalf("type = %s, want %s", info.Type, TypeTransformers)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "exl3" {
+		t.Fatalf("metadata lost to LFS pointer: %+v", info.Quantized)
+	}
+	if meta := info.Metadata["quantization_config.json"].(map[string]interface{}); meta["quant_method"] != "exl3" {
+		t.Fatalf("pointer interpreted as JSON: %+v", meta)
+	}
+}
+
+// A pointer that persists at /resolve/ is an explicit failure, never silently
+// dropped metadata.
+func TestAnalyzeLFSPointerUnresolved(t *testing.T) {
+	paths := []string{"config.json", "model.safetensors", "quantization_config.json"}
+	_, err := analyzeFixtureFiles(t, paths, map[string]bool{"quantization_config.json": true},
+		map[string]string{"config.json": `{}`},
+		map[string]string{"quantization_config.json": lfsPointerBody}, false)
+	if err == nil || !strings.Contains(err.Error(), "quantization_config.json") || !strings.Contains(err.Error(), "pointer") {
+		t.Fatalf("unresolved lfs pointer hidden: %v", err)
+	}
+}
+
+// When /raw/ served a pointer stub and the /resolve/ retry cannot replace it,
+// the lost metadata is an explicit failure, not a silent skip.
+func TestAnalyzeUnmarkedLFSResolveFailure(t *testing.T) {
+	paths := []string{"config.json", "model.safetensors", "quantization_config.json"}
+	_, err := analyzeFixtureFiles(t, paths, nil,
+		map[string]string{"config.json": `{}`, "quantization_config.json": lfsPointerBody},
+		nil, false)
+	if err == nil || !strings.Contains(err.Error(), "quantization_config.json") || !strings.Contains(err.Error(), "pointer") {
+		t.Fatalf("lost LFS metadata not explicit: %v", err)
 	}
 }

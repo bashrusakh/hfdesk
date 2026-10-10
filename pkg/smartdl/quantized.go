@@ -10,6 +10,7 @@ var quantMethodDescriptions = map[string]string{
 	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
 	"awq":          "AWQ - Activation-aware Weight Quantization",
 	"exl2":         "EXL2 - ExLlamaV2 mixed-precision quantization",
+	"exl3":         "EXL3 - ExLlamaV3 quantization",
 	"bitsandbytes": "bitsandbytes INT8/INT4 quantization",
 	"bnb":          "bitsandbytes INT8/INT4 quantization",
 	"hqq":          "HQQ - Half-Quadratic Quantization",
@@ -41,9 +42,24 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		}
 	}
 
-	// GPTQ specific fields
-	if bits, ok := config["bits"].(float64); ok {
-		info.Bits = int(bits)
+	// Declared precision. A header "bits" value describes only the tensors it
+	// applies to: when the config declares non-uniform precision (per-group or
+	// per-expert widths such as EXL3 head_bits/expert_bits), it must not be
+	// presented as model-wide precision (issue #123).
+	headerBits, hasBits := config["bits"].(float64)
+	if headBits, ok := config["head_bits"].(float64); ok {
+		info.HeadBits = headBits
+		if !hasBits || headBits != headerBits {
+			info.MixedPrecision = true
+		}
+	}
+	if expertBits, ok := config["expert_bits"]; ok {
+		// Per-expert widths are never model-wide precision.
+		info.MixedPrecision = true
+		info.ExpertBitsMin, info.ExpertBitsMax = expertBitRange(expertBits)
+	}
+	if !info.MixedPrecision {
+		info.Bits = int(headerBits)
 	}
 
 	if groupSize, ok := config["group_size"].(float64); ok {
@@ -101,6 +117,34 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	}
 
 	return info
+}
+
+// expertBitRange returns the smallest and largest numeric bit widths declared
+// anywhere inside a config's expert_bits value (a per-expert object, a list, or
+// a bare width). Both are 0 when the value declares no numeric widths.
+func expertBitRange(value interface{}) (minBits, maxBits float64) {
+	var walk func(interface{})
+	walk = func(v interface{}) {
+		switch t := v.(type) {
+		case float64:
+			if minBits == 0 || t < minBits {
+				minBits = t
+			}
+			if t > maxBits {
+				maxBits = t
+			}
+		case map[string]interface{}:
+			for _, item := range t {
+				walk(item)
+			}
+		case []interface{}:
+			for _, item := range t {
+				walk(item)
+			}
+		}
+	}
+	walk(value)
+	return minBits, maxBits
 }
 
 // detectBackends returns compatible inference backends.
