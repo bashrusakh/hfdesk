@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
@@ -165,6 +166,13 @@ type JobManager struct {
 	// can race a still-in-flight mkdir inside the downloader and fail
 	// with "directory not empty".
 	runWG sync.WaitGroup
+	// runActivities outlive visible job state and retain each run's immutable
+	// destination/plan until its downloader call has actually returned.
+	runActivities      map[uint64]*jobWriteActivity
+	deleteReservations map[uint64][]string
+	hfRepoReservations map[uint64][]string
+	mutationScopes     map[uint64][]string
+	nextWriteID        uint64
 }
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
@@ -185,15 +193,19 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	cfg = cfg.captureCacheEnvironment()
 	m := &JobManager{
-		saveMu:           &sync.Mutex{},
-		jobs:             make(map[string]*Job),
-		config:           cfg,
-		statePath:        statePath,
-		persistStateFile: saveJobsState,
-		loadStateFile:    loadJobsState,
-		closeDone:        make(chan struct{}),
-		wsHub:            wsHub,
-		speedLimiter:     hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+		saveMu:             &sync.Mutex{},
+		jobs:               make(map[string]*Job),
+		runActivities:      make(map[uint64]*jobWriteActivity),
+		deleteReservations: make(map[uint64][]string),
+		hfRepoReservations: make(map[uint64][]string),
+		mutationScopes:     make(map[uint64][]string),
+		config:             cfg,
+		statePath:          statePath,
+		persistStateFile:   saveJobsState,
+		loadStateFile:      loadJobsState,
+		closeDone:          make(chan struct{}),
+		wsHub:              wsHub,
+		speedLimiter:       hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -560,6 +572,16 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		// nil until runJob wires it.
 		partialFilesMu: &sync.Mutex{},
 	}
+	// Validate the exact frozen output base using the same pure constructor as
+	// the downloader before any reservation check can inspect filesystem state.
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: repository folder escapes its configured root", errInvalidDestination)
+	}
+	if m.jobBlockedByDeleteLocked(job) {
+		m.mu.Unlock()
+		return nil, false, errSelectionWriterBusy
+	}
 
 	m.opWG.Add(1)
 	defer m.opWG.Done()
@@ -694,6 +716,14 @@ func (m *JobManager) ResumeJob(id string) bool {
 		m.mu.Unlock()
 		return false
 	}
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return false
+	}
+	if m.jobBlockedByDeleteLocked(job) {
+		m.mu.Unlock()
+		return false
+	}
 	m.opWG.Add(1)
 	defer m.opWG.Done()
 
@@ -742,6 +772,14 @@ func (m *JobManager) RetryJob(id string) bool {
 	}
 
 	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
+		m.mu.Unlock()
+		return false
+	}
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return false
+	}
+	if m.jobBlockedByDeleteLocked(job) {
 		m.mu.Unlock()
 		return false
 	}
@@ -966,9 +1004,21 @@ func (m *JobManager) dispatchLocked() {
 		if active >= limit {
 			break
 		}
+		// Restored legacy state can contain destinations that new requests
+		// reject. Do not inspect or dispatch such a job; keep FIFO ordering and
+		// leave its saved state available for explicit repair.
+		if jobDestinationBase(j) == "" {
+			break
+		}
+		// Preserve FIFO: a reservation can hold its matching oldest queued job,
+		// but the scheduler must not route around it to start a younger job.
+		if m.jobBlockedByDeleteLocked(j) {
+			break
+		}
 		j.starting = true
 		m.runWG.Add(1)
-		go m.runJob(j)
+		activityID := m.registerRunActivityLocked(j)
+		go m.runJob(j, activityID)
 		active++
 	}
 }
@@ -1257,10 +1307,15 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 }
 
 // runJob executes the download job.
-func (m *JobManager) runJob(job *Job) {
+func (m *JobManager) runJob(job *Job, activityID uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
+		if activityID != 0 {
+			m.mu.Lock()
+			delete(m.runActivities, activityID)
+			m.mu.Unlock()
+		}
 		m.runWG.Done()
 	}()
 
@@ -1383,6 +1438,28 @@ func (m *JobManager) runJob(job *Job) {
 		settings.OutputDir = job.LocalDir
 		settings.CacheDir = ""
 		settings.HubDir = ""
+	}
+	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
+		paths, complete := jobPlannedWriteEntries(job, plan)
+		m.mu.Lock()
+		if activity := m.runActivities[activityID]; activity != nil {
+			if complete {
+				activity.planned = make(map[string]struct{}, len(paths))
+				for _, planned := range paths {
+					if absolute, err := filepath.Abs(filepath.Clean(planned)); err == nil {
+						activity.planned[pathIdentityKey(absolute)] = struct{}{}
+					} else {
+						complete = false
+						break
+					}
+				}
+			}
+			activity.planKnown = complete
+			if !complete {
+				activity.planned = make(map[string]struct{})
+			}
+		}
+		m.mu.Unlock()
 	}
 
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners

@@ -312,6 +312,11 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if err != nil {
 		return err
 	}
+	if cfg.OnPlanComplete != nil {
+		completedPlan := *plan
+		completedPlan.Items = append([]PlanItem(nil), plan.Items...)
+		cfg.OnPlanComplete(completedPlan)
+	}
 
 	// Emit ALL plan_item events upfront so TUI knows total size immediately
 	for _, item := range plan.Items {

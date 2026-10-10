@@ -79,8 +79,16 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	// Create and start the job (or return existing if duplicate)
 	job, wasExisting, err := s.jobs.CreateJob(req)
 	if err != nil {
+		if errors.Is(err, errInvalidDestination) {
+			writeError(w, http.StatusBadRequest, "Invalid destination", err.Error())
+			return
+		}
 		if errors.Is(err, errInvalidRouteKey) {
 			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+			return
+		}
+		if errors.Is(err, errSelectionWriterBusy) {
+			writeError(w, http.StatusConflict, "Selected GGUF is being deleted", "Retry the download after the selected-file operation finishes")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "Failed to create job", err.Error())
@@ -911,26 +919,96 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 	return roots
 }
 
-// excludedSubroots keeps all scan roots, but gives each configured descendant
-// exclusive ownership of its subtree. Absolute lexical keys also handle mixed
-// relative/absolute configuration without resolving symlinks.
-func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
-	rootPath, err := filepath.Abs(root.Path)
+// configuredRootIdentity resolves an existing configured directory through
+// symlinks. For an ordinary missing suffix, it resolves the nearest existing
+// directory and reconstructs the absent components so adding a missing scan
+// root does not make unrelated selections unavailable.
+func configuredRootIdentity(name string) (lexical, physical string, ok bool) {
+	lexical, err := filepath.Abs(filepath.Clean(name))
 	if err != nil {
-		return nil
+		return "", "", false
 	}
-	rootKey := pathIdentityKey(rootPath)
+	missing := []string{}
+	for current := lexical; ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink == 0 && !info.IsDir() {
+				return lexical, "", false
+			}
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil {
+				return lexical, "", false
+			}
+			target, targetErr := os.Stat(current)
+			if targetErr != nil || !target.IsDir() {
+				return lexical, "", false
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return pathIdentityKey(lexical), pathIdentityKey(filepath.Clean(resolved)), true
+		}
+		if !os.IsNotExist(statErr) {
+			return lexical, "", false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return lexical, "", false
+		}
+		missing = append(missing, filepath.Base(current))
+	}
+}
+
+// excludedSubrootsWithStatus projects every known descendant boundary into
+// the walker's lexical root namespace. Walking remains lexical (Walk does not
+// follow symlinked directories), while overlap ownership is established from
+// resolved configured directory identities.
+func (root localCacheRoot) excludedSubrootsWithStatus(roots []localCacheRoot) ([]string, bool) {
+	rootLexical, rootPhysical, rootOK := configuredRootIdentity(root.Path)
+	if !rootOK {
+		return nil, false
+	}
 	var excluded []string
+	seen := make(map[string]bool)
+	complete := true
+	add := func(candidate string) {
+		key := pathIdentityKey(filepath.Clean(candidate))
+		if !seen[key] {
+			seen[key] = true
+			excluded = append(excluded, key)
+		}
+	}
 	for _, candidate := range roots {
-		candidatePath, err := filepath.Abs(candidate.Path)
-		if err != nil {
+		candidateLexical, candidatePhysical, candidateOK := configuredRootIdentity(candidate.Path)
+		if !candidateOK {
+			complete = false
+			// Keep any provable lexical boundary for best-effort reads, but do not
+			// claim that an unresolved configured root is physically disjoint.
+			if abs, err := filepath.Abs(filepath.Clean(candidate.Path)); err == nil &&
+				pathIdentityKey(abs) != rootLexical && withinLocalRoot(rootLexical, pathIdentityKey(abs)) {
+				add(abs)
+			}
 			continue
 		}
-		candidateKey := pathIdentityKey(candidatePath)
-		if candidateKey != rootKey && withinLocalRoot(rootKey, candidateKey) {
-			excluded = append(excluded, candidateKey)
+		if candidateLexical != rootLexical && withinLocalRoot(rootLexical, candidateLexical) {
+			add(candidateLexical)
+		}
+		if candidatePhysical != rootPhysical && withinLocalRoot(rootPhysical, candidatePhysical) {
+			rel, err := filepath.Rel(rootPhysical, candidatePhysical)
+			if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				complete = false
+				continue
+			}
+			add(filepath.Join(rootLexical, rel))
 		}
 	}
+	return excluded, complete
+}
+
+// excludedSubroots is the best-effort boundary view used by metadata and
+// qualification scans. Selected deletion also consumes the completeness bit.
+func (root localCacheRoot) excludedSubroots(roots []localCacheRoot) []string {
+	excluded, _ := root.excludedSubrootsWithStatus(roots)
 	return excluded
 }
 
@@ -1417,19 +1495,27 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	repoTypeValue, suppliedType := r.URL.Query()["type"]
+	repoType := hfdownloader.RepoTypeModel
+	if suppliedType {
+		if len(repoTypeValue) != 1 || (repoTypeValue[0] != string(hfdownloader.RepoTypeModel) && repoTypeValue[0] != string(hfdownloader.RepoTypeDataset)) {
+			writeError(w, http.StatusBadRequest, "Invalid repository type", "Expected type=model or type=dataset")
+			return
+		}
+		repoType = hfdownloader.RepoType(repoTypeValue[0])
+	}
 	cfg := s.snapshotConfig()
 	cacheDir := cfg.cacheRoot()
 	cache := cfg.cache()
 
-	// Try as model first
-	repoDir, err := cache.Repo(repo, hfdownloader.RepoTypeModel)
+	repoDir, err := cache.Repo(repo, repoType)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid repository format", err.Error())
 		return
 	}
 
-	// Check if the path exists
-	if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
+	// Preserve the legacy untyped model-then-dataset lookup. Explicit type is authoritative.
+	if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) && !suppliedType {
 		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
@@ -1441,6 +1527,16 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "Repository not found in cache", "")
 			return
 		}
+	} else if _, statErr := os.Stat(repoDir.Path()); os.IsNotExist(statErr) && suppliedType {
+		if repoType == hfdownloader.RepoTypeModel {
+			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, repo, true)
+			if localErr == nil {
+				writeJSON(w, http.StatusOK, localRepo)
+				return
+			}
+		}
+		writeError(w, http.StatusNotFound, "Repository not found in cache", "")
+		return
 	}
 
 	// Get snapshots
@@ -1592,6 +1688,15 @@ type RebuildResponse struct {
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
+	release, ok := s.jobs.beginCacheMutation(
+		filepath.Join(cfg.cacheRoot(), "models"),
+		filepath.Join(cfg.cacheRoot(), "datasets"),
+	)
+	if !ok {
+		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		return
+	}
+	defer release()
 
 	// Parse options from request body
 	var req struct {
@@ -1772,6 +1877,12 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// All security checks passed - proceed with deletion
+	release, ok := s.jobs.beginCacheMutation(absHubPath, friendlyPath)
+	if !ok {
+		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		return
+	}
+	defer release()
 	if err := os.RemoveAll(absHubPath); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 		return

@@ -104,6 +104,7 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
 - `routeKey` (optional) selects a configured download route (see Settings). It
@@ -216,8 +217,10 @@ friendly views, not Hub storage, and does not move existing files.
 
 When `localDir` is set, downloads use real files under
 `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots.
-`localScanDirs` are independent read-only model roots scanned as `<owner>/<model>`
-folders for the Cache browser and local badges in Hub search results.
+`localScanDirs` are independent model roots scanned as `<owner>/<model>` folders
+for the Cache browser and local badges in Hub search results. A selected GGUF
+entry there can be deleted through `DELETE /api/cache-selection`; these roots do
+not thereby become download destinations.
 
 `downloadRoutes` is an opt-in map from an internal route key to a destination directory. When a download request sends a `routeKey` that resolves in this map, the job is written to that folder instead of `localDir`/HF cache. Route destinations are also scanned by the Cache browser and accepted by `/api/diskfree?path=...`.
 
@@ -243,9 +246,125 @@ key. No directory is created by saving settings.
 ```http
 GET    /api/cache
 GET    /api/cache/{owner}/{repo}
+GET    /api/cache-selection?repo={owner}/{repo}&type=model[&locationId={id}]
+DELETE /api/cache-selection
 POST   /api/cache/rebuild
 DELETE /api/cache/{owner}/{repo}?type=model
 ```
+
+`GET /api/cache-selection` returns a read-only, fresh view of GGUF groups for
+the requested repository and explicit repository type. `type` is required and
+must be `model` or `dataset`; dataset requests return `400` because this view is
+GGUF/model-only and dataset cache behavior is unchanged. For models, the
+response lists the configured local locations and selected HF cache location
+that currently contain readable GGUF entries. Groups preserve the full
+case-sensitive relative filename/path (including the `.gguf` extension) for a
+single file; a recognized numbered split varies only its part index while
+preserving its stem, delimiters, extension, and declared total. Display quant
+labels do not identify or merge groups. HF members include their saved
+snapshot version, and the same concrete group is combined across saved
+versions in that HF location. Differently named files, differing split totals,
+and unsplit files remain separately selectable. Location and group `canDelete`
+fields are capability advertising only: they are not authorization tokens.
+They are true only when the current location and its entries were completely
+enumerated and the supported mutation scope is available. A location may include
+`deleteReason` when it cannot be safely mutated.
+
+```http
+DELETE /api/cache-selection
+```
+
+Request (the `members` array is the exact composition the user confirmed):
+
+```json
+{
+  "repo": "owner/model",
+  "type": "model",
+  "locationId": "local-...",
+  "groupId": "gguf-...",
+  "members": [{"path": "model-Q4_K_M.gguf", "versions": [], "size": 1234, "linkOnly": false}]
+}
+```
+
+Successful response:
+
+```json
+{
+  "ok": true,
+  "repo": "owner/model",
+  "groupId": "gguf-...",
+  "removed": ["model-Q4_K_M.gguf"],
+  "remaining": [],
+  "message": "Removed the selected local GGUF files"
+}
+```
+
+The server freshly resolves the location and GGUF group and compares their IDs
+and exact member composition (paths, saved versions, size, and link role) with
+the confirmation. Request paths are not used as deletion authority. Local
+deletion removes only selected GGUF entries. For an HF location it removes the
+selected named snapshot entries across the confirmed saved versions and only
+friendly symlinks whose relative names match the selected remote paths and
+which resolve to those entries. Other friendly names are preserved; if one
+depends on a selected snapshot entry, deletion is refused before unlinking.
+It removes a blob payload only when no other named snapshot entry or retained
+friendly link in that repository references it; shared payloads are retained
+and listed in `retainedPayloads`. Ordinary
+friendly files, other groups, versions, locations, metadata, partial files,
+and directories remain. Stale/unsafe selections and conflicting writers return
+`409`; this also applies when a selected snapshot link targets a downloader
+staging name (`tmp-…`, including part/multipart metadata forms, or
+`<blob-key>.tmp-…` atomic-copy stages). The refusal precedes unlinking, leaving
+all confirmed members intact. Unrelated staging files do not by themselves
+prevent deleting a completed selection; ordinary opaque keys and `.part` /
+`.parts.json` names outside these producer-shaped namespaces remain eligible.
+The server does not cancel jobs. HF mutation excludes writers to the
+selected repository reference namespace and associated friendly view. Local
+queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
+unlink results use `207` and identify removed, remaining, and failed paths
+(`errors`). A local symlink member is unlinked without following or deleting
+its target. The older `DELETE /api/cache/{owner}/{repo}` remains the separate
+whole-repository operation.
+
+`GET /api/cache/{owner}/{repo}?type=model|dataset` also honors an explicit
+repository type and returns only that cache type (or `404` when absent). An
+invalid supplied type returns `400`. Omitting `type` preserves the legacy
+model-first, then dataset/local lookup behavior.
+
+Example:
+
+```json
+{
+  "repo": "owner/model",
+  "type": "model",
+  "locations": [{
+    "id": "local-4e1a...",
+    "source": "Local",
+    "path": "/models/owner/model",
+    "groups": [{
+      "id": "gguf-a392...",
+      "label": "weights · Q4_K_M",
+      "quant": "Q4_K_M",
+      "members": [{"path": "weights-Q4_K_M.gguf", "size": 1234}]
+    }]
+  }]
+}
+```
+
+`locationId` is optional. When supplied, it must match a currently discovered
+location for this repo/type; unknown or stale IDs return `400` rather than
+falling back to another location. Local IDs are derived from the configured
+root path, not its position in the current root list. HF IDs identify the
+currently selected Hub and repo. `source` is a display label, not a permission
+or deletion classification. Local symlink members carry `linkOnly: true` and a
+message explaining that only the link is represented and its target remains;
+this is display information, not deletion authorization. Per-location `warning` fields report incomplete
+reads without suppressing healthy locations. A group's optional `warning` marks
+an apparently incomplete numbered shard set; it is not proof that missing parts
+exist or may be inferred. A confirmed deletion removes only the exact currently
+enumerated member paths after a fresh complete local read; it never broadens to
+an inferred shard set. A missing quant label still produces a group by filename.
+`mmproj` companions are excluded from weight groups.
 
 Cache entries may come from:
 
