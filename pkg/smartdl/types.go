@@ -393,23 +393,35 @@ type QuantizedInfo struct {
 	MethodDescription string `json:"method_description,omitempty"`
 
 	// Bits is the quantization bit width when the config declares uniform
-	// model-wide precision. It stays 0 when MixedPrecision is true: a header
-	// bits field then describes only part of the model and must not be read
-	// as model-wide precision (the literal value remains in Metadata).
+	// model-wide precision and was read completely enough to establish it. It
+	// stays 0 when MixedPrecision or ConfigPartial is true: a header bits
+	// field then describes only part of the model or uniformity is not
+	// established, and it must not be read as model-wide precision (the
+	// literal value remains in Metadata).
 	Bits int `json:"bits"`
 
-	// MixedPrecision indicates the config declares non-uniform precision,
-	// e.g. per-tensor-group and/or per-expert widths such as EXL3 head_bits
-	// and expert_bits. HeadBits and ExpertBitsMin/Max describe those groups
-	// and do not describe every tensor.
+	// MixedPrecision indicates the config carries precision evidence that
+	// contradicts uniform model-wide precision: per-expert width declarations
+	// (EXL3 expert_bits / routed_expert_bits), differing tensor-group widths
+	// (EXL3 head_bits, vision_bits, mtp_bits), or effective/aggregate
+	// precision evidence (EXL2 bits_per_weight, routed_expert_bits_avg).
+	// HeadBits and ExpertBitsMin/Max describe declared groups and do not
+	// describe every tensor.
 	MixedPrecision bool `json:"mixed_precision,omitempty"`
+
+	// ConfigPartial indicates the quantization config exceeded the metadata
+	// size bound and only its leading fields were recovered. Precision
+	// declarations past the cut are unknown, so no model-wide uniform
+	// precision is claimed from the recovered fields alone.
+	ConfigPartial bool `json:"config_partial,omitempty"`
 
 	// HeadBits is the bit width the config declares for head tensors
 	// (EXL3 head_bits): a tensor-group width, not model-wide precision.
 	HeadBits float64 `json:"head_bits,omitempty"`
 
 	// ExpertBitsMin and ExpertBitsMax bound the per-expert bit widths declared
-	// in the config's expert_bits mapping (EXL3), which vary per expert.
+	// in the config (expert_bits / routed_expert_bits), which vary per expert.
+	// Both are 0 when those declarations were cut before their widths were read.
 	ExpertBitsMin float64 `json:"expert_bits_min,omitempty"`
 	ExpertBitsMax float64 `json:"expert_bits_max,omitempty"`
 

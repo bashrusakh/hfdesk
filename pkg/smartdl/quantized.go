@@ -43,9 +43,11 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	}
 
 	// Declared precision. A header "bits" value describes only the tensors it
-	// applies to: when the config declares non-uniform precision (per-group or
-	// per-expert widths such as EXL3 head_bits/expert_bits), it must not be
-	// presented as model-wide precision (issue #123).
+	// applies to: it may be presented as model-wide precision only when the
+	// config was read completely and every declared width is consistent with
+	// uniform precision (issue #123). Per-expert width declarations, differing
+	// group widths, effective/aggregate precision evidence, and a partially
+	// recovered config all prevent that claim.
 	headerBits, hasBits := config["bits"].(float64)
 	if headBits, ok := config["head_bits"].(float64); ok {
 		info.HeadBits = headBits
@@ -53,12 +55,43 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 			info.MixedPrecision = true
 		}
 	}
-	if expertBits, ok := config["expert_bits"]; ok {
-		// Per-expert widths are never model-wide precision.
-		info.MixedPrecision = true
-		info.ExpertBitsMin, info.ExpertBitsMax = expertBitRange(expertBits)
+	// Other tensor-group widths contradict a uniform claim when they differ.
+	for _, key := range []string{"vision_bits", "mtp_bits"} {
+		if groupBits, ok := config[key].(float64); ok && (!hasBits || groupBits != headerBits) {
+			info.MixedPrecision = true
+		}
 	}
-	if !info.MixedPrecision {
+	// Per-expert width declarations are never model-wide precision. Completed
+	// declarations are reflected as bounds; a cut declaration (nil) proves only
+	// that per-expert widths exist, so no range is invented for it.
+	for _, key := range []string{"expert_bits", "routed_expert_bits"} {
+		expertBits, ok := config[key]
+		if !ok {
+			continue
+		}
+		info.MixedPrecision = true
+		minBits, maxBits := expertBitRange(expertBits)
+		if minBits != 0 && (info.ExpertBitsMin == 0 || minBits < info.ExpertBitsMin) {
+			info.ExpertBitsMin = minBits
+		}
+		if maxBits > info.ExpertBitsMax {
+			info.ExpertBitsMax = maxBits
+		}
+	}
+	// Effective or aggregated precision evidence (EXL2 bits per weight, an
+	// expert width average) is never proof of uniform model-wide precision.
+	for _, key := range []string{"bits_per_weight", "routed_expert_bits_avg"} {
+		if _, ok := config[key]; ok {
+			info.MixedPrecision = true
+		}
+	}
+	// A config recovered only partially at the metadata size bound may hold
+	// more precision declarations past the cut, so uniformity is not
+	// established even when the recovered fields look uniform.
+	if _, ok := config[partialHeadMarker]; ok {
+		info.ConfigPartial = true
+	}
+	if !info.MixedPrecision && !info.ConfigPartial {
 		info.Bits = int(headerBits)
 	}
 
@@ -120,8 +153,10 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 }
 
 // expertBitRange returns the smallest and largest numeric bit widths declared
-// anywhere inside a config's expert_bits value (a per-expert object, a list, or
-// a bare width). Both are 0 when the value declares no numeric widths.
+// anywhere inside a per-expert width declaration (expert_bits /
+// routed_expert_bits: a per-expert object, a list, or a bare width). Both are 0
+// when the value declares no numeric widths, including a declaration whose
+// value was cut at the metadata bound.
 func expertBitRange(value interface{}) (minBits, maxBits float64) {
 	var walk func(interface{})
 	walk = func(v interface{}) {

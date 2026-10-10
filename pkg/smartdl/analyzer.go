@@ -653,10 +653,35 @@ type metadataReadError struct{ error }
 
 func (e *metadataReadError) Unwrap() error { return e.error }
 
+// partialHeadMarker marks a bounded head whose recovery stopped at the size
+// bound: the config continued past the recovered fields, so precision
+// declarations the tail may hold are unknown and uniform precision cannot be
+// established from the head alone. It is stored in the recovered map (which
+// replaces the config under Metadata) so the partial recovery is explicit in
+// the response instead of silent.
+const partialHeadMarker = "__partial__"
+
+// precisionHeadKeys are the config declarations that carry bit-width or
+// effective-precision evidence. A value cut at the size bound is recovered as
+// an explicit null: the declaration happened, its width is unknown, and it
+// must not be silently dropped or invented.
+var precisionHeadKeys = map[string]bool{
+	"bits":                   true,
+	"head_bits":              true,
+	"vision_bits":            true,
+	"mtp_bits":               true,
+	"expert_bits":            true,
+	"routed_expert_bits":     true,
+	"routed_expert_bits_avg": true,
+	"bits_per_weight":        true,
+}
+
 // decodeQuantizationHead keeps only completed top-level fields useful for the
-// quantization projection (quant_method, bits, head_bits, expert_bits). An
+// quantization projection (quant_method and the precisionHeadKeys widths). An
 // incomplete large trailing value is expected at the cap; malformed JSON is not
-// recovery.
+// recovery. A precision declaration whose value was cut at the cap is kept as
+// an explicit null and the head is marked partial, so truncation never reads as
+// a completed declaration.
 func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 	d := json.NewDecoder(bytes.NewReader(content))
 	token, err := d.Token()
@@ -664,17 +689,23 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		return nil, errors.New("quantization head is not an object")
 	}
 	head := make(map[string]interface{})
+	completed := 0
 	for d.More() {
-		key, err := d.Token()
+		token, err := d.Token()
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return nil, err
 		}
+		key, _ := token.(string)
 		var value interface{}
 		if err := d.Decode(&value); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				// The key is known and its value was cut at the cap.
+				if precisionHeadKeys[key] {
+					head[key] = nil
+				}
 				break
 			}
 			return nil, err
@@ -683,6 +714,9 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		// Only a visible member delimiter proves the value is complete.
 		tail := bytes.TrimLeft(content[d.InputOffset():], " \t\r\n")
 		if len(tail) == 0 {
+			if precisionHeadKeys[key] {
+				head[key] = nil
+			}
 			break
 		}
 		if tail[0] != ',' && tail[0] != '}' {
@@ -692,26 +726,34 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		case "quant_method":
 			if method, ok := value.(string); ok && method != "" {
 				head["quant_method"] = method
+				completed++
 			}
-		case "bits", "head_bits":
+		case "bits", "head_bits", "vision_bits", "mtp_bits", "bits_per_weight", "routed_expert_bits_avg":
 			if _, ok := value.(float64); ok {
-				head[key.(string)] = value
+				head[key] = value
+				completed++
 			}
-		case "expert_bits":
+		case "expert_bits", "routed_expert_bits":
 			// Per-expert widths: an object keyed by expert or a single width.
 			switch value.(type) {
 			case map[string]interface{}, float64:
-				head["expert_bits"] = value
+				head[key] = value
+				completed++
 			}
 		}
 	}
+	partial := true
 	if token, err := d.Token(); err == nil && token == json.Delim('}') {
 		if len(bytes.TrimSpace(content[d.InputOffset():])) != 0 {
 			return nil, errors.New("invalid trailing quantization data")
 		}
+		partial = false
 	}
-	if len(head) == 0 {
+	if completed == 0 {
 		return nil, errors.New("no completed quantization fields in bounded head")
+	}
+	if partial {
+		head[partialHeadMarker] = true
 	}
 	return head, nil
 }

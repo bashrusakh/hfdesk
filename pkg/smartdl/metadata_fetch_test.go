@@ -266,12 +266,17 @@ func TestDecodeQuantizationHeadCompletedFields(t *testing.T) {
 		want       map[string]interface{}
 		wantError  bool
 	}{
-		{"trailing array", `{"quant_method":"exl3","bits":4,"head_bits":6,"layers":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6)}, false},
-		{"incomplete number", `{"quant_method":"exl3","bits":4`, map[string]interface{}{"quant_method": "exl3"}, false},
+		{"trailing array", `{"quant_method":"exl3","bits":4,"head_bits":6,"layers":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6), partialHeadMarker: true}, false},
+		{"incomplete number", `{"quant_method":"exl3","bits":4`, map[string]interface{}{"quant_method": "exl3", "bits": nil, partialHeadMarker: true}, false},
 		{"incomplete method", `{"quant_method":"exl`, nil, true},
-		{"completed expert_bits", `{"quant_method":"exl3","bits":4,"expert_bits":{"0":{"gu":4,"down":3}},"tail":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}}, false},
-		{"expert_bits scalar", `{"quant_method":"exl3","expert_bits":3.51,"tail":[`, map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, false},
-		{"truncated expert_bits", `{"quant_method":"exl3","expert_bits":{"0":{"gu":4`, map[string]interface{}{"quant_method": "exl3"}, false},
+		{"completed expert_bits", `{"quant_method":"exl3","bits":4,"expert_bits":{"0":{"gu":4,"down":3}},"tail":[`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}, partialHeadMarker: true}, false},
+		{"expert_bits scalar", `{"quant_method":"exl3","expert_bits":3.51,"tail":[`, map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51), partialHeadMarker: true}, false},
+		{"truncated expert_bits", `{"quant_method":"exl3","expert_bits":{"0":{"gu":4`, map[string]interface{}{"quant_method": "exl3", "expert_bits": nil, partialHeadMarker: true}, false},
+		{"complete object is not partial", `{"quant_method":"exl3","bits":4}`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4)}, false},
+		{"completed bits_per_weight", `{"quant_method":"exl2","bits":4,"bits_per_weight":4.5,"tail":[`, map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5), partialHeadMarker: true}, false},
+		{"truncated bits_per_weight", `{"quant_method":"exl2","bits":4,"bits_per_weight":4`, map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": nil, partialHeadMarker: true}, false},
+		{"completed routed_expert_bits", `{"quant_method":"exl3","routed_expert_bits":{"0":{"gu":4,"down":3}},"tail":[`, map[string]interface{}{"quant_method": "exl3", "routed_expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}, partialHeadMarker: true}, false},
+		{"no completed fields", `{"expert_bits":{"0":{"gu":4`, nil, true},
 		{"nested method", `{"layers":{"quant_method":"exl3"},"tail":[`, nil, true},
 		{"syntax corruption", `{"quant_method":"exl3","layers":[!`, nil, true},
 		{"trailing corruption", `{"quant_method":"exl3"}garbage`, nil, true},
@@ -406,6 +411,112 @@ func TestAnalyzeQuantOnlyOversizedTruncatedExpertBits(t *testing.T) {
 	}
 	if q.ExpertBitsMin != 0 || q.ExpertBitsMax != 0 {
 		t.Fatalf("invented expert widths: %+v", q)
+	}
+}
+
+// The proven probe shape: bounded recovery stops with a precision-relevant
+// declaration cut at the cap (expert_bits started but never completed) while
+// the recovered fields look uniform (head_bits == bits, or head_bits absent).
+// No model-wide uniform claim may survive, the partial recovery must be
+// explicit, and the cut declaration must not be silently dropped or invented.
+func TestAnalyzeQuantOnlyOversizedTruncatedWidthDeclaration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"equal head width", `{"quant_method":"exl3","bits":4,"head_bits":4,"expert_bits":{"0":{"gu":4,` + strings.Repeat(" ", maxMetadataSize)},
+		{"head width absent", `{"quant_method":"exl3","bits":4,"expert_bits":{"0":{"gu":4,` + strings.Repeat(" ", maxMetadataSize)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+				map[string]bool{"quantization_config.json": true},
+				map[string]string{"quantization_config.json": lfsPointerBody},
+				map[string]string{"quantization_config.json": tc.body}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := info.Quantized
+			if q == nil || q.Method != "exl3" {
+				t.Fatalf("incorrect oversized result: %+v", info.Quantized)
+			}
+			// The truncated per-expert declaration blocks any model-wide
+			// uniform claim even though head_bits == bits looks uniform.
+			if q.Bits != 0 {
+				t.Fatalf("uniform model-wide precision claimed from a truncated config: %+v", q)
+			}
+			if !q.ConfigPartial {
+				t.Fatalf("partial head recovery not explicit: %+v", q)
+			}
+			if !q.MixedPrecision {
+				t.Fatalf("truncated per-expert width declaration dropped silently: %+v", q)
+			}
+			if q.ExpertBitsMin != 0 || q.ExpertBitsMax != 0 {
+				t.Fatalf("invented expert widths from a cut declaration: %+v", q)
+			}
+			meta, ok := info.Metadata["quantization_config.json"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("recovered head missing: %+v", info.Metadata)
+			}
+			if v, exists := meta["expert_bits"]; !exists || v != nil {
+				t.Fatalf("cut expert_bits declaration dropped or invented: %+v", meta)
+			}
+			if meta[partialHeadMarker] != true {
+				t.Fatalf("partial recovery not explicit in metadata: %+v", meta)
+			}
+		})
+	}
+}
+
+// A truncation that carries no width information is a judgment call: the
+// recovered fields look uniform, but uniformity is not established, so no
+// model-wide uniform claim is made and the recovered fields stay usable.
+func TestAnalyzeQuantOnlyOversizedTruncationWithoutWidthInfo(t *testing.T) {
+	body := `{"quant_method":"gptq","bits":4,"group_size":128,"layers":[` + strings.Repeat(" ", maxMetadataSize)
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "gptq" {
+		t.Fatalf("incorrect oversized result: %+v", info.Quantized)
+	}
+	if q.Bits != 0 || !q.ConfigPartial {
+		t.Fatalf("uniform model-wide precision claimed from an unreadable tail: %+v", q)
+	}
+	if q.MixedPrecision {
+		t.Fatalf("mixed precision invented without declaration: %+v", q)
+	}
+	if meta, _ := info.Metadata["quantization_config.json"].(map[string]interface{}); meta["bits"] != float64(4) {
+		t.Fatalf("completed leading fields lost: %+v", meta)
+	}
+}
+
+// Oversized EXL2: the effective precision must survive bounded recovery so
+// nominal bits can never stand in for it (issue #123).
+func TestAnalyzeQuantOnlyOversizedExl2BitsPerWeight(t *testing.T) {
+	body := `{"quant_method":"exl2","bits":4,"bits_per_weight":4.5,"layers":[` + strings.Repeat(" ", maxMetadataSize)
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := info.Quantized
+	if q == nil || q.Method != "exl2" {
+		t.Fatalf("incorrect oversized result: %+v", info.Quantized)
+	}
+	if q.BitsPerWeight != 4.5 {
+		t.Fatalf("EXL2 bits per weight lost to bounded recovery: %+v", q)
+	}
+	if q.Bits != 0 || !q.MixedPrecision {
+		t.Fatalf("nominal bits presented as model-wide precision: %+v", q)
+	}
+	if !q.ConfigPartial {
+		t.Fatalf("partial head recovery not explicit: %+v", q)
 	}
 }
 

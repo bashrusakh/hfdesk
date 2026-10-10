@@ -626,3 +626,42 @@ func TestAnalyzeQuantizedPrecisionProjection(t *testing.T) {
 		})
 	}
 }
+
+// Width and effective-precision declarations beyond head_bits/expert_bits also
+// contradict uniform model-wide precision and must not leave a bare bits claim
+// (issue #123 follow-up). Widths only: no method or backend semantics are
+// inferred from these fields.
+func TestAnalyzeQuantizedPrecisionEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		config                         map[string]interface{}
+		bits                           int
+		mixed, partial                 bool
+		headBits, expertMin, expertMax float64
+		bpw                            float64
+	}{
+		{"routed expert widths are never model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}}, 0, true, false, 0, 3, 4, 0},
+		{"expert width average is not proof of uniformity", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits_avg": float64(3.51)}, 0, true, false, 0, 0, 0, 0},
+		{"differing vision group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(8)}, 0, true, false, 0, 0, 0, 0},
+		{"differing mtp group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(2)}, 0, true, false, 0, 0, 0, 0},
+		{"effective bits per weight is not model-wide precision", map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5)}, 0, true, false, 0, 0, 0, 4.5},
+		{"nominal bits are never bits per weight", map[string]interface{}{"quant_method": "exl2", "bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"equal vision group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"equal mtp group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"partial head cannot establish uniformity", map[string]interface{}{"quant_method": "gptq", "bits": float64(4), partialHeadMarker: true}, 0, false, true, 0, 0, 0, 0},
+		{"cut expert declaration is not silently dropped", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4), "expert_bits": nil, partialHeadMarker: true}, 0, true, true, 4, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
+			if info == nil {
+				t.Fatal("analyzeQuantized returned nil")
+			}
+			if info.Bits != tc.bits || info.MixedPrecision != tc.mixed || info.ConfigPartial != tc.partial ||
+				info.HeadBits != tc.headBits || info.ExpertBitsMin != tc.expertMin || info.ExpertBitsMax != tc.expertMax ||
+				info.BitsPerWeight != tc.bpw {
+				t.Fatalf("projection = %+v, want bits=%d mixed=%v partial=%v head=%v experts=%v..%v bpw=%v",
+					info, tc.bits, tc.mixed, tc.partial, tc.headBits, tc.expertMin, tc.expertMax, tc.bpw)
+			}
+		})
+	}
+}
