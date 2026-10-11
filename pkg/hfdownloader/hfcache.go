@@ -510,17 +510,18 @@ func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePat
 		return fmt.Errorf("create parent directory: %w", err)
 	}
 
-	// Calculate relative path from link location to blob
-	// From: snapshots/{commit}/{relativePath}
-	// To:   blobs/{sha256}
-	// Need: ../../blobs/{sha256} (or more ../ for nested paths)
-	// Count slash-separated segments: relativePath arrives in wire form
-	// ("subdir/file.txt") from the Hub tree, so counting filepath.Separator
-	// would under-count on Windows and produce a dangling target there.
-	depth := strings.Count(filepath.ToSlash(relativePath), "/") + 1 // +1 for commit dir
-	relPrefix := strings.Repeat("../", depth+1)                     // +1 to get from snapshots/ to repo root
-	target := relPrefix + "blobs/" + sha256
+	// Calculate relative path from link location to blob from the normalized
+	// link location, not from the raw wire-form relativePath: SafeJoin/Clean
+	// above may have collapsed "a/../", "./", or "//" segments that are
+	// allowed by unsafeRepoPath, and counting separators in the raw string
+	// would then emit too many "../" components and leave a dangling
+	// symlink (os.Symlink succeeds, so the hardlink/copy fallback never
+	// runs). Both paths sit under the same Hub dir, so Rel must hold.
 	blobPath := r.BlobPath(sha256)
+	target, err := filepath.Rel(filepath.Dir(linkPath), blobPath)
+	if err != nil {
+		return fmt.Errorf("relativize snapshot target: %w", err)
+	}
 
 	// Leave an already-correct entry untouched: re-placing it would churn a
 	// full copy under the copy fallback and briefly remove a good entry.

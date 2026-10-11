@@ -754,6 +754,74 @@ func TestCrossVolumeFriendlyLinkFallbackSimulated(t *testing.T) {
 // invariant on the copy-fallback correctness path: entry-correctness hashing
 // must stop promptly when its context is cancelled instead of reading
 // multi-GB files to completion.
+// TestSnapshotNonCanonicalPathsResolveToBlob pins the P1 fix: wire-form
+// paths that normalize but stay contained ("a/../", "./", "//" — allowed
+// by unsafeRepoPath) must still place snapshot entries that resolve to the
+// blob. Counting "../" from the raw relativePath over-counts depth and
+// leaves a dangling symlink (os.Symlink succeeds, so the fallback never
+// runs); the target must be derived from the normalized link location.
+func TestSnapshotNonCanonicalPathsResolveToBlob(t *testing.T) {
+	cases := []string{"a/../b.gguf", "a/./b.gguf", "a//b.gguf"}
+	for _, rel := range cases {
+		t.Run(rel, func(t *testing.T) {
+			repo := linkTestRepo(t)
+			content := []byte("payload for " + rel)
+			hash := fmt.Sprintf("%x", sha256.Sum256(content))
+			if err := os.WriteFile(repo.BlobPath(hash), content, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := repo.createSnapshotSymlink(context.Background(), "commit-a", rel, hash); err != nil {
+				t.Fatalf("createSnapshotSymlink(%q): %v", rel, err)
+			}
+			snapPath, err := repo.SnapshotPath("commit-a", rel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireContent(t, snapPath, content)
+			info, err := os.Lstat(snapPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				target, err := os.Readlink(snapPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := filepath.Rel(filepath.Dir(snapPath), repo.BlobPath(hash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if target != want {
+					t.Fatalf("symlink target=%q, want %q (normalized Rel)", target, want)
+				}
+				if resolved := filepath.Clean(filepath.Join(filepath.Dir(snapPath), target)); resolved != repo.BlobPath(hash) {
+					t.Fatalf("symlink resolves to %q, want blob %q", resolved, repo.BlobPath(hash))
+				}
+			}
+		})
+	}
+
+	t.Run("Simulated no-links fallback stays usable", func(t *testing.T) {
+		withLinkFakes(t, denySymlink, denyHardlink)
+		for _, rel := range cases {
+			repo := linkTestRepo(t)
+			content := []byte("fallback payload for " + rel)
+			hash := fmt.Sprintf("%x", sha256.Sum256(content))
+			if err := os.WriteFile(repo.BlobPath(hash), content, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := repo.createSnapshotSymlink(context.Background(), "commit-a", rel, hash); err != nil {
+				t.Fatalf("createSnapshotSymlink(%q): %v", rel, err)
+			}
+			snapPath, err := repo.SnapshotPath("commit-a", rel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireRegularFileWithContent(t, snapPath, content)
+		}
+	})
+}
+
 func TestEntryCorrectnessHashingHonorsCancellation(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.bin")
