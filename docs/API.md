@@ -71,6 +71,62 @@ Important response fields:
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
 
+Quantized models expose a `quantized` projection in the response (also for
+quantization-only repositories that have a root `quantization_config.json` but
+no root architecture config):
+
+```json
+"quantized": {
+  "method": "exl3",
+  "method_description": "EXL3 - ExLlamaV3 quantization",
+  "bits": 0,
+  "head_bits": 16,
+  "expert_bits_min": 3,
+  "expert_bits_max": 4,
+  "mixed_precision": true
+}
+```
+
+`method` is the literal `quant_method` from the repository's quantization
+config. `bits` is the declared bit width of the quantized tensors and is only
+set when the config declares uniform precision and was read completely enough
+to establish it and the declared width is exactly representable as the API's
+integer field. Fractional or out-of-range declarations leave `bits` at `0`
+(they are retained literally under `metadata`, not rounded). `excluded_modules`
+lists the modules the config excludes from
+quantization (`modules_to_not_convert`). When `excluded_modules` is non-empty,
+part of the model is not quantized at that width, so `bits` is not a model-wide
+width and consumers must present the excluded modules alongside it. Exclusions
+alone are not mixed precision: `mixed_precision` stays `false` and `bits` stays
+set. When `mixed_precision` is true, `bits` is `0` and must not be read as
+model-wide precision: `head_bits` is the declared width for head tensors and
+`expert_bits_min`/`expert_bits_max` bound the declared per-expert widths
+(`expert_bits` / `routed_expert_bits`).
+
+`mixed_precision` is set only when observed declared widths conflict (including
+different widths inside expert declarations). Equal local/group/expert widths
+without a model-wide `bits` declaration establish neither uniform nor mixed
+precision. A cut/null expert declaration is unknown, not mixed, and prevents a
+uniform claim; observed variation remains mixed even when the config is
+partial. `bits_per_weight` and `routed_expert_bits_avg` are retained as their
+own metadata and do not alone establish mixed precision. `bits_per_weight` is
+the EXL2 bits per weight (effective precision) and is only ever copied from the
+config: nominal `bits` is never presented as bits per weight. Width
+declarations without a dedicated field here remain literal under `metadata`.
+
+`config_partial` is `true` when the quantization config exceeded the 10 MiB
+metadata bound and only its leading fields were recovered. Precision
+declarations past the cut are unknown, so `bits` stays `0` even when the
+recovered fields look uniform. Mixed is reported only for variation actually
+observed in the recovered widths. A precision declaration whose value was cut at
+the bound appears in `metadata` with a `null` value, and the recovered object
+carries `"__partial__": true`, so a lost declaration is explicit instead of
+silently dropped; declared widths are still presented as declared.
+
+The literal config header remains available under `metadata` (for oversized
+configs it is the recovered head with the markers described above). Unknown
+methods keep their name with an empty `method_description` and no `backends`.
+
 ## Plan
 
 ```http
@@ -304,15 +360,26 @@ and exact member composition (paths, saved versions, size, and link role) with
 the confirmation. Request paths are not used as deletion authority. Local
 deletion removes only selected GGUF entries. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
-friendly symlinks whose relative names match the selected remote paths and
-which resolve to those entries. Other friendly names are preserved; if one
-depends on a selected snapshot entry, deletion is refused before unlinking.
+friendly entries whose relative names match the selected remote paths and
+which provably resolve to those entries: symlinks by their link chain, and
+hardlink/copy fallback entries by shared file or identical content. Other
+friendly names are preserved; if one depends on a selected snapshot entry,
+deletion is refused before unlinking.
 It removes a blob payload only when no other named snapshot entry or retained
-friendly link in that repository references it; shared payloads are retained
-and listed in `retainedPayloads`. Ordinary
+friendly entry in that repository references it (link target or shared file);
+shared payloads are retained
+and listed in `retainedPayloads`. Deletion is durable across rebuild when its
+tombstones are recorded: after deletion is attempted, the confirmed names are
+recorded in the repository manifest (`deleted`), so rebuild/repair never
+recreates them from the manifest's file mapping even while a retained payload
+keeps their content available. If manifest recording fails, the response
+reports the error but deletion proceeds, and repair may later recreate those
+names. A later download of the repository restores names and clears recorded
+tombstones. A refused deletion records nothing and changes no state. The
+manifest is updated in place; its other metadata remains. Ordinary
 friendly files, other groups, versions, locations, metadata, partial files,
 and directories remain. Stale/unsafe selections and conflicting writers return
-`409`; this also applies when a selected snapshot link targets a downloader
+`409`; this also applies when a selected snapshot entry resolves to a downloader
 staging name (`tmp-…`, including part/multipart metadata forms, or
 `<blob-key>.tmp-…` atomic-copy stages). The refusal precedes unlinking, leaving
 all confirmed members intact. Unrelated staging files do not by themselves

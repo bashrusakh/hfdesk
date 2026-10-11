@@ -8,34 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
-
-// Windows symlink warning - only show once per session
-var (
-	windowsSymlinkWarned bool
-	windowsSymlinkMu     sync.Mutex
-)
-
-// isWindows returns true if running on Windows
-func isWindows() bool {
-	return runtime.GOOS == "windows"
-}
-
-// warnWindowsSymlink logs a warning about symlinks on Windows (once per session)
-func warnWindowsSymlink() {
-	windowsSymlinkMu.Lock()
-	defer windowsSymlinkMu.Unlock()
-	if !windowsSymlinkWarned {
-		fmt.Fprintln(os.Stderr, "[WARN] Symlinks not supported on Windows without admin/Developer Mode. Friendly view will not be created.")
-		fmt.Fprintln(os.Stderr, "[WARN] Downloads will still work - files are stored in the HuggingFace cache.")
-		windowsSymlinkWarned = true
-	}
-}
 
 // RepoType indicates whether a repository is a model or dataset.
 type RepoType string
@@ -488,8 +464,9 @@ type SnapshotFile struct {
 	SHA256 string
 }
 
-// CreateSnapshot creates or updates a snapshot directory with symlinks to blobs.
-// Uses relative symlinks for portability.
+// CreateSnapshot creates or updates a snapshot directory with entries
+// pointing at blobs. Entries use relative symlinks for portability and fall
+// back to hard links and copies where symlinks are unavailable.
 func (r *RepoDir) CreateSnapshot(commit string, files []SnapshotFile) error {
 	snapshotDir, err := r.SnapshotDir(commit)
 	if err != nil {
@@ -502,7 +479,7 @@ func (r *RepoDir) CreateSnapshot(commit string, files []SnapshotFile) error {
 	}
 
 	for _, f := range files {
-		if err := r.createSnapshotSymlink(commit, f.RelativePath, f.SHA256); err != nil {
+		if err := r.createSnapshotSymlink(context.Background(), commit, f.RelativePath, f.SHA256); err != nil {
 			return fmt.Errorf("create symlink for %s: %w", f.RelativePath, err)
 		}
 	}
@@ -510,14 +487,16 @@ func (r *RepoDir) CreateSnapshot(commit string, files []SnapshotFile) error {
 	return nil
 }
 
-// createSnapshotSymlink creates a single symlink from snapshot to blob.
-// Uses relative symlinks: snapshots/{commit}/{path} -> ../../blobs/{sha256}
-// On Windows, this is skipped gracefully since symlinks require admin privileges.
-func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) error {
-	// Skip symlinks on Windows - they require admin/Developer Mode
-	if isWindows() {
-		warnWindowsSymlink()
-		return nil
+// createSnapshotSymlink creates a single snapshot entry for a blob.
+// The symlink form uses relative symlinks: snapshots/{commit}/{path} -> ../../blobs/{sha256}
+// Where symlinks are unavailable it falls back to a hard link and then a
+// copy, so the snapshot entry is always a usable file.
+func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePath, sha256 string) error {
+	// The blob name is used verbatim as a file name under blobs/ for the
+	// hardlink/copy source, so reject empty and non-local keys up front
+	// instead of resolving them onto BlobPath's contained placeholder.
+	if unsafeBlobFileName(sha256) {
+		return fmt.Errorf("invalid blob name %q", sha256)
 	}
 
 	// Validate linkPath stays inside the snapshot dir to prevent path traversal.
@@ -531,23 +510,46 @@ func (r *RepoDir) createSnapshotSymlink(commit, relativePath, sha256 string) err
 		return fmt.Errorf("create parent directory: %w", err)
 	}
 
-	// Calculate relative path from link location to blob
-	// From: snapshots/{commit}/{relativePath}
-	// To:   blobs/{sha256}
-	// Need: ../../blobs/{sha256} (or more ../ for nested paths)
-	depth := strings.Count(relativePath, string(filepath.Separator)) + 1 // +1 for commit dir
-	relPrefix := strings.Repeat("../", depth+1)                          // +1 to get from snapshots/ to repo root
-	target := relPrefix + "blobs/" + sha256
+	// Calculate relative path from link location to blob from the normalized
+	// link location, not from the raw wire-form relativePath: SafeJoin/Clean
+	// above may have collapsed "a/../", "./", or "//" segments that are
+	// allowed by unsafeRepoPath, and counting separators in the raw string
+	// would then emit too many "../" components and leave a dangling
+	// symlink (os.Symlink succeeds, so the hardlink/copy fallback never
+	// runs). Both paths sit under the same Hub dir, so Rel is not expected
+	// to fail; if it ever does (e.g. a cross-volume Hub layout), fall back
+	// to the absolute blob path so the symlink step of the placement
+	// cascade stays reachable and a target-computation detail can neither
+	// drop the entry nor fail the download.
+	blobPath := r.BlobPath(sha256)
+	target := blobPath
+	if rel, err := relPathFn(filepath.Dir(linkPath), blobPath); err == nil {
+		target = rel
+	}
 
-	// Remove existing symlink if it exists
+	// Leave an already-correct entry untouched: re-placing it would churn a
+	// full copy under the copy fallback and briefly remove a good entry.
+	correct, cerr := cacheEntryCorrect(ctx, linkPath, blobPath, target)
+	if cerr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return cerr
+		}
+	} else if correct {
+		return nil
+	}
+
+	// Remove existing entry if it exists
 	if _, err := os.Lstat(linkPath); err == nil {
 		if err := os.Remove(linkPath); err != nil {
 			return fmt.Errorf("remove existing symlink: %w", err)
 		}
 	}
 
-	// Create symlink
-	if err := os.Symlink(target, linkPath); err != nil {
+	// Create the entry: symlink -> hard link -> copy.
+	if _, err := r.placeCacheEntry(ctx, r.cache.HubDir(), linkPath, blobPath, target); err != nil {
 		return fmt.Errorf("create symlink: %w", err)
 	}
 
@@ -584,17 +586,18 @@ func (r *RepoDir) ListSnapshots() ([]string, error) {
 
 // --- Friendly View Management ---
 
-// CreateFriendlySymlink creates a symlink in the friendly view pointing to a snapshot file.
-// Uses relative symlinks for portability.
-// filterSubdir is optional - if provided, creates symlink in a subdirectory (e.g., "q4_k_m")
-// On Windows, this is skipped gracefully since symlinks require admin privileges.
+// CreateFriendlySymlink creates an entry in the friendly view pointing to a
+// snapshot file. Uses relative symlinks for portability, falling back to a
+// hard link and then a copy where symlinks are unavailable.
+// filterSubdir is optional - if provided, creates the entry in a subdirectory (e.g., "q4_k_m")
 func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir string) error {
-	// Skip symlinks on Windows - they require admin/Developer Mode
-	if isWindows() {
-		warnWindowsSymlink()
-		return nil
-	}
+	return r.createFriendlySymlinkCtx(context.Background(), commit, relativePath, filterSubdir)
+}
 
+// createFriendlySymlinkCtx is the context-bounded implementation used by the
+// downloader and sync paths; the existing public context-free API remains
+// unchanged.
+func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relativePath, filterSubdir string) error {
 	// Build the (optionally filtered) base safely first, THEN join relativePath
 	// onto it. Joining filterSubdir and relativePath together first would let a
 	// "../" in relativePath cancel the filter subdir before validation.
@@ -616,31 +619,58 @@ func (r *RepoDir) CreateFriendlySymlink(commit, relativePath, filterSubdir strin
 		return fmt.Errorf("create parent directory: %w", err)
 	}
 
-	// Calculate relative path from link location to snapshot
+	// Calculate the symlink target from link location to snapshot
 	// Need to go from: models/{owner}/{name}/[filterSubdir/]{relativePath}
 	// To:              hub/models--{owner}--{name}/snapshots/{commit}/{relativePath}
+	// A relative target is used for portability; when Hub and friendly roots
+	// are on different volumes the two paths cannot be related and the
+	// absolute snapshot path is the target instead (see friendlyLinkTarget).
 	snapshotPath, err := r.SnapshotPath(commit, relativePath)
 	if err != nil {
 		return fmt.Errorf("resolve snapshot path: %w", err)
 	}
-	target, err := filepath.Rel(filepath.Dir(linkPath), snapshotPath)
-	if err != nil {
-		return fmt.Errorf("calculate relative path: %w", err)
+	target := friendlyLinkTarget(filepath.Dir(linkPath), snapshotPath)
+
+	// Leave an already-correct entry untouched: re-placing it would churn a
+	// full copy under the copy fallback and briefly remove a good entry.
+	correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target)
+	if cerr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return cerr
+		}
+	} else if correct {
+		return nil
 	}
 
-	// Remove existing symlink if it exists
+	// Remove existing entry if it exists
 	if _, err := os.Lstat(linkPath); err == nil {
 		if err := os.Remove(linkPath); err != nil {
 			return fmt.Errorf("remove existing symlink: %w", err)
 		}
 	}
 
-	// Create symlink
-	if err := os.Symlink(target, linkPath); err != nil {
+	// Create the entry: symlink -> hard link -> copy. The source is the
+	// snapshot entry, so a fallback entry mirrors the snapshot content even
+	// when the two directories live on different volumes (the hardlink step
+	// then fails per-volume and the copy step applies).
+	if _, err := r.placeCacheEntry(ctx, r.friendlyLinkRoot(), linkPath, snapshotPath, target); err != nil {
 		return fmt.Errorf("create symlink: %w", err)
 	}
 
 	return nil
+}
+
+// friendlyLinkRoot is the placement root (and fallback-memo key) for friendly
+// view entries: the friendly tree root of this repo's kind, which sits on the
+// volume friendly entries are created on.
+func (r *RepoDir) friendlyLinkRoot() string {
+	if r.repoType == RepoTypeDataset {
+		return r.cache.DatasetsDir()
+	}
+	return r.cache.ModelsDir()
 }
 
 // EnsureFriendlyDir creates the friendly view directory for this repo.
@@ -711,14 +741,14 @@ func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relative
 		}
 	}
 
-	// Create snapshot symlink
-	if err := r.createSnapshotSymlink(commit, relativePath, sha256); err != nil {
+	// Create snapshot entry
+	if err := r.createSnapshotSymlink(ctx, commit, relativePath, sha256); err != nil {
 		return nil, fmt.Errorf("create snapshot symlink: %w", err)
 	}
 
-	// Create friendly view symlink (unless disabled)
+	// Create friendly view entry (unless disabled)
 	if !noFriendly {
-		if err := r.CreateFriendlySymlink(commit, relativePath, filterSubdir); err != nil {
+		if err := r.createFriendlySymlinkCtx(ctx, commit, relativePath, filterSubdir); err != nil {
 			return nil, fmt.Errorf("create friendly symlink: %w", err)
 		}
 	}

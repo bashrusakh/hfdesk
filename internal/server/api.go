@@ -1736,7 +1736,7 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	if resp.SymlinksCreated == 0 && resp.SymlinksUpdated == 0 {
 		resp.Message = "Friendly view is up to date"
 	} else {
-		resp.Message = fmt.Sprintf("Created %d symlinks, updated %d", resp.SymlinksCreated, resp.SymlinksUpdated)
+		resp.Message = fmt.Sprintf("Created %d links, updated %d", resp.SymlinksCreated, resp.SymlinksUpdated)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
