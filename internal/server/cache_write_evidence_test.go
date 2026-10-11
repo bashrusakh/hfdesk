@@ -4,8 +4,109 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
+
+func TestSelectedDeleteReservationInventoriesOffLockAndRejectsChangedSnapshot(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"weights.gguf"}}
+	m.jobs[job.ID] = job
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		once.Do(func() { close(entered) })
+		<-resume
+		return inventoryWritableNamespace(base)
+	}
+	target := filepath.Join(jobDestinationBase(job), "weights.gguf")
+	done := make(chan bool, 1)
+	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
+	<-entered
+	if _, ok := m.GetJob(job.ID); !ok || len(m.ListJobs()) != 1 {
+		t.Fatal("inventory held manager lock while readers were blocked")
+	}
+	// A newly admitted queued writer changes the decision snapshot; evidence
+	// collected before it existed must not authorize a late delete commit.
+	m.mu.Lock()
+	m.jobs["late"] = &Job{ID: "late", Repo: "owner/other", OutputDir: root, Status: JobStatusQueued}
+	m.mu.Unlock()
+	close(resume)
+	if <-done {
+		t.Fatal("reservation committed using a stale manager snapshot")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued}
+	m.jobs[job.ID] = job
+	entered, resume := make(chan struct{}), make(chan struct{})
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-resume
+		return inventoryWritableNamespace(base)
+	}
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := m.reserveSelectedGGUF([]string{filepath.Join(jobDestinationBase(job), "other.gguf")})
+		done <- ok
+	}()
+	<-entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- m.Close(context.Background()) }()
+	close(resume)
+	if <-done {
+		t.Fatal("reservation committed after Close began")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedDeleteReservationRejectsManagedMutationCrossingInventory(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued}
+	m.jobs[job.ID] = job
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var calls int
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		calls++
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-resume
+		return inventoryWritableNamespace(base)
+	}
+	done := make(chan bool, 1)
+	target := filepath.Join(jobDestinationBase(job), "other.gguf")
+	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
+	<-entered
+	finish := m.beginObservedMutation([]string{filepath.Join(root, "unrelated-managed-path")})
+	finish() // completed during collection must still invalidate this attempt
+	close(resume)
+	if <-done {
+		t.Fatal("unrelated test reservation unexpectedly conflicted")
+	}
+	if calls < 4 {
+		t.Fatalf("stale scan was not retried with fresh inventories: calls=%d", calls)
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func testCacheWriteAttempt(m *JobManager) *cacheWriteAttempt {
 	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecision(), evidence: map[string]selectedWriteEvidence{}, failed: map[string]bool{}, descriptors: map[string]writeDecisionJob{}, probes: map[string]writeIdentityProbe{}, targets: map[string]writeIdentityProbe{}, inventory: inventoryWritableNamespace}

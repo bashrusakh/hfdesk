@@ -24,10 +24,11 @@ type writeDecisionJob struct {
 }
 
 type writeDecisionActivity struct {
-	id        uint64
-	job       writeDecisionJob
-	planKnown bool
-	planned   []string
+	id           uint64
+	job          writeDecisionJob
+	planKnown    bool
+	planComplete bool
+	planned      []string
 }
 
 type writeDecisionSnapshot struct {
@@ -89,7 +90,7 @@ func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 		if descriptor.id == "" {
 			descriptor = decisionJob(a.job)
 		}
-		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown}
+		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown, planComplete: a.planComplete}
 		if a.planKnown {
 			item.planned = mapKeys(a.planned)
 			sort.Strings(item.planned)
@@ -190,7 +191,11 @@ func (m *JobManager) beginCacheWriteAttempt() (*cacheWriteAttempt, bool) {
 		return nil, false
 	}
 	m.opWG.Add(1)
-	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventoryWritableNamespace}, true
+	inventory := m.writeInventory
+	if inventory == nil {
+		inventory = inventoryWritableNamespace
+	}
+	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}, true
 }
 
 func (a *cacheWriteAttempt) Close() {
@@ -329,12 +334,23 @@ func (a *cacheWriteAttempt) collectDescriptor(descriptor writeDecisionJob) {
 }
 
 func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
+	if job == nil {
+		return true
+	}
+	return a.MayWriteDescriptor(decisionJob(job), targets)
+}
+
+func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targets []string) bool {
 	if a == nil {
 		return true
 	}
-	base := decisionJob(job)
+	base := descriptor
+	wasActivity := base.activityID != 0
 	base.activityID = 0
-	if base.starting {
+	// registerRunActivityLocked already advances the descriptor generation
+	// when a run claims a starting job. Preserve that generation when checking
+	// the activity; only a starting job descriptor needs the claim adjustment.
+	if base.starting && !wasActivity {
 		base.generation++
 	}
 	baseKey := decisionDescriptorKey(base)

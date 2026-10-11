@@ -176,6 +176,7 @@ type JobManager struct {
 	nextWriteID          uint64
 	writeDecisionEpoch   uint64
 	writeDecisionChanged chan struct{}
+	writeInventory       func(string) (writableNamespaceInventory, bool)
 }
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
