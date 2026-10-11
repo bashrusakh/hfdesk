@@ -565,3 +565,108 @@ func TestPlacementLeavesCorrectEntriesUntouchedAndReplacesStale(t *testing.T) {
 		requireContent(t, stored.SnapshotPath, content)
 	})
 }
+
+// withRelFailure simulates the Windows cross-volume condition where
+// filepath.Rel cannot relate the Hub and friendly roots (they sit on
+// different volumes) and errors instead of returning a relative path.
+func withRelFailure(t *testing.T) {
+	t.Helper()
+	orig := relPathFn
+	relPathFn = func(basepath, targpath string) (string, error) {
+		return "", errors.New("simulated: can't make path relative across volumes")
+	}
+	t.Cleanup(func() { relPathFn = orig })
+}
+
+// TestCrossVolumeFriendlyLinkFallbackSimulated covers the cross-volume
+// configuration (Hub and friendly roots on separate volumes): the friendly
+// placement must stay reachable when the relative target cannot be computed,
+// and a download must complete there instead of failing harder than the old
+// skip behavior.
+func TestCrossVolumeFriendlyLinkFallbackSimulated(t *testing.T) {
+	content := []byte("cross volume friendly payload")
+
+	t.Run("symlink step stays reachable with an absolute target", func(t *testing.T) {
+		withRelFailure(t)
+		repo := linkTestRepo(t)
+		stored, _ := linkTestStore(t, repo, content, "model-Q4_K_M.gguf")
+
+		target, err := os.Readlink(stored.FriendlyPath)
+		if err != nil {
+			t.Fatalf("friendly entry is not a symlink: %v", err)
+		}
+		if target != stored.SnapshotPath {
+			t.Fatalf("friendly symlink target=%q, want absolute %q", target, stored.SnapshotPath)
+		}
+		requireContent(t, stored.FriendlyPath, content)
+
+		// Sync must recognize the absolute-target entry as correct instead of
+		// re-placing it on every rebuild.
+		before, err := os.Lstat(stored.FriendlyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := repo.cache.Sync(SyncOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Errors) != 0 || result.SymlinksCreated != 0 || result.SymlinksUpdated != 0 {
+			t.Fatalf("sync churned correct cross-volume entries: %+v %v", result, result.Errors)
+		}
+		after, err := os.Lstat(stored.FriendlyPath)
+		if err != nil || !os.SameFile(before, after) {
+			t.Fatalf("sync replaced the friendly entry: %v", err)
+		}
+	})
+
+	t.Run("Simulated no-links fallback still copies", func(t *testing.T) {
+		withRelFailure(t)
+		withLinkFakes(t, denySymlink, crossVolumeHardlink)
+		repo := linkTestRepo(t)
+		stored, _ := linkTestStore(t, repo, content, "model-Q4_K_M.gguf")
+		requireRegularFileWithContent(t, stored.SnapshotPath, content)
+		requireRegularFileWithContent(t, stored.FriendlyPath, content)
+	})
+
+	t.Run("download completes", func(t *testing.T) {
+		withRelFailure(t)
+		body := []byte("cross volume download payload")
+		srv := newMockHFFileServer(t, body)
+		root := filepath.Join(t.TempDir(), "friendly-root")
+		hub := filepath.Join(t.TempDir(), "hub-root")
+		cfg := Settings{CacheDir: root, HubDir: hub, Endpoint: srv.URL, Concurrency: 1}
+		if err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, nil); err != nil {
+			t.Fatalf("download failed in the cross-volume configuration: %v", err)
+		}
+		requireContent(t, filepath.Join(root, "models", "owner", "model", "file.bin"), body)
+		requireContent(t, filepath.Join(hub, "models--owner--model", "snapshots", "commit123", "file.bin"), body)
+	})
+}
+
+// TestEntryCorrectnessHashingHonorsCancellation pins the project cancellation
+// invariant on the copy-fallback correctness path: entry-correctness hashing
+// must stop promptly when its context is cancelled instead of reading
+// multi-GB files to completion.
+func TestEntryCorrectnessHashingHonorsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.bin")
+	b := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(a, []byte("same-size content A"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("same-size content B"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := entryContentSHA256(ctx, a); !errors.Is(err, context.Canceled) {
+		t.Fatalf("entryContentSHA256 err=%v, want context.Canceled", err)
+	}
+	if _, err := sameEntryContent(ctx, a, b); !errors.Is(err, context.Canceled) {
+		t.Fatalf("sameEntryContent err=%v, want context.Canceled", err)
+	}
+	if _, err := cacheEntryCorrect(ctx, a, b, "target"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cacheEntryCorrect err=%v, want context.Canceled", err)
+	}
+}

@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -392,7 +393,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 				}
 				selectedTargets[name] = shared.path
 				blobInfos[shared.path] = shared.info
-			} else if digest, herr := entryContentSHA256(name); herr == nil {
+			} else if digest, herr := entryContentSHA256(context.Background(), name); herr == nil {
 				if candidate := r.BlobPath(digest); candidate != filepath.Join(blobRoot, invalidBlobName) {
 					if targetInfo, terr := os.Lstat(candidate); terr == nil && targetInfo.Mode().IsRegular() && targetInfo.Mode()&os.ModeSymlink == 0 {
 						selectedTargets[name] = candidate
@@ -527,7 +528,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		}
 		for _, selName := range selectedByRel[filepath.ToSlash(rel)] {
 			if !os.SameFile(info, selectedInfos[selName]) {
-				same, e := sameEntryContent(name, selName)
+				same, e := sameEntryContent(context.Background(), name, selName)
 				if e != nil || !same {
 					continue
 				}

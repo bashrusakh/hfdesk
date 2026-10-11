@@ -524,7 +524,7 @@ func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePat
 
 	// Leave an already-correct entry untouched: re-placing it would churn a
 	// full copy under the copy fallback and briefly remove a good entry.
-	if correct, cerr := cacheEntryCorrect(linkPath, blobPath, target); cerr == nil && correct {
+	if correct, cerr := cacheEntryCorrect(ctx, linkPath, blobPath, target); cerr == nil && correct {
 		return nil
 	}
 
@@ -606,21 +606,21 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 		return fmt.Errorf("create parent directory: %w", err)
 	}
 
-	// Calculate relative path from link location to snapshot
+	// Calculate the symlink target from link location to snapshot
 	// Need to go from: models/{owner}/{name}/[filterSubdir/]{relativePath}
 	// To:              hub/models--{owner}--{name}/snapshots/{commit}/{relativePath}
+	// A relative target is used for portability; when Hub and friendly roots
+	// are on different volumes the two paths cannot be related and the
+	// absolute snapshot path is the target instead (see friendlyLinkTarget).
 	snapshotPath, err := r.SnapshotPath(commit, relativePath)
 	if err != nil {
 		return fmt.Errorf("resolve snapshot path: %w", err)
 	}
-	target, err := filepath.Rel(filepath.Dir(linkPath), snapshotPath)
-	if err != nil {
-		return fmt.Errorf("calculate relative path: %w", err)
-	}
+	target := friendlyLinkTarget(filepath.Dir(linkPath), snapshotPath)
 
 	// Leave an already-correct entry untouched: re-placing it would churn a
 	// full copy under the copy fallback and briefly remove a good entry.
-	if correct, cerr := cacheEntryCorrect(linkPath, snapshotPath, target); cerr == nil && correct {
+	if correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target); cerr == nil && correct {
 		return nil
 	}
 
@@ -633,7 +633,8 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 
 	// Create the entry: symlink -> hard link -> copy. The source is the
 	// snapshot entry, so a fallback entry mirrors the snapshot content even
-	// when the two directories live on different volumes.
+	// when the two directories live on different volumes (the hardlink step
+	// then fails per-volume and the copy step applies).
 	if _, err := r.placeCacheEntry(ctx, r.friendlyLinkRoot(), linkPath, snapshotPath, target); err != nil {
 		return fmt.Errorf("create symlink: %w", err)
 	}

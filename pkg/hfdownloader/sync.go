@@ -204,10 +204,10 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		if perr != nil {
 			return perr
 		}
-		expectedTarget, _ := filepath.Rel(filepath.Dir(friendlyPath), snapshotPath)
+		expectedTarget := friendlyLinkTarget(filepath.Dir(friendlyPath), snapshotPath)
 
 		// Check if the friendly entry already exists and is correct
-		correct, cerr := cacheEntryCorrect(friendlyPath, snapshotPath, expectedTarget)
+		correct, cerr := cacheEntryCorrect(context.Background(), friendlyPath, snapshotPath, expectedTarget)
 		if cerr != nil {
 			errs = append(errs, fmt.Errorf("inspect friendly entry %s: %w", relPath, cerr))
 			return nil

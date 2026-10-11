@@ -204,15 +204,17 @@ func unsafeBlobFileName(name string) bool {
 // entryContentSHA256 returns the SHA-256 of a file's content, following a
 // symlink leaf the way a reader would. It is the content-identity proof used
 // for entries placed by the copy fallback, where no link relationship exists.
-func entryContentSHA256(name string) (string, error) {
-	return computeSHA256(name)
+// The digest read is bounded by ctx so a cancelled download stops hashing
+// multi-GB files promptly.
+func entryContentSHA256(ctx context.Context, name string) (string, error) {
+	return computeSHA256Ctx(ctx, name)
 }
 
 // sameEntryContent reports whether a and b hold identical bytes. Shared file
 // identity (hard links) is recognized first, then size, then a full digest
 // comparison. Callers accept the digest read cost only for copy-placed
 // entries, where content equality is the sole available correctness proof.
-func sameEntryContent(a, b string) (bool, error) {
+func sameEntryContent(ctx context.Context, a, b string) (bool, error) {
 	ai, err := os.Stat(a)
 	if err != nil {
 		return false, err
@@ -227,11 +229,11 @@ func sameEntryContent(a, b string) (bool, error) {
 	if ai.Size() != bi.Size() {
 		return false, nil
 	}
-	ah, err := entryContentSHA256(a)
+	ah, err := entryContentSHA256(ctx, a)
 	if err != nil {
 		return false, err
 	}
-	bh, err := entryContentSHA256(b)
+	bh, err := entryContentSHA256(ctx, b)
 	if err != nil {
 		return false, err
 	}
@@ -246,7 +248,7 @@ func sameEntryContent(a, b string) (bool, error) {
 // re-place a correct entry: under the copy fallback that would re-copy full
 // content per entry and briefly leave no entry at all, so a failed re-placement
 // could lose a previously good entry).
-func cacheEntryCorrect(entryPath, sourcePath, expectedTarget string) (bool, error) {
+func cacheEntryCorrect(ctx context.Context, entryPath, sourcePath, expectedTarget string) (bool, error) {
 	info, err := os.Lstat(entryPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -264,5 +266,24 @@ func cacheEntryCorrect(entryPath, sourcePath, expectedTarget string) (bool, erro
 	if sourceInfo, err := os.Stat(sourcePath); err == nil && os.SameFile(info, sourceInfo) {
 		return true, nil
 	}
-	return sameEntryContent(entryPath, sourcePath)
+	return sameEntryContent(ctx, entryPath, sourcePath)
+}
+
+// relPathFn is the relative-path computation used for friendly symlink
+// targets. It is a seam so tests can reproduce the Windows cross-volume
+// failure — filepath.Rel errors when the Hub and friendly roots sit on
+// different volumes — without a real multi-volume machine.
+var relPathFn = filepath.Rel
+
+// friendlyLinkTarget returns the symlink target for a friendly entry at
+// linkDir pointing at snapshotPath. The classic HF layout uses a relative
+// target for portability; when the two directories cannot be related (Hub and
+// friendly roots on different volumes), the absolute snapshot path is used
+// instead, so the symlink step of the placement cascade stays reachable and a
+// target-computation detail can neither drop the entry nor fail the download.
+func friendlyLinkTarget(linkDir, snapshotPath string) string {
+	if target, err := relPathFn(linkDir, snapshotPath); err == nil {
+		return target
+	}
+	return snapshotPath
 }
