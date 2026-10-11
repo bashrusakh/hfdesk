@@ -12,6 +12,29 @@ import (
 	"syscall"
 )
 
+func openLocalSelectionDirectory(root *os.Root, name string) (*os.File, error) {
+	before, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("local selection path %q is no longer a directory", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.IsDir() || !os.SameFile(before, info) {
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("local selection path %q is no longer a directory", name)
+	}
+	return f, nil
+}
+
 // The open handle supplies Windows' volume/file-index identity and keeps the
 // original object alive until the selected operation releases its pin.
 func openSelectedWindowsEntry(physicalRepo, name string) (*os.File, error) {

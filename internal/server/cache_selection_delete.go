@@ -1205,6 +1205,14 @@ func withPinCleanupDetails(details string, failures []string) string {
 	return details + "; temporary identity-pin cleanup: " + strings.Join(failures, "; ")
 }
 
+// localSelectionWalkFS keeps WalkDir's directory opens rooted and prevents a
+// replaced directory entry from blocking indefinitely when it becomes a FIFO.
+type localSelectionWalkFS struct{ root *os.Root }
+
+func (f localSelectionWalkFS) Open(name string) (fs.File, error) {
+	return openLocalSelectionDirectory(f.root, name)
+}
+
 func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool, beforeIdentityPin func(string), pins *selectedEntryPinSet) ([]cacheSelectionFile, string) {
 	var files []cacheSelectionFile
 	var warning string
@@ -1212,7 +1220,7 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 	for _, name := range excluded {
 		excludedSet[filepath.ToSlash(filepath.Clean(name))] = true
 	}
-	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}

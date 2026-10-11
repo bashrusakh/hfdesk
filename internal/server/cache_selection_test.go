@@ -1765,6 +1765,96 @@ func TestSelectedLocalDeleteRejectsAliasRetargetDuringOpen(t *testing.T) {
 	}
 }
 
+func TestSelectedLocalDeleteDoesNotBlockWhenLaterDirectoryBecomesFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory-to-FIFO replacement regression requires Linux FIFO semantics")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected := "a-selected-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	laterDir := filepath.Join(repoDir, "z-later-empty-dir")
+	if err := os.Mkdir(laterDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.beforeIdentityPin = func(name string) {
+		if name != selected {
+			return
+		}
+		if err := os.Remove(laterDir); err != nil {
+			t.Errorf("remove later directory: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", laterDir).Run(); err != nil {
+			t.Errorf("replace later directory with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("replacement hook was not reached")
+			return
+		}
+		// Opening a FIFO read/write does not wait for a peer and releases an old
+		// blocking Root.Open implementation even when the regression is present.
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(laterDir, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		// Let the guaranteed FIFO peer release the pre-fix blocking operation.
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked on a replaced directory FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, selected)); err != nil {
+		t.Fatalf("selected GGUF changed: %v", err)
+	}
+	if info, err := os.Lstat(laterDir); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("substituted FIFO changed: info=%v err=%v", info, err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+	paths := []string{filepath.Join(repoDir, selected)}
+	release, ok := s.jobs.reserveSelectedGGUF(paths)
+	if !ok {
+		t.Fatal("selected-file reservation leaked after failed walk")
+	}
+	release()
+}
+
 func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
