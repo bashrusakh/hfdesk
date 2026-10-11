@@ -232,6 +232,97 @@ func TestCacheSelectionLocalGroupsAndExplicitLocation(t *testing.T) {
 	}
 }
 
+func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
+	root := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "configured-alias")
+	cases := []struct {
+		repo         string
+		windowsLocal bool
+	}{
+		{repo: "owner/model", windowsLocal: true},
+		{repo: "CON/model", windowsLocal: false},
+		{repo: "owner/NUL", windowsLocal: false},
+	}
+	for _, tc := range cases {
+		repo := tc.repo
+		if !hfdownloader.IsValidModelName(repo) {
+			t.Fatalf("test repo %q unexpectedly fails the existing validator", repo)
+		}
+		if filepath.IsLocal(repo) {
+			writeSelectionFile(t, filepath.Join(root, filepath.FromSlash(repo)), "model-Q4_K_M.gguf")
+		}
+	}
+	if err := os.Symlink(root, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			alias = ""
+		} else {
+			t.Fatalf("create configured-root alias: %v", err)
+		}
+	}
+	roots := []string{root}
+	if alias != "" {
+		roots = append(roots, alias)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: roots})
+	for _, tc := range cases {
+		repo := tc.repo
+		isLocal := filepath.IsLocal(repo)
+		wantLocal := tc.windowsLocal
+		if runtime.GOOS != "windows" {
+			wantLocal = true
+		}
+		if isLocal != wantLocal {
+			t.Errorf("filepath.IsLocal(%q)=%v on %s, want %v", repo, isLocal, runtime.GOOS, wantLocal)
+		}
+		if !isLocal {
+			if got := cacheSelectionLocations(s.snapshotConfig(), repo); len(got) != 0 {
+				t.Errorf("non-local %q was joined/probed: got %d locations", repo, len(got))
+			}
+			code, _ := getSelection(t, s, repo, "model", "")
+			if code != http.StatusBadRequest {
+				t.Errorf("GET selection for non-local %q status=%d, want 400", repo, code)
+			}
+			body, err := json.Marshal(testSelectedDeleteRequest{Repo: repo, Type: "model", LocationID: "loc", GroupID: "group", Members: []cacheSelectionMember{{Path: "model-Q4_K_M.gguf"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := cacheRequest(t, s, http.MethodDelete, "/api/cache-selection", string(body))
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("DELETE selection for non-local %q status=%d, want 400", repo, w.Code)
+			}
+			continue
+		}
+		code, selection := getSelection(t, s, repo, "model", "")
+		if code != http.StatusOK || len(selection.Locations) == 0 {
+			t.Errorf("local configured repo %q was not selectable: status=%d locations=%+v", repo, code, selection.Locations)
+		}
+		ggufFound := false
+		for _, loc := range selection.Locations {
+			for _, group := range loc.Groups {
+				for _, member := range group.Members {
+					if member.Path == "model-Q4_K_M.gguf" {
+						ggufFound = true
+					}
+				}
+			}
+		}
+		if !ggufFound {
+			t.Errorf("nested owner/name repo %q did not expose its GGUF selection", repo)
+		}
+		aliasFound := false
+		if alias != "" {
+			for _, loc := range selection.Locations {
+				if strings.HasPrefix(loc.Path, alias) {
+					aliasFound = true
+				}
+			}
+			if !aliasFound {
+				t.Errorf("configured alias location missing for %q: %+v", repo, selection.Locations)
+			}
+		}
+	}
+}
+
 func TestSelectedDeleteRefusesOwnerSymlinkEscape(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	outsideRepo := filepath.Join(outside, "model")

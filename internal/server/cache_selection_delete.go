@@ -2095,7 +2095,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	if !hfdownloader.IsValidModelName(req.Repo) || req.Type != "model" || req.LocationID == "" || req.GroupID == "" || len(req.Members) == 0 {
+	if !hfdownloader.IsValidModelName(req.Repo) || !filepath.IsLocal(req.Repo) || req.Type != "model" || req.LocationID == "" || req.GroupID == "" || len(req.Members) == 0 {
 		writeError(w, http.StatusBadRequest, "Invalid selection", "Expected a model repo, current locationId, groupId, and confirmed members")
 		return
 	}
