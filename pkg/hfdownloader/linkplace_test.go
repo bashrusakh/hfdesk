@@ -822,6 +822,27 @@ func TestSnapshotNonCanonicalPathsResolveToBlob(t *testing.T) {
 	})
 }
 
+// TestSnapshotRelFailureFallsBackToAbsoluteTarget pins the snapshot-side
+// cross-volume policy: when the Rel computation fails, placement must fall
+// back to the absolute blob path so the symlink step of the cascade stays
+// reachable and the placed entry still resolves to blob content instead of
+// dropping the entry or failing the download.
+func TestSnapshotRelFailureFallsBackToAbsoluteTarget(t *testing.T) {
+	withRelFailure(t)
+	repo := linkTestRepo(t)
+	content := []byte("snapshot rel-failure payload")
+	stored, hash := linkTestStore(t, repo, content, "model-Q4_K_M.gguf")
+
+	target, err := os.Readlink(stored.SnapshotPath)
+	if err != nil {
+		t.Fatalf("snapshot entry is not a symlink after Rel failure: %v", err)
+	}
+	if want := repo.BlobPath(hash); target != want {
+		t.Fatalf("snapshot symlink target=%q, want absolute blob %q", target, want)
+	}
+	requireContent(t, stored.SnapshotPath, content)
+}
+
 func TestEntryCorrectnessHashingHonorsCancellation(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.bin")

@@ -516,11 +516,15 @@ func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePat
 	// allowed by unsafeRepoPath, and counting separators in the raw string
 	// would then emit too many "../" components and leave a dangling
 	// symlink (os.Symlink succeeds, so the hardlink/copy fallback never
-	// runs). Both paths sit under the same Hub dir, so Rel must hold.
+	// runs). Both paths sit under the same Hub dir, so Rel is not expected
+	// to fail; if it ever does (e.g. a cross-volume Hub layout), fall back
+	// to the absolute blob path so the symlink step of the placement
+	// cascade stays reachable and a target-computation detail can neither
+	// drop the entry nor fail the download.
 	blobPath := r.BlobPath(sha256)
-	target, err := filepath.Rel(filepath.Dir(linkPath), blobPath)
-	if err != nil {
-		return fmt.Errorf("relativize snapshot target: %w", err)
+	target := blobPath
+	if rel, err := relPathFn(filepath.Dir(linkPath), blobPath); err == nil {
+		target = rel
 	}
 
 	// Leave an already-correct entry untouched: re-placing it would churn a

@@ -269,10 +269,10 @@ func cacheEntryCorrect(ctx context.Context, entryPath, sourcePath, expectedTarge
 	return sameEntryContent(ctx, entryPath, sourcePath)
 }
 
-// relPathFn is the relative-path computation used for friendly symlink
-// targets. It is a seam so tests can reproduce the Windows cross-volume
-// failure — filepath.Rel errors when the Hub and friendly roots sit on
-// different volumes — without a real multi-volume machine.
+// relPathFn is the relative-path computation used for cache-entry symlink
+// targets (snapshot and friendly). It is a seam so tests can reproduce the
+// Windows cross-volume failure — filepath.Rel errors when the two roots sit
+// on different volumes — without a real multi-volume machine.
 var relPathFn = filepath.Rel
 
 // friendlyLinkTarget returns the symlink target for a friendly entry at
