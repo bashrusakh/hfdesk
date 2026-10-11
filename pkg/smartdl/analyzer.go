@@ -638,11 +638,66 @@ func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]by
 	return content, nil
 }
 
-// isLFSPointer reports whether content is a Git LFS pointer stub (the pointer
-// format of the Git LFS v1 spec) rather than actual file content.
+// isLFSPointer reports whether content is a structurally valid Git LFS pointer
+// stub (the pointer format of the Git LFS v1 spec) rather than actual file
+// content: the version header line plus an "oid sha256:<64 hex>" line and a
+// "size <digits>" line. Content that merely starts with the version line is
+// file content and must not trigger pointer handling (a false match would
+// become a fatal named-file error after the /resolve/ retry).
 func isLFSPointer(content []byte) bool {
-	first, _, _ := bytes.Cut(content, []byte("\n"))
-	return string(bytes.TrimSpace(first)) == "version https://git-lfs.github.com/spec/v1"
+	const header = "version https://git-lfs.github.com/spec/v1"
+	oidPrefix := []byte("oid sha256:")
+	sizePrefix := []byte("size ")
+	hasOID, hasSize := false, false
+	for i, line := range bytes.Split(content, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if i == 0 {
+			if string(line) != header {
+				return false
+			}
+			continue
+		}
+		if !hasOID && bytes.HasPrefix(line, oidPrefix) {
+			oid := line[len(oidPrefix):]
+			if len(oid) == 64 && allHex(oid) {
+				hasOID = true
+			}
+		} else if !hasSize && bytes.HasPrefix(line, sizePrefix) {
+			if allDigits(line[len(sizePrefix):]) {
+				hasSize = true
+			}
+		}
+		if hasOID && hasSize {
+			return true
+		}
+	}
+	return false
+}
+
+// allHex reports whether b is a non-empty ASCII hexadecimal string.
+func allHex(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// allDigits reports whether b is a non-empty ASCII decimal string.
+func allDigits(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 const maxMetadataSize = 10 * 1024 * 1024

@@ -645,3 +645,46 @@ func TestAnalyzeUnmarkedLFSResolveFailure(t *testing.T) {
 		t.Fatalf("lost LFS metadata not explicit: %v", err)
 	}
 }
+
+// Only a structurally valid Git LFS v1 pointer (version header plus an
+// oid sha256:<64 hex> line and a size <digits> line) is a persistent pointer;
+// content that merely starts with the version line is file content and must
+// never reach the fatal pointer error path.
+func TestIsLFSPointer(t *testing.T) {
+	oidLine := "oid sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name, content string
+		want          bool
+	}{
+		{"valid pointer fixture", lfsPointerBody, true},
+		{"header only", "version https://git-lfs.github.com/spec/v1\n", false},
+		{"header plus prose", "version https://git-lfs.github.com/spec/v1\nsee the git-lfs pointer format\n", false},
+		{"missing oid", "version https://git-lfs.github.com/spec/v1\nsize 32272712\n", false},
+		{"missing size", "version https://git-lfs.github.com/spec/v1\n" + oidLine + "\n", false},
+		{"short oid", "version https://git-lfs.github.com/spec/v1\noid sha256:abcd\nsize 1\n", false},
+		{"non-hex oid", "version https://git-lfs.github.com/spec/v1\noid sha256:" + strings.Repeat("z", 64) + "\nsize 1\n", false},
+		{"non-numeric size", "version https://git-lfs.github.com/spec/v1\n" + oidLine + "\nsize twelve\n", false},
+		{"pointer lines not first", "padding\n" + lfsPointerBody, false},
+		{"json content", `{"quant_method":"exl3"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLFSPointer([]byte(tc.content)); got != tc.want {
+				t.Fatalf("isLFSPointer = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Benign content starting with the LFS version line is file content, not a
+// pointer: no /resolve/ retry and no fatal named-file error after it.
+func TestAnalyzeHeaderOnlyContentIsNotPointer(t *testing.T) {
+	body := "version https://git-lfs.github.com/spec/v1\nThis file documents the git-lfs pointer format.\n"
+	info, err := analyzeFixtureFiles(t, []string{"config.json", "model.safetensors", "quantization_config.json"}, nil,
+		map[string]string{"quantization_config.json": body}, nil, false)
+	if err != nil {
+		t.Fatalf("benign content treated as a fatal lfs pointer: %v", err)
+	}
+	if _, ok := info.Metadata["quantization_config.json"]; ok {
+		t.Fatalf("non-JSON content interpreted as metadata: %+v", info.Metadata)
+	}
+}
