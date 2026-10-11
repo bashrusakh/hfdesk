@@ -186,8 +186,7 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 		}
 		errStr := strings.ToLower(err.Error())
 		return strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "unauthorized") ||
-			strings.Contains(errStr, "401")
+			strings.Contains(errStr, "unauthorized")
 	}
 
 	// If model not found or unauthorized, try as dataset
