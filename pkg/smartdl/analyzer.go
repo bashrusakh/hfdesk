@@ -734,9 +734,10 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 				completed++
 			}
 		case "expert_bits", "routed_expert_bits":
-			// Per-expert widths: an object keyed by expert or a single width.
+			// Per-expert widths: an object keyed by expert, a list of widths,
+			// or a single width.
 			switch value.(type) {
-			case map[string]interface{}, float64:
+			case map[string]interface{}, []interface{}, float64:
 				head[key] = value
 				completed++
 			}
