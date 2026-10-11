@@ -596,7 +596,7 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 	if err != nil && !errors.Is(err, errMetadataTooLarge) {
 		return nil, err
 	}
-	if isLFSPointer(content) && !isLFS {
+	if !isLFS && isLFSPointer(content) {
 		// Unmarked LFS file: /raw/ served the pointer stub, so the content is
 		// known to be missing; failing to replace it must stay explicit.
 		content, err = a.fetchFileFrom(ctx, a.resolveURL(repo, isDataset, revision, path), path)
@@ -646,17 +646,17 @@ func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]by
 // become a fatal named-file error after the /resolve/ retry).
 func isLFSPointer(content []byte) bool {
 	const header = "version https://git-lfs.github.com/spec/v1"
+	// Check the header line before splitting the body so ordinary file
+	// content costs one line comparison instead of a full split.
+	first, rest, _ := bytes.Cut(content, []byte("\n"))
+	if string(bytes.TrimSpace(first)) != header {
+		return false
+	}
 	oidPrefix := []byte("oid sha256:")
 	sizePrefix := []byte("size ")
 	hasOID, hasSize := false, false
-	for i, line := range bytes.Split(content, []byte("\n")) {
+	for _, line := range bytes.Split(rest, []byte("\n")) {
 		line = bytes.TrimSpace(line)
-		if i == 0 {
-			if string(line) != header {
-				return false
-			}
-			continue
-		}
 		if !hasOID && bytes.HasPrefix(line, oidPrefix) {
 			oid := line[len(oidPrefix):]
 			if len(oid) == 64 && allHex(oid) {
