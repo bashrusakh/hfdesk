@@ -491,6 +491,8 @@ func stringSlicesEqual(a, b []string) bool {
 // destination, destination folder override, or matching mode creates a new
 // job.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
+	reservationRetries := 0
+resolveRequest:
 	revision := req.Revision
 	if revision == "" {
 		revision = "main"
@@ -591,9 +593,103 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		m.mu.Unlock()
 		return nil, false, fmt.Errorf("%w: repository folder escapes its configured root", errInvalidDestination)
 	}
-	if m.jobBlockedByDeleteLocked(job) {
+	for _, scopes := range m.hfRepoReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+	}
+	if len(m.deleteReservations) != 0 {
+		start := m.captureWriteDecisionLocked()
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, existing := range m.jobs {
+			jobPointers[id] = existing
+		}
+		// The candidate is immutable for this attempt and participates in the
+		// same deduplicated namespace inventory as existing queued/starting jobs.
+		candidate := decisionJob(job)
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		m.opWG.Add(1)
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		var targets []string
+		for _, paths := range start.deletes {
+			targets = append(targets, paths...)
+		}
 		m.mu.Unlock()
-		return nil, false, errSelectionWriterBusy
+
+		a.CollectSnapshot(inventorySnapshot)
+		for _, target := range targets {
+			probe, probeErr := captureWriteIdentityProbe(target, false)
+			if probeErr != nil {
+				a.failed["create-target"] = true
+				break
+			}
+			a.targets[filepath.Clean(target)] = probe
+		}
+		blocked := a.failed["create-target"] || hfReservationsBlockSnapshot(start, job) || a.HasActiveBroadMutationFor(candidate, nil)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+				break
+			}
+		}
+		probesOK := !a.failed["create-target"] && a.RevalidateProbes(targets)
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return nil, false, errJobManagerStopping
+		}
+		// Re-run dedup while still holding the commit lock even when the
+		// inventory snapshot changed; an equal concurrent admission wins.
+		for _, existing := range m.jobs {
+			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
+				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
+				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
+				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
+				a.Close()
+				snapshot := m.cloneJobLocked(existing)
+				m.mu.Unlock()
+				return snapshot, true, nil
+			}
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for id, existing := range jobPointers {
+				if m.jobs[id] != existing {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			reservationRetries++
+			if reservationRetries < 3 {
+				goto resolveRequest
+			}
+			return nil, false, errSelectionWriterBusy
+		}
+		if blocked {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+		m.opWG.Add(1)
+		m.jobs[job.ID] = job
+		m.signalWriteDecisionLocked()
+		m.dispatchLocked()
+		snapshot := m.cloneJobLocked(job)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		m.opWG.Done()
+		return snapshot, false, nil
 	}
 
 	m.opWG.Add(1)
