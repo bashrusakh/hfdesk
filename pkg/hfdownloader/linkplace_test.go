@@ -362,8 +362,12 @@ func TestSyncRepairsBlobsOnlyCacheSnapshotEntries(t *testing.T) {
 		if _, err := builder.Build().Write(repo.FriendlyPath()); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := cache.Sync(SyncOptions{}); err != nil {
+		result, err := cache.Sync(SyncOptions{})
+		if err != nil {
 			t.Fatal(err)
+		}
+		if len(result.Errors) != 0 {
+			t.Fatalf("commit mismatch was reported as a sync failure: %v", result.Errors)
 		}
 		for _, commit := range []string{"commit-a", "other-commit"} {
 			snapPath, err := repo.SnapshotPath(commit, "model-Q4_K_M.gguf")
@@ -375,6 +379,71 @@ func TestSyncRepairsBlobsOnlyCacheSnapshotEntries(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("malformed manifest with ref reports repair error once", func(t *testing.T) {
+		cache, repo, _ := blobsOnlyCacheFixture(t, content)
+		if err := repo.WriteRef("main", "commit-a"); err != nil {
+			t.Fatal(err)
+		}
+		manifestPath := filepath.Join(repo.FriendlyPath(), ManifestFilename)
+		if err := os.WriteFile(manifestPath, []byte("invalid: [yaml"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		result, err := cache.Sync(SyncOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "read download manifest") {
+			t.Fatalf("manifest repair failure errors=%v, want one manifest error", result.Errors)
+		}
+	})
+
+	t.Run("manifest read failure without refs is reported", func(t *testing.T) {
+		cache, repo, _ := blobsOnlyCacheFixture(t, content)
+		manifestPath := filepath.Join(repo.FriendlyPath(), ManifestFilename)
+		if err := os.Remove(manifestPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(manifestPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+		result, err := cache.Sync(SyncOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "read download manifest") {
+			t.Fatalf("manifest discovery failure errors=%v, want one manifest error", result.Errors)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		foreign bool
+	}{
+		{name: "absent manifest remains a no-op"},
+		{name: "foreign manifest remains a no-op", foreign: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, repo, _ := blobsOnlyCacheFixture(t, content)
+			manifestPath := filepath.Join(repo.FriendlyPath(), ManifestFilename)
+			if err := os.Remove(manifestPath); err != nil {
+				t.Fatal(err)
+			}
+			if tc.foreign {
+				m := &DownloadManifest{Repo: "other/repo", Commit: "commit-a", Type: "model"}
+				if _, err := m.Write(repo.FriendlyPath()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := cache.Sync(SyncOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Errors) != 0 {
+				t.Fatalf("absent/foreign manifest returned sync errors: %v", result.Errors)
+			}
+		})
+	}
 }
 
 // TestCleanOrphanedSymlinksKeepsHardLinkAndCopyEntries verifies the Clean

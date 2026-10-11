@@ -152,13 +152,16 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		// Blobs-only cache (for example one downloaded on a filesystem where
 		// link creation was skipped entirely): the offline download manifest
 		// still names the commit its blobs belong to.
-		if m, err := readRepoManifest(repoDir); err == nil && m != nil {
+		m, err := readRepoManifest(repoDir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read download manifest: %w", err))
+		} else if m != nil {
 			commit = m.Commit
 		}
 	}
 
 	if commit == "" {
-		return 0, 0, nil // Nothing to sync
+		return 0, 0, errs // Nothing to sync, but retain manifest read failures
 	}
 
 	// Recreate snapshot entries a blobs-only or partially repaired cache is
@@ -273,7 +276,10 @@ func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 	var errs []error
 
 	m, err := readRepoManifest(r)
-	if err != nil || m == nil || m.Commit != commit {
+	if err != nil {
+		return 0, []error{fmt.Errorf("read download manifest: %w", err)}
+	}
+	if m == nil || m.Commit != commit {
 		return 0, nil
 	}
 
