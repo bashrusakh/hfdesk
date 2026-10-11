@@ -3,13 +3,18 @@
 
 package smartdl
 
-import "strings"
+import (
+	"math"
+	"strconv"
+	"strings"
+)
 
 // Quantization method descriptions.
 var quantMethodDescriptions = map[string]string{
 	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
 	"awq":          "AWQ - Activation-aware Weight Quantization",
 	"exl2":         "EXL2 - ExLlamaV2 mixed-precision quantization",
+	"exl3":         "EXL3 - ExLlamaV3 quantization",
 	"bitsandbytes": "bitsandbytes INT8/INT4 quantization",
 	"bnb":          "bitsandbytes INT8/INT4 quantization",
 	"hqq":          "HQQ - Half-Quadratic Quantization",
@@ -41,9 +46,76 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		}
 	}
 
-	// GPTQ specific fields
-	if bits, ok := config["bits"].(float64); ok {
-		info.Bits = int(bits)
+	// Declared precision. A header "bits" value describes only the tensors it
+	// applies to: it may be presented as model-wide precision only when the
+	// config was read completely and every observed declared width is consistent
+	// with it (issue #123). Unknown declarations and a partial config prevent
+	// that claim; metadata such as bits_per_weight is independent evidence.
+	headerBits, hasBits, validBits := declaredWidth(config, "bits")
+	knownWidths := make([]float64, 0, 8)
+	if hasBits {
+		if validBits {
+			knownWidths = append(knownWidths, headerBits)
+		}
+	}
+	unknownWidths := hasBits && !validBits
+	headBits, hasHeadBits, validHeadBits := declaredWidth(config, "head_bits")
+	if hasHeadBits {
+		if validHeadBits {
+			info.HeadBits = headBits
+			knownWidths = append(knownWidths, headBits)
+		} else {
+			unknownWidths = true
+		}
+	}
+	// Group declarations are local evidence: equal values without a model-wide
+	// declaration do not prove either uniformity or variation.
+	for _, key := range []string{"vision_bits", "mtp_bits"} {
+		if groupBits, present, valid := declaredWidth(config, key); present {
+			if valid {
+				knownWidths = append(knownWidths, groupBits)
+			} else {
+				unknownWidths = true
+			}
+		}
+	}
+	// A known per-expert range contributes observed widths; an absent or cut
+	// range is uncertainty, not evidence of variation.
+	for _, key := range []string{"expert_bits", "routed_expert_bits"} {
+		expertBits, ok := config[key]
+		if !ok {
+			continue
+		}
+		minBits, maxBits, complete := expertBitRange(expertBits)
+		if !complete {
+			unknownWidths = true
+		}
+		if minBits != 0 && (info.ExpertBitsMin == 0 || minBits < info.ExpertBitsMin) {
+			info.ExpertBitsMin = minBits
+		}
+		if maxBits > info.ExpertBitsMax {
+			info.ExpertBitsMax = maxBits
+		}
+		if minBits != 0 {
+			knownWidths = append(knownWidths, minBits, maxBits)
+		}
+	}
+	// Only demonstrated width differences establish mixed precision.
+	for i := 1; i < len(knownWidths); i++ {
+		if knownWidths[i] != knownWidths[0] {
+			info.MixedPrecision = true
+			break
+		}
+	}
+	// A config recovered only partially at the metadata size bound may hold
+	// more precision declarations past the cut, so uniformity is not
+	// established even when the recovered fields look uniform.
+	if _, ok := config[partialHeadMarker]; ok {
+		info.ConfigPartial = true
+	}
+	if intBits, representable := exactIntegerBits(headerBits); hasBits && representable &&
+		!info.MixedPrecision && !info.ConfigPartial && !unknownWidths {
+		info.Bits = intBits
 	}
 
 	if groupSize, ok := config["group_size"].(float64); ok {
@@ -101,6 +173,72 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	}
 
 	return info
+}
+
+// declaredWidth reports whether a field exists and whether its value is a
+// valid positive finite bit width.
+func declaredWidth(config map[string]interface{}, key string) (width float64, present, valid bool) {
+	value, present := config[key]
+	if !present {
+		return 0, false, false
+	}
+	width, ok := value.(float64)
+	return width, true, ok && width > 0 && !math.IsNaN(width) && !math.IsInf(width, 0)
+}
+
+// exactIntegerBits prevents the public integer field from rounding fractional
+// declarations or overflowing on values outside the platform int range.
+func exactIntegerBits(width float64) (int, bool) {
+	if width <= 0 || math.IsNaN(width) || math.IsInf(width, 0) || math.Trunc(width) != width {
+		return 0, false
+	}
+	maxIntExclusive := math.Ldexp(1, strconv.IntSize-1)
+	if width >= maxIntExclusive {
+		return 0, false
+	}
+	return int(width), true
+}
+
+// expertBitRange collects valid positive finite widths from the declared
+// object/list/scalar while separately reporting whether every branch was
+// structurally complete and valid. Unknown leaves block a uniform claim but
+// do not erase genuine conflicts among the valid widths.
+func expertBitRange(value interface{}) (minBits, maxBits float64, complete bool) {
+	complete = true
+	var walk func(interface{})
+	walk = func(v interface{}) {
+		switch t := v.(type) {
+		case float64:
+			if t <= 0 || math.IsNaN(t) || math.IsInf(t, 0) {
+				complete = false
+				return
+			}
+			if minBits == 0 || t < minBits {
+				minBits = t
+			}
+			if t > maxBits {
+				maxBits = t
+			}
+		case map[string]interface{}:
+			if len(t) == 0 {
+				complete = false
+			}
+			for _, item := range t {
+				walk(item)
+			}
+		case []interface{}:
+			if len(t) == 0 {
+				complete = false
+			}
+			for _, item := range t {
+				walk(item)
+			}
+		default:
+			complete = false
+		}
+	}
+	walk(value)
+	return minBits, maxBits, complete
 }
 
 // detectBackends returns compatible inference backends.
