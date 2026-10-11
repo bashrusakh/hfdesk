@@ -4,10 +4,11 @@
 package server
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 )
 
 // writeDecisionJob is the manager-owned portion of a reservation decision.
@@ -37,6 +38,12 @@ type writeDecisionSnapshot struct {
 	deletes, hfReservations, mutations map[uint64][]frozenMutationPath
 }
 
+type writeIdentityProbe struct {
+	path, identity, linkTarget string
+	directory                  bool
+	mode                       os.FileMode
+}
+
 func decisionJob(j *Job) writeDecisionJob {
 	return writeDecisionJob{id: j.ID, repo: j.Repo, revision: j.Revision, output: j.OutputDir,
 		hub: j.HubDir, local: j.LocalDir, localRepo: j.LocalRepo, status: j.Status,
@@ -61,7 +68,11 @@ func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 		s.jobs = append(s.jobs, decisionJob(j))
 	}
 	for id, a := range m.runActivities {
-		item := writeDecisionActivity{id: id, job: decisionJob(a.job), planKnown: a.planKnown}
+		descriptor := a.descriptor
+		if descriptor.id == "" {
+			descriptor = decisionJob(a.job)
+		}
+		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown}
 		if a.planKnown {
 			item.planned = mapKeys(a.planned)
 			sort.Strings(item.planned)
@@ -138,7 +149,9 @@ type cacheWriteAttempt struct {
 	manager   *JobManager
 	start     writeDecisionSnapshot
 	evidence  map[string]selectedWriteEvidence
-	complete  bool
+	failed    map[string]bool
+	probes    map[string]writeIdentityProbe
+	targets   map[string]writeIdentityProbe
 	inventory func(string) (writableNamespaceInventory, bool)
 }
 
@@ -149,7 +162,7 @@ func (m *JobManager) beginCacheWriteAttempt() (*cacheWriteAttempt, bool) {
 		return nil, false
 	}
 	m.opWG.Add(1)
-	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), complete: true, inventory: inventoryWritableNamespace}, true
+	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventoryWritableNamespace}, true
 }
 
 func (a *cacheWriteAttempt) Close() {
@@ -159,7 +172,17 @@ func (a *cacheWriteAttempt) Close() {
 }
 
 func decisionJobKey(j *Job) string {
-	return j.ID + "\x00" + j.Repo + "\x00" + j.Revision + "\x00" + j.OutputDir + "\x00" + j.HubDir + "\x00" + j.LocalDir + "\x00" + j.LocalRepo + "\x00" + strconv.Itoa(j.generation)
+	return decisionDescriptorKey(decisionJob(j))
+}
+
+func decisionDescriptorKey(d writeDecisionJob) string {
+	b, _ := json.Marshal(struct {
+		ID, Repo, Revision, Output, Hub, Local, LocalRepo string
+		Filters, Excludes                                 []string
+		Generation                                        int
+		Exact, Flat, Dataset                              bool
+	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset})
+	return string(b)
 }
 
 func jobFromDecision(d writeDecisionJob) *Job {
@@ -175,12 +198,18 @@ func jobFromDecision(d writeDecisionJob) *Job {
 func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 	seen := make(map[string]struct{}, len(s.jobs)+len(s.activities))
 	for _, d := range s.jobs {
+		if d.status != JobStatusQueued && !d.starting {
+			continue
+		}
 		j := jobFromDecision(d)
 		key := decisionJobKey(j)
 		seen[key] = struct{}{}
 		a.Collect(j)
 	}
 	for _, activity := range s.activities {
+		if activity.planKnown {
+			continue
+		}
 		j := jobFromDecision(activity.job)
 		key := decisionJobKey(j)
 		if _, ok := seen[key]; ok {
@@ -194,16 +223,10 @@ func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 // Collect builds each semantic job's writable namespace once, independent
 // of target count. It is safe to call only on the attempt-local job copies.
 func (a *cacheWriteAttempt) Collect(job *Job) {
-	a.CollectAs(job, "job")
-}
-
-// CollectAs keeps evidence from separate writer lifetimes distinct even when
-// they reuse a visible semantic job ID (for example, a stale run and retry).
-func (a *cacheWriteAttempt) CollectAs(job *Job, lifetime string) {
-	if a == nil || job == nil || !a.complete {
+	if a == nil || job == nil {
 		return
 	}
-	key := lifetime + "\x00" + decisionJobKey(job)
+	key := decisionJobKey(job)
 	if _, ok := a.evidence[key]; ok {
 		return
 	}
@@ -211,29 +234,64 @@ func (a *cacheWriteAttempt) CollectAs(job *Job, lifetime string) {
 	if inventory == nil {
 		inventory = inventoryWritableNamespace
 	}
+	bases := jobWritableBases(job)
+	baseProbes := make([]writeIdentityProbe, len(bases))
+	for i, base := range bases {
+		probe, err := captureWriteIdentityProbe(base, true)
+		if err != nil {
+			a.failed[key] = true
+			return
+		}
+		baseProbes[i] = probe
+	}
 	ev, ok := buildSelectedWriteEvidence(job, inventory)
 	if !ok {
-		a.complete = false
+		a.failed[key] = true
 		return
 	}
 	a.evidence[key] = ev
+	for i, base := range bases {
+		probe, err := captureWriteIdentityProbe(base, true)
+		if err != nil || !reflect.DeepEqual(probe, baseProbes[i]) || i >= len(ev.inventories) || probe.identity != ev.inventories[i].base {
+			a.failed[key] = true
+			delete(a.evidence, key)
+			return
+		}
+		a.probes[probe.path] = probe
+	}
+	for _, inv := range ev.inventories {
+		for _, alias := range inv.aliases {
+			probe, err := captureWriteIdentityProbe(alias.location, true)
+			if err != nil || probe.identity != pathIdentityKey(alias.dest) {
+				a.failed[key] = true
+				delete(a.evidence, key)
+				return
+			}
+			a.probes[probe.path] = probe
+		}
+	}
 }
 
 func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
-	if a == nil || !a.complete {
+	if a == nil {
 		return true
 	}
-	ev, ok := a.evidence["job\x00"+decisionJobKey(job)]
+	key := decisionJobKey(job)
+	if a.failed[key] {
+		return true
+	}
+	ev, ok := a.evidence[key]
 	if !ok {
 		return true
 	}
 	identities := make([]string, len(targets))
 	for i, p := range targets {
-		id, err := mutationEntryIdentity(p)
+		probe, err := captureWriteIdentityProbe(p, false)
 		if err != nil {
 			return true
 		}
-		identities[i] = id
+		identities[i] = probe.identity
+		a.targets[filepath.Clean(p)] = probe
 	}
 	return selectedWriteEvidenceMayWrite(ev, identities)
 }
@@ -241,11 +299,22 @@ func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
 // Revalidate probes only the explicit bounded identities supplied by the
 // caller. It is not a guarantee against unmanaged external filesystem writes.
 func (a *cacheWriteAttempt) Revalidate(paths []string) bool {
-	if a == nil || !a.complete || !a.manager.writeDecisionUnchanged(a.start) {
+	if a == nil || !a.manager.writeDecisionUnchanged(a.start) {
 		return false
 	}
+	for _, probe := range a.probes {
+		current, err := captureWriteIdentityProbe(probe.path, probe.directory)
+		if err != nil || !reflect.DeepEqual(probe, current) {
+			return false
+		}
+	}
 	for _, p := range paths {
-		if _, err := mutationEntryIdentity(filepath.Clean(p)); err != nil {
+		probe, ok := a.targets[filepath.Clean(p)]
+		if !ok {
+			return false
+		}
+		current, err := captureWriteIdentityProbe(p, probe.directory)
+		if err != nil || !reflect.DeepEqual(probe, current) {
 			return false
 		}
 	}
@@ -256,14 +325,70 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 	if a == nil {
 		return true
 	}
-	for _, scopes := range a.start.mutations {
-		for _, scope := range scopes {
-			for _, target := range targets {
-				if frozenMutationOverlapsRawEntry(scope, target) {
-					return true
+	for _, scopesByID := range []map[uint64][]frozenMutationPath{a.start.mutations, a.start.deletes, a.start.hfReservations} {
+		for _, scopes := range scopesByID {
+			for _, scope := range scopes {
+				for _, target := range targets {
+					if frozenMutationOverlapsRawEntry(scope, target) {
+						return true
+					}
+				}
+				for _, ev := range a.evidence {
+					for _, inv := range ev.inventories {
+						if frozenMutationOverlapsRawDirectory(scope, inv.base) {
+							return true
+						}
+						for _, alias := range inv.aliases {
+							if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
+								return true
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+func captureWriteIdentityProbe(path string, directory bool) (writeIdentityProbe, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return writeIdentityProbe{}, err
+	}
+	var identity string
+	if directory {
+		identity, err = mutationDirectoryIdentity(abs)
+	} else {
+		identity, err = mutationEntryIdentity(abs)
+	}
+	if err != nil {
+		return writeIdentityProbe{}, err
+	}
+	p := writeIdentityProbe{path: abs, identity: identity, directory: directory}
+	info, lerr := os.Lstat(abs)
+	if lerr == nil {
+		p.mode = info.Mode()
+		if info.Mode()&os.ModeSymlink != 0 {
+			p.linkTarget, err = os.Readlink(abs)
+			if err != nil {
+				return writeIdentityProbe{}, err
+			}
+		}
+	} else if !os.IsNotExist(lerr) {
+		return writeIdentityProbe{}, lerr
+	}
+	return p, nil
+}
+
+func jobWritableBases(job *Job) []string {
+	base := jobDestinationBase(job)
+	if base == "" {
+		return nil
+	}
+	bases := []string{base}
+	if snapshot := jobSnapshotBase(job); snapshot != "" && snapshot != base {
+		bases = append(bases, snapshot)
+	}
+	return bases
 }
