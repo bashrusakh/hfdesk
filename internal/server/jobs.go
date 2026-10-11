@@ -813,59 +813,7 @@ func (m *JobManager) PauseJob(id string) bool {
 
 // ResumeJob resumes a paused job.
 func (m *JobManager) ResumeJob(id string) bool {
-	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
-		return false
-	}
-	job, ok := m.jobs[id]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-
-	if job.Status != JobStatusPaused {
-		m.mu.Unlock()
-		return false
-	}
-	if jobDestinationBase(job) == "" {
-		m.mu.Unlock()
-		return false
-	}
-	if m.jobBlockedByDeleteLocked(job) {
-		m.mu.Unlock()
-		return false
-	}
-	m.opWG.Add(1)
-	defer m.opWG.Done()
-
-	job.Status = JobStatusQueued
-	m.signalWriteDecisionLocked()
-	// Reset progress totals — the downloader will re-scan the repo and
-	// emit fresh plan_item events that rebuild TotalFiles / TotalBytes.
-	// Preserve DownloadedBytes as an initial estimate so the UI doesn't
-	// jump from e.g. 60% to 0% while the scan runs. The downloader's
-	// file_progress and file_done events recompute DownloadedBytes from
-	// the live job.Files list as soon as files are processed (skipped
-	// blob → immediate file_done; partial → file_progress at the on-disk
-	// position from the .part file), so the estimate corrects itself
-	// within a second or two. resumeFloor arms the monotonic guard in
-	// applyJobProgress for this recovery window and is cleared by
-	// applyJobProgress once the running sum catches up.
-	oldBytes := job.Progress.DownloadedBytes
-	job.Progress = JobProgress{}
-	job.Progress.DownloadedBytes = oldBytes
-	job.resumeFloor = oldBytes
-	job.Files = nil
-	snapshot := m.cloneJobLocked(job)
-	// Re-queue through the scheduler so resuming respects max-active.
-	m.dispatchLocked()
-	m.mu.Unlock()
-
-	// Notify listeners of status change
-	m.notifyListeners(snapshot)
-
-	return true
+	return m.restartJob(id, false)
 }
 
 // RetryJob restarts a failed or cancelled job using its original
@@ -873,51 +821,158 @@ func (m *JobManager) ResumeJob(id string) bool {
 // re-queued and run again. Already-downloaded files are skipped by the
 // downloader, so a retry resumes where it left off.
 func (m *JobManager) RetryJob(id string) bool {
+	return m.restartJob(id, true)
+}
+
+// restartJob admits a resume/retry transition. Selected-delete reservations
+// require filesystem inventory, so that evidence is gathered without m.mu and
+// committed only if the complete manager decision is still the one observed.
+func (m *JobManager) restartJob(id string, retry bool) bool {
+	const maxAttempts = 3
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
 		return false
 	}
 	job, ok := m.jobs[id]
-	if !ok {
+	if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
 		m.mu.Unlock()
 		return false
 	}
-
-	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
-		m.mu.Unlock()
-		return false
-	}
-	if jobDestinationBase(job) == "" {
-		m.mu.Unlock()
-		return false
-	}
-	if m.jobBlockedByDeleteLocked(job) {
-		m.mu.Unlock()
-		return false
-	}
+	// Register before unlocking: Close fences new work then drains this
+	// operation, including inventory collection and any revalidation retry.
 	m.opWG.Add(1)
+	m.mu.Unlock()
 	defer m.opWG.Done()
 
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		m.mu.Lock()
+		if m.stopping {
+			m.mu.Unlock()
+			return false
+		}
+		job, ok = m.jobs[id]
+		if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
+			m.mu.Unlock()
+			return false
+		}
+		if len(m.deleteReservations) == 0 {
+			if m.jobBlockedByDeleteLocked(job) {
+				m.mu.Unlock()
+				return false
+			}
+			snapshot := resetAndQueueRestartLocked(m, job, retry)
+			m.mu.Unlock()
+			m.notifyListeners(snapshot)
+			return true
+		}
+
+		start := m.captureWriteDecisionLocked()
+		pointers := make(map[string]*Job, len(m.jobs))
+		for jobID, existing := range m.jobs {
+			pointers[jobID] = existing
+		}
+		cfg := m.config
+		candidate := decisionJob(job)
+		candidate.status = JobStatusQueued
+		candidate.starting = false
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		targets := make([]string, 0)
+		for _, paths := range start.deletes {
+			targets = append(targets, paths...)
+		}
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		// The attempt owns a separate reference because cacheWriteAttempt.Close
+		// releases it on every success, rejection, and retry path.
+		m.opWG.Add(1)
+		m.mu.Unlock()
+
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		a.CollectSnapshot(inventorySnapshot)
+		blocked := a.HasActiveBroadMutationFor(candidate, nil)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+			}
+		}
+		probesOK := a.RevalidateProbes(targets)
+
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		current, exists := m.jobs[id]
+		if !exists || !restartStatusAllowed(current.Status, retry) || jobDestinationBase(current) == "" {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		if current != pointers[id] {
+			a.Close()
+			m.mu.Unlock()
+			continue // The same eligible job was replaced; inventory its new state.
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for jobID, pointer := range pointers {
+				if m.jobs[jobID] != pointer {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			continue // A fresh attempt gets fresh reservation and filesystem evidence.
+		}
+		if blocked {
+			m.mu.Unlock()
+			return false
+		}
+		snapshot := resetAndQueueRestartLocked(m, current, retry)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		return true
+	}
+	return false
+}
+
+func restartStatusAllowed(status JobStatus, retry bool) bool {
+	if retry {
+		return status == JobStatusFailed || status == JobStatusCancelled
+	}
+	return status == JobStatusPaused
+}
+
+func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
 	job.Status = JobStatusQueued
 	m.signalWriteDecisionLocked()
-	job.Error = ""
-	job.EndedAt = nil
-	// Reset progress - the downloader will re-scan and report all files.
-	// No resume floor: a retry is a clean restart from zero, so the
-	// running sum drives DownloadedBytes directly.
-	job.Progress = JobProgress{}
-	job.resumeFloor = 0
+	if retry {
+		job.Error = ""
+		job.EndedAt = nil
+		// Retry is a clean restart from zero; the downloader re-scans and
+		// reports all files, so there is no resume floor.
+		job.Progress = JobProgress{}
+		job.resumeFloor = 0
+	} else {
+		// Keep the visible byte estimate until the next run reports its
+		// on-disk progress while rebuilding file totals from a fresh scan.
+		oldBytes := job.Progress.DownloadedBytes
+		job.Progress = JobProgress{}
+		job.Progress.DownloadedBytes = oldBytes
+		job.resumeFloor = oldBytes
+	}
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
-	// Re-queue through the scheduler so retrying respects max-active.
 	m.dispatchLocked()
-	m.mu.Unlock()
-
-	// Notify listeners of status change
-	m.notifyListeners(snapshot)
-
-	return true
+	return snapshot
 }
 
 // DeleteJob removes a job from the list.
