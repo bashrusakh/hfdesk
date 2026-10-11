@@ -93,6 +93,38 @@ func mutationScopesOverlap(a, b frozenMutationPath) bool {
 	return false
 }
 
+// mutationScopeKindOverlap compares a frozen scope with a frozen entry using
+// the identity kind that produced the scope. Directory scopes retain the raw
+// spelling revalidation in mutationScopesOverlap; entry scopes only compare
+// entry identities because their final symlink must remain unfollowed.
+func mutationScopeKindOverlap(scope, other frozenMutationPath, kind writeScopeKind) bool {
+	if kind != writeScopeEntry {
+		return mutationScopesOverlap(scope, other)
+	}
+	if frozenMutationOverlap(scope, other) {
+		return true
+	}
+	if scope.raw != "" {
+		if frozenMutationOverlapsRawEntry(other, scope.raw) {
+			return true
+		}
+		current, err := freezeMutationEntry(scope.raw)
+		if err != nil || frozenMutationOverlap(current, other) {
+			return true
+		}
+	}
+	if other.raw != "" {
+		if frozenMutationOverlapsRawEntry(scope, other.raw) {
+			return true
+		}
+		current, err := freezeMutationEntry(other.raw)
+		if err != nil || frozenMutationOverlap(scope, current) {
+			return true
+		}
+	}
+	return false
+}
+
 func pathKeysOverlap(a, b string) bool {
 	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
 }
@@ -813,10 +845,11 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 			}
 		}
 	}
-	for _, scopes := range m.mutationScopes {
+	for id, scopes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if mutationScopesOverlap(scope, entry) {
+				if mutationScopeKindOverlap(scope, entry, kind) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -997,10 +1030,15 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 			return nil, false
 		}
 	}
-	for _, writes := range m.mutationScopes {
-		if conflictScopes(writes) {
-			m.mu.Unlock()
-			return nil, false
+	for id, writes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
+		for _, scope := range scopes {
+			for _, write := range writes {
+				if mutationScopeKindOverlap(scope, write, kind) {
+					m.mu.Unlock()
+					return nil, false
+				}
+			}
 		}
 	}
 	for _, activity := range m.runActivities {
@@ -1104,15 +1142,20 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	if m.mutationScopes == nil {
 		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
+	if m.mutationScopeKinds == nil {
+		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
+	}
 	m.opWG.Add(1)
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.mutationScopes[id] = clean
+	m.mutationScopeKinds[id] = writeScopeDirectory
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.mutationScopes, id)
+		delete(m.mutationScopeKinds, id)
 		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()

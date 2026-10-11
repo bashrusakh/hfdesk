@@ -37,6 +37,7 @@ type writeDecisionSnapshot struct {
 	jobs                               []writeDecisionJob
 	activities                         []writeDecisionActivity
 	deletes, hfReservations, mutations map[uint64][]frozenMutationPath
+	mutationKinds                      map[uint64]writeScopeKind
 }
 
 type writeIdentityProbe struct {
@@ -44,6 +45,13 @@ type writeIdentityProbe struct {
 	directory                  bool
 	mode                       os.FileMode
 }
+
+type writeScopeKind uint8
+
+const (
+	writeScopeDirectory writeScopeKind = iota
+	writeScopeEntry
+)
 
 func decisionJob(j *Job) writeDecisionJob {
 	return writeDecisionJob{id: j.ID, repo: j.Repo, revision: j.Revision, output: j.OutputDir,
@@ -61,10 +69,18 @@ func cloneScopes[T any](in map[uint64][]T) map[uint64][]T {
 	return out
 }
 
+func cloneScopeKinds(in map[uint64]writeScopeKind) map[uint64]writeScopeKind {
+	out := make(map[uint64]writeScopeKind, len(in))
+	for id, kind := range in {
+		out[id] = kind
+	}
+	return out
+}
+
 func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 	s := writeDecisionSnapshot{epoch: m.writeDecisionEpoch, fenced: m.fenced, stopping: m.stopping,
 		maxActive: m.effectiveMaxActive(), deletes: cloneScopes(m.deleteReservations),
-		hfReservations: cloneScopes(m.hfRepoReservations), mutations: cloneScopes(m.mutationScopes)}
+		hfReservations: cloneScopes(m.hfRepoReservations), mutations: cloneScopes(m.mutationScopes), mutationKinds: cloneScopeKinds(m.mutationScopeKinds)}
 	for _, j := range m.jobs {
 		s.jobs = append(s.jobs, decisionJob(j))
 	}
@@ -123,7 +139,7 @@ func (m *JobManager) beginObservedMutation(paths []string) func() {
 		if p == "" {
 			continue
 		}
-		frozen, err := freezeMutationDirectory(p)
+		frozen, err := freezeMutationEntry(p)
 		if err != nil {
 			// The mutation still happens; the epoch bump below keeps decision
 			// waiters from treating their pre-mutation snapshot as current.
@@ -136,12 +152,22 @@ func (m *JobManager) beginObservedMutation(paths []string) func() {
 	if m.mutationScopes == nil {
 		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
+	if m.mutationScopeKinds == nil {
+		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
+	}
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.mutationScopes[id] = clean
+	m.mutationScopeKinds[id] = writeScopeEntry
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
-	return func() { m.mu.Lock(); delete(m.mutationScopes, id); m.bumpWriteDecisionLocked(); m.mu.Unlock() }
+	return func() {
+		m.mu.Lock()
+		delete(m.mutationScopes, id)
+		delete(m.mutationScopeKinds, id)
+		m.bumpWriteDecisionLocked()
+		m.mu.Unlock()
+	}
 }
 
 // cacheWriteAttempt owns an immutable inventory assembled outside manager
@@ -371,23 +397,45 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 	}
 	// beginCacheMutation and HF reservations name directory scopes; selected
 	// GGUF deletes name leaf entries whose final symlink must remain unfollowed.
-	for _, scopesByID := range []map[uint64][]frozenMutationPath{a.start.mutations, a.start.hfReservations} {
-		for _, scopes := range scopesByID {
-			for _, scope := range scopes {
-				for _, target := range targets {
-					if frozenMutationOverlapsRawEntry(scope, target) {
+	// The frozen identity kind is encoded in each scope key, so entry and
+	// directory scopes compare correctly without re-deriving it here.
+	for id, scopes := range a.start.mutations {
+		_ = id
+		for _, scope := range scopes {
+			for _, target := range targets {
+				if frozenMutationOverlapsRawEntry(scope, target) {
+					return true
+				}
+			}
+			for _, ev := range a.evidence {
+				for _, inv := range ev.inventories {
+					if frozenMutationOverlapsRawDirectory(scope, inv.base) {
 						return true
 					}
-				}
-				for _, ev := range a.evidence {
-					for _, inv := range ev.inventories {
-						if frozenMutationOverlapsRawDirectory(scope, inv.base) {
+					for _, alias := range inv.aliases {
+						if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
 							return true
 						}
-						for _, alias := range inv.aliases {
-							if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
-								return true
-							}
+					}
+				}
+			}
+		}
+	}
+	for _, scopes := range a.start.hfReservations {
+		for _, scope := range scopes {
+			for _, target := range targets {
+				if frozenMutationOverlapsRawEntry(scope, target) {
+					return true
+				}
+			}
+			for _, ev := range a.evidence {
+				for _, inv := range ev.inventories {
+					if frozenMutationOverlapsRawDirectory(scope, inv.base) {
+						return true
+					}
+					for _, alias := range inv.aliases {
+						if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
+							return true
 						}
 					}
 				}
@@ -416,15 +464,6 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 		}
 	}
 	return false
-}
-
-func directoryScopesOverlap(a, b string) bool {
-	a, errA := mutationDirectoryIdentity(a)
-	b, errB := mutationDirectoryIdentity(b)
-	if errA != nil || errB != nil {
-		return true
-	}
-	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
 }
 
 func captureWriteIdentityProbe(path string, directory bool) (writeIdentityProbe, error) {

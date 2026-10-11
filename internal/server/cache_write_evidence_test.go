@@ -363,6 +363,119 @@ func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t
 	}
 }
 
+func TestObservedCleanupEntryScopeIsTypedAndNamespaceSensitive(t *testing.T) {
+	root := t.TempDir()
+	writerRoot := filepath.Join(root, "writer")
+	job := &Job{ID: "writer", Repo: "owner/repo", LocalDir: writerRoot, Flat: true}
+	base := jobDestinationBase(job)
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	tempFile := filepath.Join(base, "tmp-blob")
+	if err := os.WriteFile(tempFile, []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	end := m.beginObservedMutation([]string{tempFile})
+	defer end()
+	a, ok := m.beginCacheWriteAttempt()
+	if !ok {
+		t.Fatal("attempt rejected")
+	}
+	defer a.Close()
+	a.Collect(job)
+	if !m.writeDecisionUnchanged(a.start) {
+		t.Fatal("manager state changed during entry-scope collection")
+	}
+	var scopeID uint64
+	for id, paths := range a.start.mutations {
+		if len(paths) > 0 && paths[0].raw == tempFile {
+			scopeID = id
+			if a.start.mutationKinds[id] != writeScopeEntry {
+				t.Fatal("cleanup file scope lost its explicit entry kind")
+			}
+		}
+	}
+	if scopeID == 0 {
+		t.Fatal("observed cleanup entry missing from immutable scope snapshot")
+	}
+	if !a.HasActiveBroadMutation(nil) {
+		t.Fatal("relevant cleanup file did not overlap its writer namespace")
+	}
+	m.mu.Lock()
+	m.mutationScopeKinds[scopeID] = writeScopeDirectory
+	m.mu.Unlock()
+	if m.writeDecisionUnchanged(a.start) {
+		t.Fatal("scope-kind-only change did not invalidate the captured decision")
+	}
+	m.mu.Lock()
+	m.mutationScopeKinds[scopeID] = writeScopeEntry
+	m.mu.Unlock()
+	if _, ok := m.reserveSelectedGGUF([]string{tempFile}); ok {
+		t.Fatal("selected delete overlapped active cleanup entry")
+	}
+	if _, ok := m.reserveSelectedHF(base, filepath.Join(base, "friendly")); ok {
+		t.Fatal("HF namespace reservation overlapped active cleanup entry")
+	}
+	unrelatedEntry := filepath.Join(root, "unrelated", "tmp-blob")
+	if err := os.MkdirAll(filepath.Dir(unrelatedEntry), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unrelatedEntry, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deleteRelease, ok := m.reserveSelectedGGUF([]string{unrelatedEntry})
+	if !ok {
+		t.Fatal("unrelated local deletion was blocked by cleanup entry")
+	}
+	deleteRelease()
+	hfRelease, ok := m.reserveSelectedHF(filepath.Join(root, "unrelated-hub"), filepath.Join(root, "unrelated-friendly"))
+	if !ok {
+		t.Fatal("unrelated HF reservation was blocked by cleanup entry")
+	}
+	hfRelease()
+
+	unrelated := &Job{ID: "other", Repo: "owner/repo", LocalDir: filepath.Join(root, "other-writer"), Flat: true}
+	b := testCacheWriteAttempt(m)
+	b.Collect(unrelated)
+	if b.HasActiveBroadMutation(nil) {
+		t.Fatal("existing cleanup file falsely conflicted with an unrelated namespace")
+	}
+}
+
+func TestSelectedLocalDeleteKeepsFinalSymlinkEntryIdentity(t *testing.T) {
+	root := t.TempDir()
+	writerRoot := filepath.Join(root, "writer")
+	job := &Job{ID: "writer", Repo: "owner/repo", LocalDir: writerRoot, Flat: true}
+	base := jobDestinationBase(job)
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	physical := filepath.Join(base, "weights.gguf")
+	if err := os.WriteFile(physical, []byte("weight"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	leaf := filepath.Join(outside, "selected.gguf")
+	if err := os.Symlink(physical, leaf); err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	release, ok := m.reserveSelectedGGUF([]string{leaf})
+	if !ok {
+		t.Fatal("leaf deletion reservation rejected")
+	}
+	defer release()
+	a := testCacheWriteAttempt(m)
+	a.Collect(job)
+	if a.HasActiveBroadMutation(nil) {
+		t.Fatal("entry-scoped symlink deletion followed its leaf target")
+	}
+}
+
 func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
