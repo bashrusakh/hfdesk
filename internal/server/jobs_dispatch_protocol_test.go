@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -122,6 +125,81 @@ func TestReservationDispatchKeepsYoungerQueuedBehindBlockedHead(t *testing.T) {
 	}
 	m.mu.RUnlock()
 	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReservationDispatchRejectsCapacitySnapshotChangedBeforeCommit(t *testing.T) {
+	root := t.TempDir()
+	requests := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	m := newJobManagerWithStatePath(Config{CacheDir: root, MaxActive: 2, Endpoint: server.URL}, nil, filepath.Join(root, "state"))
+	defer m.Close(context.Background())
+	jobs := []*Job{
+		{ID: "first", Repo: "owner/first", LocalDir: filepath.Join(root, "first"), Flat: true, Status: JobStatusQueued, CreatedAt: time.Now(), partialFilesMu: &sync.Mutex{}},
+		{ID: "second", Repo: "owner/second", LocalDir: filepath.Join(root, "second"), Flat: true, Status: JobStatusQueued, CreatedAt: time.Now().Add(time.Second), partialFilesMu: &sync.Mutex{}},
+	}
+	for _, job := range jobs {
+		m.jobs[job.ID] = job
+		if err := os.MkdirAll(jobDestinationBase(job), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseInventory := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseInventory()
+	var once sync.Once
+	var inventoryCalls int
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		m.mu.Lock()
+		inventoryCalls++
+		m.mu.Unlock()
+		once.Do(func() { close(entered) })
+		<-release
+		return inventoryWritableNamespace(base)
+	}
+	m.mu.Lock()
+	m.deleteReservations[1] = []string{filepath.Join(root, "reserved.gguf")}
+	m.bumpWriteDecisionLocked()
+	m.dispatchLocked()
+	m.mu.Unlock()
+	<-entered
+
+	// Change capacity after the dispatch snapshot was taken but while its
+	// off-lock namespace inventory is still in progress.
+	m.UpdateConfig(Config{CacheDir: root, MaxActive: 1, Endpoint: server.URL})
+	releaseInventory()
+	select {
+	case <-requests:
+	case <-time.After(5 * time.Second):
+		m.mu.RLock()
+		first, firstStarting, second, secondStarting := jobs[0].Status, jobs[0].starting, jobs[1].Status, jobs[1].starting
+		dispatchRunning, dispatchPending, inventoryCount := m.dispatchRunning, m.dispatchPending, inventoryCalls
+		m.mu.RUnlock()
+		t.Fatalf("no queued job reached the blocking endpoint: first=%s/%v second=%s/%v dispatcher=%v pending=%v inventories=%d", first, firstStarting, second, secondStarting, dispatchRunning, dispatchPending, inventoryCount)
+	}
+	m.mu.RLock()
+	active, queued := 0, 0
+	for _, job := range jobs {
+		if job.Status == JobStatusRunning || job.starting {
+			active++
+		}
+		if job.Status == JobStatusQueued {
+			queued++
+		}
+	}
+	m.mu.RUnlock()
+	if active != 1 || queued != 1 {
+		t.Fatalf("stale capacity snapshot started wrong prefix: active=%d queued=%d", active, queued)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
 }

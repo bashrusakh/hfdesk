@@ -1073,6 +1073,10 @@ func (m *JobManager) dispatchWithReservations() {
 		}
 		m.dispatchPending = false
 		change := m.writeDecisionChanged
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, job := range m.jobs {
+			jobPointers[id] = job
+		}
 		m.opWG.Add(1)
 		inventory := m.writeInventory
 		if inventory == nil {
@@ -1098,7 +1102,7 @@ func (m *JobManager) dispatchWithReservations() {
 		blocked := make(map[string]bool)
 		for _, job := range snapshot.jobs {
 			if job.status == JobStatusQueued {
-				if a.HasActiveBroadMutationFor(job, targets) {
+				if a.HasActiveBroadMutationFor(job, nil) {
 					blocked[job.id] = true
 					continue
 				}
@@ -1127,6 +1131,14 @@ func (m *JobManager) dispatchWithReservations() {
 		}
 		current := m.captureWriteDecisionLocked()
 		unchanged := probesOK && reflect.DeepEqual(snapshot, current)
+		if unchanged {
+			for _, descriptor := range snapshot.jobs {
+				if m.jobs[descriptor.id] != jobPointers[descriptor.id] {
+					unchanged = false
+					break
+				}
+			}
+		}
 		if unchanged && len(current.deletes) == 0 {
 			// The final selected-delete lease was released during collection.
 			// Return to the ordinary locked path, which also enforces HF leases.

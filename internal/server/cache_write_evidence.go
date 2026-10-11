@@ -387,7 +387,7 @@ func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targ
 // Revalidate probes only the explicit bounded identities supplied by the
 // caller. It is not a guarantee against unmanaged external filesystem writes.
 func (a *cacheWriteAttempt) Revalidate(paths []string) bool {
-	if a == nil {
+	if a == nil || !a.manager.writeDecisionUnchanged(a.start) {
 		return false
 	}
 	return a.RevalidateProbes(paths)
@@ -420,14 +420,16 @@ func (a *cacheWriteAttempt) RevalidateProbes(paths []string) bool {
 }
 
 func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
-	return a.hasActiveBroadMutation(nil, targets)
+	return a.hasActiveBroadMutation(nil, targets, true)
 }
 
 func (a *cacheWriteAttempt) HasActiveBroadMutationFor(descriptor writeDecisionJob, targets []string) bool {
-	return a.hasActiveBroadMutation(&descriptor, targets)
+	// Selected-delete reservations are checked separately using the job's
+	// path-filter-aware evidence; only broad managed scopes belong here.
+	return a.hasActiveBroadMutation(&descriptor, targets, false)
 }
 
-func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob, targets []string) bool {
+func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob, targets []string, includeDeletes bool) bool {
 	if a == nil {
 		return true
 	}
@@ -490,6 +492,9 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 				}
 			}
 		}
+	}
+	if !includeDeletes {
+		return false
 	}
 	for _, scopes := range a.start.deletes {
 		for _, entry := range scopes {
