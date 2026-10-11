@@ -553,6 +553,11 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 
 		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path, isLFS)
 		if err != nil {
+			// Fetch-failure rule: a transport failure (network/HTTP error) is a
+			// non-fatal skip, consistent with the pre-existing "partial failure
+			// is normal" metadata contract; a structurally valid persistent LFS
+			// pointer is an explicit named-file failure; header-only content is
+			// not a pointer (see isLFSPointer).
 			if errors.Is(err, errMetadataTooLarge) && path == "quantization_config.json" {
 				data, headErr := decodeQuantizationHead(content)
 				if headErr == nil {
