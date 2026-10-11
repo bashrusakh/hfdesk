@@ -358,7 +358,13 @@ Successful response:
 The server freshly resolves the location and GGUF group and compares their IDs
 and exact member composition (paths, saved versions, size, and link role) with
 the confirmation. Request paths are not used as deletion authority. Local
-deletion removes only selected GGUF entries. For an HF location it removes the
+deletion removes only selected GGUF entries. The local symlink-member behavior
+described below is supported on Linux, Windows, and macOS. On other operating
+systems, a selected local symlink member cannot be safely identity-pinned: the
+request returns `409` before unlinking, leaving the selected link and its target
+unchanged. This platform qualification applies to selected local symlink entries;
+it does not change the handling of regular files or imply that other HFDesk
+features are unsupported on those operating systems. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
 friendly entries whose relative names match the selected remote paths and
 which provably resolve to those entries: symlinks by their link chain, and
@@ -389,8 +395,9 @@ The server does not cancel jobs. HF mutation excludes writers to the
 selected repository reference namespace and associated friendly view. Local
 queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
 unlink results use `207` and identify removed, remaining, and failed paths
-(`errors`). A local symlink member is unlinked without following or deleting
-its target. The authoritative delete-time enumeration and filesystem operations
+(`errors`). On the supported platforms above, a local symlink member is unlinked
+without following or deleting its target. The authoritative delete-time
+enumeration and filesystem operations
 use one opened repository root and recheck each selected entry immediately
 before unlink; a detected configured-root alias change during admission is
 refused, and a later alias change does not redirect the operation to another
