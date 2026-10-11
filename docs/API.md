@@ -312,11 +312,13 @@ deletion is refused before unlinking.
 It removes a blob payload only when no other named snapshot entry or retained
 friendly entry in that repository references it (link target or shared file);
 shared payloads are retained
-and listed in `retainedPayloads`. Deletion is durable across rebuild: once
-deletion is attempted, the confirmed names are tombstoned in the repository
-manifest (`deleted`), so rebuild/repair never recreates them from the
-manifest's file mapping even while a retained payload keeps their content
-available; a later download of the repository restores them and clears the
+and listed in `retainedPayloads`. Deletion is durable across rebuild when its
+tombstones are recorded: after deletion is attempted, the confirmed names are
+recorded in the repository manifest (`deleted`), so rebuild/repair never
+recreates them from the manifest's file mapping even while a retained payload
+keeps their content available. If manifest recording fails, the response
+reports the error but deletion proceeds, and repair may later recreate those
+names. A later download of the repository restores names and clears recorded
 tombstones. A refused deletion records nothing and changes no state. The
 manifest is updated in place; its other metadata remains. Ordinary
 friendly files, other groups, versions, locations, metadata, partial files,

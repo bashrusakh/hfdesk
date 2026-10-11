@@ -129,6 +129,12 @@ func (b *ManifestBuilder) Build() *DownloadManifest {
 }
 
 // Write writes the manifest to the friendly view directory.
+// The write is staged in a sibling temporary file and then renamed into
+// place, so a staging failure cannot truncate a previously good manifest:
+// the manifest is load-bearing state for deletion durability and cache repair.
+// Same-directory rename provides atomic visibility on platforms/filesystems
+// that support it; Go does not guarantee atomic Rename on non-Unix platforms.
+// The staging file is not fsynced, so this does not provide crash durability.
 func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
 
@@ -149,11 +155,50 @@ func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	header += "# Run 'hfdesk' and open the Local Cache tab to browse downloaded repos\n\n"
 	content := header + string(data)
 
-	if err := os.WriteFile(manifestPath, []byte(content), 0o644); err != nil {
+	if err := writeFileAtomic(manifestPath, []byte(content)); err != nil {
 		return "", fmt.Errorf("write manifest: %w", err)
 	}
 
 	return manifestPath, nil
+}
+
+// manifestCreateTemp is the staging seam for writeFileAtomic; tests inject
+// failures here to prove a failed manifest write leaves the previous file
+// intact.
+var manifestCreateTemp = os.CreateTemp
+
+// writeFileAtomic publishes data at path via a staged sibling temporary file
+// and a rename. On any failure the staging file is removed and path is left
+// exactly as it was, so a failed write cannot truncate an existing file the
+// way os.WriteFile would. Modes follow the previous truncate-in-place write:
+// a new file lands at 0644 and a rewritten file keeps its existing mode.
+func writeFileAtomic(path string, data []byte) error {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		mode = info.Mode().Perm()
+	}
+
+	staging, err := manifestCreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	stagingPath := staging.Name()
+	// Clean up the staging file on every non-success path. Once the rename
+	// succeeds the staging path no longer exists, so os.Remove is a no-op.
+	defer os.Remove(stagingPath)
+
+	if _, err := staging.Write(data); err != nil {
+		staging.Close()
+		return err
+	}
+	if err := staging.Chmod(mode); err != nil {
+		staging.Close()
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	return os.Rename(stagingPath, path)
 }
 
 // ReadManifest reads a manifest from a file.
