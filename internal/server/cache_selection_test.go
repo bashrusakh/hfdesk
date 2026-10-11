@@ -1305,8 +1305,12 @@ func TestSelectedDeleteIgnoresUnrelatedRepoDespiteInternalAliasAndPathFilter(t *
 	for _, deleteFirst := range []bool{false, true} {
 		srv := newTestServerWithConfig(t, Config{CacheDir: storage})
 		queued := *job
-		queued.ID, queued.Status = "repo-a-writer", JobStatusQueued
+		queued.ID, queued.Status, queued.partialFilesMu = "repo-a-writer", JobStatusQueued, &sync.Mutex{}
 		srv.jobs.mu.Lock()
+		// This test exercises reservation/admission predicates, not scheduler
+		// dispatch. Keep the queued fixture production-valid without starting a
+		// downloader when Close drains the manager.
+		srv.jobs.fenced = true
 		srv.jobs.jobs[queued.ID] = &queued
 		srv.jobs.mu.Unlock()
 		if deleteFirst {

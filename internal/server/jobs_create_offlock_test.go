@@ -164,6 +164,8 @@ func TestCreateJobReservationCloseDuringInventoryDoesNotInsertOrLeak(t *testing.
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	var once sync.Once
 	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
 		once.Do(func() { close(entered) })
@@ -176,7 +178,8 @@ func TestCreateJobReservationCloseDuringInventoryDoesNotInsertOrLeak(t *testing.
 	<-entered
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- m.Close(context.Background()) }()
-	close(release)
+	waitForJobManagerStopping(t, m)
+	releaseOnce.Do(func() { close(release) })
 	if err := <-done; err != errJobManagerStopping {
 		t.Fatalf("CreateJob error = %v, want stopping", err)
 	}
@@ -185,6 +188,25 @@ func TestCreateJobReservationCloseDuringInventoryDoesNotInsertOrLeak(t *testing.
 	}
 	if jobs := m.ListJobs(); len(jobs) != 0 {
 		t.Fatalf("late insertion after Close: %d jobs", len(jobs))
+	}
+}
+
+func waitForJobManagerStopping(t *testing.T, m *JobManager) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		m.mu.RLock()
+		stopping := m.stopping
+		m.mu.RUnlock()
+		if stopping {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Close did not establish stopping fence")
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 

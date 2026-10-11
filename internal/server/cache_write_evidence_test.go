@@ -44,9 +44,21 @@ func TestSelectedDeleteReservationInventoriesOffLockAndRejectsChangedSnapshot(t 
 func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued}
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
+	m.fenced = true // Keep scheduler execution outside this reservation test.
 	m.jobs[job.ID] = job
+	target := filepath.Join(jobDestinationBase(job), "other.gguf")
+	if jobMayWriteSelectedPath(job, target) {
+		t.Fatal("pre-shutdown nonmatching writer unexpectedly conflicts with reservation")
+	}
+	preCloseRelease, ok := m.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("pre-shutdown reservation rejected despite the nonmatching writer")
+	}
+	preCloseRelease()
 	entered, resume := make(chan struct{}), make(chan struct{})
+	var resumeOnce sync.Once
+	t.Cleanup(func() { resumeOnce.Do(func() { close(resume) }) })
 	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
 		select {
 		case <-entered:
@@ -58,13 +70,14 @@ func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T
 	}
 	done := make(chan bool, 1)
 	go func() {
-		_, ok := m.reserveSelectedGGUF([]string{filepath.Join(jobDestinationBase(job), "other.gguf")})
+		_, ok := m.reserveSelectedGGUF([]string{target})
 		done <- ok
 	}()
 	<-entered
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- m.Close(context.Background()) }()
-	close(resume)
+	waitForJobManagerStopping(t, m)
+	resumeOnce.Do(func() { close(resume) })
 	if <-done {
 		t.Fatal("reservation committed after Close began")
 	}
