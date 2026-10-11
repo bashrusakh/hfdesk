@@ -54,6 +54,18 @@ func analyzeFixtureFiles(t *testing.T, paths []string, lfs map[string]bool, raw,
 				http.NotFound(w, r)
 				return
 			}
+			if body == "!network" {
+				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+					conn.Close()
+				}
+				return
+			}
+			if strings.HasPrefix(body, "!status:") {
+				var status int
+				fmt.Sscanf(body, "!status:%d", &status)
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
 			io.WriteString(w, body)
 		case strings.Contains(r.URL.Path, "/raw/"):
 			body, ok := raw[filepath.Base(r.URL.Path)]
@@ -68,6 +80,33 @@ func analyzeFixtureFiles(t *testing.T, paths []string, lfs map[string]bool, raw,
 	}))
 	defer srv.Close()
 	return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/model", dataset)
+}
+
+func TestAnalyzeLFSResolveFailureIsExplicit(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{{"forbidden", "!status:403"}, {"not found", "!status:404"}, {"network failure", "!network"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := analyzeFixtureFiles(t,
+				[]string{"config.json", "model.safetensors", "quantization_config.json"},
+				map[string]bool{"quantization_config.json": true},
+				map[string]string{"config.json": `{}`},
+				map[string]string{"quantization_config.json": tc.body}, false)
+			if err == nil || !strings.Contains(err.Error(), "quantization_config.json") || !strings.Contains(err.Error(), "resolved") {
+				t.Fatalf("LFS resolve failure was not explicit: %v", err)
+			}
+		})
+	}
+}
+
+func TestAnalyzeOptionalNonLFSFailureRemainsNonfatal(t *testing.T) {
+	info, err := analyzeFixture(t, []string{"config.json", "model.safetensors", "quantization_config.json"}, map[string]string{"config.json": `{}`}, false)
+	if err != nil {
+		t.Fatalf("optional non-LFS metadata failure became fatal: %v", err)
+	}
+	if _, ok := info.Metadata["quantization_config.json"]; ok {
+		t.Fatalf("missing optional metadata unexpectedly present: %+v", info.Metadata)
+	}
 }
 
 // analyzeFixture analyzes a repository with no LFS files; content is served
@@ -504,8 +543,8 @@ func TestAnalyzeQuantOnlyOversizedTruncatedWidthDeclaration(t *testing.T) {
 			if !q.ConfigPartial {
 				t.Fatalf("partial head recovery not explicit: %+v", q)
 			}
-			if !q.MixedPrecision {
-				t.Fatalf("truncated per-expert width declaration dropped silently: %+v", q)
+			if q.MixedPrecision {
+				t.Fatalf("unknown truncated widths mislabeled as mixed: %+v", q)
 			}
 			if q.ExpertBitsMin != 0 || q.ExpertBitsMax != 0 {
 				t.Fatalf("invented expert widths from a cut declaration: %+v", q)
@@ -569,7 +608,7 @@ func TestAnalyzeQuantOnlyOversizedExl2BitsPerWeight(t *testing.T) {
 	if q.BitsPerWeight != 4.5 {
 		t.Fatalf("EXL2 bits per weight lost to bounded recovery: %+v", q)
 	}
-	if q.Bits != 0 || !q.MixedPrecision {
+	if q.Bits != 0 || q.MixedPrecision {
 		t.Fatalf("nominal bits presented as model-wide precision: %+v", q)
 	}
 	if !q.ConfigPartial {

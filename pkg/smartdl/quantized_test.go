@@ -636,9 +636,10 @@ func TestAnalyzeQuantizedPrecisionProjection(t *testing.T) {
 		{"uniform gptq bits preserved", map[string]interface{}{"quant_method": "gptq", "bits": float64(4)}, 4, false, 0, 0, 0},
 		{"head width equal to bits stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4)}, 4, false, 4, 0, 0},
 		{"head width differs is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6)}, 0, true, 6, 0, 0},
-		{"head-only declaration is not model-wide", map[string]interface{}{"quant_method": "exl3", "head_bits": float64(6)}, 0, true, 6, 0, 0},
-		{"expert widths scalar", map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, 0, true, 0, 3.51, 3.51},
-		{"expert widths per expert", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}, "1": map[string]interface{}{"gu": float64(3), "down": float64(3)}}}, 0, true, 0, 3, 4},
+		{"head-only declaration is not model-wide", map[string]interface{}{"quant_method": "exl3", "head_bits": float64(6)}, 0, false, 6, 0, 0},
+		{"expert widths scalar without global width", map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, 0, false, 0, 3.51, 3.51},
+		{"expert widths vary against global width", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}, "1": map[string]interface{}{"gu": float64(3), "down": float64(3)}}}, 0, true, 0, 3, 4},
+		{"complete matching expert widths", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(4)}}}, 4, false, 0, 4, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
@@ -668,15 +669,23 @@ func TestAnalyzeQuantizedPrecisionEvidence(t *testing.T) {
 		bpw                            float64
 	}{
 		{"routed expert widths are never model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}}, 0, true, false, 0, 3, 4, 0},
-		{"expert width average is not proof of uniformity", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits_avg": float64(3.51)}, 0, true, false, 0, 0, 0, 0},
+		{"expert width average is retained but not variation evidence", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits_avg": float64(3.51)}, 4, false, false, 0, 0, 0, 0},
 		{"differing vision group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(8)}, 0, true, false, 0, 0, 0, 0},
 		{"differing mtp group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(2)}, 0, true, false, 0, 0, 0, 0},
-		{"effective bits per weight is not model-wide precision", map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5)}, 0, true, false, 0, 0, 0, 4.5},
+		{"effective bits per weight retained without mixed claim", map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5)}, 4, false, false, 0, 0, 0, 4.5},
 		{"nominal bits are never bits per weight", map[string]interface{}{"quant_method": "exl2", "bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
 		{"equal vision group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
 		{"equal mtp group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
 		{"partial head cannot establish uniformity", map[string]interface{}{"quant_method": "gptq", "bits": float64(4), partialHeadMarker: true}, 0, false, true, 0, 0, 0, 0},
-		{"cut expert declaration is not silently dropped", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4), "expert_bits": nil, partialHeadMarker: true}, 0, true, true, 4, 0, 0, 0},
+		{"cut expert declaration is unknown not mixed", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4), "expert_bits": nil, partialHeadMarker: true}, 0, false, true, 4, 0, 0, 0},
+		{"partial known variation is mixed but has no model width", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6), partialHeadMarker: true}, 0, true, true, 6, 0, 0, 0},
+		{"equal local group widths without global width unknown not mixed", map[string]interface{}{"quant_method": "exl3", "head_bits": float64(4), "vision_bits": float64(4)}, 0, false, false, 4, 0, 0, 0},
+		{"null expert leaf blocks uniformity without mixed claim", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": nil}}}, 0, false, false, 0, 4, 4, 0},
+		{"malformed expert list blocks uniformity without mixed claim", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits": []interface{}{float64(4), "unknown"}}, 0, false, false, 0, 4, 4, 0},
+		{"empty expert branch blocks uniformity without mixed claim", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": []interface{}{float64(4), map[string]interface{}{}}}, 0, false, false, 0, 4, 4, 0},
+		{"invalid expert width is unknown not variation", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": []interface{}{float64(4), float64(-1)}}, 0, false, false, 0, 4, 4, 0},
+		{"valid conflict remains mixed beside unknown leaf", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(3), "down": nil}}}, 0, true, false, 0, 3, 3, 0},
+		{"invalid group declarations block uniformity without mixed claim", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": nil, "vision_bits": "unknown", "mtp_bits": false}, 0, false, false, 0, 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})

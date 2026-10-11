@@ -599,6 +599,9 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 
 	content, err := a.fetchFileFrom(ctx, reqURL, path)
 	if err != nil && !errors.Is(err, errMetadataTooLarge) {
+		if isLFS {
+			return nil, &metadataReadError{fmt.Errorf("git-lfs file could not be resolved: %w", err)}
+		}
 		return nil, err
 	}
 	if !isLFS && isLFSPointer(content) {
@@ -660,7 +663,8 @@ func isLFSPointer(content []byte) bool {
 	oidPrefix := []byte("oid sha256:")
 	sizePrefix := []byte("size ")
 	hasOID, hasSize := false, false
-	for _, line := range bytes.Split(rest, []byte("\n")) {
+	for len(rest) > 0 {
+		line, next, found := bytes.Cut(rest, []byte("\n"))
 		line = bytes.TrimSpace(line)
 		if !hasOID && bytes.HasPrefix(line, oidPrefix) {
 			oid := line[len(oidPrefix):]
@@ -675,6 +679,10 @@ func isLFSPointer(content []byte) bool {
 		if hasOID && hasSize {
 			return true
 		}
+		if !found {
+			break
+		}
+		rest = next
 	}
 	return false
 }

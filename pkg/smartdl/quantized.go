@@ -3,7 +3,10 @@
 
 package smartdl
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // Quantization method descriptions.
 var quantMethodDescriptions = map[string]string{
@@ -44,45 +47,63 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 
 	// Declared precision. A header "bits" value describes only the tensors it
 	// applies to: it may be presented as model-wide precision only when the
-	// config was read completely and every declared width is consistent with
-	// uniform precision (issue #123). Per-expert width declarations, differing
-	// group widths, effective/aggregate precision evidence, and a partially
-	// recovered config all prevent that claim.
-	headerBits, hasBits := config["bits"].(float64)
-	if headBits, ok := config["head_bits"].(float64); ok {
-		info.HeadBits = headBits
-		if !hasBits || headBits != headerBits {
-			info.MixedPrecision = true
+	// config was read completely and every observed declared width is consistent
+	// with it (issue #123). Unknown declarations and a partial config prevent
+	// that claim; metadata such as bits_per_weight is independent evidence.
+	headerBits, hasBits, validBits := declaredWidth(config, "bits")
+	knownWidths := make([]float64, 0, 8)
+	if hasBits {
+		if validBits {
+			knownWidths = append(knownWidths, headerBits)
 		}
 	}
-	// Other tensor-group widths contradict a uniform claim when they differ.
+	unknownWidths := hasBits && !validBits
+	headBits, hasHeadBits, validHeadBits := declaredWidth(config, "head_bits")
+	if hasHeadBits {
+		if validHeadBits {
+			info.HeadBits = headBits
+			knownWidths = append(knownWidths, headBits)
+		} else {
+			unknownWidths = true
+		}
+	}
+	// Group declarations are local evidence: equal values without a model-wide
+	// declaration do not prove either uniformity or variation.
 	for _, key := range []string{"vision_bits", "mtp_bits"} {
-		if groupBits, ok := config[key].(float64); ok && (!hasBits || groupBits != headerBits) {
-			info.MixedPrecision = true
+		if groupBits, present, valid := declaredWidth(config, key); present {
+			if valid {
+				knownWidths = append(knownWidths, groupBits)
+			} else {
+				unknownWidths = true
+			}
 		}
 	}
-	// Per-expert width declarations are never model-wide precision. Completed
-	// declarations are reflected as bounds; a cut declaration (nil) proves only
-	// that per-expert widths exist, so no range is invented for it.
+	// A known per-expert range contributes observed widths; an absent or cut
+	// range is uncertainty, not evidence of variation.
 	for _, key := range []string{"expert_bits", "routed_expert_bits"} {
 		expertBits, ok := config[key]
 		if !ok {
 			continue
 		}
-		info.MixedPrecision = true
-		minBits, maxBits := expertBitRange(expertBits)
+		minBits, maxBits, complete := expertBitRange(expertBits)
+		if !complete {
+			unknownWidths = true
+		}
 		if minBits != 0 && (info.ExpertBitsMin == 0 || minBits < info.ExpertBitsMin) {
 			info.ExpertBitsMin = minBits
 		}
 		if maxBits > info.ExpertBitsMax {
 			info.ExpertBitsMax = maxBits
 		}
+		if minBits != 0 {
+			knownWidths = append(knownWidths, minBits, maxBits)
+		}
 	}
-	// Effective or aggregated precision evidence (EXL2 bits per weight, an
-	// expert width average) is never proof of uniform model-wide precision.
-	for _, key := range []string{"bits_per_weight", "routed_expert_bits_avg"} {
-		if _, ok := config[key]; ok {
+	// Only demonstrated width differences establish mixed precision.
+	for i := 1; i < len(knownWidths); i++ {
+		if knownWidths[i] != knownWidths[0] {
 			info.MixedPrecision = true
+			break
 		}
 	}
 	// A config recovered only partially at the metadata size bound may hold
@@ -91,7 +112,7 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	if _, ok := config[partialHeadMarker]; ok {
 		info.ConfigPartial = true
 	}
-	if !info.MixedPrecision && !info.ConfigPartial {
+	if hasBits && !info.MixedPrecision && !info.ConfigPartial && !unknownWidths {
 		info.Bits = int(headerBits)
 	}
 
@@ -152,16 +173,31 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	return info
 }
 
-// expertBitRange returns the smallest and largest numeric bit widths declared
-// anywhere inside a per-expert width declaration (expert_bits /
-// routed_expert_bits: a per-expert object, a list, or a bare width). Both are 0
-// when the value declares no numeric widths, including a declaration whose
-// value was cut at the metadata bound.
-func expertBitRange(value interface{}) (minBits, maxBits float64) {
+// declaredWidth reports whether a field exists and whether its value is a
+// valid positive finite bit width.
+func declaredWidth(config map[string]interface{}, key string) (width float64, present, valid bool) {
+	value, present := config[key]
+	if !present {
+		return 0, false, false
+	}
+	width, ok := value.(float64)
+	return width, true, ok && width > 0 && !math.IsNaN(width) && !math.IsInf(width, 0)
+}
+
+// expertBitRange collects valid positive finite widths from the declared
+// object/list/scalar while separately reporting whether every branch was
+// structurally complete and valid. Unknown leaves block a uniform claim but
+// do not erase genuine conflicts among the valid widths.
+func expertBitRange(value interface{}) (minBits, maxBits float64, complete bool) {
+	complete = true
 	var walk func(interface{})
 	walk = func(v interface{}) {
 		switch t := v.(type) {
 		case float64:
+			if t <= 0 || math.IsNaN(t) || math.IsInf(t, 0) {
+				complete = false
+				return
+			}
 			if minBits == 0 || t < minBits {
 				minBits = t
 			}
@@ -169,17 +205,25 @@ func expertBitRange(value interface{}) (minBits, maxBits float64) {
 				maxBits = t
 			}
 		case map[string]interface{}:
+			if len(t) == 0 {
+				complete = false
+			}
 			for _, item := range t {
 				walk(item)
 			}
 		case []interface{}:
+			if len(t) == 0 {
+				complete = false
+			}
 			for _, item := range t {
 				walk(item)
 			}
+		default:
+			complete = false
 		}
 	}
 	walk(value)
-	return minBits, maxBits
+	return minBits, maxBits, complete
 }
 
 // detectBackends returns compatible inference backends.

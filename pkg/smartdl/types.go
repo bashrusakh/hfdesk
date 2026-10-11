@@ -402,13 +402,10 @@ type QuantizedInfo struct {
 	// alongside it.
 	Bits int `json:"bits"`
 
-	// MixedPrecision indicates the config carries precision evidence that
-	// contradicts uniform model-wide precision: per-expert width declarations
-	// (EXL3 expert_bits / routed_expert_bits), differing tensor-group widths
-	// (EXL3 head_bits, vision_bits, mtp_bits), or effective/aggregate
-	// precision evidence (EXL2 bits_per_weight, routed_expert_bits_avg).
-	// HeadBits and ExpertBitsMin/Max describe declared groups and do not
-	// describe every tensor.
+	// MixedPrecision indicates observed differing declared bit widths. Width
+	// declarations with no observed conflict, including incomplete declarations,
+	// do not alone prove mixed precision. HeadBits and ExpertBitsMin/Max describe
+	// declared groups and do not describe every tensor.
 	MixedPrecision bool `json:"mixed_precision,omitempty"`
 
 	// ConfigPartial indicates the quantization config exceeded the metadata
