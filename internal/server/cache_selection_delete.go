@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -581,6 +582,25 @@ func mutationDirectoryEntryOverlap(directory, entry string) bool {
 }
 
 func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
+	// Manager mutations that begin and end during an off-lock walk invalidate
+	// that attempt. Retry from a fresh snapshot a small bounded number of times;
+	// persistent churn fails conservatively without holding m.mu across scans.
+	for attempt := 0; attempt < 3; attempt++ {
+		release, ok := m.reserveSelectedGGUFAttempt(paths)
+		if ok {
+			return release, true
+		}
+		m.mu.RLock()
+		stopping := m.stopping
+		m.mu.RUnlock()
+		if stopping {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func (m *JobManager) reserveSelectedGGUFAttempt(paths []string) (func(), bool) {
 	clean := make([]string, 0, len(paths))
 	for _, p := range paths {
 		abs, err := filepath.Abs(filepath.Clean(p))
@@ -589,9 +609,53 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		}
 		clean = append(clean, abs)
 	}
+	a, ok := m.beginCacheWriteAttempt()
+	if !ok {
+		return nil, false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			a.Close()
+		}
+	}()
+	// Collect namespace inventories and bounded identities without holding
+	// the manager lock. The final snapshot comparison rejects crossed writes.
+	a.CollectSnapshot(a.start)
+	for _, p := range clean {
+		probe, err := captureWriteIdentityProbe(p, false)
+		if err != nil {
+			return nil, false
+		}
+		a.targets[filepath.Clean(p)] = probe
+	}
+	if a.HasActiveBroadMutation(clean) || !a.Revalidate(clean) {
+		return nil, false
+	}
+	for _, activity := range a.start.activities {
+		if activity.planKnown {
+			for _, planned := range activity.planned {
+				if mutationPathsOverlapAny(planned, clean) {
+					return nil, false
+				}
+			}
+			continue
+		}
+		if a.MayWriteDescriptor(activity.job, clean) {
+			return nil, false
+		}
+	}
+	for _, job := range a.start.jobs {
+		if job.status != JobStatusQueued && !job.starting {
+			continue
+		}
+		if a.MayWrite(jobFromDecision(job), clean) {
+			return nil, false
+		}
+	}
 	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
+	defer m.mu.Unlock()
+	if m.stopping || !reflect.DeepEqual(a.start, m.captureWriteDecisionLocked()) {
 		return nil, false
 	}
 	entryConflicts := func(scopes []string) bool {
@@ -606,7 +670,6 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	}
 	for _, scopes := range m.deleteReservations {
 		if entryConflicts(scopes) {
-			m.mu.Unlock()
 			return nil, false
 		}
 	}
@@ -614,7 +677,6 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		for _, scope := range scopes {
 			for _, entry := range clean {
 				if mutationDirectoryEntryOverlap(scope, entry) {
-					m.mu.Unlock()
 					return nil, false
 				}
 			}
@@ -629,43 +691,19 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 					conflicts = mutationPathsOverlap(scope, entry)
 				}
 				if conflicts {
-					m.mu.Unlock()
 					return nil, false
 				}
 			}
 		}
 	}
-	for _, activity := range m.runActivities {
-		if activity.planKnown {
-			if entryConflicts(mapKeys(activity.planned)) {
-				m.mu.Unlock()
-				return nil, false
-			}
-			continue
-		}
-		if jobMayWriteSelectedPaths(activity.job, clean, inventoryWritableNamespace) {
-			m.mu.Unlock()
-			return nil, false
-		}
-	}
-	for _, job := range m.jobs {
-		if job.Status != JobStatusQueued && !job.starting {
-			continue
-		}
-		if jobMayWriteSelectedPaths(job, clean, inventoryWritableNamespace) {
-			m.mu.Unlock()
-			return nil, false
-		}
-	}
 	if m.deleteReservations == nil {
 		m.deleteReservations = make(map[uint64][]string)
 	}
-	m.opWG.Add(1)
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.deleteReservations[id] = clean
 	m.bumpWriteDecisionLocked()
-	m.mu.Unlock()
+	committed = true // the lease now owns the attempt operation reference
 	return func() {
 		m.mu.Lock()
 		delete(m.deleteReservations, id)
@@ -674,6 +712,15 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		m.mu.Unlock()
 		m.opWG.Done()
 	}, true
+}
+
+func mutationPathsOverlapAny(path string, paths []string) bool {
+	for _, candidate := range paths {
+		if mutationPathsOverlap(path, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func hfJobRepoPath(job *Job) string {
