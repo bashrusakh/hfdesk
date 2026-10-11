@@ -3059,6 +3059,9 @@ func TestSelectedDeleteWaitsAfterCancelAndDismissUntilRunUnwinds(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancelled downloader did not unwind")
 	}
+	// The downloader may have changed the selected member while unwinding;
+	// use a current selection to isolate the post-unwind reservation result.
+	body = selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
 	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete remained blocked after actual run unwind: status=%d body=%s", w.Code, w.Body.String())
@@ -3165,6 +3168,12 @@ func TestSelectedDeleteTracksBothRealGenerationsDuringRetry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("both downloader generations did not unwind")
 	}
+	// The test starts with a four-byte local file while the fake Hub plan
+	// declares five bytes. Once released, the real downloader may change the
+	// selected member's size, making the original token stale. Refresh either
+	// way so this assertion measures only whether deletion waits for both runs
+	// to unwind; stale-token rejection is covered separately.
+	body = selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
 	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete stayed busy after both generations exited: status=%d body=%s", w.Code, w.Body.String())

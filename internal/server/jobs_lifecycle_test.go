@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func newLifecycleTestManager(t *testing.T, cfg Config) *JobManager {
 
 func TestJobManagerQuiesceFencesAlreadyDispatchedRunner(t *testing.T) {
 	m := newLifecycleTestManager(t, Config{MaxActive: 1})
-	job := &Job{ID: "starting", Repo: "test/repo", Status: JobStatusQueued, CreatedAt: time.Now()}
+	job := &Job{ID: "starting", Repo: "test/repo", Status: JobStatusQueued, CreatedAt: time.Now(), partialFilesMu: &sync.Mutex{}}
 	m.mu.Lock()
 	m.jobs[job.ID] = job
 	m.dispatchLocked()
