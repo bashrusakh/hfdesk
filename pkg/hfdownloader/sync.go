@@ -152,7 +152,7 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		// Blobs-only cache (for example one downloaded on a filesystem where
 		// link creation was skipped entirely): the offline download manifest
 		// still names the commit its blobs belong to.
-		if m := readRepoManifest(repoDir); m != nil {
+		if m, err := readRepoManifest(repoDir); err == nil && m != nil {
 			commit = m.Commit
 		}
 	}
@@ -243,15 +243,18 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 // friendly view root when it belongs to this repository. A manifest from a
 // different repo must never be used as a repair mapping: its recorded paths
 // would be placed into an unrelated snapshot.
-func readRepoManifest(repoDir *RepoDir) *DownloadManifest {
+func readRepoManifest(repoDir *RepoDir) (*DownloadManifest, error) {
 	m, err := ReadManifest(filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
 	if err != nil {
-		return nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	if !strings.EqualFold(m.Repo, repoDir.RepoID()) {
-		return nil
+		return nil, nil
 	}
-	return m
+	return m, nil
 }
 
 // repairSnapshotEntries recreates snapshot entries the manifest records for
@@ -269,8 +272,8 @@ func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 	created := 0
 	var errs []error
 
-	m := readRepoManifest(r)
-	if m == nil || m.Commit != commit {
+	m, err := readRepoManifest(r)
+	if err != nil || m == nil || m.Commit != commit {
 		return 0, nil
 	}
 

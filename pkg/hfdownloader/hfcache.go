@@ -524,7 +524,15 @@ func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePat
 
 	// Leave an already-correct entry untouched: re-placing it would churn a
 	// full copy under the copy fallback and briefly remove a good entry.
-	if correct, cerr := cacheEntryCorrect(ctx, linkPath, blobPath, target); cerr == nil && correct {
+	correct, cerr := cacheEntryCorrect(ctx, linkPath, blobPath, target)
+	if cerr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return cerr
+		}
+	} else if correct {
 		return nil
 	}
 
@@ -620,7 +628,15 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 
 	// Leave an already-correct entry untouched: re-placing it would churn a
 	// full copy under the copy fallback and briefly remove a good entry.
-	if correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target); cerr == nil && correct {
+	correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target)
+	if cerr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return cerr
+		}
+	} else if correct {
 		return nil
 	}
 

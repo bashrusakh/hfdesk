@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -309,6 +310,35 @@ func TestManifestWriteFailureLeavesPreviousManifestIntact(t *testing.T) {
 	leftovers, err := filepath.Glob(filepath.Join(dir, ManifestFilename+".tmp-*"))
 	if err != nil || len(leftovers) != 0 {
 		t.Fatalf("staging leftovers=%v %v", leftovers, err)
+	}
+}
+
+func TestManifestWriteRespectsUmask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX umask semantics are unavailable on Windows")
+	}
+	const pathEnv = "HFDESK_UMASK_MANIFEST_PATH"
+	if path := os.Getenv(pathEnv); path != "" {
+		m := &DownloadManifest{Type: "model", Repo: "owner/model", CompletedAt: time.Now().UTC()}
+		if _, err := m.Write(filepath.Dir(path)); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ManifestFilename)
+	cmd := exec.Command("sh", "-c", `umask 077; exec "$@"`, "sh", os.Args[0], "-test.run=^TestManifestWriteRespectsUmask$")
+	cmd.Env = append(os.Environ(), pathEnv+"="+path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("restricted-umask child failed: %v\n%s", err, output)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("manifest mode under umask 077 = %04o, want 0600", got)
 	}
 }
 

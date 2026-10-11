@@ -713,6 +713,72 @@ func writeFallbackManifest(t *testing.T, repo *RepoDir, name string, content []b
 // the payload is retained (shared entry, retained alias, or failed blob
 // unlink) — while retained payloads and refused deletions stay intact.
 func TestDeleteSelectedGGUFDeletionDurableAcrossSync(t *testing.T) {
+	t.Run("manifest parse failure is reported while deletion proceeds", func(t *testing.T) {
+		repo, blob, snapshot, friendly, _ := selectedDeleteFallbackFixture(t, true)
+		retainedAlias := filepath.Join(repo.FriendlyPath(), "model-Q5_K_M.gguf")
+		if err := os.Link(blob, retainedAlias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo.FriendlyPath(), ManifestFilename), []byte("invalid: [yaml"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+		if !result.Attempted || len(result.Errors) == 0 || !strings.Contains(strings.Join(result.Errors, "\n"), "read download manifest") {
+			t.Fatalf("manifest parse failure was not reported: %+v", result)
+		}
+		for _, name := range []string{snapshot, friendly} {
+			if _, err := os.Lstat(name); !os.IsNotExist(err) {
+				t.Fatalf("deletion did not proceed after manifest read failure for %q: %v", name, err)
+			}
+		}
+		if _, err := os.Stat(retainedAlias); err != nil {
+			t.Fatalf("retained payload alias was lost: %v", err)
+		}
+	})
+	t.Run("manifest read failure is reported while deletion proceeds", func(t *testing.T) {
+		repo, _, snapshot, friendly, _ := selectedDeleteFallbackFixture(t, true)
+		manifestPath := filepath.Join(repo.FriendlyPath(), ManifestFilename)
+		if err := os.Mkdir(manifestPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+		if !result.Attempted || len(result.Errors) == 0 || !strings.Contains(strings.Join(result.Errors, "\n"), "read download manifest") {
+			t.Fatalf("manifest read failure was not reported: %+v", result)
+		}
+		for _, name := range []string{snapshot, friendly} {
+			if _, err := os.Lstat(name); !os.IsNotExist(err) {
+				t.Fatalf("deletion did not proceed after manifest read failure for %q: %v", name, err)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		foreign bool
+	}{
+		{name: "manifest absent"},
+		{name: "foreign manifest ignored", foreign: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, snapshot, _, _ := selectedDeleteFallbackFixture(t, true)
+			if tc.foreign {
+				m := &DownloadManifest{Repo: "other/repo", Type: "model"}
+				if _, err := m.Write(repo.FriendlyPath()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+			if !result.Attempted || len(result.Errors) != 0 {
+				t.Fatalf("absence/foreign identity reported as a manifest failure: %v", result.Errors)
+			}
+			if _, err := os.Lstat(snapshot); !os.IsNotExist(err) {
+				t.Fatalf("deletion did not proceed for absent/foreign manifest: %v", err)
+			}
+		})
+	}
+
 	t.Run("retained payload is not resurrected", func(t *testing.T) {
 		repo, blob, snapshot, friendly, content := selectedDeleteFallbackFixture(t, true)
 		otherName := filepath.Join(repo.FriendlyPath(), "model-Q5_K_M.gguf")

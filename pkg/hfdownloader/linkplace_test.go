@@ -566,6 +566,44 @@ func TestPlacementLeavesCorrectEntriesUntouchedAndReplacesStale(t *testing.T) {
 	})
 }
 
+func TestPlacementCancellationPreservesCorrectCopyEntries(t *testing.T) {
+	withLinkFakes(t, denySymlink, denyHardlink)
+	for _, which := range []string{"snapshot", "friendly"} {
+		t.Run(which, func(t *testing.T) {
+			repo := linkTestRepo(t)
+			content := []byte("already-correct copied payload")
+			stored, hash := linkTestStore(t, repo, content, "model-Q4_K_M.gguf")
+			entry := stored.SnapshotPath
+			place := func(ctx context.Context) error {
+				return repo.createSnapshotSymlink(ctx, "commit-a", "model-Q4_K_M.gguf", hash)
+			}
+			if which == "friendly" {
+				entry = stored.FriendlyPath
+				place = func(ctx context.Context) error {
+					return repo.createFriendlySymlinkCtx(ctx, "commit-a", "model-Q4_K_M.gguf", "")
+				}
+			}
+			before, err := os.Lstat(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := place(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("placement error=%v, want context.Canceled", err)
+			}
+			after, err := os.Lstat(entry)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("existing copied entry was removed/replaced: %v", err)
+			}
+			got, err := os.ReadFile(entry)
+			if err != nil || !bytes.Equal(got, content) {
+				t.Fatalf("existing copied entry content=%q, err=%v", got, err)
+			}
+		})
+	}
+}
+
 // withRelFailure simulates the Windows cross-volume condition where
 // filepath.Rel cannot relate the Hub and friendly roots (they sit on
 // different volumes) and errors instead of returning a relative path.

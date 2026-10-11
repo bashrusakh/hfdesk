@@ -758,7 +758,10 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 // without a manifest has no mapping to resurrect from; a manifest belonging
 // to another repository is ignored exactly like repair ignores it.
 func (r *RepoDir) recordManifestDeletions(entries []SelectedGGUFEntry) error {
-	m := readRepoManifest(r)
+	m, err := readRepoManifest(r)
+	if err != nil {
+		return fmt.Errorf("read download manifest: %w", err)
+	}
 	if m == nil {
 		return nil
 	}
@@ -771,6 +774,6 @@ func (r *RepoDir) recordManifestDeletions(entries []SelectedGGUFEntry) error {
 	if !changed {
 		return nil
 	}
-	_, err := m.Write(r.FriendlyPath())
+	_, err = m.Write(r.FriendlyPath())
 	return err
 }

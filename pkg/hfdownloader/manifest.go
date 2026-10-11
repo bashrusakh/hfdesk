@@ -4,6 +4,9 @@
 package hfdownloader
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -165,15 +168,36 @@ func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 // manifestCreateTemp is the staging seam for writeFileAtomic; tests inject
 // failures here to prove a failed manifest write leaves the previous file
 // intact.
-var manifestCreateTemp = os.CreateTemp
+var manifestCreateTemp = createManifestTemp
+
+// createManifestTemp creates an exclusive sibling staging file using the
+// requested permissions. Unlike os.CreateTemp (which always uses 0600),
+// OpenFile applies the process umask to 0644 just as the former WriteFile did.
+func createManifestTemp(dir, pattern string) (*os.File, error) {
+	for range 100 {
+		var suffix [12]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, err
+		}
+		name := filepath.Join(dir, strings.Replace(pattern, "*", hex.EncodeToString(suffix[:]), 1))
+		file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("create manifest staging file: too many name collisions")
+}
 
 // writeFileAtomic publishes data at path via a staged sibling temporary file
 // and a rename. On any failure the staging file is removed and path is left
 // exactly as it was, so a failed write cannot truncate an existing file the
-// way os.WriteFile would. Modes follow the previous truncate-in-place write:
-// a new file lands at 0644 and a rewritten file keeps its existing mode.
+// way os.WriteFile would. New-file permissions are filtered through the
+// process umask; a rewritten file keeps its existing mode.
 func writeFileAtomic(path string, data []byte) error {
-	mode := os.FileMode(0o644)
+	var mode os.FileMode
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 		mode = info.Mode().Perm()
 	}
@@ -191,9 +215,11 @@ func writeFileAtomic(path string, data []byte) error {
 		staging.Close()
 		return err
 	}
-	if err := staging.Chmod(mode); err != nil {
-		staging.Close()
-		return err
+	if mode != 0 {
+		if err := staging.Chmod(mode); err != nil {
+			staging.Close()
+			return err
+		}
 	}
 	if err := staging.Close(); err != nil {
 		return err
