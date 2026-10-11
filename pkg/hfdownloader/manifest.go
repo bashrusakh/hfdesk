@@ -4,9 +4,13 @@
 package hfdownloader
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -41,6 +45,21 @@ type DownloadManifest struct {
 	TotalSize  int64          `yaml:"total_size" json:"total_size"`   // Total bytes downloaded
 	TotalFiles int            `yaml:"total_files" json:"total_files"` // Number of files
 	Files      []ManifestFile `yaml:"files" json:"files"`
+
+	// Deleted records snapshot names intentionally removed after the download
+	// (selected-GGUF deletion). Rebuild/repair must never recreate them from
+	// the file mapping above: a retained payload does not imply consent to
+	// restore a deleted entry. Absent on manifests written before this field
+	// existed (old readers ignore it, old manifests simply have no tombstones).
+	Deleted []ManifestDeletion `yaml:"deleted,omitempty" json:"deleted,omitempty"`
+}
+
+// ManifestDeletion tombstones one intentionally removed repo-relative name,
+// bound to the snapshot versions it was removed from. An empty Versions list
+// means every version of that name.
+type ManifestDeletion struct {
+	Path     string   `yaml:"path" json:"path"`
+	Versions []string `yaml:"versions,omitempty" json:"versions,omitempty"`
 }
 
 // ManifestFile represents a single file in the manifest.
@@ -113,6 +132,12 @@ func (b *ManifestBuilder) Build() *DownloadManifest {
 }
 
 // Write writes the manifest to the friendly view directory.
+// The write is staged in a sibling temporary file and then renamed into
+// place, so a staging failure cannot truncate a previously good manifest:
+// the manifest is load-bearing state for deletion durability and cache repair.
+// Same-directory rename provides atomic visibility on platforms/filesystems
+// that support it; Go does not guarantee atomic Rename on non-Unix platforms.
+// The staging file is not fsynced, so this does not provide crash durability.
 func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
 
@@ -133,11 +158,73 @@ func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	header += "# Run 'hfdesk' and open the Local Cache tab to browse downloaded repos\n\n"
 	content := header + string(data)
 
-	if err := os.WriteFile(manifestPath, []byte(content), 0o644); err != nil {
+	if err := writeFileAtomic(manifestPath, []byte(content)); err != nil {
 		return "", fmt.Errorf("write manifest: %w", err)
 	}
 
 	return manifestPath, nil
+}
+
+// manifestCreateTemp is the staging seam for writeFileAtomic; tests inject
+// failures here to prove a failed manifest write leaves the previous file
+// intact.
+var manifestCreateTemp = createManifestTemp
+
+// createManifestTemp creates an exclusive sibling staging file using the
+// requested permissions. Unlike os.CreateTemp (which always uses 0600),
+// OpenFile applies the process umask to 0644 just as the former WriteFile did.
+func createManifestTemp(dir, pattern string) (*os.File, error) {
+	for range 100 {
+		var suffix [12]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, err
+		}
+		name := filepath.Join(dir, strings.Replace(pattern, "*", hex.EncodeToString(suffix[:]), 1))
+		file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("create manifest staging file: too many name collisions")
+}
+
+// writeFileAtomic publishes data at path via a staged sibling temporary file
+// and a rename. On any failure the staging file is removed and path is left
+// exactly as it was, so a failed write cannot truncate an existing file the
+// way os.WriteFile would. New-file permissions are filtered through the
+// process umask; a rewritten file keeps its existing mode.
+func writeFileAtomic(path string, data []byte) error {
+	var mode os.FileMode
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		mode = info.Mode().Perm()
+	}
+
+	staging, err := manifestCreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	stagingPath := staging.Name()
+	// Clean up the staging file on every non-success path. Once the rename
+	// succeeds the staging path no longer exists, so os.Remove is a no-op.
+	defer os.Remove(stagingPath)
+
+	if _, err := staging.Write(data); err != nil {
+		staging.Close()
+		return err
+	}
+	if mode != 0 {
+		if err := staging.Chmod(mode); err != nil {
+			staging.Close()
+			return err
+		}
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	return os.Rename(stagingPath, path)
 }
 
 // ReadManifest reads a manifest from a file.
@@ -153,6 +240,59 @@ func ReadManifest(path string) (*DownloadManifest, error) {
 	}
 
 	return &manifest, nil
+}
+
+// RecordDeletion tombstones name for the given snapshot versions so rebuild
+// and repair will not recreate it. Repeated records merge versions into the
+// existing tombstone. An empty versions list means every version of that
+// name, and is the absorbing state: recording a specific version into an
+// existing all-version tombstone is a no-op (reports unchanged), while
+// recording an all-version deletion into a version-specific tombstone
+// upgrades it to all (clears Versions). It reports whether the manifest changed.
+func (m *DownloadManifest) RecordDeletion(name string, versions []string) bool {
+	name = filepath.ToSlash(name)
+	for i := range m.Deleted {
+		if m.Deleted[i].Path != name {
+			continue
+		}
+		if len(m.Deleted[i].Versions) == 0 {
+			// Already tombstoned for all versions: specific records add nothing.
+			return false
+		}
+		if len(versions) == 0 {
+			// Upgrade a version-specific tombstone to all versions.
+			m.Deleted[i].Versions = nil
+			return true
+		}
+		changed := false
+		for _, v := range versions {
+			if !slices.Contains(m.Deleted[i].Versions, v) {
+				m.Deleted[i].Versions = append(m.Deleted[i].Versions, v)
+				changed = true
+			}
+		}
+		return changed
+	}
+	m.Deleted = append(m.Deleted, ManifestDeletion{Path: name, Versions: append([]string(nil), versions...)})
+	return true
+}
+
+// IsDeleted reports whether name at the given snapshot version was
+// intentionally removed. A tombstone without versions covers every version.
+func (m *DownloadManifest) IsDeleted(name, version string) bool {
+	name = filepath.ToSlash(name)
+	for _, d := range m.Deleted {
+		if d.Path != name {
+			continue
+		}
+		if len(d.Versions) == 0 {
+			return true
+		}
+		if slices.Contains(d.Versions, version) {
+			return true
+		}
+	}
+	return false
 }
 
 // RepoTypeName returns the type name prefix for repo directories.

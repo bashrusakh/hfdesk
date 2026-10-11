@@ -443,10 +443,10 @@ LOOP:
 							return false, "", err
 						}
 						if status == BlobComplete {
-							// Blob exists, but ensure symlinks are in place
-							if err := repoDir.createSnapshotSymlink(plan.Commit, it.RelativePath, it.SHA256); err == nil {
+							// Blob exists, but ensure snapshot entries are in place
+							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil {
 								if !cfg.NoFriendlyView {
-									repoDir.CreateFriendlySymlink(plan.Commit, it.RelativePath, filterSubdir)
+									repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
 								}
 							}
 							return true, "blob exists", nil
