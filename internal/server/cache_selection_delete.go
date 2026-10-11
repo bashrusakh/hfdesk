@@ -716,6 +716,10 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 	if err != nil {
 		return nil, "", err
 	}
+	physicalBase, err = filepath.Abs(physicalBase)
+	if err != nil {
+		return nil, "", err
+	}
 	if beforeOpen != nil {
 		beforeOpen()
 	}

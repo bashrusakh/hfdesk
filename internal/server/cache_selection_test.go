@@ -1541,6 +1541,45 @@ func TestSelectedCacheDeleteRemovesOnlyConfirmedLocalGroup(t *testing.T) {
 	}
 }
 
+func TestSelectedDeleteExclusionsResolveRelativeConfiguredRoot(t *testing.T) {
+	work := t.TempDir()
+	t.Chdir(work)
+	selectedPath := filepath.Join("root", "owner", "model")
+	physicalRoot := filepath.Join(work, selectedPath)
+	if err := os.MkdirAll(physicalRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	protectedPhysical := filepath.Join(physicalRoot, "protected")
+	if err := os.MkdirAll(filepath.Join(protectedPhysical, "owner", "model"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	absoluteAlias, err := filepath.Abs(filepath.Join("unrelated-alias"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(protectedPhysical, absoluteAlias); err != nil {
+		t.Fatal(err)
+	}
+	const member = "model-Q4_K_M.gguf"
+	writeSelectionFile(t, physicalRoot, member)
+	marker := filepath.Join(absoluteAlias, "owner", "model", "model-Q4_K_M.gguf")
+	if err := os.Symlink("missing.gguf", marker); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: "root", LocalScanDirs: []string{absoluteAlias}})
+	body := selectedGroupRequest(t, s, "owner/model", selectedPath, member)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(marker); err != nil {
+		t.Fatalf("protected dangling descendant was changed: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(selectedPath, member)); !os.IsNotExist(err) {
+		t.Fatalf("selected outer member remains or changed unexpectedly: %v", err)
+	}
+}
+
 func TestSelectedLocalDeleteStaysOnOpenedRootAfterAliasRetarget(t *testing.T) {
 	actual, other := t.TempDir(), t.TempDir()
 	alias := filepath.Join(t.TempDir(), "scan")

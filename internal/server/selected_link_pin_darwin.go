@@ -23,7 +23,7 @@ func openSelectedLinkEntry(physicalRepo, name string) (*os.File, error) {
 }
 
 func openSelectedRegularEntry(root *os.Root, _, name string) (*os.File, error) {
-	return root.Open(filepath.FromSlash(name))
+	return openSelectedNonblockingRegularEntry(root, filepath.FromSlash(name))
 }
 
 func shouldHardLinkSelectedEntry(err error) bool {

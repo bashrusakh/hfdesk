@@ -1,7 +1,7 @@
 // Copyright 2025
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !linux && !windows && !darwin
+//go:build !linux && !windows && !darwin && !unix
 
 package server
 
