@@ -162,6 +162,35 @@ func decisionJobKey(j *Job) string {
 	return j.ID + "\x00" + j.Repo + "\x00" + j.Revision + "\x00" + j.OutputDir + "\x00" + j.HubDir + "\x00" + j.LocalDir + "\x00" + j.LocalRepo + "\x00" + strconv.Itoa(j.generation)
 }
 
+func jobFromDecision(d writeDecisionJob) *Job {
+	return &Job{ID: d.id, Repo: d.repo, Revision: d.revision, OutputDir: d.output, HubDir: d.hub,
+		LocalDir: d.local, LocalRepo: d.localRepo, Status: d.status, starting: d.starting,
+		Flat: d.flat, IsDataset: d.dataset, ExactMatch: d.exact, Filters: append([]string(nil), d.filters...),
+		Excludes: append([]string(nil), d.excludes...), generation: d.generation}
+}
+
+// CollectSnapshot inventories all job and run-activity descriptors in the
+// immutable decision snapshot. A descriptor shared by a queued job and its
+// activity is visited once; a distinct generation remains independent.
+func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
+	seen := make(map[string]struct{}, len(s.jobs)+len(s.activities))
+	for _, d := range s.jobs {
+		j := jobFromDecision(d)
+		key := decisionJobKey(j)
+		seen[key] = struct{}{}
+		a.Collect(j)
+	}
+	for _, activity := range s.activities {
+		j := jobFromDecision(activity.job)
+		key := decisionJobKey(j)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		a.Collect(j)
+	}
+}
+
 // Collect builds each semantic job's writable namespace once, independent
 // of target count. It is safe to call only on the attempt-local job copies.
 func (a *cacheWriteAttempt) Collect(job *Job) {
