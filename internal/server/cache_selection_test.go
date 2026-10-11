@@ -1511,6 +1511,106 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 	}
 }
 
+func TestSelectedDeleteIgnoresUnrelatedRepoDespiteInternalAliasAndPathFilter(t *testing.T) {
+	storage := t.TempDir()
+	job := &Job{OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/a", Filters: []string{"weights/model.gguf"}, ExactMatch: true}
+	base := jobDestinationBase(job)
+	actual := filepath.Join(base, "actual")
+	if err := os.MkdirAll(actual, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, actual, filepath.Join(base, "weights"))
+	other := filepath.Join(storage, "models", "owner", "b", "model.gguf")
+	if jobMayWriteSelectedPath(job, other) {
+		t.Fatal("internal alias in repo A conservatively blocked unrelated repo B")
+	}
+
+	for _, deleteFirst := range []bool{false, true} {
+		srv := newTestServerWithConfig(t, Config{CacheDir: storage})
+		queued := *job
+		queued.ID, queued.Status = "repo-a-writer", JobStatusQueued
+		srv.jobs.mu.Lock()
+		srv.jobs.jobs[queued.ID] = &queued
+		srv.jobs.mu.Unlock()
+		if deleteFirst {
+			release, ok := srv.jobs.reserveSelectedGGUF([]string{other})
+			if !ok {
+				t.Fatal("unrelated repo B delete conflicted with repo A writer")
+			}
+			srv.jobs.mu.Lock()
+			blocked := srv.jobs.jobBlockedByDeleteLocked(&queued)
+			srv.jobs.mu.Unlock()
+			release()
+			if blocked {
+				t.Fatal("repo A admission conflicted with reserved repo B deletion")
+			}
+		} else if release, ok := srv.jobs.reserveSelectedGGUF([]string{other}); !ok {
+			t.Fatal("unrelated repo B delete conflicted with repo A writer")
+		} else {
+			release()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := srv.jobs.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	}
+}
+
+func TestJobWritableInventoriesAreBuiltOnceForAllTargets(t *testing.T) {
+	job := &Job{OutputDir: t.TempDir(), Repo: "owner/model", Filters: []string{"Q4_K_M"}}
+	for _, targetCount := range []int{1, 12} {
+		targets := make([]string, targetCount)
+		for i := range targets {
+			targets[i] = filepath.Join(t.TempDir(), fmt.Sprintf("other-%d.gguf", i))
+		}
+		calls := 0
+		inventory := func(base string) (writableNamespaceInventory, bool) {
+			calls++
+			return inventoryWritableNamespace(base)
+		}
+		if jobMayWriteSelectedPaths(job, targets, inventory) {
+			t.Fatal("unrelated targets unexpectedly matched writer")
+		}
+		if calls != 2 { // friendly + snapshot namespaces
+			t.Fatalf("inventory calls for %d targets = %d, want 2", targetCount, calls)
+		}
+	}
+}
+
+func TestSelectedWriteEvidenceCopiesFiltersAndEvaluatesWithoutInventory(t *testing.T) {
+	storage := t.TempDir()
+	filters := []string{"Q4_K_M"}
+	excludes := []string{"blocked.gguf"}
+	job := &Job{OutputDir: storage, Repo: "owner/model", Filters: filters, Excludes: excludes}
+	calls := 0
+	evidence, ok := buildSelectedWriteEvidence(job, func(base string) (writableNamespaceInventory, bool) {
+		calls++
+		return inventoryWritableNamespace(base)
+	})
+	if !ok {
+		t.Fatal("failed building namespace evidence")
+	}
+	if calls != 2 {
+		t.Fatalf("inventory calls = %d, want 2", calls)
+	}
+	// Mutating caller-owned slices after the inventory/evidence phase must not
+	// alter the reservation decision made from its snapshot.
+	filters[0] = "Q5_K_M"
+	excludes[0] = "model-Q4_K_M.gguf"
+	target := filepath.Join(jobDestinationBase(job), "model-Q4_K_M.gguf")
+	identity, err := mutationEntryIdentity(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selectedWriteEvidenceMayWrite(evidence, []string{identity}) {
+		t.Fatal("evidence did not preserve the copied filter semantics")
+	}
+	if calls != 2 {
+		t.Fatalf("pure evaluation performed inventory work: calls = %d", calls)
+	}
+}
+
 func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T) {
 	storage := t.TempDir()
 	job := &Job{
