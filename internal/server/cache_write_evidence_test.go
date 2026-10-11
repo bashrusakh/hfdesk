@@ -130,6 +130,35 @@ func TestCacheWriteAttemptInventoriesOncePerLifetimeNotTarget(t *testing.T) {
 	}
 }
 
+func TestCacheWriteAttemptCollectsSnapshotJobsAndActivitiesOnce(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	j := &Job{ID: "same", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"*.gguf"}}
+	m.jobs[j.ID] = j
+	m.runActivities[1] = &jobWriteActivity{job: j, planned: map[string]struct{}{}}
+	// An old in-flight generation and a retry are distinct writers despite the
+	// shared visible job ID and destination.
+	old := *j
+	old.generation = 1
+	m.runActivities[2] = &jobWriteActivity{job: &old, planned: map[string]struct{}{}}
+	s := m.captureWriteDecision()
+	count := 0
+	a := &cacheWriteAttempt{evidence: map[string]selectedWriteEvidence{}, complete: true, inventory: func(base string) (writableNamespaceInventory, bool) {
+		count++
+		return writableNamespaceInventory{base: base}, true
+	}}
+	a.CollectSnapshot(s)
+	if len(a.evidence) != 2 || count != 4 {
+		t.Fatalf("evidence=%d inventory calls=%d; want two lifetimes × two namespaces", len(a.evidence), count)
+	}
+	for _, target := range []string{filepath.Join(root, "owner", "repo", "a.gguf"), filepath.Join(root, "owner", "repo", "b.gguf")} {
+		a.MayWrite(j, []string{target})
+	}
+	if count != 4 {
+		t.Fatalf("multiple targets rebuilt inventory: %d", count)
+	}
+}
+
 func TestCacheWriteAttemptMutationScopesAreTargetRelevant(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
 	root := t.TempDir()
