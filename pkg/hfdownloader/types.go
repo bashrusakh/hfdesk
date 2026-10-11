@@ -47,8 +47,20 @@ type Job struct {
 	// Filters specify which LFS files to download, matched case-insensitively.
 	// If empty, all files are downloaded.
 	//
-	// Each filter is matched as a substring against file names. A file is
-	// included if it contains any of the filter strings.
+	// Each filter is matched against the file's complete repository-relative
+	// path, not just its base name, so directory components, dataset splits,
+	// and extensions all participate in matching. A file is included if any
+	// filter matches its path. Filter forms:
+	//   - bare component ("unet", "q4_k_m", "text_encoder"): selects files
+	//     under that directory at any depth
+	//   - trailing slash ("q4_k_m/"): explicitly selects a directory
+	//   - extension (".safetensors"): selects files carrying that extension
+	//   - full path ("text_encoder/config.json"): selects exactly that path
+	//
+	// By default (ExactMatch false) each filter is a case-insensitive
+	// substring of the whole path, which is the broadest of these forms;
+	// ExactMatch tightens each form to precise path semantics (see
+	// ExactMatch).
 	//
 	// Examples:
 	//   - []string{"q4_0"} matches "model.Q4_0.gguf"
@@ -69,11 +81,20 @@ type Job struct {
 	Excludes []string
 
 	// ExactMatch controls how Filters are matched. When false (the default),
-	// each filter is matched as a case-insensitive substring (see Filters).
-	// When true, a filter matches only when it equals a whole delimiter-bounded
-	// segment of the file name (segments are split on '-', '.', and spaces;
-	// underscores stay within a segment). This lets a filter like "q6_k" select
-	// "model-Q6_K.gguf" without also matching "model-UD-Q6_K_XL.gguf".
+	// each filter is a case-insensitive substring of the whole
+	// repository-relative path (see Filters). When true, a filter matches
+	// only in one of these exact forms against the repository-relative path:
+	//   - the whole path or file name ("text_encoder/config.json",
+	//     "model-q6_k.gguf")
+	//   - a whole delimiter-bounded segment of the file name (segments are
+	//     split on '-', '.', and spaces; underscores stay within a segment),
+	//     so "q6_k" selects "model-Q6_K.gguf" without also matching
+	//     "model-UD-Q6_K_XL.gguf"
+	//   - a whole directory component at any depth ("unet", "text_encoder")
+	//   - an explicit directory prefix with a trailing slash ("q4_k_m/"),
+	//     which must start at a path component boundary so "unet/" does not
+	//     select "myunet/"
+	//   - an extension suffix (".safetensors")
 	//
 	// Excludes are always matched as substrings, regardless of this setting.
 	ExactMatch bool
