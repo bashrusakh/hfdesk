@@ -620,10 +620,15 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 			}
 		}
 	}
-	for _, scopes := range m.mutationScopes {
+	for id, scopes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if mutationDirectoryEntryOverlap(scope, entry) {
+				conflicts := mutationDirectoryEntryOverlap(scope, entry)
+				if kind == writeScopeEntry {
+					conflicts = mutationPathsOverlap(scope, entry)
+				}
+				if conflicts {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -791,10 +796,19 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 			return nil, false
 		}
 	}
-	for _, writes := range m.mutationScopes {
-		if conflictScopes(writes) {
-			m.mu.Unlock()
-			return nil, false
+	for id, writes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
+		for _, scope := range scopes {
+			for _, write := range writes {
+				conflicts := mutationDirectoryEntryOverlap(scope, write)
+				if kind != writeScopeEntry {
+					conflicts = directoryScopesOverlap(scope, write)
+				}
+				if conflicts {
+					m.mu.Unlock()
+					return nil, false
+				}
+			}
 		}
 	}
 	for _, activity := range m.runActivities {
@@ -876,15 +890,20 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	if m.mutationScopes == nil {
 		m.mutationScopes = make(map[uint64][]string)
 	}
+	if m.mutationScopeKinds == nil {
+		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
+	}
 	m.opWG.Add(1)
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.mutationScopes[id] = clean
+	m.mutationScopeKinds[id] = writeScopeDirectory
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.mutationScopes, id)
+		delete(m.mutationScopeKinds, id)
 		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()

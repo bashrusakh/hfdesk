@@ -172,6 +172,7 @@ type JobManager struct {
 	deleteReservations   map[uint64][]string
 	hfRepoReservations   map[uint64][]string
 	mutationScopes       map[uint64][]string
+	mutationScopeKinds   map[uint64]writeScopeKind
 	nextWriteID          uint64
 	writeDecisionEpoch   uint64
 	writeDecisionChanged chan struct{}
@@ -201,6 +202,7 @@ func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *Job
 		deleteReservations:   make(map[uint64][]string),
 		hfRepoReservations:   make(map[uint64][]string),
 		mutationScopes:       make(map[uint64][]string),
+		mutationScopeKinds:   make(map[uint64]writeScopeKind),
 		writeDecisionChanged: make(chan struct{}),
 		config:               cfg,
 		statePath:            statePath,
