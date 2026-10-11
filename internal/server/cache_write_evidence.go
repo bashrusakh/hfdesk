@@ -20,6 +20,7 @@ type writeDecisionJob struct {
 	filters, excludes                                 []string
 	generation                                        int
 	createdAt                                         int64
+	activityID                                        uint64
 }
 
 type writeDecisionActivity struct {
@@ -146,13 +147,14 @@ func (m *JobManager) beginObservedMutation(paths []string) func() {
 // cacheWriteAttempt owns an immutable inventory assembled outside manager
 // locks. Begin under m.mu so Close cannot race WaitGroup.Add.
 type cacheWriteAttempt struct {
-	manager   *JobManager
-	start     writeDecisionSnapshot
-	evidence  map[string]selectedWriteEvidence
-	failed    map[string]bool
-	probes    map[string]writeIdentityProbe
-	targets   map[string]writeIdentityProbe
-	inventory func(string) (writableNamespaceInventory, bool)
+	manager     *JobManager
+	start       writeDecisionSnapshot
+	evidence    map[string]selectedWriteEvidence
+	failed      map[string]bool
+	descriptors map[string]writeDecisionJob
+	probes      map[string]writeIdentityProbe
+	targets     map[string]writeIdentityProbe
+	inventory   func(string) (writableNamespaceInventory, bool)
 }
 
 func (m *JobManager) beginCacheWriteAttempt() (*cacheWriteAttempt, bool) {
@@ -162,7 +164,7 @@ func (m *JobManager) beginCacheWriteAttempt() (*cacheWriteAttempt, bool) {
 		return nil, false
 	}
 	m.opWG.Add(1)
-	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventoryWritableNamespace}, true
+	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventoryWritableNamespace}, true
 }
 
 func (a *cacheWriteAttempt) Close() {
@@ -181,8 +183,15 @@ func decisionDescriptorKey(d writeDecisionJob) string {
 		Filters, Excludes                                 []string
 		Generation                                        int
 		Exact, Flat, Dataset                              bool
-	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset})
+		ActivityID                                        uint64
+	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.activityID})
 	return string(b)
+}
+
+func descriptorForStartingJob(job, activity writeDecisionJob) bool {
+	job.generation = activity.generation
+	job.activityID = activity.activityID
+	return decisionDescriptorKey(job) == decisionDescriptorKey(activity)
 }
 
 func jobFromDecision(d writeDecisionJob) *Job {
@@ -197,26 +206,38 @@ func jobFromDecision(d writeDecisionJob) *Job {
 // activity is visited once; a distinct generation remains independent.
 func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 	seen := make(map[string]struct{}, len(s.jobs)+len(s.activities))
+	startingActivity := make(map[string][]writeDecisionJob)
+	for _, activity := range s.activities {
+		if !activity.planKnown {
+			startingActivity[activity.job.id] = append(startingActivity[activity.job.id], activity.job)
+		}
+	}
 	for _, d := range s.jobs {
 		if d.status != JobStatusQueued && !d.starting {
 			continue
 		}
-		j := jobFromDecision(d)
-		key := decisionJobKey(j)
+		if d.starting {
+			for _, activity := range startingActivity[d.id] {
+				if descriptorForStartingJob(d, activity) {
+					d = activity
+					break
+				}
+			}
+		}
+		key := decisionDescriptorKey(d)
 		seen[key] = struct{}{}
-		a.Collect(j)
+		a.collectDescriptor(d)
 	}
 	for _, activity := range s.activities {
 		if activity.planKnown {
 			continue
 		}
-		j := jobFromDecision(activity.job)
-		key := decisionJobKey(j)
+		key := decisionDescriptorKey(activity.job)
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		a.Collect(j)
+		a.collectDescriptor(activity.job)
 	}
 }
 
@@ -226,10 +247,19 @@ func (a *cacheWriteAttempt) Collect(job *Job) {
 	if a == nil || job == nil {
 		return
 	}
-	key := decisionJobKey(job)
+	a.collectDescriptor(decisionJob(job))
+}
+
+func (a *cacheWriteAttempt) collectDescriptor(descriptor writeDecisionJob) {
+	job := jobFromDecision(descriptor)
+	key := decisionDescriptorKey(descriptor)
+	if a.failed[key] {
+		return
+	}
 	if _, ok := a.evidence[key]; ok {
 		return
 	}
+	a.descriptors[key] = descriptor
 	inventory := a.inventory
 	if inventory == nil {
 		inventory = inventoryWritableNamespace
@@ -276,14 +306,12 @@ func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
 	if a == nil {
 		return true
 	}
-	key := decisionJobKey(job)
-	if a.failed[key] {
-		return true
+	base := decisionJob(job)
+	base.activityID = 0
+	if base.starting {
+		base.generation++
 	}
-	ev, ok := a.evidence[key]
-	if !ok {
-		return true
-	}
+	baseKey := decisionDescriptorKey(base)
 	identities := make([]string, len(targets))
 	for i, p := range targets {
 		probe, err := captureWriteIdentityProbe(p, false)
@@ -293,7 +321,23 @@ func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
 		identities[i] = probe.identity
 		a.targets[filepath.Clean(p)] = probe
 	}
-	return selectedWriteEvidenceMayWrite(ev, identities)
+	found := false
+	for key, descriptor := range a.descriptors {
+		candidate := descriptor
+		candidate.activityID = 0
+		if decisionDescriptorKey(candidate) != baseKey {
+			continue
+		}
+		found = true
+		if a.failed[key] {
+			return true
+		}
+		ev, ok := a.evidence[key]
+		if !ok || selectedWriteEvidenceMayWrite(ev, identities) {
+			return true
+		}
+	}
+	return !found
 }
 
 // Revalidate probes only the explicit bounded identities supplied by the
@@ -325,7 +369,9 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 	if a == nil {
 		return true
 	}
-	for _, scopesByID := range []map[uint64][]frozenMutationPath{a.start.mutations, a.start.deletes, a.start.hfReservations} {
+	// beginCacheMutation and HF reservations name directory scopes; selected
+	// GGUF deletes name leaf entries whose final symlink must remain unfollowed.
+	for _, scopesByID := range []map[uint64][]frozenMutationPath{a.start.mutations, a.start.hfReservations} {
 		for _, scopes := range scopesByID {
 			for _, scope := range scopes {
 				for _, target := range targets {
@@ -348,7 +394,37 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 			}
 		}
 	}
+	for _, scopes := range a.start.deletes {
+		for _, entry := range scopes {
+			for _, target := range targets {
+				if frozenMutationOverlapsRawEntry(entry, target) {
+					return true
+				}
+			}
+			for _, ev := range a.evidence {
+				for _, inv := range ev.inventories {
+					if frozenMutationOverlapsRawDirectory(entry, inv.base) {
+						return true
+					}
+					for _, alias := range inv.aliases {
+						if frozenMutationOverlapsRawDirectory(entry, alias.location) || frozenMutationOverlapsRawDirectory(entry, alias.dest) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
 	return false
+}
+
+func directoryScopesOverlap(a, b string) bool {
+	a, errA := mutationDirectoryIdentity(a)
+	b, errB := mutationDirectoryIdentity(b)
+	if errA != nil || errB != nil {
+		return true
+	}
+	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
 }
 
 func captureWriteIdentityProbe(path string, directory bool) (writeIdentityProbe, error) {
