@@ -6,10 +6,13 @@ package hfdownloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -211,6 +214,131 @@ func TestDownloadManifest(t *testing.T) {
 	}
 	if !manifest.Files[1].LFS {
 		t.Error("Second file should be LFS")
+	}
+}
+
+// TestManifestWriteFailureLeavesPreviousManifestIntact pins the atomic
+// manifest write: a failed write must leave the previous manifest intact —
+// the truncate-in-place write it replaces would have destroyed it — must not
+// leave staging files behind, and must preserve existing file modes.
+func TestManifestWriteFailureLeavesPreviousManifestIntact(t *testing.T) {
+	dir := t.TempDir()
+	build := func(files int) *DownloadManifest {
+		m := &DownloadManifest{
+			Version: "1.0", Type: "model", Repo: "owner/model", Branch: "main", Commit: "commit-a",
+			StartedAt: time.Now().UTC(), CompletedAt: time.Now().UTC(),
+		}
+		for i := 0; i < files; i++ {
+			m.Files = append(m.Files, ManifestFile{Name: "file.gguf", Blob: "blobs/abc", Size: 1})
+		}
+		return m
+	}
+	path, err := build(1).Write(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := manifestCreateTemp
+	t.Cleanup(func() { manifestCreateTemp = orig })
+
+	assertIntact := func(t *testing.T) {
+		t.Helper()
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != string(original) {
+			t.Fatalf("previous manifest changed after failed write: %v", err)
+		}
+		if runtime.GOOS != "windows" {
+			if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+				t.Fatalf("manifest mode changed after failed write: %v %v", info, err)
+			}
+		}
+		leftovers, err := filepath.Glob(filepath.Join(dir, ManifestFilename+".tmp-*"))
+		if err != nil || len(leftovers) != 0 {
+			t.Fatalf("staging leftovers=%v %v", leftovers, err)
+		}
+	}
+
+	t.Run("staging cannot be created", func(t *testing.T) {
+		manifestCreateTemp = func(dir, pattern string) (*os.File, error) {
+			return nil, errors.New("simulated: staging creation failed")
+		}
+		if _, err := build(2).Write(dir); err == nil {
+			t.Fatal("write succeeded despite staging failure")
+		}
+		assertIntact(t)
+	})
+
+	t.Run("staging write fails", func(t *testing.T) {
+		manifestCreateTemp = func(dir, pattern string) (*os.File, error) {
+			f, err := os.CreateTemp(dir, pattern)
+			if err == nil {
+				f.Close() // every subsequent write on the staging file fails
+			}
+			return f, err
+		}
+		if _, err := build(2).Write(dir); err == nil {
+			t.Fatal("write succeeded despite staging write failure")
+		}
+		assertIntact(t)
+	})
+
+	// Do not let the injected failing factory leak into the successful-path
+	// assertion below (or any later test in this package).
+	manifestCreateTemp = orig
+
+	// The successful path still publishes the new manifest, keeps its mode,
+	// and leaves no staging files behind.
+	if _, err := build(2).Write(dir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) == string(original) {
+		t.Fatalf("manifest was not replaced on success: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("rewritten manifest did not keep its mode: %v %v", info, err)
+		}
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ManifestFilename+".tmp-*"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("staging leftovers=%v %v", leftovers, err)
+	}
+}
+
+func TestManifestWriteRespectsUmask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX umask semantics are unavailable on Windows")
+	}
+	const pathEnv = "HFDESK_UMASK_MANIFEST_PATH"
+	if path := os.Getenv(pathEnv); path != "" {
+		m := &DownloadManifest{Type: "model", Repo: "owner/model", CompletedAt: time.Now().UTC()}
+		if _, err := m.Write(filepath.Dir(path)); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ManifestFilename)
+	cmd := exec.Command("sh", "-c", `umask 077; exec "$@"`, "sh", os.Args[0], "-test.run=^TestManifestWriteRespectsUmask$")
+	cmd.Env = append(os.Environ(), pathEnv+"="+path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("restricted-umask child failed: %v\n%s", err, output)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("manifest mode under umask 077 = %04o, want 0600", got)
 	}
 }
 

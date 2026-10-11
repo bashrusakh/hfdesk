@@ -532,14 +532,6 @@ func TestIsProcessAlive(t *testing.T) {
 	})
 }
 
-func TestIsWindows(t *testing.T) {
-	result := isWindows()
-	expected := runtime.GOOS == "windows"
-	if result != expected {
-		t.Errorf("isWindows() = %v, want %v", result, expected)
-	}
-}
-
 func TestRepoDir_EnsureFriendlyDir(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir, 0)
