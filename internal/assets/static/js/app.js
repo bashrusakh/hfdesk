@@ -792,12 +792,23 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       } else if (q.bits) {
         precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
       }
+      // Modules the config excludes from quantization (modules_to_not_convert)
+      // are an exception to the declared width above, not mixed precision.
+      // Show them in every precision state so `bits` is never read as a
+      // model-wide width. Rendered as escaped text only (never into an
+      // attribute): escapeHtml does not escape quotes.
+      const excludedModules = (q.excluded_modules || []).filter((m) => typeof m === 'string' && m);
+      const excludedText = excludedModules.slice(0, 4).join(', ')
+        + (excludedModules.length > 4 ? ` +${excludedModules.length - 4} more` : '');
+      const excludedRow = excludedModules.length
+        ? `<div class="analysis-stat"><div class="analysis-stat-label">Not quantized</div><div class="analysis-stat-value">${escapeHtml(excludedText)}</div></div>`
+        : '';
       typeInfoHtml = `
         <div class="analysis-section">
           <h4>Quantized Model Information</h4>
           <div class="analysis-grid">
             ${q.method ? `<div class="analysis-stat"><div class="analysis-stat-label">Method</div><div class="analysis-stat-value">${escapeHtml(q.method.toUpperCase())}</div></div>` : ''}
-            ${precisionRow}
+            ${precisionRow}${excludedRow}
             ${q.group_size ? `<div class="analysis-stat"><div class="analysis-stat-label">Group Size</div><div class="analysis-stat-value">${q.group_size}</div></div>` : ''}
             ${q.backends?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Backends</div><div class="analysis-stat-value">${q.backends.slice(0,3).join(', ')}</div></div>` : ''}
           </div>
