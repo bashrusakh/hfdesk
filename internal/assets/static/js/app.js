@@ -768,12 +768,47 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     if (data.quantized) {
       const q = data.quantized;
+      // Precision must not be implied from a header field: `bits` is only a
+      // model-wide width when precision is uniform and the config was read
+      // completely. A partially read config leaves precision declarations past
+      // the metadata cut unknown, so present it as unverified instead of
+      // claiming uniform or mixed precision. Width rows show only declared
+      // widths: a 0 bound means the declaration was cut, not a 0-bit width.
+      const bitWidth = (n) => `${n}-bit`;
+      const expertWidth = (q.expert_bits_min || q.expert_bits_max)
+        ? (q.expert_bits_min && q.expert_bits_max && q.expert_bits_min !== q.expert_bits_max
+            ? `${q.expert_bits_min}–${q.expert_bits_max}-bit`
+            : bitWidth(q.expert_bits_min || q.expert_bits_max))
+        : '';
+      const widthRows = (expertWidth ? `<div class="analysis-stat"><div class="analysis-stat-label">Per-Expert Widths</div><div class="analysis-stat-value">${expertWidth}</div></div>` : '')
+        + (q.head_bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Head Width</div><div class="analysis-stat-value">${bitWidth(q.head_bits)}</div></div>` : '');
+      let precisionRow = '';
+      if (q.mixed_precision) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Mixed${q.config_partial ? ' (config partially read)' : ''}</div></div>`
+          + widthRows;
+      } else if (q.config_partial) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unverified — config partially read (10 MiB limit)</div></div>`
+          + widthRows;
+      } else if (q.bits) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
+      }
+      // Modules the config excludes from quantization (modules_to_not_convert)
+      // are an exception to the declared width above, not mixed precision.
+      // Show them in every precision state so `bits` is never read as a
+      // model-wide width. Rendered as escaped text only (never into an
+      // attribute): escapeHtml does not escape quotes.
+      const excludedModules = (q.excluded_modules || []).filter((m) => typeof m === 'string' && m);
+      const excludedText = excludedModules.slice(0, 4).join(', ')
+        + (excludedModules.length > 4 ? ` +${excludedModules.length - 4} more` : '');
+      const excludedRow = excludedModules.length
+        ? `<div class="analysis-stat"><div class="analysis-stat-label">Not quantized</div><div class="analysis-stat-value">${escapeHtml(excludedText)}</div></div>`
+        : '';
       typeInfoHtml = `
         <div class="analysis-section">
           <h4>Quantized Model Information</h4>
           <div class="analysis-grid">
             ${q.method ? `<div class="analysis-stat"><div class="analysis-stat-label">Method</div><div class="analysis-stat-value">${escapeHtml(q.method.toUpperCase())}</div></div>` : ''}
-            ${q.bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>` : ''}
+            ${precisionRow}${excludedRow}
             ${q.group_size ? `<div class="analysis-stat"><div class="analysis-stat-label">Group Size</div><div class="analysis-stat-value">${q.group_size}</div></div>` : ''}
             ${q.backends?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Backends</div><div class="analysis-stat-value">${q.backends.slice(0,3).join(', ')}</div></div>` : ''}
           </div>

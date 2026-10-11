@@ -71,6 +71,58 @@ Important response fields:
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
 
+Quantized models expose a `quantized` projection in the response (also for
+quantization-only repositories that have a root `quantization_config.json` but
+no root architecture config):
+
+```json
+"quantized": {
+  "method": "exl3",
+  "method_description": "EXL3 - ExLlamaV3 quantization",
+  "bits": 0,
+  "head_bits": 16,
+  "expert_bits_min": 3,
+  "expert_bits_max": 4,
+  "mixed_precision": true
+}
+```
+
+`method` is the literal `quant_method` from the repository's quantization
+config. `bits` is the declared bit width of the quantized tensors and is only
+set when the config declares uniform precision and was read completely enough
+to establish it. `excluded_modules` lists the modules the config excludes from
+quantization (`modules_to_not_convert`). When `excluded_modules` is non-empty,
+part of the model is not quantized at that width, so `bits` is not a model-wide
+width and consumers must present the excluded modules alongside it. Exclusions
+alone are not mixed precision: `mixed_precision` stays `false` and `bits` stays
+set. When `mixed_precision` is true, `bits` is `0` and must not be read as
+model-wide precision: `head_bits` is the declared width for head tensors and
+`expert_bits_min`/`expert_bits_max` bound the declared per-expert widths
+(`expert_bits` / `routed_expert_bits`).
+
+`mixed_precision` is set whenever the config carries precision evidence that
+contradicts uniform model-wide precision: per-expert width declarations
+(`expert_bits`, `routed_expert_bits`), tensor-group widths that differ from
+`bits` or are present while model-wide `bits` is absent (`head_bits`,
+`vision_bits`, `mtp_bits`), or effective/aggregate
+precision evidence (`bits_per_weight`, `routed_expert_bits_avg`). An average is
+never treated as proof of uniformity. `bits_per_weight` is the EXL2 bits per
+weight (effective precision) and is only ever copied from the config: nominal
+`bits` is never presented as bits per weight. Width declarations without a
+dedicated field here remain literal under `metadata`.
+
+`config_partial` is `true` when the quantization config exceeded the 10 MiB
+metadata bound and only its leading fields were recovered. Precision
+declarations past the cut are unknown, so `bits` stays `0` even when the
+recovered fields look uniform. A precision declaration whose value was cut at
+the bound appears in `metadata` with a `null` value, and the recovered object
+carries `"__partial__": true`, so a lost declaration is explicit instead of
+silently dropped; declared widths are still presented as declared.
+
+The literal config header remains available under `metadata` (for oversized
+configs it is the recovered head with the markers described above). Unknown
+methods keep their name with an empty `method_description` and no `backends`.
+
 ## Plan
 
 ```http

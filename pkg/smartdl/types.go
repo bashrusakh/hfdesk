@@ -392,8 +392,40 @@ type QuantizedInfo struct {
 	// MethodDescription is a human-readable description of the method.
 	MethodDescription string `json:"method_description,omitempty"`
 
-	// Bits is the quantization bit width.
+	// Bits is the declared bit width of the quantized tensors when the config
+	// declares uniform precision and was read completely enough to establish
+	// it. It stays 0 when MixedPrecision or ConfigPartial is true: a header
+	// bits field then describes only part of the model or uniformity is not
+	// established, and it must not be read as model-wide precision (the
+	// literal value remains in Metadata). When ExcludedModules is non-empty it
+	// is not a model-wide width either: present the excluded modules
+	// alongside it.
 	Bits int `json:"bits"`
+
+	// MixedPrecision indicates the config carries precision evidence that
+	// contradicts uniform model-wide precision: per-expert width declarations
+	// (EXL3 expert_bits / routed_expert_bits), differing tensor-group widths
+	// (EXL3 head_bits, vision_bits, mtp_bits), or effective/aggregate
+	// precision evidence (EXL2 bits_per_weight, routed_expert_bits_avg).
+	// HeadBits and ExpertBitsMin/Max describe declared groups and do not
+	// describe every tensor.
+	MixedPrecision bool `json:"mixed_precision,omitempty"`
+
+	// ConfigPartial indicates the quantization config exceeded the metadata
+	// size bound and only its leading fields were recovered. Precision
+	// declarations past the cut are unknown, so no model-wide uniform
+	// precision is claimed from the recovered fields alone.
+	ConfigPartial bool `json:"config_partial,omitempty"`
+
+	// HeadBits is the bit width the config declares for head tensors
+	// (EXL3 head_bits): a tensor-group width, not model-wide precision.
+	HeadBits float64 `json:"head_bits,omitempty"`
+
+	// ExpertBitsMin and ExpertBitsMax bound the per-expert bit widths declared
+	// in the config (expert_bits / routed_expert_bits), which vary per expert.
+	// Both are 0 when those declarations were cut before their widths were read.
+	ExpertBitsMin float64 `json:"expert_bits_min,omitempty"`
+	ExpertBitsMax float64 `json:"expert_bits_max,omitempty"`
 
 	// GroupSize is the quantization group size.
 	GroupSize int `json:"group_size,omitempty"`
@@ -413,7 +445,11 @@ type QuantizedInfo struct {
 	// BitsPerWeight is the EXL2 bits per weight.
 	BitsPerWeight float64 `json:"bits_per_weight,omitempty"`
 
-	// ExcludedModules is the list of modules not quantized.
+	// ExcludedModules is the list of modules not quantized
+	// (modules_to_not_convert). When non-empty, part of the model is not
+	// quantized at Bits's width, so Bits is not a model-wide width and these
+	// modules must be presented alongside it. Exclusions alone are not mixed
+	// precision.
 	ExcludedModules []string `json:"excluded_modules,omitempty"`
 
 	// Backends is the list of compatible inference backends.

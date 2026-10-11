@@ -343,6 +343,16 @@ func (a *Analyzer) rawURL(repo string, isDataset bool, revision, path string) st
 	return fmt.Sprintf("%s/%s/raw/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
 }
 
+// resolveURL builds the LFS-resolving file URL. Git-LFS-backed files are stored
+// as pointer stubs under /raw/; /resolve/ serves the actual bytes, matching the
+// downloader's LFS routing (pkg/hfdownloader lfsURL).
+func (a *Analyzer) resolveURL(repo string, isDataset bool, revision, path string) string {
+	if isDataset {
+		return fmt.Sprintf("%s/datasets/%s/resolve/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
+	}
+	return fmt.Sprintf("%s/%s/resolve/%s/%s", a.endpoint, repo, url.PathEscape(revision), pathEscapeAll(path))
+}
+
 // hfRefsResponse represents the HuggingFace refs API response.
 type hfRefsResponse struct {
 	Branches []hfRef `json:"branches"`
@@ -527,11 +537,13 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 		filesToFetch = append(filesToFetch, "quantization_config.json")
 	}
 	for _, path := range filesToFetch {
-		// Check if file exists
+		// Check if the file exists and whether it is Git-LFS-backed.
 		found := false
+		isLFS := false
 		for _, f := range info.Files {
 			if f.Path == path {
 				found = true
+				isLFS = f.IsLFS
 				break
 			}
 		}
@@ -539,7 +551,7 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 			continue
 		}
 
-		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path)
+		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path, isLFS)
 		if err != nil {
 			if errors.Is(err, errMetadataTooLarge) && path == "quantization_config.json" {
 				data, headErr := decodeQuantizationHead(content)
@@ -567,10 +579,39 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 	return nil
 }
 
-// fetchFile fetches raw file content from the repository.
-func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, revision, path string) ([]byte, error) {
+// fetchFile fetches file content from the repository. Git-LFS-backed files are
+// fetched through /resolve/ so the actual bytes are returned instead of the
+// pointer stub that /raw/ serves (issue #123). A pointer stub from a file the
+// tree did not mark as LFS is retried through /resolve/ once; a pointer that
+// persists is an explicit failure and is never interpreted as file content.
+// Authentication keeps the default net/http redirect policy, which drops
+// Authorization on the cross-host CDN hop /resolve/ introduces.
+func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, revision, path string, isLFS bool) ([]byte, error) {
 	reqURL := a.rawURL(repo, isDataset, revision, path)
+	if isLFS {
+		reqURL = a.resolveURL(repo, isDataset, revision, path)
+	}
 
+	content, err := a.fetchFileFrom(ctx, reqURL, path)
+	if err != nil && !errors.Is(err, errMetadataTooLarge) {
+		return nil, err
+	}
+	if isLFSPointer(content) && !isLFS {
+		// Unmarked LFS file: /raw/ served the pointer stub, so the content is
+		// known to be missing; failing to replace it must stay explicit.
+		content, err = a.fetchFileFrom(ctx, a.resolveURL(repo, isDataset, revision, path), path)
+		if err != nil && !errors.Is(err, errMetadataTooLarge) {
+			return nil, &metadataReadError{fmt.Errorf("git-lfs pointer served instead of file content: %w", err)}
+		}
+	}
+	if isLFSPointer(content) {
+		return nil, &metadataReadError{errors.New("git-lfs pointer served instead of file content")}
+	}
+	return content, err
+}
+
+// fetchFileFrom reads one file's content under the metadata size bound.
+func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -597,6 +638,68 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 	return content, nil
 }
 
+// isLFSPointer reports whether content is a structurally valid Git LFS pointer
+// stub (the pointer format of the Git LFS v1 spec) rather than actual file
+// content: the version header line plus an "oid sha256:<64 hex>" line and a
+// "size <digits>" line. Content that merely starts with the version line is
+// file content and must not trigger pointer handling (a false match would
+// become a fatal named-file error after the /resolve/ retry).
+func isLFSPointer(content []byte) bool {
+	const header = "version https://git-lfs.github.com/spec/v1"
+	oidPrefix := []byte("oid sha256:")
+	sizePrefix := []byte("size ")
+	hasOID, hasSize := false, false
+	for i, line := range bytes.Split(content, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if i == 0 {
+			if string(line) != header {
+				return false
+			}
+			continue
+		}
+		if !hasOID && bytes.HasPrefix(line, oidPrefix) {
+			oid := line[len(oidPrefix):]
+			if len(oid) == 64 && allHex(oid) {
+				hasOID = true
+			}
+		} else if !hasSize && bytes.HasPrefix(line, sizePrefix) {
+			if allDigits(line[len(sizePrefix):]) {
+				hasSize = true
+			}
+		}
+		if hasOID && hasSize {
+			return true
+		}
+	}
+	return false
+}
+
+// allHex reports whether b is a non-empty ASCII hexadecimal string.
+func allHex(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// allDigits reports whether b is a non-empty ASCII decimal string.
+func allDigits(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 const maxMetadataSize = 10 * 1024 * 1024
 
 var errMetadataTooLarge = errors.New("exceeds 10 MiB metadata limit")
@@ -605,8 +708,35 @@ type metadataReadError struct{ error }
 
 func (e *metadataReadError) Unwrap() error { return e.error }
 
-// decodeQuantizationHead keeps only completed top-level fields. An incomplete
-// large trailing value is expected at the cap; malformed JSON is not recovery.
+// partialHeadMarker marks a bounded head whose recovery stopped at the size
+// bound: the config continued past the recovered fields, so precision
+// declarations the tail may hold are unknown and uniform precision cannot be
+// established from the head alone. It is stored in the recovered map (which
+// replaces the config under Metadata) so the partial recovery is explicit in
+// the response instead of silent.
+const partialHeadMarker = "__partial__"
+
+// precisionHeadKeys are the config declarations that carry bit-width or
+// effective-precision evidence. A value cut at the size bound is recovered as
+// an explicit null: the declaration happened, its width is unknown, and it
+// must not be silently dropped or invented.
+var precisionHeadKeys = map[string]bool{
+	"bits":                   true,
+	"head_bits":              true,
+	"vision_bits":            true,
+	"mtp_bits":               true,
+	"expert_bits":            true,
+	"routed_expert_bits":     true,
+	"routed_expert_bits_avg": true,
+	"bits_per_weight":        true,
+}
+
+// decodeQuantizationHead keeps only completed top-level fields useful for the
+// quantization projection (quant_method and the precisionHeadKeys widths). An
+// incomplete large trailing value is expected at the cap; malformed JSON is not
+// recovery. A precision declaration whose value was cut at the cap is kept as
+// an explicit null and the head is marked partial, so truncation never reads as
+// a completed declaration.
 func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 	d := json.NewDecoder(bytes.NewReader(content))
 	token, err := d.Token()
@@ -614,17 +744,23 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		return nil, errors.New("quantization head is not an object")
 	}
 	head := make(map[string]interface{})
+	completed := 0
 	for d.More() {
-		key, err := d.Token()
+		token, err := d.Token()
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return nil, err
 		}
+		key, _ := token.(string)
 		var value interface{}
 		if err := d.Decode(&value); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				// The key is known and its value was cut at the cap.
+				if precisionHeadKeys[key] {
+					head[key] = nil
+				}
 				break
 			}
 			return nil, err
@@ -633,6 +769,9 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		// Only a visible member delimiter proves the value is complete.
 		tail := bytes.TrimLeft(content[d.InputOffset():], " \t\r\n")
 		if len(tail) == 0 {
+			if precisionHeadKeys[key] {
+				head[key] = nil
+			}
 			break
 		}
 		if tail[0] != ',' && tail[0] != '}' {
@@ -642,20 +781,35 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 		case "quant_method":
 			if method, ok := value.(string); ok && method != "" {
 				head["quant_method"] = method
+				completed++
 			}
-		case "bits", "head_bits":
+		case "bits", "head_bits", "vision_bits", "mtp_bits", "bits_per_weight", "routed_expert_bits_avg":
 			if _, ok := value.(float64); ok {
-				head[key.(string)] = value
+				head[key] = value
+				completed++
+			}
+		case "expert_bits", "routed_expert_bits":
+			// Per-expert widths: an object keyed by expert, a list of widths,
+			// or a single width.
+			switch value.(type) {
+			case map[string]interface{}, []interface{}, float64:
+				head[key] = value
+				completed++
 			}
 		}
 	}
+	partial := true
 	if token, err := d.Token(); err == nil && token == json.Delim('}') {
 		if len(bytes.TrimSpace(content[d.InputOffset():])) != 0 {
 			return nil, errors.New("invalid trailing quantization data")
 		}
+		partial = false
 	}
-	if len(head) == 0 {
+	if completed == 0 {
 		return nil, errors.New("no completed quantization fields in bounded head")
+	}
+	if partial {
+		head[partialHeadMarker] = true
 	}
 	return head, nil
 }
@@ -704,6 +858,15 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 			// Re-run analysis for the specialized type
 			a.analyzeTypeSpecific(info)
 			return
+		}
+		// Quantization-only repositories (root weights plus a root
+		// quantization_config.json, no root architecture config) stay
+		// generic; project their quantization info without reclassifying
+		// or changing selectable items (issue #123).
+		if hasRootWeights(info.Files) {
+			if _, ok := info.Metadata["quantization_config.json"]; ok {
+				info.Quantized = analyzeQuantized(info.Metadata)
+			}
 		}
 	}
 

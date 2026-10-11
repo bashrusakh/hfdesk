@@ -18,8 +18,8 @@ func TestAnalyzeQuantized(t *testing.T) {
 				"sym":          true,
 			},
 			"config.json": map[string]interface{}{
-				"architectures":    []interface{}{"LlamaForCausalLM"},
-				"hidden_size":      float64(4096),
+				"architectures":     []interface{}{"LlamaForCausalLM"},
+				"hidden_size":       float64(4096),
 				"num_hidden_layers": float64(32),
 			},
 		}
@@ -100,7 +100,7 @@ func TestAnalyzeQuantized(t *testing.T) {
 	t.Run("model with excluded modules", func(t *testing.T) {
 		metadata := map[string]interface{}{
 			"quantize_config.json": map[string]interface{}{
-				"quant_method":          "gptq",
+				"quant_method":           "gptq",
 				"modules_to_not_convert": []interface{}{"lm_head", "embed_tokens"},
 			},
 		}
@@ -121,10 +121,10 @@ func TestAnalyzeQuantized(t *testing.T) {
 	t.Run("fallback to config.json", func(t *testing.T) {
 		metadata := map[string]interface{}{
 			"config.json": map[string]interface{}{
-				"quant_method":     "bitsandbytes",
-				"bits":             float64(8),
-				"architectures":    []interface{}{"MistralForCausalLM"},
-				"hidden_size":      float64(4096),
+				"quant_method":      "bitsandbytes",
+				"bits":              float64(8),
+				"architectures":     []interface{}{"MistralForCausalLM"},
+				"hidden_size":       float64(4096),
 				"num_hidden_layers": float64(32),
 			},
 		}
@@ -156,6 +156,33 @@ func TestAnalyzeQuantized(t *testing.T) {
 			t.Error("expected nil for invalid config type")
 		}
 	})
+}
+
+// Contract (docs/API.md): modules excluded from quantization are projected
+// alongside the declared bit width. Exclusions alone are not mixed precision,
+// and "bits" stays the declared width of the quantized tensors — the response
+// must carry the excluded modules with it so consumers can present them.
+func TestAnalyzeQuantizedExcludedModulesKeepDeclaredBits(t *testing.T) {
+	metadata := map[string]interface{}{
+		"quantization_config.json": map[string]interface{}{
+			"quant_method":           "gptq",
+			"bits":                   float64(4),
+			"modules_to_not_convert": []interface{}{"lm_head", "embed_tokens"},
+		},
+	}
+	info := analyzeQuantized(metadata)
+	if info == nil {
+		t.Fatal("analyzeQuantized returned nil")
+	}
+	if info.Bits != 4 {
+		t.Fatalf("declared width dropped for excluded modules: %+v", info)
+	}
+	if info.MixedPrecision || info.ConfigPartial {
+		t.Fatalf("exclusions alone imply mixed/partial precision: %+v", info)
+	}
+	if len(info.ExcludedModules) != 2 || info.ExcludedModules[0] != "lm_head" || info.ExcludedModules[1] != "embed_tokens" {
+		t.Fatalf("excluded modules not projected alongside bits: %+v", info)
+	}
 }
 
 func TestDetectBackends(t *testing.T) {
@@ -593,6 +620,74 @@ func TestQuantMethodDescriptions(t *testing.T) {
 			}
 			if desc == "" {
 				t.Errorf("empty description for %q", method)
+			}
+		})
+	}
+}
+
+func TestAnalyzeQuantizedPrecisionProjection(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		config                         map[string]interface{}
+		bits                           int
+		mixed                          bool
+		headBits, expertMin, expertMax float64
+	}{
+		{"uniform gptq bits preserved", map[string]interface{}{"quant_method": "gptq", "bits": float64(4)}, 4, false, 0, 0, 0},
+		{"head width equal to bits stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4)}, 4, false, 4, 0, 0},
+		{"head width differs is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(6)}, 0, true, 6, 0, 0},
+		{"head-only declaration is not model-wide", map[string]interface{}{"quant_method": "exl3", "head_bits": float64(6)}, 0, true, 6, 0, 0},
+		{"expert widths scalar", map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, 0, true, 0, 3.51, 3.51},
+		{"expert widths per expert", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}, "1": map[string]interface{}{"gu": float64(3), "down": float64(3)}}}, 0, true, 0, 3, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
+			if info == nil {
+				t.Fatal("analyzeQuantized returned nil")
+			}
+			if info.Bits != tc.bits || info.MixedPrecision != tc.mixed ||
+				info.HeadBits != tc.headBits || info.ExpertBitsMin != tc.expertMin || info.ExpertBitsMax != tc.expertMax {
+				t.Fatalf("projection = %+v, want bits=%d mixed=%v head=%v experts=%v..%v",
+					info, tc.bits, tc.mixed, tc.headBits, tc.expertMin, tc.expertMax)
+			}
+		})
+	}
+}
+
+// Width and effective-precision declarations beyond head_bits/expert_bits also
+// contradict uniform model-wide precision and must not leave a bare bits claim
+// (issue #123 follow-up). Widths only: no method or backend semantics are
+// inferred from these fields.
+func TestAnalyzeQuantizedPrecisionEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		config                         map[string]interface{}
+		bits                           int
+		mixed, partial                 bool
+		headBits, expertMin, expertMax float64
+		bpw                            float64
+	}{
+		{"routed expert widths are never model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}}, 0, true, false, 0, 3, 4, 0},
+		{"expert width average is not proof of uniformity", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "routed_expert_bits_avg": float64(3.51)}, 0, true, false, 0, 0, 0, 0},
+		{"differing vision group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(8)}, 0, true, false, 0, 0, 0, 0},
+		{"differing mtp group width is not model-wide", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(2)}, 0, true, false, 0, 0, 0, 0},
+		{"effective bits per weight is not model-wide precision", map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5)}, 0, true, false, 0, 0, 0, 4.5},
+		{"nominal bits are never bits per weight", map[string]interface{}{"quant_method": "exl2", "bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"equal vision group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "vision_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"equal mtp group width stays uniform", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "mtp_bits": float64(4)}, 4, false, false, 0, 0, 0, 0},
+		{"partial head cannot establish uniformity", map[string]interface{}{"quant_method": "gptq", "bits": float64(4), partialHeadMarker: true}, 0, false, true, 0, 0, 0, 0},
+		{"cut expert declaration is not silently dropped", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": float64(4), "expert_bits": nil, partialHeadMarker: true}, 0, true, true, 4, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
+			if info == nil {
+				t.Fatal("analyzeQuantized returned nil")
+			}
+			if info.Bits != tc.bits || info.MixedPrecision != tc.mixed || info.ConfigPartial != tc.partial ||
+				info.HeadBits != tc.headBits || info.ExpertBitsMin != tc.expertMin || info.ExpertBitsMax != tc.expertMax ||
+				info.BitsPerWeight != tc.bpw {
+				t.Fatalf("projection = %+v, want bits=%d mixed=%v partial=%v head=%v experts=%v..%v bpw=%v",
+					info, tc.bits, tc.mixed, tc.partial, tc.headBits, tc.expertMin, tc.expertMax, tc.bpw)
 			}
 		})
 	}
