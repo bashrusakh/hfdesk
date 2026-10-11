@@ -658,10 +658,12 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.deleteReservations[id] = clean
+	m.signalWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.deleteReservations, id)
+		m.signalWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
@@ -813,10 +815,12 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		m.hfRepoReservations = make(map[uint64][]string)
 	}
 	m.hfRepoReservations[id] = scopes
+	m.signalWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.hfRepoReservations, id)
+		m.signalWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
@@ -875,10 +879,12 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.mutationScopes[id] = clean
+	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.mutationScopes, id)
+		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
@@ -906,6 +912,7 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.runActivities[id] = &jobWriteActivity{job: job, planned: make(map[string]struct{})}
+	m.signalWriteDecisionLocked()
 	return id
 }
 
