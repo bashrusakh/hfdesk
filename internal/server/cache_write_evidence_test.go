@@ -8,7 +8,7 @@ import (
 )
 
 func testCacheWriteAttempt(m *JobManager) *cacheWriteAttempt {
-	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecision(), evidence: map[string]selectedWriteEvidence{}, failed: map[string]bool{}, probes: map[string]writeIdentityProbe{}, targets: map[string]writeIdentityProbe{}, inventory: inventoryWritableNamespace}
+	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecision(), evidence: map[string]selectedWriteEvidence{}, failed: map[string]bool{}, descriptors: map[string]writeDecisionJob{}, probes: map[string]writeIdentityProbe{}, targets: map[string]writeIdentityProbe{}, inventory: inventoryWritableNamespace}
 }
 
 func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
@@ -68,7 +68,7 @@ func TestCacheWriteAttemptDeduplicatesJobsAndFailsClosed(t *testing.T) {
 	j := &Job{ID: "j", Repo: "owner/repo", OutputDir: root, Filters: []string{"weights.gguf"}}
 	a := testCacheWriteAttempt(newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state")))
 	// Missing inventory is conservative, including when no evidence was collected.
-	if !a.MayWrite(j, []string{filepath.Join(root, "owner", "repo", "weights.gguf")}) {
+	if !a.MayWrite(j, []string{filepath.Join(jobDestinationBase(j), "weights.gguf")}) {
 		t.Fatal("unbuilt inventory did not fail closed")
 	}
 }
@@ -197,14 +197,53 @@ func TestCacheWriteAttemptInventoriesOncePerLifetimeNotTarget(t *testing.T) {
 func TestCacheWriteAttemptCollectsSnapshotJobsAndActivitiesOnce(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	j := &Job{ID: "same", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"*.gguf"}}
+	j := &Job{ID: "same", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, starting: true}
 	m.jobs[j.ID] = j
-	m.runActivities[1] = &jobWriteActivity{job: j, planned: map[string]struct{}{}}
-	// An old in-flight generation and a retry are distinct writers despite the
-	// shared visible job ID and destination.
-	old := *j
-	old.generation = 1
-	m.runActivities[2] = &jobWriteActivity{job: &old, planned: map[string]struct{}{}}
+	m.mu.Lock()
+	m.registerRunActivityLocked(j)
+	m.mu.Unlock()
+	s := m.captureWriteDecision()
+	count := 0
+	a := testCacheWriteAttempt(m)
+	a.inventory = func(base string) (writableNamespaceInventory, bool) {
+		count++
+		identity, err := mutationDirectoryIdentity(base)
+		if err != nil {
+			return writableNamespaceInventory{}, false
+		}
+		return writableNamespaceInventory{base: identity}, true
+	}
+	a.CollectSnapshot(s)
+	if len(a.evidence) != 1 || count != 2 {
+		t.Fatalf("evidence=%d inventory calls=%d; wanted one imminent writer × two namespaces", len(a.evidence), count)
+	}
+	var target string
+	for _, ev := range a.evidence {
+		target = filepath.Join(ev.inventories[0].base, "weights.gguf")
+	}
+	if !a.MayWrite(j, []string{target}) {
+		t.Fatal("registered starting activity evidence did not match the imminent job")
+	}
+	for _, target := range []string{filepath.Join(root, "owner", "repo", "a.gguf"), filepath.Join(root, "owner", "repo", "b.gguf")} {
+		a.MayWrite(j, []string{target})
+	}
+	if count != 2 {
+		t.Fatalf("multiple targets rebuilt inventory: %d", count)
+	}
+}
+
+func TestCollectSnapshotKeepsHistoricalActivityDistinctFromQueuedRetry(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	old := &Job{ID: "retry", Repo: "owner/repo", OutputDir: root, Status: JobStatusRunning}
+	m.mu.Lock()
+	m.registerRunActivityLocked(old)
+	m.mu.Unlock()
+	old.generation = 1 // the registered run has now started and claimed generation 1.
+	queued := *old
+	queued.Status = JobStatusQueued
+	queued.starting = false
+	m.jobs[queued.ID] = &queued
 	s := m.captureWriteDecision()
 	count := 0
 	a := testCacheWriteAttempt(m)
@@ -218,13 +257,7 @@ func TestCacheWriteAttemptCollectsSnapshotJobsAndActivitiesOnce(t *testing.T) {
 	}
 	a.CollectSnapshot(s)
 	if len(a.evidence) != 2 || count != 4 {
-		t.Fatalf("evidence=%d inventory calls=%d; want two lifetimes × two namespaces", len(a.evidence), count)
-	}
-	for _, target := range []string{filepath.Join(root, "owner", "repo", "a.gguf"), filepath.Join(root, "owner", "repo", "b.gguf")} {
-		a.MayWrite(j, []string{target})
-	}
-	if count != 4 {
-		t.Fatalf("multiple targets rebuilt inventory: %d", count)
+		t.Fatalf("historical + retry evidence=%d inventories=%d, want distinct descriptors", len(a.evidence), count)
 	}
 }
 
@@ -271,6 +304,63 @@ func TestCacheWriteAttemptMutationScopesCoverWholeWriterNamespace(t *testing.T) 
 		t.Fatal("unrelated namespace mutation conflicted")
 	}
 	end()
+}
+
+func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t *testing.T) {
+	root := t.TempDir()
+	physicalHub := filepath.Join(root, "physical-hub")
+	if err := os.MkdirAll(physicalHub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hubLink := filepath.Join(root, "hub-link")
+	if err := os.Symlink(physicalHub, hubLink); err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{ID: "writer", Repo: "owner/model", OutputDir: filepath.Join(root, "friendly-root"), HubDir: hubLink, Status: JobStatusRunning}
+	repo := hfJobRepoPath(job)
+	if repo == "" {
+		t.Fatal("HF repo path unavailable")
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "snapshots"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	release, ok := m.beginCacheMutation(hubLink)
+	if !ok {
+		t.Fatal("cache mutation scope rejected")
+	}
+	a, ok := m.beginCacheWriteAttempt()
+	if !ok {
+		t.Fatal("evidence attempt rejected")
+	}
+	a.Collect(job)
+	if !m.writeDecisionUnchanged(a.start) {
+		t.Fatal("manager epoch changed during collection")
+	}
+	if !a.HasActiveBroadMutation(nil) {
+		t.Fatal("symlink directory scope failed to overlap resolved snapshot namespace")
+	}
+	a.Close()
+	release()
+
+	unrelated := filepath.Join(root, "other-tree")
+	if err := os.MkdirAll(unrelated, 0700); err != nil {
+		t.Fatal(err)
+	}
+	release, ok = m.beginCacheMutation(unrelated)
+	if !ok {
+		t.Fatal("unrelated mutation scope rejected")
+	}
+	defer release()
+	a, ok = m.beginCacheWriteAttempt()
+	if !ok {
+		t.Fatal("second evidence attempt rejected")
+	}
+	defer a.Close()
+	a.Collect(job)
+	if a.HasActiveBroadMutation(nil) {
+		t.Fatal("unrelated directory scope blocked writer evidence")
+	}
 }
 
 func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
@@ -375,5 +465,22 @@ func TestCollectSnapshotIgnoresTerminalAndKnownPlanButFailsRelevantUnknownClosed
 	a.Collect(relevant)
 	if !a.MayWrite(relevant, []string{filepath.Join(base, "weights.gguf")}) {
 		t.Fatal("relevant outward alias did not fail closed")
+	}
+}
+
+func TestFailedInventoryIsMemoizedPerDescriptor(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	a := testCacheWriteAttempt(m)
+	job := &Job{ID: "unknown", Repo: "owner/repo", OutputDir: root}
+	calls := 0
+	a.inventory = func(string) (writableNamespaceInventory, bool) { calls++; return writableNamespaceInventory{}, false }
+	a.Collect(job)
+	a.Collect(job)
+	if calls != 1 || len(a.failed) != 1 {
+		t.Fatalf("failed inventory rescanned: calls=%d failed=%d", calls, len(a.failed))
+	}
+	if !a.MayWrite(job, []string{filepath.Join(root, "target")}) {
+		t.Fatal("failed descriptor did not remain fail-closed")
 	}
 }
