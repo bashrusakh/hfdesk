@@ -360,9 +360,10 @@ and exact member composition (paths, saved versions, size, and link role) with
 the confirmation. Request paths are not used as deletion authority. Local
 deletion removes only selected GGUF entries. The local symlink-member behavior
 described below is supported on Linux, Windows, and macOS. On other operating
-systems, a selected local symlink member cannot be safely identity-pinned: the
-request returns `409` before unlinking, leaving the selected link and its target
-unchanged. This platform qualification applies to selected local symlink entries;
+systems, the current implementation does not support identity-pinning a selected
+local symlink member, so the request returns `409` before unlinking, leaving the
+selected link and its target unchanged. This platform qualification applies to
+selected local symlink entries;
 it does not change the handling of regular files or imply that other HFDesk
 features are unsupported on those operating systems. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
