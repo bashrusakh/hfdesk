@@ -88,10 +88,15 @@ no root architecture config):
 ```
 
 `method` is the literal `quant_method` from the repository's quantization
-config. `bits` is the model-wide bit width and is only set when the config
-declares uniform precision and was read completely enough to establish it. When
-`mixed_precision` is true, `bits` is `0` and must not be read as model-wide
-precision: `head_bits` is the declared width for head tensors and
+config. `bits` is the declared bit width of the quantized tensors and is only
+set when the config declares uniform precision and was read completely enough
+to establish it. `excluded_modules` lists the modules the config excludes from
+quantization (`modules_to_not_convert`). When `excluded_modules` is non-empty,
+part of the model is not quantized at that width, so `bits` is not a model-wide
+width and consumers must present the excluded modules alongside it. Exclusions
+alone are not mixed precision: `mixed_precision` stays `false` and `bits` stays
+set. When `mixed_precision` is true, `bits` is `0` and must not be read as
+model-wide precision: `head_bits` is the declared width for head tensors and
 `expert_bits_min`/`expert_bits_max` bound the declared per-expert widths
 (`expert_bits` / `routed_expert_bits`).
 

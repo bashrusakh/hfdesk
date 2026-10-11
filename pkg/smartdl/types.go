@@ -392,12 +392,14 @@ type QuantizedInfo struct {
 	// MethodDescription is a human-readable description of the method.
 	MethodDescription string `json:"method_description,omitempty"`
 
-	// Bits is the quantization bit width when the config declares uniform
-	// model-wide precision and was read completely enough to establish it. It
-	// stays 0 when MixedPrecision or ConfigPartial is true: a header bits
-	// field then describes only part of the model or uniformity is not
+	// Bits is the declared bit width of the quantized tensors when the config
+	// declares uniform precision and was read completely enough to establish
+	// it. It stays 0 when MixedPrecision or ConfigPartial is true: a header
+	// bits field then describes only part of the model or uniformity is not
 	// established, and it must not be read as model-wide precision (the
-	// literal value remains in Metadata).
+	// literal value remains in Metadata). When ExcludedModules is non-empty it
+	// is not a model-wide width either: present the excluded modules
+	// alongside it.
 	Bits int `json:"bits"`
 
 	// MixedPrecision indicates the config carries precision evidence that
@@ -443,7 +445,11 @@ type QuantizedInfo struct {
 	// BitsPerWeight is the EXL2 bits per weight.
 	BitsPerWeight float64 `json:"bits_per_weight,omitempty"`
 
-	// ExcludedModules is the list of modules not quantized.
+	// ExcludedModules is the list of modules not quantized
+	// (modules_to_not_convert). When non-empty, part of the model is not
+	// quantized at Bits's width, so Bits is not a model-wide width and these
+	// modules must be presented alongside it. Exclusions alone are not mixed
+	// precision.
 	ExcludedModules []string `json:"excluded_modules,omitempty"`
 
 	// Backends is the list of compatible inference backends.

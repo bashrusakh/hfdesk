@@ -158,6 +158,33 @@ func TestAnalyzeQuantized(t *testing.T) {
 	})
 }
 
+// Contract (docs/API.md): modules excluded from quantization are projected
+// alongside the declared bit width. Exclusions alone are not mixed precision,
+// and "bits" stays the declared width of the quantized tensors — the response
+// must carry the excluded modules with it so consumers can present them.
+func TestAnalyzeQuantizedExcludedModulesKeepDeclaredBits(t *testing.T) {
+	metadata := map[string]interface{}{
+		"quantization_config.json": map[string]interface{}{
+			"quant_method":           "gptq",
+			"bits":                   float64(4),
+			"modules_to_not_convert": []interface{}{"lm_head", "embed_tokens"},
+		},
+	}
+	info := analyzeQuantized(metadata)
+	if info == nil {
+		t.Fatal("analyzeQuantized returned nil")
+	}
+	if info.Bits != 4 {
+		t.Fatalf("declared width dropped for excluded modules: %+v", info)
+	}
+	if info.MixedPrecision || info.ConfigPartial {
+		t.Fatalf("exclusions alone imply mixed/partial precision: %+v", info)
+	}
+	if len(info.ExcludedModules) != 2 || info.ExcludedModules[0] != "lm_head" || info.ExcludedModules[1] != "embed_tokens" {
+		t.Fatalf("excluded modules not projected alongside bits: %+v", info)
+	}
+}
+
 func TestDetectBackends(t *testing.T) {
 	tests := []struct {
 		name      string

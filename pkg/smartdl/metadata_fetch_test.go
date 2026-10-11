@@ -360,6 +360,33 @@ func TestAnalyzeQuantOnlyLFSRepo(t *testing.T) {
 	}
 }
 
+// The excluded-modules contract also holds for a quantization-only root
+// repository (issue #123): the declared width is projected and the excluded
+// modules are carried alongside it, without mixed-precision semantics.
+func TestAnalyzeQuantOnlyExcludedModulesKeepDeclaredBits(t *testing.T) {
+	body := `{"quant_method":"gptq","bits":4,"modules_to_not_convert":["lm_head","embed_tokens"]}`
+	info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+		map[string]bool{"quantization_config.json": true},
+		map[string]string{"quantization_config.json": lfsPointerBody},
+		map[string]string{"quantization_config.json": body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Type != TypeGeneric {
+		t.Fatalf("type = %s, want %s", info.Type, TypeGeneric)
+	}
+	q := info.Quantized
+	if q == nil || q.Bits != 4 {
+		t.Fatalf("declared width dropped for excluded modules: %+v", info.Quantized)
+	}
+	if q.MixedPrecision {
+		t.Fatalf("exclusions alone imply mixed precision: %+v", q)
+	}
+	if len(q.ExcludedModules) != 2 || q.ExcludedModules[0] != "lm_head" || q.ExcludedModules[1] != "embed_tokens" {
+		t.Fatalf("excluded modules not projected alongside bits: %+v", q)
+	}
+}
+
 // Oversized pinned config: the bounded head keeps the completed leading
 // fields (including expert_bits) without reading the whole config.
 func TestAnalyzeQuantOnlyOversizedConfig(t *testing.T) {
