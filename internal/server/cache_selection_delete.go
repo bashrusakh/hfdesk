@@ -417,13 +417,47 @@ type writableNamespaceBase struct {
 }
 
 func jobMayWriteSelectedPath(job *Job, target string) bool {
+	return jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace)
+}
+
+// selectedWriteEvidence is an immutable reservation-attempt snapshot. Its
+// namespace inventories are built before evaluation; evaluation only consumes
+// these values and never consults the filesystem or mutable Job slices.
+type selectedWriteEvidence struct {
+	inventories []writableNamespaceInventory
+	filters     []string
+	excludes    []string
+	exactMatch  bool
+	aliases     bool
+}
+
+// jobMayWriteSelectedPaths builds each job namespace inventory once and reuses
+// it for all targets in this single reservation/admission check. inventory is
+// an injected seam so tests can assert the work scales with jobs, not targets.
+func jobMayWriteSelectedPaths(job *Job, targets []string, inventory func(string) (writableNamespaceInventory, bool)) bool {
+	evidence, ok := buildSelectedWriteEvidence(job, inventory)
+	if !ok {
+		return true
+	}
 	base := jobDestinationBase(job)
 	if base == "" {
 		return false
 	}
-	targetIdentity, targetErr := mutationEntryIdentity(target)
-	if targetErr != nil {
-		return true
+	targetIdentities := make([]string, len(targets))
+	for i, target := range targets {
+		targetIdentity, targetErr := mutationEntryIdentity(target)
+		if targetErr != nil {
+			return true
+		}
+		targetIdentities[i] = targetIdentity
+	}
+	return selectedWriteEvidenceMayWrite(evidence, targetIdentities)
+}
+
+func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamespaceInventory, bool)) (selectedWriteEvidence, bool) {
+	base := jobDestinationBase(job)
+	if base == "" {
+		return selectedWriteEvidence{}, true
 	}
 	bases := []writableNamespaceBase{{path: base}}
 	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && snapshotBase != base {
@@ -432,31 +466,51 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 	// A negative pre-plan answer requires a complete physical-to-repo mapping
 	// proof for every writable namespace of the job. Any unknown or outward
 	// mapping short-circuits to the conservative possible-writer answer.
-	inventories := make([]writableNamespaceInventory, 0, len(bases))
-	aliasesFound := false
+	evidence := selectedWriteEvidence{
+		inventories: make([]writableNamespaceInventory, 0, len(bases)),
+		filters:     append([]string(nil), job.Filters...),
+		excludes:    append([]string(nil), job.Excludes...),
+		exactMatch:  job.ExactMatch,
+	}
 	for _, writable := range bases {
-		inv, ok := inventoryWritableNamespace(writable.path)
+		inv, ok := inventory(writable.path)
 		if !ok {
-			return true
+			return selectedWriteEvidence{}, false
 		}
 		inv.snapshotNamespace = writable.snapshot
 		if len(inv.aliases) > 0 {
-			aliasesFound = true
+			evidence.aliases = true
 		}
-		inventories = append(inventories, inv)
+		evidence.inventories = append(evidence.inventories, inv)
 	}
-	for _, inv := range inventories {
-		if jobMayWriteSelectedPathWithinBase(inv, targetIdentity, job) {
+	return evidence, true
+}
+
+func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentities []string) bool {
+	for _, targetIdentity := range targetIdentities {
+		targetReachedNamespace := false
+		for _, inv := range evidence.inventories {
+			candidates, ok := inv.selectedPathCandidates(targetIdentity)
+			if !ok {
+				return true
+			}
+			if len(candidates) > 0 {
+				targetReachedNamespace = true
+				for _, candidate := range candidates {
+					if hfdownloader.GGUFPathSelected(candidate, evidence.filters, evidence.excludes, evidence.exactMatch) {
+						return true
+					}
+				}
+			}
+		}
+		// Keep the conservative path-filter residual only for targets actually
+		// reachable through a completely inventoried namespace. An unrelated
+		// repository outside every writable namespace cannot be selected by an
+		// internal alias there. Unknown/outward mappings returned above remain
+		// fail-closed before this narrowing is considered.
+		if evidence.aliases && targetReachedNamespace && hasPathFilter(evidence.filters) {
 			return true
 		}
-	}
-	// Exact path-shaped filters name one exact repository path. While the
-	// writable namespaces contain directory aliases, a canonical containment
-	// miss does not prove that this exact spelling resolves elsewhere, so the
-	// reservation stays conservative instead of deriving a negative from the
-	// filter shape alone.
-	if aliasesFound && hasPathFilter(job.Filters) {
-		return true
 	}
 	return false
 }
@@ -583,22 +637,18 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 			}
 			continue
 		}
-		for _, target := range clean {
-			if jobMayWriteSelectedPath(activity.job, target) {
-				m.mu.Unlock()
-				return nil, false
-			}
+		if jobMayWriteSelectedPaths(activity.job, clean, inventoryWritableNamespace) {
+			m.mu.Unlock()
+			return nil, false
 		}
 	}
 	for _, job := range m.jobs {
 		if job.Status != JobStatusQueued && !job.starting {
 			continue
 		}
-		for _, target := range clean {
-			if jobMayWriteSelectedPath(job, target) {
-				m.mu.Unlock()
-				return nil, false
-			}
+		if jobMayWriteSelectedPaths(job, clean, inventoryWritableNamespace) {
+			m.mu.Unlock()
+			return nil, false
 		}
 	}
 	if m.deleteReservations == nil {
@@ -842,10 +892,8 @@ func (m *JobManager) jobBlockedByDeleteLocked(job *Job) bool {
 		}
 	}
 	for _, targets := range m.deleteReservations {
-		for _, target := range targets {
-			if jobMayWriteSelectedPath(job, target) {
-				return true
-			}
+		if jobMayWriteSelectedPaths(job, targets, inventoryWritableNamespace) {
+			return true
 		}
 	}
 	return false
