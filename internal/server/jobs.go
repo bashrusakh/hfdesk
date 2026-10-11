@@ -168,11 +168,13 @@ type JobManager struct {
 	runWG sync.WaitGroup
 	// runActivities outlive visible job state and retain each run's immutable
 	// destination/plan until its downloader call has actually returned.
-	runActivities      map[uint64]*jobWriteActivity
-	deleteReservations map[uint64][]frozenMutationPath
-	hfRepoReservations map[uint64][]frozenMutationPath
-	mutationScopes     map[uint64][]frozenMutationPath
-	nextWriteID        uint64
+	runActivities        map[uint64]*jobWriteActivity
+	deleteReservations   map[uint64][]frozenMutationPath
+	hfRepoReservations   map[uint64][]frozenMutationPath
+	mutationScopes       map[uint64][]frozenMutationPath
+	nextWriteID          uint64
+	writeDecisionEpoch   uint64
+	writeDecisionChanged chan struct{}
 }
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
@@ -193,19 +195,20 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	cfg = cfg.captureCacheEnvironment()
 	m := &JobManager{
-		saveMu:             &sync.Mutex{},
-		jobs:               make(map[string]*Job),
-		runActivities:      make(map[uint64]*jobWriteActivity),
-		deleteReservations: make(map[uint64][]frozenMutationPath),
-		hfRepoReservations: make(map[uint64][]frozenMutationPath),
-		mutationScopes:     make(map[uint64][]frozenMutationPath),
-		config:             cfg,
-		statePath:          statePath,
-		persistStateFile:   saveJobsState,
-		loadStateFile:      loadJobsState,
-		closeDone:          make(chan struct{}),
-		wsHub:              wsHub,
-		speedLimiter:       hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+		saveMu:               &sync.Mutex{},
+		jobs:                 make(map[string]*Job),
+		runActivities:        make(map[uint64]*jobWriteActivity),
+		deleteReservations:   make(map[uint64][]frozenMutationPath),
+		hfRepoReservations:   make(map[uint64][]frozenMutationPath),
+		mutationScopes:       make(map[uint64][]frozenMutationPath),
+		writeDecisionChanged: make(chan struct{}),
+		config:               cfg,
+		statePath:            statePath,
+		persistStateFile:     saveJobsState,
+		loadStateFile:        loadJobsState,
+		closeDone:            make(chan struct{}),
+		wsHub:                wsHub,
+		speedLimiter:         hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -308,6 +311,7 @@ func (m *JobManager) Close(ctx context.Context) error {
 		m.mu.Lock()
 		m.fenced = true
 		m.stopping = true
+		m.signalWriteDecisionLocked()
 		var cancels []context.CancelFunc
 		var snapshots []*Job
 		for _, job := range m.jobs {
@@ -1314,6 +1318,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		if activityID != 0 {
 			m.mu.Lock()
 			delete(m.runActivities, activityID)
+			m.signalWriteDecisionLocked()
 			m.mu.Unlock()
 		}
 		m.runWG.Done()
@@ -1448,6 +1453,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 			activity.planned = planned
 			activity.planKnown = true
 			activity.planComplete = complete
+			m.signalWriteDecisionLocked()
 		}
 		m.mu.Unlock()
 	}
@@ -1550,6 +1556,8 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		settings.CacheDir = ""
 		settings.HubDir = ""
 	}
+	endObservedMutation := m.beginObservedMutation(dsts)
+	defer endObservedMutation()
 	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
 		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, err)
 	}
