@@ -1862,6 +1862,153 @@ func TestSelectedLocalDeletePinsUnreadableRegularFileWithHardLink(t *testing.T) 
 	}
 }
 
+func TestSelectedLocalDeletePlacesHardLinkPinUnderWritableSourceParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(repoDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(repoDir, 0755); err != nil {
+			t.Errorf("restore repo permissions for temporary fixture cleanup: %v", err)
+		}
+	})
+	if err := os.Chmod(sourceParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("source-parent hard-link pin delete status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected nested file remains: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, sourceParent)
+	assertNoTemporaryPinContainer(t, repoDir)
+}
+
+func TestSelectedLocalDeleteUsesKnownRepoRootOnlyAfterSourceParentPinDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hard-link pin fallback fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	var destinations []string
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, destination string) error {
+		destinations = append(destinations, destination)
+		if len(destinations) == 1 {
+			return os.ErrPermission
+		}
+		return nil
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("repo-root fallback status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if len(destinations) != 2 {
+		t.Fatalf("pin attempts=%v, want source-parent attempt then one repo-root fallback", destinations)
+	}
+	sourcePinDir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(destinations[0])))
+	rootPinDir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(destinations[1])))
+	if !strings.HasPrefix(sourcePinDir, "nested/.hfdesk-delete-pin-") || !strings.HasPrefix(rootPinDir, ".hfdesk-delete-pin-") {
+		t.Fatalf("pin did not prefer source parent before repo-root fallback: %v", destinations)
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected entry remains after approved repo-root fallback: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+	assertNoTemporaryPinContainer(t, sourceParent)
+}
+
+func TestSelectedLocalDeleteCleansSourceParentPinThroughRetainedHandle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin binding fixture is Unix-specific")
+	}
+	root, foreign := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	movedParent := sourceParent + ".moved"
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	foreignMarker := filepath.Join(foreign, "keep.txt")
+	if err := os.WriteFile(foreignMarker, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.beforeHardLinkPin = func(source, _ string) error {
+		if source != filepath.ToSlash(filepath.Join("nested", name)) {
+			return nil
+		}
+		if err := os.Rename(sourceParent, movedParent); err != nil {
+			return err
+		}
+		return os.Symlink(foreign, sourceParent)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, filepath.ToSlash(filepath.Join("nested", name)))
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "parent") {
+		t.Fatalf("source-parent retarget status=%d body=%s, want diagnostic 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(movedParent, name)); err != nil {
+		t.Fatalf("retarget removed selected entry from the held parent: %v", err)
+	}
+	if data, err := os.ReadFile(foreignMarker); err != nil || string(data) != "keep" {
+		t.Fatalf("foreign parent target changed during cleanup: data=%q err=%v", data, err)
+	}
+	assertNoTemporaryPinContainer(t, movedParent)
+}
+
 func TestSelectedLocalDeleteHardLinkPinDetectsSameSizeReplacementBeforeFirstEffect(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
@@ -1926,11 +2073,12 @@ func TestSelectedLocalDeleteHardLinkPinReportsLaterReplacementTruthfully(t *test
 	}
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
+	sourceDir := filepath.Join(repoDir, "nested")
 	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
-	writeSelectionFile(t, repoDir, first)
-	writeSelectionFile(t, repoDir, second)
-	secondPath := filepath.Join(repoDir, second)
-	if err := os.Chmod(filepath.Join(repoDir, first), 0000); err != nil {
+	writeSelectionFile(t, sourceDir, first)
+	writeSelectionFile(t, sourceDir, second)
+	firstPath, secondPath := filepath.Join(sourceDir, first), filepath.Join(sourceDir, second)
+	if err := os.Chmod(firstPath, 0000); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(secondPath, 0000); err != nil {
@@ -1942,6 +2090,17 @@ func TestSelectedLocalDeleteHardLinkPinReportsLaterReplacementTruthfully(t *test
 	} else if !os.IsPermission(err) {
 		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
 	}
+	if err := os.Chmod(repoDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(repoDir, 0755); err != nil {
+			t.Errorf("restore repo permissions for temporary fixture cleanup: %v", err)
+		}
+	})
+	if err := os.Chmod(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	originalInfo, err := os.Lstat(secondPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1949,7 +2108,7 @@ func TestSelectedLocalDeleteHardLinkPinReportsLaterReplacementTruthfully(t *test
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
 	registerJobManagerCleanup(t, s)
 	s.selectedDeleteHooks.forceHardLinkPin = true
-	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+first)
 	s.selectedDeleteHooks.beforeRemove = func(i int) {
 		if i != 1 {
 			return
@@ -1976,13 +2135,13 @@ func TestSelectedLocalDeleteHardLinkPinReportsLaterReplacementTruthfully(t *test
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Removed) != 1 || result.Removed[0] != first || len(result.Remaining) != 1 || result.Remaining[0] != second {
+	if len(result.Removed) != 1 || result.Removed[0] != "nested/"+first || len(result.Remaining) != 1 || result.Remaining[0] != "nested/"+second {
 		t.Fatalf("partial response does not match actual effects: %+v", result)
 	}
 	if data, err := os.ReadFile(secondPath); err != nil || string(data) != "new!" {
 		t.Fatalf("later replacement was removed or altered: data=%q err=%v", data, err)
 	}
-	assertNoTemporaryPinContainer(t, repoDir)
+	assertNoTemporaryPinContainer(t, sourceDir)
 }
 
 func TestSelectedLocalDeleteHardLinkPinSetupFailureRefusesAndCleans(t *testing.T) {

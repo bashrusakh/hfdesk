@@ -765,8 +765,26 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 // repository root. The normal cache-selection scanner remains unchanged.
 type selectedHardLinkPin struct {
 	name    string
+	path    string
 	info    os.FileInfo
 	created bool
+}
+
+type hardLinkParentComponent struct {
+	name string
+	info os.FileInfo
+}
+
+type selectedHardLinkContainer struct {
+	parent           string
+	parentRoot       *os.Root
+	parentInfo       os.FileInfo
+	parentComponents []hardLinkParentComponent
+	name             string
+	info             os.FileInfo
+	root             *os.Root
+	created          bool
+	pins             []*selectedHardLinkPin
 }
 
 // selectedEntryPinSet owns every request-local identity resource from the
@@ -778,13 +796,19 @@ type selectedEntryPinSet struct {
 	removeHardLink    func(*os.Root, string) error
 	closeHardLinkRoot func(*os.Root) error
 	handles           []*os.File
-	hardLinks         []*selectedHardLinkPin
-	containerName     string
-	containerInfo     os.FileInfo
-	containerRoot     *os.Root
-	containerCreated  bool
+	containers        map[string]*selectedHardLinkContainer
+	containerOrder    []*selectedHardLinkContainer
+	extraRoots        []*os.Root
 	cleaned           bool
 }
+
+type hardLinkPinLocationUnavailable struct {
+	err error
+}
+
+func (e *hardLinkPinLocationUnavailable) Error() string { return e.err.Error() }
+
+func (e *hardLinkPinLocationUnavailable) Unwrap() error { return e.err }
 
 func newSelectedEntryPinSet(root *os.Root, hooks selectedDeleteHooks) *selectedEntryPinSet {
 	return &selectedEntryPinSet{
@@ -793,116 +817,256 @@ func newSelectedEntryPinSet(root *os.Root, hooks selectedDeleteHooks) *selectedE
 		beforeHardLink:    hooks.beforeHardLinkPin,
 		removeHardLink:    hooks.removeHardLinkPin,
 		closeHardLinkRoot: hooks.closeHardLinkRoot,
+		containers:        make(map[string]*selectedHardLinkContainer),
 	}
 }
 
-func (p *selectedEntryPinSet) ensureHardLinkContainer() error {
-	if p.containerCreated {
-		if p.containerRoot == nil {
-			return fmt.Errorf("temporary identity-pin container %q is unavailable", p.containerName)
+func (p *selectedEntryPinSet) hardLinkParent(parent string) (*selectedHardLinkContainer, error) {
+	parent = filepath.ToSlash(filepath.Clean(filepath.FromSlash(parent)))
+	if existing := p.containers[parent]; existing != nil {
+		return existing, nil
+	}
+	container := &selectedHardLinkContainer{parent: parent}
+	if parent == "." {
+		container.parentRoot = p.root
+		info, err := p.root.Stat(".")
+		if err != nil {
+			return nil, fmt.Errorf("stat selected-entry parent: %w", err)
 		}
-		return nil
+		container.parentInfo = info
+		p.containers[parent] = container
+		p.containerOrder = append(p.containerOrder, container)
+		return container, nil
+	}
+	clean := filepath.FromSlash(parent)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("selected-entry parent is outside the admitted repository")
+	}
+	current := p.root
+	var prefix string
+	for _, component := range strings.Split(clean, string(filepath.Separator)) {
+		before, err := current.Lstat(component)
+		if err != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("selected-entry parent has an unsafe component")
+		}
+		next, err := current.OpenRoot(component)
+		if err != nil {
+			return nil, fmt.Errorf("open selected-entry parent component %q: %w", component, err)
+		}
+		// Own each opened parent immediately, including a later component failure.
+		p.extraRoots = append(p.extraRoots, next)
+		opened, openedErr := next.Stat(".")
+		after, afterErr := current.Lstat(component)
+		if openedErr != nil || afterErr != nil || after.Mode()&os.ModeSymlink != 0 || !os.SameFile(before, opened) || !os.SameFile(opened, after) {
+			if openedErr != nil {
+				return nil, fmt.Errorf("verify selected-entry parent component %q: %w", component, openedErr)
+			}
+			if afterErr != nil {
+				return nil, fmt.Errorf("recheck selected-entry parent component %q: %w", component, afterErr)
+			}
+			return nil, fmt.Errorf("selected-entry parent component %q changed while opening", component)
+		}
+		prefix = filepath.Join(prefix, component)
+		container.parentComponents = append(container.parentComponents, hardLinkParentComponent{name: filepath.ToSlash(prefix), info: after})
+		current = next
+	}
+	container.parentRoot = current
+	parentInfo, err := current.Stat(".")
+	if err != nil {
+		return nil, fmt.Errorf("stat selected-entry parent %q: %w", parent, err)
+	}
+	container.parentInfo = parentInfo
+	p.containers[parent] = container
+	p.containerOrder = append(p.containerOrder, container)
+	return container, nil
+}
+
+func (p *selectedEntryPinSet) verifyHardLinkParentBinding(container *selectedHardLinkContainer) error {
+	if container.parentRoot == nil || container.parentInfo == nil {
+		return fmt.Errorf("selected-entry parent %q has no verified binding", container.parent)
+	}
+	for _, component := range container.parentComponents {
+		current, err := p.root.Lstat(filepath.FromSlash(component.name))
+		if err != nil {
+			return fmt.Errorf("verify selected-entry parent %q: %w", component.name, err)
+		}
+		if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(component.info, current) {
+			return fmt.Errorf("selected-entry parent %q binding changed", component.name)
+		}
+	}
+	opened, err := container.parentRoot.Stat(".")
+	if err != nil {
+		return fmt.Errorf("verify opened selected-entry parent %q: %w", container.parent, err)
+	}
+	if !os.SameFile(container.parentInfo, opened) {
+		return fmt.Errorf("opened selected-entry parent %q binding changed", container.parent)
+	}
+	return nil
+}
+
+func (p *selectedEntryPinSet) ensureHardLinkContainer(parent string) (*selectedHardLinkContainer, error) {
+	container, err := p.hardLinkParent(parent)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.verifyHardLinkParentBinding(container); err != nil {
+		return nil, err
+	}
+	if container.created {
+		if container.root == nil {
+			return nil, fmt.Errorf("temporary identity-pin container %q is unavailable", container.name)
+		}
+		return container, nil
 	}
 	for attempt := 0; attempt < 8; attempt++ {
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
-			return fmt.Errorf("create temporary identity-pin name: %w", err)
+			return nil, fmt.Errorf("create temporary identity-pin name: %w", err)
 		}
 		name := ".hfdesk-delete-pin-" + hex.EncodeToString(random)
-		if err := p.root.Mkdir(name, 0700); err != nil {
+		if err := container.parentRoot.Mkdir(name, 0700); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				continue
 			}
-			return fmt.Errorf("create temporary identity-pin container %q: %w", name, err)
+			if os.IsPermission(err) {
+				return nil, &hardLinkPinLocationUnavailable{err: fmt.Errorf("create temporary identity-pin container %q under %q: %w", name, parent, err)}
+			}
+			return nil, fmt.Errorf("create temporary identity-pin container %q under %q: %w", name, parent, err)
 		}
 		// Record ownership immediately after the exclusive mkdir succeeds.
-		p.containerName = name
-		p.containerCreated = true
-		info, err := p.root.Lstat(name)
+		container.name = name
+		container.created = true
+		info, err := container.parentRoot.Lstat(name)
 		if err != nil {
-			return fmt.Errorf("capture temporary identity-pin container %q: %w", name, err)
+			return nil, fmt.Errorf("capture temporary identity-pin container %q: %w", name, err)
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("temporary identity-pin container %q changed during creation", name)
+			return nil, fmt.Errorf("temporary identity-pin container %q changed during creation", name)
 		}
 		if info.Mode().Perm()&0077 != 0 {
-			return fmt.Errorf("temporary identity-pin container %q is not private", name)
+			return nil, fmt.Errorf("temporary identity-pin container %q is not private", name)
 		}
-		p.containerInfo = info
-		containerRoot, err := p.root.OpenRoot(name)
+		container.info = info
+		containerRoot, err := container.parentRoot.OpenRoot(name)
 		if err != nil {
-			return fmt.Errorf("open temporary identity-pin container %q: %w", name, err)
+			return nil, fmt.Errorf("open temporary identity-pin container %q: %w", name, err)
 		}
+		container.root = containerRoot
 		opened, statErr := containerRoot.Stat(".")
 		if statErr != nil || !os.SameFile(info, opened) {
-			_ = containerRoot.Close()
 			if statErr != nil {
-				return fmt.Errorf("verify temporary identity-pin container %q: %w", name, statErr)
+				return nil, fmt.Errorf("verify temporary identity-pin container %q: %w", name, statErr)
 			}
-			return fmt.Errorf("temporary identity-pin container %q changed while opening", name)
+			return nil, fmt.Errorf("temporary identity-pin container %q changed while opening", name)
 		}
-		p.containerRoot = containerRoot
-		return nil
+		if err := verifyHardLinkContainerBinding(container); err != nil {
+			return nil, err
+		}
+		if err := p.verifyHardLinkParentBinding(container); err != nil {
+			return nil, err
+		}
+		return container, nil
 	}
-	return fmt.Errorf("could not allocate an exclusive temporary identity-pin container")
+	return nil, fmt.Errorf("could not allocate an exclusive temporary identity-pin container under %q", parent)
 }
 
-func (p *selectedEntryPinSet) verifyHardLinkContainerBinding() error {
-	if p.containerRoot == nil || p.containerInfo == nil {
-		return fmt.Errorf("temporary identity-pin container %q has no verified binding", p.containerName)
+func verifyHardLinkContainerBinding(container *selectedHardLinkContainer) error {
+	if container.root == nil || container.info == nil {
+		return fmt.Errorf("temporary identity-pin container %q has no verified binding", container.name)
 	}
-	current, err := p.root.Lstat(p.containerName)
+	current, err := container.parentRoot.Lstat(container.name)
 	if err != nil {
-		return fmt.Errorf("verify temporary identity-pin container %q: %w", p.containerName, err)
+		return fmt.Errorf("verify temporary identity-pin container %q: %w", container.name, err)
 	}
-	if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(p.containerInfo, current) {
-		return fmt.Errorf("temporary identity-pin container %q binding changed", p.containerName)
+	if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(container.info, current) {
+		return fmt.Errorf("temporary identity-pin container %q binding changed", container.name)
 	}
-	opened, err := p.containerRoot.Stat(".")
-	if err != nil || !os.SameFile(p.containerInfo, opened) {
+	opened, err := container.root.Stat(".")
+	if err != nil || !os.SameFile(container.info, opened) {
 		if err != nil {
-			return fmt.Errorf("verify opened temporary identity-pin container %q: %w", p.containerName, err)
+			return fmt.Errorf("verify opened temporary identity-pin container %q: %w", container.name, err)
 		}
-		return fmt.Errorf("opened temporary identity-pin container %q binding changed", p.containerName)
+		return fmt.Errorf("opened temporary identity-pin container %q binding changed", container.name)
 	}
 	return nil
 }
 
 func (p *selectedEntryPinSet) pinByHardLink(name string) (*selectedEntryIdentity, error) {
-	if err := p.ensureHardLinkContainer(); err != nil {
+	parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(name)))
+	identity, err := p.pinByHardLinkAt(name, parent)
+	if err == nil || parent == "." {
+		return identity, err
+	}
+	var unavailable *hardLinkPinLocationUnavailable
+	if !errors.As(err, &unavailable) {
 		return nil, err
 	}
-	if err := p.verifyHardLinkContainerBinding(); err != nil {
+	fallback, fallbackErr := p.pinByHardLinkAt(name, ".")
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("source-parent identity pin failed: %v; repository-root fallback failed: %w", err, fallbackErr)
+	}
+	return fallback, nil
+}
+
+func (p *selectedEntryPinSet) pinByHardLinkAt(name, parent string) (*selectedEntryIdentity, error) {
+	container, err := p.ensureHardLinkContainer(parent)
+	if err != nil {
 		return nil, err
 	}
-	pinName := fmt.Sprintf("entry-%08d.pin", len(p.hardLinks))
-	destination := filepath.ToSlash(filepath.Join(p.containerName, pinName))
+	if err := verifyHardLinkContainerBinding(container); err != nil {
+		return nil, err
+	}
+	if err := p.verifyHardLinkParentBinding(container); err != nil {
+		return nil, err
+	}
+	pinName := fmt.Sprintf("entry-%08d.pin", len(container.pins))
+	destination := filepath.ToSlash(filepath.Join(parent, container.name, pinName))
 	if p.beforeHardLink != nil {
 		if err := p.beforeHardLink(name, destination); err != nil {
+			if os.IsPermission(err) {
+				return nil, &hardLinkPinLocationUnavailable{err: fmt.Errorf("create temporary identity pin %q: %w", destination, err)}
+			}
 			return nil, fmt.Errorf("create temporary identity pin %q: %w", destination, err)
 		}
 	}
-	if err := p.verifyHardLinkContainerBinding(); err != nil {
+	if err := verifyHardLinkContainerBinding(container); err != nil {
 		return nil, err
 	}
-	if err := p.root.Link(filepath.FromSlash(name), filepath.FromSlash(destination)); err != nil {
+	if err := p.verifyHardLinkParentBinding(container); err != nil {
+		return nil, err
+	}
+	parentName := filepath.FromSlash(name)
+	if parent != "." {
+		parentName, err = filepath.Rel(filepath.FromSlash(parent), parentName)
+		if err != nil || parentName == ".." || filepath.IsAbs(parentName) || strings.HasPrefix(parentName, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("selected entry is outside its hard-link pin parent")
+		}
+	}
+	containerDestination := filepath.Join(container.name, pinName)
+	if err := container.parentRoot.Link(parentName, containerDestination); err != nil {
+		if os.IsPermission(err) {
+			return nil, &hardLinkPinLocationUnavailable{err: fmt.Errorf("create temporary identity pin %q: %w", destination, err)}
+		}
 		return nil, fmt.Errorf("create temporary identity pin %q: %w", destination, err)
 	}
-	record := &selectedHardLinkPin{name: pinName, created: true}
+	record := &selectedHardLinkPin{name: pinName, path: destination, created: true}
 	// Link success creates a resource immediately; register it before any stat.
-	p.hardLinks = append(p.hardLinks, record)
-	info, err := p.containerRoot.Lstat(pinName)
+	container.pins = append(container.pins, record)
+	info, err := container.root.Lstat(pinName)
 	if err != nil {
 		return nil, fmt.Errorf("capture temporary identity pin %q: %w", destination, err)
 	}
 	record.info = info
-	if err := p.verifyHardLinkContainerBinding(); err != nil {
+	if err := verifyHardLinkContainerBinding(container); err != nil {
+		return nil, err
+	}
+	if err := p.verifyHardLinkParentBinding(container); err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("temporary identity pin %q is not a regular file", destination)
 	}
-	sourceInfo, err := p.root.Lstat(filepath.FromSlash(name))
+	sourceInfo, err := container.parentRoot.Lstat(parentName)
 	if err != nil {
 		return nil, fmt.Errorf("verify selected source for temporary identity pin %q: %w", destination, err)
 	}
@@ -956,58 +1120,75 @@ func (p *selectedEntryPinSet) cleanup() []string {
 			failures = append(failures, "close selected-entry identity handle: "+err.Error())
 		}
 	}
-	for _, pin := range p.hardLinks {
-		if !pin.created {
+	for _, container := range p.containerOrder {
+		parentBindingErr := p.verifyHardLinkParentBinding(container)
+		if parentBindingErr != nil {
+			failures = append(failures, fmt.Sprintf("selected-entry parent %q name binding changed during cleanup; retained parent handle remains anchored: %v", container.parent, parentBindingErr))
+		}
+		for _, pin := range container.pins {
+			if !pin.created {
+				continue
+			}
+			artifact := pin.path
+			if container.root == nil || pin.info == nil {
+				failures = append(failures, fmt.Sprintf("could not verify temporary identity pin %q; possible artifact remains", artifact))
+				continue
+			}
+			current, err := container.root.Lstat(pin.name)
+			if os.IsNotExist(err) {
+				failures = append(failures, fmt.Sprintf("temporary identity pin %q binding disappeared; possible renamed artifact remains", artifact))
+				continue
+			}
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("inspect temporary identity pin %q: %v", artifact, err))
+				continue
+			}
+			if !os.SameFile(pin.info, current) {
+				failures = append(failures, fmt.Sprintf("temporary identity pin %q binding changed; possible artifact remains", artifact))
+				continue
+			}
+			remove := container.root.Remove
+			if p.removeHardLink != nil {
+				remove = func(name string) error { return p.removeHardLink(container.root, name) }
+			}
+			if err := remove(pin.name); err != nil {
+				failures = append(failures, fmt.Sprintf("remove temporary identity pin %q (possible artifact remains): %v", artifact, err))
+			}
+		}
+		if container.root != nil {
+			closeRoot := container.root.Close
+			if p.closeHardLinkRoot != nil {
+				closeRoot = func() error { return p.closeHardLinkRoot(container.root) }
+			}
+			if err := closeRoot(); err != nil {
+				failures = append(failures, fmt.Sprintf("close temporary identity-pin container %q: %v", container.name, err))
+			}
+			container.root = nil
+		}
+		if !container.created {
 			continue
 		}
-		artifact := filepath.ToSlash(filepath.Join(p.containerName, pin.name))
-		if p.containerRoot == nil || pin.info == nil {
-			failures = append(failures, fmt.Sprintf("could not verify temporary identity pin %q; possible artifact remains", artifact))
+		if container.info == nil {
+			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q could not be safely identified; possible artifact remains", filepath.ToSlash(filepath.Join(container.parent, container.name))))
 			continue
 		}
-		current, err := p.containerRoot.Lstat(pin.name)
-		if os.IsNotExist(err) {
-			failures = append(failures, fmt.Sprintf("temporary identity pin %q binding disappeared; possible renamed artifact remains", artifact))
+		current, err := container.parentRoot.Lstat(container.name)
+		if os.IsNotExist(err) || err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(container.info, current) {
+			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q binding changed; possible artifact remains", filepath.ToSlash(filepath.Join(container.parent, container.name))))
 			continue
 		}
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("inspect temporary identity pin %q: %v", artifact, err))
-			continue
+		if err := container.parentRoot.Remove(container.name); err != nil {
+			failures = append(failures, fmt.Sprintf("remove temporary identity-pin container %q (possible artifact remains): %v", filepath.ToSlash(filepath.Join(container.parent, container.name)), err))
 		}
-		if !os.SameFile(pin.info, current) {
-			failures = append(failures, fmt.Sprintf("temporary identity pin %q binding changed; possible artifact remains", artifact))
-			continue
-		}
-		remove := p.containerRoot.Remove
-		if p.removeHardLink != nil {
-			remove = func(name string) error { return p.removeHardLink(p.containerRoot, name) }
-		}
-		if err := remove(pin.name); err != nil {
-			failures = append(failures, fmt.Sprintf("remove temporary identity pin %q (possible artifact remains): %v", artifact, err))
+		if parentBindingErr == nil {
+			if err := p.verifyHardLinkParentBinding(container); err != nil {
+				failures = append(failures, fmt.Sprintf("selected-entry parent %q name binding changed during cleanup; operations stayed on the retained parent handle: %v", container.parent, err))
+			}
 		}
 	}
-	if p.containerRoot != nil {
-		closeRoot := p.containerRoot.Close
-		if p.closeHardLinkRoot != nil {
-			closeRoot = func() error { return p.closeHardLinkRoot(p.containerRoot) }
-		}
-		if err := closeRoot(); err != nil {
-			failures = append(failures, fmt.Sprintf("close temporary identity-pin container %q: %v", p.containerName, err))
-		}
-		p.containerRoot = nil
-	}
-	if p.containerCreated {
-		if p.containerInfo == nil {
-			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q could not be safely identified; possible artifact remains", p.containerName))
-			return failures
-		}
-		current, err := p.root.Lstat(p.containerName)
-		if os.IsNotExist(err) || err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(p.containerInfo, current) {
-			failures = append(failures, fmt.Sprintf("temporary identity-pin container %q binding changed; possible artifact remains", p.containerName))
-			return failures
-		}
-		if err := p.root.Remove(p.containerName); err != nil {
-			failures = append(failures, fmt.Sprintf("remove temporary identity-pin container %q (possible artifact remains): %v", p.containerName, err))
+	for i := len(p.extraRoots) - 1; i >= 0; i-- {
+		if err := p.extraRoots[i].Close(); err != nil {
+			failures = append(failures, fmt.Sprintf("close selected-entry parent handle: %v", err))
 		}
 	}
 	return failures
