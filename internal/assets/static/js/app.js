@@ -792,7 +792,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       } else if (q.bits) {
         precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
       } else {
-        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unknown</div></div>`;
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unknown</div></div>`
+          + widthRows
+          + (q.bits_per_weight ? `<div class="analysis-stat"><div class="analysis-stat-label">Bits per Weight</div><div class="analysis-stat-value">${q.bits_per_weight}</div></div>` : '');
       }
       // Modules the config excludes from quantization (modules_to_not_convert)
       // are an exception to the declared width above, not mixed precision.
