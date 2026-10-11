@@ -57,7 +57,7 @@ jobs:
       - name: Smoke-test entrypoint
         run: sh docker/smoke-test.sh hfdesk:ci
 
-  # Exercise the native state-file replacement path added here. The full suite
+  # Exercise native state-file replacement and selected-cache path locality. The full suite
   # has separate pre-existing Windows-compatibility gaps.
   go-windows:
     name: Go checks (Windows)
@@ -81,3 +81,6 @@ jobs:
 
       - name: Test native state replacement
         run: go test ./internal/server -run 'Test(WindowsReplaceJobsStateFileUsesNativeReplacement|ReplaceJobsStateFile)' -v
+
+      - name: Test selected-cache path locality
+        run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
