@@ -628,6 +628,15 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		}
 	}
 	result.Attempted = true
+	// Record the confirmed deletion in the download manifest before any
+	// unlink. Rebuild/repair treats the manifest as its path -> blob mapping,
+	// so without this tombstone a retained payload (shared snapshot entry,
+	// retained alias, or a blob whose unlink failed) would let the next
+	// Sync/rebuild recreate intentionally deleted names. Preflight refusals
+	// never reach this point and leave the manifest untouched.
+	if err := r.recordManifestDeletions(entries); err != nil {
+		result.Errors = append(result.Errors, "deletion not recorded in the download manifest: "+err.Error())
+	}
 	retainedSelected := make(map[string]bool)
 	for _, name := range friendly {
 		rel, _ := filepath.Rel(friendlyRoot, name)
@@ -741,4 +750,26 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 	sort.Strings(result.RetainedBlobs)
 	sort.Strings(result.Errors)
 	return result
+}
+
+// recordManifestDeletions tombstones the confirmed names in the repository's
+// download manifest so rebuild/repair will not recreate them. A repository
+// without a manifest has no mapping to resurrect from; a manifest belonging
+// to another repository is ignored exactly like repair ignores it.
+func (r *RepoDir) recordManifestDeletions(entries []SelectedGGUFEntry) error {
+	m := readRepoManifest(r)
+	if m == nil {
+		return nil
+	}
+	changed := false
+	for _, e := range entries {
+		if m.RecordDeletion(e.Path, e.Versions) {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	_, err := m.Write(r.FriendlyPath())
+	return err
 }

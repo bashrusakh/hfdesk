@@ -694,3 +694,109 @@ func TestDeleteSelectedGGUFRetainsPayloadReferencedByHardLinkSnapshotEntry(t *te
 		t.Fatalf("retained payload reporting=%v, want %q", result.RetainedBlobs, blob)
 	}
 }
+
+// writeFallbackManifest records the fallback fixture's file in a download
+// manifest, the repair mapping a later rebuild would use.
+func writeFallbackManifest(t *testing.T, repo *RepoDir, name string, content []byte) {
+	t.Helper()
+	builder := NewManifestBuilder(Job{Repo: "owner/model"}, "hfdesk test")
+	builder.SetCommit("version-a")
+	builder.AddFile(name, fmt.Sprintf("%x", sha256.Sum256(content)), int64(len(content)), true)
+	if _, err := builder.Build().Write(repo.FriendlyPath()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDeleteSelectedGGUFDeletionDurableAcrossSync pins the deletion-durability
+// contract: a rebuild after a selected-GGUF deletion must not resurrect the
+// deleted names from the download manifest's repair mapping — including when
+// the payload is retained (shared entry, retained alias, or failed blob
+// unlink) — while retained payloads and refused deletions stay intact.
+func TestDeleteSelectedGGUFDeletionDurableAcrossSync(t *testing.T) {
+	t.Run("retained payload is not resurrected", func(t *testing.T) {
+		repo, blob, snapshot, friendly, content := selectedDeleteFallbackFixture(t, true)
+		otherName := filepath.Join(repo.FriendlyPath(), "model-Q5_K_M.gguf")
+		if err := os.Link(blob, otherName); err != nil {
+			t.Fatal(err)
+		}
+		writeFallbackManifest(t, repo, "model-Q4_K_M.gguf", content)
+
+		result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+		if len(result.Errors) != 0 {
+			t.Fatalf("delete errors: %v", result.Errors)
+		}
+		if len(result.RetainedBlobs) != 1 || result.RetainedBlobs[0] != blob {
+			t.Fatalf("retained payload reporting=%v, want %q", result.RetainedBlobs, blob)
+		}
+
+		if _, err := repo.cache.Sync(SyncOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{snapshot, friendly} {
+			if _, err := os.Lstat(name); !os.IsNotExist(err) {
+				t.Fatalf("deleted entry %q was resurrected by sync: %v", name, err)
+			}
+		}
+		for _, name := range []string{blob, otherName} {
+			if _, err := os.Lstat(name); err != nil {
+				t.Fatalf("retained entry %q changed after sync: %v", name, err)
+			}
+		}
+		got, err := os.ReadFile(otherName)
+		if err != nil || string(got) != string(content) {
+			t.Fatalf("retained alias content=%q %v", got, err)
+		}
+	})
+
+	t.Run("plain deletion is not resurrected", func(t *testing.T) {
+		repo, _, snapshot, friendly, content := selectedDeleteFallbackFixture(t, true)
+		writeFallbackManifest(t, repo, "model-Q4_K_M.gguf", content)
+
+		result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+		if len(result.Errors) != 0 {
+			t.Fatalf("delete errors: %v", result.Errors)
+		}
+		m, err := ReadManifest(filepath.Join(repo.FriendlyPath(), ManifestFilename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !m.IsDeleted("model-Q4_K_M.gguf", "version-a") {
+			t.Fatal("deletion was not recorded in the manifest")
+		}
+
+		if _, err := repo.cache.Sync(SyncOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{snapshot, friendly} {
+			if _, err := os.Lstat(name); !os.IsNotExist(err) {
+				t.Fatalf("deleted entry %q was resurrected by sync: %v", name, err)
+			}
+		}
+	})
+
+	t.Run("refused deletion leaves the manifest untouched", func(t *testing.T) {
+		repo, _, snapshot, friendly, content := selectedDeleteFallbackFixture(t, false)
+		alias := filepath.Join(repo.FriendlyPath(), "model-Q5_K_M.gguf")
+		if err := os.Symlink(friendly, alias); err != nil {
+			t.Fatal(err)
+		}
+		writeFallbackManifest(t, repo, "model-Q4_K_M.gguf", content)
+
+		result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
+		if len(result.Errors) == 0 || len(result.Removed) != 0 {
+			t.Fatalf("dependent friendly reference was not refused before unlink: %+v", result)
+		}
+		m, err := ReadManifest(filepath.Join(repo.FriendlyPath(), ManifestFilename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(m.Deleted) != 0 {
+			t.Fatalf("refused deletion recorded manifest tombstones: %+v", m.Deleted)
+		}
+		for _, name := range []string{snapshot, friendly, alias} {
+			if _, err := os.Lstat(name); err != nil {
+				t.Fatalf("refused operation changed %q: %v", name, err)
+			}
+		}
+	})
+}

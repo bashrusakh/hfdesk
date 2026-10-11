@@ -258,9 +258,12 @@ func readRepoManifest(repoDir *RepoDir) *DownloadManifest {
 // commit but the cache is missing (or holds as a dangling symlink). The
 // manifest is the offline relative path -> blob mapping written at download
 // time, so a blobs-only cache can be repaired without contacting the Hub.
-// Entries whose blob is absent, whose recorded path would escape the snapshot
-// directory, or whose manifest shape is unusable are skipped or reported;
-// existing snapshot entries (of any link kind) are left untouched.
+// Names tombstoned as intentionally deleted (DownloadManifest.Deleted) are
+// never recreated: a retained payload does not imply consent to restore a
+// deleted entry. Entries whose blob is absent, whose recorded path would
+// escape the snapshot directory, or whose manifest shape is unusable are
+// skipped or reported; existing snapshot entries (of any link kind) are left
+// untouched.
 // Returns (created, errors).
 func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 	created := 0
@@ -273,6 +276,9 @@ func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 
 	for _, f := range m.Files {
 		rel := filepath.ToSlash(f.Name)
+		if m.IsDeleted(rel, commit) {
+			continue // Intentionally removed: rebuild must not resurrect it
+		}
 		if unsafeRepoPath(rel) {
 			errs = append(errs, fmt.Errorf("manifest path %q is not a usable repository path", f.Name))
 			continue

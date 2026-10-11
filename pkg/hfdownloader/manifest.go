@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -41,6 +42,21 @@ type DownloadManifest struct {
 	TotalSize  int64          `yaml:"total_size" json:"total_size"`   // Total bytes downloaded
 	TotalFiles int            `yaml:"total_files" json:"total_files"` // Number of files
 	Files      []ManifestFile `yaml:"files" json:"files"`
+
+	// Deleted records snapshot names intentionally removed after the download
+	// (selected-GGUF deletion). Rebuild/repair must never recreate them from
+	// the file mapping above: a retained payload does not imply consent to
+	// restore a deleted entry. Absent on manifests written before this field
+	// existed (old readers ignore it, old manifests simply have no tombstones).
+	Deleted []ManifestDeletion `yaml:"deleted,omitempty" json:"deleted,omitempty"`
+}
+
+// ManifestDeletion tombstones one intentionally removed repo-relative name,
+// bound to the snapshot versions it was removed from. An empty Versions list
+// means every version of that name.
+type ManifestDeletion struct {
+	Path     string   `yaml:"path" json:"path"`
+	Versions []string `yaml:"versions,omitempty" json:"versions,omitempty"`
 }
 
 // ManifestFile represents a single file in the manifest.
@@ -153,6 +169,46 @@ func ReadManifest(path string) (*DownloadManifest, error) {
 	}
 
 	return &manifest, nil
+}
+
+// RecordDeletion tombstones name for the given snapshot versions so rebuild
+// and repair will not recreate it. Repeated records merge versions into the
+// existing tombstone. It reports whether the manifest changed.
+func (m *DownloadManifest) RecordDeletion(name string, versions []string) bool {
+	name = filepath.ToSlash(name)
+	for i := range m.Deleted {
+		if m.Deleted[i].Path != name {
+			continue
+		}
+		changed := false
+		for _, v := range versions {
+			if !slices.Contains(m.Deleted[i].Versions, v) {
+				m.Deleted[i].Versions = append(m.Deleted[i].Versions, v)
+				changed = true
+			}
+		}
+		return changed
+	}
+	m.Deleted = append(m.Deleted, ManifestDeletion{Path: name, Versions: append([]string(nil), versions...)})
+	return true
+}
+
+// IsDeleted reports whether name at the given snapshot version was
+// intentionally removed. A tombstone without versions covers every version.
+func (m *DownloadManifest) IsDeleted(name, version string) bool {
+	name = filepath.ToSlash(name)
+	for _, d := range m.Deleted {
+		if d.Path != name {
+			continue
+		}
+		if len(d.Versions) == 0 {
+			return true
+		}
+		if slices.Contains(d.Versions, version) {
+			return true
+		}
+	}
+	return false
 }
 
 // RepoTypeName returns the type name prefix for repo directories.
