@@ -693,6 +693,36 @@ func TestAnalyzeQuantOnlyUnknownMethod(t *testing.T) {
 	}
 }
 
+// Issue #123: a quantization-only root repository that also refines to a
+// specialized type must keep both projections: the specialized
+// classification and the verified quantization info.
+func TestAnalyzeQuantOnlyMultimodalKeepsQuantized(t *testing.T) {
+	paths := append(quantOnlyPaths(), "processor_config.json")
+	info, err := analyzeFixture(t, paths, map[string]string{
+		"quantization_config.json": `{"quant_method":"gptq","bits":4}`,
+		"processor_config.json":    `{}`,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Type != TypeMultimodal {
+		t.Fatalf("type = %s, want %s", info.Type, TypeMultimodal)
+	}
+	if info.Multimodal == nil {
+		t.Fatalf("multimodal info lost: %+v", info)
+	}
+	q := info.Quantized
+	if q == nil {
+		t.Fatalf("quantization info lost on multimodal refinement: %+v", info)
+	}
+	if q.Method != "gptq" {
+		t.Fatalf("method = %q, want gptq", q.Method)
+	}
+	if len(info.SelectableItems) != 0 {
+		t.Fatalf("selectable items changed: %+v", info.SelectableItems)
+	}
+}
+
 // A file the tree did not mark as LFS whose /raw/ body is a pointer stub is
 // retried through /resolve/ once instead of losing the metadata.
 func TestAnalyzeUnmarkedLFSFallback(t *testing.T) {

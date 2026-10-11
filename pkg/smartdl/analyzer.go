@@ -553,10 +553,10 @@ func (a *Analyzer) fetchMetadata(ctx context.Context, repo string, isDataset boo
 
 		content, err := a.fetchFile(ctx, repo, isDataset, info.Branch, path, isLFS)
 		if err != nil {
-			// Fetch-failure rule: a transport failure (network/HTTP error) is a
-			// non-fatal skip, consistent with the pre-existing "partial failure
-			// is normal" metadata contract; a structurally valid persistent LFS
-			// pointer is an explicit named-file failure; header-only content is
+			// Fetch-failure rule: a plain transport failure (network/HTTP error)
+			// for optional metadata is a non-fatal skip; a tree-marked LFS file
+			// or a valid raw pointer stub whose /resolve/ fetch fails is an
+			// explicit named-file failure (see fetchFile); header-only content is
 			// not a pointer (see isLFSPointer).
 			if errors.Is(err, errMetadataTooLarge) && path == "quantization_config.json" {
 				data, headErr := decodeQuantizationHead(content)
@@ -859,6 +859,17 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 		// Standard transformers analysis
 		info.Transformers = analyzeTransformers(info.Files, info.Metadata)
 	case TypeGeneric:
+		// Quantization-only repositories (root weights plus a root
+		// quantization_config.json, no root architecture config) stay
+		// generic; project their quantization info without reclassifying
+		// or changing selectable items (issue #123). Project before
+		// specialized refinement so the recursion below keeps it,
+		// symmetrically to TypeTransformers.
+		if hasRootWeights(info.Files) {
+			if _, ok := info.Metadata["quantization_config.json"]; ok {
+				info.Quantized = analyzeQuantized(info.Metadata)
+			}
+		}
 		// For generic, try to detect specialized types from metadata
 		specializedType := detectSpecializedType(info.Files, info.Metadata)
 		if specializedType != "" {
@@ -867,15 +878,6 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 			// Re-run analysis for the specialized type
 			a.analyzeTypeSpecific(info)
 			return
-		}
-		// Quantization-only repositories (root weights plus a root
-		// quantization_config.json, no root architecture config) stay
-		// generic; project their quantization info without reclassifying
-		// or changing selectable items (issue #123).
-		if hasRootWeights(info.Files) {
-			if _, ok := info.Metadata["quantization_config.json"]; ok {
-				info.Quantized = analyzeQuantized(info.Metadata)
-			}
 		}
 	}
 
