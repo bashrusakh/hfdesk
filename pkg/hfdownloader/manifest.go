@@ -244,12 +244,25 @@ func ReadManifest(path string) (*DownloadManifest, error) {
 
 // RecordDeletion tombstones name for the given snapshot versions so rebuild
 // and repair will not recreate it. Repeated records merge versions into the
-// existing tombstone. It reports whether the manifest changed.
+// existing tombstone. An empty versions list means every version of that
+// name, and is the absorbing state: recording a specific version into an
+// existing all-version tombstone is a no-op (reports unchanged), while
+// recording an all-version deletion into a version-specific tombstone
+// upgrades it to all (clears Versions). It reports whether the manifest changed.
 func (m *DownloadManifest) RecordDeletion(name string, versions []string) bool {
 	name = filepath.ToSlash(name)
 	for i := range m.Deleted {
 		if m.Deleted[i].Path != name {
 			continue
+		}
+		if len(m.Deleted[i].Versions) == 0 {
+			// Already tombstoned for all versions: specific records add nothing.
+			return false
+		}
+		if len(versions) == 0 {
+			// Upgrade a version-specific tombstone to all versions.
+			m.Deleted[i].Versions = nil
+			return true
 		}
 		changed := false
 		for _, v := range versions {
