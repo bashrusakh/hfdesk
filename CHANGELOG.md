@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Read quantization metadata from Git-LFS-backed config files instead of silently losing it to pointer stubs, show quantization information for quantization-only repositories, and distinguish proven uniform precision, observed width variation, and unknown/incomplete precision in the quantized panel; also show `Not quantized: …` for excluded modules (#123).
 - Analyze and plan/download previews honor the configured proxy and report proxy construction failures rather than falling back to direct planning requests (#104).
 - Read analyzer metadata completely within the 10 MiB cap, recover completed leading quantization fields from oversized configs, and report unrecoverable overflow/read failures; root Transformers weights take precedence over ONNX exports while specialized model detection is preserved (#105).
 - Recover stalled downloads and bound transport waits with deadlines; retry `429` and all `5xx`, fail non-retryable file responses without retrying, and keep optional verification metadata failures non-fatal (#97)
