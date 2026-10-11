@@ -315,6 +315,9 @@ func TestDecodeQuantizationHeadCompletedFields(t *testing.T) {
 		{"truncated expert_bits", `{"quant_method":"exl3","expert_bits":{"0":{"gu":4`, map[string]interface{}{"quant_method": "exl3", "expert_bits": nil, partialHeadMarker: true}, false},
 		{"truncated expert_bits list", `{"quant_method":"exl3","expert_bits":[3,4`, map[string]interface{}{"quant_method": "exl3", "expert_bits": nil, partialHeadMarker: true}, false},
 		{"complete object is not partial", `{"quant_method":"exl3","bits":4}`, map[string]interface{}{"quant_method": "exl3", "bits": float64(4)}, false},
+		{"completed null width retained", `{"quant_method":"gptq","bits":4,"head_bits":null}`, map[string]interface{}{"quant_method": "gptq", "bits": float64(4), "head_bits": nil}, false},
+		{"completed malformed width retained", `{"quant_method":"gptq","bits":4,"vision_bits":"unknown"}`, map[string]interface{}{"quant_method": "gptq", "bits": float64(4), "vision_bits": "unknown"}, false},
+		{"completed exclusions retained", `{"quant_method":"gptq","bits":4,"modules_to_not_convert":["lm_head"]}`, map[string]interface{}{"quant_method": "gptq", "bits": float64(4), "modules_to_not_convert": []interface{}{"lm_head"}}, false},
 		{"completed bits_per_weight", `{"quant_method":"exl2","bits":4,"bits_per_weight":4.5,"tail":[`, map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": float64(4.5), partialHeadMarker: true}, false},
 		{"truncated bits_per_weight", `{"quant_method":"exl2","bits":4,"bits_per_weight":4`, map[string]interface{}{"quant_method": "exl2", "bits": float64(4), "bits_per_weight": nil, partialHeadMarker: true}, false},
 		{"completed routed_expert_bits", `{"quant_method":"exl3","routed_expert_bits":{"0":{"gu":4,"down":3}},"tail":[`, map[string]interface{}{"quant_method": "exl3", "routed_expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}}, partialHeadMarker: true}, false},
@@ -336,6 +339,57 @@ func TestDecodeQuantizationHeadCompletedFields(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("head=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzeQuantOnlyClosedWhitespaceOversizePreservesDeclarations(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, declaration string
+		wantBits                int
+	}{
+		{"null expert declaration", `"expert_bits":null`, "expert_bits", 0},
+		{"wrong-shape group declaration", `"vision_bits":"unknown"`, "vision_bits", 0},
+		{"wrong-shape expert declaration", `"expert_bits":"unknown"`, "expert_bits", 0},
+		{"valid uniform control", `"head_bits":4`, "head_bits", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"quant_method":"gptq","bits":4,` + tc.body + `,"modules_to_not_convert":["lm_head"]}`
+			analyze := func(content string) *RepoInfo {
+				t.Helper()
+				info, err := analyzeFixtureFiles(t, quantOnlyPaths(),
+					map[string]bool{"quantization_config.json": true},
+					map[string]string{"quantization_config.json": lfsPointerBody},
+					map[string]string{"quantization_config.json": content}, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return info
+			}
+			normal := analyze(body)
+			bounded := analyze(body + strings.Repeat(" ", maxMetadataSize))
+			for label, info := range map[string]*RepoInfo{"normal": normal, "bounded": bounded} {
+				q := info.Quantized
+				if q == nil || q.Bits != tc.wantBits || q.MixedPrecision || q.ConfigPartial {
+					t.Fatalf("%s projection differs from declaration contract: %+v", label, q)
+				}
+				if len(q.ExcludedModules) != 1 || q.ExcludedModules[0] != "lm_head" {
+					t.Fatalf("%s excluded modules lost: %+v", label, q)
+				}
+				meta, ok := info.Metadata["quantization_config.json"].(map[string]interface{})
+				if !ok {
+					t.Fatalf("%s config metadata unavailable: %+v", label, info.Metadata)
+				}
+				if _, exists := meta[tc.declaration]; !exists {
+					t.Fatalf("%s completed declaration key %q missing: %+v", label, tc.declaration, meta)
+				}
+				if _, exists := meta[partialHeadMarker]; exists {
+					t.Fatalf("%s closed object marked partial: %+v", label, meta)
+				}
+			}
+			if !reflect.DeepEqual(normal.Quantized, bounded.Quantized) {
+				t.Fatalf("normal and bounded projections differ: normal=%+v bounded=%+v", normal.Quantized, bounded.Quantized)
 			}
 		})
 	}

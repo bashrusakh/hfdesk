@@ -399,7 +399,8 @@ type QuantizedInfo struct {
 	// established, and it must not be read as model-wide precision (the
 	// literal value remains in Metadata). When ExcludedModules is non-empty it
 	// is not a model-wide width either: present the excluded modules
-	// alongside it.
+	// alongside it. Because Bits is an integer, fractional or out-of-range
+	// declarations remain in Metadata and are not rounded into this field.
 	Bits int `json:"bits"`
 
 	// MixedPrecision indicates observed differing declared bit widths. Width

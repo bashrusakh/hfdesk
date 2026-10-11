@@ -729,10 +729,10 @@ func (e *metadataReadError) Unwrap() error { return e.error }
 // the response instead of silent.
 const partialHeadMarker = "__partial__"
 
-// precisionHeadKeys are the config declarations that carry bit-width or
-// effective-precision evidence. A value cut at the size bound is recovered as
-// an explicit null: the declaration happened, its width is unknown, and it
-// must not be silently dropped or invented.
+// precisionHeadKeys are config declarations needed by the quantization
+// projection, including excluded-module presentation. A value cut at the size
+// bound is recovered as an explicit null: the declaration happened, its value
+// is unknown, and it must not be silently dropped or invented.
 var precisionHeadKeys = map[string]bool{
 	"bits":                   true,
 	"head_bits":              true,
@@ -742,14 +742,15 @@ var precisionHeadKeys = map[string]bool{
 	"routed_expert_bits":     true,
 	"routed_expert_bits_avg": true,
 	"bits_per_weight":        true,
+	"modules_to_not_convert": true,
 }
 
-// decodeQuantizationHead keeps only completed top-level fields useful for the
-// quantization projection (quant_method and the precisionHeadKeys widths). An
-// incomplete large trailing value is expected at the cap; malformed JSON is not
-// recovery. A precision declaration whose value was cut at the cap is kept as
-// an explicit null and the head is marked partial, so truncation never reads as
-// a completed declaration.
+// decodeQuantizationHead keeps completed top-level fields useful for the
+// quantization projection (quant_method and precisionHeadKeys) without
+// filtering their valid-JSON values by shape. An incomplete large trailing
+// value is expected at the cap; malformed JSON is not recovery. A declaration
+// whose value was cut at the cap is kept as an explicit null and the head is
+// marked partial, so truncation never reads as a completed declaration.
 func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 	d := json.NewDecoder(bytes.NewReader(content))
 	token, err := d.Token()
@@ -796,16 +797,11 @@ func decodeQuantizationHead(content []byte) (map[string]interface{}, error) {
 				head["quant_method"] = method
 				completed++
 			}
-		case "bits", "head_bits", "vision_bits", "mtp_bits", "bits_per_weight", "routed_expert_bits_avg":
-			if _, ok := value.(float64); ok {
-				head[key] = value
-				completed++
-			}
-		case "expert_bits", "routed_expert_bits":
-			// Per-expert widths: an object keyed by expert, a list of widths,
-			// or a single width.
-			switch value.(type) {
-			case map[string]interface{}, []interface{}, float64:
+		default:
+			// Preserve completed declaration values as decoded, including null or
+			// unfamiliar shapes. Projection needs to distinguish these from absent
+			// keys, and exclusions are surfaced from this metadata too.
+			if precisionHeadKeys[key] {
 				head[key] = value
 				completed++
 			}

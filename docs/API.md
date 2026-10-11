@@ -90,7 +90,10 @@ no root architecture config):
 `method` is the literal `quant_method` from the repository's quantization
 config. `bits` is the declared bit width of the quantized tensors and is only
 set when the config declares uniform precision and was read completely enough
-to establish it. `excluded_modules` lists the modules the config excludes from
+to establish it and the declared width is exactly representable as the API's
+integer field. Fractional or out-of-range declarations leave `bits` at `0`
+(they are retained literally under `metadata`, not rounded). `excluded_modules`
+lists the modules the config excludes from
 quantization (`modules_to_not_convert`). When `excluded_modules` is non-empty,
 part of the model is not quantized at that width, so `bits` is not a model-wide
 width and consumers must present the excluded modules alongside it. Exclusions

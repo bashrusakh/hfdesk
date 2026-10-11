@@ -5,6 +5,7 @@ package smartdl
 
 import (
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -112,8 +113,9 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	if _, ok := config[partialHeadMarker]; ok {
 		info.ConfigPartial = true
 	}
-	if hasBits && !info.MixedPrecision && !info.ConfigPartial && !unknownWidths {
-		info.Bits = int(headerBits)
+	if intBits, representable := exactIntegerBits(headerBits); hasBits && representable &&
+		!info.MixedPrecision && !info.ConfigPartial && !unknownWidths {
+		info.Bits = intBits
 	}
 
 	if groupSize, ok := config["group_size"].(float64); ok {
@@ -182,6 +184,19 @@ func declaredWidth(config map[string]interface{}, key string) (width float64, pr
 	}
 	width, ok := value.(float64)
 	return width, true, ok && width > 0 && !math.IsNaN(width) && !math.IsInf(width, 0)
+}
+
+// exactIntegerBits prevents the public integer field from rounding fractional
+// declarations or overflowing on values outside the platform int range.
+func exactIntegerBits(width float64) (int, bool) {
+	if width <= 0 || math.IsNaN(width) || math.IsInf(width, 0) || math.Trunc(width) != width {
+		return 0, false
+	}
+	maxIntExclusive := math.Ldexp(1, strconv.IntSize-1)
+	if width >= maxIntExclusive {
+		return 0, false
+	}
+	return int(width), true
 }
 
 // expertBitRange collects valid positive finite widths from the declared

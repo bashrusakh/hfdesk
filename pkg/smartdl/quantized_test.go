@@ -640,6 +640,8 @@ func TestAnalyzeQuantizedPrecisionProjection(t *testing.T) {
 		{"expert widths scalar without global width", map[string]interface{}{"quant_method": "exl3", "expert_bits": float64(3.51)}, 0, false, 0, 3.51, 3.51},
 		{"expert widths vary against global width", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(3)}, "1": map[string]interface{}{"gu": float64(3), "down": float64(3)}}}, 0, true, 0, 3, 4},
 		{"complete matching expert widths", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(4), "down": float64(4)}}}, 4, false, 0, 4, 4},
+		{"fractional header is not rounded into integer bits", map[string]interface{}{"quant_method": "gptq", "bits": float64(4.5)}, 0, false, 0, 0, 0},
+		{"out-of-range header is not converted to integer bits", map[string]interface{}{"quant_method": "gptq", "bits": float64(1e100)}, 0, false, 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
@@ -686,6 +688,7 @@ func TestAnalyzeQuantizedPrecisionEvidence(t *testing.T) {
 		{"invalid expert width is unknown not variation", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": []interface{}{float64(4), float64(-1)}}, 0, false, false, 0, 4, 4, 0},
 		{"valid conflict remains mixed beside unknown leaf", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": map[string]interface{}{"0": map[string]interface{}{"gu": float64(3), "down": nil}}}, 0, true, false, 0, 3, 3, 0},
 		{"invalid group declarations block uniformity without mixed claim", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "head_bits": nil, "vision_bits": "unknown", "mtp_bits": false}, 0, false, false, 0, 0, 0, 0},
+		{"fractional observed width conflicts without rounding", map[string]interface{}{"quant_method": "exl3", "bits": float64(4), "expert_bits": float64(4.5)}, 0, true, false, 0, 4.5, 4.5, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := analyzeQuantized(map[string]interface{}{"quantization_config.json": tc.config})
