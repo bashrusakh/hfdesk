@@ -119,6 +119,15 @@ func (m *JobManager) writeDecisionUnchanged(s writeDecisionSnapshot) bool {
 	return reflect.DeepEqual(s, m.captureWriteDecisionLocked())
 }
 
+func hfReservationsBlockSnapshot(snapshot writeDecisionSnapshot, job *Job) bool {
+	for _, scopes := range snapshot.hfReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *JobManager) signalWriteDecisionLocked() {
 	if m.writeDecisionChanged == nil {
 		m.writeDecisionChanged = make(chan struct{})
@@ -378,7 +387,17 @@ func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targ
 // Revalidate probes only the explicit bounded identities supplied by the
 // caller. It is not a guarantee against unmanaged external filesystem writes.
 func (a *cacheWriteAttempt) Revalidate(paths []string) bool {
-	if a == nil || !a.manager.writeDecisionUnchanged(a.start) {
+	if a == nil {
+		return false
+	}
+	return a.RevalidateProbes(paths)
+}
+
+// RevalidateProbes checks bounded filesystem observations only. Callers that
+// need an atomic manager-state commit must compare start with
+// captureWriteDecisionLocked while holding manager.mu after this returns.
+func (a *cacheWriteAttempt) RevalidateProbes(paths []string) bool {
+	if a == nil {
 		return false
 	}
 	for _, probe := range a.probes {
@@ -401,8 +420,27 @@ func (a *cacheWriteAttempt) Revalidate(paths []string) bool {
 }
 
 func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
+	return a.hasActiveBroadMutation(nil, targets)
+}
+
+func (a *cacheWriteAttempt) HasActiveBroadMutationFor(descriptor writeDecisionJob, targets []string) bool {
+	return a.hasActiveBroadMutation(&descriptor, targets)
+}
+
+func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob, targets []string) bool {
 	if a == nil {
 		return true
+	}
+	var evidence []selectedWriteEvidence
+	if descriptor == nil {
+		for _, ev := range a.evidence {
+			evidence = append(evidence, ev)
+		}
+	} else {
+		key := decisionDescriptorKey(*descriptor)
+		if ev, ok := a.evidence[key]; ok {
+			evidence = append(evidence, ev)
+		}
 	}
 	// beginCacheMutation and HF reservations name directory scopes; selected
 	// GGUF deletes name leaf entries whose final symlink must remain unfollowed.
@@ -418,7 +456,7 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 					return true
 				}
 			}
-			for _, ev := range a.evidence {
+			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
 					if scopeOverlapsDirectory(scope, inv.base, kind) {
 						return true
@@ -439,7 +477,7 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 					return true
 				}
 			}
-			for _, ev := range a.evidence {
+			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
 					if directoryScopesOverlap(scope, inv.base) {
 						return true
@@ -460,7 +498,7 @@ func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
 					return true
 				}
 			}
-			for _, ev := range a.evidence {
+			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
 					if mutationDirectoryEntryOverlap(inv.base, entry) {
 						return true
