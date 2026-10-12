@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
@@ -47,7 +48,7 @@ type datasetDecisionInput struct {
 	DirectResidualConditions         []string
 	GroupCoreConditions              uint64
 	GroupResidualConditions          []string
-	AncestorDirectSeedIndexes        []int
+	Directory                        string
 	// DirectSeedCandidate is an unexcluded inventory source that a direct
 	// filter can select in at least one admissible membership interpretation.
 	// A membership selection is also a directory seed even when its group
@@ -65,15 +66,28 @@ type datasetDecisionInput struct {
 // needed for finite dataset-selection reasoning. It is deliberately dormant:
 // compiling it does not decide inclusion, ambiguity disposition, or a plan.
 type datasetDecisionContext struct {
-	Inputs           []datasetDecisionInput
-	Filters          []datasetDecisionFilter
-	FilterBits       map[string]uint
-	RecognizedLabels []string
-	CoreLabels       []string
-	ResidualLabels   []string
-	ExactMatch       bool
-	IsDataset        bool
-	GGUFMode         bool
+	Inputs                 []datasetDecisionInput
+	Filters                []datasetDecisionFilter
+	FilterBits             map[string]uint
+	RecognizedLabels       []string
+	CoreLabels             []string
+	ResidualLabels         []string
+	ExactMatch             bool
+	IsDataset              bool
+	GGUFMode               bool
+	DirectSeedsByDirectory map[string][]int
+	uniqueEvaluation       *datasetDecisionUniqueEvaluation
+}
+
+// The evaluator is immutable after compilation; Once safely shares the one
+// concrete evaluation across the many per-input queries made by its caller.
+type datasetDecisionUniqueEvaluation struct {
+	proofOnce sync.Once
+	unique    bool
+	once      sync.Once
+	world     datasetDecisionWorld
+	records   []datasetDecisionRecord
+	valid     bool
 }
 
 func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
@@ -239,25 +253,17 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 		hasPossibleDataRole := in.PossibleCore != 0 || len(in.PossibleResidual) != 0
 		in.DirectSeedCandidate = !in.Excluded && hasPossibleDataRole && (len(in.DirectFilterIndexes) != 0 || in.GroupCoreConditions != 0 || len(in.GroupResidualConditions) != 0)
 	}
-	// Index actual, non-excluded direct matches by containing directory, then
-	// record source indexes that seed each input's containing directory or one
-	// of its ancestors. Lookup cost follows path depth plus returned evidence,
-	// rather than comparing every pair of inventory entries.
-	seedsByDirectory := make(map[string][]int)
+	// Index actual, non-excluded direct matches by containing directory. Keep
+	// one shared index rather than copying each seed list onto every file.
+	c.DirectSeedsByDirectory = make(map[string][]int)
 	for i, input := range c.Inputs {
+		c.Inputs[i].Directory = path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
 		if !input.DirectSeedCandidate {
 			continue
 		}
-		dir := path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
-		seedsByDirectory[dir] = append(seedsByDirectory[dir], i)
+		c.DirectSeedsByDirectory[c.Inputs[i].Directory] = append(c.DirectSeedsByDirectory[c.Inputs[i].Directory], i)
 	}
-	for i := range c.Inputs {
-		dir := path.Dir(strings.ReplaceAll(c.Inputs[i].Path, "\\", "/"))
-		for current := dir; current != "." && current != "/"; current = path.Dir(current) {
-			c.Inputs[i].AncestorDirectSeedIndexes = append(c.Inputs[i].AncestorDirectSeedIndexes, seedsByDirectory[current]...)
-		}
-		sort.Ints(c.Inputs[i].AncestorDirectSeedIndexes)
-	}
+	c.uniqueEvaluation = &datasetDecisionUniqueEvaluation{}
 	return c
 }
 

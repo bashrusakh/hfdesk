@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
@@ -113,7 +114,7 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 				trialRoles[j] = append([]datasetDecisionRoleLabel(nil), roles[j]...)
 			}
 			ok := constrainDecisionDirect(c, i, []datasetDecisionRoleLabel{alt}, trial, collisions, false)
-			for _, seed := range in.AncestorDirectSeedIndexes {
+			for _, seed := range validDatasetDirectorySeeds(c, in.Directory) {
 				if seed >= 0 && seed < len(c.Inputs) && seed != i && !c.Inputs[seed].Excluded {
 					chosen, next, zero := chooseZeroDecisionAlternative(c, seed, trialRoles[seed], trial, collisions)
 					if !zero {
@@ -391,6 +392,238 @@ type datasetDecisionRecord struct {
 
 type datasetDecisionEvaluation struct {
 	Records []datasetDecisionRecord
+}
+
+// datasetDecisionQueryResult keeps feasibility separate from its coherent
+// witness. A nil witness means the proposition was disproved, not unknown.
+type datasetDecisionQueryResult struct {
+	Possible bool
+	World    datasetDecisionWorld
+	Record   datasetDecisionRecord
+}
+
+// queryDatasetDecision runs bounded concrete queries over the six conventional
+// collision bits. Residual token bits are solved by the unit primitive rather
+// than enumerated. It intentionally has no caller in PlanRepo yet.
+func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips []int, requireSkip bool) datasetDecisionQueryResult {
+	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
+		return datasetDecisionQueryResult{}
+	}
+	if r, unique := uniqueDatasetDecisionQuery(c, index, requireSkip); unique {
+		return r
+	}
+	for _, core := range datasetCoreAssignments(c) {
+		if requireSkip {
+			w, ok := feasibleDatasetDecisionWorld(c, core, nil, []int{index}, nil, nil)
+			if ok {
+				e, err := evaluateDatasetDecisionWorld(c, w)
+				if err == nil && e.Records[index].Skipped {
+					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+				}
+			}
+			continue
+		}
+		// A direct selection is witnessed by one actual data alternative and
+		// one direct term, all interpreted in this same world.
+		for _, alt := range c.Inputs[index].Alternatives {
+			if alt.Role != datasetselection.EvidenceRoleData {
+				continue
+			}
+			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: alt}, earlierCaseSkips, nil, &datasetDecisionPositive{Input: index, Alternative: alt})
+			if ok && queryWorldEmits(c, w, index) {
+				e, _ := evaluateDatasetDecisionWorld(c, w)
+				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+			}
+		}
+		// A companion is retained at the root without a seed, or below a
+		// directory seeded by one directly selected data input. The source and
+		// target roles are pinned together so an input cannot self-seed through
+		// its mutually exclusive data/companion interpretations.
+		companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+		// Companions may themselves satisfy an ordinary explicit path filter;
+		// this is a direct witness, not root/nested fallback retention.
+		w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseSkips, nil, &datasetDecisionPositive{Input: index, Alternative: companion})
+		if ok && queryWorldEmits(c, w, index) {
+			e, _ := evaluateDatasetDecisionWorld(c, w)
+			return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+		}
+		if path.Dir(strings.ReplaceAll(c.Inputs[index].Path, "\\", "/")) == "." {
+			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseSkips, nil, nil)
+			if ok && queryWorldEmits(c, w, index) {
+				e, _ := evaluateDatasetDecisionWorld(c, w)
+				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+			}
+		}
+		for _, seed := range validDatasetDirectorySeeds(c, c.Inputs[index].Directory) {
+			if seed == index || c.Inputs[seed].Excluded {
+				continue
+			}
+			for _, alt := range c.Inputs[seed].Alternatives {
+				if alt.Role != datasetselection.EvidenceRoleData {
+					continue
+				}
+				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseSkips, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
+				if ok && queryWorldEmits(c, w, index) {
+					e, _ := evaluateDatasetDecisionWorld(c, w)
+					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+				}
+			}
+		}
+	}
+	return datasetDecisionQueryResult{}
+}
+
+// uniqueDatasetDecisionQuery avoids constructing and validating a complete
+// feasibility witness for every inventory entry when the interpretation is
+// provably unique: each input has one actual role/label alternative and no
+// recognized token has a competing ordinary-path interpretation. In that
+// case there is exactly one admissible world, whose full records can be
+// evaluated once and reused. Any role ambiguity or colliding token falls
+// through to the complete feasibility solver unchanged.
+func uniqueDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip bool) (datasetDecisionQueryResult, bool) {
+	if c.uniqueEvaluation == nil {
+		return datasetDecisionQueryResult{}, false
+	}
+	e := c.uniqueEvaluation
+	e.proofOnce.Do(func() {
+		e.unique = len(collisionTokenBits(c)) == 0
+		if e.unique {
+			for _, in := range c.Inputs {
+				if len(in.Alternatives) != 1 {
+					e.unique = false
+					break
+				}
+			}
+		}
+	})
+	if !e.unique {
+		return datasetDecisionQueryResult{}, false
+	}
+	e.once.Do(func() {
+		world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+		for i, in := range c.Inputs {
+			alt := in.Alternatives[0]
+			if alt.Role == datasetselection.EvidenceRoleCompanion {
+				world.Companion[i] = true
+			} else {
+				world.DataLabels[i] = alt.Label
+			}
+		}
+		e.world = world
+		if err := validateDatasetDecisionWorld(c, world); err != nil {
+			return
+		}
+		evaluation, err := evaluateDatasetDecisionWorld(c, world)
+		if err != nil {
+			return
+		}
+		e.records, e.valid = evaluation.Records, true
+	})
+	if !e.valid || index >= len(e.records) {
+		return datasetDecisionQueryResult{}, true
+	}
+	record := e.records[index]
+	possible := record.Skipped == requireSkip
+	if !possible {
+		return datasetDecisionQueryResult{}, true
+	}
+	return datasetDecisionQueryResult{Possible: true, World: e.world, Record: record}, true
+}
+
+// A directly selected file seeds its containing directory and ancestors. A
+// companion in D therefore may be seeded by a source in D or below D.
+func validDatasetDirectorySeeds(c datasetDecisionContext, directory string) []int {
+	var indexes []int
+	for seedDir, seeds := range c.DirectSeedsByDirectory {
+		if seedDir == directory || strings.HasPrefix(seedDir, strings.TrimSuffix(directory, "/")+"/") {
+			indexes = append(indexes, seeds...)
+		}
+	}
+	sort.Ints(indexes)
+	return indexes
+}
+
+func datasetCoreAssignments(c datasetDecisionContext) []map[uint]bool {
+	var bits []uint
+	for bit := range collisionTokenBits(c) {
+		if _, core := isDatasetCoreBit(c, bit); core {
+			bits = append(bits, bit)
+		}
+	}
+	sort.Slice(bits, func(i, j int) bool { return bits[i] < bits[j] })
+	if len(bits) > len(datasetCoreLabels) {
+		return nil
+	}
+	assignments := make([]map[uint]bool, 0, 1<<len(bits))
+	for mask := 0; mask < 1<<len(bits); mask++ {
+		values := make(map[uint]bool, len(bits))
+		for i, bit := range bits {
+			values[bit] = mask&(1<<i) != 0
+		}
+		assignments = append(assignments, values)
+	}
+	return assignments
+}
+
+func canSelectDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips []int) datasetDecisionQueryResult {
+	return queryDatasetDecision(c, index, earlierCaseSkips, false)
+}
+
+func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	return queryDatasetDecision(c, index, nil, true)
+}
+
+func queryWorldEmits(c datasetDecisionContext, w datasetDecisionWorld, index int) bool {
+	e, err := evaluateDatasetDecisionWorld(c, w)
+	return err == nil && index < len(e.Records) && e.Records[index].Selected
+}
+
+func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if index < 0 || index >= len(c.Inputs) {
+		return datasetDecisionQueryResult{}
+	}
+	in := c.Inputs[index]
+	// Exact duplicates are always suppressed by input order, including when
+	// the earlier record is excluded. Case-folded duplicates are suppressed
+	// only after an earlier record actually becomes eligible; model that with
+	// required-skip constraints instead of the compiler's lexical-first hint.
+	if !in.ExactDuplicateEligible {
+		return datasetDecisionQueryResult{}
+	}
+	var earlier []int
+	fold := strings.ToLower(in.Path)
+	for i := 0; i < index; i++ {
+		if strings.ToLower(c.Inputs[i].Path) == fold {
+			earlier = append(earlier, i)
+		}
+	}
+	return canSelectDatasetDecision(c, index, earlier)
+}
+
+func canNotEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if index < 0 || index >= len(c.Inputs) {
+		return datasetDecisionQueryResult{}
+	}
+	if r := canSkipDatasetDecision(c, index); r.Possible {
+		return r
+	}
+	fold := strings.ToLower(c.Inputs[index].Path)
+	for i := 0; i < index; i++ {
+		if strings.ToLower(c.Inputs[i].Path) == fold {
+			if r := canEmitDatasetDecision(c, i); r.Possible {
+				return r
+			}
+		}
+	}
+	return datasetDecisionQueryResult{}
+}
+
+func datasetDecisionRefusal(c datasetDecisionContext, index int) (can, cannot datasetDecisionQueryResult) {
+	can = canEmitDatasetDecision(c, index)
+	if can.Possible {
+		cannot = canNotEmitDatasetDecision(c, index)
+	}
+	return
 }
 
 // evaluateDatasetDecisionWorld applies the exact-dataset-group concrete
