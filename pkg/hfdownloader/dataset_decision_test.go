@@ -369,17 +369,33 @@ func feasibleAnyCoreDecisionWorld(c datasetDecisionContext, pins datasetDecision
 
 func oracleCollisionBits(c datasetDecisionContext) map[uint]bool {
 	bits := map[uint]bool{}
-	filterBits := map[int]uint{}
+	// Re-derive ambiguity from actual role/label alternatives and concrete path
+	// matching; never use the compiler's collision-index attribution as oracle
+	// input.
 	for _, filter := range c.Filters {
-		filterBits[filter.Index] = filter.Bit
-	}
-	for _, input := range c.Inputs {
-		if input.Excluded {
+		recognized := false
+		for _, input := range c.Inputs {
+			for _, alt := range input.Alternatives {
+				if alt.Role == datasetselection.EvidenceRoleData && strings.EqualFold(alt.Label, filter.Normalized) {
+					recognized = true
+				}
+			}
+		}
+		if !recognized {
 			continue
 		}
-		for _, index := range input.CollisionFilterIndexes {
-			if bit, ok := filterBits[index]; ok {
-				bits[bit] = true
+		for _, input := range c.Inputs {
+			if input.Excluded {
+				continue
+			}
+			if !filterMatchesPath(input.Path, filter.Original, c.ExactMatch) {
+				continue
+			}
+			for _, alt := range input.Alternatives {
+				if alt.Role == datasetselection.EvidenceRoleData && !strings.EqualFold(alt.Label, filter.Normalized) {
+					bits[filter.Bit] = true
+					break
+				}
 			}
 		}
 	}
@@ -580,11 +596,11 @@ func TestCompileDatasetDecisionContextPathPredicatesSeedsAndDuplicates(t *testin
 	if !reflect.DeepEqual(c.Inputs[1].DirectFilterIndexes, []int{0}) {
 		t.Fatalf("full-path direct match=%v", c.Inputs[1].DirectFilterIndexes)
 	}
-	if got := c.Inputs[2].AncestorDirectSeedIndexes; !reflect.DeepEqual(got, []int{1, 4}) {
-		t.Fatalf("nested seed indexes=%v want both actual direct seed sources", got)
+	if got := validDatasetDirectorySeeds(c, c.Inputs[2].Directory); len(got) != 0 {
+		t.Fatalf("parent-directory source incorrectly seeded its child: %v", got)
 	}
-	if len(c.Inputs[3].AncestorDirectSeedIndexes) != 0 {
-		t.Fatalf("unrelated directory inherited seeds: %v", c.Inputs[3].AncestorDirectSeedIndexes)
+	if len(validDatasetDirectorySeeds(c, c.Inputs[3].Directory)) != 0 {
+		t.Fatalf("unrelated directory inherited seeds: %v", validDatasetDirectorySeeds(c, c.Inputs[3].Directory))
 	}
 	if !c.Inputs[3].Excluded {
 		t.Fatal("exclude predicate missing")
@@ -608,16 +624,16 @@ func TestCompileDatasetDecisionContextMembershipSelectionsCanSeedDirectories(t *
 	if !c.Inputs[0].DirectSeedCandidate {
 		t.Fatal("membership-selected file was not indexed as a possible seed")
 	}
-	if got := c.Inputs[1].AncestorDirectSeedIndexes; !reflect.DeepEqual(got, []int{0}) {
+	if got := validDatasetDirectorySeeds(c, c.Inputs[1].Directory); !reflect.DeepEqual(got, []int{0}) {
 		t.Fatalf("membership-selected directory seeds=%v want [0]", got)
 	}
 	// Exclusion is prior to selection and must prevent a seed.
 	excluded := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, []string{"train.csv"})
-	if excluded.Inputs[0].DirectSeedCandidate || len(excluded.Inputs[1].AncestorDirectSeedIndexes) != 0 {
+	if excluded.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(excluded, excluded.Inputs[1].Directory)) != 0 {
 		t.Fatalf("excluded membership source seeded directory: %+v", excluded.Inputs)
 	}
 	companionOnly := compileDecisionFixture([]hfNode{{Path: "train/README.md"}, {Path: "other/metadata.json"}}, []string{"train"}, nil)
-	if companionOnly.Inputs[0].DirectSeedCandidate || len(companionOnly.Inputs[1].AncestorDirectSeedIndexes) != 0 {
+	if companionOnly.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(companionOnly, companionOnly.Inputs[1].Directory)) != 0 {
 		t.Fatalf("directly selected companion became a directory seed: %+v", companionOnly.Inputs)
 	}
 }
@@ -847,6 +863,258 @@ func TestConcreteWorldCaseInsensitiveFirstEligibleEmission(t *testing.T) {
 	}
 	if !got.Records[0].Selected || got.Records[1].Selected || !got.Records[1].Skipped {
 		t.Fatalf("case-equivalent records did not retain first eligible winner: %+v", got.Records)
+	}
+}
+
+func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T) {
+	cases := []struct {
+		name              string
+		nodes             []hfNode
+		filters, excludes []string
+		target            int
+	}{
+		{"train-test-collision", []hfNode{{Path: "train.csv"}, {Path: "test/train_data.parquet"}}, []string{"train", "test"}, nil, 1},
+		{"explicit-filename-extension-directory", []hfNode{{Path: "data/train.csv"}, {Path: "data/test.csv"}, {Path: "metadata.json"}}, []string{"train", "data/train.csv", ".csv", "data/"}, nil, 0},
+		{"both-groups", []hfNode{{Path: "train.csv"}, {Path: "test.csv"}}, []string{"train", "test"}, nil, 0},
+		{"custom-and-train", []hfNode{{Path: "train.csv"}, {Path: "data/custom/chunk.parquet"}}, []string{"train", "custom"}, nil, 1},
+		{"nested-companion-seed", []hfNode{{Path: "train.csv"}, {Path: "train/meta.json"}}, []string{"train"}, nil, 1},
+		{"seed-in-child-directory", []hfNode{{Path: "data/train/test.csv"}, {Path: "data/README.md"}}, []string{"train"}, nil, 1},
+		{"child-companion-is-not-seeded-by-parent", []hfNode{{Path: "folder/train.csv"}, {Path: "folder/sub/notes.json"}}, []string{"train", "default"}, nil, 1},
+		{"direct-companion-filter", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md"}}, []string{"train", "docs/"}, nil, 1},
+		{"direct-lfs-companion-filter", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md", LFS: &hfLfsInfo{Size: 3}}}, []string{"train", ".md"}, nil, 1},
+		{"attribution-tie", []hfNode{{Path: "dir/test.csv"}}, []string{".csv", "test"}, nil, 0},
+		{"excluded-target", []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}}, []string{"train", "test"}, []string{"test/train.csv"}, 1},
+		{"case-winner", []hfNode{{Path: "Train/a.csv"}, {Path: "train/A.CSV"}}, []string{"train", ".csv"}, nil, 1},
+		{"excluded-case-winner", []hfNode{{Path: "Train/a.csv"}, {Path: "train/A.CSV"}}, []string{"train", ".csv"}, []string{"Train/a.csv"}, 1},
+	}
+	checked := 0
+	oracleWorlds := uint64(0)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := compileDecisionFixture(tc.nodes, tc.filters, tc.excludes)
+			gotCan, gotCannot := canEmitDatasetDecision(c, tc.target), canNotEmitDatasetDecision(c, tc.target)
+			wantCan, wantCannot, worlds := oracleQueryOutcomes(c, tc.target)
+			oracleWorlds += worlds
+			if gotCan.Possible != wantCan || gotCannot.Possible != wantCannot {
+				t.Fatalf("query mismatch: can=%t/%t cannot=%t/%t alternatives=%+v filters=%+v inputs=%+v", gotCan.Possible, wantCan, gotCannot.Possible, wantCannot, c.Inputs[tc.target].Alternatives, c.Filters, c.Inputs)
+			}
+			can, cannot := datasetDecisionRefusal(c, tc.target)
+			if can.Possible != wantCan || cannot.Possible != (wantCan && wantCannot) {
+				t.Fatalf("refusal mismatch: can=%t cannot=%t want can=%t cannot=%t", can.Possible, cannot.Possible, wantCan, wantCan && wantCannot)
+			}
+			if gotCan.Possible && !queryWorldEmits(c, gotCan.World, tc.target) {
+				t.Fatal("CanEmit witness does not emit target")
+			}
+			if gotCan.Possible {
+				actual, err := evaluateDatasetDecisionWorld(c, gotCan.World)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := concreteOracleRecords(c, gotCan.World)
+				for i := range want {
+					if actual.Records[i].Selected != want[i].Selected || actual.Records[i].Subdir != want[i].Subdir {
+						t.Fatalf("accepted world record %d differs from independent selection/attribution oracle: got %+v want %+v", i, actual.Records[i], want[i])
+					}
+				}
+			}
+			if gotCannot.Possible {
+				e, err := evaluateDatasetDecisionWorld(c, gotCannot.World)
+				if err != nil || !e.Records[tc.target].Skipped {
+					t.Fatalf("CanNotEmit witness invalid: %+v, %v", e, err)
+				}
+			}
+			checked++
+		})
+	}
+	if checked != len(cases) {
+		t.Fatalf("checked %d cases", checked)
+	}
+	if oracleWorlds == 0 {
+		t.Fatal("independent oracle enumerated no admissible worlds")
+	}
+	t.Logf("independent concrete worlds checked: %d", oracleWorlds)
+}
+
+// Independent exhaustive query oracle: enumerate actual roles and every
+// collision interpretation, then use the separate test-only concrete matcher
+// and emission model; it never calls the production feasibility primitive.
+func oracleQueryOutcomes(c datasetDecisionContext, target int) (can, cannot bool, worlds uint64) {
+	collisions := oracleCollisionBits(c)
+	var residual []uint
+	for bit := range collisions {
+		if !oracleCoreBit(c, bit) {
+			residual = append(residual, bit)
+		}
+	}
+	if len(residual) > 12 {
+		return false, false, 0
+	}
+	for _, core := range oracleCoreAssignments(c) {
+		for mask := 0; mask < 1<<len(residual); mask++ {
+			w := datasetDecisionWorld{DataLabels: map[int]string{}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}}
+			for bit, value := range core {
+				w.SharedToken[bit] = value
+			}
+			for i, bit := range residual {
+				w.SharedToken[bit] = mask&(1<<i) != 0
+			}
+			var visit func(int)
+			visit = func(i int) {
+				if i == len(c.Inputs) {
+					if !oracleWorldValid(c, w, collisions) {
+						return
+					}
+					worlds++
+					selected := concreteOracleSelected(c, w, collisions)
+					if selected[target] {
+						can = true
+					} else {
+						cannot = true
+					}
+					return
+				}
+				for _, alt := range c.Inputs[i].Alternatives {
+					if alt.Role == datasetselection.EvidenceRoleCompanion {
+						w.Companion[i] = true
+					} else {
+						w.DataLabels[i] = alt.Label
+					}
+					visit(i + 1)
+					delete(w.Companion, i)
+					delete(w.DataLabels, i)
+				}
+			}
+			visit(0)
+		}
+	}
+	return
+}
+
+func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
+	direct := make([]bool, len(c.Inputs))
+	dirs := map[string]bool{}
+	for i, in := range c.Inputs {
+		if !in.Excluded {
+			direct[i] = concreteOracleDirect(c, w, i, collisions)
+			if direct[i] && !w.Companion[i] {
+				for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
+					dirs[d] = true
+				}
+			}
+		}
+	}
+	selected := make([]bool, len(c.Inputs))
+	seenExact, seenFold := map[string]bool{}, map[string]bool{}
+	for i, in := range c.Inputs {
+		if seenExact[in.Path] {
+			continue
+		}
+		seenExact[in.Path] = true
+		if in.Excluded {
+			continue
+		}
+		fold := strings.ToLower(in.Path)
+		if seenFold[fold] {
+			continue
+		}
+		if !direct[i] {
+			if !w.Companion[i] || in.LFS {
+				continue
+			}
+			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
+			if d != "." && !dirs[d] {
+				continue
+			}
+		}
+		selected[i] = true
+		seenFold[fold] = true
+	}
+	return selected
+}
+
+func concreteOracleRecords(c datasetDecisionContext, w datasetDecisionWorld) []datasetDecisionRecord {
+	collisions := oracleCollisionBits(c)
+	selected := concreteOracleSelected(c, w, collisions)
+	direct := make([]bool, len(c.Inputs))
+	for i := range c.Inputs {
+		direct[i] = !c.Inputs[i].Excluded && concreteOracleDirect(c, w, i, collisions)
+	}
+	out := make([]datasetDecisionRecord, len(c.Inputs))
+	for i, in := range c.Inputs {
+		out[i].Selected = selected[i]
+		out[i].Skipped = !selected[i]
+		if !selected[i] {
+			continue
+		}
+		best := -1
+		for _, f := range c.Filters {
+			if direct[i] && concreteOracleFilterMatch(i, in, f, c, w, collisions) && len(f.Original) > best {
+				out[i].Subdir = f.Original
+				best = len(f.Original)
+			}
+		}
+	}
+	return out
+}
+
+func concreteOracleFilterMatch(i int, in datasetDecisionInput, f datasetDecisionFilter, c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) bool {
+	pathMatch := filterMatchesPath(in.Path, f.Original, c.ExactMatch)
+	if w.Companion[i] {
+		return pathMatch
+	}
+	recognized := containsString(c.RecognizedLabels, f.Normalized)
+	if !recognized {
+		return pathMatch
+	}
+	if collisions[f.Bit] && !w.SharedToken[f.Bit] {
+		return pathMatch
+	}
+	return w.DataLabels[i] == f.Normalized
+}
+
+func BenchmarkDatasetDecisionQueryThousandFileInventory(b *testing.B) {
+	nodes := make([]hfNode, 1000)
+	for i := range nodes {
+		nodes[i].Path = fmt.Sprintf("train/part-%04d.parquet", i)
+	}
+	c := compileDecisionFixture(nodes, []string{"train", ".parquet"}, nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = canEmitDatasetDecision(c, 500)
+	}
+}
+
+func BenchmarkDatasetDecisionCompileAndAllQueries(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("files-%d", size), func(b *testing.B) {
+			nodes := make([]hfNode, size)
+			for i := range nodes {
+				nodes[i].Path = fmt.Sprintf("train/part-%04d.parquet", i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				c := compileDecisionFixture(nodes, []string{"train", ".parquet"}, nil)
+				for i := range c.Inputs {
+					_ = canEmitDatasetDecision(c, i)
+					_ = canNotEmitDatasetDecision(c, i)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDatasetDecisionAmbiguousFirstVariableQuery(b *testing.B) {
+	nodes := make([]hfNode, 100)
+	for i := range nodes {
+		nodes[i].Path = fmt.Sprintf("metadata/file-%04d.txt", i)
+	}
+	c := compileDecisionFixture(nodes, []string{"default"}, nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = datasetDecisionRefusal(c, 0)
 	}
 }
 
