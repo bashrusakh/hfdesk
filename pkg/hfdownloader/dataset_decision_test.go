@@ -111,6 +111,28 @@ func TestCompileDatasetDecisionContextPathPredicatesSeedsAndDuplicates(t *testin
 	}
 }
 
+func TestCompileDatasetDecisionContextMembershipSelectionsCanSeedDirectories(t *testing.T) {
+	// The filter "train" selects train.csv by membership even though the
+	// ordinary complete-path matcher does not match that filename. It must
+	// still seed companion scope for siblings beneath the selected directory.
+	c := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, nil)
+	if !c.Inputs[0].DirectSeedCandidate {
+		t.Fatal("membership-selected file was not indexed as a possible seed")
+	}
+	if got := c.Inputs[1].AncestorDirectSeedIndexes; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("membership-selected directory seeds=%v want [0]", got)
+	}
+	// Exclusion is prior to selection and must prevent a seed.
+	excluded := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, []string{"train.csv"})
+	if excluded.Inputs[0].DirectSeedCandidate || len(excluded.Inputs[1].AncestorDirectSeedIndexes) != 0 {
+		t.Fatalf("excluded membership source seeded directory: %+v", excluded.Inputs)
+	}
+	companionOnly := compileDecisionFixture([]hfNode{{Path: "train/README.md"}, {Path: "other/metadata.json"}}, []string{"train"}, nil)
+	if companionOnly.Inputs[0].DirectSeedCandidate || len(companionOnly.Inputs[1].AncestorDirectSeedIndexes) != 0 {
+		t.Fatalf("directly selected companion became a directory seed: %+v", companionOnly.Inputs)
+	}
+}
+
 func TestCompileDatasetDecisionContextIsSnapshot(t *testing.T) {
 	filters := []string{"train"}
 	excludes := []string{"draft"}
@@ -124,6 +146,218 @@ func TestCompileDatasetDecisionContextIsSnapshot(t *testing.T) {
 	}
 	if c.Inputs[0].DirectCoreConditions == 0 || c.Inputs[0].PossibleCore == 0 {
 		t.Fatal("expected core condition and actual possible-label bits")
+	}
+}
+
+func TestEvaluateDatasetDecisionWorldUsesConditionalCompanionScope(t *testing.T) {
+	nodes := []hfNode{{Path: "train.csv"}, {Path: "train/README.md"}, {Path: "other/meta.json"}, {Path: "README.md"}, {Path: "root.csv"}}
+	c := compileDecisionFixture(nodes, []string{"train"}, nil)
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{
+		2: {Role: datasetselection.EvidenceRoleCompanion},
+		3: {Role: datasetselection.EvidenceRoleCompanion},
+	}, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[0].Selected || !got.Records[1].Selected || got.Records[2].Selected || !got.Records[3].Selected {
+		t.Fatalf("unexpected direct/companion disposition: %+v", got.Records)
+	}
+	if got.Records[4].Selected {
+		t.Fatalf("unselected root data fell back as a companion: %+v", got.Records[4])
+	}
+}
+
+func TestEvaluateDatasetDecisionWorldHonorsFirstLongestAttributionAndLFS(t *testing.T) {
+	nodes := []hfNode{{Path: "dir/test.csv"}, {Path: "dir/data.bin", LFS: &hfLfsInfo{Size: 1}}, {Path: "dir/data.json"}}
+	c := compileDecisionFixture(nodes, []string{".csv", "test"}, nil)
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{
+		0: {Role: datasetselection.EvidenceRoleData, Label: "test"},
+		1: {Role: datasetselection.EvidenceRoleCompanion},
+		2: {Role: datasetselection.EvidenceRoleCompanion},
+	}, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[0].Selected || got.Records[0].Subdir != ".csv" {
+		t.Fatalf("equal-length filters must preserve first input attribution: %+v", got.Records[0])
+	}
+	if got.Records[1].Selected || !got.Records[1].Skipped {
+		t.Fatalf("unmatched LFS payload must not inherit companion scope: %+v", got.Records[1])
+	}
+	if !got.Records[2].Selected {
+		t.Fatalf("nested non-LFS companion in selected directory should remain: %+v", got.Records[2])
+	}
+}
+
+func mustDecisionWorld(t *testing.T, c datasetDecisionContext, choices map[int]datasetDecisionRoleLabel, shared map[uint]bool) datasetDecisionWorld {
+	t.Helper()
+	w, err := datasetDecisionWorldFromAlternatives(c, choices, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func TestConcreteWorldSharedCollisionAndIndependentFilter(t *testing.T) {
+	nodes := []hfNode{{Path: "test/train.csv"}, {Path: "train_dataset.csv"}}
+	c := compileDecisionFixture(nodes, []string{"train", " TRAIN "}, nil)
+	bit := c.FilterBits["train"]
+	choices := map[int]datasetDecisionRoleLabel{
+		0: {Role: datasetselection.EvidenceRoleData, Label: "train"},
+	}
+	membershipWorld := mustDecisionWorld(t, c, choices, map[uint]bool{bit: true})
+	ordinaryWorld := mustDecisionWorld(t, c, choices, map[uint]bool{bit: false})
+	a, err := evaluateDatasetDecisionWorld(c, membershipWorld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := evaluateDatasetDecisionWorld(c, ordinaryWorld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Records[0].Selected || !b.Records[0].Selected || !a.Records[1].Selected || b.Records[1].Selected {
+		t.Fatalf("shared token interpretations collapsed: membership=%+v ordinary=%+v", a.Records, b.Records)
+	}
+
+	// An unrelated ordinary extension term independently selects data in
+	// either shared-token interpretation.
+	extensionContext := compileDecisionFixture(nodes, []string{"train", ".csv"}, nil)
+	extensionBit := extensionContext.FilterBits["train"]
+	for _, membershipChoice := range []bool{true, false} {
+		world := mustDecisionWorld(t, extensionContext, choices, map[uint]bool{extensionBit: membershipChoice})
+		got, err := evaluateDatasetDecisionWorld(extensionContext, world)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Records[0].Selected || !got.Records[1].Selected {
+			t.Fatalf("independent extension term failed to select both matched paths for membership=%t: %+v", membershipChoice, got.Records)
+		}
+	}
+}
+
+func TestConcreteWorldDefaultDataDoesNotSelfSeedCompanionAlternative(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "nested/data.json"}}, []string{"default"}, nil)
+	data := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{0: {Role: datasetselection.EvidenceRoleData, Label: "default"}}, nil)
+	companion := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{0: {Role: datasetselection.EvidenceRoleCompanion}}, nil)
+	a, err := evaluateDatasetDecisionWorld(c, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := evaluateDatasetDecisionWorld(c, companion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Records[0].Selected || b.Records[0].Selected {
+		t.Fatalf("default data/companion role distinction lost: data=%+v companion=%+v", a.Records[0], b.Records[0])
+	}
+}
+
+func TestConcreteWorldMembershipSelectionSeedsNestedCompanionDirectory(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "partition/train_dataset.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, nil)
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{1: {Role: datasetselection.EvidenceRoleCompanion}}, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[0].Selected || !got.Records[1].Selected {
+		t.Fatalf("membership-selected underscore path did not seed companion scope: %+v", got.Records)
+	}
+}
+
+func TestConcreteWorldDirectCompanionDoesNotSeedNestedScope(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train.csv"},
+		{Path: "other/README.md"},
+		{Path: "other/metadata.json"},
+	}, []string{"train", "README"}, []string{"train.csv"})
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{
+		1: {Role: datasetselection.EvidenceRoleCompanion},
+		2: {Role: datasetselection.EvidenceRoleCompanion},
+	}, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[1].Selected || got.Records[2].Selected {
+		t.Fatalf("directly selected companion incorrectly seeded nested scope: %+v", got.Records)
+	}
+}
+
+func TestConcreteWorldAttributionTieFollowsFilterOrder(t *testing.T) {
+	nodes := []hfNode{{Path: "dir/test.csv"}}
+	for _, tc := range []struct {
+		filters []string
+		want    string
+	}{{[]string{".csv", "test"}, ".csv"}, {[]string{"test", ".csv"}, "test"}} {
+		c := compileDecisionFixture(nodes, tc.filters, nil)
+		got, err := evaluateDatasetDecisionWorld(c, mustDecisionWorld(t, c, nil, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Records[0].Subdir != tc.want {
+			t.Errorf("filters %v attributed %q, want %q", tc.filters, got.Records[0].Subdir, tc.want)
+		}
+	}
+}
+
+func TestConcreteWorldRequiresAdmissibleExplicitAmbiguousRole(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "meta.json"}}, []string{"default"}, nil)
+	if _, err := datasetDecisionWorldFromAlternatives(c, nil, nil); err == nil {
+		t.Fatal("ambiguous evidence silently defaulted to companion")
+	}
+	if _, err := datasetDecisionWorldFromAlternatives(c, map[int]datasetDecisionRoleLabel{0: {Role: datasetselection.EvidenceRoleData, Label: "train"}}, nil); err == nil {
+		t.Fatal("inadmissible data label accepted")
+	}
+}
+
+func TestExcludedCollisionDoesNotCreateSharedTokenVariable(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "test/train.csv"}, {Path: "train_dataset.csv"}}, []string{"train"}, []string{"test/train.csv"})
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{0: {Role: datasetselection.EvidenceRoleData, Label: "test"}}, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[0].Skipped || !got.Records[1].Selected {
+		t.Fatalf("excluded collision affected active membership interpretation: %+v", got.Records)
+	}
+}
+
+func TestConcreteWorldKeepsMultipleCustomCollisionBitsDistinct(t *testing.T) {
+	nodes := []hfNode{
+		{Path: "test/alpha_group.csv"},
+		{Path: "validation/beta_group.csv"},
+		{Path: "data/alpha_group/chunk.csv"},
+		{Path: "data/beta_group/chunk.csv"},
+	}
+	c := compileDecisionFixture(nodes, []string{"alpha_group", " ALPHA_GROUP ", "beta_group"}, nil)
+	alphaBit, betaBit := c.FilterBits["alpha_group"], c.FilterBits["beta_group"]
+	if alphaBit == betaBit {
+		t.Fatal("distinct custom collision tokens shared one bit")
+	}
+	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{
+		0: {Role: datasetselection.EvidenceRoleData, Label: "test"},
+		1: {Role: datasetselection.EvidenceRoleData, Label: "validation"},
+	}, map[uint]bool{alphaBit: true, betaBit: false})
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Records[0].Selected || !got.Records[1].Selected || !got.Records[2].Selected || !got.Records[3].Selected {
+		t.Fatalf("distinct custom token interpretations were not applied globally: %+v", got.Records)
+	}
+}
+
+func TestConcreteWorldCaseInsensitiveFirstEligibleEmission(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "Train/file.csv"}, {Path: "train/FILE.CSV"}}, []string{"train", ".csv"}, nil)
+	w := mustDecisionWorld(t, c, nil, nil)
+	got, err := evaluateDatasetDecisionWorld(c, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Records[0].Selected || got.Records[1].Selected || !got.Records[1].Skipped {
+		t.Fatalf("case-equivalent records did not retain first eligible winner: %+v", got.Records)
 	}
 }
 
