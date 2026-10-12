@@ -185,6 +185,27 @@ not implement the endpoint (404), transient/server failures, network errors, and
 non-gated responses do not block analysis; the existing tree/metadata analysis
 is used instead.
 
+For GGUF repositories, a quantization filter keeps matching GGUF files and
+matching README documents (for example, `model-Q4_K_M.gguf` and
+`README-Q4_K_M.md` for `q4_k_m`); that README filename match does not turn the
+selection into a mixed-format download. Unmatched files such as configs and
+other README files are omitted from this matched-only selection. A filter that
+also selects another payload format, such as safetensors, retains the ordinary
+mixed-format companion behavior. Existing path, directory, and extension
+filters keep their usual matching rules.
+
+For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
+membership can be inferred from conventional split paths/names or
+`data/<group>/` paths. Send a group's `filter_value` with `exactMatch: true` to
+`/api/plan` or `/api/download`; the planner selects that group's data files and
+keeps applicable repository companions. Ambiguous files that could affect a
+selected group cause planning to fail with the standard JSON error response,
+rather than silently broadening or narrowing the selection. Excluding the
+ambiguous file resolves that ambiguity. This selection behavior does not claim
+to identify every possible dataset file layout; use explicit path/extension
+filters where appropriate. A README-only filter does not activate GGUF-only
+selection.
+
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
 no root architecture config):
