@@ -138,6 +138,19 @@ func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.
 	assertPaths(t, planPaths(plan), []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "metadata.json"})
 }
 
+func TestPlanRepoDatasetGroupLabelPathCollisionRefuses(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "test/train.csv", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err == nil || plan != nil {
+		t.Fatalf("colliding label/path plan = %+v, err=%v; want refusal", plan, err)
+	}
+}
+
 func TestPlanRepoExactGGUFAndNoFilterRegression(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "model-q6_k.gguf", LFS: &hfLfsInfo{Size: 100}},

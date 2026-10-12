@@ -327,6 +327,12 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			if explicitlyRequested {
 				continue
 			}
+			for _, filter := range job.Filters {
+				group := strings.ToLower(strings.TrimSpace(filter))
+				if datasetGroups[group] && filterMatchesPath(n.Path, group, true) {
+					return nil, fmt.Errorf("dataset filter %q conflicts with ambiguous membership of %q", filter, n.Path)
+				}
+			}
 			dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/"))
 			if dir == "." || containsPath(matchedDirs, dir) {
 				for _, filter := range job.Filters {
