@@ -79,6 +79,65 @@ func TestPlanRepoDatasetSplitPathFilter(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"dataset_info.json", "train/data-00000-of-00001.parquet"})
 }
 
+func TestPlanRepoDatasetGroupFiltersSelectMembership(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "test_data.csv", Size: 10},
+		{Type: "file", Path: "data/customdata/chunk.arrow", Size: 10},
+		{Type: "file", Path: "default.parquet", Size: 10},
+		{Type: "file", Path: "config.json", Size: 10},
+		{Type: "file", Path: "dataset_info.json", Size: 10},
+		{Type: "file", Path: "README.md", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "config.json", "dataset_info.json", "README.md"})
+
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"customdata", "default"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("multi-group PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"})
+}
+
+func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "unknown.json", Size: 10},
+		{Type: "file", Path: "elsewhere/notes.txt", Size: 10},
+		{Type: "file", Path: "metadata.json", LFS: &hfLfsInfo{Size: 10}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}
+	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
+		t.Fatalf("ambiguous root companion plan = %+v, err=%v; want whole-plan refusal", plan, err)
+	}
+	job.Excludes = []string{"unknown.json"}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("excluded ambiguity: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv"})
+	job.Excludes = nil
+	job.Filters = []string{"train", "unknown.json"}
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("explicitly requested ambiguous file: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "unknown.json"})
+	job.Filters = nil
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("unfiltered plan: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "metadata.json"})
+}
+
 func TestPlanRepoExactGGUFAndNoFilterRegression(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "model-q6_k.gguf", LFS: &hfLfsInfo{Size: 100}},

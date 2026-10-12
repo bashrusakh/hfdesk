@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 func TestAnalyzeDataset(t *testing.T) {
@@ -208,6 +210,46 @@ func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
 	}
 	if got := info.Dataset.Formats; len(got) != 5 || got[0] != "arrow" || got[1] != "csv" || got[2] != "json" || got[3] != "parquet" || got[4] != "txt" {
 		t.Errorf("dataset formats = %v, want [arrow csv json parquet txt]", got)
+	}
+}
+
+func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
+	paths := []string{"train.csv", "test_data.csv", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/data", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.PopulateDownloadSelection()
+	request := info.RecommendedDownload
+	if request == nil || !request.ExactMatch || len(request.Filters) != 1 || request.Filters[0] != "train" {
+		t.Fatalf("recommended request = %+v", request)
+	}
+	plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: request.Filters, ExactMatch: request.ExactMatch}, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, item := range plan.Items {
+		got = append(got, item.RelativePath)
+	}
+	want := []string{"train.csv", "config.json", "dataset_info.json", "README.md"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("planned paths = %v, want %v", got, want)
 	}
 }
 
