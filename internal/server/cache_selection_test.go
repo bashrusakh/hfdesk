@@ -4581,6 +4581,9 @@ func TestSelectedDeleteTracksBothRealGenerationsDuringRetry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("both downloader generations did not unwind")
 	}
+	// Reselect after both writers exit: the in-flight transfer may have changed
+	// the selected member's size, making the earlier request body stale.
+	body = selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
 	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete stayed busy after both generations exited: status=%d body=%s", w.Code, w.Body.String())
