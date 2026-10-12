@@ -39,6 +39,7 @@ type datasetDecisionInput struct {
 	// DirectFilterIndexes retain input filter order; a match uses the existing
 	// complete-path matcher, not a second delimiter/token interpretation.
 	DirectFilterIndexes              []int
+	MembershipFilterIndexes          []int
 	RecognizedTermFilterIndexes      []int
 	RecognizedCompanionFilterIndexes []int
 	CollisionFilterIndexes           []int
@@ -47,11 +48,17 @@ type datasetDecisionInput struct {
 	GroupCoreConditions              uint64
 	GroupResidualConditions          []string
 	AncestorDirectSeedIndexes        []int
-	ExactDuplicateOf                 int
-	CaseDuplicateOf                  int
-	ExactDuplicateEligible           bool
-	CaseDuplicateEligible            bool
-	LFS                              bool
+	// DirectSeedCandidate is an unexcluded inventory source that a direct
+	// filter can select in at least one admissible membership interpretation.
+	// A membership selection is also a directory seed even when its group
+	// token is not an ordinary path match (for example, "train" selecting
+	// train.csv).
+	DirectSeedCandidate    bool
+	ExactDuplicateOf       int
+	CaseDuplicateOf        int
+	ExactDuplicateEligible bool
+	CaseDuplicateEligible  bool
+	LFS                    bool
 }
 
 // datasetDecisionContext is an immutable, deterministic snapshot of inputs
@@ -180,6 +187,12 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 			}
 			if _, recognized := recognizedSet[f.Normalized]; recognized {
 				if bit, ok := coreBits[f.Normalized]; ok && in.PossibleCore&(1<<bit) != 0 {
+					in.MembershipFilterIndexes = append(in.MembershipFilterIndexes, f.Index)
+				}
+				if _, ok := residualBit[f.Normalized]; ok && containsString(in.PossibleResidual, f.Normalized) {
+					in.MembershipFilterIndexes = append(in.MembershipFilterIndexes, f.Index)
+				}
+				if bit, ok := coreBits[f.Normalized]; ok && in.PossibleCore&(1<<bit) != 0 {
 					in.GroupCoreConditions |= 1 << bit
 				}
 				if _, ok := residualBit[f.Normalized]; ok && containsString(in.PossibleResidual, f.Normalized) {
@@ -221,13 +234,18 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 		}
 		c.Inputs[i] = in
 	}
+	for i := range c.Inputs {
+		in := &c.Inputs[i]
+		hasPossibleDataRole := in.PossibleCore != 0 || len(in.PossibleResidual) != 0
+		in.DirectSeedCandidate = !in.Excluded && hasPossibleDataRole && (len(in.DirectFilterIndexes) != 0 || in.GroupCoreConditions != 0 || len(in.GroupResidualConditions) != 0)
+	}
 	// Index actual, non-excluded direct matches by containing directory, then
 	// record source indexes that seed each input's containing directory or one
 	// of its ancestors. Lookup cost follows path depth plus returned evidence,
 	// rather than comparing every pair of inventory entries.
 	seedsByDirectory := make(map[string][]int)
 	for i, input := range c.Inputs {
-		if input.Excluded || len(input.DirectFilterIndexes) == 0 {
+		if !input.DirectSeedCandidate {
 			continue
 		}
 		dir := path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
