@@ -886,6 +886,7 @@ func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T
 		{"excluded-target", []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}}, []string{"train", "test"}, []string{"test/train.csv"}, 1},
 		{"case-winner", []hfNode{{Path: "Train/a.csv"}, {Path: "train/A.CSV"}}, []string{"train", ".csv"}, nil, 1},
 		{"excluded-case-winner", []hfNode{{Path: "Train/a.csv"}, {Path: "train/A.CSV"}}, []string{"train", ".csv"}, []string{"Train/a.csv"}, 1},
+		{"case-winner-first-eligible-not-first-member", []hfNode{{Path: "train.csv"}, {Path: "metadata.json", LFS: &hfLfsInfo{Size: 4}}, {Path: "METADATA.JSON"}}, []string{"train"}, nil, 2},
 	}
 	checked := 0
 	oracleWorlds := uint64(0)
@@ -933,6 +934,381 @@ func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T
 		t.Fatal("independent oracle enumerated no admissible worlds")
 	}
 	t.Logf("independent concrete worlds checked: %d", oracleWorlds)
+}
+
+func TestStableDirectEvaluationWithRoleAndSharedTokenAlternatives(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "test/train.csv"},
+		{Path: "notes.json"},
+	}, []string{"test", "train", ".csv", ".json"}, nil)
+	if len(c.Inputs[1].Alternatives) < 2 {
+		t.Fatalf("fixture did not contain role ambiguity: %+v", c.Inputs[1].Alternatives)
+	}
+	if len(collisionTokenBits(c)) == 0 {
+		t.Fatal("fixture did not contain a shared-token collision")
+	}
+	if !stableDirectEvaluation(c) {
+		t.Fatalf("explicit accepted filter union was not certified stable: %+v", c.Inputs)
+	}
+	for i := range c.Inputs {
+		gotCan, gotCannot := datasetDecisionRefusal(c, i)
+		wantCan, wantCannot, _ := oracleQueryOutcomes(c, i)
+		if gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+			t.Fatalf("input %d refusal=%t/%t oracle=%t/%t", i, gotCan.Possible, gotCannot.Possible, wantCan, wantCannot)
+		}
+	}
+	first, second := c.Inputs[0].Alternatives[0], c.Inputs[0].Alternatives[1]
+	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+	shared := map[uint]bool{c.FilterBits["test"]: true, c.FilterBits["train"]: true}
+	one, err := datasetDecisionWorldFromAlternatives(c, map[int]datasetDecisionRoleLabel{0: first, 1: companion}, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := datasetDecisionWorldFromAlternatives(c, map[int]datasetDecisionRoleLabel{0: second, 1: companion}, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEval, err := evaluateDatasetDecisionWorld(c, one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEval, err := evaluateDatasetDecisionWorld(c, two)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstEval.Records[0].Selected || !secondEval.Records[0].Selected || firstEval.Records[0].Subdir == secondEval.Records[0].Subdir {
+		t.Fatalf("fixture must preserve selection while varying attribution: first=%+v second=%+v", firstEval.Records[0], secondEval.Records[0])
+	}
+}
+
+func TestStableRoleAmbiguityDoesNotRequireEveryInputDirect(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train/data.parquet"},
+		{Path: "notes.json"},
+		{Path: "README.md"},
+		{Path: "unselected.bin"},
+		{Path: "test/train.csv"},
+	}, []string{"train", ".parquet", ".json"}, []string{"test/train.csv"})
+	if len(c.Inputs[1].Alternatives) < 2 {
+		t.Fatalf("fixture must preserve default data/companion ambiguity: %+v", c.Inputs[1].Alternatives)
+	}
+	if len(collisionTokenBits(c)) != 0 {
+		t.Fatalf("excluded multi-alternative input must not create an active collision: %v", collisionTokenBits(c))
+	}
+	if !stableDatasetDecisionEvaluation(c) {
+		t.Fatalf("role ambiguity masked by explicit path match should be certified: %+v", c.Inputs)
+	}
+	if stableDirectEvaluation(c) {
+		t.Fatal("proof must not require every active input to be directly selected")
+	}
+	for i := range c.Inputs {
+		gotCan, gotCannot := datasetDecisionRefusal(c, i)
+		wantCan, wantCannot, _ := oracleQueryOutcomes(c, i)
+		if gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+			t.Fatalf("input %d refusal=%t/%t oracle=%t/%t", i, gotCan.Possible, gotCannot.Possible, wantCan, wantCannot)
+		}
+		if gotCan.Possible {
+			actual, err := evaluateDatasetDecisionWorld(c, gotCan.World)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := concreteOracleRecords(c, gotCan.World)
+			for j := range want {
+				if actual.Records[j] != want[j] {
+					t.Fatalf("input %d accepted witness record %d=%+v oracle=%+v", i, j, actual.Records[j], want[j])
+				}
+			}
+		}
+	}
+}
+
+func TestUniqueDatasetDecisionWorldKeepsPartialInventoryFast(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train.csv"},
+		{Path: "README.md"},
+		{Path: "raw.bin"},
+	}, []string{"train"}, []string{"raw.bin"})
+	if !uniqueDatasetDecisionWorld(c) {
+		t.Fatalf("singleton roles without token collisions should have one world: %+v", c.Inputs)
+	}
+	if stableDirectEvaluation(c) {
+		t.Fatal("fixture must include ordinary unmatched/excluded entries, not rely on all-direct proof")
+	}
+	for i := range c.Inputs {
+		gotCan, gotCannot := datasetDecisionRefusal(c, i)
+		wantCan, wantCannot, _ := oracleQueryOutcomes(c, i)
+		if gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+			t.Fatalf("input %d refusal=%t/%t oracle=%t/%t", i, gotCan.Possible, gotCannot.Possible, wantCan, wantCannot)
+		}
+	}
+}
+
+func TestStableRoleProofFallsBackForRealRoleAndTokenUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		nodes   []hfNode
+		filters []string
+		target  int
+	}{
+		{"unmasked-role-ambiguity", []hfNode{{Path: "nested/data.json"}}, []string{"default"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := compileDecisionFixture(tc.nodes, tc.filters, nil)
+			if stableDatasetDecisionEvaluation(c) {
+				t.Fatal("uncertain role disposition must not be certified")
+			}
+			if stableDirectEvaluation(c) {
+				t.Fatal("unmasked role ambiguity must not satisfy all-input direct proof")
+			}
+			gotCan, gotCannot := datasetDecisionRefusal(c, tc.target)
+			wantCan, wantCannot, _ := oracleQueryOutcomes(c, tc.target)
+			if gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+				t.Fatalf("refusal=%t/%t oracle=%t/%t", gotCan.Possible, gotCannot.Possible, wantCan, wantCan && wantCannot)
+			}
+		})
+	}
+}
+
+func TestStableEvaluationAcrossRealEnglishTokenCollisionAndImplicitCompanions(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "data/english/items-0000.parquet"},
+		{Path: "data/english/train.csv"},
+		{Path: "README.md"},
+		{Path: "config.json"},
+		{Path: "data/README.md"},
+	}, []string{"english", "train"}, nil)
+	if !collisionTokenBits(c)[c.FilterBits["english"]] {
+		t.Fatal("fixture must retain the real english-directory shared-token collision")
+	}
+	for _, i := range []int{2, 3, 4} {
+		if len(c.Inputs[i].Alternatives) != 1 || c.Inputs[i].Alternatives[0].Role != datasetselection.EvidenceRoleCompanion {
+			t.Fatalf("metadata input %d must remain an implicit companion: %+v", i, c.Inputs[i].Alternatives)
+		}
+	}
+	if !stableDatasetDecisionEvaluation(c) {
+		t.Fatalf("direct selections and companion fallback should be invariant: %+v", c.Inputs)
+	}
+	world := mustDecisionWorld(t, c, nil, map[uint]bool{c.FilterBits["english"]: false})
+	evaluation, err := evaluateDatasetDecisionWorld(c, world)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, record := range evaluation.Records {
+		if !record.Selected {
+			t.Fatalf("fixture input %d should be selected in the baseline world (including seeded data/README.md): %+v", i, record)
+		}
+	}
+	checkDatasetDecisionAgainstOracle(t, c)
+}
+
+func TestStableEvaluationStillFallsBackWhenCollisionChangesSeededCompanionSet(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train.csv"},
+		{Path: "test/train.csv"},
+		{Path: "test/README.md"},
+	}, []string{"train"}, nil)
+	if len(collisionTokenBits(c)) == 0 {
+		t.Fatal("fixture must have a shared train-token collision")
+	}
+	if stableDatasetDecisionEvaluation(c) {
+		t.Fatal("token-dependent direct seed must not certify one emitted set")
+	}
+	can, cannot, _ := oracleQueryOutcomes(c, 2)
+	if !can || !cannot {
+		t.Fatalf("fixture must show both seeded and unseeded companion outcomes, oracle can/cannot=%t/%t", can, cannot)
+	}
+	gotCan, gotCannot := datasetDecisionRefusal(c, 2)
+	if gotCan.Possible != can || gotCannot.Possible != cannot {
+		t.Fatalf("solver refusal=%t/%t oracle=%t/%t", gotCan.Possible, gotCannot.Possible, can, cannot)
+	}
+}
+
+func TestStableEvaluationRejectsConditionallySeededAmbiguousRole(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "folder/train.csv"},
+		{Path: "folder/metadata.json"},
+	}, []string{"train"}, nil)
+	if len(c.Inputs[1].Alternatives) < 2 {
+		t.Fatalf("fixture needs data/companion alternatives: %+v", c.Inputs[1].Alternatives)
+	}
+	if stableDatasetDecisionEvaluation(c) {
+		t.Fatal("companion fallback role changes selection inside a fixed seeded directory")
+	}
+	can, cannot, _ := oracleQueryOutcomes(c, 1)
+	if !can || !cannot {
+		t.Fatalf("fixture must show selected companion vs unselected data worlds, can/cannot=%t/%t", can, cannot)
+	}
+	gotCan, gotCannot := datasetDecisionRefusal(c, 1)
+	if gotCan.Possible != can || gotCannot.Possible != cannot {
+		t.Fatalf("refusal=%t/%t oracle=%t/%t", gotCan.Possible, gotCannot.Possible, can, cannot)
+	}
+}
+
+func TestStableEvaluationRejectsRoleDependentDirectorySeed(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "folder/data.json"},
+		{Path: "folder/README.md"},
+	}, []string{"default"}, nil)
+	if len(c.Inputs[0].Alternatives) < 2 {
+		t.Fatalf("fixture needs data/companion ambiguity: %+v", c.Inputs[0].Alternatives)
+	}
+	if stableDatasetDecisionEvaluation(c) {
+		t.Fatal("role-dependent data seed changes nested companion selection")
+	}
+	can, cannot, _ := oracleQueryOutcomes(c, 1)
+	if !can || !cannot {
+		t.Fatalf("fixture must vary nested companion selection, can/cannot=%t/%t", can, cannot)
+	}
+	gotCan, gotCannot := datasetDecisionRefusal(c, 1)
+	if gotCan.Possible != can || gotCannot.Possible != cannot {
+		t.Fatalf("refusal=%t/%t oracle=%t/%t", gotCan.Possible, gotCannot.Possible, can, cannot)
+	}
+}
+
+func checkDatasetDecisionAgainstOracle(t *testing.T, c datasetDecisionContext) {
+	t.Helper()
+	for i := range c.Inputs {
+		gotCan, gotCannot := datasetDecisionRefusal(c, i)
+		wantCan, wantCannot, worlds := oracleQueryOutcomes(c, i)
+		if worlds == 0 || gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+			t.Fatalf("input %d refusal=%t/%t oracle=%t/%t worlds=%d", i, gotCan.Possible, gotCannot.Possible, wantCan, wantCan && wantCannot, worlds)
+		}
+		if gotCan.Possible {
+			actual, err := evaluateDatasetDecisionWorld(c, gotCan.World)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := concreteOracleRecords(c, gotCan.World)
+			for j := range want {
+				if actual.Records[j] != want[j] {
+					t.Fatalf("input %d witness record %d=%+v oracle=%+v", i, j, actual.Records[j], want[j])
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkDatasetDecisionCompileAndAllQueriesStableAmbiguous(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("files-%d", size), func(b *testing.B) {
+			nodes := make([]hfNode, size)
+			for i := range nodes {
+				ext := ".parquet"
+				if i%2 != 0 {
+					ext = ".json"
+				}
+				nodes[i].Path = fmt.Sprintf("test/train/part-%04d%s", i, ext)
+			}
+			files := make([]datasetselection.File, len(nodes))
+			for i := range nodes {
+				files[i].Path = nodes[i].Path
+			}
+			membership := datasetselection.Recognize(files)
+			filters := []string{"test", "train", ".parquet", ".json"}
+			for _, optimized := range []bool{false, true} {
+				name := "solver"
+				if optimized {
+					name = "stable"
+				}
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.ResetTimer()
+					for n := 0; n < b.N; n++ {
+						c := compileDatasetDecisionContext(nodes, membership, filters, nil, true, true, false)
+						if !stableDirectEvaluation(c) {
+							b.Fatal("benchmark inventory is not a stable direct-selection context")
+						}
+						if !optimized {
+							c.uniqueEvaluation = nil
+						}
+						for i := range c.Inputs {
+							_, _ = datasetDecisionRefusal(c, i)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkDatasetDecisionCompileAndAllQueriesMaskedRoleAmbiguity(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("files-%d", size), func(b *testing.B) {
+			nodes := make([]hfNode, 0, size)
+			for i := 0; i < size-4; i++ {
+				nodes = append(nodes, hfNode{Path: fmt.Sprintf("train/part-%04d.parquet", i)})
+			}
+			nodes = append(nodes, hfNode{Path: "notes.json"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"}, hfNode{Path: "test/train.csv"})
+			files := make([]datasetselection.File, len(nodes))
+			for i := range nodes {
+				files[i].Path = nodes[i].Path
+			}
+			membership := datasetselection.Recognize(files)
+			filters, excludes := []string{"train", ".parquet", ".json"}, []string{"test/train.csv"}
+			for _, optimized := range []bool{false, true} {
+				name := "solver"
+				if optimized {
+					name = "stable"
+				}
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.ResetTimer()
+					for n := 0; n < b.N; n++ {
+						c := compileDatasetDecisionContext(nodes, membership, filters, excludes, true, true, false)
+						if !stableDatasetDecisionEvaluation(c) {
+							b.Fatal("benchmark inventory does not satisfy masked-role proof")
+						}
+						if !optimized {
+							c.uniqueEvaluation = nil
+						}
+						for i := range c.Inputs {
+							_, _ = datasetDecisionRefusal(c, i)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkDatasetDecisionCompileAndAllQueriesRealTokenCollision(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("files-%d", size), func(b *testing.B) {
+			nodes := make([]hfNode, 0, size)
+			for i := 0; i < size-4; i++ {
+				nodes = append(nodes, hfNode{Path: fmt.Sprintf("data/english/items-%04d.parquet", i)})
+			}
+			nodes = append(nodes, hfNode{Path: "data/english/train.csv"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"}, hfNode{Path: "data/README.md"})
+			files := make([]datasetselection.File, len(nodes))
+			for i := range nodes {
+				files[i].Path = nodes[i].Path
+			}
+			membership := datasetselection.Recognize(files)
+			filters := []string{"english", "train"}
+			for _, optimized := range []bool{false, true} {
+				name := "solver"
+				if optimized {
+					name = "stable"
+				}
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.ResetTimer()
+					for n := 0; n < b.N; n++ {
+						c := compileDatasetDecisionContext(nodes, membership, filters, nil, true, true, false)
+						if len(collisionTokenBits(c)) == 0 || !stableDatasetDecisionEvaluation(c) {
+							b.Fatal("inventory does not have the real-token stable-selection proof")
+						}
+						if !optimized {
+							c.uniqueEvaluation = nil
+						}
+						for i := range c.Inputs {
+							_, _ = datasetDecisionRefusal(c, i)
+						}
+					}
+				})
+			}
+		})
+	}
 }
 
 // Independent exhaustive query oracle: enumerate actual roles and every
