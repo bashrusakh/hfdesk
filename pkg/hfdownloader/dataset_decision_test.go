@@ -907,6 +907,73 @@ func TestConcreteWorldCaseInsensitiveFirstEligibleEmission(t *testing.T) {
 	}
 }
 
+func TestFeasibilityQueriesRespectJointSkipAndEmissionConstraints(t *testing.T) {
+	cases := []struct {
+		name   string
+		nodes  []hfNode
+		filter []string
+		target int
+	}{
+		{"exact-duplicate-suppression", []hfNode{{Path: "train.csv"}, {Path: "folder/train.csv"}, {Path: "folder/notes.bin", LFS: &hfLfsInfo{Size: 4}}, {Path: "folder/notes.bin"}, {Path: "folder/NOTES.BIN"}, {Path: "notes.json"}}, []string{"train"}, 3},
+		{"required-skip-conflicts-with-unique-witness", []hfNode{{Path: "train.csv"}, {Path: "README.md"}}, []string{"train"}, 0},
+		{"case-winner-must-remain-eligible", []hfNode{{Path: "train.csv"}, {Path: "folder/notes.bin", LFS: &hfLfsInfo{Size: 4}}, {Path: "folder/NOTES.BIN"}}, []string{"train"}, 2},
+		{"role-pinned-companion-seed", []hfNode{{Path: "folder/train.csv"}, {Path: "folder/notes.json"}}, []string{"train"}, 1},
+		{"unmasked-role-ambiguity", []hfNode{{Path: "folder/notes.json"}}, []string{"default"}, 0},
+		{"ordinary-direct-companion", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md"}}, []string{"train", "docs/"}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := compileDecisionFixture(tc.nodes, tc.filter, nil)
+			for _, cached := range []bool{true, false} {
+				q := c
+				if !cached {
+					q.uniqueEvaluation = nil
+				}
+				checkDatasetDecisionAgainstOracle(t, q)
+				for i := range q.Inputs {
+					can := canEmitDatasetDecision(q, i)
+					wantCan, wantCannot, worlds := oracleQueryOutcomes(q, i)
+					cannot := canNotEmitDatasetDecision(q, i)
+					refusalCan, refusalCannot := datasetDecisionRefusal(q, i)
+					if worlds == 0 || can.Possible != wantCan || refusalCan.Possible != wantCan || refusalCannot.Possible != (wantCan && wantCannot) {
+						t.Fatalf("cached=%t input=%d can/cannot=%t/%t refusal=%t/%t oracle=%t/%t worlds=%d", cached, i, can.Possible, cannot.Possible, refusalCan.Possible, refusalCannot.Possible, wantCan, wantCan && wantCannot, worlds)
+					}
+					if cannot.Possible {
+						e, err := evaluateDatasetDecisionWorld(q, cannot.World)
+						if err != nil || e.Records[i].Selected {
+							t.Fatalf("invalid skip witness: %+v, %v", e, err)
+						}
+					}
+				}
+			}
+		})
+	}
+	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "README.md"}}, []string{"train"}, nil)
+	for _, cached := range []bool{true, false} {
+		q := c
+		if !cached {
+			q.uniqueEvaluation = nil
+		}
+		got := canSelectDatasetDecision(q, 1, []int{0})
+		if got.Possible {
+			t.Fatalf("cached=%t unique-world shortcut ignored required earlier skip", cached)
+		}
+	}
+	// A caller-supplied skip of an actually selected record remains a real
+	// contradiction even when fixed emission outcomes are cached.
+	train := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "notes.json"}}, []string{"train", ".json"}, nil)
+	for _, cached := range []bool{true, false} {
+		q := train
+		if !cached {
+			q.uniqueEvaluation = nil
+		}
+		got := canSelectDatasetDecision(q, 1, []int{0})
+		if got.Possible {
+			t.Fatalf("cached=%t accepted contradictory required skip", cached)
+		}
+	}
+}
+
 func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -1591,6 +1658,32 @@ func BenchmarkDatasetDecisionCompileAndAllQueries(b *testing.B) {
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
 				c := compileDecisionFixture(nodes, []string{"train", ".parquet"}, nil)
+				for i := range c.Inputs {
+					_ = canEmitDatasetDecision(c, i)
+					_ = canNotEmitDatasetDecision(c, i)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDatasetDecisionCompileAndAllQueriesUnmaskedMetadata(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("files-%d", size), func(b *testing.B) {
+			nodes := make([]hfNode, 0, size)
+			for i := 0; i < size-4; i++ {
+				nodes = append(nodes, hfNode{Path: fmt.Sprintf("train/part-%04d.parquet", i)})
+			}
+			nodes = append(nodes, hfNode{Path: "notes.json"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"}, hfNode{Path: "tail/notes.json"})
+			files := make([]datasetselection.File, len(nodes))
+			for i := range nodes {
+				files[i].Path = nodes[i].Path
+			}
+			membership := datasetselection.Recognize(files)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				c := compileDatasetDecisionContext(nodes, membership, []string{"train"}, nil, true, true, false)
 				for i := range c.Inputs {
 					_ = canEmitDatasetDecision(c, i)
 					_ = canNotEmitDatasetDecision(c, i)
