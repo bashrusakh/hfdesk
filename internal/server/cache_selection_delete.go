@@ -21,8 +21,72 @@ import (
 
 type jobWriteActivity struct {
 	job       *Job
-	planned   map[string]struct{}
+	planned   map[string]frozenMutationPath
 	planKnown bool
+}
+
+// frozenMutationPath retains the physical spelling for basename predicates
+// and an immutable, comparison-only key. Neither field is an incoming lookup
+// path; frozen values are never passed to filesystem identity resolvers.
+type frozenMutationPath struct {
+	physical string
+	key      string
+}
+
+func freezeMutationEntry(path string) (frozenMutationPath, error) {
+	return freezeMutationEntryWithKey(path, pathIdentityKey)
+}
+
+func freezeMutationEntryWithKey(path string, key func(string) string) (frozenMutationPath, error) {
+	physical, err := mutationEntryPhysicalIdentity(path)
+	if err != nil {
+		return frozenMutationPath{}, err
+	}
+	return frozenMutationPath{physical: physical, key: key(physical)}, nil
+}
+
+func freezeMutationDirectory(path string) (frozenMutationPath, error) {
+	return freezeMutationDirectoryWithKey(path, pathIdentityKey)
+}
+
+func freezeMutationDirectoryWithKey(path string, key func(string) string) (frozenMutationPath, error) {
+	physical, err := mutationDirectoryPhysicalIdentity(path)
+	if err != nil {
+		return frozenMutationPath{}, err
+	}
+	return frozenMutationPath{physical: physical, key: key(physical)}, nil
+}
+
+func frozenMutationOverlap(a, b frozenMutationPath) bool {
+	return pathKeysOverlap(a.key, b.key)
+}
+
+func pathKeysOverlap(a, b string) bool {
+	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
+}
+
+func frozenMutationOverlapsRawDirectory(frozen frozenMutationPath, incoming string) bool {
+	return frozenMutationOverlapsRawDirectoryWithKey(frozen, incoming, pathIdentityKey)
+}
+
+func frozenMutationOverlapsRawDirectoryWithKey(frozen frozenMutationPath, incoming string, key func(string) string) bool {
+	dir, err := mutationDirectoryPhysicalIdentity(incoming)
+	if err != nil {
+		return true
+	}
+	return pathKeysOverlap(frozen.key, key(dir))
+}
+
+func frozenMutationOverlapsRawEntry(frozen frozenMutationPath, incoming string) bool {
+	return frozenMutationOverlapsRawEntryWithKey(frozen, incoming, pathIdentityKey)
+}
+
+func frozenMutationOverlapsRawEntryWithKey(frozen frozenMutationPath, incoming string, key func(string) string) bool {
+	entry, err := mutationEntryPhysicalIdentity(incoming)
+	if err != nil {
+		return true
+	}
+	return pathKeysOverlap(frozen.key, key(entry))
 }
 
 func jobDestinationBase(job *Job) string {
@@ -59,9 +123,11 @@ func jobDestinationBase(job *Job) string {
 	return repo.FriendlyPath()
 }
 
-// mutationEntryIdentity resolves symlinks in parent directories but preserves
-// the final basename as an entry, so leaf symlink targets are never followed.
-func mutationEntryIdentity(name string) (string, error) {
+// mutationEntryPhysicalIdentity resolves symlinks in parent directories but
+// preserves the final basename as an entry, so leaf symlink targets are never
+// followed. The returned spelling is for filesystem identity only; callers
+// must apply pathIdentityKey separately when comparing identities.
+func mutationEntryPhysicalIdentity(name string) (string, error) {
 	abs, err := filepath.Abs(filepath.Clean(name))
 	if err != nil {
 		return "", err
@@ -77,7 +143,7 @@ func mutationEntryIdentity(name string) (string, error) {
 			if resolveErr != nil {
 				return "", resolveErr
 			}
-			return pathIdentityKey(resolved), nil
+			return filepath.Clean(resolved), nil
 		}
 	} else if !os.IsNotExist(lstatErr) {
 		return "", lstatErr
@@ -124,13 +190,31 @@ func mutationEntryIdentity(name string) (string, error) {
 			resolved = filepath.Join(resolved, missing[i])
 		}
 	}
-	return pathIdentityKey(filepath.Join(resolved, base)), nil
+	return filepath.Clean(filepath.Join(resolved, base)), nil
+}
+
+// mutationEntryIdentity is a comparison identity, not a filesystem path.
+func mutationEntryIdentity(name string) (string, error) {
+	physical, err := mutationEntryPhysicalIdentity(name)
+	if err != nil {
+		return "", err
+	}
+	return pathIdentityKey(physical), nil
 }
 
 // mutationDirectoryIdentity treats base as a directory scope, not a final
 // entry. Existing directory aliases resolve to their destination; absent
-// ordinary suffixes are reconstructed by mutationEntryIdentity.
+// ordinary suffixes are reconstructed by mutationEntryPhysicalIdentity before
+// the comparison key is derived.
 func mutationDirectoryIdentity(name string) (string, error) {
+	physical, err := mutationDirectoryPhysicalIdentity(name)
+	if err != nil {
+		return "", err
+	}
+	return pathIdentityKey(physical), nil
+}
+
+func mutationDirectoryPhysicalIdentity(name string) (string, error) {
 	abs, err := filepath.Abs(filepath.Clean(name))
 	if err != nil {
 		return "", err
@@ -152,12 +236,12 @@ func mutationDirectoryIdentity(name string) (string, error) {
 		if resolveErr != nil {
 			return "", resolveErr
 		}
-		return pathIdentityKey(resolved), nil
+		return filepath.Clean(resolved), nil
 	}
 	if !os.IsNotExist(err) {
 		return "", err
 	}
-	return mutationEntryIdentity(abs)
+	return mutationEntryPhysicalIdentity(abs)
 }
 
 func jobMayWriteSelectedPath(job *Job, target string) bool {
@@ -185,20 +269,16 @@ func jobMayWriteSelectedPath(job *Job, target string) bool {
 	return false
 }
 
-func jobMayWriteFrozenSelectedPath(job *Job, target string) bool {
+func jobMayWriteFrozenSelectedPath(job *Job, target frozenMutationPath) bool {
 	base := jobDestinationBase(job)
 	if base == "" {
 		return false
 	}
-	target, err := filepath.Abs(filepath.Clean(target))
-	if err != nil {
-		return true
+	if pathWithinWriterBase(base, target.key) {
+		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
 	}
-	if pathWithinWriterBase(base, target) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, target) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target), job.Filters, job.Excludes, job.ExactMatch)
+	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, target.key) {
+		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
 	}
 	return false
 }
@@ -238,49 +318,15 @@ func mutationPathsOverlap(a, b string) bool {
 	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
 }
 
-// physicalEntryOverlap treats stored as an already-frozen physical entry key
-// and resolves only the newly arriving path. It must not re-resolve stored
-// through a lexical alias after admission.
-func physicalEntryOverlap(stored, incoming string) bool {
-	stored, err := filepath.Abs(filepath.Clean(stored))
-	if err != nil {
-		return true
-	}
-	incoming, err = mutationEntryIdentity(incoming)
-	if err != nil {
-		return true
-	}
-	return stored == incoming || withinLocalRoot(stored, incoming) || withinLocalRoot(incoming, stored)
-}
-
-func plannedEntriesConflict(frozenEntries, plannedPaths []string) bool {
+func plannedEntriesConflict(frozenEntries []frozenMutationPath, plannedPaths map[string]frozenMutationPath) bool {
 	for _, frozen := range frozenEntries {
 		for _, planned := range plannedPaths {
-			if plannedEntryOverlap(frozen, planned) {
+			if frozenMutationOverlap(frozen, planned) {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-// Planned destinations are raw filesystem paths, not frozen identity keys.
-// physicalEntryOverlap resolves the incoming path once, before applying its
-// comparison identity, so case-folding never changes the filesystem lookup.
-func plannedEntryOverlap(frozen, planned string) bool {
-	return physicalEntryOverlap(frozen, planned)
-}
-
-func directoryOverlapsFrozenEntry(scope, frozenEntry string) bool {
-	dir, err := mutationDirectoryIdentity(scope)
-	if err != nil {
-		return true
-	}
-	entry, err := filepath.Abs(filepath.Clean(frozenEntry))
-	if err != nil {
-		return true
-	}
-	return withinLocalRoot(dir, entry) || withinLocalRoot(entry, dir)
 }
 
 func mutationDirectoryEntryOverlap(directory, entry string) bool {
@@ -293,16 +339,12 @@ func mutationDirectoryEntryOverlap(directory, entry string) bool {
 }
 
 func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
-	clean := make([]string, 0, len(paths))
+	clean := make([]frozenMutationPath, 0, len(paths))
 	for _, p := range paths {
-		abs, err := filepath.Abs(filepath.Clean(p))
-		if err != nil {
-			return nil, false
-		}
 		// Freeze the selected entry's physical parent at admission. The final
 		// basename is intentionally retained as an entry (not followed when it
 		// is a symlink), so later root-alias changes cannot move this reservation.
-		identity, err := mutationEntryIdentity(abs)
+		identity, err := freezeMutationEntry(p)
 		if err != nil {
 			return nil, false
 		}
@@ -313,10 +355,10 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		m.mu.Unlock()
 		return nil, false
 	}
-	entryConflicts := func(scopes []string) bool {
+	entryConflicts := func(scopes []frozenMutationPath) bool {
 		for _, a := range scopes {
 			for _, b := range clean {
-				if physicalEntryOverlap(a, b) {
+				if frozenMutationOverlap(a, b) {
 					return true
 				}
 			}
@@ -332,7 +374,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.hfRepoReservations {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if directoryOverlapsFrozenEntry(scope, entry) {
+				if frozenMutationOverlap(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -342,7 +384,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.mutationScopes {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if directoryOverlapsFrozenEntry(scope, entry) {
+				if frozenMutationOverlap(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -351,14 +393,14 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	}
 	for _, activity := range m.runActivities {
 		if activity.planKnown {
-			if plannedEntriesConflict(clean, mapKeys(activity.planned)) {
+			if plannedEntriesConflict(clean, activity.planned) {
 				m.mu.Unlock()
 				return nil, false
 			}
 			continue
 		}
 		for _, target := range clean {
-			if jobMayWriteSelectedPath(activity.job, target) {
+			if jobMayWriteFrozenSelectedPath(activity.job, target) {
 				m.mu.Unlock()
 				return nil, false
 			}
@@ -369,14 +411,14 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 			continue
 		}
 		for _, target := range clean {
-			if jobMayWriteSelectedPath(job, target) {
+			if jobMayWriteFrozenSelectedPath(job, target) {
 				m.mu.Unlock()
 				return nil, false
 			}
 		}
 	}
 	if m.deleteReservations == nil {
-		m.deleteReservations = make(map[uint64][]string)
+		m.deleteReservations = make(map[uint64][]frozenMutationPath)
 	}
 	m.opWG.Add(1)
 	m.nextWriteID++
@@ -458,16 +500,20 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 	return entries, true
 }
 
-func hfReservationConflictsJob(scopes []string, job *Job) bool {
+func hfReservationConflictsJob(scopes []frozenMutationPath, job *Job) bool {
 	base := jobDestinationBase(job)
 	if base == "" {
 		return false
 	}
-	if repo := hfJobRepoPath(job); repo != "" && mutationDirectoryEntryOverlap(scopes[0], repo) {
-		return true
+	if repo := hfJobRepoPath(job); repo != "" {
+		for _, scope := range scopes {
+			if frozenMutationOverlapsRawDirectory(scope, repo) {
+				return true
+			}
+		}
 	}
 	for _, scope := range scopes {
-		if mutationDirectoryEntryOverlap(scope, base) {
+		if frozenMutationOverlapsRawDirectory(scope, base) {
 			return true
 		}
 	}
@@ -477,23 +523,23 @@ func hfReservationConflictsJob(scopes []string, job *Job) bool {
 // reserveSelectedHF protects the complete selected HF repo-reference namespace
 // and the associated friendly view for the full scan/unlink interval.
 func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), bool) {
-	scopes := []string{repoDir, friendlyDir}
-	for i, scope := range scopes {
-		abs, err := filepath.Abs(filepath.Clean(scope))
+	scopes := make([]frozenMutationPath, 0, 2)
+	for _, scope := range []string{repoDir, friendlyDir} {
+		frozen, err := freezeMutationDirectory(scope)
 		if err != nil {
 			return nil, false
 		}
-		scopes[i] = abs
+		scopes = append(scopes, frozen)
 	}
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
 		return nil, false
 	}
-	conflictScopes := func(other []string) bool {
+	conflictScopes := func(other []frozenMutationPath) bool {
 		for _, a := range scopes {
 			for _, b := range other {
-				if mutationDirectoryEntryOverlap(a, b) {
+				if frozenMutationOverlap(a, b) {
 					return true
 				}
 			}
@@ -534,7 +580,7 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 	m.nextWriteID++
 	id := m.nextWriteID
 	if m.hfRepoReservations == nil {
-		m.hfRepoReservations = make(map[uint64][]string)
+		m.hfRepoReservations = make(map[uint64][]frozenMutationPath)
 	}
 	m.hfRepoReservations[id] = scopes
 	m.mu.Unlock()
@@ -547,40 +593,37 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 	}, true
 }
 
-func mapKeys(values map[string]struct{}) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	return keys
-}
-
-// plannedDestinationSet retains every writer destination in its absolute
-// filesystem lookup spelling. It must not use pathIdentityKey: that value is
-// only suitable for comparisons and can merge distinct Windows paths.
-func plannedDestinationSet(paths []string) (map[string]struct{}, bool) {
-	planned := make(map[string]struct{}, len(paths))
+// plannedDestinationSet retains every raw absolute lookup spelling as its map
+// key and freezes a separate physical/comparison identity as its value. Thus
+// case-distinct raw paths are not collapsed, and comparisons never re-resolve
+// a completed plan's stored path.
+func plannedDestinationSet(paths []string) (map[string]frozenMutationPath, bool) {
+	planned := make(map[string]frozenMutationPath, len(paths))
 	for _, path := range paths {
 		absolute, err := filepath.Abs(filepath.Clean(path))
 		if err != nil {
 			return nil, false
 		}
-		planned[absolute] = struct{}{}
+		frozen, err := freezeMutationEntry(absolute)
+		if err != nil {
+			return nil, false
+		}
+		planned[absolute] = frozen
 	}
 	return planned, true
 }
 
 func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
-	clean := make([]string, 0, len(paths))
+	clean := make([]frozenMutationPath, 0, len(paths))
 	for _, p := range paths {
 		if p == "" {
 			continue
 		}
-		abs, err := filepath.Abs(filepath.Clean(p))
+		frozen, err := freezeMutationDirectory(p)
 		if err != nil {
 			return nil, false
 		}
-		clean = append(clean, abs)
+		clean = append(clean, frozen)
 	}
 	m.mu.Lock()
 	if m.stopping {
@@ -590,7 +633,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	for _, scopes := range m.deleteReservations {
 		for _, scope := range scopes {
 			for _, write := range clean {
-				if directoryOverlapsFrozenEntry(write, scope) {
+				if frozenMutationOverlap(write, scope) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -600,7 +643,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	for _, scopes := range m.hfRepoReservations {
 		for _, scope := range scopes {
 			for _, write := range clean {
-				if mutationDirectoryEntryOverlap(write, scope) {
+				if frozenMutationOverlap(write, scope) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -608,7 +651,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 		}
 	}
 	if m.mutationScopes == nil {
-		m.mutationScopes = make(map[uint64][]string)
+		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
 	m.opWG.Add(1)
 	m.nextWriteID++
@@ -646,7 +689,7 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	}
 	m.nextWriteID++
 	id := m.nextWriteID
-	m.runActivities[id] = &jobWriteActivity{job: job, planned: make(map[string]struct{})}
+	m.runActivities[id] = &jobWriteActivity{job: job, planned: make(map[string]frozenMutationPath)}
 	return id
 }
 
@@ -1367,17 +1410,19 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 // selectedDeleteExclusions projects configured descendant ownership into the
 // admitted repository namespace. The selected root's physical identity is
 // supplied by its open handle; the selected alias is never re-resolved here.
-func selectedDeleteExclusions(cfg Config, selected *cacheSelectionLocation, physicalRepo string) ([]string, bool) {
+func selectedDeleteExclusions(cfg Config, selected *cacheSelectionLocation, physicalRepo, admittedSourceBase string) ([]string, bool) {
 	roots := localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
 	selectedLexical, err := filepath.Abs(filepath.Clean(selected.Path))
 	if err != nil {
 		return nil, false
 	}
 	selectedBase := filepath.Dir(filepath.Dir(selectedLexical))
-	selectedBaseLexical, selectedBasePhysical, baseOK := configuredRootIdentity(selectedBase)
-	if !baseOK {
+	selectedBaseLexical, baseErr := filepath.Abs(filepath.Clean(selectedBase))
+	if baseErr != nil || admittedSourceBase == "" {
 		return nil, false
 	}
+	selectedBaseLexical = pathIdentityKey(selectedBaseLexical)
+	selectedBasePhysical := pathIdentityKey(filepath.Clean(admittedSourceBase))
 	selectedLexical = pathIdentityKey(selectedLexical)
 	physicalRepo = pathIdentityKey(filepath.Clean(physicalRepo))
 	var excluded []string
@@ -1653,7 +1698,10 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
 		return
 	}
-	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo)
+	// Derive the source root from the admitted repository, not by resolving the
+	// configured source alias again: it may have been retargeted after admission.
+	admittedSourceBase := filepath.Dir(filepath.Dir(physicalRepo))
+	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo, admittedSourceBase)
 	if !boundariesComplete {
 		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
 		return
@@ -1755,7 +1803,19 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		if s.selectedDeleteHooks.beforeRemove != nil {
 			s.selectedDeleteHooks.beforeRemove(i)
 		}
-		info, statErr := root.Lstat(rels[i])
+		parent := filepath.ToSlash(filepath.Dir(rels[i]))
+		parentHandle, parentErr := pins.hardLinkParent(parent)
+		if parentErr == nil {
+			parentErr = pins.verifyHardLinkParentBinding(parentHandle)
+		}
+		name := filepath.Base(rels[i])
+		var info os.FileInfo
+		var statErr error
+		if parentErr != nil {
+			statErr = parentErr
+		} else {
+			info, statErr = parentHandle.parentRoot.Lstat(name)
+		}
 		if statErr != nil || member.identity == nil || !os.SameFile(member.identity.info, info) || info.Size() != member.identity.info.Size() || (member.LinkOnly && info.Mode()&os.ModeSymlink == 0) || (!member.LinkOnly && !info.Mode().IsRegular()) {
 			if len(result.Removed) == 0 {
 				details := "A selected GGUF entry changed immediately before deletion"
@@ -1770,11 +1830,16 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			}
 			break
 		}
-		remove := root.Remove
+		// Unlink through the retained handle for the selected parent directory.
+		// Rechecking a same-inode leaf through root plus a multi-component path
+		// is insufficient: a swapped parent symlink can redirect Remove to a
+		// different hardlink name. The directory handle preserves the admitted
+		// parent namespace for the actual unlink.
+		remove := parentHandle.parentRoot.Remove
 		if s.selectedDeleteHooks.removeEntry != nil {
-			remove = func(name string) error { return s.selectedDeleteHooks.removeEntry(root, name) }
+			remove = func(name string) error { return s.selectedDeleteHooks.removeEntry(parentHandle.parentRoot, name) }
 		}
-		if err := remove(rels[i]); err != nil {
+		if err := remove(name); err != nil {
 			result.OK = false
 			result.Remaining = append(result.Remaining, member.Path)
 			result.Errors = append(result.Errors, member.Path+": "+err.Error())

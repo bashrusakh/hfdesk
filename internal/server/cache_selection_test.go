@@ -39,6 +39,19 @@ type testSelectedDeleteRequest struct {
 	Members    []cacheSelectionMember `json:"members"`
 }
 
+func freezeTestDirectories(t *testing.T, paths ...string) []frozenMutationPath {
+	t.Helper()
+	frozen := make([]frozenMutationPath, 0, len(paths))
+	for _, path := range paths {
+		value, err := freezeMutationDirectory(path)
+		if err != nil {
+			t.Fatalf("freeze directory %q: %v", path, err)
+		}
+		frozen = append(frozen, value)
+	}
+	return frozen
+}
+
 func getSelection(t *testing.T, s *Server, repo, repoType, location string) (int, cacheSelectionResponse) {
 	t.Helper()
 	path := "/api/cache-selection?repo=" + url.QueryEscape(repo) + "&type=" + url.QueryEscape(repoType)
@@ -962,6 +975,65 @@ func TestSelectedDeleteAndRebuildReserveDatasetFriendlyTree(t *testing.T) {
 	}
 }
 
+func TestReservationProducersFreezeEntryAndDirectoryScopes(t *testing.T) {
+	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	repo, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.FriendlyPath(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServerWithConfig(t, Config{CacheDir: cache.Root})
+	selected := filepath.Join(repo.Path(), "snapshots", "deadbeef", "model-Q4_K_M.gguf")
+	selectedRelease, ok := server.jobs.reserveSelectedGGUF([]string{selected})
+	if !ok {
+		t.Fatal("could not register selected-entry reservation")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("duplicate selected-entry reservation was admitted")
+	}
+	if _, ok := server.jobs.beginCacheMutation(repo.Path()); ok {
+		t.Fatal("cache mutation containing selected entry was admitted")
+	}
+	selectedRelease()
+
+	mutationRelease, ok := server.jobs.beginCacheMutation(repo.Path())
+	if !ok {
+		t.Fatal("could not register cache directory mutation")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("selected-entry reservation crossed active cache mutation")
+	}
+	mutationRelease()
+
+	hfRelease, ok := server.jobs.reserveSelectedHF(repo.Path(), repo.FriendlyPath())
+	if !ok {
+		t.Fatal("could not register HF repo reservation")
+	}
+	if _, ok := server.jobs.reserveSelectedHF(repo.Path(), repo.FriendlyPath()); ok {
+		t.Fatal("duplicate HF directory reservation was admitted")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("selected-entry reservation crossed frozen HF directory scope")
+	}
+	if _, ok := server.jobs.beginCacheMutation(repo.Path()); ok {
+		t.Fatal("cache mutation crossed frozen HF directory scope")
+	}
+	if _, _, err := server.jobs.CreateJob(DownloadRequest{Repo: "owner/model"}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new HF job crossed frozen repo reservation: %v", err)
+	}
+	hfRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+}
+
 func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.T) {
 	actual, alias := t.TempDir(), t.TempDir()
 	if err := os.Symlink(actual, filepath.Join(alias, "parent")); err != nil {
@@ -988,6 +1060,132 @@ func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.
 	}
 	if got == pathIdentityKey(target) {
 		t.Fatalf("leaf identity followed symlink target: %q", got)
+	}
+}
+
+func TestFrozenPhysicalIdentityIsNotReusedAsFilesystemLookupPath(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(actual, "Model-Q4_K_M.gguf")
+	if err := os.WriteFile(entry, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	incoming := filepath.Join(alias, "Owner", "Model", filepath.Base(entry))
+	physical, err := mutationEntryPhysicalIdentity(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if physical != entry {
+		t.Fatalf("physical lookup identity=%q want raw resolved path %q", physical, entry)
+	}
+	// Simulate Windows' comparison-only folding on a case-sensitive host. The
+	// lookup above must still use the raw alias spelling; folding is applied
+	// only after the physical identity has been established.
+	fold := func(path string) string { return strings.ToLower(filepath.Clean(path)) }
+	frozen, err := freezeMutationEntryWithKey(entry, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incomingFrozen, err := freezeMutationEntryWithKey(incoming, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlap(frozen, incomingFrozen) {
+		t.Fatal("folded comparison missed the same admitted physical entry")
+	}
+	if physical == fold(physical) {
+		t.Fatal("physical identity was replaced by its comparison key")
+	}
+}
+
+func TestFrozenReservationComparisonsKeepLookupAndComparisonDomainsSeparate(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	q4 := filepath.Join(actual, "Model-Q4_K_M.gguf")
+	q5 := filepath.Join(actual, "Model-Q5_K_M.gguf")
+	for _, path := range []string{q4, q5} {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	incomingQ4 := filepath.Join(alias, "Owner", "Model", filepath.Base(q4))
+	fold := func(path string) string { return strings.ToLower(filepath.Clean(path)) }
+
+	// Linux remains genuinely case-sensitive: the test shim changes comparison
+	// keys only, while every physical observation still receives raw input.
+	frozenQ4, err := freezeMutationEntryWithKey(q4, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozenQ4.physical != q4 {
+		t.Fatalf("stored physical path=%q want %q", frozenQ4.physical, q4)
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Lstat(frozenQ4.key); !os.IsNotExist(err) {
+			t.Fatal("folded comparison-only key unexpectedly served as the raw filesystem lookup")
+		}
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenQ4, incomingQ4, fold) {
+		t.Fatal("same entry via parent alias did not match the frozen comparison key")
+	}
+	if frozenMutationOverlapsRawEntryWithKey(frozenQ4, q5, fold) {
+		t.Fatal("disjoint Q5 entry overlapped the Q4 reservation")
+	}
+	duplicate, err := freezeMutationEntryWithKey(incomingQ4, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlap(frozenQ4, duplicate) {
+		t.Fatal("duplicate reservation did not compare already-frozen identities directly")
+	}
+	frozenHF, err := freezeMutationDirectoryWithKey(actual, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenHF, q4, fold) {
+		t.Fatal("frozen HF directory scope missed raw incoming selected entry")
+	}
+	if !frozenMutationOverlapsRawDirectoryWithKey(frozenHF, filepath.Dir(incomingQ4), fold) {
+		t.Fatal("frozen HF directory scope missed aliased raw cache-mutation scope")
+	}
+	other := filepath.Join(t.TempDir(), "OtherCase", "Owner", "Model")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, filepath.Base(q4)), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(filepath.Dir(other)), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenQ4, q4, fold) ||
+		frozenMutationOverlapsRawEntryWithKey(frozenQ4, filepath.Join(alias, "Owner", "Model", filepath.Base(q4)), fold) {
+		t.Fatal("retargeting the raw alias changed the already-frozen physical reservation")
+	}
+	if hfdownloader.GGUFPathSelected(filepath.Base(frozenQ4.physical), []string{"Q4_K_M"}, nil, false) == false ||
+		hfdownloader.GGUFPathSelected(filepath.Base(frozenQ4.physical), []string{"Q5_K_M"}, nil, false) {
+		t.Fatal("physical basename no longer preserves Q4/Q5 filter semantics")
 	}
 }
 
@@ -1581,6 +1779,45 @@ func TestSelectedDeleteExclusionsResolveRelativeConfiguredRoot(t *testing.T) {
 	}
 }
 
+func TestSelectedDeleteExclusionsUseAdmittedSourceAfterAliasRetarget(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	repo := filepath.Join(actual, "owner", "model")
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	selected := &cacheSelectionLocation{Path: filepath.Join(alias, "owner", "model")}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, alias); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalScanDirs: []string{alias, repo}}
+	_, complete := selectedDeleteExclusions(cfg, selected, repo, actual)
+	if complete {
+		t.Fatal("retargeted source alias hid a separately configured owner of the admitted repository")
+	}
+	// Restoring the admitted alias must not make a second projection necessary;
+	// the caller carries the same frozen source identity through the operation.
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(actual, alias); err != nil {
+		t.Fatal(err)
+	}
+	_, complete = selectedDeleteExclusions(cfg, selected, repo, actual)
+	if complete {
+		t.Fatal("restoring the source alias bypassed the configured repository owner")
+	}
+}
+
 func TestSelectedLocalDeleteStaysOnOpenedRootAfterAliasRetarget(t *testing.T) {
 	actual, other := t.TempDir(), t.TempDir()
 	alias := filepath.Join(t.TempDir(), "scan")
@@ -1638,6 +1875,56 @@ func TestSelectedLocalDeleteStaysOnOpenedRootAfterAliasRetarget(t *testing.T) {
 	}
 	assertNoTemporaryPinContainer(t, filepath.Join(actual, "owner", "model"))
 	assertNoTemporaryPinContainer(t, filepath.Join(other, "owner", "model"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsParentSwapWithHardlinkPeer(t *testing.T) {
+	root := t.TempDir()
+	selectedParent := filepath.Join(root, "owner", "model", "nested")
+	protectedParent := filepath.Join(root, "protected", "nested")
+	if err := os.MkdirAll(selectedParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(protectedParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	const name = "model-Q4_K_M.gguf"
+	selected := filepath.Join(selectedParent, name)
+	protected := filepath.Join(protectedParent, name)
+	if err := os.WriteFile(selected, []byte("same inode"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(selected, protected); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root})
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(root, "owner", "model"), filepath.Join("nested", name))
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		moved := filepath.Join(root, "owner", "model", "selected-parent")
+		if err := os.Rename(selectedParent, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(protectedParent, selectedParent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "owner", "model", "selected-parent", name)); err != nil {
+		t.Fatalf("stale parent swap changed the selected name: %v", err)
+	}
+	if info, err := os.Stat(protected); err != nil || info.Size() != int64(len("same inode")) {
+		t.Fatalf("protected hardlink peer changed: info=%v err=%v", info, err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
@@ -3724,6 +4011,7 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	modelScopes := freezeTestDirectories(t, rd.Path(), rd.FriendlyPath())
 	for name, job := range map[string]*Job{
 		"localRepo in the selected Hub": {
 			Repo: "upstream/source", LocalRepo: "owner/model", OutputDir: cache.Root, HubDir: cache.HubDir(),
@@ -3736,7 +4024,7 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if !hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, job) {
+			if !hfReservationConflictsJob(modelScopes, job) {
 				t.Fatal("writer to selected HF state was not blocked")
 			}
 		})
@@ -3746,10 +4034,10 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataset := &Job{Repo: "upstream/source", LocalRepo: "owner/model", IsDataset: true, OutputDir: cache.Root, HubDir: cache.HubDir()}
-	if hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, dataset) {
+	if hfReservationConflictsJob(modelScopes, dataset) {
 		t.Fatal("dataset actual namespace was mistaken for the selected model namespace")
 	}
-	if !hfReservationConflictsJob([]string{otherDataset.Path(), filepath.Join(cache.DatasetsDir(), "owner", "model")}, dataset) {
+	if !hfReservationConflictsJob(freezeTestDirectories(t, otherDataset.Path(), filepath.Join(cache.DatasetsDir(), "owner", "model")), dataset) {
 		t.Fatal("dataset LocalRepo destination was not recognized")
 	}
 }
@@ -4358,6 +4646,53 @@ func TestPlannedDestinationSetRetainsRawCaseDistinctLookupPaths(t *testing.T) {
 		if _, ok := planned[absolute]; !ok {
 			t.Errorf("writer lookup path %q was not retained verbatim", absolute)
 		}
+	}
+}
+
+func TestPlannedDestinationSetFreezesPhysicalIdentityBeforeAliasRetarget(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(actual, "model-Q4_K_M.gguf")
+	if err := os.WriteFile(selected, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	plannedRaw := filepath.Join(alias, "Owner", "Model", filepath.Base(selected))
+	planned, complete := plannedDestinationSet([]string{plannedRaw})
+	if !complete || len(planned) != 1 {
+		t.Fatalf("planned raw destination was not retained: %v complete=%t", planned, complete)
+	}
+	frozen, ok := planned[plannedRaw]
+	if !ok || frozen.physical != selected {
+		t.Fatalf("planned raw path did not retain its admitted physical identity: %+v", frozen)
+	}
+	selectedFrozen, err := freezeMutationEntry(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plannedEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("completed plan did not conflict with the selected physical entry")
+	}
+	other := filepath.Join(t.TempDir(), "OtherCase", "Owner", "Model")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(filepath.Dir(other)), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !plannedEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("retargeting the raw plan alias changed its frozen completed-plan conflict")
 	}
 }
 

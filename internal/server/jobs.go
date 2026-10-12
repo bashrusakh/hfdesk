@@ -169,9 +169,9 @@ type JobManager struct {
 	// runActivities outlive visible job state and retain each run's immutable
 	// destination/plan until its downloader call has actually returned.
 	runActivities      map[uint64]*jobWriteActivity
-	deleteReservations map[uint64][]string
-	hfRepoReservations map[uint64][]string
-	mutationScopes     map[uint64][]string
+	deleteReservations map[uint64][]frozenMutationPath
+	hfRepoReservations map[uint64][]frozenMutationPath
+	mutationScopes     map[uint64][]frozenMutationPath
 	nextWriteID        uint64
 }
 
@@ -196,9 +196,9 @@ func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *Job
 		saveMu:             &sync.Mutex{},
 		jobs:               make(map[string]*Job),
 		runActivities:      make(map[uint64]*jobWriteActivity),
-		deleteReservations: make(map[uint64][]string),
-		hfRepoReservations: make(map[uint64][]string),
-		mutationScopes:     make(map[uint64][]string),
+		deleteReservations: make(map[uint64][]frozenMutationPath),
+		hfRepoReservations: make(map[uint64][]frozenMutationPath),
+		mutationScopes:     make(map[uint64][]frozenMutationPath),
 		config:             cfg,
 		statePath:          statePath,
 		persistStateFile:   saveJobsState,
@@ -1441,14 +1441,18 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	}
 	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
 		paths, complete := jobPlannedWriteEntries(job, plan)
+		var planned map[string]frozenMutationPath
+		if complete {
+			planned, complete = plannedDestinationSet(paths)
+		}
 		m.mu.Lock()
 		if activity := m.runActivities[activityID]; activity != nil {
 			if complete {
-				activity.planned, complete = plannedDestinationSet(paths)
+				activity.planned = planned
 			}
 			activity.planKnown = complete
 			if !complete {
-				activity.planned = make(map[string]struct{})
+				activity.planned = make(map[string]frozenMutationPath)
 			}
 		}
 		m.mu.Unlock()
