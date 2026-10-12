@@ -1444,15 +1444,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		m.mu.Lock()
 		if activity := m.runActivities[activityID]; activity != nil {
 			if complete {
-				activity.planned = make(map[string]struct{}, len(paths))
-				for _, planned := range paths {
-					if absolute, err := filepath.Abs(filepath.Clean(planned)); err == nil {
-						activity.planned[pathIdentityKey(absolute)] = struct{}{}
-					} else {
-						complete = false
-						break
-					}
-				}
+				activity.planned, complete = plannedDestinationSet(paths)
 			}
 			activity.planKnown = complete
 			if !complete {

@@ -256,12 +256,19 @@ func physicalEntryOverlap(stored, incoming string) bool {
 func plannedEntriesConflict(frozenEntries, plannedPaths []string) bool {
 	for _, frozen := range frozenEntries {
 		for _, planned := range plannedPaths {
-			if physicalEntryOverlap(frozen, planned) {
+			if plannedEntryOverlap(frozen, planned) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// Planned destinations are raw filesystem paths, not frozen identity keys.
+// physicalEntryOverlap resolves the incoming path once, before applying its
+// comparison identity, so case-folding never changes the filesystem lookup.
+func plannedEntryOverlap(frozen, planned string) bool {
+	return physicalEntryOverlap(frozen, planned)
 }
 
 func directoryOverlapsFrozenEntry(scope, frozenEntry string) bool {
@@ -546,6 +553,21 @@ func mapKeys(values map[string]struct{}) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+// plannedDestinationSet retains every writer destination in its absolute
+// filesystem lookup spelling. It must not use pathIdentityKey: that value is
+// only suitable for comparisons and can merge distinct Windows paths.
+func plannedDestinationSet(paths []string) (map[string]struct{}, bool) {
+	planned := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		absolute, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			return nil, false
+		}
+		planned[absolute] = struct{}{}
+	}
+	return planned, true
 }
 
 func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {

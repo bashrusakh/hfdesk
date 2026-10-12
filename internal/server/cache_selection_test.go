@@ -4339,6 +4339,28 @@ func TestSelectedDeleteAllowsActualNonOverlappingQ5Plan(t *testing.T) {
 	}
 }
 
+func TestPlannedDestinationSetRetainsRawCaseDistinctLookupPaths(t *testing.T) {
+	root := t.TempDir()
+	upper := filepath.Join(root, "Payload", "model.gguf")
+	lower := filepath.Join(root, "payload", "model.gguf")
+	planned, complete := plannedDestinationSet([]string{upper, lower})
+	if !complete {
+		t.Fatal("could not retain planned destinations")
+	}
+	if len(planned) != 2 {
+		t.Fatalf("case-distinct filesystem paths collapsed: %#v", planned)
+	}
+	for _, path := range []string{upper, lower} {
+		absolute, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := planned[absolute]; !ok {
+			t.Errorf("writer lookup path %q was not retained verbatim", absolute)
+		}
+	}
+}
+
 func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	root := t.TempDir()
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
