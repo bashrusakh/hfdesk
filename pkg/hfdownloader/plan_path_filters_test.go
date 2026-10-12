@@ -175,10 +175,49 @@ func TestPlanRepoExactGGUFAndNoFilterRegression(t *testing.T) {
 	assertPaths(t, planPaths(unfiltered), []string{"model-q6_k.gguf", "model-q6_k_xl.gguf", "config.json"})
 }
 
+func TestPlanRepoGGUFQuantFilterKeepsMatchedREADMEOnly(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "README-Q4_K_M.md", Size: 10},
+		{Type: "file", Path: "config.json", Size: 10},
+		{Type: "file", Path: "README.md", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/gguf", Revision: "main", Filters: []string{"Q4_K_M"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md"})
+}
+
+func TestPlanRepoREADMEOnlyFilterDoesNotEnableGGUFMode(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "README-Q4_K_M.md", Size: 10},
+		{Type: "file", Path: "config.json", Size: 10},
+		{Type: "file", Path: "other.safetensors", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/gguf", Revision: "main", Filters: []string{"README-Q4_K_M.md"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"README-Q4_K_M.md", "config.json", "other.safetensors"})
+}
+
 func TestPlanRepoMixedGGUFFolderFilterKeepsCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "weights/model.gguf", LFS: &hfLfsInfo{Size: 100}},
 		{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "weights/other.safetensors", Size: 20},
 		{Type: "file", Path: "weights/README.md", Size: 10},
 		{Type: "file", Path: "config.json", Size: 10},
 	}
@@ -191,7 +230,7 @@ func TestPlanRepoMixedGGUFFolderFilterKeepsCompanions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "weights/model.safetensors", "weights/README.md", "config.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "weights/model.safetensors", "weights/other.safetensors", "weights/README.md", "config.json"})
 }
 
 func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {

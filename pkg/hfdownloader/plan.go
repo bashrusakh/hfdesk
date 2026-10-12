@@ -688,13 +688,29 @@ func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exa
 			}
 			if strings.HasSuffix(filePath, ".gguf") {
 				matchedGGUF = true
-			} else {
+			} else if !isREADMEPath(filePath) {
 				matchedNonGGUF = true
 			}
 			break
 		}
 	}
 	return matchedGGUF && !matchedNonGGUF
+}
+
+// isREADMEPath identifies README documents that may carry a selected GGUF
+// quant token in their filename. They are descriptive companions, not evidence
+// that a filter also selected a non-GGUF payload.
+func isREADMEPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	if !strings.HasPrefix(base, "readme") {
+		return false
+	}
+	switch path.Ext(base) {
+	case ".md", ".markdown", ".rst", ".txt":
+		return true
+	default:
+		return false
+	}
 }
 
 // destinationBase returns the base output directory for a job.
