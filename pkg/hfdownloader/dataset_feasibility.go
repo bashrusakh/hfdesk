@@ -70,7 +70,10 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			return datasetDecisionWorld{}, false
 		}
 		in := c.Inputs[i]
-		if in.Excluded {
+		// Exact-duplicate suppression precedes eligibility in the concrete
+		// evaluator. Requiring such a record to be ineligible would add a
+		// condition not present in the requested skipped-output proposition.
+		if in.Excluded || in.ExactDuplicateOf >= 0 {
 			continue
 		}
 		if in.LFS {
@@ -414,8 +417,10 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 			return r
 		}
 	}
-	if r, unique := uniqueDatasetDecisionQuery(c, index, requireSkip); unique {
-		return r
+	if len(earlierCaseSkips) == 0 {
+		if r, unique := uniqueDatasetDecisionQuery(c, index, requireSkip); unique {
+			return r
+		}
 	}
 	for _, core := range datasetCoreAssignments(c) {
 		if requireSkip {
@@ -848,6 +853,24 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	if !in.ExactDuplicateEligible {
 		return datasetDecisionQueryResult{}
 	}
+	if r, fixed := fixedDatasetDecisionQuery(c, index, false); fixed && r.Possible {
+		// The fixed-outcome proof includes ordered case-fold suppression. Still
+		// require the returned concrete baseline witness to satisfy the exact
+		// earlier-record constraints supplied to the lower-level query.
+		valid := true
+		for i := 0; i < index; i++ {
+			if strings.EqualFold(c.Inputs[i].Path, in.Path) {
+				e, err := evaluateDatasetDecisionWorld(c, r.World)
+				if err != nil || !e.Records[i].Skipped {
+					valid = false
+					break
+				}
+			}
+		}
+		if valid {
+			return r
+		}
+	}
 	var earlier []int
 	fold := strings.ToLower(in.Path)
 	for i := 0; i < index; i++ {
@@ -861,6 +884,9 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 func canNotEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
 	if index < 0 || index >= len(c.Inputs) {
 		return datasetDecisionQueryResult{}
+	}
+	if r, fixed := fixedDatasetDecisionQuery(c, index, true); fixed {
+		return r
 	}
 	if r := canSkipDatasetDecision(c, index); r.Possible {
 		return r
