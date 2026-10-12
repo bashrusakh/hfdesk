@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
 
 // Known dataset file formats and their descriptions.
@@ -29,22 +31,37 @@ var standardSplits = []string{"train", "test", "validation", "dev", "eval"}
 // analyzeDataset analyzes a dataset repository.
 func analyzeDataset(files []FileInfo) *DatasetInfo {
 	info := &DatasetInfo{}
+	inputs := make([]datasetselection.File, len(files))
+	for i, f := range files {
+		inputs[i] = datasetselection.File{Path: f.Path}
+	}
+	membership := datasetselection.Recognize(inputs)
+	fileGroups := make(map[int]string)
+	for group, indexes := range membership.Groups {
+		for _, i := range indexes {
+			fileGroups[i] = group
+		}
+	}
 
 	// Collect splits and formats
 	splitMap := make(map[string]*DatasetSplit)
 	formatSet := make(map[string]bool)
 	configSet := make(map[string]bool)
+	for _, i := range membership.Unresolved {
+		ext := datasetFileExtension(files[i].Name)
+		if ext != "" {
+			formatSet[ext] = true
+		}
+	}
 
-	for _, f := range files {
-		ext := strings.ToLower(filepath.Ext(f.Name))
-		if ext == "" {
+	for i, f := range files {
+		split, member := fileGroups[i]
+		if !member {
 			continue
 		}
-		ext = strings.TrimPrefix(ext, ".")
-
-		// Handle compound extensions
-		if strings.HasSuffix(f.Name, ".tar.gz") {
-			ext = "tar.gz"
+		ext := datasetFileExtension(f.Name)
+		if ext == "" {
+			continue
 		}
 
 		// Check if this is a data file
@@ -53,12 +70,6 @@ func analyzeDataset(files []FileInfo) *DatasetInfo {
 		}
 
 		formatSet[ext] = true
-
-		// Detect split from path or filename
-		split := detectSplit(f.Path, f.Name)
-		if split == "" {
-			split = "default"
-		}
 
 		// Detect config/subset from path
 		config := detectConfig(f.Path)
@@ -104,6 +115,14 @@ func analyzeDataset(files []FileInfo) *DatasetInfo {
 	info.PrimaryFormat = selectPrimaryFormat(info.Formats)
 
 	return info
+}
+
+func datasetFileExtension(name string) string {
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
+	if strings.HasSuffix(strings.ToLower(name), ".tar.gz") {
+		return "tar.gz"
+	}
+	return ext
 }
 
 // isDataFileExtension checks if the extension indicates a data file.
@@ -323,6 +342,9 @@ func DatasetToSelectableItems(info *DatasetInfo) []SelectableItem {
 			Recommended: split.Name == "train",
 			Category:    "split",
 			FilterValue: split.Name,
+		}
+		for _, file := range split.Files {
+			item.Files = append(item.Files, file.Path)
 		}
 		items = append(items, item)
 	}

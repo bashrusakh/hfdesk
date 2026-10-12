@@ -1,0 +1,107 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+// Package datasetselection recognizes repository files that belong to dataset
+// groups. It intentionally does not infer membership from an ambiguous file
+// extension alone.
+package datasetselection
+
+import (
+	"path"
+	"strings"
+)
+
+// File describes the repository-relative path needed for membership analysis.
+type File struct {
+	Path string
+}
+
+// Result contains indexes into the input files. Groups are keyed by the same
+// labels used by smartdl; Unresolved files are known data-shaped files whose
+// dataset role cannot be established from their repository path.
+type Result struct {
+	Groups     map[string][]int
+	Unresolved []int
+}
+
+var standardGroups = []string{"train", "test", "validation", "dev", "eval"}
+
+// Recognize classifies data files using conventional split names and
+// data/<custom-group>/ directory membership. Order and duplicate paths are
+// retained as input indexes; callers that deduplicate inventory should do so
+// before calling this function.
+func Recognize(files []File) Result {
+	r := Result{Groups: make(map[string][]int)}
+	for i, file := range files {
+		p := strings.TrimPrefix(path.Clean(strings.ReplaceAll(file.Path, "\\", "/")), "./")
+		lower := strings.ToLower(p)
+		base := path.Base(lower)
+		ext := strings.TrimPrefix(path.Ext(base), ".")
+		if strings.HasSuffix(base, ".tar.gz") {
+			ext = "tar.gz"
+		}
+		if !dataExtension[ext] || isServiceMetadata(p) {
+			continue
+		}
+
+		groups := pathGroups(lower, base)
+		if len(groups) > 1 {
+			r.Unresolved = append(r.Unresolved, i)
+			continue
+		}
+		if len(groups) == 1 {
+			r.Groups[groups[0]] = append(r.Groups[groups[0]], i)
+			continue
+		}
+		if ext == "json" || ext == "jsonl" || ext == "txt" {
+			r.Unresolved = append(r.Unresolved, i)
+			continue
+		}
+		r.Groups["default"] = append(r.Groups["default"], i)
+	}
+	return r
+}
+
+var dataExtension = map[string]bool{
+	"parquet": true, "arrow": true, "json": true, "jsonl": true,
+	"csv": true, "tsv": true, "txt": true, "tar": true,
+	"tar.gz": true, "zip": true, "gz": true, "zst": true,
+}
+
+func isServiceMetadata(p string) bool {
+	if strings.Contains(p, "/") {
+		return false
+	}
+	switch strings.ToLower(p) {
+	case "config.json", "dataset_info.json":
+		return true
+	default:
+		return false
+	}
+}
+
+func pathGroups(p, base string) []string {
+	parts := strings.Split(p, "/")
+	found := make(map[string]bool)
+	for _, split := range standardGroups {
+		for _, part := range parts[:len(parts)-1] {
+			if part == split {
+				found[split] = true
+			}
+		}
+		if strings.HasPrefix(base, split+"-") || strings.HasPrefix(base, split+"_") || strings.HasPrefix(base, split+".") {
+			found[split] = true
+		}
+	}
+	if len(found) > 0 {
+		groups := make([]string, 0, len(found))
+		for group := range found {
+			groups = append(groups, group)
+		}
+		return groups
+	}
+	if len(parts) > 1 && parts[0] == "data" && parts[1] != "" {
+		return []string{parts[1]}
+	}
+	return nil
+}

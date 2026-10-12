@@ -4,6 +4,10 @@
 package smartdl
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -147,6 +151,64 @@ func TestAnalyzeDataset(t *testing.T) {
 			t.Errorf("FileCount = %d, want 3", info.Splits[0].FileCount)
 		}
 	})
+}
+
+func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
+	paths := []string{
+		"data/train-000.parquet",
+		"data/test_records.csv",
+		"data/customdata/shard.arrow",
+		"ambiguous.json",
+		"notes.txt",
+		"config.json",
+		"dataset_info.json",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/revision-1"):
+			nodes := make([]map[string]interface{}, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]interface{}{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/refs"):
+			_, _ = w.Write([]byte(`{"branches":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/data", true, "revision-1")
+	if err != nil {
+		t.Fatalf("AnalyzeWithRevision: %v", err)
+	}
+	if len(info.Files) != len(paths) {
+		t.Fatalf("repository inventory has %d files, want %d", len(info.Files), len(paths))
+	}
+	if info.Dataset == nil || len(info.Dataset.Splits) != 3 {
+		t.Fatalf("dataset groups = %+v, want train/test/customdata", info.Dataset)
+	}
+	items := DatasetToSelectableItems(info.Dataset)
+	if len(items) != 3 {
+		t.Fatalf("selectable items = %+v, want three definite groups", items)
+	}
+	byID := make(map[string]SelectableItem, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	for id, path := range map[string]string{"train": paths[0], "test": paths[1], "customdata": paths[2]} {
+		item := byID[id]
+		if len(item.Files) != 1 || item.Files[0] != path {
+			t.Errorf("selectable %q files = %v, want [%s]", id, item.Files, path)
+		}
+	}
+	if _, ok := byID["default"]; ok {
+		t.Fatal("unresolved JSON/TXT files were advertised as a default selection")
+	}
+	if got := info.Dataset.Formats; len(got) != 5 || got[0] != "arrow" || got[1] != "csv" || got[2] != "json" || got[3] != "parquet" || got[4] != "txt" {
+		t.Errorf("dataset formats = %v, want [arrow csv json parquet txt]", got)
+	}
 }
 
 func TestIsDataFileExtension(t *testing.T) {
