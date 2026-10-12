@@ -446,7 +446,7 @@ func concreteOracleSkipped(c datasetDecisionContext, w datasetDecisionWorld, col
 			continue
 		}
 		direct[i] = concreteOracleDirect(c, w, i, collisions)
-		if direct[i] && !w.Companion[i] {
+		if direct[i] {
 			for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
 				dirs[d] = true
 			}
@@ -633,8 +633,8 @@ func TestCompileDatasetDecisionContextMembershipSelectionsCanSeedDirectories(t *
 		t.Fatalf("excluded membership source seeded directory: %+v", excluded.Inputs)
 	}
 	companionOnly := compileDecisionFixture([]hfNode{{Path: "train/README.md"}, {Path: "other/metadata.json"}}, []string{"train"}, nil)
-	if companionOnly.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(companionOnly, companionOnly.Inputs[1].Directory)) != 0 {
-		t.Fatalf("directly selected companion became a directory seed: %+v", companionOnly.Inputs)
+	if !companionOnly.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(companionOnly, companionOnly.Inputs[1].Directory)) != 0 {
+		t.Fatalf("directly selected companion seed candidate or unrelated scope is wrong: %+v", companionOnly.Inputs)
 	}
 }
 
@@ -771,7 +771,7 @@ func TestConcreteWorldMembershipSelectionSeedsNestedCompanionDirectory(t *testin
 	}
 }
 
-func TestConcreteWorldDirectCompanionDoesNotSeedNestedScope(t *testing.T) {
+func TestConcreteWorldDirectCompanionSeedsNestedScope(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "other/README.md"},
@@ -785,8 +785,49 @@ func TestConcreteWorldDirectCompanionDoesNotSeedNestedScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Records[1].Selected || got.Records[2].Selected {
-		t.Fatalf("directly selected companion incorrectly seeded nested scope: %+v", got.Records)
+	if !got.Records[1].Selected || !got.Records[2].Selected {
+		t.Fatalf("directly selected companion did not seed nested scope: %+v", got.Records)
+	}
+}
+
+func TestStableEvaluationWithMultipleDirectRoleAlternatives(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train.csv"},
+		{Path: "folder/a.json"},
+		{Path: "folder/b.json"},
+		{Path: "folder/README.md"},
+	}, []string{"train", ".json"}, nil)
+	for i := 1; i <= 2; i++ {
+		if len(c.Inputs[i].Alternatives) < 2 || !c.Inputs[i].DirectSeedCandidate {
+			t.Fatalf("fixture lacks a directly matched multi-role seed at %d: %+v", i, c.Inputs[i])
+		}
+	}
+	if !stableDatasetDecisionEvaluation(c) {
+		t.Fatal("role-invariant direct matches and directory seeds should admit a reusable evaluation")
+	}
+	for _, roles := range []map[int]datasetDecisionRoleLabel{
+		{1: {Role: datasetselection.EvidenceRoleData, Label: "default"}, 2: {Role: datasetselection.EvidenceRoleData, Label: "default"}},
+		{1: {Role: datasetselection.EvidenceRoleCompanion}, 2: {Role: datasetselection.EvidenceRoleCompanion}},
+		{1: {Role: datasetselection.EvidenceRoleData, Label: "default"}, 2: {Role: datasetselection.EvidenceRoleCompanion}},
+	} {
+		w := mustDecisionWorld(t, c, roles, nil)
+		actual, err := evaluateDatasetDecisionWorld(c, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := concreteOracleRecords(c, w)
+		for i := range want {
+			if actual.Records[i].Selected != want[i].Selected || actual.Records[i].Subdir != want[i].Subdir {
+				t.Fatalf("roles=%v record %d got %+v want %+v", roles, i, actual.Records[i], want[i])
+			}
+		}
+	}
+	for i := range c.Inputs {
+		gotCan, gotCannot := datasetDecisionRefusal(c, i)
+		wantCan, wantCannot, worlds := oracleQueryOutcomes(c, i)
+		if worlds == 0 || gotCan.Possible != wantCan || gotCannot.Possible != (wantCan && wantCannot) {
+			t.Fatalf("input %d query=%t/%t oracle=%t/%t worlds=%d", i, gotCan.Possible, gotCannot.Possible, wantCan, wantCan && wantCannot, worlds)
+		}
 	}
 }
 
@@ -882,6 +923,8 @@ func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T
 		{"child-companion-is-not-seeded-by-parent", []hfNode{{Path: "folder/train.csv"}, {Path: "folder/sub/notes.json"}}, []string{"train", "default"}, nil, 1},
 		{"direct-companion-filter", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md"}}, []string{"train", "docs/"}, nil, 1},
 		{"direct-lfs-companion-filter", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md", LFS: &hfLfsInfo{Size: 3}}}, []string{"train", ".md"}, nil, 1},
+		{"direct-companion-directory-seed", []hfNode{{Path: "train.csv"}, {Path: "other/README.md"}, {Path: "other/LICENSE"}}, []string{"train", "README"}, nil, 2},
+		{"direct-lfs-companion-directory-seed", []hfNode{{Path: "train.csv"}, {Path: "docs/README.md", LFS: &hfLfsInfo{Size: 3}}, {Path: "docs/LICENSE"}}, []string{"train", ".md"}, nil, 2},
 		{"attribution-tie", []hfNode{{Path: "dir/test.csv"}}, []string{".csv", "test"}, nil, 0},
 		{"excluded-target", []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}}, []string{"train", "test"}, []string{"test/train.csv"}, 1},
 		{"case-winner", []hfNode{{Path: "Train/a.csv"}, {Path: "train/A.CSV"}}, []string{"train", ".csv"}, nil, 1},
@@ -1372,7 +1415,7 @@ func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, co
 	for i, in := range c.Inputs {
 		if !in.Excluded {
 			direct[i] = concreteOracleDirect(c, w, i, collisions)
-			if direct[i] && !w.Companion[i] {
+			if direct[i] {
 				for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
 					dirs[d] = true
 				}
