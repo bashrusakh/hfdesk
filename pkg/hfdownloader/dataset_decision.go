@@ -84,6 +84,8 @@ type datasetDecisionContext struct {
 type datasetDecisionUniqueEvaluation struct {
 	proofOnce sync.Once
 	unique    bool
+	fixedOnce sync.Once
+	fixedEmit []int8
 	once      sync.Once
 	world     datasetDecisionWorld
 	records   []datasetDecisionRecord

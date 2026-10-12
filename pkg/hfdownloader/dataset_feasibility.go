@@ -409,6 +409,11 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionQueryResult{}
 	}
+	if len(earlierCaseSkips) == 0 {
+		if r, fixed := fixedDatasetDecisionQuery(c, index, requireSkip); fixed {
+			return r
+		}
+	}
 	if r, unique := uniqueDatasetDecisionQuery(c, index, requireSkip); unique {
 		return r
 	}
@@ -459,9 +464,6 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 				continue
 			}
 			for _, alt := range c.Inputs[seed].Alternatives {
-				if alt.Role != datasetselection.EvidenceRoleData {
-					continue
-				}
 				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseSkips, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
 				if ok && queryWorldEmits(c, w, index) {
 					e, _ := evaluateDatasetDecisionWorld(c, w)
@@ -471,6 +473,140 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 		}
 	}
 	return datasetDecisionQueryResult{}
+}
+
+// fixedDatasetDecisionQuery proves per-record constant outcomes before using
+// the exact solver. It is deliberately conservative: any unresolved role,
+// token, seed, or first-eligible duplicate condition falls through.
+func fixedDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip bool) (datasetDecisionQueryResult, bool) {
+	if c.uniqueEvaluation == nil {
+		return datasetDecisionQueryResult{}, false
+	}
+	e := c.uniqueEvaluation
+	e.fixedOnce.Do(func() { e.fixedEmit = fixedDatasetDecisionOutcomes(c) })
+	if index >= len(e.fixedEmit) {
+		return datasetDecisionQueryResult{}, true
+	}
+	// Only a proof of the opposite fixed outcome may answer a query here.
+	// A merely possible outcome is not evidence that its complement is
+	// impossible (e.g. data-vs-companion root fallback).
+	fixed := e.fixedEmit[index]
+	if fixed == 0 {
+		return datasetDecisionQueryResult{}, false
+	}
+	if (fixed == 1) != !requireSkip {
+		return datasetDecisionQueryResult{}, true
+	}
+	// Use one independently admissible concrete world as the witness. The
+	// per-record proof establishes its queried outcome without relying on a
+	// global unique-world proof.
+	initializeDatasetDecisionBaseline(c, e)
+	if !e.valid || e.records[index].Selected == requireSkip {
+		return datasetDecisionQueryResult{}, false
+	}
+	return datasetDecisionQueryResult{Possible: true, World: e.world, Record: e.records[index]}, true
+}
+
+func initializeDatasetDecisionBaseline(c datasetDecisionContext, e *datasetDecisionUniqueEvaluation) {
+	e.once.Do(func() {
+		world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+		for bit := range collisionTokenBits(c) {
+			world.SharedToken[bit] = false
+		}
+		for i, in := range c.Inputs {
+			if len(in.Alternatives) == 0 {
+				return
+			}
+			alt := in.Alternatives[0]
+			if alt.Role == datasetselection.EvidenceRoleCompanion {
+				world.Companion[i] = true
+			} else {
+				world.DataLabels[i] = alt.Label
+			}
+		}
+		e.world = world
+		if validateDatasetDecisionWorld(c, world) != nil {
+			return
+		}
+		evaluation, err := evaluateDatasetDecisionWorld(c, world)
+		if err != nil {
+			return
+		}
+		e.records, e.valid = evaluation.Records, true
+	})
+}
+
+func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
+	n := len(c.Inputs)
+	directValue, directFixed := make([]bool, n), make([]bool, n)
+	for i, in := range c.Inputs {
+		if in.Excluded || len(in.Alternatives) == 0 {
+			directFixed[i] = true
+			continue
+		}
+		for j, alt := range in.Alternatives {
+			value, fixed := invariantDatasetDirect(c, i, alt, collisionTokenBits(c))
+			if !fixed || j > 0 && value != directValue[i] {
+				directFixed[i] = false
+				break
+			}
+			if j == 0 {
+				directFixed[i], directValue[i] = true, value
+			}
+		}
+	}
+	guaranteedDirs, possibleDirs := map[string]bool{}, map[string]bool{}
+	for i, in := range c.Inputs {
+		if in.Excluded || len(in.Alternatives) == 0 || !directFixed[i] || !directValue[i] {
+			if !in.Excluded && !directFixed[i] {
+				for _, dir := range datasetDecisionSeedDirectories(in) {
+					possibleDirs[dir] = true
+				}
+			}
+			continue
+		}
+		for _, dir := range datasetDecisionSeedDirectories(in) {
+			guaranteedDirs[dir], possibleDirs[dir] = true, true
+		}
+	}
+	outcomes := make([]int8, n) // +1 always emits, -1 always skips, 0 varies/is unproved.
+	seenExact, seenFold := map[string]bool{}, map[string]int8{}
+	for i, in := range c.Inputs {
+		fold := strings.ToLower(in.Path)
+		duplicate := seenExact[in.Path]
+		seenExact[in.Path] = true
+		priorOutcome, priorSeen := seenFold[fold]
+		if !duplicate && !in.Excluded {
+			allEligible, anyEligible := true, false
+			for _, alt := range in.Alternatives {
+				eligible, possible := directFixed[i] && directValue[i], !directFixed[i] || directValue[i]
+				if !eligible && alt.Role == datasetselection.EvidenceRoleCompanion {
+					dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
+					fallback := !in.LFS && (dir == "." || guaranteedDirs[dir])
+					maybeFallback := !in.LFS && (dir == "." || possibleDirs[dir])
+					eligible, possible = fallback, fallback || maybeFallback
+				}
+				if !eligible {
+					allEligible = false
+				}
+				if possible {
+					anyEligible = true
+				}
+			}
+			if duplicate || priorSeen && priorOutcome == 1 || !anyEligible {
+				outcomes[i] = -1
+			} else if allEligible && (!priorSeen || priorOutcome == -1) {
+				outcomes[i] = 1
+			}
+		}
+		if in.Excluded || duplicate {
+			outcomes[i] = -1
+		}
+		if !priorSeen || outcomes[i] == 1 || outcomes[i] == 0 && priorOutcome == -1 {
+			seenFold[fold] = outcomes[i]
+		}
+	}
+	return outcomes
 }
 
 // uniqueDatasetDecisionQuery avoids repeating whole-inventory feasibility and
@@ -489,29 +625,7 @@ func uniqueDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip
 	if !e.unique {
 		return datasetDecisionQueryResult{}, false
 	}
-	e.once.Do(func() {
-		world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
-		for bit := range collisionTokenBits(c) {
-			world.SharedToken[bit] = false
-		}
-		for i, in := range c.Inputs {
-			alt := in.Alternatives[0]
-			if alt.Role == datasetselection.EvidenceRoleCompanion {
-				world.Companion[i] = true
-			} else {
-				world.DataLabels[i] = alt.Label
-			}
-		}
-		e.world = world
-		if err := validateDatasetDecisionWorld(c, world); err != nil {
-			return
-		}
-		evaluation, err := evaluateDatasetDecisionWorld(c, world)
-		if err != nil {
-			return
-		}
-		e.records, e.valid = evaluation.Records, true
-	})
+	initializeDatasetDecisionBaseline(c, e)
 	if !e.valid || index >= len(e.records) {
 		return datasetDecisionQueryResult{}, true
 	}
