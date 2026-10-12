@@ -1208,6 +1208,41 @@ func TestStableEvaluationRejectsRoleDependentDirectorySeed(t *testing.T) {
 	}
 }
 
+func TestNestedCompanionCanUseDirectCompanionSeedWithoutStableCache(t *testing.T) {
+	cases := []struct {
+		name  string
+		nodes []hfNode
+	}{
+		{"ordinary-source", []hfNode{{Path: "train.csv"}, {Path: "other/README.md"}, {Path: "other/LICENSE"}, {Path: "notes.json"}}},
+		{"lfs-source", []hfNode{{Path: "train.csv"}, {Path: "other/README.md", LFS: &hfLfsInfo{Size: 3}}, {Path: "other/LICENSE"}, {Path: "notes.json"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := compileDecisionFixture(tc.nodes, []string{"train", "README"}, nil)
+			for _, cached := range []bool{false, true} {
+				query := c
+				if !cached {
+					query.uniqueEvaluation = nil
+				}
+				checkDatasetDecisionAgainstOracle(t, query)
+				for _, target := range []int{2, 3} {
+					got := canEmitDatasetDecision(query, target)
+					want, _, worlds := oracleQueryOutcomes(query, target)
+					if worlds == 0 || got.Possible != want {
+						t.Fatalf("cached=%t target %q CanEmit=%t oracle=%t worlds=%d", cached, query.Inputs[target].Path, got.Possible, want, worlds)
+					}
+					if got.Possible {
+						e, err := evaluateDatasetDecisionWorld(query, got.World)
+						if err != nil || !e.Records[target].Selected {
+							t.Fatalf("target %q has invalid witness: %+v, %v", query.Inputs[target].Path, e, err)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
 func checkDatasetDecisionAgainstOracle(t *testing.T, c datasetDecisionContext) {
 	t.Helper()
 	for i := range c.Inputs {
@@ -1351,6 +1386,47 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesRealTokenCollision(b *testing.B
 				})
 			}
 		})
+	}
+}
+
+func BenchmarkDatasetDecisionAllEmitAndNonEmitQueriesWithUnknownRoot(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		for _, notesAtEnd := range []bool{false, true} {
+			name := fmt.Sprintf("files-%d/notes-at-beginning", size)
+			if notesAtEnd {
+				name = fmt.Sprintf("files-%d/notes-at-end", size)
+			}
+			b.Run(name, func(b *testing.B) {
+				nodes := make([]hfNode, 0, size)
+				addData := func(i int) {
+					nodes = append(nodes, hfNode{Path: fmt.Sprintf("train/part-%04d.parquet", i)})
+				}
+				if !notesAtEnd {
+					nodes = append(nodes, hfNode{Path: "notes.json"})
+				}
+				for i := 0; i < size-4; i++ {
+					addData(i)
+				}
+				nodes = append(nodes, hfNode{Path: "test/part.csv"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"})
+				if notesAtEnd {
+					nodes = append(nodes, hfNode{Path: "notes.json"})
+				}
+				files := make([]datasetselection.File, len(nodes))
+				for i := range nodes {
+					files[i].Path = nodes[i].Path
+				}
+				membership := datasetselection.Recognize(files)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					c := compileDatasetDecisionContext(nodes, membership, []string{"train", ".parquet", ".json"}, []string{"test/part.csv"}, true, true, false)
+					for i := range c.Inputs {
+						_ = canEmitDatasetDecision(c, i)
+						_ = canNotEmitDatasetDecision(c, i)
+					}
+				}
+			})
+		}
 	}
 }
 
