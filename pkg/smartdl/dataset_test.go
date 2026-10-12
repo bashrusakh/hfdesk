@@ -251,6 +251,27 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("planned paths = %v, want %v", got, want)
 	}
+	var selectedGroups []string
+	for _, selectable := range info.SelectableItems {
+		if selectable.ID == "customdata" || selectable.ID == "default" {
+			selectedGroups = append(selectedGroups, selectable.FilterValue)
+		}
+	}
+	if len(selectedGroups) != 2 {
+		t.Fatalf("custom/default selectable filters = %v, want both groups", selectedGroups)
+	}
+	plan, err = hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: selectedGroups, ExactMatch: true}, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("public planner custom/default groups: %v", err)
+	}
+	got = got[:0]
+	for _, item := range plan.Items {
+		got = append(got, item.RelativePath)
+	}
+	want = []string{"data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("custom/default planned paths = %v, want %v", got, want)
+	}
 }
 
 func TestIsDataFileExtension(t *testing.T) {
