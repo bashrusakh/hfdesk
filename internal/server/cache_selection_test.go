@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1853,6 +1854,237 @@ func TestSelectedLocalDeleteDoesNotBlockWhenLaterDirectoryBecomesFIFO(t *testing
 		t.Fatal("selected-file reservation leaked after failed walk")
 	}
 	release()
+}
+
+func TestSelectedLocalDeletePreservesUnrelatedFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory-to-FIFO replacement regression requires Linux FIFO semantics")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected := "a-selected-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	laterDir := filepath.Join(repoDir, "z-later-empty-dir")
+	if err := os.Mkdir(laterDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.afterRootOpen = func() {
+		if err := os.Remove(laterDir); err != nil {
+			t.Errorf("remove later directory: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", laterDir).Run(); err != nil {
+			t.Errorf("replace later directory with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("replacement hook was not reached")
+			return
+		}
+		// This peer is a safety release if a regression opens the FIFO in
+		// blocking mode; it is not the expected successful execution path.
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(laterDir, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked in its initial location scan on a replaced directory FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(repoDir, selected)); !os.IsNotExist(err) {
+		t.Fatalf("selected GGUF was not removed: %v", err)
+	}
+	if info, err := os.Lstat(laterDir); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("unrelated FIFO changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestSelectedLocalDeleteDoesNotBlockWhenSelectedLinkBecomesFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("selected-link FIFO open regression is covered on Linux and macOS")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	target := filepath.Join(t.TempDir(), "weights.gguf")
+	if err := os.WriteFile(target, []byte("weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repoDir, name)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.beforeIdentityPin = func(path string) {
+		if path != name {
+			return
+		}
+		if err := os.Remove(link); err != nil {
+			t.Errorf("remove selected link: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", link).Run(); err != nil {
+			t.Errorf("replace selected link with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("FIFO replacement hook was not reached")
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(link, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked opening a selected link replaced by a FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("substituted FIFO changed: info=%v err=%v", info, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "weights" {
+		t.Fatalf("link target changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsForgedMemberBeforePinning(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ctime/link-count oracle uses Linux stat metadata")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected, foreign := "model-Q4_K_M.gguf", "other-Q5_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	writeSelectionFile(t, repoDir, foreign)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	var forged testSelectedDeleteRequest
+	if err := json.Unmarshal(body, &forged); err != nil {
+		t.Fatal(err)
+	}
+	forged.GroupID = "gguf-not-a-current-group"
+	forged.Members = []cacheSelectionMember{{Path: foreign, Size: int64(len("gguf"))}}
+	body, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignPath := filepath.Join(repoDir, foreign)
+	before, err := os.Lstat(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeMetadata := linuxPinMutationMetadata(t, before)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	var pinAttempts atomic.Int32
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+		pinAttempts.Add(1)
+		return nil
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("forged group status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if got := pinAttempts.Load(); got != 0 {
+		t.Fatalf("invalid request attempted %d identity pins before rejecting", got)
+	}
+	after, err := os.Lstat(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := linuxPinMutationMetadata(t, after); got != beforeMetadata {
+		t.Fatalf("unselected file link/ctime metadata changed: before=%s after=%s", beforeMetadata, got)
+	}
+	for _, name := range []string{selected, foreign} {
+		if data, err := os.ReadFile(filepath.Join(repoDir, name)); err != nil || string(data) != "gguf" {
+			t.Fatalf("%s changed: data=%q err=%v", name, data, err)
+		}
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+}
+
+func linuxPinMutationMetadata(t *testing.T, info os.FileInfo) string {
+	t.Helper()
+	stat := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	links, ctime := stat.FieldByName("Nlink"), stat.FieldByName("Ctim")
+	if !links.IsValid() || !ctime.IsValid() {
+		t.Fatal("Linux file metadata lacks link count or ctime fields")
+	}
+	return fmt.Sprintf("%v/%v", links.Interface(), ctime.Interface())
 }
 
 func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {

@@ -1425,11 +1425,18 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	var selected *cacheSelectionLocation
-	for _, loc := range cacheSelectionLocations(cfg, req.Repo) {
-		if loc.ID == req.LocationID {
-			copy := loc
-			selected = &copy
-			break
+	if localRoot != nil {
+		// The normal location scanner is intentionally unchanged for GET and HF
+		// deletion, but its filepath.Walk opens directories by path. Re-enumerate
+		// this local selection only through the already admitted rooted walks below.
+		selected = selectedLocalLocationCandidate(cfg, req.Repo, req.LocationID)
+	} else {
+		for _, loc := range cacheSelectionLocations(cfg, req.Repo) {
+			if loc.ID == req.LocationID {
+				copy := loc
+				selected = &copy
+				break
+			}
 		}
 	}
 	if selected == nil {
@@ -1441,20 +1448,22 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var group *cacheSelectionGroup
-	for i := range selected.Groups {
-		if selected.Groups[i].ID == req.GroupID {
-			copy := selected.Groups[i]
-			group = &copy
-			break
+	if localRoot == nil {
+		for i := range selected.Groups {
+			if selected.Groups[i].ID == req.GroupID {
+				copy := selected.Groups[i]
+				group = &copy
+				break
+			}
 		}
-	}
-	if group == nil || !group.CanDelete || !selectionCompositionEqual(req.Members, group.Members) {
-		writeError(w, http.StatusConflict, "Selection is stale", "The selected GGUF group or its exact members changed; refresh before deleting")
-		return
-	}
-	if selected.Warning != "" {
-		writeError(w, http.StatusConflict, "Location could not be verified", selected.Warning)
-		return
+		if group == nil || !group.CanDelete || !selectionCompositionEqual(req.Members, group.Members) {
+			writeError(w, http.StatusConflict, "Selection is stale", "The selected GGUF group or its exact members changed; refresh before deleting")
+			return
+		}
+		if selected.Warning != "" {
+			writeError(w, http.StatusConflict, "Location could not be verified", selected.Warning)
+			return
+		}
 	}
 	if localRoot != nil {
 		opened, openedErr := localRoot.Stat(".")
@@ -1549,12 +1558,6 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, status, response)
 		return
 	}
-	for _, member := range group.Members {
-		if !safeSelectedRelative(member.Path) {
-			writeError(w, http.StatusConflict, "Selection is unsafe", "A selected path is not a safe relative GGUF entry")
-			return
-		}
-	}
 	if localRoot == nil {
 		writeError(w, http.StatusConflict, "Selection is stale", "The configured local deletion scope could not be opened")
 		return
@@ -1565,6 +1568,37 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	if openedErr != nil || boundErr != nil || !os.SameFile(openedInfo, boundInfo) {
 		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
 		return
+	}
+	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo)
+	if !boundariesComplete {
+		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
+		return
+	}
+	// Establish the current group from the admitted rooted repository before
+	// request paths can influence reservation or identity-pin side effects.
+	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, nil, nil, nil)
+	if scanWarning != "" {
+		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)
+		return
+	}
+	freshGroups := makeSelectionGroups(selected.ID, files)
+	var fresh *cacheSelectionGroup
+	for i := range freshGroups {
+		if freshGroups[i].ID == req.GroupID {
+			fresh = &freshGroups[i]
+			break
+		}
+	}
+	if fresh == nil || !selectionCompositionEqual(req.Members, fresh.Members) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The selected GGUF group or its exact members changed; refresh before deleting")
+		return
+	}
+	group = fresh
+	for _, member := range group.Members {
+		if !safeSelectedRelative(member.Path) {
+			writeError(w, http.StatusConflict, "Selection is unsafe", "A selected path is not a safe relative GGUF entry")
+			return
+		}
 	}
 	physicalPaths := make([]string, 0, len(group.Members))
 	for _, member := range group.Members {
@@ -1585,17 +1619,12 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
 		return
 	}
-	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo)
-	if !boundariesComplete {
-		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
-		return
-	}
 	pinPaths := make(map[string]bool, len(group.Members))
 	for _, member := range group.Members {
 		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = true
 	}
 	pins := newSelectedEntryPinSet(root, s.selectedDeleteHooks)
-	files, scanWarning := localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin, pins)
+	files, scanWarning = localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin, pins)
 	if scanWarning != "" {
 		writeError(w, http.StatusConflict, "Location could not be verified", withPinCleanupDetails(scanWarning, pins.cleanup()))
 		return
@@ -1603,8 +1632,8 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	if s.selectedDeleteHooks.afterFinalScan != nil {
 		s.selectedDeleteHooks.afterFinalScan()
 	}
-	freshGroups := makeSelectionGroups(selected.ID, files)
-	var fresh *cacheSelectionGroup
+	freshGroups = makeSelectionGroups(selected.ID, files)
+	fresh = nil
 	for i := range freshGroups {
 		if freshGroups[i].ID == req.GroupID {
 			fresh = &freshGroups[i]

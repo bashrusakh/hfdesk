@@ -14,8 +14,9 @@ import (
 
 func openSelectedLinkEntry(physicalRepo, name string) (*os.File, error) {
 	path := filepath.Join(physicalRepo, filepath.FromSlash(name))
-	// macOS O_SYMLINK opens the symlink inode itself rather than its target.
-	fd, err := syscall.Open(path, syscall.O_SYMLINK|syscall.O_CLOEXEC, 0)
+	// O_SYMLINK opens the link inode itself; O_NONBLOCK prevents a replacement
+	// FIFO from waiting for a writer during identity capture.
+	fd, err := syscall.Open(path, syscall.O_SYMLINK|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("pin selected link entry: %w", err)
 	}
