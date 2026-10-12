@@ -1856,6 +1856,136 @@ func TestSelectedLocalDeleteDoesNotBlockWhenLaterDirectoryBecomesFIFO(t *testing
 	release()
 }
 
+func TestSelectedDirectoryAcquisitionRejectsFIFOWithoutWaiting(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("nonblocking directory acquisition regression requires Linux FIFO semantics")
+	}
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, acquire := range []struct {
+		name string
+		fn   func() (*os.Root, error)
+	}{
+		{"base", func() (*os.Root, error) { return openSelectedLocalBase(filepath.Join(base, "fifo")) }},
+		{"child", func() (*os.Root, error) { return openSelectedDirectoryRoot(root, "fifo") }},
+	} {
+		if err := exec.Command("mkfifo", filepath.Join(base, "fifo")).Run(); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			opened, err := acquire.fn()
+			if opened != nil {
+				_ = opened.Close()
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s acquisition accepted a FIFO", acquire.name)
+			}
+		case <-time.After(time.Second):
+			// Ensure a regression cannot strand this test process on FIFO open.
+			peer, peerErr := os.OpenFile(filepath.Join(base, "fifo"), os.O_RDWR, 0)
+			if peerErr == nil {
+				_ = peer.Close()
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatalf("%s acquisition remained blocked after FIFO release", acquire.name)
+			}
+			t.Fatalf("%s acquisition blocked while opening a FIFO", acquire.name)
+		}
+		if err := os.Remove(filepath.Join(base, "fifo")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(base, "fifo"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		opened, err := acquire.fn()
+		if err != nil {
+			t.Fatalf("%s acquisition rejected an ordinary directory: %v", acquire.name, err)
+		}
+		_ = opened.Close()
+		if err := os.RemoveAll(filepath.Join(base, "fifo")); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSelectedLocalDeleteRejectsNewContainingRootOwnership(t *testing.T) {
+	base := t.TempDir()
+	rel := "model-Q4_K_M.gguf"
+	repoDir := filepath.Join(base, "owner", "model")
+	writeSelectionFile(t, repoDir, rel)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{base}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, rel)
+	// This independently configured subroot contains the selected repo; GET's
+	// outer-root projection omits it, so DELETE must refuse the stale source.
+	alias := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(repoDir, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{filepath.Join(base, "owner"), alias, repoDir} {
+		s.configMu.Lock()
+		s.config.LocalScanDirs = []string{base, candidate}
+		s.configMu.Unlock()
+		w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("delete through superseded root %q status=%d body=%s, want 409", candidate, w.Code, w.Body.String())
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, rel)); err != nil {
+			t.Fatalf("protected file changed after ownership refusal: %v", err)
+		}
+	}
+}
+
+func TestSelectedLocalDeleteAllowsDeeperSourceRootUnderConfiguredAncestor(t *testing.T) {
+	outer := t.TempDir()
+	deeper := filepath.Join(outer, "deeper")
+	writeSelectionFile(t, filepath.Join(outer, "owner", "model"), "outer-Q4_K_M.gguf")
+	writeSelectionFile(t, filepath.Join(deeper, "owner", "model"), "inner-Q4_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{
+		CacheDir:      filepath.Join(t.TempDir(), "cache"),
+		LocalScanDirs: []string{outer, deeper},
+	})
+	_, selection := getSelection(t, s, "owner/model", "model", "")
+	var selected *cacheSelectionLocation
+	for i := range selection.Locations {
+		if pathIdentityKey(filepath.Clean(selection.Locations[i].Path)) == pathIdentityKey(filepath.Join(deeper, "owner", "model")) {
+			selected = &selection.Locations[i]
+			break
+		}
+	}
+	if selected == nil || !selected.CanDelete || len(selected.Groups) == 0 {
+		t.Fatalf("deeper configured source root was not selectable: %+v", selection.Locations)
+	}
+	group := selected.Groups[0]
+	body, err := json.Marshal(testSelectedDeleteRequest{
+		Repo: "owner/model", Type: "model", LocationID: selected.ID, GroupID: group.ID, Members: group.Members,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete through deeper source root under ancestor status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outer, "owner", "model", "outer-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("ancestor-owned sibling changed: %v", err)
+	}
+}
+
 func TestSelectedLocalDeletePreservesUnrelatedFIFO(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("directory-to-FIFO replacement regression requires Linux FIFO semantics")

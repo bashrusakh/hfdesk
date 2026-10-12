@@ -702,6 +702,49 @@ func safeSelectedRelative(name string) bool {
 	return clean == name && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
+// openSelectedDirectoryRoot makes the last path component a directory
+// traversal component (rather than opening it as a file first). In particular,
+// a concurrent replacement with a FIFO must fail without waiting for a peer.
+func openSelectedDirectoryRoot(root *os.Root, name string) (*os.Root, error) {
+	return root.OpenRoot(name + string(filepath.Separator) + ".")
+}
+
+func openSelectedLocalBase(name string) (*os.Root, error) {
+	return os.OpenRoot(name + string(filepath.Separator) + ".")
+}
+
+func openSelectedDirectoryFile(root *os.Root, name string) (*os.File, error) {
+	before, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("local selection path %q is no longer a directory", name)
+	}
+	child, err := openSelectedDirectoryRoot(root, name)
+	if err != nil {
+		return nil, err
+	}
+	f, err := child.Open(".")
+	closeErr := child.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		_ = f.Close()
+		return nil, closeErr
+	}
+	info, err := f.Stat()
+	if err != nil || !info.IsDir() || !os.SameFile(before, info) {
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("local selection path %q is no longer a directory", name)
+	}
+	return f, nil
+}
+
 // openSelectedLocalRepo admits a repository through its configured lexical
 // location, then keeps an os.Root anchored to that exact repository directory.
 // Comparing the opened directory with both observed bindings rejects an alias
@@ -723,7 +766,7 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 	if beforeOpen != nil {
 		beforeOpen()
 	}
-	root, err := os.OpenRoot(base)
+	root, err := openSelectedLocalBase(base)
 	if err != nil {
 		return nil, "", err
 	}
@@ -740,7 +783,7 @@ func openSelectedLocalRepo(repoDir string, beforeOpen func()) (*os.Root, string,
 			root.Close()
 			return nil, "", fmt.Errorf("selected repository has an unsafe owner/model component")
 		}
-		next, openErr := root.OpenRoot(component)
+		next, openErr := openSelectedDirectoryRoot(root, component)
 		if openErr != nil {
 			root.Close()
 			return nil, "", openErr
@@ -853,7 +896,7 @@ func (p *selectedEntryPinSet) hardLinkParent(parent string) (*selectedHardLinkCo
 		if err != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("selected-entry parent has an unsafe component")
 		}
-		next, err := current.OpenRoot(component)
+		next, err := openSelectedDirectoryRoot(current, component)
 		if err != nil {
 			return nil, fmt.Errorf("open selected-entry parent component %q: %w", component, err)
 		}
@@ -951,7 +994,7 @@ func (p *selectedEntryPinSet) ensureHardLinkContainer(parent string) (*selectedH
 			return nil, fmt.Errorf("temporary identity-pin container %q is not private", name)
 		}
 		container.info = info
-		containerRoot, err := container.parentRoot.OpenRoot(name)
+		containerRoot, err := openSelectedDirectoryRoot(container.parentRoot, name)
 		if err != nil {
 			return nil, fmt.Errorf("open temporary identity-pin container %q: %w", name, err)
 		}
@@ -1218,7 +1261,7 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 	var warning string
 	excludedSet := make(map[string]bool, len(excluded))
 	for _, name := range excluded {
-		excludedSet[filepath.ToSlash(filepath.Clean(name))] = true
+		excludedSet[filepath.ToSlash(pathIdentityKey(filepath.Clean(name)))] = true
 	}
 	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1227,7 +1270,7 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 		if name == "." {
 			return nil
 		}
-		if excludedSet[filepath.ToSlash(filepath.Clean(name))] {
+		if excludedSet[filepath.ToSlash(pathIdentityKey(filepath.Clean(name)))] {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -1308,6 +1351,13 @@ func selectedDeleteExclusions(cfg Config, selected *cacheSelectionLocation, phys
 	if err != nil {
 		return nil, false
 	}
+	selectedBase := filepath.Dir(filepath.Dir(selectedLexical))
+	selectedBaseLexical, selectedBasePhysical, baseOK := configuredRootIdentity(selectedBase)
+	if !baseOK {
+		return nil, false
+	}
+	selectedLexical = pathIdentityKey(selectedLexical)
+	physicalRepo = pathIdentityKey(filepath.Clean(physicalRepo))
 	var excluded []string
 	seen := make(map[string]bool)
 	add := func(rel string) bool {
@@ -1327,18 +1377,30 @@ func selectedDeleteExclusions(cfg Config, selected *cacheSelectionLocation, phys
 		if absErr != nil {
 			return nil, false
 		}
-		if pathIdentityKey(candidateLexical) == pathIdentityKey(selectedLexical) {
+		candidateLexical = pathIdentityKey(candidateLexical)
+		_, candidatePhysical, ok := configuredRootIdentity(candidate.Path)
+		if !ok {
+			return nil, false
+		}
+		// GET projects ownership only from descendants of the selected source
+		// root. A separately configured root inside that source which contains
+		// this repo (including an exact physical alias) takes ownership of the
+		// repo from above; deleting through the broader source would otherwise
+		// disagree with the locations GET presents.
+		candidatePhysical = pathIdentityKey(filepath.Clean(candidatePhysical))
+		if candidateLexical == selectedBaseLexical || candidatePhysical == selectedBasePhysical {
 			continue
+		}
+		insideSource := withinLocalRoot(selectedBaseLexical, candidateLexical) || withinLocalRoot(selectedBasePhysical, candidatePhysical)
+		containsRepo := withinLocalRoot(candidateLexical, selectedLexical) || withinLocalRoot(candidatePhysical, physicalRepo)
+		if insideSource && containsRepo {
+			return nil, false
 		}
 		if withinLocalRoot(selectedLexical, candidateLexical) {
 			rel, relErr := filepath.Rel(selectedLexical, candidateLexical)
 			if relErr != nil || !add(rel) {
 				return nil, false
 			}
-		}
-		_, candidatePhysical, ok := configuredRootIdentity(candidate.Path)
-		if !ok {
-			return nil, false
 		}
 		if candidatePhysical != physicalRepo && withinLocalRoot(physicalRepo, candidatePhysical) {
 			rel, relErr := filepath.Rel(physicalRepo, candidatePhysical)
