@@ -580,9 +580,9 @@ func stableDirectEvaluation(c datasetDecisionContext) bool {
 
 // stableDatasetDecisionEvaluation certifies a reusable complete evaluation
 // when each input's direct-match result is invariant across its actual roles
-// and every shared-token assignment. It also requires the direct data-seed
-// status to be role-invariant, then checks that companion fallback eligibility
-// is invariant against the resulting fixed seed directories. Input order and
+// and every shared-token assignment, then checks that companion fallback
+// eligibility is invariant against the resulting fixed seed directories. Any
+// direct selection seeds its directory regardless of role. Input order and
 // duplicate suppression are consequently deterministic as well. Attribution
 // need not be invariant: the cached records are evaluated in one coherent
 // admissible baseline world, which remains a valid refusal witness.
@@ -606,38 +606,13 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			}
 		}
 	}
-	seedDirsByInput := make([][]string, len(c.Inputs))
 	seedCounts := make(map[string]int)
 	for i, in := range c.Inputs {
-		if in.Excluded || !direct[i] || c.Inputs[i].Alternatives[0].Role != datasetselection.EvidenceRoleData {
+		if in.Excluded || !direct[i] {
 			continue
 		}
-		seedDirsByInput[i] = datasetDecisionSeedDirectories(in)
-		for _, dir := range seedDirsByInput[i] {
+		for _, dir := range datasetDecisionSeedDirectories(in) {
 			seedCounts[dir]++
-		}
-	}
-	for i, in := range c.Inputs {
-		if in.Excluded {
-			continue
-		}
-		for _, alt := range in.Alternatives {
-			var candidateDirs []string
-			if direct[i] && alt.Role == datasetselection.EvidenceRoleData {
-				candidateDirs = datasetDecisionSeedDirectories(in)
-			}
-			candidateSet := make(map[string]bool, len(candidateDirs))
-			for _, dir := range candidateDirs {
-				candidateSet[dir] = true
-				if seedCounts[dir] == 0 {
-					return false
-				}
-			}
-			for _, dir := range seedDirsByInput[i] {
-				if seedCounts[dir] == 1 && !candidateSet[dir] {
-					return false
-				}
-			}
 		}
 	}
 	dirs := make(map[string]bool, len(seedCounts))
@@ -837,7 +812,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 				direct[i] = true
 			}
 		}
-		if direct[i] && !companions[i] {
+		if direct[i] {
 			for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
 				dirs[d] = true
 			}

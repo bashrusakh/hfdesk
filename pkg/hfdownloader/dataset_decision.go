@@ -251,7 +251,10 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	for i := range c.Inputs {
 		in := &c.Inputs[i]
 		hasPossibleDataRole := in.PossibleCore != 0 || len(in.PossibleResidual) != 0
-		in.DirectSeedCandidate = !in.Excluded && hasPossibleDataRole && (len(in.DirectFilterIndexes) != 0 || in.GroupCoreConditions != 0 || len(in.GroupResidualConditions) != 0)
+		// Any ordinary explicit path match is a direct selection under every
+		// actual role, including companion interpretations. Membership-only
+		// selection remains limited to actual data alternatives.
+		in.DirectSeedCandidate = !in.Excluded && (len(in.DirectFilterIndexes) != 0 || hasPossibleDataRole && (in.GroupCoreConditions != 0 || len(in.GroupResidualConditions) != 0))
 	}
 	// Index actual, non-excluded direct matches by containing directory. Keep
 	// one shared index rather than copying each seed list onto every file.
