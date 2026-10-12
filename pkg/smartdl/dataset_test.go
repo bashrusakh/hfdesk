@@ -274,6 +274,55 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	}
 }
 
+func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
+	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/ambiguous", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.PopulateDownloadSelection()
+	request := info.RecommendedDownload
+	if request == nil || len(request.Filters) != 1 || request.Filters[0] != "train" {
+		t.Fatalf("recommended request = %+v", request)
+	}
+	job := hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: request.Filters, ExactMatch: request.ExactMatch}
+	if plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL}); err == nil || plan != nil {
+		t.Fatalf("ambiguous public plan = %+v, err=%v; want refusal", plan, err)
+	}
+	job.Excludes = []string{"unknown.json"}
+	plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("excluded ambiguity plan: %v", err)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "train.csv" {
+		t.Fatalf("excluded plan paths = %+v", plan.Items)
+	}
+	job.Filters = nil
+	job.Excludes = nil
+	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("unfiltered public plan: %v", err)
+	}
+	if len(plan.Items) != len(paths) {
+		t.Fatalf("unfiltered plan has %d items, want %d", len(plan.Items), len(paths))
+	}
+}
+
 func TestIsDataFileExtension(t *testing.T) {
 	validExts := []string{
 		"parquet", "arrow", "json", "jsonl", "csv", "tsv",
