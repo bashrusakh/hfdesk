@@ -4,7 +4,10 @@
 package hfdownloader
 
 import (
+	"fmt"
+	"path"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
@@ -44,6 +47,492 @@ func TestCompileDatasetDecisionContextPreservesActualRolesAndAlternatives(t *tes
 			t.Fatal("invented a group absent from actual evidence")
 		}
 	}
+}
+
+func TestFeasibleDatasetDecisionWorldHonorsPinsSkipsAndPositiveSeed(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "train/meta.json"}, {Path: "other/meta.json"}}, []string{"train"}, nil)
+	train := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "train"}
+	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+	// A direct data file cannot be required skipped while the recognized group
+	// filter selects it; an unseeded nested companion can satisfy the skip.
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{0: train}, []int{0}, nil, nil); ok {
+		t.Fatal("pinned direct data unexpectedly skipped")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{2: companion}, []int{2}, nil, nil); !ok {
+		t.Fatal("pinned companion should permit required skip")
+	}
+	// A positive clause can force a selected data seed, while a contradictory
+	// zero-direct requirement must be rejected rather than returning a bad world.
+	positive := &datasetDecisionPositive{Input: 0, Alternative: train}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{0: train}, nil, nil, positive); !ok {
+		t.Fatal("expected coherent positive seed world")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{0: train}, nil, []int{0}, positive); ok {
+		t.Fatal("positive and zero-direct contradiction accepted")
+	}
+}
+
+func TestFeasibleDatasetDecisionWorldAgainstIndependentSmallOracle(t *testing.T) {
+	cases := []struct {
+		name    string
+		nodes   []hfNode
+		filters []string
+	}{
+		{"different-groups-and-path-collisions", []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "test/meta.json"}}, []string{"train", "test"}},
+		{"custom-group-and-shared-ordinary-token", []hfNode{{Path: "data/customdata/a.parquet"}, {Path: "data/customdata/b.parquet"}, {Path: "root.json"}, {Path: "data/customdata/README.md"}}, []string{"customdata", "a.parquet"}},
+		{"default-companion-and-repeat-filter", []hfNode{{Path: "records.parquet"}, {Path: "notes.json"}, {Path: "nested/info.md"}}, []string{"default", "DEFAULT", ".md"}},
+		{"four-files-with-shared-custom-terms", []hfNode{{Path: "data/customdata/other/one.csv"}, {Path: "data/customdata/two.csv"}, {Path: "data/other/three.csv"}, {Path: "root.json"}}, []string{"customdata", "other", "CSV"}},
+	}
+	queries := 0
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := compileDecisionFixture(tc.nodes, tc.filters, nil)
+			for i, in := range c.Inputs {
+				for _, pin := range in.Alternatives {
+					for _, zeros := range [][]int{{i}, {i, (i + 1) % len(c.Inputs)}} {
+						for _, positiveIndex := range []int{-1, (i + 1) % len(c.Inputs)} {
+							positives := []*datasetDecisionPositive{nil}
+							if positiveIndex >= 0 {
+								positives = positives[:0]
+								for _, alt := range c.Inputs[positiveIndex].Alternatives {
+									positives = append(positives, &datasetDecisionPositive{Input: positiveIndex, Alternative: alt})
+								}
+							}
+							for _, positive := range positives {
+								for _, skipIndex := range []int{-1, (i + 2) % len(c.Inputs)} {
+									var skips []int
+									if skipIndex >= 0 {
+										skips = []int{skipIndex}
+									}
+									pins := datasetDecisionPins{i: pin}
+									for _, core := range oracleCoreAssignments(c) {
+										want, oracleWorld := enumerateDecisionFeasibility(c, core, pins, skips, zeros, positive)
+										gotWorld, got := feasibleDatasetDecisionWorld(c, core, pins, skips, zeros, positive)
+										queries++
+										if got != want {
+											t.Errorf("solver/oracle mismatch filters=%q core=%v roles=%+v pins=%v skips=%v zeroDirect=%v positive=%+v: solver=%v oracle=%v witness=%+v", tc.filters, core, c.Inputs, pins, skips, zeros, positive, got, want, gotWorld)
+											continue
+										}
+										if got && !decisionWitnessSatisfies(c, gotWorld, core, pins, skips, zeros, positive) {
+											t.Errorf("invalid solver witness: filters=%q core=%v pins=%v skips=%v zeroDirect=%v positive=%+v witness=%+v", tc.filters, core, pins, skips, zeros, positive, gotWorld)
+										}
+										if want && !decisionWitnessSatisfies(c, oracleWorld, core, pins, skips, zeros, positive) {
+											t.Errorf("oracle generated invalid witness: %s", fmt.Sprint(oracleWorld))
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+	if queries < 70 {
+		t.Fatalf("oracle query count=%d, expected broad small-domain coverage", queries)
+	}
+	t.Logf("independent concrete oracle matched solver for %d generated queries", queries)
+}
+
+func TestRequiredSkipRejectsRootCompanionAndAcceptsNestedCompanion(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "config.json"}, {Path: "nested/notes.md"}}, []string{"train"}, nil)
+	rootCompanion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); ok {
+		t.Fatal("root non-LFS companion cannot satisfy required skip")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{2: rootCompanion}, []int{2}, nil, nil); !ok {
+		t.Fatal("unseeded nested companion should satisfy required skip")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{99: rootCompanion}, nil, nil, nil); ok {
+		t.Fatal("pin to unknown input accepted")
+	}
+	seeded := compileDecisionFixture([]hfNode{{Path: "train/data.csv"}, {Path: "train/meta.json"}}, []string{"train"}, nil)
+	positiveSeed := &datasetDecisionPositive{Input: 0, Alternative: seeded.Inputs[0].Alternatives[0]}
+	if _, ok := feasibleAnyCoreDecisionWorld(seeded, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, positiveSeed); ok {
+		t.Fatal("positive direct source cannot coexist with required skip of its companion descendant")
+	}
+	lfs := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "other/weights.bin", LFS: &hfLfsInfo{Size: 3}}}, []string{"train"}, nil)
+	if _, ok := feasibleAnyCoreDecisionWorld(lfs, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); !ok {
+		t.Fatal("non-direct LFS companion should be skipped")
+	}
+	directLFS := compileDecisionFixture([]hfNode{{Path: "other/train/weights.bin", LFS: &hfLfsInfo{Size: 3}}}, []string{"train"}, nil)
+	if _, ok := feasibleAnyCoreDecisionWorld(directLFS, datasetDecisionPins{0: rootCompanion}, []int{0}, nil, nil); ok {
+		t.Fatal("directly matched LFS companion is selected, not skipped")
+	}
+	excludedSeed := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/notes.md"}}, []string{"train"}, []string{"train.csv"})
+	train := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "train"}
+	if _, ok := feasibleAnyCoreDecisionWorld(excludedSeed, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); !ok {
+		t.Fatal("excluded direct candidate must not seed companion scope")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(excludedSeed, datasetDecisionPins{0: train}, []int{0}, nil, nil); !ok {
+		t.Fatal("excluded file is skipped regardless of its role or direct match")
+	}
+}
+
+func TestPositiveDirectAssignsResidualSharedCustomBit(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "data/customdata/other/a.parquet"}, {Path: "data/other/b.parquet"}}, []string{"other"}, nil)
+	alt := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "other"}
+	if !containsString(c.ResidualLabels, "other") {
+		t.Fatalf("expected custom residual label: %+v", c.ResidualLabels)
+	}
+	bit := c.FilterBits["other"]
+	if !oracleCollisionBits(c)[bit] {
+		t.Fatalf("fixture did not create the residual shared-token collision: labels=%v inputs=%+v filters=%+v", c.RecognizedLabels, c.Inputs, c.Filters)
+	}
+	w, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{1: alt}, nil, nil, &datasetDecisionPositive{Input: 1, Alternative: alt})
+	if !ok || !w.SharedToken[bit] {
+		t.Fatalf("positive custom membership must assign its shared residual unit true: ok=%v witness=%+v bit=%d", ok, w, bit)
+	}
+}
+
+func TestZeroDirectUsesEveryIndependentGroupTerm(t *testing.T) {
+	// Minimal counterexample to the first draft's aggregation: this file has
+	// actual train/test/validation alternatives, but the pinned validation role
+	// makes train and test direct only under their ordinary-path interpretations.
+	// Both bits can be set to membership, making every direct term false.
+	c := compileDecisionFixture([]hfNode{{Path: "train/test/validation/data.csv"}}, []string{"train", "test"}, nil)
+	validation := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "validation"}
+	pins := datasetDecisionPins{0: validation}
+	zeros := []int{0}
+	core := map[uint]bool{c.FilterBits["train"]: true, c.FilterBits["test"]: true}
+	want, oracle := enumerateDecisionFeasibility(c, core, pins, nil, zeros, nil)
+	gotWorld, got := feasibleDatasetDecisionWorld(c, core, pins, nil, zeros, nil)
+	if !want || !got {
+		t.Fatalf("multi-term zero-direct should be feasible: filters=%v roles=%+v pins=%v coreUnits=%v zeroDirect=%v expected=%v oracleWorld=%+v solver=%v witness=%+v", c.Filters, c.Inputs, pins, core, zeros, want, oracle, got, gotWorld)
+	}
+	if !decisionWitnessSatisfies(c, gotWorld, core, pins, nil, zeros, nil) {
+		t.Fatalf("solver returned invalid witness: %+v", gotWorld)
+	}
+	if !gotWorld.SharedToken[c.FilterBits["train"]] || !gotWorld.SharedToken[c.FilterBits["test"]] {
+		t.Fatalf("zero-direct must force both independent group bits to membership: %+v", gotWorld.SharedToken)
+	}
+	contradictoryCore := map[uint]bool{c.FilterBits["train"]: false, c.FilterBits["test"]: true}
+	want, _ = enumerateDecisionFeasibility(c, contradictoryCore, pins, nil, zeros, nil)
+	if want {
+		t.Fatal("oracle found zero-direct under a fixed ordinary interpretation for train")
+	}
+	if _, ok := feasibleDatasetDecisionWorld(c, contradictoryCore, pins, nil, zeros, nil); ok {
+		t.Fatal("primitive ignored its fixed core assignment")
+	}
+	if _, ok := feasibleDatasetDecisionWorld(c, map[uint]bool{c.FilterBits["train"]: true}, pins, nil, zeros, nil); ok {
+		t.Fatal("primitive accepted an incomplete core assignment")
+	}
+	positive := &datasetDecisionPositive{Input: 0, Alternative: validation}
+	want, _ = enumerateDecisionFeasibility(c, core, pins, nil, zeros, positive)
+	if want {
+		t.Fatal("oracle found a world satisfying both zero-direct and positive-direct on one pinned file")
+	}
+	if _, ok := feasibleDatasetDecisionWorld(c, core, pins, nil, zeros, positive); ok {
+		t.Fatal("solver accepted conflicting shared-token requirements")
+	}
+	duplicate := compileDecisionFixture([]hfNode{{Path: "train/test/validation/data.csv"}}, []string{"train", "TRAIN", "test"}, nil)
+	dupCore := map[uint]bool{duplicate.FilterBits["train"]: true, duplicate.FilterBits["test"]: true}
+	want, _ = enumerateDecisionFeasibility(duplicate, dupCore, pins, nil, zeros, nil)
+	gotWorld, got = feasibleDatasetDecisionWorld(duplicate, dupCore, pins, nil, zeros, nil)
+	if !want || !got || duplicate.Filters[0].Bit != duplicate.Filters[1].Bit || !gotWorld.SharedToken[duplicate.Filters[0].Bit] {
+		t.Fatalf("case-normalized duplicate terms must share the one forced unit: oracle=%v solver=%v world=%+v filters=%+v", want, got, gotWorld, duplicate.Filters)
+	}
+	explicit := compileDecisionFixture([]hfNode{{Path: "train/test/validation/data.csv"}}, []string{"train", "test", ".csv"}, nil)
+	want, _ = enumerateAnyCoreDecisionFeasibility(explicit, pins, nil, zeros, nil)
+	if want {
+		t.Fatal("independent ordinary .csv term should make zero-direct impossible")
+	}
+	if _, ok := feasibleAnyCoreDecisionWorld(explicit, pins, nil, zeros, nil); ok {
+		t.Fatal("solver ignored constant-true explicit ordinary term")
+	}
+}
+
+// This deliberately enumerates the tiny test domain and evaluates direct
+// terms/skip outcomes with an independent concrete reference, never through
+// the symbolic solver, literal compiler, or production world evaluator.
+func enumerateDecisionFeasibility(c datasetDecisionContext, coreAssignment map[uint]bool, pins datasetDecisionPins, skips, zeros []int, positive *datasetDecisionPositive) (bool, datasetDecisionWorld) {
+	collisions := oracleCollisionBits(c)
+	var bits []uint
+	for bit := range collisions {
+		if !oracleCoreBit(c, bit) {
+			bits = append(bits, bit)
+		}
+	}
+	for mask := 0; mask < 1<<len(bits); mask++ {
+		w := datasetDecisionWorld{DataLabels: map[int]string{}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}}
+		for bit, value := range coreAssignment {
+			if !collisions[bit] || !oracleCoreBit(c, bit) {
+				return false, datasetDecisionWorld{}
+			}
+			w.SharedToken[bit] = value
+		}
+		for bit := range collisions {
+			if oracleCoreBit(c, bit) {
+				if _, ok := coreAssignment[bit]; !ok {
+					return false, datasetDecisionWorld{}
+				}
+			}
+		}
+		for j, bit := range bits {
+			w.SharedToken[bit] = mask&(1<<j) != 0
+		}
+		var visit func(int) (bool, datasetDecisionWorld)
+		visit = func(i int) (bool, datasetDecisionWorld) {
+			if i == len(c.Inputs) {
+				for index, pin := range pins {
+					if index < 0 || index >= len(c.Inputs) || !hasDecisionAlternative([]datasetDecisionRoleLabel{worldRole(w, index)}, pin) {
+						return false, datasetDecisionWorld{}
+					}
+				}
+				for _, index := range zeros {
+					if concreteOracleDirect(c, w, index, collisions) {
+						return false, datasetDecisionWorld{}
+					}
+				}
+				if positive != nil {
+					if positive.Input < 0 || positive.Input >= len(c.Inputs) || worldRole(w, positive.Input) != positive.Alternative || !concreteOracleDirect(c, w, positive.Input, collisions) {
+						return false, datasetDecisionWorld{}
+					}
+				}
+				if len(skips) > 0 {
+					skipped := concreteOracleSkipped(c, w, collisions)
+					for _, index := range skips {
+						if index < 0 || index >= len(skipped) || !skipped[index] {
+							return false, datasetDecisionWorld{}
+						}
+					}
+				}
+				return true, cloneDecisionWorld(w)
+			}
+			for _, alt := range c.Inputs[i].Alternatives {
+				if alt.Role == datasetselection.EvidenceRoleCompanion {
+					w.Companion[i] = true
+				} else {
+					w.DataLabels[i] = alt.Label
+				}
+				if ok, found := visit(i + 1); ok {
+					return true, found
+				}
+				delete(w.Companion, i)
+				delete(w.DataLabels, i)
+			}
+			return false, datasetDecisionWorld{}
+		}
+		if ok, found := visit(0); ok {
+			return true, found
+		}
+	}
+	return false, datasetDecisionWorld{}
+}
+
+func oracleCoreBit(c datasetDecisionContext, bit uint) bool {
+	for _, filter := range c.Filters {
+		if filter.Bit == bit {
+			for _, label := range datasetCoreLabels {
+				if filter.Normalized == label {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+func oracleCoreAssignments(c datasetDecisionContext) []map[uint]bool {
+	var bits []uint
+	for bit := range oracleCollisionBits(c) {
+		if oracleCoreBit(c, bit) {
+			bits = append(bits, bit)
+		}
+	}
+	assignments := make([]map[uint]bool, 0, 1<<len(bits))
+	for mask := 0; mask < 1<<len(bits); mask++ {
+		assignment := map[uint]bool{}
+		for i, bit := range bits {
+			assignment[bit] = mask&(1<<i) != 0
+		}
+		assignments = append(assignments, assignment)
+	}
+	return assignments
+}
+func enumerateAnyCoreDecisionFeasibility(c datasetDecisionContext, pins datasetDecisionPins, skips, zeros []int, positive *datasetDecisionPositive) (bool, datasetDecisionWorld) {
+	for _, core := range oracleCoreAssignments(c) {
+		if ok, w := enumerateDecisionFeasibility(c, core, pins, skips, zeros, positive); ok {
+			return true, w
+		}
+	}
+	return false, datasetDecisionWorld{}
+}
+func feasibleAnyCoreDecisionWorld(c datasetDecisionContext, pins datasetDecisionPins, skips, zeros []int, positive *datasetDecisionPositive) (datasetDecisionWorld, bool) {
+	for _, core := range oracleCoreAssignments(c) {
+		if w, ok := feasibleDatasetDecisionWorld(c, core, pins, skips, zeros, positive); ok {
+			return w, true
+		}
+	}
+	return datasetDecisionWorld{}, false
+}
+
+func oracleCollisionBits(c datasetDecisionContext) map[uint]bool {
+	bits := map[uint]bool{}
+	filterBits := map[int]uint{}
+	for _, filter := range c.Filters {
+		filterBits[filter.Index] = filter.Bit
+	}
+	for _, input := range c.Inputs {
+		if input.Excluded {
+			continue
+		}
+		for _, index := range input.CollisionFilterIndexes {
+			if bit, ok := filterBits[index]; ok {
+				bits[bit] = true
+			}
+		}
+	}
+	return bits
+}
+
+func worldRole(w datasetDecisionWorld, i int) datasetDecisionRoleLabel {
+	if w.Companion[i] {
+		return datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+	}
+	return datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: w.DataLabels[i]}
+}
+func concreteOracleDirect(c datasetDecisionContext, w datasetDecisionWorld, i int, collisions map[uint]bool) bool {
+	recognized := map[string]bool{}
+	for _, label := range c.RecognizedLabels {
+		recognized[label] = true
+	}
+	for _, filter := range c.Filters {
+		pathMatch := filterMatchesPath(c.Inputs[i].Path, filter.Original, c.ExactMatch)
+		matched := false
+		if w.Companion[i] || !recognized[filter.Normalized] {
+			matched = pathMatch
+		} else if collisions[filter.Bit] {
+			if w.SharedToken[filter.Bit] {
+				matched = w.DataLabels[i] == filter.Normalized
+			} else {
+				matched = pathMatch
+			}
+		} else {
+			matched = w.DataLabels[i] == filter.Normalized
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+// concreteOracleSkipped is a deliberately small independent reference for
+// the evaluator's direct-selection, directory-seed, and input-order retention
+// rules. It does not call the production world evaluator or validate helper.
+func concreteOracleSkipped(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
+	n := len(c.Inputs)
+	direct := make([]bool, n)
+	dirs := map[string]bool{}
+	for i, in := range c.Inputs {
+		if in.Excluded {
+			continue
+		}
+		direct[i] = concreteOracleDirect(c, w, i, collisions)
+		if direct[i] && !w.Companion[i] {
+			for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
+				dirs[d] = true
+			}
+		}
+	}
+	skipped := make([]bool, n)
+	seenExact := map[string]bool{}
+	seenFold := map[string]bool{}
+	for i, in := range c.Inputs {
+		if seenExact[in.Path] {
+			skipped[i] = true
+			continue
+		}
+		seenExact[in.Path] = true
+		if in.Excluded {
+			skipped[i] = true
+			continue
+		}
+		fold := strings.ToLower(in.Path)
+		if seenFold[fold] {
+			skipped[i] = true
+			continue
+		}
+		if !direct[i] {
+			if !w.Companion[i] || in.LFS {
+				skipped[i] = true
+				continue
+			}
+			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
+			if d != "." && !dirs[d] {
+				skipped[i] = true
+				continue
+			}
+		}
+		seenFold[fold] = true
+	}
+	return skipped
+}
+func cloneDecisionWorld(w datasetDecisionWorld) datasetDecisionWorld {
+	out := datasetDecisionWorld{DataLabels: map[int]string{}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}}
+	for k, v := range w.DataLabels {
+		out.DataLabels[k] = v
+	}
+	for k, v := range w.Companion {
+		out.Companion[k] = v
+	}
+	for k, v := range w.SharedToken {
+		out.SharedToken[k] = v
+	}
+	return out
+}
+func decisionWitnessSatisfies(c datasetDecisionContext, w datasetDecisionWorld, core map[uint]bool, pins datasetDecisionPins, skips, zeros []int, positive *datasetDecisionPositive) bool {
+	collisions := oracleCollisionBits(c)
+	if !oracleWorldValid(c, w, collisions) {
+		return false
+	}
+	for bit, value := range core {
+		if w.SharedToken[bit] != value {
+			return false
+		}
+	}
+	for i, pin := range pins {
+		if i < 0 || i >= len(c.Inputs) || worldRole(w, i) != pin {
+			return false
+		}
+	}
+	for _, i := range zeros {
+		if concreteOracleDirect(c, w, i, collisions) {
+			return false
+		}
+	}
+	if positive != nil && (positive.Input < 0 || positive.Input >= len(c.Inputs) || worldRole(w, positive.Input) != positive.Alternative || !concreteOracleDirect(c, w, positive.Input, collisions)) {
+		return false
+	}
+	if len(skips) > 0 {
+		skipped := concreteOracleSkipped(c, w, collisions)
+		for _, i := range skips {
+			if i < 0 || i >= len(skipped) || !skipped[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func oracleWorldValid(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) bool {
+	for i, in := range c.Inputs {
+		if !hasDecisionAlternative(in.Alternatives, worldRole(w, i)) {
+			return false
+		}
+	}
+	for bit := range w.SharedToken {
+		if !collisions[bit] {
+			return false
+		}
+	}
+	for bit := range collisions {
+		if _, ok := w.SharedToken[bit]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCompileDatasetDecisionContextFilterBitsAndCollisionEvidence(t *testing.T) {
