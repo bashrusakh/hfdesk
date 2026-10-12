@@ -473,34 +473,27 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 	return datasetDecisionQueryResult{}
 }
 
-// uniqueDatasetDecisionQuery avoids constructing and validating a complete
-// feasibility witness for every inventory entry when the interpretation is
-// provably unique: each input has one actual role/label alternative and no
-// recognized token has a competing ordinary-path interpretation. In that
-// case there is exactly one admissible world, whose full records can be
-// evaluated once and reused. Any role ambiguity or colliding token falls
-// through to the complete feasibility solver unchanged.
+// uniqueDatasetDecisionQuery avoids repeating whole-inventory feasibility and
+// evaluation when there is one concrete role/token world, or when direct
+// selection is stable across every role/token interpretation. In either case
+// a baseline-world record is a valid witness. Other contexts use the exact
+// feasibility solver.
 func uniqueDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip bool) (datasetDecisionQueryResult, bool) {
 	if c.uniqueEvaluation == nil {
 		return datasetDecisionQueryResult{}, false
 	}
 	e := c.uniqueEvaluation
 	e.proofOnce.Do(func() {
-		e.unique = len(collisionTokenBits(c)) == 0
-		if e.unique {
-			for _, in := range c.Inputs {
-				if len(in.Alternatives) != 1 {
-					e.unique = false
-					break
-				}
-			}
-		}
+		e.unique = uniqueDatasetDecisionWorld(c) || stableDirectEvaluation(c) || stableDatasetDecisionEvaluation(c)
 	})
 	if !e.unique {
 		return datasetDecisionQueryResult{}, false
 	}
 	e.once.Do(func() {
 		world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+		for bit := range collisionTokenBits(c) {
+			world.SharedToken[bit] = false
+		}
 		for i, in := range c.Inputs {
 			alt := in.Alternatives[0]
 			if alt.Role == datasetselection.EvidenceRoleCompanion {
@@ -528,6 +521,182 @@ func uniqueDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip
 		return datasetDecisionQueryResult{}, true
 	}
 	return datasetDecisionQueryResult{Possible: true, World: e.world, Record: record}, true
+}
+
+// uniqueDatasetDecisionWorld preserves the cheap complete evaluation for
+// singleton role alternatives without colliding path tokens. It includes
+// ordinary unmatched, excluded, and implicit-companion inputs: their behavior
+// is fully determined by that one concrete interpretation, not by requiring
+// every input to match a filter.
+func uniqueDatasetDecisionWorld(c datasetDecisionContext) bool {
+	if len(collisionTokenBits(c)) != 0 {
+		return false
+	}
+	for _, in := range c.Inputs {
+		if len(in.Alternatives) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// stableDirectEvaluation proves, without enumerating role/token worlds, that
+// each input is directly selected under every actual role and shared-token
+// assignment. Consequently companion fallback and role-dependent directory
+// seeds are irrelevant. A false return is only a missed optimization.
+func stableDirectEvaluation(c datasetDecisionContext) bool {
+	collisions := collisionTokenBits(c)
+	for i, in := range c.Inputs {
+		if in.Excluded || len(in.Alternatives) == 0 {
+			return false
+		}
+		for _, alt := range in.Alternatives {
+			fixedTrue := false
+			seenLiterals := make(map[uint]bool)
+			for _, f := range c.Filters {
+				literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
+				if constant {
+					fixedTrue = true
+					break
+				}
+				for _, literal := range literals {
+					if value, ok := seenLiterals[literal.Bit]; ok && value != literal.Value {
+						fixedTrue = true
+						break
+					}
+					seenLiterals[literal.Bit] = literal.Value
+				}
+				if fixedTrue {
+					break
+				}
+			}
+			if !fixedTrue {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// stableDatasetDecisionEvaluation certifies a reusable complete evaluation
+// when each input's direct-match result is invariant across its actual roles
+// and every shared-token assignment. It also requires the direct data-seed
+// status to be role-invariant, then checks that companion fallback eligibility
+// is invariant against the resulting fixed seed directories. Input order and
+// duplicate suppression are consequently deterministic as well. Attribution
+// need not be invariant: the cached records are evaluated in one coherent
+// admissible baseline world, which remains a valid refusal witness.
+func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
+	collisions := collisionTokenBits(c)
+	direct := make([]bool, len(c.Inputs))
+	for i, in := range c.Inputs {
+		if len(in.Alternatives) == 0 {
+			return false
+		}
+		if in.Excluded {
+			continue
+		}
+		for altIndex, alt := range in.Alternatives {
+			value, invariant := invariantDatasetDirect(c, i, alt, collisions)
+			if !invariant || (altIndex > 0 && value != direct[i]) {
+				return false
+			}
+			if altIndex == 0 {
+				direct[i] = value
+			}
+		}
+	}
+	seedDirsByInput := make([][]string, len(c.Inputs))
+	seedCounts := make(map[string]int)
+	for i, in := range c.Inputs {
+		if in.Excluded || !direct[i] || c.Inputs[i].Alternatives[0].Role != datasetselection.EvidenceRoleData {
+			continue
+		}
+		seedDirsByInput[i] = datasetDecisionSeedDirectories(in)
+		for _, dir := range seedDirsByInput[i] {
+			seedCounts[dir]++
+		}
+	}
+	for i, in := range c.Inputs {
+		if in.Excluded {
+			continue
+		}
+		for _, alt := range in.Alternatives {
+			var candidateDirs []string
+			if direct[i] && alt.Role == datasetselection.EvidenceRoleData {
+				candidateDirs = datasetDecisionSeedDirectories(in)
+			}
+			candidateSet := make(map[string]bool, len(candidateDirs))
+			for _, dir := range candidateDirs {
+				candidateSet[dir] = true
+				if seedCounts[dir] == 0 {
+					return false
+				}
+			}
+			for _, dir := range seedDirsByInput[i] {
+				if seedCounts[dir] == 1 && !candidateSet[dir] {
+					return false
+				}
+			}
+		}
+	}
+	dirs := make(map[string]bool, len(seedCounts))
+	for dir := range seedCounts {
+		dirs[dir] = true
+	}
+	for i, in := range c.Inputs {
+		if in.Excluded {
+			continue
+		}
+		var eligible bool
+		for altIndex, alt := range in.Alternatives {
+			selected := direct[i]
+			if !selected && alt.Role == datasetselection.EvidenceRoleCompanion && !in.LFS {
+				dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
+				selected = dir == "." || dirs[dir]
+			}
+			if altIndex > 0 && selected != eligible {
+				return false
+			}
+			if altIndex == 0 {
+				eligible = selected
+			}
+		}
+	}
+	return true
+}
+
+func datasetDecisionSeedDirectories(in datasetDecisionInput) []string {
+	var dirs []string
+	for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
+		dirs = append(dirs, d)
+	}
+	return dirs
+}
+
+// invariantDatasetDirect determines whether the OR of one role's filter terms
+// is fixed for all shared-token assignments. A direct term is either constant,
+// one literal, or (for a collision) the complementary membership/path pair;
+// therefore only a constant-true term or both polarities of one shared bit
+// make the disjunction tautological. An empty disjunction is false.
+func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, collisions map[uint]bool) (bool, bool) {
+	seen := make(map[uint]bool)
+	for _, f := range c.Filters {
+		literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
+		if constant {
+			return true, true
+		}
+		for _, literal := range literals {
+			if value, ok := seen[literal.Bit]; ok && value != literal.Value {
+				return true, true
+			}
+			seen[literal.Bit] = literal.Value
+		}
+	}
+	if len(seen) == 0 {
+		return false, true
+	}
+	return false, false
 }
 
 // A directly selected file seeds its containing directory and ancestors. A
