@@ -1843,10 +1843,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			result.OK = false
 			result.Remaining = append(result.Remaining, member.Path)
 			result.Errors = append(result.Errors, member.Path+": "+err.Error())
-			for _, remaining := range group.Members[i+1:] {
-				result.Remaining = append(result.Remaining, remaining.Path)
-			}
-			break
+			continue
 		}
 		result.Removed = append(result.Removed, member.Path)
 		if member.LinkOnly {

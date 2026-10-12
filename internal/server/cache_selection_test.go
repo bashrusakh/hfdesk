@@ -3414,6 +3414,69 @@ func TestSelectedLocalDeleteReportsInjectedUnlinkFailureTruthfully(t *testing.T)
 	}
 }
 
+func TestSelectedLocalDeleteContinuesAfterOrdinaryUnlinkFailures(t *testing.T) {
+	for _, failIndex := range []int{0, 1} {
+		t.Run(fmt.Sprintf("member-%d", failIndex), func(t *testing.T) {
+			root := t.TempDir()
+			repoDir := filepath.Join(root, "owner", "model")
+			names := []string{
+				"model-Q4_K_M-00001-of-00003.gguf",
+				"model-Q4_K_M-00002-of-00003.gguf",
+				"model-Q4_K_M-00003-of-00003.gguf",
+			}
+			for _, name := range names {
+				writeSelectionFile(t, repoDir, name)
+			}
+			s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+			registerJobManagerCleanup(t, s)
+			body := selectedGroupRequest(t, s, "owner/model", repoDir, names[0])
+			failedName := names[failIndex]
+			s.selectedDeleteHooks.removeEntry = func(parent *os.Root, name string) error {
+				if name == failedName {
+					return errors.New("injected unlink failure")
+				}
+				return parent.Remove(name)
+			}
+
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusMultiStatus {
+				t.Fatalf("unlink failure status=%d body=%s, want 207", w.Code, w.Body.String())
+			}
+			var result selectedDeleteResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			wantRemoved := make([]string, 0, 2)
+			for i, name := range names {
+				if i != failIndex {
+					wantRemoved = append(wantRemoved, name)
+				}
+			}
+			if len(result.Removed) != len(wantRemoved) || len(result.Remaining) != 1 || result.Remaining[0] != failedName || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "injected unlink failure") {
+				t.Fatalf("partial response does not match actual effects: %+v", result)
+			}
+			for i, name := range wantRemoved {
+				if result.Removed[i] != name {
+					t.Fatalf("removed entries=%v, want %v", result.Removed, wantRemoved)
+				}
+			}
+			for _, name := range wantRemoved {
+				if _, err := os.Stat(filepath.Join(repoDir, name)); !os.IsNotExist(err) {
+					t.Errorf("later eligible shard %q was not removed: %v", name, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(repoDir, failedName)); err != nil {
+				t.Errorf("failed shard %q unexpectedly changed: %v", failedName, err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.jobs.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestSelectedCacheDeleteRejectsStaleMembersAndDeletesHFLocation(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
