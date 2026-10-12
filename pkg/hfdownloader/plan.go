@@ -280,6 +280,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	datasetMembers := make(map[int]string)
 	datasetGroups := make(map[string]bool)
+	selectedGroups := make(map[string]bool)
+	selectedGroupFilters := make(map[string]string)
 	datasetGroupRequest := job.IsDataset && job.ExactMatch && !ggufMode && len(job.Filters) > 0
 	if datasetGroupRequest {
 		membership := datasetselection.Recognize(datasetFiles)
@@ -289,10 +291,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				datasetMembers[index] = strings.ToLower(group)
 			}
 		}
-		selectedGroups := make(map[string]bool)
 		for _, filter := range job.Filters {
-			if datasetGroups[strings.ToLower(strings.TrimSpace(filter))] {
-				selectedGroups[strings.ToLower(strings.TrimSpace(filter))] = true
+			group := strings.ToLower(strings.TrimSpace(filter))
+			if datasetGroups[group] {
+				selectedGroups[group] = true
+				if selectedGroupFilters[group] == "" {
+					selectedGroupFilters[group] = filter
+				}
 			}
 		}
 		if len(selectedGroups) > 0 {
@@ -317,20 +322,33 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	}
 	matchedDirs := matchedFilterDirectories(fileNodes, job, ggufMode)
 	if datasetGroupRequest {
+		for index, group := range datasetMembers {
+			if !selectedGroups[group] || isExcludedPath(fileNodes[index].Path, job.Excludes) {
+				continue
+			}
+			for dir := path.Dir(strings.ReplaceAll(fileNodes[index].Path, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
+				matchedDirs[dir] = struct{}{}
+			}
+		}
 		membership := datasetselection.Recognize(datasetFiles)
 		for _, index := range membership.Unresolved {
 			n := fileNodes[index]
-			if n.LFS != nil || isExcludedPath(n.Path, job.Excludes) {
+			if isExcludedPath(n.Path, job.Excludes) {
 				continue
 			}
-			explicitlyRequested := false
+			ordinaryMatch, exactFileRequest := false, false
 			for _, filter := range job.Filters {
-				if strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"), strings.ReplaceAll(n.Path, "\\", "/")) {
-					explicitlyRequested = true
-					break
+				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+					ordinaryMatch = true
+					if job.ExactMatch && strings.ContainsAny(filter, "/\\") && strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"), strings.ReplaceAll(n.Path, "\\", "/")) {
+						exactFileRequest = true
+					}
 				}
 			}
-			if explicitlyRequested {
+			if exactFileRequest {
+				continue
+			}
+			if n.LFS != nil && !ordinaryMatch {
 				continue
 			}
 			for _, filter := range job.Filters {
@@ -339,8 +357,12 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					return nil, fmt.Errorf("dataset filter %q conflicts with ambiguous membership of %q", filter, n.Path)
 				}
 			}
+			if ordinaryMatch {
+				continue
+			}
 			dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/"))
-			if dir == "." || containsPath(matchedDirs, dir) {
+			_, hasMatchedDir := matchedDirs[dir]
+			if dir == "." || hasMatchedDir {
 				for _, filter := range job.Filters {
 					if datasetGroups[strings.ToLower(strings.TrimSpace(filter))] {
 						return nil, fmt.Errorf("dataset filter %q has ambiguous membership for %q", filter, n.Path)
@@ -363,17 +385,22 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		nameLower := strings.ToLower(name)
 		relLower := strings.ToLower(rel)
 		isLFS := n.LFS != nil
+		selectedDatasetGroup := ""
 		if datasetGroupRequest {
 			if group := datasetMembers[nodeIndex]; group != "" {
-				selected := false
-				for _, filter := range job.Filters {
-					if strings.EqualFold(strings.TrimSpace(filter), group) {
-						selected = true
-						break
+				if selectedGroups[group] {
+					selectedDatasetGroup = group
+				} else {
+					explicitMatch := false
+					for _, filter := range job.Filters {
+						if filterMatchesPath(rel, filter, job.ExactMatch) {
+							explicitMatch = true
+							break
+						}
 					}
-				}
-				if !selected {
-					continue
+					if !explicitMatch {
+						continue
+					}
 				}
 			}
 		}
@@ -414,6 +441,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
 		// branches below; it is not the selection proof (see directMatchedFilter).
 		matchedFilter := ""
+		if selectedDatasetGroup != "" {
+			matchedFilter = selectedGroupFilters[selectedDatasetGroup]
+		}
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
 		// requested companions.
@@ -446,6 +476,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 						continue
 					}
 				}
+			}
+		}
+		if selectedDatasetGroup != "" {
+			for dir := path.Dir(strings.ReplaceAll(rel, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
+				matchedDirs[dir] = struct{}{}
 			}
 		}
 

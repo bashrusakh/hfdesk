@@ -275,7 +275,7 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 }
 
 func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
-	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt"}
+	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/test_data.parquet"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/revision/rev1"):
@@ -283,7 +283,11 @@ func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/tree/rev1"):
 			nodes := make([]map[string]any, 0, len(paths))
 			for _, p := range paths {
-				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+				node := map[string]any{"type": "file", "path": p, "size": 10}
+				if p == "train/test_data.parquet" {
+					node["lfs"] = map[string]any{"size": 1000, "sha256": strings.Repeat("b", 64)}
+				}
+				nodes = append(nodes, node)
 			}
 			_ = json.NewEncoder(w).Encode(nodes)
 		default:
@@ -304,13 +308,22 @@ func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
 	if plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL}); err == nil || plan != nil {
 		t.Fatalf("ambiguous public plan = %+v, err=%v; want refusal", plan, err)
 	}
-	job.Excludes = []string{"unknown.json"}
+	job.Excludes = []string{"unknown.json", "train/test_data.parquet"}
 	plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("excluded ambiguity plan: %v", err)
 	}
 	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "train.csv" {
 		t.Fatalf("excluded plan paths = %+v", plan.Items)
+	}
+	job.Filters = []string{"train", "train/test_data.parquet"}
+	job.Excludes = []string{"unknown.json"}
+	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("exact ambiguous-file request: %v", err)
+	}
+	if len(plan.Items) != 2 || plan.Items[1].RelativePath != "train/test_data.parquet" {
+		t.Fatalf("explicit exact-path plan = %+v", plan.Items)
 	}
 	job.Filters = nil
 	job.Excludes = nil
@@ -320,6 +333,78 @@ func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
 	}
 	if len(plan.Items) != len(paths) {
 		t.Fatalf("unfiltered plan has %d items, want %d", len(plan.Items), len(paths))
+	}
+}
+
+func TestDatasetGroupAndExplicitFiltersUnionThroughPublicPlanner(t *testing.T) {
+	paths := []string{
+		"data/train_data.parquet", "other/data.parquet", "train.csv", "test.csv",
+		"train/records.csv", "test/records.csv", "train/part.parquet",
+		"data/unrelated/notes.txt", "config.json", "README.md",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/union/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/union/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				node := map[string]any{"type": "file", "path": p, "size": 10}
+				if p == "data/train_data.parquet" {
+					node["lfs"] = map[string]any{"size": 1000, "sha256": strings.Repeat("a", 64)}
+				}
+				nodes = append(nodes, node)
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/union", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Dataset == nil {
+		t.Fatal("analyzer did not identify dataset groups")
+	}
+	groupFilters := make(map[string]string)
+	for _, item := range info.SelectableItems {
+		groupFilters[item.ID] = item.FilterValue
+	}
+	if groupFilters["train"] == "" || groupFilters["default"] == "" {
+		t.Fatalf("analyzer selectable group filters = %v, want train and default", groupFilters)
+	}
+	cases := []struct {
+		name    string
+		filters []string
+		want    []string
+	}{
+		{"matched LFS underscore group and companions", []string{groupFilters["train"]}, []string{"data/train_data.parquet", "train.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"synthetic default and companions", []string{groupFilters["default"]}, []string{"other/data.parquet", "config.json", "README.md"}},
+		{"group plus exact explicit file", []string{groupFilters["train"], "test.csv"}, []string{"data/train_data.parquet", "train.csv", "test.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"group plus explicit directory", []string{groupFilters["train"], "test/"}, []string{"data/train_data.parquet", "train.csv", "train/records.csv", "test/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"group plus extension", []string{groupFilters["train"], ".parquet"}, []string{"data/train_data.parquet", "other/data.parquet", "train.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := hfdownloader.Job{Repo: "owner/union", Revision: "rev1", IsDataset: true, Filters: tc.filters, ExactMatch: true}
+			plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			got := make([]string, 0, len(plan.Items))
+			for _, item := range plan.Items {
+				got = append(got, item.RelativePath)
+				if item.RelativePath == "data/train_data.parquet" && (item.Size != 1000 || (len(tc.filters) == 1 && item.Subdir != groupFilters["train"])) {
+					t.Errorf("matched group item = %+v; want LFS size 1000 and group attribution when train is the only filter", item)
+				}
+			}
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("planned paths = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
