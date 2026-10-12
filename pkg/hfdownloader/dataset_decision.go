@@ -1,0 +1,270 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package hfdownloader
+
+import (
+	"path"
+	"sort"
+	"strings"
+
+	"github.com/bashrusakh/hfdesk/internal/datasetselection"
+)
+
+// datasetCoreLabels is the finite conventional domain used by the later
+// evaluator. Other evidence labels remain representable in residualLabels;
+// this list is not a classifier or an advertised-group inventory.
+var datasetCoreLabels = [...]string{"train", "test", "validation", "dev", "eval", "default"}
+
+type datasetDecisionRoleLabel struct {
+	Role  datasetselection.EvidenceRole
+	Label string // empty only for companion alternatives
+}
+
+type datasetDecisionFilter struct {
+	Index      int
+	Original   string
+	Normalized string
+	Length     int
+	Bit        uint
+}
+
+type datasetDecisionInput struct {
+	Path string
+	// Alternatives preserve the input's actual role/label possibilities.
+	Alternatives                       []datasetDecisionRoleLabel
+	PossibleCore, DefiniteCore         uint64
+	PossibleResidual, DefiniteResidual []string
+	Excluded                           bool
+	// DirectFilterIndexes retain input filter order; a match uses the existing
+	// complete-path matcher, not a second delimiter/token interpretation.
+	DirectFilterIndexes              []int
+	RecognizedTermFilterIndexes      []int
+	RecognizedCompanionFilterIndexes []int
+	CollisionFilterIndexes           []int
+	DirectCoreConditions             uint64
+	DirectResidualConditions         []string
+	GroupCoreConditions              uint64
+	GroupResidualConditions          []string
+	AncestorDirectSeedIndexes        []int
+	ExactDuplicateOf                 int
+	CaseDuplicateOf                  int
+	ExactDuplicateEligible           bool
+	CaseDuplicateEligible            bool
+	LFS                              bool
+}
+
+// datasetDecisionContext is an immutable, deterministic snapshot of inputs
+// needed for finite dataset-selection reasoning. It is deliberately dormant:
+// compiling it does not decide inclusion, ambiguity disposition, or a plan.
+type datasetDecisionContext struct {
+	Inputs           []datasetDecisionInput
+	Filters          []datasetDecisionFilter
+	FilterBits       map[string]uint
+	RecognizedLabels []string
+	CoreLabels       []string
+	ResidualLabels   []string
+	ExactMatch       bool
+	IsDataset        bool
+	GGUFMode         bool
+}
+
+func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
+	c := datasetDecisionContext{ExactMatch: exact, IsDataset: isDataset, GGUFMode: ggufMode, FilterBits: make(map[string]uint)}
+	coreBits := make(map[string]uint, len(datasetCoreLabels))
+	for i, label := range datasetCoreLabels {
+		coreBits[label] = uint(i)
+		c.CoreLabels = append(c.CoreLabels, label)
+	}
+
+	// Labels are drawn solely from actual alternatives in this inventory.
+	labelSet := make(map[string]struct{})
+	evidence := make(map[int]datasetselection.Evidence, len(membership.Evidence))
+	for _, e := range membership.Evidence {
+		evidence[e.InputIndex] = e
+		for _, label := range e.PossibleLabels {
+			labelSet[strings.ToLower(label)] = struct{}{}
+		}
+		for _, label := range e.DefiniteLabels {
+			labelSet[strings.ToLower(label)] = struct{}{}
+		}
+	}
+	for label := range membership.Groups {
+		labelSet[strings.ToLower(label)] = struct{}{}
+	}
+	for _, label := range stableSortedKeys(labelSet) {
+		c.RecognizedLabels = append(c.RecognizedLabels, label)
+	}
+	residualBit := make(map[string]uint)
+	recognizedSet := make(map[string]struct{}, len(c.RecognizedLabels))
+	for _, label := range c.RecognizedLabels {
+		recognizedSet[label] = struct{}{}
+		if _, core := coreBits[label]; !core {
+			residualBit[label] = uint(len(residualBit))
+			c.ResidualLabels = append(c.ResidualLabels, label)
+		}
+	}
+
+	for i, original := range filters {
+		norm := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(original), "\\", "/"))
+		bit, ok := c.FilterBits[norm]
+		if !ok {
+			bit = uint(len(c.FilterBits))
+			c.FilterBits[norm] = bit
+		}
+		c.Filters = append(c.Filters, datasetDecisionFilter{Index: i, Original: original, Normalized: norm, Length: len(original), Bit: bit})
+	}
+
+	c.Inputs = make([]datasetDecisionInput, len(nodes))
+	firstExact, firstCase := map[string]int{}, map[string]int{}
+	for i, n := range nodes {
+		in := datasetDecisionInput{Path: n.Path, LFS: n.LFS != nil, ExactDuplicateOf: -1, CaseDuplicateOf: -1}
+		e, hasEvidence := evidence[i]
+		if hasEvidence {
+			for _, role := range e.PossibleRoles {
+				if role == datasetselection.EvidenceRoleCompanion {
+					in.Alternatives = append(in.Alternatives, datasetDecisionRoleLabel{Role: role})
+					continue
+				}
+				for _, label := range e.PossibleLabels {
+					in.Alternatives = append(in.Alternatives, datasetDecisionRoleLabel{Role: role, Label: strings.ToLower(label)})
+				}
+			}
+		} else {
+			// Preserve usable legacy Result values if evidence is absent.
+			groupNames := make([]string, 0, len(membership.Groups))
+			for label := range membership.Groups {
+				groupNames = append(groupNames, label)
+			}
+			sort.Strings(groupNames)
+			for _, label := range groupNames {
+				indexes := membership.Groups[label]
+				for _, index := range indexes {
+					if index == i {
+						in.Alternatives = append(in.Alternatives, datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: strings.ToLower(label)})
+					}
+				}
+			}
+			if len(in.Alternatives) == 0 {
+				in.Alternatives = []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}
+			}
+		}
+		for _, alt := range in.Alternatives {
+			if bit, ok := coreBits[alt.Label]; ok && alt.Role == datasetselection.EvidenceRoleData {
+				in.PossibleCore |= 1 << bit
+			}
+			if _, ok := residualBit[alt.Label]; ok && alt.Role == datasetselection.EvidenceRoleData {
+				in.PossibleResidual = appendUnique(in.PossibleResidual, alt.Label)
+			}
+		}
+		if hasEvidence && e.DefiniteRole == datasetselection.EvidenceRoleData {
+			for _, label := range e.DefiniteLabels {
+				label = strings.ToLower(label)
+				if bit, ok := coreBits[label]; ok {
+					in.DefiniteCore |= 1 << bit
+				} else {
+					in.DefiniteResidual = appendUnique(in.DefiniteResidual, label)
+				}
+			}
+		}
+		in.Excluded = isExcludedPath(n.Path, excludes)
+		for _, f := range c.Filters {
+			if filterMatchesPath(n.Path, f.Original, exact) {
+				in.DirectFilterIndexes = append(in.DirectFilterIndexes, f.Index)
+				if bit, ok := coreBits[f.Normalized]; ok {
+					in.DirectCoreConditions |= 1 << bit
+				}
+				if _, ok := residualBit[f.Normalized]; ok {
+					in.DirectResidualConditions = appendUnique(in.DirectResidualConditions, f.Normalized)
+				}
+			}
+			if _, recognized := recognizedSet[f.Normalized]; recognized {
+				if bit, ok := coreBits[f.Normalized]; ok && in.PossibleCore&(1<<bit) != 0 {
+					in.GroupCoreConditions |= 1 << bit
+				}
+				if _, ok := residualBit[f.Normalized]; ok && containsString(in.PossibleResidual, f.Normalized) {
+					in.GroupResidualConditions = appendUnique(in.GroupResidualConditions, f.Normalized)
+				}
+				if filterMatchesPath(n.Path, f.Original, exact) {
+					in.RecognizedTermFilterIndexes = append(in.RecognizedTermFilterIndexes, f.Index)
+					companion, collision := false, false
+					for _, alt := range in.Alternatives {
+						if alt.Role == datasetselection.EvidenceRoleCompanion {
+							companion = true
+						}
+						if alt.Role == datasetselection.EvidenceRoleData && alt.Label != f.Normalized {
+							collision = true
+						}
+					}
+					if companion {
+						in.RecognizedCompanionFilterIndexes = append(in.RecognizedCompanionFilterIndexes, f.Index)
+					}
+					if collision {
+						in.CollisionFilterIndexes = append(in.CollisionFilterIndexes, f.Index)
+					}
+				}
+			}
+		}
+		key := n.Path
+		if prior, ok := firstExact[key]; ok {
+			in.ExactDuplicateOf = prior
+		} else {
+			firstExact[key] = i
+			in.ExactDuplicateEligible = true
+		}
+		lower := strings.ToLower(key)
+		if prior, ok := firstCase[lower]; ok {
+			in.CaseDuplicateOf = prior
+		} else {
+			firstCase[lower] = i
+			in.CaseDuplicateEligible = true
+		}
+		c.Inputs[i] = in
+	}
+	// Index actual, non-excluded direct matches by containing directory, then
+	// record source indexes that seed each input's containing directory or one
+	// of its ancestors. Lookup cost follows path depth plus returned evidence,
+	// rather than comparing every pair of inventory entries.
+	seedsByDirectory := make(map[string][]int)
+	for i, input := range c.Inputs {
+		if input.Excluded || len(input.DirectFilterIndexes) == 0 {
+			continue
+		}
+		dir := path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
+		seedsByDirectory[dir] = append(seedsByDirectory[dir], i)
+	}
+	for i := range c.Inputs {
+		dir := path.Dir(strings.ReplaceAll(c.Inputs[i].Path, "\\", "/"))
+		for current := dir; current != "." && current != "/"; current = path.Dir(current) {
+			c.Inputs[i].AncestorDirectSeedIndexes = append(c.Inputs[i].AncestorDirectSeedIndexes, seedsByDirectory[current]...)
+		}
+		sort.Ints(c.Inputs[i].AncestorDirectSeedIndexes)
+	}
+	return c
+}
+
+func stableSortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sortStrings(keys)
+	return keys
+}
+func sortStrings(values []string) { sort.Strings(values) }
+func appendUnique(values []string, value string) []string {
+	for _, v := range values {
+		if v == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+func containsString(values []string, value string) bool {
+	for _, v := range values {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
