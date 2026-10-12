@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
@@ -270,13 +272,79 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		return nil, err
 	}
 	baseNames := make([]string, 0, len(fileNodes))
+	datasetFiles := make([]datasetselection.File, len(fileNodes))
 	for _, n := range fileNodes {
 		baseNames = append(baseNames, strings.ToLower(n.Path))
+		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
 	}
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
+	datasetMembers := make(map[int]string)
+	datasetGroups := make(map[string]bool)
+	datasetGroupRequest := job.IsDataset && job.ExactMatch && !ggufMode && len(job.Filters) > 0
+	if datasetGroupRequest {
+		membership := datasetselection.Recognize(datasetFiles)
+		for group, indexes := range membership.Groups {
+			datasetGroups[strings.ToLower(group)] = true
+			for _, index := range indexes {
+				datasetMembers[index] = strings.ToLower(group)
+			}
+		}
+		selectedGroups := make(map[string]bool)
+		for _, filter := range job.Filters {
+			if datasetGroups[strings.ToLower(strings.TrimSpace(filter))] {
+				selectedGroups[strings.ToLower(strings.TrimSpace(filter))] = true
+			}
+		}
+		if len(selectedGroups) > 0 {
+			// Ambiguous inventory is evaluated below only where the existing
+			// companion rule would otherwise retain it.
+			// A group label and another exact-path interpretation must not silently
+			// select a different definite group.
+			for i, n := range fileNodes {
+				if isExcludedPath(n.Path, job.Excludes) || datasetMembers[i] == "" {
+					continue
+				}
+				for group := range selectedGroups {
+					if filterMatchesPath(n.Path, group, true) && datasetMembers[i] != group {
+						return nil, fmt.Errorf("dataset filter %q conflicts with membership of %q (%s)", group, n.Path, datasetMembers[i])
+					}
+				}
+			}
+		}
+		if len(selectedGroups) == 0 {
+			datasetGroupRequest = false
+		}
+	}
 	matchedDirs := matchedFilterDirectories(fileNodes, job, ggufMode)
+	if datasetGroupRequest {
+		membership := datasetselection.Recognize(datasetFiles)
+		for _, index := range membership.Unresolved {
+			n := fileNodes[index]
+			if n.LFS != nil || isExcludedPath(n.Path, job.Excludes) {
+				continue
+			}
+			explicitlyRequested := false
+			for _, filter := range job.Filters {
+				if strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"), strings.ReplaceAll(n.Path, "\\", "/")) {
+					explicitlyRequested = true
+					break
+				}
+			}
+			if explicitlyRequested {
+				continue
+			}
+			dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/"))
+			if dir == "." || containsPath(matchedDirs, dir) {
+				for _, filter := range job.Filters {
+					if datasetGroups[strings.ToLower(strings.TrimSpace(filter))] {
+						return nil, fmt.Errorf("dataset filter %q has ambiguous membership for %q", filter, n.Path)
+					}
+				}
+			}
+		}
+	}
 
-	for _, n := range fileNodes {
+	for nodeIndex, n := range fileNodes {
 		rel := n.Path
 
 		// Deduplicate by relative path
@@ -289,7 +357,20 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		nameLower := strings.ToLower(name)
 		relLower := strings.ToLower(rel)
 		isLFS := n.LFS != nil
-
+		if datasetGroupRequest {
+			if group := datasetMembers[nodeIndex]; group != "" {
+				selected := false
+				for _, filter := range job.Filters {
+					if strings.EqualFold(strings.TrimSpace(filter), group) {
+						selected = true
+						break
+					}
+				}
+				if !selected {
+					continue
+				}
+			}
+		}
 		// Check excludes first - if file matches any exclude pattern, skip it
 		// Credits: Exclude feature suggested by jeroenkroese (#41)
 		excluded := false
@@ -459,6 +540,15 @@ func GGUFPathSelected(relativePath string, filters, excludes []string, exact boo
 	}
 	for _, filter := range filters {
 		if filterMatchesPath(relativePath, filter, exact) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPath(dirs map[string]struct{}, dir string) bool {
+	for current := dir; current != "." && current != "/"; current = path.Dir(current) {
+		if _, ok := dirs[current]; ok {
 			return true
 		}
 	}

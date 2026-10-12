@@ -667,9 +667,10 @@ func (r *RepoInfo) RecommendedFilterValues() []string {
 func (r *RepoInfo) PopulateDownloadSelection() {
 	r.RecommendedFilters = r.RecommendedFilterValues()
 	r.RecommendedDownload = &DownloadSelection{
-		Repo:    r.Repo,
-		Dataset: r.IsDataset,
-		Filters: r.RecommendedFilters,
+		Repo:       r.Repo,
+		Dataset:    r.IsDataset,
+		Filters:    r.RecommendedFilters,
+		ExactMatch: r.IsDataset,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch
