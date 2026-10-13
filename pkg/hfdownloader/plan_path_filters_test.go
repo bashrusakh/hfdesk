@@ -5,10 +5,61 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+type inventoryEOFBody struct {
+	io.ReadCloser
+	read *atomic.Bool
+}
+
+func (b *inventoryEOFBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.read.Store(true)
+	}
+	return n, err
+}
+
+func (b *inventoryEOFBody) Close() error {
+	b.read.Store(true)
+	return b.ReadCloser.Close()
+}
+
+type inventoryBodyTransport struct {
+	base http.RoundTripper
+	read atomic.Bool
+}
+
+func (t *inventoryBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil && strings.Contains(req.URL.Path, "/tree/") {
+		resp.Body = &inventoryEOFBody{ReadCloser: resp.Body, read: &t.read}
+	}
+	return resp, err
+}
+
+type cancelAfterInventoryContext struct {
+	context.Context
+	read   *atomic.Bool
+	checks atomic.Int64
+	limit  int64
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterInventoryContext) Err() error {
+	if c.read.Load() && c.checks.Add(1) >= c.limit {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
 
 func TestFilterMatchesPath(t *testing.T) {
 	tests := []struct {
@@ -103,6 +154,48 @@ func TestPlanRepoDatasetGroupFiltersSelectMembership(t *testing.T) {
 		t.Fatalf("multi-group PlanRepo: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"})
+}
+
+func TestPlanRepoDatasetRootDefaultRecordsDoNotRefuseForRoleOnlyVariance(t *testing.T) {
+	files := make([]hfNode, 1001)
+	want := make([]string, len(files))
+	files[0] = hfNode{Type: "file", Path: "records.parquet", Size: 10}
+	want[0] = "records.parquet"
+	for i := 1; i < len(files); i++ {
+		name := fmt.Sprintf("records-%04d.json", i-1)
+		files[i] = hfNode{Type: "file", Path: name, Size: 10}
+		want[i] = name
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"default"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), want)
+}
+
+func TestPlanRepoDatasetCancellationDuringDecisionReturnsNoPlan(t *testing.T) {
+	const count = 1000
+	files := make([]hfNode, count)
+	for i := range files {
+		files[i] = hfNode{Type: "file", Path: fmt.Sprintf("records-%04d.json", i), Size: 10}
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	transport := &inventoryBodyTransport{base: http.DefaultTransport}
+	baseCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAfterInventoryContext{Context: baseCtx, read: &transport.read, limit: count + 10, cancel: cancel}
+	httpc := &http.Client{Transport: transport}
+	plan, err := scanRepo(ctx, httpc, "", Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: []string{"default"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if plan != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("scanRepo returned plan=%t err=%v; inventoryRead=%t checks=%d; want nil plan and context.Canceled", plan != nil, err, transport.read.Load(), ctx.checks.Load())
+	}
+	if !transport.read.Load() || ctx.checks.Load() < ctx.limit {
+		t.Fatalf("cancellation was not triggered after the complete inventory: read=%t checks=%d limit=%d", transport.read.Load(), ctx.checks.Load(), ctx.limit)
+	}
 }
 
 func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.T) {

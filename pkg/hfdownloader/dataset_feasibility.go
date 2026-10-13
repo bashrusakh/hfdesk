@@ -67,6 +67,9 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 		}
 	}
 	for _, i := range ineligible {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionWorld{}, false
+		}
 		if i < 0 || i >= len(c.Inputs) {
 			return datasetDecisionWorld{}, false
 		}
@@ -141,6 +144,9 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 		}
 	}
 	for _, i := range zeroDirect {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionWorld{}, false
+		}
 		if i < 0 || i >= len(c.Inputs) {
 			return datasetDecisionWorld{}, false
 		}
@@ -169,9 +175,15 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 	assignment := cloneDecisionUnits(units)
 	w := datasetDecisionWorld{DataLabels: map[int]string{}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}}
 	for bit := range collisions {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionWorld{}, false
+		}
 		w.SharedToken[bit] = assignment[bit]
 	}
 	for i, alts := range roles {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionWorld{}, false
+		}
 		if len(alts) == 0 {
 			return datasetDecisionWorld{}, false
 		}
@@ -232,6 +244,9 @@ func cloneDecisionUnits(in map[uint]bool) map[uint]bool {
 func chooseZeroDecisionAlternative(c datasetDecisionContext, i int, alts []datasetDecisionRoleLabel, units map[uint]bool, collisions map[uint]bool) (datasetDecisionRoleLabel, map[uint]bool, bool) {
 	for _, role := range []datasetselection.EvidenceRole{datasetselection.EvidenceRoleData, datasetselection.EvidenceRoleCompanion} {
 		for _, alt := range alts {
+			if datasetDecisionContextErr(c) != nil {
+				return datasetDecisionRoleLabel{}, nil, false
+			}
 			if alt.Role != role {
 				continue
 			}
@@ -246,6 +261,9 @@ func chooseZeroDecisionAlternative(c datasetDecisionContext, i int, alts []datas
 
 func choosePositiveDecisionAlternative(c datasetDecisionContext, i int, alts []datasetDecisionRoleLabel, units map[uint]bool, collisions map[uint]bool) (datasetDecisionRoleLabel, map[uint]bool, bool) {
 	for _, alt := range alts {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionRoleLabel{}, nil, false
+		}
 		trial := cloneDecisionUnits(units)
 		if constrainDecisionDirect(c, i, []datasetDecisionRoleLabel{alt}, trial, collisions, true) {
 			return alt, trial, true
@@ -283,6 +301,9 @@ func constrainDecisionDirect(c datasetDecisionContext, i int, alts []datasetDeci
 		trial := cloneDecisionUnits(units)
 		ok := true
 		for _, f := range c.Filters {
+			if datasetDecisionContextErr(c) != nil {
+				return false
+			}
 			literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
 			if want {
 				if constant {
@@ -402,9 +423,10 @@ type datasetDecisionEvaluation struct {
 }
 
 // datasetDecisionQueryResult keeps feasibility separate from its coherent
-// witness. A nil witness means the proposition was disproved, not unknown.
+// witness. Err distinguishes an interrupted proof from a disproved proposition.
 type datasetDecisionQueryResult struct {
 	Possible bool
+	Err      error
 	World    datasetDecisionWorld
 	Record   datasetDecisionRecord
 }
@@ -415,6 +437,9 @@ type datasetDecisionQueryResult struct {
 // generic output-skip requirements. Exact/case-fold suppression is applied by
 // the upper output wrappers.
 func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseIneligible []int, requireIneligible bool) datasetDecisionQueryResult {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
 	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionQueryResult{}
 	}
@@ -429,6 +454,9 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 		}
 	}
 	for _, core := range datasetCoreAssignments(c) {
+		if err := datasetDecisionContextErr(c); err != nil {
+			return datasetDecisionQueryResult{Err: err}
+		}
 		if requireIneligible {
 			w, ok := feasibleDatasetDecisionWorld(c, core, nil, []int{index}, nil, nil)
 			if ok {
@@ -442,6 +470,9 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 		// A direct selection is witnessed by one actual data alternative and
 		// one direct term, all interpreted in this same world.
 		for _, alt := range c.Inputs[index].Alternatives {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionQueryResult{Err: err}
+			}
 			if alt.Role != datasetselection.EvidenceRoleData {
 				continue
 			}
@@ -471,10 +502,16 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 			}
 		}
 		for _, seed := range validDatasetDirectorySeeds(c, c.Inputs[index].Directory) {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionQueryResult{Err: err}
+			}
 			if seed == index || c.Inputs[seed].Excluded {
 				continue
 			}
 			for _, alt := range c.Inputs[seed].Alternatives {
+				if err := datasetDecisionContextErr(c); err != nil {
+					return datasetDecisionQueryResult{Err: err}
+				}
 				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseIneligible, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
 				if ok && queryWorldEmits(c, w, index) {
 					e, _ := evaluateDatasetDecisionWorld(c, w)
@@ -482,6 +519,9 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 				}
 			}
 		}
+	}
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
 	}
 	return datasetDecisionQueryResult{}
 }
@@ -494,14 +534,24 @@ func fixedDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip 
 		return datasetDecisionQueryResult{}, false
 	}
 	e := c.uniqueEvaluation
-	e.fixedOnce.Do(func() { e.fixedEmit = fixedDatasetDecisionOutcomes(c) })
+	e.mu.Lock()
+	if !e.fixedDone {
+		outcomes := fixedDatasetDecisionOutcomes(c)
+		if err := datasetDecisionContextErr(c); err != nil {
+			e.mu.Unlock()
+			return datasetDecisionQueryResult{Err: err}, true
+		}
+		e.fixedEmit, e.fixedDone = outcomes, true
+	}
 	if index >= len(e.fixedEmit) {
+		e.mu.Unlock()
 		return datasetDecisionQueryResult{}, true
 	}
 	// Only a proof of the opposite fixed outcome may answer a query here.
 	// A merely possible outcome is not evidence that its complement is
 	// impossible (e.g. data-vs-companion root fallback).
 	fixed := e.fixedEmit[index]
+	e.mu.Unlock()
 	if fixed == 0 {
 		return datasetDecisionQueryResult{}, false
 	}
@@ -512,19 +562,38 @@ func fixedDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip 
 	// per-record proof establishes its queried outcome without relying on a
 	// global unique-world proof.
 	initializeDatasetDecisionBaseline(c, e)
-	if !e.valid || e.records[index].Selected == requireSkip {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}, true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.valid || index >= len(e.records) || e.records[index].Selected == requireSkip {
 		return datasetDecisionQueryResult{}, false
 	}
 	return datasetDecisionQueryResult{Possible: true, World: e.world, Record: e.records[index]}, true
 }
 
 func initializeDatasetDecisionBaseline(c datasetDecisionContext, e *datasetDecisionUniqueEvaluation) {
-	e.once.Do(func() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.baseDone {
+		return
+	}
+	if datasetDecisionContextErr(c) != nil {
+		return
+	}
+	{
 		world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
 		for bit := range collisionTokenBits(c) {
+			if datasetDecisionContextErr(c) != nil {
+				return
+			}
 			world.SharedToken[bit] = false
 		}
 		for i, in := range c.Inputs {
+			if datasetDecisionContextErr(c) != nil {
+				return
+			}
 			if len(in.Alternatives) == 0 {
 				return
 			}
@@ -544,59 +613,74 @@ func initializeDatasetDecisionBaseline(c datasetDecisionContext, e *datasetDecis
 			return
 		}
 		e.records, e.valid = evaluation.Records, true
-	})
+		e.baseDone = true
+	}
 }
 
 func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 	n := len(c.Inputs)
 	collisions := collisionTokenBits(c)
-	directValue, directFixed := make([]bool, n), make([]bool, n)
+	direct := make([][]int8, n) // +1 always direct, -1 never direct, 0 varies.
+	allDirect, anyDirect := make([]bool, n), make([]bool, n)
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return nil
+		}
 		if in.Excluded || len(in.Alternatives) == 0 {
-			directFixed[i] = true
 			continue
 		}
+		allDirect[i] = true
+		direct[i] = make([]int8, len(in.Alternatives))
 		for j, alt := range in.Alternatives {
-			value, fixed := invariantDatasetDirect(c, i, alt, collisions)
-			if !fixed || j > 0 && value != directValue[i] {
-				directFixed[i] = false
-				break
+			if datasetDecisionContextErr(c) != nil {
+				return nil
 			}
-			if j == 0 {
-				directFixed[i], directValue[i] = true, value
+			value, fixed := invariantDatasetDirect(c, i, alt, collisions)
+			if !fixed {
+				direct[i][j] = 0
+				allDirect[i], anyDirect[i] = false, true
+			} else if value {
+				direct[i][j], anyDirect[i] = 1, true
+			} else {
+				direct[i][j], allDirect[i] = -1, false
 			}
 		}
 	}
 	guaranteedDirs, possibleDirs := map[string]bool{}, map[string]bool{}
 	for i, in := range c.Inputs {
-		if in.Excluded || len(in.Alternatives) == 0 || !directFixed[i] || !directValue[i] {
-			if !in.Excluded && !directFixed[i] {
-				for _, dir := range datasetDecisionSeedDirectories(in) {
-					possibleDirs[dir] = true
-				}
-			}
+		if datasetDecisionContextErr(c) != nil {
+			return nil
+		}
+		if in.Excluded || len(in.Alternatives) == 0 || !anyDirect[i] {
 			continue
 		}
 		for _, dir := range datasetDecisionSeedDirectories(in) {
-			guaranteedDirs[dir], possibleDirs[dir] = true, true
+			possibleDirs[dir] = true
+			if allDirect[i] {
+				guaranteedDirs[dir] = true
+			}
 		}
 	}
 	outcomes := make([]int8, n) // +1 always emits, -1 always skips, 0 varies/is unproved.
 	seenExact, seenFold := map[string]bool{}, map[string]int8{}
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return nil
+		}
 		fold := strings.ToLower(in.Path)
 		duplicate := seenExact[in.Path]
 		seenExact[in.Path] = true
 		priorOutcome, priorSeen := seenFold[fold]
 		if !duplicate && !in.Excluded {
 			allEligible, anyEligible := true, false
-			for _, alt := range in.Alternatives {
-				eligible, possible := directFixed[i] && directValue[i], !directFixed[i] || directValue[i]
-				if !eligible && alt.Role == datasetselection.EvidenceRoleCompanion {
+			for j, alt := range in.Alternatives {
+				directAlways, directPossible := direct[i][j] == 1, direct[i][j] >= 0
+				eligible, possible := directAlways, directPossible
+				if alt.Role == datasetselection.EvidenceRoleCompanion && !in.LFS {
 					dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-					fallback := !in.LFS && (dir == "." || guaranteedDirs[dir])
-					maybeFallback := !in.LFS && (dir == "." || possibleDirs[dir])
-					eligible, possible = fallback, fallback || maybeFallback
+					fallback := dir == "." || guaranteedDirs[dir]
+					maybeFallback := dir == "." || possibleDirs[dir]
+					eligible, possible = eligible || fallback, possible || maybeFallback
 				}
 				if !eligible {
 					allEligible = false
@@ -631,13 +715,26 @@ func uniqueDatasetDecisionQuery(c datasetDecisionContext, index int, requireSkip
 		return datasetDecisionQueryResult{}, false
 	}
 	e := c.uniqueEvaluation
-	e.proofOnce.Do(func() {
-		e.unique = uniqueDatasetDecisionWorld(c) || stableDirectEvaluation(c) || stableDatasetDecisionEvaluation(c)
-	})
-	if !e.unique {
+	e.mu.Lock()
+	if !e.proofDone {
+		unique := uniqueDatasetDecisionWorld(c) || stableDirectEvaluation(c) || stableDatasetDecisionEvaluation(c)
+		if err := datasetDecisionContextErr(c); err != nil {
+			e.mu.Unlock()
+			return datasetDecisionQueryResult{Err: err}, true
+		}
+		e.unique, e.proofDone = unique, true
+	}
+	unique := e.unique
+	e.mu.Unlock()
+	if !unique {
 		return datasetDecisionQueryResult{}, false
 	}
 	initializeDatasetDecisionBaseline(c, e)
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}, true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if !e.valid || index >= len(e.records) {
 		return datasetDecisionQueryResult{}, true
 	}
@@ -659,6 +756,9 @@ func uniqueDatasetDecisionWorld(c datasetDecisionContext) bool {
 		return false
 	}
 	for _, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return false
+		}
 		if len(in.Alternatives) != 1 {
 			return false
 		}
@@ -673,13 +773,22 @@ func uniqueDatasetDecisionWorld(c datasetDecisionContext) bool {
 func stableDirectEvaluation(c datasetDecisionContext) bool {
 	collisions := collisionTokenBits(c)
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return false
+		}
 		if in.Excluded || len(in.Alternatives) == 0 {
 			return false
 		}
 		for _, alt := range in.Alternatives {
+			if datasetDecisionContextErr(c) != nil {
+				return false
+			}
 			fixedTrue := false
 			seenLiterals := make(map[uint]bool)
 			for _, f := range c.Filters {
+				if datasetDecisionContextErr(c) != nil {
+					return false
+				}
 				literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
 				if constant {
 					fixedTrue = true
@@ -716,6 +825,9 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 	collisions := collisionTokenBits(c)
 	direct := make([]bool, len(c.Inputs))
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return false
+		}
 		if len(in.Alternatives) == 0 {
 			return false
 		}
@@ -723,6 +835,9 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			continue
 		}
 		for altIndex, alt := range in.Alternatives {
+			if datasetDecisionContextErr(c) != nil {
+				return false
+			}
 			value, invariant := invariantDatasetDirect(c, i, alt, collisions)
 			if !invariant || (altIndex > 0 && value != direct[i]) {
 				return false
@@ -738,6 +853,9 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			continue
 		}
 		for _, dir := range datasetDecisionSeedDirectories(in) {
+			if datasetDecisionContextErr(c) != nil {
+				return false
+			}
 			seedCounts[dir]++
 		}
 	}
@@ -746,11 +864,17 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 		dirs[dir] = true
 	}
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return false
+		}
 		if in.Excluded {
 			continue
 		}
 		var eligible bool
 		for altIndex, alt := range in.Alternatives {
+			if datasetDecisionContextErr(c) != nil {
+				return false
+			}
 			selected := direct[i]
 			if !selected && alt.Role == datasetselection.EvidenceRoleCompanion && !in.LFS {
 				dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
@@ -783,6 +907,9 @@ func datasetDecisionSeedDirectories(in datasetDecisionInput) []string {
 func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, collisions map[uint]bool) (bool, bool) {
 	seen := make(map[uint]bool)
 	for _, f := range c.Filters {
+		if datasetDecisionContextErr(c) != nil {
+			return false, false
+		}
 		literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
 		if constant {
 			return true, true
@@ -805,6 +932,9 @@ func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecision
 func validDatasetDirectorySeeds(c datasetDecisionContext, directory string) []int {
 	var indexes []int
 	for seedDir, seeds := range c.DirectSeedsByDirectory {
+		if datasetDecisionContextErr(c) != nil {
+			return nil
+		}
 		if seedDir == directory || strings.HasPrefix(seedDir, strings.TrimSuffix(directory, "/")+"/") {
 			indexes = append(indexes, seeds...)
 		}
@@ -840,6 +970,9 @@ func canSelectDatasetDecision(c datasetDecisionContext, index int, earlierCaseIn
 }
 
 func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
 	if index < 0 || index >= len(c.Inputs) {
 		return datasetDecisionQueryResult{}
 	}
@@ -857,11 +990,16 @@ func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	// to construct a world where this record is ineligible.
 	fold := strings.ToLower(c.Inputs[index].Path)
 	for _, i := range caseFoldPredecessors(c, index, fold) {
+		if err := datasetDecisionContextErr(c); err != nil {
+			return datasetDecisionQueryResult{Err: err}
+		}
 		if r := canEmitDatasetDecision(c, i); r.Possible {
 			e, err := evaluateDatasetDecisionWorld(c, r.World)
 			if err == nil && e.Records[index].Skipped {
 				return datasetDecisionQueryResult{Possible: true, World: r.World, Record: e.Records[index]}
 			}
+		} else if r.Err != nil {
+			return r
 		}
 	}
 	// Exact duplicates are suppressed regardless of their raw eligibility.
@@ -869,6 +1007,9 @@ func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	// output fact as a lower-kernel ineligibility constraint.
 	if c.Inputs[index].ExactDuplicateOf >= 0 {
 		for _, core := range datasetCoreAssignments(c) {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionQueryResult{Err: err}
+			}
 			w, ok := feasibleDatasetDecisionWorld(c, core, nil, nil, nil, nil)
 			if !ok {
 				continue
@@ -876,6 +1017,9 @@ func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 			e, err := evaluateDatasetDecisionWorld(c, w)
 			if err == nil && e.Records[index].Skipped {
 				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+			}
+			if ctxErr := datasetDecisionContextErr(c); ctxErr != nil {
+				return datasetDecisionQueryResult{Err: ctxErr}
 			}
 		}
 		return datasetDecisionQueryResult{}
@@ -889,6 +1033,9 @@ func queryWorldEmits(c datasetDecisionContext, w datasetDecisionWorld, index int
 }
 
 func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
 	if index < 0 || index >= len(c.Inputs) {
 		return datasetDecisionQueryResult{}
 	}
@@ -919,6 +1066,9 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	if in.CaseDuplicateOf >= 0 {
 		fold := strings.ToLower(in.Path)
 		for _, prior := range c.CaseIndexesByPath[fold] {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionQueryResult{Err: err}
+			}
 			if prior >= index {
 				break
 			}
@@ -931,18 +1081,26 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 }
 
 func canNotEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
 	if index < 0 || index >= len(c.Inputs) {
 		return datasetDecisionQueryResult{}
 	}
 	if r, fixed := fixedDatasetDecisionQuery(c, index, true); fixed {
 		return r
 	}
-	if r := canSkipDatasetDecision(c, index); r.Possible {
+	if r := canSkipDatasetDecision(c, index); r.Possible || r.Err != nil {
 		return r
 	}
 	fold := strings.ToLower(c.Inputs[index].Path)
 	for _, i := range caseFoldPredecessors(c, index, fold) {
+		if err := datasetDecisionContextErr(c); err != nil {
+			return datasetDecisionQueryResult{Err: err}
+		}
 		if r := canEmitDatasetDecision(c, i); r.Possible {
+			return r
+		} else if r.Err != nil {
 			return r
 		}
 	}
@@ -971,6 +1129,9 @@ func datasetDecisionRefusal(c datasetDecisionContext, index int) (can, cannot da
 // inexact, non-dataset, and GGUF requests are outside this evaluator's
 // established contract.
 func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisionWorld) (datasetDecisionEvaluation, error) {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionEvaluation{}, err
+	}
 	if !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionEvaluation{}, fmt.Errorf("concrete dataset evaluator requires an exact filtered non-GGUF dataset request")
 	}
@@ -980,6 +1141,9 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	}
 	groupSelected := false
 	for _, f := range c.Filters {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionEvaluation{}, datasetDecisionContextErr(c)
+		}
 		if recognizedLabels[f.Normalized] {
 			groupSelected = true
 			break
@@ -998,12 +1162,18 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	labels := make([]string, len(c.Inputs))
 	companions := make([]bool, len(c.Inputs))
 	for i, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return datasetDecisionEvaluation{}, datasetDecisionContextErr(c)
+		}
 		if in.Excluded {
 			continue
 		}
 		labels[i] = strings.ToLower(world.DataLabels[i])
 		companions[i] = world.Companion[i]
 		for _, f := range c.Filters {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionEvaluation{}, err
+			}
 			if concreteDatasetFilterMatches(in, f, c, world, labels[i], companions[i], collidingTokens, recognizedLabels) {
 				direct[i] = true
 			}
@@ -1016,6 +1186,9 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	}
 	seenExact, seenFold := make(map[string]bool), make(map[string]bool)
 	for i, in := range c.Inputs {
+		if err := datasetDecisionContextErr(c); err != nil {
+			return datasetDecisionEvaluation{}, err
+		}
 		r := &out.Records[i]
 		eligible := !in.Excluded && (direct[i] || (companions[i] && !in.LFS && (path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
 		r.Eligible = eligible
@@ -1041,6 +1214,9 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		// selection error.
 		bestLength := -1
 		for _, f := range c.Filters {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionEvaluation{}, err
+			}
 			if concreteDatasetFilterMatches(in, f, c, world, labels[i], companions[i], collidingTokens, recognizedLabels) && len(f.Original) > bestLength {
 				r.Subdir, bestLength = f.Original, len(f.Original)
 			}
@@ -1049,6 +1225,13 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		seenFold[strings.ToLower(in.Path)] = true
 	}
 	return out, nil
+}
+
+func datasetDecisionContextErr(c datasetDecisionContext) error {
+	if c.ctx == nil {
+		return nil
+	}
+	return c.ctx.Err()
 }
 
 func concreteDatasetFilterMatches(in datasetDecisionInput, f datasetDecisionFilter, c datasetDecisionContext, world datasetDecisionWorld, label string, companion bool, collidingTokens map[uint]bool, recognizedLabels map[string]bool) bool {
@@ -1078,6 +1261,9 @@ func validateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		}
 	}
 	for i, in := range c.Inputs {
+		if err := datasetDecisionContextErr(c); err != nil {
+			return err
+		}
 		label, data := world.DataLabels[i]
 		companion := world.Companion[i]
 		if data == companion { // both false or both true
@@ -1115,9 +1301,15 @@ func collisionTokenBits(c datasetDecisionContext) map[uint]bool {
 	bits := make(map[uint]bool)
 	filterBits := make(map[int]uint, len(c.Filters))
 	for _, f := range c.Filters {
+		if datasetDecisionContextErr(c) != nil {
+			return bits
+		}
 		filterBits[f.Index] = f.Bit
 	}
 	for _, in := range c.Inputs {
+		if datasetDecisionContextErr(c) != nil {
+			return bits
+		}
 		if in.Excluded {
 			continue
 		}

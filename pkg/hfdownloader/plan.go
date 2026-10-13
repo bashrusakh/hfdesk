@@ -248,6 +248,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
 	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if n.Type == "file" || n.Type == "blob" {
 			// Reject path-traversal entries before they reach any filesystem
 			// operation downstream. Fail the whole plan rather than silently
@@ -271,9 +274,15 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	baseNames := make([]string, 0, len(fileNodes))
 	datasetFiles := make([]datasetselection.File, len(fileNodes))
 	for _, n := range fileNodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
 	}
@@ -282,9 +291,15 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	datasetGroupRequest := job.IsDataset && job.ExactMatch && !ggufMode && len(job.Filters) > 0
 	if datasetGroupRequest {
 		membership := datasetselection.Recognize(datasetFiles)
-		context := compileDatasetDecisionContext(fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, ggufMode)
+		context := compileDatasetDecisionContextWithContext(ctx, fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, ggufMode)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		datasetGroupRequest = false
 		for _, filter := range job.Filters {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
 			if containsString(context.RecognizedLabels, normalized) {
 				datasetGroupRequest = true
@@ -296,9 +311,21 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// complete admissible interpretations. Keep the eventual path set and
 			// filter attribution together in one admissible concrete world.
 			for i, n := range fileNodes {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				can, cannot := datasetDecisionRefusal(context, i)
+				if can.Err != nil {
+					return nil, can.Err
+				}
+				if cannot.Err != nil {
+					return nil, cannot.Err
+				}
 				if can.Possible && cannot.Possible {
 					for _, filter := range job.Filters {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
 						if containsString(context.RecognizedLabels, normalized) {
 							return nil, fmt.Errorf("dataset filter %q has ambiguous path selection for %q", filter, n.Path)
@@ -311,6 +338,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				world.SharedToken[bit] = false
 			}
 			for i, input := range context.Inputs {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if len(input.Alternatives) == 0 {
 					return nil, fmt.Errorf("dataset selection has no membership evidence for %q", input.Path)
 				}
@@ -323,6 +353,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			}
 			var evalErr error
 			datasetEvaluation, evalErr = evaluateDatasetDecisionWorld(context, world)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if evalErr != nil {
 				return nil, fmt.Errorf("evaluate dataset selection: %w", evalErr)
 			}
@@ -334,6 +367,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	}
 
 	for nodeIndex, n := range fileNodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rel := n.Path
 
 		// Deduplicate by relative path
@@ -361,6 +397,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// Credits: Exclude feature suggested by jeroenkroese (#41)
 		excluded := false
 		for _, ex := range job.Excludes {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			exLower := strings.ToLower(ex)
 			if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
 				excluded = true
@@ -411,12 +450,18 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// and any mmproj companion. Everything else is skipped. The loop
 			// this replaced computed exactly directMatchedFilter (same name,
 			// filters, exact mode, longest-match rule).
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
 				continue
 			}
 		} else if len(job.Filters) > 0 {
 			// Same computation as the ggufMode branch above: directMatchedFilter.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			matchedFilter = directMatchedFilter
 			// Filters select payloads by their full repo-relative path. An unmatched
 			// LFS entry is payload for planning purposes, regardless of extension:
@@ -503,6 +548,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			AcceptRanges: acceptRanges,
 			Subdir:       matchedFilter, // empty when no filter matched
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	// A non-empty filter set must have produced at least one direct selection
 	// match across the scanned tree (excludes applied). Companion/metadata
