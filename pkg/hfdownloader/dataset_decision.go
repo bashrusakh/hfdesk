@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"path"
 	"sort"
 	"strings"
@@ -65,6 +66,7 @@ type datasetDecisionInput struct {
 // datasetDecisionContext is an immutable, deterministic snapshot of inputs
 // needed for finite dataset-selection reasoning.
 type datasetDecisionContext struct {
+	ctx                    context.Context
 	Inputs                 []datasetDecisionInput
 	Filters                []datasetDecisionFilter
 	FilterBits             map[string]uint
@@ -79,21 +81,29 @@ type datasetDecisionContext struct {
 	uniqueEvaluation       *datasetDecisionUniqueEvaluation
 }
 
-// The evaluator is immutable after compilation; Once safely shares the one
-// concrete evaluation across the many per-input queries made by its caller.
+// The compiled input is immutable. The mutex shares only fully completed proof
+// and baseline caches across per-input queries.
 type datasetDecisionUniqueEvaluation struct {
-	proofOnce sync.Once
+	mu        sync.Mutex
+	proofDone bool
 	unique    bool
-	fixedOnce sync.Once
+	fixedDone bool
 	fixedEmit []int8
-	once      sync.Once
+	baseDone  bool
 	world     datasetDecisionWorld
 	records   []datasetDecisionRecord
 	valid     bool
 }
 
 func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
-	c := datasetDecisionContext{ExactMatch: exact, IsDataset: isDataset, GGUFMode: ggufMode, FilterBits: make(map[string]uint)}
+	return compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, filters, excludes, exact, isDataset, ggufMode)
+}
+
+func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c := datasetDecisionContext{ctx: ctx, ExactMatch: exact, IsDataset: isDataset, GGUFMode: ggufMode, FilterBits: make(map[string]uint)}
 	coreBits := make(map[string]uint, len(datasetCoreLabels))
 	for i, label := range datasetCoreLabels {
 		coreBits[label] = uint(i)
@@ -104,15 +114,27 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	labelSet := make(map[string]struct{})
 	evidence := make(map[int]datasetselection.Evidence, len(membership.Evidence))
 	for _, e := range membership.Evidence {
+		if ctx.Err() != nil {
+			return c
+		}
 		evidence[e.InputIndex] = e
 		for _, label := range e.PossibleLabels {
+			if ctx.Err() != nil {
+				return c
+			}
 			labelSet[strings.ToLower(label)] = struct{}{}
 		}
 		for _, label := range e.DefiniteLabels {
+			if ctx.Err() != nil {
+				return c
+			}
 			labelSet[strings.ToLower(label)] = struct{}{}
 		}
 	}
 	for label := range membership.Groups {
+		if ctx.Err() != nil {
+			return c
+		}
 		labelSet[strings.ToLower(label)] = struct{}{}
 	}
 	for _, label := range stableSortedKeys(labelSet) {
@@ -129,6 +151,9 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	}
 
 	for i, original := range filters {
+		if ctx.Err() != nil {
+			return c
+		}
 		norm := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(original), "\\", "/"))
 		bit, ok := c.FilterBits[norm]
 		if !ok {
@@ -141,6 +166,9 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	c.Inputs = make([]datasetDecisionInput, len(nodes))
 	firstExact, firstCase := map[string]int{}, map[string]int{}
 	for i, n := range nodes {
+		if ctx.Err() != nil {
+			return c
+		}
 		in := datasetDecisionInput{Path: n.Path, LFS: n.LFS != nil, ExactDuplicateOf: -1, CaseDuplicateOf: -1}
 		e, hasEvidence := evidence[i]
 		if hasEvidence {
@@ -192,6 +220,9 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 		}
 		in.Excluded = isExcludedPath(n.Path, excludes)
 		for _, f := range c.Filters {
+			if ctx.Err() != nil {
+				return c
+			}
 			if filterMatchesPath(n.Path, f.Original, exact) {
 				in.DirectFilterIndexes = append(in.DirectFilterIndexes, f.Index)
 				if bit, ok := coreBits[f.Normalized]; ok {
@@ -251,6 +282,9 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 		c.Inputs[i] = in
 	}
 	for i := range c.Inputs {
+		if ctx.Err() != nil {
+			return c
+		}
 		in := &c.Inputs[i]
 		hasPossibleDataRole := in.PossibleCore != 0 || len(in.PossibleResidual) != 0
 		// Any ordinary explicit path match is a direct selection under every
@@ -263,6 +297,9 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	c.DirectSeedsByDirectory = make(map[string][]int)
 	c.CaseIndexesByPath = make(map[string][]int)
 	for i, input := range c.Inputs {
+		if ctx.Err() != nil {
+			return c
+		}
 		c.Inputs[i].Directory = path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
 		fold := strings.ToLower(input.Path)
 		c.CaseIndexesByPath[fold] = append(c.CaseIndexesByPath[fold], i)

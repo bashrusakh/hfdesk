@@ -4,14 +4,56 @@
 package hfdownloader
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
+
+type blockingDecisionContext struct {
+	context.Context
+	reached chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingDecisionContext) Err() error {
+	c.once.Do(func() { close(c.reached); <-c.resume })
+	return context.Canceled
+}
+
+func TestInterruptedDatasetDecisionCacheCanBeRetried(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "records.parquet"}}, []string{"default"}, nil)
+	blocked := &blockingDecisionContext{Context: context.Background(), reached: make(chan struct{}), resume: make(chan struct{})}
+	c.ctx = blocked
+	result := make(chan datasetDecisionQueryResult, 1)
+	go func() {
+		got, _ := fixedDatasetDecisionQuery(c, 0, false)
+		result <- got
+	}()
+	<-blocked.reached
+	close(blocked.resume)
+	if got := <-result; !errors.Is(got.Err, context.Canceled) {
+		t.Fatalf("interrupted query error=%v, want context.Canceled", got.Err)
+	}
+	c.uniqueEvaluation.mu.Lock()
+	cached := c.uniqueEvaluation.fixedDone
+	c.uniqueEvaluation.mu.Unlock()
+	if cached {
+		t.Fatal("interrupted fixed-outcome proof was cached")
+	}
+	c.ctx = context.Background()
+	got, fixed := fixedDatasetDecisionQuery(c, 0, false)
+	if !fixed || !got.Possible || got.Err != nil {
+		t.Fatalf("retry did not complete normally: fixed=%t result=%+v", fixed, got)
+	}
+}
 
 func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetDecisionContext {
 	files := make([]datasetselection.File, len(nodes))
@@ -970,6 +1012,7 @@ func TestFeasibilityQueriesRespectJointSkipAndEmissionConstraints(t *testing.T) 
 	}{
 		{"exact-duplicate-suppression", []hfNode{{Path: "train.csv"}, {Path: "folder/train.csv"}, {Path: "folder/notes.bin", LFS: &hfLfsInfo{Size: 4}}, {Path: "folder/notes.bin"}, {Path: "folder/NOTES.BIN"}, {Path: "notes.json"}}, []string{"train"}, 3},
 		{"required-skip-conflicts-with-unique-witness", []hfNode{{Path: "train.csv"}, {Path: "README.md"}}, []string{"train"}, 0},
+		{"root-default-data-or-companion-final-emission", []hfNode{{Path: "records.parquet"}, {Path: "notes.json"}}, []string{"default"}, 1},
 		{"case-winner-must-remain-eligible", []hfNode{{Path: "train.csv"}, {Path: "folder/notes.bin", LFS: &hfLfsInfo{Size: 4}}, {Path: "folder/NOTES.BIN"}}, []string{"train"}, 2},
 		{"ambiguous-lfs-prefix-before-case-winner", []hfNode{{Path: "records.parquet"}, {Path: "notes.json", LFS: &hfLfsInfo{Size: 4}}, {Path: "NOTES.JSON", LFS: &hfLfsInfo{Size: 4}}, {Path: "Notes.Json"}}, []string{"default"}, 3},
 		{"role-pinned-companion-seed", []hfNode{{Path: "folder/train.csv"}, {Path: "folder/notes.json"}}, []string{"train"}, 1},
