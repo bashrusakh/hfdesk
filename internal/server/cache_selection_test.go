@@ -1034,6 +1034,86 @@ func TestReservationProducersFreezeEntryAndDirectoryScopes(t *testing.T) {
 	}
 }
 
+func TestSelectedDeleteChecksFrozenAndCurrentMutationAlias(t *testing.T) {
+	root := t.TempDir()
+	a, b, other := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "other")
+	for _, dir := range []string{a, b, other} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(root, "destination")
+	if err := os.Symlink(a, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(root, "cache")})
+	release, ok := s.jobs.beginCacheMutation(alias)
+	if !ok {
+		t.Fatal("could not reserve aliased mutation destination")
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "model-Q4_K_M.gguf")}); ok {
+		t.Fatal("delete admission ignored the mutation destination's current alias mapping")
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(a, "model-Q4_K_M.gguf")}); ok {
+		t.Fatal("delete admission ignored the mutation's frozen original destination")
+	}
+	if unrelated, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(other, "model-Q4_K_M.gguf")}); !ok {
+		t.Fatal("unrelated selected deletion was blocked")
+	} else {
+		unrelated()
+	}
+	release()
+	if mutation, ok := s.jobs.beginCacheMutation(alias); !ok {
+		t.Fatal("mutation could not be admitted after deletion reservation release")
+	} else {
+		mutation()
+	}
+	deleteB, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "model-Q4_K_M.gguf")})
+	if !ok {
+		t.Fatal("could not reserve current alias target for reverse-admission check")
+	}
+	if _, ok := s.jobs.beginCacheMutation(alias); ok {
+		t.Fatal("mutation admission ignored the raw destination's current alias mapping")
+	}
+	deleteB()
+	// HF repo reservations use the same shared owner and must retain their IO
+	// spelling too, not only the selected-local mutation scopes above.
+	hfRelease, ok := s.jobs.reserveSelectedHF(alias, filepath.Join(root, "friendly"))
+	if !ok {
+		t.Fatal("could not reserve aliased HF repository scope")
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(a, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(a, "snapshot-Q4_K_M.gguf")}); ok {
+		t.Fatal("selected-delete admission ignored current mapping of held HF reservation")
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "snapshot-Q4_K_M.gguf")}); ok {
+		t.Fatal("selected-delete admission ignored frozen mapping of held HF reservation")
+	}
+	if _, ok := s.jobs.beginCacheMutation(alias); ok {
+		t.Fatal("mutation admission crossed an existing HF reservation")
+	}
+	hfRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.T) {
 	actual, alias := t.TempDir(), t.TempDir()
 	if err := os.Symlink(actual, filepath.Join(alias, "parent")); err != nil {

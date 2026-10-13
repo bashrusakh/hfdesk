@@ -363,9 +363,8 @@ described below is supported on Linux, Windows, and macOS. On other operating
 systems, the current implementation does not support identity-pinning a selected
 local symlink member, so the request returns `409` before unlinking, leaving the
 selected link and its target unchanged. This platform qualification applies to
-selected local symlink entries;
-it does not change the handling of regular files or imply that other HFDesk
-features are unsupported on those operating systems. For an HF location it removes the
+selected local symlink entries; it does not imply that other HFDesk features
+are unsupported on those operating systems. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
 friendly entries whose relative names match the selected remote paths and
 which provably resolve to those entries: symlinks by their link chain, and
@@ -418,6 +417,14 @@ cleanup failure after selected effects returns `207`, with `removed` and
 failures and any possible pin artifacts. A process crash can leave the private
 pin directory behind; HFDesk does not scan for or automatically remove such
 orphaned directories.
+On operating systems other than Linux, Windows, and macOS, selected local
+regular files that cannot be read for identity pinning may also be refused with
+`409` before unlinking, even when the parent directory would otherwise permit
+unlinking. This is a limitation of the current selected-delete identity-pin
+implementation, not an inherent operating-system restriction or a general
+HFDesk support policy. Regular-file deletion remains supported on the released
+platforms above. The Darwin hard-link pin fallback described above is a separate
+platform-specific behavior.
 The older `DELETE /api/cache/{owner}/{repo}` remains the separate
 whole-repository operation.
 

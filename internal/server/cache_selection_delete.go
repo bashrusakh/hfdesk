@@ -31,6 +31,9 @@ type jobWriteActivity struct {
 type frozenMutationPath struct {
 	physical string
 	key      string
+	// raw is the spelling used by the operation's filesystem IO. It is kept
+	// separately from the immutable comparison snapshot for admission checks.
+	raw string
 }
 
 func freezeMutationEntry(path string) (frozenMutationPath, error) {
@@ -59,6 +62,33 @@ func freezeMutationDirectoryWithKey(path string, key func(string) string) (froze
 
 func frozenMutationOverlap(a, b frozenMutationPath) bool {
 	return pathKeysOverlap(a.key, b.key)
+}
+
+// mutationScopesOverlap checks both immutable admission snapshots and the
+// current mappings of raw spellings whose owners perform filesystem IO there.
+func mutationScopesOverlap(a, b frozenMutationPath) bool {
+	if frozenMutationOverlap(a, b) {
+		return true
+	}
+	if a.raw != "" {
+		if frozenMutationOverlapsRawDirectory(b, a.raw) {
+			return true
+		}
+		current, err := freezeMutationDirectory(a.raw)
+		if err != nil || frozenMutationOverlap(current, b) {
+			return true
+		}
+	}
+	if b.raw != "" {
+		if frozenMutationOverlapsRawDirectory(a, b.raw) {
+			return true
+		}
+		current, err := freezeMutationDirectory(b.raw)
+		if err != nil || frozenMutationOverlap(a, current) {
+			return true
+		}
+	}
+	return false
 }
 
 func pathKeysOverlap(a, b string) bool {
@@ -395,7 +425,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.hfRepoReservations {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if frozenMutationOverlap(scope, entry) {
+				if mutationScopesOverlap(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -405,7 +435,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	for _, scopes := range m.mutationScopes {
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if frozenMutationOverlap(scope, entry) {
+				if mutationScopesOverlap(scope, entry) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -550,6 +580,7 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		if err != nil {
 			return nil, false
 		}
+		frozen.raw = scope
 		scopes = append(scopes, frozen)
 	}
 	m.mu.Lock()
@@ -560,7 +591,7 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 	conflictScopes := func(other []frozenMutationPath) bool {
 		for _, a := range scopes {
 			for _, b := range other {
-				if frozenMutationOverlap(a, b) {
+				if mutationScopesOverlap(a, b) {
 					return true
 				}
 			}
@@ -644,6 +675,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 		if err != nil {
 			return nil, false
 		}
+		frozen.raw = p
 		clean = append(clean, frozen)
 	}
 	m.mu.Lock()
@@ -654,7 +686,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	for _, scopes := range m.deleteReservations {
 		for _, scope := range scopes {
 			for _, write := range clean {
-				if frozenMutationOverlap(write, scope) {
+				if mutationScopesOverlap(write, scope) {
 					m.mu.Unlock()
 					return nil, false
 				}
@@ -664,7 +696,7 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	for _, scopes := range m.hfRepoReservations {
 		for _, scope := range scopes {
 			for _, write := range clean {
-				if frozenMutationOverlap(write, scope) {
+				if mutationScopesOverlap(write, scope) {
 					m.mu.Unlock()
 					return nil, false
 				}
