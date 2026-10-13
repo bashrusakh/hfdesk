@@ -278,98 +278,59 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
 	}
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
-	datasetMembers := make(map[int]string)
-	datasetGroups := make(map[string]bool)
-	selectedGroups := make(map[string]bool)
-	selectedGroupFilters := make(map[string]string)
+	var datasetEvaluation datasetDecisionEvaluation
 	datasetGroupRequest := job.IsDataset && job.ExactMatch && !ggufMode && len(job.Filters) > 0
 	if datasetGroupRequest {
 		membership := datasetselection.Recognize(datasetFiles)
-		for group, indexes := range membership.Groups {
-			datasetGroups[strings.ToLower(group)] = true
-			for _, index := range indexes {
-				datasetMembers[index] = strings.ToLower(group)
-			}
-		}
+		context := compileDatasetDecisionContext(fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, ggufMode)
+		datasetGroupRequest = false
 		for _, filter := range job.Filters {
-			group := strings.ToLower(strings.TrimSpace(filter))
-			if datasetGroups[group] {
-				selectedGroups[group] = true
-				if selectedGroupFilters[group] == "" {
-					selectedGroupFilters[group] = filter
-				}
+			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+			if containsString(context.RecognizedLabels, normalized) {
+				datasetGroupRequest = true
+				break
 			}
 		}
-		if len(selectedGroups) > 0 {
-			// Ambiguous inventory is evaluated below only where the existing
-			// companion rule would otherwise retain it.
-			// A group label and another exact-path interpretation must not silently
-			// select a different definite group.
+		if datasetGroupRequest {
+			// A plan is useful only when every emitted path is invariant across
+			// complete admissible interpretations. Keep the eventual path set and
+			// filter attribution together in one admissible concrete world.
 			for i, n := range fileNodes {
-				if isExcludedPath(n.Path, job.Excludes) || datasetMembers[i] == "" {
-					continue
-				}
-				for group := range selectedGroups {
-					if filterMatchesPath(n.Path, group, true) && datasetMembers[i] != group {
-						return nil, fmt.Errorf("dataset filter %q conflicts with membership of %q (%s)", group, n.Path, datasetMembers[i])
+				can, cannot := datasetDecisionRefusal(context, i)
+				if can.Possible && cannot.Possible {
+					for _, filter := range job.Filters {
+						normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+						if containsString(context.RecognizedLabels, normalized) {
+							return nil, fmt.Errorf("dataset filter %q has ambiguous path selection for %q", filter, n.Path)
+						}
 					}
 				}
 			}
-		}
-		if len(selectedGroups) == 0 {
-			datasetGroupRequest = false
+			world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+			for bit := range collisionTokenBits(context) {
+				world.SharedToken[bit] = false
+			}
+			for i, input := range context.Inputs {
+				if len(input.Alternatives) == 0 {
+					return nil, fmt.Errorf("dataset selection has no membership evidence for %q", input.Path)
+				}
+				alternative := input.Alternatives[0]
+				if alternative.Role == datasetselection.EvidenceRoleCompanion {
+					world.Companion[i] = true
+				} else {
+					world.DataLabels[i] = alternative.Label
+				}
+			}
+			var evalErr error
+			datasetEvaluation, evalErr = evaluateDatasetDecisionWorld(context, world)
+			if evalErr != nil {
+				return nil, fmt.Errorf("evaluate dataset selection: %w", evalErr)
+			}
 		}
 	}
-	matchedDirs := matchedFilterDirectories(fileNodes, job, ggufMode)
-	if datasetGroupRequest {
-		for index, group := range datasetMembers {
-			if !selectedGroups[group] || isExcludedPath(fileNodes[index].Path, job.Excludes) {
-				continue
-			}
-			for dir := path.Dir(strings.ReplaceAll(fileNodes[index].Path, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
-				matchedDirs[dir] = struct{}{}
-			}
-		}
-		membership := datasetselection.Recognize(datasetFiles)
-		for _, index := range membership.Unresolved {
-			n := fileNodes[index]
-			if isExcludedPath(n.Path, job.Excludes) {
-				continue
-			}
-			ordinaryMatch, exactFileRequest := false, false
-			for _, filter := range job.Filters {
-				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
-					ordinaryMatch = true
-					if job.ExactMatch && strings.ContainsAny(filter, "/\\") && strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"), strings.ReplaceAll(n.Path, "\\", "/")) {
-						exactFileRequest = true
-					}
-				}
-			}
-			if exactFileRequest {
-				continue
-			}
-			if n.LFS != nil && !ordinaryMatch {
-				continue
-			}
-			for _, filter := range job.Filters {
-				group := strings.ToLower(strings.TrimSpace(filter))
-				if datasetGroups[group] && filterMatchesPath(n.Path, group, true) {
-					return nil, fmt.Errorf("dataset filter %q conflicts with ambiguous membership of %q", filter, n.Path)
-				}
-			}
-			if ordinaryMatch {
-				continue
-			}
-			dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/"))
-			_, hasMatchedDir := matchedDirs[dir]
-			if dir == "." || hasMatchedDir {
-				for _, filter := range job.Filters {
-					if datasetGroups[strings.ToLower(strings.TrimSpace(filter))] {
-						return nil, fmt.Errorf("dataset filter %q has ambiguous membership for %q", filter, n.Path)
-					}
-				}
-			}
-		}
+	matchedDirs := make(map[string]struct{})
+	if !datasetGroupRequest {
+		matchedDirs = matchedFilterDirectories(fileNodes, job, ggufMode)
 	}
 
 	for nodeIndex, n := range fileNodes {
@@ -385,22 +346,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		nameLower := strings.ToLower(name)
 		relLower := strings.ToLower(rel)
 		isLFS := n.LFS != nil
-		selectedDatasetGroup := ""
+		var datasetRecord datasetDecisionRecord
 		if datasetGroupRequest {
-			if group := datasetMembers[nodeIndex]; group != "" {
-				if selectedGroups[group] {
-					selectedDatasetGroup = group
-				} else {
-					explicitMatch := false
-					for _, filter := range job.Filters {
-						if filterMatchesPath(rel, filter, job.ExactMatch) {
-							explicitMatch = true
-							break
-						}
-					}
-					if !explicitMatch {
-						continue
-					}
+			datasetRecord = datasetEvaluation.Records[nodeIndex]
+			if !datasetRecord.Selected {
+				_, caseWinner := seenLower[relLower]
+				caseWinner = caseWinner && datasetRecord.Eligible
+				if !caseWinner {
+					continue
 				}
 			}
 		}
@@ -441,17 +394,19 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
 		// branches below; it is not the selection proof (see directMatchedFilter).
 		matchedFilter := ""
-		if selectedDatasetGroup != "" {
-			matchedFilter = selectedGroupFilters[selectedDatasetGroup]
+		if datasetGroupRequest {
+			matchedFilter = datasetRecord.Subdir
 		}
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
 		// requested companions.
-		if strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
+		if !datasetGroupRequest && strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
-		if ggufMode {
+		if datasetGroupRequest {
+			// Inclusion and attribution come from one concrete dataset world.
+		} else if ggufMode {
 			// Keep only files that match a filter: the selected quant's shards
 			// and any mmproj companion. Everything else is skipped. The loop
 			// this replaced computed exactly directMatchedFilter (same name,
@@ -476,11 +431,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 						continue
 					}
 				}
-			}
-		}
-		if selectedDatasetGroup != "" {
-			for dir := path.Dir(strings.ReplaceAll(rel, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
-				matchedDirs[dir] = struct{}{}
 			}
 		}
 

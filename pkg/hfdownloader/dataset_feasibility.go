@@ -14,7 +14,7 @@ import (
 
 // datasetDecisionPositive is one optional disjunction of direct matches. The
 // solver deliberately supports one such clause: direct inventory seeds are
-// the only positive conditions needed by the dormant evaluator.
+// the only positive conditions needed by the dataset selection decision.
 type datasetDecisionPositive struct {
 	Input       int
 	Alternative datasetDecisionRoleLabel
@@ -32,7 +32,6 @@ type datasetDecisionLiteral struct {
 // satisfying pins, pre-dedup ineligibility, zero-direct constraints and (when
 // present) one positive direct clause. Ineligible is deliberately distinct
 // from skipped output: exact/case-fold deduplication happens after eligibility.
-// It is dormant and does not activate planning.
 func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[uint]bool, pins datasetDecisionPins, ineligible, zeroDirect []int, positive *datasetDecisionPositive) (datasetDecisionWorld, bool) {
 	collisions := collisionTokenBits(c)
 	units := map[uint]bool{}
@@ -414,7 +413,7 @@ type datasetDecisionQueryResult struct {
 // false, or a raw pre-dedup ineligibility witness when it is true. Its
 // earlierCaseIneligible inputs are likewise raw eligibility constraints, not
 // generic output-skip requirements. Exact/case-fold suppression is applied by
-// the upper output wrappers. It is dormant and has no PlanRepo caller.
+// the upper output wrappers.
 func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseIneligible []int, requireIneligible bool) datasetDecisionQueryResult {
 	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionQueryResult{}
@@ -965,9 +964,9 @@ func datasetDecisionRefusal(c datasetDecisionContext, index int) (can, cannot da
 }
 
 // evaluateDatasetDecisionWorld applies the exact-dataset-group concrete
-// selection contract to one admissible role/token interpretation. It remains
-// dormant: PlanRepo does not call it. No-filter, inexact, non-dataset, and
-// GGUF requests are outside this evaluator's established contract.
+// selection contract to one admissible role/token interpretation. No-filter,
+// inexact, non-dataset, and GGUF requests are outside this evaluator's
+// established contract.
 func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisionWorld) (datasetDecisionEvaluation, error) {
 	if !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionEvaluation{}, fmt.Errorf("concrete dataset evaluator requires an exact filtered non-GGUF dataset request")
