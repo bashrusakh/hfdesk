@@ -1441,19 +1441,13 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	}
 	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
 		paths, complete := jobPlannedWriteEntries(job, plan)
-		var planned map[string]frozenMutationPath
-		if complete {
-			planned, complete = plannedDestinationSet(paths)
-		}
+		planned, frozenComplete := plannedDestinationSet(paths)
+		complete = complete && frozenComplete
 		m.mu.Lock()
 		if activity := m.runActivities[activityID]; activity != nil {
-			if complete {
-				activity.planned = planned
-			}
-			activity.planKnown = complete
-			if !complete {
-				activity.planned = make(map[string]frozenMutationPath)
-			}
+			activity.planned = planned
+			activity.planKnown = true
+			activity.planComplete = complete
 		}
 		m.mu.Unlock()
 	}

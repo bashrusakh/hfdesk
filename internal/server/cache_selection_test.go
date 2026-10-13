@@ -1643,6 +1643,100 @@ func TestSelectedDeleteExcludesPlannedWriterThroughAliasAfterPlan(t *testing.T) 
 	}
 }
 
+func TestSelectedDeleteKeepsKnownAliasConflictWhenSiblingPlanPathCannotFreeze(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blocked := filepath.Join(repoDir, "blocked")
+	selectedFile := filepath.Join(blocked, "model-Q4_K_M.gguf")
+	writeSelectionFile(t, blocked, filepath.Base(selectedFile))
+	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	danglingTarget := filepath.Join(t.TempDir(), "not-created")
+	if err := os.Symlink(danglingTarget, filepath.Join(repoDir, "dangling")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(`[{"type":"file","path":"live/model-Q4_K_M.gguf","size":5},{"type":"file","path":"dangling/model-Q5_K_M.gguf","size":5}]`))
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+				_, _ = w.Write([]byte("data!"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M", "Q5_K_M"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("close test job manager: %v", err)
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production run did not reach the held transfer")
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		s.jobs.mu.RLock()
+		captured := false
+		for _, activity := range s.jobs.runActivities {
+			if activity.job.ID == job.ID && activity.planKnown && !activity.planComplete && len(activity.planned) > 0 {
+				captured = true
+				break
+			}
+		}
+		s.jobs.mu.RUnlock()
+		if captured {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("partial production plan was not retained through transfer")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("partial plan lost known alias conflict: status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(selectedFile); err != nil {
+		t.Fatalf("selected bytes were removed despite the valid planned alias: %v", err)
+	}
+}
+
 func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	storage := t.TempDir()
 	repoDir := filepath.Join(storage, "models", "o", "m")
@@ -4299,11 +4393,32 @@ func TestHFReservationRejectsCompletedPlanWriter(t *testing.T) {
 	s.jobs.mu.Lock()
 	s.jobs.runActivities[1] = &jobWriteActivity{
 		job:     &Job{Repo: "owner/model", OutputDir: root, HubDir: cache.HubDir()},
-		planned: planned, planKnown: true,
+		planned: planned, planKnown: true, planComplete: true,
 	}
 	s.jobs.mu.Unlock()
 	if _, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
 		t.Fatal("HF reservation admitted while a completed plan retained a part writer in the selected repository")
+	}
+}
+
+func TestHFReservationKeepsBroadJobRepoScopeForCompleteEmptyPlan(t *testing.T) {
+	root := t.TempDir()
+	cache := hfdownloader.NewHFCache(root, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: root})
+	s.jobs.mu.Lock()
+	s.jobs.runActivities[1] = &jobWriteActivity{
+		job:          &Job{Repo: "owner/model", OutputDir: root, HubDir: cache.HubDir()},
+		planned:      map[string]frozenMutationPath{},
+		planKnown:    true,
+		planComplete: true,
+	}
+	s.jobs.mu.Unlock()
+	if _, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
+		t.Fatal("complete empty plan narrowed the active HF writer's broad repository scope")
 	}
 }
 
@@ -5018,6 +5133,38 @@ func TestPlannedDestinationSetFreezesPhysicalIdentityBeforeAliasRetarget(t *test
 	}
 	if !plannedRawEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
 		t.Fatal("frozen plan identity no longer protects the original destination")
+	}
+}
+
+func TestIncompletePlannedRawDestinationIsRecheckedAfterItResolves(t *testing.T) {
+	selected := filepath.Join(t.TempDir(), "model-Q4_K_M.gguf")
+	if err := os.WriteFile(selected, []byte("selected"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "writer")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	plannedRaw := filepath.Join(alias, filepath.Base(selected))
+	planned, complete := plannedDestinationSet([]string{plannedRaw})
+	if complete || len(planned) != 1 {
+		t.Fatalf("unresolvable raw destination was not retained as incomplete: %v complete=%v", planned, complete)
+	}
+	selectedFrozen, err := freezeMutationEntry(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(selected), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("raw destination that resolved into selected entry was not rechecked")
 	}
 }
 

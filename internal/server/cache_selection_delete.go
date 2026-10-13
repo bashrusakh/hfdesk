@@ -20,9 +20,10 @@ import (
 )
 
 type jobWriteActivity struct {
-	job       *Job
-	planned   map[string]frozenMutationPath
-	planKnown bool
+	job          *Job
+	planned      map[string]frozenMutationPath
+	planKnown    bool
+	planComplete bool
 }
 
 // frozenMutationPath retains the physical spelling for basename predicates
@@ -366,9 +367,15 @@ func plannedRawEntriesConflict(frozenEntries []frozenMutationPath, plannedPaths 
 	if plannedEntriesConflict(frozenEntries, plannedPaths) {
 		return true
 	}
-	for raw := range plannedPaths {
+	for raw, captured := range plannedPaths {
 		current, err := freezeMutationEntry(raw)
 		if err != nil {
+			// An unfreezable destination remains represented by its raw writer
+			// spelling; the caller's incomplete-plan fallback conservatively
+			// covers destinations whose current mapping is still unavailable.
+			if captured.key == "" {
+				continue
+			}
 			return true
 		}
 		for _, frozen := range frozenEntries {
@@ -448,7 +455,9 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 				m.mu.Unlock()
 				return nil, false
 			}
-			continue
+			if activity.planComplete {
+				continue
+			}
 		}
 		for _, target := range clean {
 			if jobMayWriteFrozenSelectedPath(activity.job, target) {
@@ -534,21 +543,24 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 		}
 	}
 	entries := make([]string, 0, len(plan.Items)*2)
+	complete := true
 	for _, item := range plan.Items {
 		friendly, err := hfdownloader.SafeJoin(base, item.RelativePath)
 		if err != nil {
-			return nil, false
+			complete = false
+			continue
 		}
 		entries = append(entries, friendly)
 		if repo != nil {
 			snapshot, err := repo.SnapshotPath(plan.Commit, item.RelativePath)
 			if err != nil {
-				return nil, false
+				complete = false
+				continue
 			}
 			entries = append(entries, snapshot)
 		}
 	}
-	return entries, true
+	return entries, complete
 }
 
 func hfReservationConflictsJob(scopes []frozenMutationPath, job *Job) bool {
@@ -658,18 +670,23 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 // a completed plan's stored path.
 func plannedDestinationSet(paths []string) (map[string]frozenMutationPath, bool) {
 	planned := make(map[string]frozenMutationPath, len(paths))
+	complete := true
 	for _, path := range paths {
 		absolute, err := filepath.Abs(filepath.Clean(path))
 		if err != nil {
-			return nil, false
+			complete = false
+			continue
 		}
 		frozen, err := freezeMutationEntry(absolute)
 		if err != nil {
-			return nil, false
+			planned[absolute] = frozenMutationPath{raw: absolute}
+			complete = false
+			continue
 		}
+		frozen.raw = absolute
 		planned[absolute] = frozen
 	}
-	return planned, true
+	return planned, complete
 }
 
 func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
