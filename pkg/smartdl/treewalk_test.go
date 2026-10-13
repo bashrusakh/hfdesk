@@ -207,6 +207,42 @@ func TestAnalyze_TransportPort401IsNotAuthorization(t *testing.T) {
 	}
 }
 
+func TestAnalyze_TransportDiagnosticsDoNotTriggerNamespaceFallback(t *testing.T) {
+	for _, diagnostic := range []string{
+		"unauthorized",
+		"not found",
+		"request to https://hub.test/401 failed",
+		"request to https://hub.test/404 failed: forbidden",
+	} {
+		t.Run(diagnostic, func(t *testing.T) {
+			var requests atomic.Int64
+			var datasetRequests atomic.Int64
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				if strings.Contains(req.URL.Path, "/datasets/") {
+					datasetRequests.Add(1)
+				}
+				return nil, errors.New(diagnostic)
+			})}
+			a := NewAnalyzer(AnalyzerOptions{Endpoint: "https://hub.test", HTTPClient: client})
+			info, err := a.Analyze(context.Background(), "owner/repo", false)
+			if info != nil || err == nil {
+				t.Fatalf("info = %v, error = %v; want original transport failure", info, err)
+			}
+			if strings.Contains(err.Error(), "repository not found as model or dataset") {
+				t.Fatalf("error = %v; transport failure triggered namespace fallback", err)
+			}
+			if got := requests.Load(); got != 5 || datasetRequests.Load() != 0 {
+				t.Fatalf("total/dataset requests = %d/%d, want five model retries and no dataset fallback", got, datasetRequests.Load())
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 // Exercise public Analyze so attacker text cannot turn a pagination failure
 // into namespace autodetection and successful partial analysis.
 func TestAnalyze_PaginationOriginBoundary(t *testing.T) {
