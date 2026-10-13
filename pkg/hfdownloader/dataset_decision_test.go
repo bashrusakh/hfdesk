@@ -21,6 +21,23 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
+func TestCanEmitDatasetDecisionStopsAtProvenNonEmission(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train/part.parquet"},
+		{Path: "test/part.parquet"},
+	}, []string{"train"}, nil)
+
+	// The fixed proof says the second record can never emit. Its negative
+	// answer is conclusive; the query must not fall through to the general
+	// feasibility solver and reinterpret it as an unknown.
+	if got := canEmitDatasetDecision(c, 1); got.Possible {
+		t.Fatalf("non-emitting test record got an emission witness: %+v", got)
+	}
+	if got := canEmitDatasetDecision(c, 0); !got.Possible || got.Record.Subdir != "train" {
+		t.Fatalf("selected train record = %+v, want train emission", got)
+	}
+}
+
 func TestCompileDatasetDecisionContextPreservesActualRolesAndAlternatives(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "notes.txt"},
