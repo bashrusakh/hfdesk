@@ -63,8 +63,7 @@ type datasetDecisionInput struct {
 }
 
 // datasetDecisionContext is an immutable, deterministic snapshot of inputs
-// needed for finite dataset-selection reasoning. It is deliberately dormant:
-// compiling it does not decide inclusion, ambiguity disposition, or a plan.
+// needed for finite dataset-selection reasoning.
 type datasetDecisionContext struct {
 	Inputs                 []datasetDecisionInput
 	Filters                []datasetDecisionFilter

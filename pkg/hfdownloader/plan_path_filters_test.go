@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -148,6 +149,134 @@ func TestPlanRepoDatasetGroupLabelPathCollisionRefuses(t *testing.T) {
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
 	if err == nil || plan != nil {
 		t.Fatalf("colliding label/path plan = %+v, err=%v; want refusal", plan, err)
+	}
+}
+
+func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "test/train.csv", Size: 20},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train", ".csv"}, ExactMatch: true, AppendFilterSubdir: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("independent extension filter should resolve group/path collision: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train.csv", "test/train.csv"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths=%v, want %v", got, want)
+	}
+	for _, item := range plan.Items {
+		if item.Subdir != "train" {
+			t.Errorf("%s attribution=%q, want longest applicable filter train", item.RelativePath, item.Subdir)
+		}
+	}
+}
+
+func TestPlanRepoDatasetGroupCollisionWithNonDatasetInterpretationRefuses(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "test/train.csv", Size: 20},
+		{Type: "file", Path: "README.md", Size: 5},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err == nil || plan != nil || !strings.Contains(strings.ToLower(err.Error()), "ambiguous") {
+		t.Fatalf("group/path interpretation plan=%+v err=%v; want whole-plan ambiguity refusal", plan, err)
+	}
+}
+
+func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "data/train_data/part.parquet", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "data/train_data/schema.json", Size: 8},
+		{Type: "file", Path: "data/train_data/README.md", Size: 4},
+		{Type: "file", Path: "other/data.parquet", Size: 20},
+		{Type: "file", Path: "data/english/chunk.arrow", Size: 30},
+		{Type: "file", Path: "unknown.json", Size: 5},
+		{Type: "file", Path: "unrelated/unknown.json", Size: 6},
+		{Type: "file", Path: "metadata-lfs.json", LFS: &hfLfsInfo{Size: 7}},
+		{Type: "file", Path: "README.md", Size: 3},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	planFor := func(filters, excludes []string) (*Plan, error) {
+		return PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: filters, Excludes: excludes, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	}
+	tests := []struct {
+		name, filter string
+		excludes     []string
+		want         []string
+	}{
+		{"conventional root train", "train", []string{"unknown.json"}, []string{"train.csv", "README.md"}},
+		{"underscore custom group with companions", "train_data", []string{"unknown.json"}, []string{"data/train_data/part.parquet", "data/train_data/schema.json", "data/train_data/README.md", "README.md"}},
+		{"unnamed default", "default", []string{"unknown.json", "metadata-lfs.json"}, []string{"other/data.parquet", "README.md"}},
+		{"custom data group", "english", []string{"unknown.json"}, []string{"data/english/chunk.arrow", "README.md"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := planFor([]string{tc.filter}, tc.excludes)
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			if got := planPaths(plan); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("paths=%v, want %v", got, tc.want)
+			}
+		})
+	}
+	if plan, err := planFor([]string{"train"}, nil); err == nil || plan != nil {
+		t.Fatalf("ambiguous root JSON should refuse whole plan: plan=%+v err=%v", plan, err)
+	}
+	plan, err := planFor([]string{"train"}, []string{"unknown.json"})
+	if err != nil {
+		t.Fatalf("exclude resolves relevant root ambiguity: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train.csv", "README.md"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("excluded ambiguity paths=%v, want %v", got, want)
+	}
+	plan, err = planFor(nil, nil)
+	if err != nil {
+		t.Fatalf("unfiltered dataset plan: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train.csv", "data/train_data/part.parquet", "data/train_data/schema.json", "data/train_data/README.md", "other/data.parquet", "data/english/chunk.arrow", "unknown.json", "unrelated/unknown.json", "metadata-lfs.json", "README.md"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unfiltered paths=%v, want %v", got, want)
+	}
+}
+
+func TestPlanRepoDatasetCaseSuppressedEligibleInputStillValidatesHash(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "Train.csv", Size: 10},
+		{Type: "file", Path: "train.csv", Size: 10, Sha256: "not-a-canonical-sha256"},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err == nil || plan != nil || !strings.Contains(strings.ToLower(err.Error()), "non-canonical sha256") {
+		t.Fatalf("case-suppressed eligible record was not metadata-validated: plan=%+v err=%v", plan, err)
+	}
+}
+
+func TestPlanRepoDatasetAttributionUsesLongestThenEarliestFilter(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{{Type: "file", Path: "train.json", Size: 10}})
+	defer srv.Close()
+	for _, tc := range []struct {
+		filters []string
+		want    string
+	}{
+		{[]string{".json", "train"}, ".json"},
+		{[]string{"train", ".json"}, "train"},
+	} {
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("filters %v: PlanRepo: %v", tc.filters, err)
+		}
+		if len(plan.Items) != 1 || plan.Items[0].Subdir != tc.want {
+			t.Errorf("filters %v: items=%+v; want one item attributed to %q", tc.filters, plan.Items, tc.want)
+		}
 	}
 }
 
