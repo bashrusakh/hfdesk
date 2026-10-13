@@ -75,6 +75,7 @@ type datasetDecisionContext struct {
 	IsDataset              bool
 	GGUFMode               bool
 	DirectSeedsByDirectory map[string][]int
+	CaseIndexesByPath      map[string][]int
 	uniqueEvaluation       *datasetDecisionUniqueEvaluation
 }
 
@@ -260,8 +261,11 @@ func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.R
 	// Index actual, non-excluded direct matches by containing directory. Keep
 	// one shared index rather than copying each seed list onto every file.
 	c.DirectSeedsByDirectory = make(map[string][]int)
+	c.CaseIndexesByPath = make(map[string][]int)
 	for i, input := range c.Inputs {
 		c.Inputs[i].Directory = path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
+		fold := strings.ToLower(input.Path)
+		c.CaseIndexesByPath[fold] = append(c.CaseIndexesByPath[fold], i)
 		if !input.DirectSeedCandidate {
 			continue
 		}

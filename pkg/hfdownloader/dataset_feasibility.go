@@ -549,6 +549,7 @@ func initializeDatasetDecisionBaseline(c datasetDecisionContext, e *datasetDecis
 
 func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 	n := len(c.Inputs)
+	collisions := collisionTokenBits(c)
 	directValue, directFixed := make([]bool, n), make([]bool, n)
 	for i, in := range c.Inputs {
 		if in.Excluded || len(in.Alternatives) == 0 {
@@ -556,7 +557,7 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 			continue
 		}
 		for j, alt := range in.Alternatives {
-			value, fixed := invariantDatasetDirect(c, i, alt, collisionTokenBits(c))
+			value, fixed := invariantDatasetDirect(c, i, alt, collisions)
 			if !fixed || j > 0 && value != directValue[i] {
 				directFixed[i] = false
 				break
@@ -855,10 +856,7 @@ func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	// ordered emission wrapper for that witness before asking the lower solver
 	// to construct a world where this record is ineligible.
 	fold := strings.ToLower(c.Inputs[index].Path)
-	for i := 0; i < index; i++ {
-		if strings.ToLower(c.Inputs[i].Path) != fold {
-			continue
-		}
+	for _, i := range caseFoldPredecessors(c, index, fold) {
 		if r := canEmitDatasetDecision(c, i); r.Possible {
 			e, err := evaluateDatasetDecisionWorld(c, r.World)
 			if err == nil && e.Records[index].Skipped {
@@ -902,33 +900,31 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	if !in.ExactDuplicateEligible {
 		return datasetDecisionQueryResult{}
 	}
-	if r, fixed := fixedDatasetDecisionQuery(c, index, false); fixed && r.Possible {
-		// The fixed-outcome proof includes ordered case-fold suppression. Still
-		// require the returned concrete baseline witness to satisfy the exact
-		// earlier-record constraints supplied to the lower-level query.
-		valid := true
-		for i := 0; i < index; i++ {
-			if strings.EqualFold(c.Inputs[i].Path, in.Path) {
-				e, err := evaluateDatasetDecisionWorld(c, r.World)
-				if err != nil || !e.Records[i].Skipped {
-					valid = false
-					break
-				}
-			}
-		}
-		if valid {
-			return r
-		}
+	if r, fixed := fixedDatasetDecisionQuery(c, index, false); fixed {
+		// A fixed proof covers both the output result and its ordered duplicate
+		// handling. For a positive result, the cached concrete evaluation is the
+		// witness: Record.Selected already entails that no earlier same-fold
+		// record emitted. Do not rescan the inventory prefix to re-prove it.
+		return r
 	}
 	// Every earlier same-fold exact-first record must be ineligible; if any is
 	// eligible, it is the first case-fold winner and blocks this target. Exact
 	// duplicates are already suppressed before eligibility and impose no such
 	// constraint (but still contribute direct directory seeds in evaluation).
 	var earlier []int
-	fold := strings.ToLower(in.Path)
-	for i := 0; i < index; i++ {
-		if strings.ToLower(c.Inputs[i].Path) == fold && c.Inputs[i].ExactDuplicateOf < 0 {
-			earlier = append(earlier, i)
+	// Most records have no same-fold predecessor; compiler metadata proves
+	// that case without scanning the prefix. Only duplicate classes need the
+	// indexed predecessor list, whose work is proportional to actual case-fold
+	// edges rather than the entire inventory prefix.
+	if in.CaseDuplicateOf >= 0 {
+		fold := strings.ToLower(in.Path)
+		for _, prior := range c.CaseIndexesByPath[fold] {
+			if prior >= index {
+				break
+			}
+			if c.Inputs[prior].ExactDuplicateOf < 0 {
+				earlier = append(earlier, prior)
+			}
 		}
 	}
 	return canSelectDatasetDecision(c, index, earlier)
@@ -945,14 +941,21 @@ func canNotEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecis
 		return r
 	}
 	fold := strings.ToLower(c.Inputs[index].Path)
-	for i := 0; i < index; i++ {
-		if strings.ToLower(c.Inputs[i].Path) == fold {
-			if r := canEmitDatasetDecision(c, i); r.Possible {
-				return r
-			}
+	for _, i := range caseFoldPredecessors(c, index, fold) {
+		if r := canEmitDatasetDecision(c, i); r.Possible {
+			return r
 		}
 	}
 	return datasetDecisionQueryResult{}
+}
+
+func caseFoldPredecessors(c datasetDecisionContext, index int, fold string) []int {
+	if index < 0 || index >= len(c.Inputs) || c.Inputs[index].CaseDuplicateOf < 0 {
+		return nil
+	}
+	indexes := c.CaseIndexesByPath[fold]
+	end := sort.Search(len(indexes), func(i int) bool { return indexes[i] >= index })
+	return indexes[:end]
 }
 
 func datasetDecisionRefusal(c datasetDecisionContext, index int) (can, cannot datasetDecisionQueryResult) {
