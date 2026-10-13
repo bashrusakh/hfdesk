@@ -8,33 +8,47 @@ import (
 	"testing"
 )
 
-func TestSelectedDeleteReservationInventoriesOffLockAndRejectsChangedSnapshot(t *testing.T) {
+func TestSelectedDeleteReservationRechecksNewMatchingWriterAfterInventory(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"weights.gguf"}}
-	m.jobs[job.ID] = job
+	m.fenced = true // Keep scheduler execution outside this reservation test.
+	queued := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
+	m.jobs[queued.ID] = queued
+	target := filepath.Join(jobDestinationBase(queued), "weights.gguf")
+	// Establish that the target is genuinely reservable before introducing a
+	// nonmatching writer; then introduce a writer whose filter selects it.
+	initial, ok := m.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("initial reservation rejected with no competing writer")
+	}
+	initial()
 	entered, resume := make(chan struct{}), make(chan struct{})
+	var resumeOnce sync.Once
+	t.Cleanup(func() {
+		resumeOnce.Do(func() { close(resume) })
+		if err := m.Close(context.Background()); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+	})
 	var once sync.Once
 	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
 		once.Do(func() { close(entered) })
 		<-resume
 		return inventoryWritableNamespace(base)
 	}
-	target := filepath.Join(jobDestinationBase(job), "weights.gguf")
 	done := make(chan bool, 1)
 	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
 	<-entered
-	if _, ok := m.GetJob(job.ID); !ok || len(m.ListJobs()) != 1 {
-		t.Fatal("inventory held manager lock while readers were blocked")
-	}
-	// A newly admitted queued writer changes the decision snapshot; evidence
-	// collected before it existed must not authorize a late delete commit.
+	// Admit a new queued writer after its namespace was inventoried. Its exact
+	// filter matches the selected path, so refreshed evidence must reject.
 	m.mu.Lock()
-	m.jobs["late"] = &Job{ID: "late", Repo: "owner/other", OutputDir: root, Status: JobStatusQueued}
+	late := &Job{ID: "late", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"weights.gguf"}, partialFilesMu: &sync.Mutex{}}
+	m.jobs[late.ID] = late
+	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
-	close(resume)
+	resumeOnce.Do(func() { close(resume) })
 	if <-done {
-		t.Fatal("reservation committed using a stale manager snapshot")
+		t.Fatal("reservation committed although the newly admitted writer selects the target")
 	}
 	if err := m.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -86,35 +100,66 @@ func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T
 	}
 }
 
-func TestSelectedDeleteReservationRejectsManagedMutationCrossingInventory(t *testing.T) {
+func TestSelectedDeleteReservationRejectsCompletedManagedAliasMutationDuringInventory(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued}
+	m.fenced = true // Keep scheduler execution outside this reservation test.
+	base := filepath.Join(root, "managed")
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{ID: "queued", Repo: "owner/repo", LocalDir: base, Flat: true, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
 	m.jobs[job.ID] = job
+	target := filepath.Join(base, "selected.gguf")
+	alias := filepath.Join(jobDestinationBase(job), "outward-alias")
+	if err := os.MkdirAll(filepath.Dir(alias), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A valid control proves this nonmatching queued job does not itself block.
+	initial, ok := m.reserveSelectedGGUF([]string{target})
+	if !ok {
+		t.Fatal("initial reservation rejected despite the nonmatching writer")
+	}
+	initial()
 	entered, resume := make(chan struct{}), make(chan struct{})
-	var calls int
-	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
-		calls++
-		select {
-		case <-entered:
-		default:
-			close(entered)
+	var resumeOnce sync.Once
+	t.Cleanup(func() {
+		resumeOnce.Do(func() { close(resume) })
+		if err := m.Close(context.Background()); err != nil {
+			t.Errorf("close manager: %v", err)
 		}
-		<-resume
-		return inventoryWritableNamespace(base)
+	})
+	var once sync.Once
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		inventory, ok := inventoryWritableNamespace(base)
+		once.Do(func() {
+			close(entered)
+			<-resume
+		})
+		return inventory, ok
 	}
 	done := make(chan bool, 1)
-	target := filepath.Join(jobDestinationBase(job), "other.gguf")
 	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
 	<-entered
-	finish := m.beginObservedMutation([]string{filepath.Join(root, "unrelated-managed-path")})
-	finish() // completed during collection must still invalidate this attempt
-	close(resume)
-	if <-done {
-		t.Fatal("unrelated test reservation unexpectedly conflicted")
+	// This admitted managed mutation changes the writer's real filesystem
+	// namespace while inventory is off-lock, then completes before commit.
+	finish, ok := m.beginCacheMutation(alias)
+	if !ok {
+		resumeOnce.Do(func() { close(resume) })
+		<-done
+		t.Fatal("managed alias mutation was not admitted")
 	}
-	if calls < 4 {
-		t.Fatalf("stale scan was not retried with fresh inventories: calls=%d", calls)
+	outside := t.TempDir()
+	if err := os.Symlink(outside, alias); err != nil {
+		finish()
+		resumeOnce.Do(func() { close(resume) })
+		<-done
+		t.Fatal(err)
+	}
+	finish()
+	resumeOnce.Do(func() { close(resume) })
+	if <-done {
+		t.Fatal("reservation committed from evidence collected before the managed outward alias existed")
 	}
 	if err := m.Close(context.Background()); err != nil {
 		t.Fatal(err)
