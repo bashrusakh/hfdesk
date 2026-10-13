@@ -4277,6 +4277,82 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 	}
 }
 
+func TestHFReservationRejectsCompletedPlanWriter(t *testing.T) {
+	root := t.TempDir()
+	cache := hfdownloader.NewHFCache(root, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := filepath.Join(rd.FriendlyPath(), "weights-Q4_K_M.gguf.part")
+	if err := os.MkdirAll(filepath.Dir(part), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part, []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	planned, ok := plannedDestinationSet([]string{part})
+	if !ok {
+		t.Fatal("could not freeze completed writer plan")
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: root})
+	s.jobs.mu.Lock()
+	s.jobs.runActivities[1] = &jobWriteActivity{
+		job:     &Job{Repo: "owner/model", OutputDir: root, HubDir: cache.HubDir()},
+		planned: planned, planKnown: true,
+	}
+	s.jobs.mu.Unlock()
+	if _, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
+		t.Fatal("HF reservation admitted while a completed plan retained a part writer in the selected repository")
+	}
+}
+
+func TestHFReservationBlocksCurrentRawWriterMapping(t *testing.T) {
+	parent := t.TempDir()
+	a, b := filepath.Join(parent, "a"), filepath.Join(parent, "b")
+	for _, dir := range []string{a, b} {
+		if err := os.MkdirAll(filepath.Join(dir, "hub"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(parent, "hub-alias")
+	if err := os.Symlink(a, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	cache := hfdownloader.NewHFCacheResolved(parent, filepath.Join(alias, "hub"), 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(parent, "cache")})
+	release, ok := s.jobs.reserveSelectedHF(rd.Path(), filepath.Join(parent, "selected-friendly"))
+	if !ok {
+		t.Fatal("could not reserve selected raw directory")
+	}
+	defer release()
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, alias); err != nil {
+		t.Fatal(err)
+	}
+	writer := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(alias, "hub")}
+	if !s.jobs.jobBlockedByDeleteLocked(writer) {
+		t.Fatal("writer using current raw Hub mapping was not blocked")
+	}
+	captured := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(a, "hub")}
+	if !s.jobs.jobBlockedByDeleteLocked(captured) {
+		t.Fatal("writer using the reservation's captured directory was not blocked")
+	}
+	disjoint := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(parent, "other-hub")}
+	if s.jobs.jobBlockedByDeleteLocked(disjoint) {
+		t.Fatal("writer using a disjoint Hub was blocked")
+	}
+}
+
 func TestSelectedDeleteUnlinksOnlyConfirmedFriendlyLeaf(t *testing.T) {
 	root, payloadDir := t.TempDir(), t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")

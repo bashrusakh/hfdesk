@@ -556,16 +556,19 @@ func hfReservationConflictsJob(scopes []frozenMutationPath, job *Job) bool {
 	if base == "" {
 		return false
 	}
+	paths := []string{base}
 	if repo := hfJobRepoPath(job); repo != "" {
-		for _, scope := range scopes {
-			if frozenMutationOverlapsRawDirectory(scope, repo) {
-				return true
-			}
-		}
+		paths = append(paths, repo)
 	}
 	for _, scope := range scopes {
-		if frozenMutationOverlapsRawDirectory(scope, base) {
-			return true
+		for _, path := range paths {
+			// Compare both the reservation's captured identity and the current
+			// mappings of actual writer IO spellings. Either side may have been
+			// redirected since admission; neither mapping alone is sufficient.
+			current, err := freezeMutationDirectory(path)
+			if err != nil || mutationScopesOverlap(scope, current) {
+				return true
+			}
 		}
 	}
 	return false
@@ -617,6 +620,10 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		}
 	}
 	for _, activity := range m.runActivities {
+		if activity.planKnown && plannedRawEntriesConflict(scopes, activity.planned) {
+			m.mu.Unlock()
+			return nil, false
+		}
 		if hfReservationConflictsJob(scopes, activity.job) {
 			m.mu.Unlock()
 			return nil, false
