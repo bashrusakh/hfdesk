@@ -5026,11 +5026,19 @@ func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
 	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
 	running, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		releaseGate()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.jobs.Close(ctx)
+	}()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -5064,13 +5072,13 @@ func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Revision: "other", Filters: []string{"q5_k_m"}}); err != nil {
 		t.Fatalf("non-overlapping new Q5 job was rejected: %v", err)
 	}
-	releaseDelete()
-	release()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if !s.jobs.CancelJob(running.ID) {
 		t.Fatal("cancel active blocker failed")
 	}
+	releaseDelete()
+	releaseGate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
