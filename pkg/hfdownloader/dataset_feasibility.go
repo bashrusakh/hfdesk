@@ -29,9 +29,11 @@ type datasetDecisionLiteral struct {
 }
 
 // feasibleDatasetDecisionWorld finds one coherent concrete role/token world
-// satisfying pins, required skips, zero-direct constraints and (when present)
-// one positive direct clause. It is dormant and does not activate planning.
-func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[uint]bool, pins datasetDecisionPins, requiredSkips, zeroDirect []int, positive *datasetDecisionPositive) (datasetDecisionWorld, bool) {
+// satisfying pins, pre-dedup ineligibility, zero-direct constraints and (when
+// present) one positive direct clause. Ineligible is deliberately distinct
+// from skipped output: exact/case-fold deduplication happens after eligibility.
+// It is dormant and does not activate planning.
+func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[uint]bool, pins datasetDecisionPins, ineligible, zeroDirect []int, positive *datasetDecisionPositive) (datasetDecisionWorld, bool) {
 	collisions := collisionTokenBits(c)
 	units := map[uint]bool{}
 	for bit, value := range coreAssignment {
@@ -65,15 +67,14 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			roles[i] = []datasetDecisionRoleLabel{pin}
 		}
 	}
-	for _, i := range requiredSkips {
+	for _, i := range ineligible {
 		if i < 0 || i >= len(c.Inputs) {
 			return datasetDecisionWorld{}, false
 		}
 		in := c.Inputs[i]
-		// Exact-duplicate suppression precedes eligibility in the concrete
-		// evaluator. Requiring such a record to be ineligible would add a
-		// condition not present in the requested skipped-output proposition.
-		if in.Excluded || in.ExactDuplicateOf >= 0 {
+		// Excluded inputs are ineligible regardless of role. Exact duplicates
+		// are not exempt: this is a pre-dedup eligibility constraint.
+		if in.Excluded {
 			continue
 		}
 		if in.LFS {
@@ -92,10 +93,10 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			roles[i], units = []datasetDecisionRoleLabel{chosen}, next
 			continue
 		}
-		// A nested data alternative with no direct match is skipped regardless
+		// A nested data alternative with no direct match is ineligible regardless
 		// of companion-directory scope, so prefer that explanation first.
 		dataAlternatives := make([]datasetDecisionRoleLabel, 0, len(roles[i]))
-		foundSkip := false
+		foundIneligible := false
 		for _, alt := range roles[i] {
 			if alt.Role == datasetselection.EvidenceRoleData {
 				dataAlternatives = append(dataAlternatives, alt)
@@ -132,11 +133,11 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 				roles = trialRoles
 				roles[i] = []datasetDecisionRoleLabel{alt}
 				units = trial
-				foundSkip = true
+				foundIneligible = true
 				break
 			}
 		}
-		if !foundSkip {
+		if !foundIneligible {
 			return datasetDecisionWorld{}, false
 		}
 	}
@@ -182,7 +183,10 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			w.DataLabels[i] = chosen.Label
 		}
 	}
-	for _, i := range append(append([]int(nil), zeroDirect...), requiredSkips...) {
+	// Zero-direct constrains direct matching; ineligible additionally excludes
+	// companion fallback eligibility. Both are checked against the pre-dedup
+	// evaluator state below.
+	for _, i := range zeroDirect {
 		if i < 0 || i >= len(c.Inputs) || c.Inputs[i].Excluded {
 			continue
 		}
@@ -196,13 +200,13 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 	if validateDatasetDecisionWorld(c, w) != nil {
 		return datasetDecisionWorld{}, false
 	}
-	if len(requiredSkips) != 0 {
+	if len(ineligible) != 0 {
 		evaluation, err := evaluateDatasetDecisionWorld(c, w)
 		if err != nil {
 			return datasetDecisionWorld{}, false
 		}
-		for _, i := range requiredSkips {
-			if i < 0 || i >= len(evaluation.Records) || !evaluation.Records[i].Skipped {
+		for _, i := range ineligible {
+			if i < 0 || i >= len(evaluation.Records) || evaluation.Records[i].Eligible {
 				return datasetDecisionWorld{}, false
 			}
 		}
@@ -388,6 +392,7 @@ type datasetDecisionWorld struct {
 }
 
 type datasetDecisionRecord struct {
+	Eligible bool
 	Selected bool
 	Skipped  bool
 	Subdir   string
@@ -405,29 +410,31 @@ type datasetDecisionQueryResult struct {
 	Record   datasetDecisionRecord
 }
 
-// queryDatasetDecision runs bounded concrete queries over the six conventional
-// collision bits. Residual token bits are solved by the unit primitive rather
-// than enumerated. It intentionally has no caller in PlanRepo yet.
-func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips []int, requireSkip bool) datasetDecisionQueryResult {
+// queryDatasetDecision proves a target's emission when requireIneligible is
+// false, or a raw pre-dedup ineligibility witness when it is true. Its
+// earlierCaseIneligible inputs are likewise raw eligibility constraints, not
+// generic output-skip requirements. Exact/case-fold suppression is applied by
+// the upper output wrappers. It is dormant and has no PlanRepo caller.
+func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseIneligible []int, requireIneligible bool) datasetDecisionQueryResult {
 	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionQueryResult{}
 	}
-	if len(earlierCaseSkips) == 0 {
-		if r, fixed := fixedDatasetDecisionQuery(c, index, requireSkip); fixed {
+	if !requireIneligible && len(earlierCaseIneligible) == 0 {
+		if r, fixed := fixedDatasetDecisionQuery(c, index, false); fixed {
 			return r
 		}
 	}
-	if len(earlierCaseSkips) == 0 {
-		if r, unique := uniqueDatasetDecisionQuery(c, index, requireSkip); unique {
+	if !requireIneligible && len(earlierCaseIneligible) == 0 {
+		if r, unique := uniqueDatasetDecisionQuery(c, index, false); unique {
 			return r
 		}
 	}
 	for _, core := range datasetCoreAssignments(c) {
-		if requireSkip {
+		if requireIneligible {
 			w, ok := feasibleDatasetDecisionWorld(c, core, nil, []int{index}, nil, nil)
 			if ok {
 				e, err := evaluateDatasetDecisionWorld(c, w)
-				if err == nil && e.Records[index].Skipped {
+				if err == nil && !e.Records[index].Eligible {
 					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 				}
 			}
@@ -439,7 +446,7 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 			if alt.Role != datasetselection.EvidenceRoleData {
 				continue
 			}
-			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: alt}, earlierCaseSkips, nil, &datasetDecisionPositive{Input: index, Alternative: alt})
+			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: alt}, earlierCaseIneligible, nil, &datasetDecisionPositive{Input: index, Alternative: alt})
 			if ok && queryWorldEmits(c, w, index) {
 				e, _ := evaluateDatasetDecisionWorld(c, w)
 				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
@@ -452,13 +459,13 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 		companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 		// Companions may themselves satisfy an ordinary explicit path filter;
 		// this is a direct witness, not root/nested fallback retention.
-		w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseSkips, nil, &datasetDecisionPositive{Input: index, Alternative: companion})
+		w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, &datasetDecisionPositive{Input: index, Alternative: companion})
 		if ok && queryWorldEmits(c, w, index) {
 			e, _ := evaluateDatasetDecisionWorld(c, w)
 			return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 		}
 		if path.Dir(strings.ReplaceAll(c.Inputs[index].Path, "\\", "/")) == "." {
-			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseSkips, nil, nil)
+			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, nil)
 			if ok && queryWorldEmits(c, w, index) {
 				e, _ := evaluateDatasetDecisionWorld(c, w)
 				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
@@ -469,7 +476,7 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips 
 				continue
 			}
 			for _, alt := range c.Inputs[seed].Alternatives {
-				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseSkips, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
+				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseIneligible, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
 				if ok && queryWorldEmits(c, w, index) {
 					e, _ := evaluateDatasetDecisionWorld(c, w)
 					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
@@ -828,11 +835,54 @@ func datasetCoreAssignments(c datasetDecisionContext) []map[uint]bool {
 	return assignments
 }
 
-func canSelectDatasetDecision(c datasetDecisionContext, index int, earlierCaseSkips []int) datasetDecisionQueryResult {
-	return queryDatasetDecision(c, index, earlierCaseSkips, false)
+func canSelectDatasetDecision(c datasetDecisionContext, index int, earlierCaseIneligible []int) datasetDecisionQueryResult {
+	return queryDatasetDecision(c, index, earlierCaseIneligible, false)
 }
 
 func canSkipDatasetDecision(c datasetDecisionContext, index int) datasetDecisionQueryResult {
+	if index < 0 || index >= len(c.Inputs) {
+		return datasetDecisionQueryResult{}
+	}
+	// These shortcuts prove the final output proposition, so they remain valid
+	// even when the reason is exact/case-fold duplicate suppression.
+	if r, fixed := fixedDatasetDecisionQuery(c, index, true); fixed {
+		return r
+	}
+	if r, unique := uniqueDatasetDecisionQuery(c, index, true); unique {
+		return r
+	}
+	// A case-folded duplicate may be skipped because an earlier eligible
+	// record emitted, even when the duplicate itself remains eligible. Ask the
+	// ordered emission wrapper for that witness before asking the lower solver
+	// to construct a world where this record is ineligible.
+	fold := strings.ToLower(c.Inputs[index].Path)
+	for i := 0; i < index; i++ {
+		if strings.ToLower(c.Inputs[i].Path) != fold {
+			continue
+		}
+		if r := canEmitDatasetDecision(c, i); r.Possible {
+			e, err := evaluateDatasetDecisionWorld(c, r.World)
+			if err == nil && e.Records[index].Skipped {
+				return datasetDecisionQueryResult{Possible: true, World: r.World, Record: e.Records[index]}
+			}
+		}
+	}
+	// Exact duplicates are suppressed regardless of their raw eligibility.
+	// Produce an unconstrained coherent witness rather than misreporting that
+	// output fact as a lower-kernel ineligibility constraint.
+	if c.Inputs[index].ExactDuplicateOf >= 0 {
+		for _, core := range datasetCoreAssignments(c) {
+			w, ok := feasibleDatasetDecisionWorld(c, core, nil, nil, nil, nil)
+			if !ok {
+				continue
+			}
+			e, err := evaluateDatasetDecisionWorld(c, w)
+			if err == nil && e.Records[index].Skipped {
+				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
+			}
+		}
+		return datasetDecisionQueryResult{}
+	}
 	return queryDatasetDecision(c, index, nil, true)
 }
 
@@ -849,7 +899,7 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 	// Exact duplicates are always suppressed by input order, including when
 	// the earlier record is excluded. Case-folded duplicates are suppressed
 	// only after an earlier record actually becomes eligible; model that with
-	// required-skip constraints instead of the compiler's lexical-first hint.
+	// ineligibility constraints instead of the compiler's lexical-first hint.
 	if !in.ExactDuplicateEligible {
 		return datasetDecisionQueryResult{}
 	}
@@ -871,10 +921,14 @@ func canEmitDatasetDecision(c datasetDecisionContext, index int) datasetDecision
 			return r
 		}
 	}
+	// Every earlier same-fold exact-first record must be ineligible; if any is
+	// eligible, it is the first case-fold winner and blocks this target. Exact
+	// duplicates are already suppressed before eligibility and impose no such
+	// constraint (but still contribute direct directory seeds in evaluation).
 	var earlier []int
 	fold := strings.ToLower(in.Path)
 	for i := 0; i < index; i++ {
-		if strings.ToLower(c.Inputs[i].Path) == fold {
+		if strings.ToLower(c.Inputs[i].Path) == fold && c.Inputs[i].ExactDuplicateOf < 0 {
 			earlier = append(earlier, i)
 		}
 	}
@@ -961,6 +1015,8 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	seenExact, seenFold := make(map[string]bool), make(map[string]bool)
 	for i, in := range c.Inputs {
 		r := &out.Records[i]
+		eligible := !in.Excluded && (direct[i] || (companions[i] && !in.LFS && (path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
+		r.Eligible = eligible
 		if seenExact[in.Path] {
 			r.Skipped = true
 			continue
@@ -974,19 +1030,9 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			r.Skipped = true
 			continue
 		}
-		if !direct[i] {
-			// Data never falls back to companion retention. Only an actual
-			// companion role can enter the root/directory fallback, and LFS
-			// companions are intentionally not retained by that fallback.
-			if !companions[i] || in.LFS {
-				r.Skipped = true
-				continue
-			}
-			dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-			if dir != "." && !dirs[dir] {
-				r.Skipped = true
-				continue
-			}
+		if !eligible {
+			r.Skipped = true
+			continue
 		}
 		// Attribution considers every applicable direct term, preserves input
 		// order for equal lengths, and never turns attribution ambiguity into a
