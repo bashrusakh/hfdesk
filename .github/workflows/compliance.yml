@@ -21,7 +21,7 @@ permissions:
   pull-requests: write
 jobs:
   compliance:
-    uses: bashrusakh/.github/.github/workflows/compliance.lock.yml@7b665576f73b74a82dff45bee0dedf5566381a23
+    uses: bashrusakh/.github/.github/workflows/compliance.lock.yml@main
     with:
       item_number: ${{ inputs.item_number || github.event.issue.number || github.event.pull_request.number }}
       item_kind: ${{ inputs.item_kind || (github.event_name == 'issues' && 'issue' || 'pull_request') }}
