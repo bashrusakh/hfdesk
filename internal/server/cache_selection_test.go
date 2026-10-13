@@ -2015,6 +2015,98 @@ func TestSelectedLocalDeleteRejectsAliasRetargetDuringAdmission(t *testing.T) {
 	}
 }
 
+func TestSelectedLocalDeleteRevalidatesGroupBeforeCreatingPins(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "owner", "model")
+	const name = "model-Q4_K_M.gguf"
+	selected := filepath.Join(repo, name)
+	writeSelectionFile(t, repo, name)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repo, name)
+	pinAttempts := 0
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.afterReservation = func() {
+		if err := os.WriteFile(selected, []byte("changed after reservation"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+		pinAttempts++
+		return nil
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("changed-group delete status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if pinAttempts != 0 {
+		t.Fatalf("created %d identity pins before detecting changed group", pinAttempts)
+	}
+	if data, err := os.ReadFile(selected); err != nil || string(data) != "changed after reservation" {
+		t.Fatalf("changed selected data was altered: data=%q err=%v", data, err)
+	}
+	assertNoTemporaryPinContainer(t, repo)
+}
+
+func TestSelectedLocalDeleteRejectsLatestObservedMemberChangeBeforePinArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		point string
+		role  bool
+	}{{"after-group-validation", false}, {"after-member-lstat", false}, {"role-after-group-validation", true}} {
+		t.Run(tc.point, func(t *testing.T) {
+			root := t.TempDir()
+			repo := filepath.Join(root, "owner", "model")
+			const name = "model-Q4_K_M.gguf"
+			selected := filepath.Join(repo, name)
+			writeSelectionFile(t, repo, name)
+			s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+			registerJobManagerCleanup(t, s)
+			body := selectedGroupRequest(t, s, "owner/model", repo, name)
+			pinAttempts := 0
+			mutate := func() {
+				if tc.role {
+					target := filepath.Join(t.TempDir(), "replacement.gguf")
+					if err := os.WriteFile(target, []byte("unchanged target"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Remove(selected); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, selected); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(selected, []byte("changed after confirmation"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.selectedDeleteHooks.forceHardLinkPin = true
+			if tc.point != "after-member-lstat" {
+				s.selectedDeleteHooks.afterGroupValidation = mutate
+			} else {
+				s.selectedDeleteHooks.beforeIdentityPin = func(string) { mutate() }
+			}
+			s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+				pinAttempts++
+				return nil
+			}
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("changed-group delete status=%d body=%s, want 409", w.Code, w.Body.String())
+			}
+			if pinAttempts != 0 {
+				t.Fatalf("attempted %d hard-link pins after changed metadata was observed", pinAttempts)
+			}
+			if !tc.role {
+				data, err := os.ReadFile(selected)
+				if err != nil || string(data) != "changed after confirmation" {
+					t.Fatalf("changed selected data was altered: data=%q err=%v", data, err)
+				}
+			}
+			assertNoTemporaryPinContainer(t, repo)
+		})
+	}
+}
+
 func TestSelectedLocalDeleteRejectsAliasRetargetDuringOpen(t *testing.T) {
 	actual, other := t.TempDir(), t.TempDir()
 	alias := filepath.Join(t.TempDir(), "scan")
@@ -4759,6 +4851,17 @@ func TestPlannedDestinationSetFreezesPhysicalIdentityBeforeAliasRetarget(t *test
 	}
 	if !plannedEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
 		t.Fatal("retargeting the raw plan alias changed its frozen completed-plan conflict")
+	}
+	retargetedSelected := filepath.Join(other, filepath.Base(selected))
+	retargetedFrozen, err := freezeMutationEntry(retargetedSelected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{retargetedFrozen}, planned) {
+		t.Fatal("current raw plan alias did not conflict with its retargeted destination")
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("frozen plan identity no longer protects the original destination")
 	}
 }
 

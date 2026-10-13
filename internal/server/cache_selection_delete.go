@@ -329,6 +329,27 @@ func plannedEntriesConflict(frozenEntries []frozenMutationPath, plannedPaths map
 	return false
 }
 
+// plannedRawEntriesConflict re-resolves only incoming raw plan spellings. The
+// frozen values remain authoritative for the mapping captured at plan time;
+// raw keys are retained separately because their aliases may have moved.
+func plannedRawEntriesConflict(frozenEntries []frozenMutationPath, plannedPaths map[string]frozenMutationPath) bool {
+	if plannedEntriesConflict(frozenEntries, plannedPaths) {
+		return true
+	}
+	for raw := range plannedPaths {
+		current, err := freezeMutationEntry(raw)
+		if err != nil {
+			return true
+		}
+		for _, frozen := range frozenEntries {
+			if frozenMutationOverlap(frozen, current) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func mutationDirectoryEntryOverlap(directory, entry string) bool {
 	dirPath, dirErr := mutationDirectoryIdentity(directory)
 	entryPath, entryErr := mutationEntryIdentity(entry)
@@ -393,7 +414,7 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	}
 	for _, activity := range m.runActivities {
 		if activity.planKnown {
-			if plannedEntriesConflict(clean, activity.planned) {
+			if plannedRawEntriesConflict(clean, activity.planned) {
 				m.mu.Unlock()
 				return nil, false
 			}
@@ -704,16 +725,18 @@ type selectedDeleteRequest struct {
 // selectedDeleteHooks are per-server synchronization points for deterministic
 // endpoint tests. Production servers leave them nil.
 type selectedDeleteHooks struct {
-	beforeRootOpen    func()
-	afterRootOpen     func()
-	beforeIdentityPin func(string)
-	forceHardLinkPin  bool
-	beforeHardLinkPin func(source, destination string) error
-	removeHardLinkPin func(*os.Root, string) error
-	closeHardLinkRoot func(*os.Root) error
-	afterFinalScan    func()
-	beforeRemove      func(int)
-	removeEntry       func(*os.Root, string) error
+	beforeRootOpen       func()
+	afterRootOpen        func()
+	afterReservation     func()
+	afterGroupValidation func()
+	beforeIdentityPin    func(string)
+	forceHardLinkPin     bool
+	beforeHardLinkPin    func(source, destination string) error
+	removeHardLinkPin    func(*os.Root, string) error
+	closeHardLinkRoot    func(*os.Root) error
+	afterFinalScan       func()
+	beforeRemove         func(int)
+	removeEntry          func(*os.Root, string) error
 }
 
 type selectedDeleteResponse struct {
@@ -903,6 +926,7 @@ type selectedHardLinkContainer struct {
 // moment it is created until cleanup is explicitly finalized before response.
 type selectedEntryPinSet struct {
 	root              *os.Root
+	expected          map[string]cacheSelectionMember
 	forceHardLink     bool
 	beforeHardLink    func(source, destination string) error
 	removeHardLink    func(*os.Root, string) error
@@ -922,9 +946,10 @@ func (e *hardLinkPinLocationUnavailable) Error() string { return e.err.Error() }
 
 func (e *hardLinkPinLocationUnavailable) Unwrap() error { return e.err }
 
-func newSelectedEntryPinSet(root *os.Root, hooks selectedDeleteHooks) *selectedEntryPinSet {
+func newSelectedEntryPinSet(root *os.Root, hooks selectedDeleteHooks, expected map[string]cacheSelectionMember) *selectedEntryPinSet {
 	return &selectedEntryPinSet{
 		root:              root,
+		expected:          expected,
 		forceHardLink:     hooks.forceHardLinkPin,
 		beforeHardLink:    hooks.beforeHardLinkPin,
 		removeHardLink:    hooks.removeHardLinkPin,
@@ -1121,6 +1146,18 @@ func (p *selectedEntryPinSet) pinByHardLink(name string) (*selectedEntryIdentity
 }
 
 func (p *selectedEntryPinSet) pinByHardLinkAt(name, parent string) (*selectedEntryIdentity, error) {
+	// Confirm the newest known source metadata before ensureHardLinkContainer
+	// can create any directory or link artifact. The later identity check still
+	// detects a source replaced in the unavoidable interval after this read.
+	if expected, ok := p.expected[filepath.ToSlash(name)]; ok {
+		current, err := p.root.Lstat(filepath.FromSlash(name))
+		if err != nil {
+			return nil, err
+		}
+		if expected.LinkOnly || !current.Mode().IsRegular() || current.Size() != expected.Size {
+			return nil, fmt.Errorf("selected source changed before temporary identity pin creation")
+		}
+	}
 	container, err := p.ensureHardLinkContainer(parent)
 	if err != nil {
 		return nil, err
@@ -1141,18 +1178,18 @@ func (p *selectedEntryPinSet) pinByHardLinkAt(name, parent string) (*selectedEnt
 			return nil, fmt.Errorf("create temporary identity pin %q: %w", destination, err)
 		}
 	}
-	if err := verifyHardLinkContainerBinding(container); err != nil {
-		return nil, err
-	}
-	if err := p.verifyHardLinkParentBinding(container); err != nil {
-		return nil, err
-	}
 	parentName := filepath.FromSlash(name)
 	if parent != "." {
 		parentName, err = filepath.Rel(filepath.FromSlash(parent), parentName)
 		if err != nil || parentName == ".." || filepath.IsAbs(parentName) || strings.HasPrefix(parentName, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("selected entry is outside its hard-link pin parent")
 		}
+	}
+	if err := verifyHardLinkContainerBinding(container); err != nil {
+		return nil, err
+	}
+	if err := p.verifyHardLinkParentBinding(container); err != nil {
+		return nil, err
 	}
 	containerDestination := filepath.Join(container.name, pinName)
 	if err := container.parentRoot.Link(parentName, containerDestination); err != nil {
@@ -1182,13 +1219,23 @@ func (p *selectedEntryPinSet) pinByHardLinkAt(name, parent string) (*selectedEnt
 	if err != nil {
 		return nil, fmt.Errorf("verify selected source for temporary identity pin %q: %w", destination, err)
 	}
-	if !sourceInfo.Mode().IsRegular() || !os.SameFile(info, sourceInfo) || info.Size() != sourceInfo.Size() {
+	expected, hasExpected := p.expected[filepath.ToSlash(name)]
+	if !sourceInfo.Mode().IsRegular() || !os.SameFile(info, sourceInfo) || info.Size() != sourceInfo.Size() || (hasExpected && (expected.LinkOnly || sourceInfo.Size() != expected.Size)) {
 		return nil, fmt.Errorf("selected source changed while temporary identity pin %q was created", destination)
 	}
 	return &selectedEntryIdentity{info: info}, nil
 }
 
 func (p *selectedEntryPinSet) pin(root *os.Root, physicalRepo, name string, linkOnly bool) (*selectedEntryIdentity, error) {
+	if expected, ok := p.expected[filepath.ToSlash(name)]; ok {
+		current, err := root.Lstat(filepath.FromSlash(name))
+		if err != nil {
+			return nil, err
+		}
+		if (current.Mode()&os.ModeSymlink != 0) != expected.LinkOnly || (!expected.LinkOnly && (!current.Mode().IsRegular() || current.Size() != expected.Size)) {
+			return nil, fmt.Errorf("selected entry changed before identity pinning")
+		}
+	}
 	if !linkOnly && p.forceHardLink {
 		return p.pinByHardLink(name)
 	}
@@ -1215,7 +1262,8 @@ func (p *selectedEntryPinSet) pin(root *os.Root, physicalRepo, name string, link
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, sourceInfo) || (sourceInfo.Mode()&os.ModeSymlink != 0) != linkOnly || (info.Mode()&os.ModeSymlink != 0) != linkOnly || (!linkOnly && info.Size() != sourceInfo.Size()) {
+	expected, hasExpected := p.expected[filepath.ToSlash(name)]
+	if !os.SameFile(info, sourceInfo) || (sourceInfo.Mode()&os.ModeSymlink != 0) != linkOnly || (info.Mode()&os.ModeSymlink != 0) != linkOnly || (!linkOnly && info.Size() != sourceInfo.Size()) || (hasExpected && (expected.LinkOnly != linkOnly || (!linkOnly && sourceInfo.Size() != expected.Size))) {
 		return nil, fmt.Errorf("selected entry changed while its identity was being captured")
 	}
 	return &selectedEntryIdentity{info: info, pin: pin}, nil
@@ -1321,7 +1369,7 @@ func (f localSelectionWalkFS) Open(name string) (fs.File, error) {
 	return openLocalSelectionDirectory(f.root, name)
 }
 
-func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]bool, beforeIdentityPin func(string), pins *selectedEntryPinSet) ([]cacheSelectionFile, string) {
+func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []string, pinPaths map[string]cacheSelectionMember, beforeIdentityPin func(string), pins *selectedEntryPinSet) ([]cacheSelectionFile, string) {
 	var files []cacheSelectionFile
 	var warning string
 	excludedSet := make(map[string]bool, len(excluded))
@@ -1353,7 +1401,10 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 		}
 		relative := filepath.ToSlash(name)
 		var identity *selectedEntryIdentity
-		if pinPaths[relative] {
+		if expected, selected := pinPaths[relative]; selected {
+			if (info.Mode()&os.ModeSymlink != 0) != expected.LinkOnly || (!expected.LinkOnly && (!info.Mode().IsRegular() || info.Size() != expected.Size)) {
+				return fmt.Errorf("selected entry changed before identity pinning")
+			}
 			rel := filepath.FromSlash(relative)
 			for dir := filepath.Dir(rel); dir != "."; dir = filepath.Dir(dir) {
 				parentInfo, parentErr := root.Lstat(dir)
@@ -1743,6 +1794,9 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A queued or active operation may write this exact GGUF group; cancel the conflicting job and retry")
 		return
 	}
+	if s.selectedDeleteHooks.afterReservation != nil {
+		s.selectedDeleteHooks.afterReservation()
+	}
 	// Recheck the configured binding at reservation admission. Subsequent
 	// enumeration and unlink remain anchored to the opened physical repository.
 	openedInfo, openedErr = root.Stat(".")
@@ -1751,11 +1805,35 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
 		return
 	}
-	pinPaths := make(map[string]bool, len(group.Members))
-	for _, member := range group.Members {
-		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = true
+	// Revalidate the complete current group after acquiring the reservation and
+	// before pinning any selected entry. Pin creation changes filesystem metadata
+	// even when the later identity check refuses deletion.
+	files, scanWarning = localSelectionFilesRoot(root, physicalRepo, excluded, nil, nil, nil)
+	if scanWarning != "" {
+		writeError(w, http.StatusConflict, "Location could not be verified", scanWarning)
+		return
 	}
-	pins := newSelectedEntryPinSet(root, s.selectedDeleteHooks)
+	freshGroups = makeSelectionGroups(selected.ID, files)
+	fresh = nil
+	for i := range freshGroups {
+		if freshGroups[i].ID == req.GroupID {
+			fresh = &freshGroups[i]
+			break
+		}
+	}
+	if fresh == nil || !selectionCompositionEqual(group.Members, fresh.Members) || !selectionCompositionEqual(req.Members, fresh.Members) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The selected GGUF group changed while deletion was being reserved; refresh before deleting")
+		return
+	}
+	group = fresh
+	if s.selectedDeleteHooks.afterGroupValidation != nil {
+		s.selectedDeleteHooks.afterGroupValidation()
+	}
+	pinPaths := make(map[string]cacheSelectionMember, len(group.Members))
+	for _, member := range group.Members {
+		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = member
+	}
+	pins := newSelectedEntryPinSet(root, s.selectedDeleteHooks, pinPaths)
 	files, scanWarning = localSelectionFilesRoot(root, physicalRepo, excluded, pinPaths, s.selectedDeleteHooks.beforeIdentityPin, pins)
 	if scanWarning != "" {
 		writeError(w, http.StatusConflict, "Location could not be verified", withPinCleanupDetails(scanWarning, pins.cleanup()))
