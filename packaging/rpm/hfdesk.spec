@@ -18,7 +18,7 @@
 %{!?appversion:%global appversion 1.2.1}
 
 Name:           %{appname}
-Version:        %{?rpmversion}%{!?rpmversion:%{appversion}}
+Version:        %{?hfdesk_rpm_version}%{!?hfdesk_rpm_version:%{appversion}}
 Release:        1%{?dist}
 Summary:        Desktop-style web UI for HuggingFace model downloads
 

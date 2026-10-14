@@ -184,7 +184,7 @@ jobs:
             --define "_rpmdir /tmp/rpm-output" \
             --define "_srcrpmdir /tmp/rpm-output" \
             --define "appversion ${VERSION}" \
-            --define "rpmversion ${RPM_VERSION}"
+            --define "hfdesk_rpm_version ${RPM_VERSION}"
 
       - name: Upload RPM
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64

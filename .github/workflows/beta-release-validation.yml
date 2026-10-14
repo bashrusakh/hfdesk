@@ -50,7 +50,7 @@ jobs:
             --define '_rpmdir /tmp/rpm-output' \
             --define '_srcrpmdir /tmp/rpm-output' \
             --define 'appversion 1.3.0-beta.1' \
-            --define 'rpmversion 1.3.0~beta.1'
+            --define 'hfdesk_rpm_version 1.3.0~beta.1'
           rpm_file=$(find /tmp/rpm-output -name '*.rpm' -type f -print -quit)
           test -n "$rpm_file"
           rpm -qp --qf '%{VERSION}\n' "$rpm_file" | grep -Fx '1.3.0~beta.1'
