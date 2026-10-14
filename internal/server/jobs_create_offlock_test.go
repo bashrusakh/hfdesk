@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -280,6 +282,204 @@ func TestResumeRetryReservationInventoryRunsOffLockAndUnionsTargets(t *testing.T
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestRestartChecksFrozenHFReservationDespiteUnrelatedSelectedDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status JobStatus
+		act    func(*JobManager, string) bool
+	}{
+		{"resume", JobStatusPaused, (*JobManager).ResumeJob},
+		{"retry", JobStatusFailed, (*JobManager).RetryJob},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			physicalA, physicalB := filepath.Join(root, "A"), filepath.Join(root, "B")
+			alias := filepath.Join(root, "alias")
+			for _, dir := range []string{physicalA, physicalB} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(physicalA, alias); err != nil {
+				t.Fatal(err)
+			}
+			m := newJobManagerWithStatePath(Config{CacheDir: root, MaxActive: 1}, nil, filepath.Join(root, "state"))
+			m.fenced = true // Keep the case at admission; no dispatcher runner is needed.
+			job := addRestartCandidate(m, root, "restart", tc.status)
+			job.Flat, job.LocalDir, job.LocalRepo = true, physicalA, "owner/repo"
+			release, ok := m.reserveSelectedHF(alias, filepath.Join(alias, "friendly"))
+			if !ok {
+				t.Fatal("could not admit selected-HF reservation")
+			}
+			if err := os.Remove(alias); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(physicalB, alias); err != nil {
+				t.Fatal(err)
+			}
+			// A distinct selected entry makes restartJob use its off-lock evidence
+			// path; this reservation does not overlap the job's physical A target.
+			addTwoDeleteReservations(t, m, filepath.Join(root, "unrelated"))
+			before, ok := m.GetJob(job.ID)
+			if !ok {
+				t.Fatal("job disappeared")
+			}
+			if tc.act(m, job.ID) {
+				t.Fatal("restart admitted despite frozen HF lease overlapping physical destination A")
+			}
+			after, ok := m.GetJob(job.ID)
+			if !ok || !reflect.DeepEqual(before, after) {
+				t.Fatalf("rejected restart changed job snapshot: before=%#v after=%#v", before, after)
+			}
+			release()
+			if err := m.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
+	root := t.TempDir()
+	restartDir, runDir := filepath.Join(root, "restart"), filepath.Join(root, "transient-run")
+	for _, dir := range []string{restartDir, runDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hf, started, releaseDownload := blockingPlanServer(t, "transient-Q4_K_M.gguf")
+	defer hf.Close()
+	var downloadOnce sync.Once
+	finishDownload := func() { downloadOnce.Do(releaseDownload) }
+	defer finishDownload()
+	inventoryEntered, releaseInventory := make(chan struct{}), make(chan struct{})
+	m := newJobManagerWithStatePath(Config{LocalDir: runDir, Endpoint: hf.URL, MaxActive: 2}, nil, filepath.Join(root, "state"))
+	defer func() {
+		select {
+		case <-releaseInventory:
+		default:
+			close(releaseInventory)
+		}
+		finishDownload()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := m.Close(ctx); err != nil {
+			t.Errorf("close manager during test cleanup: %v", err)
+		}
+	}()
+	candidate := addRestartCandidate(m, root, "restart-candidate", JobStatusFailed)
+	candidate.Flat, candidate.LocalDir, candidate.LocalRepo = true, restartDir, "owner/restart"
+	addTwoDeleteReservations(t, m, root)
+	m.mu.Lock()
+	m.fenced = false
+	m.mu.Unlock()
+
+	candidateBase := filepath.Clean(jobDestinationBase(candidate))
+	var inventoryMu sync.Mutex
+	inventoryCalls := 0
+	var firstInventory sync.Once
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		if filepath.Clean(base) == candidateBase {
+			inventoryMu.Lock()
+			inventoryCalls++
+			inventoryMu.Unlock()
+			firstInventory.Do(func() {
+				close(inventoryEntered)
+				<-releaseInventory
+			})
+		}
+		return inventoryWritableNamespace(base)
+	}
+
+	restartResult := make(chan bool, 1)
+	go func() { restartResult <- m.RetryJob(candidate.ID) }()
+	select {
+	case <-inventoryEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restart attempt did not reach its controlled off-lock inventory")
+	}
+	before := m.captureWriteDecision()
+	candidateProbe, err := captureWriteIdentityProbe(candidateBase, true)
+	if err != nil {
+		t.Fatalf("capture stable candidate namespace: %v", err)
+	}
+	targetProbes := make(map[string]writeIdentityProbe)
+	m.mu.RLock()
+	for _, paths := range m.deleteReservations {
+		for _, target := range paths {
+			probe, probeErr := captureWriteIdentityProbe(target.physical, false)
+			if probeErr != nil {
+				m.mu.RUnlock()
+				t.Fatalf("capture selected-delete target %q: %v", target.physical, probeErr)
+			}
+			targetProbes[target.physical] = probe
+		}
+	}
+	m.mu.RUnlock()
+
+	transient, _, err := m.CreateJob(DownloadRequest{Repo: "owner/transient", LocalDir: runDir})
+	if err != nil {
+		t.Fatalf("CreateJob for transient real run: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("real downloader did not start: %+v", m.ListJobs())
+	}
+	finishDownload()
+	if !m.WaitAll(5 * time.Second) {
+		t.Fatal("real runner did not unwind after the controlled download response")
+	}
+	finished, ok := m.GetJob(transient.ID)
+	if !ok || finished.Status != JobStatusCompleted {
+		t.Fatalf("transient real run did not complete before removal: %#v", finished)
+	}
+	if result, _ := m.DismissJobResult(transient.ID); result != DismissJobOK {
+		t.Fatalf("could not remove completed transient job: %v", result)
+	}
+	currentCandidateProbe, err := captureWriteIdentityProbe(candidateBase, true)
+	if err != nil || !reflect.DeepEqual(candidateProbe, currentCandidateProbe) {
+		t.Fatalf("candidate namespace probe changed during unrelated run: before=%+v after=%+v err=%v", candidateProbe, currentCandidateProbe, err)
+	}
+	for path, expected := range targetProbes {
+		current, probeErr := captureWriteIdentityProbe(path, false)
+		if probeErr != nil || !reflect.DeepEqual(expected, current) {
+			t.Fatalf("selected-delete target probe changed during unrelated run: path=%q before=%+v after=%+v err=%v", path, expected, current, probeErr)
+		}
+	}
+	after := m.captureWriteDecision()
+	before.epoch = after.epoch
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("transient run did not return manager decision state to its initial shape except history:\nbefore=%#v\nafter=%#v", before, after)
+	}
+
+	close(releaseInventory)
+	select {
+	case accepted := <-restartResult:
+		if !accepted {
+			t.Fatal("restart was rejected instead of recollecting against the stable post-run state")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("off-lock restart did not finish after inventory was released")
+	}
+	inventoryMu.Lock()
+	gotInventoryCalls := inventoryCalls
+	inventoryMu.Unlock()
+	if gotInventoryCalls != 2 {
+		t.Fatalf("candidate namespace inventories=%d, want first stale attempt plus one fresh attempt", gotInventoryCalls)
+	}
+	if got, ok := m.GetJob(candidate.ID); !ok || (got.Status != JobStatusQueued && got.Status != JobStatusRunning && got.Status != JobStatusCompleted) || got.Progress.DownloadedBytes != 0 || len(got.Files) != 0 {
+		t.Fatalf("restart did not commit its expected clean retry after fresh evidence: %#v", got)
+	}
+	finishDownload()
+	if !m.WaitAll(5 * time.Second) {
+		t.Fatal("dispatched restart runner did not unwind")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

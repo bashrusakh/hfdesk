@@ -1200,7 +1200,7 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	descriptor.generation++ // runJob claims this generation when it starts.
 	descriptor.activityID = id
 	m.runActivities[id] = &jobWriteActivity{job: job, descriptor: descriptor, planned: make(map[string]frozenMutationPath)}
-	m.signalWriteDecisionLocked()
+	m.bumpWriteDecisionLocked()
 	return id
 }
 
