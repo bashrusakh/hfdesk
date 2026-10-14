@@ -1,0 +1,60 @@
+name: Beta release validation
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/release-version.sh'
+      - '.github/scripts/test-release-version.sh'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/beta-release-validation.yml'
+      - 'packaging/rpm/**'
+      - 'cmd/hfdesk/**'
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: read
+
+jobs:
+  beta-rpm:
+    name: Beta version and RPM validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Install RPM build and comparison tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+
+      - name: Check beta parsing and release notes
+        run: bash .github/scripts/test-release-version.sh
+
+      - name: Build the beta application binary
+        run: |
+          go build -ldflags='-s -w -X main.Version=1.3.0-beta.1' -o /tmp/hfdesk-linux-amd64 ./cmd/hfdesk
+          /tmp/hfdesk-linux-amd64 --help 2>&1 | grep -F 'HFDesk 1.3.0-beta.1'
+
+      - name: Build and inspect the beta RPM
+        run: |
+          mkdir -p /tmp/rpm-sources
+          cp /tmp/hfdesk-linux-amd64 /tmp/rpm-sources/hfdesk_linux_amd64
+          cp packaging/rpm/hfdesk.desktop packaging/rpm/hfdesk.svg LICENSE README.md /tmp/rpm-sources/
+          rpmbuild -ba packaging/rpm/hfdesk.spec \
+            --define '_sourcedir /tmp/rpm-sources' \
+            --define '_rpmdir /tmp/rpm-output' \
+            --define '_srcrpmdir /tmp/rpm-output' \
+            --define 'appversion 1.3.0-beta.1' \
+            --define 'hfdesk_rpm_version 1.3.0~beta.1'
+          rpm_file=$(find /tmp/rpm-output -name '*.rpm' -type f -print -quit)
+          test -n "$rpm_file"
+          rpm -qp --qf '%{VERSION}\n' "$rpm_file" | grep -Fx '1.3.0~beta.1'
+          rpm -qp --qf '%{RELEASE}\n' "$rpm_file" | grep -Fx '1'
+          beta_version=$(rpm -qp --qf '%{VERSION}' "$rpm_file")
+          comparison=$(rpm --eval "%{lua:print(rpm.vercmp(\"${beta_version}\", \"1.3.0\"))}")
+          test "$comparison" = '-1'
