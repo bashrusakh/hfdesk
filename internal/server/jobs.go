@@ -893,7 +893,7 @@ func (m *JobManager) restartJob(id string, retry bool) bool {
 
 		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
 		a.CollectSnapshot(inventorySnapshot)
-		blocked := a.HasActiveBroadMutationFor(candidate, nil)
+		blocked := a.HasActiveBroadMutationFor(candidate, nil) || hfReservationsBlockSnapshot(start, job)
 		for _, target := range targets {
 			if a.MayWriteDescriptor(candidate, []string{target}) {
 				blocked = true
@@ -1657,7 +1657,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		if activityID != 0 {
 			m.mu.Lock()
 			delete(m.runActivities, activityID)
-			m.signalWriteDecisionLocked()
+			m.bumpWriteDecisionLocked()
 			m.dispatchLocked()
 			m.mu.Unlock()
 		}
