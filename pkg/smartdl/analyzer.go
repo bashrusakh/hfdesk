@@ -176,18 +176,18 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	modelFiles, modelCommit, modelErr := a.fetchFileTree(ctx, repo, false, revision)
 
 	// Helper to check if error indicates repo doesn't exist as model
-	// HuggingFace returns "not found" for missing repos, but also "unauthorized"
-	// when trying to access a datasets-only repo via the models API
+	// HuggingFace reports namespace misses as HTTP 401 or 404. Only status
+	// errors created from an HTTP response are authoritative; transport error
+	// messages may contain the same words or numbers.
 	isModelNotFound := func(err error) bool {
-		// Structural pagination failure means an incomplete selected tree,
-		// not a missing namespace, regardless of URL/header diagnostic text.
 		if err == nil || errors.Is(err, hubtree.ErrPagination) {
 			return false
 		}
-		errStr := strings.ToLower(err.Error())
-		return strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "unauthorized") ||
-			strings.Contains(errStr, "401")
+		var statusErr *treeHTTPStatusError
+		if !errors.As(err, &statusErr) {
+			return false
+		}
+		return statusErr.status == http.StatusUnauthorized || statusErr.status == http.StatusNotFound
 	}
 
 	// If model not found or unauthorized, try as dataset
@@ -218,6 +218,15 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	// Return original error for other failures (network, etc.)
 	return nil, false, "", modelErr
 }
+
+// treeHTTPStatusError preserves the existing status diagnostic while retaining
+// the response status as machine-readable provenance for namespace detection.
+type treeHTTPStatusError struct {
+	status  int
+	message string
+}
+
+func (e *treeHTTPStatusError) Error() string { return e.message }
 
 // fetchFileTree recursively fetches the file tree from HuggingFace API.
 // The second return value is the resolved commit SHA for the revision (from
@@ -274,13 +283,13 @@ func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, re
 		StatusErr: func(resp *http.Response) error {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
-				return fmt.Errorf("unauthorized: repo requires token or you do not have access")
+				return &treeHTTPStatusError{status: resp.StatusCode, message: "unauthorized: repo requires token or you do not have access"}
 			case http.StatusForbidden:
-				return fmt.Errorf("forbidden: please accept the repository terms at %s", a.repoURL(repo, isDataset))
+				return &treeHTTPStatusError{status: resp.StatusCode, message: fmt.Sprintf("forbidden: please accept the repository terms at %s", a.repoURL(repo, isDataset))}
 			case http.StatusNotFound:
-				return fmt.Errorf("repository not found: %s", repo)
+				return &treeHTTPStatusError{status: resp.StatusCode, message: fmt.Sprintf("repository not found: %s", repo)}
 			default:
-				return fmt.Errorf("API error: %s", resp.Status)
+				return &treeHTTPStatusError{status: resp.StatusCode, message: fmt.Sprintf("API error: %s", resp.Status)}
 			}
 		},
 		DecodeErr: func(err error) error {

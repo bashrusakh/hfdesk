@@ -170,9 +170,9 @@ type JobManager struct {
 	// runActivities outlive visible job state and retain each run's immutable
 	// destination/plan until its downloader call has actually returned.
 	runActivities        map[uint64]*jobWriteActivity
-	deleteReservations   map[uint64][]string
-	hfRepoReservations   map[uint64][]string
-	mutationScopes       map[uint64][]string
+	deleteReservations   map[uint64][]frozenMutationPath
+	hfRepoReservations   map[uint64][]frozenMutationPath
+	mutationScopes       map[uint64][]frozenMutationPath
 	mutationScopeKinds   map[uint64]writeScopeKind
 	nextWriteID          uint64
 	writeDecisionEpoch   uint64
@@ -203,9 +203,9 @@ func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *Job
 		saveMu:               &sync.Mutex{},
 		jobs:                 make(map[string]*Job),
 		runActivities:        make(map[uint64]*jobWriteActivity),
-		deleteReservations:   make(map[uint64][]string),
-		hfRepoReservations:   make(map[uint64][]string),
-		mutationScopes:       make(map[uint64][]string),
+		deleteReservations:   make(map[uint64][]frozenMutationPath),
+		hfRepoReservations:   make(map[uint64][]frozenMutationPath),
+		mutationScopes:       make(map[uint64][]frozenMutationPath),
 		mutationScopeKinds:   make(map[uint64]writeScopeKind),
 		writeDecisionChanged: make(chan struct{}),
 		config:               cfg,
@@ -618,7 +618,9 @@ resolveRequest:
 		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
 		var targets []string
 		for _, paths := range start.deletes {
-			targets = append(targets, paths...)
+			for _, target := range paths {
+				targets = append(targets, target.physical)
+			}
 		}
 		m.mu.Unlock()
 
@@ -880,7 +882,9 @@ func (m *JobManager) restartJob(id string, retry bool) bool {
 		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
 		targets := make([]string, 0)
 		for _, paths := range start.deletes {
-			targets = append(targets, paths...)
+			for _, target := range paths {
+				targets = append(targets, target.physical)
+			}
 		}
 		inventory := m.writeInventory
 		if inventory == nil {
@@ -1237,7 +1241,9 @@ func (m *JobManager) dispatchWithReservations() {
 		snapshot := a.start
 		var targets []string
 		for _, scopes := range snapshot.deletes {
-			targets = append(targets, scopes...)
+			for _, target := range scopes {
+				targets = append(targets, target.physical)
+			}
 		}
 		m.mu.Unlock()
 
@@ -1787,23 +1793,13 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	}
 	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
 		paths, complete := jobPlannedWriteEntries(job, plan)
+		planned, frozenComplete := plannedDestinationSet(paths)
+		complete = complete && frozenComplete
 		m.mu.Lock()
 		if activity := m.runActivities[activityID]; activity != nil {
-			if complete {
-				activity.planned = make(map[string]struct{}, len(paths))
-				for _, planned := range paths {
-					if absolute, err := filepath.Abs(filepath.Clean(planned)); err == nil {
-						activity.planned[pathIdentityKey(absolute)] = struct{}{}
-					} else {
-						complete = false
-						break
-					}
-				}
-			}
-			activity.planKnown = complete
-			if !complete {
-				activity.planned = make(map[string]struct{})
-			}
+			activity.planned = planned
+			activity.planKnown = true
+			activity.planComplete = complete
 			m.signalWriteDecisionLocked()
 		}
 		m.mu.Unlock()

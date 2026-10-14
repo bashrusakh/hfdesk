@@ -24,10 +24,11 @@ type writeDecisionJob struct {
 }
 
 type writeDecisionActivity struct {
-	id        uint64
-	job       writeDecisionJob
-	planKnown bool
-	planned   []string
+	id           uint64
+	job          writeDecisionJob
+	planKnown    bool
+	planComplete bool
+	planned      []frozenMutationPath
 }
 
 type writeDecisionSnapshot struct {
@@ -36,7 +37,7 @@ type writeDecisionSnapshot struct {
 	maxActive                          int
 	jobs                               []writeDecisionJob
 	activities                         []writeDecisionActivity
-	deletes, hfReservations, mutations map[uint64][]string
+	deletes, hfReservations, mutations map[uint64][]frozenMutationPath
 	mutationKinds                      map[uint64]writeScopeKind
 }
 
@@ -61,10 +62,10 @@ func decisionJob(j *Job) writeDecisionJob {
 		generation: j.generation, createdAt: j.CreatedAt.UnixNano()}
 }
 
-func cloneScopes(in map[uint64][]string) map[uint64][]string {
-	out := make(map[uint64][]string, len(in))
+func cloneScopes(in map[uint64][]frozenMutationPath) map[uint64][]frozenMutationPath {
+	out := make(map[uint64][]frozenMutationPath, len(in))
 	for id, paths := range in {
-		out[id] = append([]string(nil), paths...)
+		out[id] = append([]frozenMutationPath(nil), paths...)
 	}
 	return out
 }
@@ -89,10 +90,12 @@ func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 		if descriptor.id == "" {
 			descriptor = decisionJob(a.job)
 		}
-		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown}
+		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown, planComplete: a.planComplete}
 		if a.planKnown {
-			item.planned = mapKeys(a.planned)
-			sort.Strings(item.planned)
+			for _, path := range a.planned {
+				item.planned = append(item.planned, path)
+			}
+			sort.Slice(item.planned, func(i, j int) bool { return item.planned[i].key < item.planned[j].key })
 		}
 		s.activities = append(s.activities, item)
 	}
@@ -143,17 +146,25 @@ func (m *JobManager) bumpWriteDecisionLocked() {
 }
 
 func (m *JobManager) beginObservedMutation(paths []string) func() {
-	clean := make([]string, 0, len(paths))
+	clean := make([]frozenMutationPath, 0, len(paths))
 	for _, p := range paths {
 		if p != "" {
-			if abs, err := filepath.Abs(filepath.Clean(p)); err == nil {
-				clean = append(clean, abs)
+			frozen, err := freezeMutationEntry(p)
+			if err != nil {
+				// This tracker cannot refuse the cleanup operation. Preserve its
+				// raw spelling and use a lexical identity; overlap helpers treat an
+				// unresolvable current mapping conservatively.
+				if absolute, absErr := filepath.Abs(filepath.Clean(p)); absErr == nil {
+					frozen = frozenMutationPath{physical: absolute, key: pathIdentityKey(absolute)}
+				}
 			}
+			frozen.raw = p
+			clean = append(clean, frozen)
 		}
 	}
 	m.mu.Lock()
 	if m.mutationScopes == nil {
-		m.mutationScopes = make(map[uint64][]string)
+		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
 	if m.mutationScopeKinds == nil {
 		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
@@ -450,21 +461,17 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 		kind := a.start.mutationKinds[id]
 		for _, scope := range scopes {
 			for _, target := range targets {
-				if kind == writeScopeEntry {
-					if mutationPathsOverlap(scope, target) {
-						return true
-					}
-				} else if mutationDirectoryEntryOverlap(scope, target) {
+				if frozenScopeOverlapsEntry(scope, target, kind) {
 					return true
 				}
 			}
 			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
-					if scopeOverlapsDirectory(scope, inv.base, kind) {
+					if scopeOverlapsDirectory(scope.rawOrPhysical(), inv.base, kind) {
 						return true
 					}
 					for _, alias := range inv.aliases {
-						if scopeOverlapsDirectory(scope, alias.location, kind) || scopeOverlapsDirectory(scope, alias.dest, kind) {
+						if scopeOverlapsDirectory(scope.rawOrPhysical(), alias.location, kind) || scopeOverlapsDirectory(scope.rawOrPhysical(), alias.dest, kind) {
 							return true
 						}
 					}
@@ -475,17 +482,17 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 	for _, scopes := range a.start.hfReservations {
 		for _, scope := range scopes {
 			for _, target := range targets {
-				if mutationDirectoryEntryOverlap(scope, target) {
+				if frozenScopeOverlapsEntry(scope, target, writeScopeDirectory) {
 					return true
 				}
 			}
 			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
-					if directoryScopesOverlap(scope, inv.base) {
+					if directoryScopesOverlap(scope.rawOrPhysical(), inv.base) {
 						return true
 					}
 					for _, alias := range inv.aliases {
-						if directoryScopesOverlap(scope, alias.location) || directoryScopesOverlap(scope, alias.dest) {
+						if directoryScopesOverlap(scope.rawOrPhysical(), alias.location) || directoryScopesOverlap(scope.rawOrPhysical(), alias.dest) {
 							return true
 						}
 					}
@@ -499,17 +506,17 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 	for _, scopes := range a.start.deletes {
 		for _, entry := range scopes {
 			for _, target := range targets {
-				if mutationPathsOverlap(entry, target) {
+				if frozenScopeOverlapsEntry(entry, target, writeScopeEntry) {
 					return true
 				}
 			}
 			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
-					if mutationDirectoryEntryOverlap(inv.base, entry) {
+					if mutationDirectoryEntryOverlap(inv.base, entry.rawOrPhysical()) {
 						return true
 					}
 					for _, alias := range inv.aliases {
-						if mutationDirectoryEntryOverlap(alias.location, entry) || mutationDirectoryEntryOverlap(alias.dest, entry) {
+						if mutationDirectoryEntryOverlap(alias.location, entry.rawOrPhysical()) || mutationDirectoryEntryOverlap(alias.dest, entry.rawOrPhysical()) {
 							return true
 						}
 					}

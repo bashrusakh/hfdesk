@@ -174,12 +174,12 @@ func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{MaxActive: 2}, nil, filepath.Join(t.TempDir(), "state"))
 	j := &Job{ID: "j", Repo: "o/r", Status: JobStatusQueued, Filters: []string{"one"}, Excludes: []string{"skip"}}
 	m.jobs[j.ID] = j
-	m.runActivities[1] = &jobWriteActivity{job: j, planKnown: true, planned: map[string]struct{}{"/tmp/a": {}}}
+	m.runActivities[1] = &jobWriteActivity{job: j, planKnown: true, planned: map[string]frozenMutationPath{"/tmp/a": {physical: "/tmp/a", key: "/tmp/a", raw: "/tmp/a"}}}
 	s := m.captureWriteDecision()
 	j.Filters[0] = "changed"
 	j.Status = JobStatusRunning
-	m.runActivities[1].planned["/tmp/b"] = struct{}{}
-	if s.jobs[0].filters[0] != "one" || s.activities[0].planned[0] != "/tmp/a" {
+	m.runActivities[1].planned["/tmp/b"] = frozenMutationPath{physical: "/tmp/b", key: "/tmp/b", raw: "/tmp/b"}
+	if s.jobs[0].filters[0] != "one" || s.activities[0].planned[0].physical != "/tmp/a" {
 		t.Fatal("snapshot shares live slices or maps")
 	}
 	j.Filters = []string{"one"}
@@ -548,7 +548,7 @@ func TestObservedCleanupEntryScopeIsTypedAndNamespaceSensitive(t *testing.T) {
 	}
 	var scopeID uint64
 	for id, paths := range a.start.mutations {
-		if len(paths) > 0 && paths[0] == tempFile {
+		if len(paths) > 0 && paths[0].raw == tempFile {
 			scopeID = id
 			if a.start.mutationKinds[id] != writeScopeEntry {
 				t.Fatal("cleanup file scope lost its explicit entry kind")
@@ -642,7 +642,7 @@ func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
 	}{
 		{"selected GGUF", func(m *JobManager, p string) (func(), bool) { return m.reserveSelectedGGUF([]string{p}) }},
 		{"selected HF", func(m *JobManager, p string) (func(), bool) {
-			return m.reserveSelectedHF(p, filepath.Join(filepath.Dir(p), "friendly"))
+			return m.reserveSelectedHF(filepath.Dir(p), filepath.Join(filepath.Dir(p), "friendly"))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -710,7 +710,8 @@ func TestCollectSnapshotIgnoresTerminalAndKnownPlanButFailsRelevantUnknownClosed
 	relevant := &Job{ID: "active", Repo: "owner/repo", OutputDir: root, Status: JobStatusRunning}
 	m.jobs[badTerminal.ID] = badTerminal
 	m.jobs[relevant.ID] = relevant
-	m.runActivities[1] = &jobWriteActivity{job: badKnown, descriptor: decisionJob(badKnown), planKnown: true, planned: map[string]struct{}{filepath.Join(root, "exact"): {}}}
+	knownPath := filepath.Join(root, "exact")
+	m.runActivities[1] = &jobWriteActivity{job: badKnown, descriptor: decisionJob(badKnown), planKnown: true, planned: map[string]frozenMutationPath{knownPath: {physical: knownPath, key: pathIdentityKey(knownPath), raw: knownPath}}}
 	m.runActivities[2] = &jobWriteActivity{job: relevant, descriptor: decisionJob(relevant)}
 	a := testCacheWriteAttempt(m)
 	count := 0
