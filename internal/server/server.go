@@ -102,10 +102,11 @@ type Server struct {
 	// (jobs.UpdateConfig + SaveConfigFile). The generation re-check is taken
 	// under this lock so that only the latest committed writer persists, and
 	// an older writer cannot clobber a newer one's job-manager/file state.
-	persistMu  sync.Mutex
-	httpServer *http.Server
-	jobs       *JobManager
-	wsHub      *WSHub
+	persistMu           sync.Mutex
+	httpServer          *http.Server
+	jobs                *JobManager
+	wsHub               *WSHub
+	selectedDeleteHooks selectedDeleteHooks
 }
 
 // snapshotConfig returns a value copy of the current server config taken

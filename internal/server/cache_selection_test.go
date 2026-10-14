@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -38,6 +39,19 @@ type testSelectedDeleteRequest struct {
 	Members    []cacheSelectionMember `json:"members"`
 }
 
+func freezeTestDirectories(t *testing.T, paths ...string) []frozenMutationPath {
+	t.Helper()
+	frozen := make([]frozenMutationPath, 0, len(paths))
+	for _, path := range paths {
+		value, err := freezeMutationDirectory(path)
+		if err != nil {
+			t.Fatalf("freeze directory %q: %v", path, err)
+		}
+		frozen = append(frozen, value)
+	}
+	return frozen
+}
+
 func getSelection(t *testing.T, s *Server, repo, repoType, location string) (int, cacheSelectionResponse) {
 	t.Helper()
 	path := "/api/cache-selection?repo=" + url.QueryEscape(repo) + "&type=" + url.QueryEscape(repoType)
@@ -60,6 +74,41 @@ func writeSelectionFile(t *testing.T, dir, name string) {
 	}
 	if err := os.WriteFile(path, []byte("gguf"), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func requireReplacementFixtureOperation(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skipf("Windows prevented replacing an entry while its identity handle was held: %v", err)
+	}
+	t.Fatal(err)
+}
+
+func registerJobManagerCleanup(t *testing.T, s *Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("close test job manager: %v", err)
+		}
+	})
+}
+
+func assertNoTemporaryPinContainer(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".hfdesk-delete-pin-") {
+			t.Fatalf("temporary pin container remains in %s: %s", dir, entry.Name())
+		}
 	}
 }
 
@@ -926,6 +975,145 @@ func TestSelectedDeleteAndRebuildReserveDatasetFriendlyTree(t *testing.T) {
 	}
 }
 
+func TestReservationProducersFreezeEntryAndDirectoryScopes(t *testing.T) {
+	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	repo, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.Path(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.FriendlyPath(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServerWithConfig(t, Config{CacheDir: cache.Root})
+	selected := filepath.Join(repo.Path(), "snapshots", "deadbeef", "model-Q4_K_M.gguf")
+	selectedRelease, ok := server.jobs.reserveSelectedGGUF([]string{selected})
+	if !ok {
+		t.Fatal("could not register selected-entry reservation")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("duplicate selected-entry reservation was admitted")
+	}
+	if _, ok := server.jobs.beginCacheMutation(repo.Path()); ok {
+		t.Fatal("cache mutation containing selected entry was admitted")
+	}
+	selectedRelease()
+
+	mutationRelease, ok := server.jobs.beginCacheMutation(repo.Path())
+	if !ok {
+		t.Fatal("could not register cache directory mutation")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("selected-entry reservation crossed active cache mutation")
+	}
+	mutationRelease()
+
+	hfRelease, ok := server.jobs.reserveSelectedHF(repo.Path(), repo.FriendlyPath())
+	if !ok {
+		t.Fatal("could not register HF repo reservation")
+	}
+	if _, ok := server.jobs.reserveSelectedHF(repo.Path(), repo.FriendlyPath()); ok {
+		t.Fatal("duplicate HF directory reservation was admitted")
+	}
+	if _, ok := server.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		t.Fatal("selected-entry reservation crossed frozen HF directory scope")
+	}
+	if _, ok := server.jobs.beginCacheMutation(repo.Path()); ok {
+		t.Fatal("cache mutation crossed frozen HF directory scope")
+	}
+	if _, _, err := server.jobs.CreateJob(DownloadRequest{Repo: "owner/model"}); !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("new HF job crossed frozen repo reservation: %v", err)
+	}
+	hfRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.jobs.Close(ctx); err != nil {
+		t.Fatalf("close test job manager: %v", err)
+	}
+}
+
+func TestSelectedDeleteChecksFrozenAndCurrentMutationAlias(t *testing.T) {
+	root := t.TempDir()
+	a, b, other := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "other")
+	for _, dir := range []string{a, b, other} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(root, "destination")
+	if err := os.Symlink(a, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(root, "cache")})
+	release, ok := s.jobs.beginCacheMutation(alias)
+	if !ok {
+		t.Fatal("could not reserve aliased mutation destination")
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "model-Q4_K_M.gguf")}); ok {
+		t.Fatal("delete admission ignored the mutation destination's current alias mapping")
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(a, "model-Q4_K_M.gguf")}); ok {
+		t.Fatal("delete admission ignored the mutation's frozen original destination")
+	}
+	if unrelated, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(other, "model-Q4_K_M.gguf")}); !ok {
+		t.Fatal("unrelated selected deletion was blocked")
+	} else {
+		unrelated()
+	}
+	release()
+	if mutation, ok := s.jobs.beginCacheMutation(alias); !ok {
+		t.Fatal("mutation could not be admitted after deletion reservation release")
+	} else {
+		mutation()
+	}
+	deleteB, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "model-Q4_K_M.gguf")})
+	if !ok {
+		t.Fatal("could not reserve current alias target for reverse-admission check")
+	}
+	if _, ok := s.jobs.beginCacheMutation(alias); ok {
+		t.Fatal("mutation admission ignored the raw destination's current alias mapping")
+	}
+	deleteB()
+	// HF repo reservations use the same shared owner and must retain their IO
+	// spelling too, not only the selected-local mutation scopes above.
+	hfRelease, ok := s.jobs.reserveSelectedHF(alias, filepath.Join(root, "friendly"))
+	if !ok {
+		t.Fatal("could not reserve aliased HF repository scope")
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(a, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(a, "snapshot-Q4_K_M.gguf")}); ok {
+		t.Fatal("selected-delete admission ignored current mapping of held HF reservation")
+	}
+	if _, ok := s.jobs.reserveSelectedGGUF([]string{filepath.Join(b, "snapshot-Q4_K_M.gguf")}); ok {
+		t.Fatal("selected-delete admission ignored frozen mapping of held HF reservation")
+	}
+	if _, ok := s.jobs.beginCacheMutation(alias); ok {
+		t.Fatal("mutation admission crossed an existing HF reservation")
+	}
+	hfRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.T) {
 	actual, alias := t.TempDir(), t.TempDir()
 	if err := os.Symlink(actual, filepath.Join(alias, "parent")); err != nil {
@@ -952,6 +1140,132 @@ func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.
 	}
 	if got == pathIdentityKey(target) {
 		t.Fatalf("leaf identity followed symlink target: %q", got)
+	}
+}
+
+func TestFrozenPhysicalIdentityIsNotReusedAsFilesystemLookupPath(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(actual, "Model-Q4_K_M.gguf")
+	if err := os.WriteFile(entry, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	incoming := filepath.Join(alias, "Owner", "Model", filepath.Base(entry))
+	physical, err := mutationEntryPhysicalIdentity(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if physical != entry {
+		t.Fatalf("physical lookup identity=%q want raw resolved path %q", physical, entry)
+	}
+	// Simulate Windows' comparison-only folding on a case-sensitive host. The
+	// lookup above must still use the raw alias spelling; folding is applied
+	// only after the physical identity has been established.
+	fold := func(path string) string { return strings.ToLower(filepath.Clean(path)) }
+	frozen, err := freezeMutationEntryWithKey(entry, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incomingFrozen, err := freezeMutationEntryWithKey(incoming, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlap(frozen, incomingFrozen) {
+		t.Fatal("folded comparison missed the same admitted physical entry")
+	}
+	if physical == fold(physical) {
+		t.Fatal("physical identity was replaced by its comparison key")
+	}
+}
+
+func TestFrozenReservationComparisonsKeepLookupAndComparisonDomainsSeparate(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	q4 := filepath.Join(actual, "Model-Q4_K_M.gguf")
+	q5 := filepath.Join(actual, "Model-Q5_K_M.gguf")
+	for _, path := range []string{q4, q5} {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	incomingQ4 := filepath.Join(alias, "Owner", "Model", filepath.Base(q4))
+	fold := func(path string) string { return strings.ToLower(filepath.Clean(path)) }
+
+	// Linux remains genuinely case-sensitive: the test shim changes comparison
+	// keys only, while every physical observation still receives raw input.
+	frozenQ4, err := freezeMutationEntryWithKey(q4, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozenQ4.physical != q4 {
+		t.Fatalf("stored physical path=%q want %q", frozenQ4.physical, q4)
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Lstat(frozenQ4.key); !os.IsNotExist(err) {
+			t.Fatal("folded comparison-only key unexpectedly served as the raw filesystem lookup")
+		}
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenQ4, incomingQ4, fold) {
+		t.Fatal("same entry via parent alias did not match the frozen comparison key")
+	}
+	if frozenMutationOverlapsRawEntryWithKey(frozenQ4, q5, fold) {
+		t.Fatal("disjoint Q5 entry overlapped the Q4 reservation")
+	}
+	duplicate, err := freezeMutationEntryWithKey(incomingQ4, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlap(frozenQ4, duplicate) {
+		t.Fatal("duplicate reservation did not compare already-frozen identities directly")
+	}
+	frozenHF, err := freezeMutationDirectoryWithKey(actual, fold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenHF, q4, fold) {
+		t.Fatal("frozen HF directory scope missed raw incoming selected entry")
+	}
+	if !frozenMutationOverlapsRawDirectoryWithKey(frozenHF, filepath.Dir(incomingQ4), fold) {
+		t.Fatal("frozen HF directory scope missed aliased raw cache-mutation scope")
+	}
+	other := filepath.Join(t.TempDir(), "OtherCase", "Owner", "Model")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, filepath.Base(q4)), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(filepath.Dir(other)), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !frozenMutationOverlapsRawEntryWithKey(frozenQ4, q4, fold) ||
+		frozenMutationOverlapsRawEntryWithKey(frozenQ4, filepath.Join(alias, "Owner", "Model", filepath.Base(q4)), fold) {
+		t.Fatal("retargeting the raw alias changed the already-frozen physical reservation")
+	}
+	if hfdownloader.GGUFPathSelected(filepath.Base(frozenQ4.physical), []string{"Q4_K_M"}, nil, false) == false ||
+		hfdownloader.GGUFPathSelected(filepath.Base(frozenQ4.physical), []string{"Q5_K_M"}, nil, false) {
+		t.Fatal("physical basename no longer preserves Q4/Q5 filter semantics")
 	}
 }
 
@@ -1230,6 +1544,199 @@ func TestSelectedDeleteBlocksPrescanWriterWhenAliasChangesExcludedPath(t *testin
 	}
 }
 
+func TestSelectedDeleteExcludesPlannedWriterThroughAliasAfterPlan(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		writerQuant string
+		writerFile  string
+		wantStatus  int
+	}{
+		{name: "matching Q4 conflicts", writerQuant: "Q4_K_M", writerFile: "model-Q4_K_M.gguf", wantStatus: http.StatusConflict},
+		{name: "nonmatching Q5 remains allowed", writerQuant: "Q5_K_M", writerFile: "model-Q5_K_M.gguf", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := t.TempDir()
+			repoDir := filepath.Join(storage, "models", "o", "m")
+			blocked := filepath.Join(repoDir, "blocked")
+			selectedFile := filepath.Join(blocked, "model-Q4_K_M.gguf")
+			writeSelectionFile(t, blocked, filepath.Base(selectedFile))
+			if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+				if runtime.GOOS == "windows" && os.IsPermission(err) {
+					t.Skipf("symlink privilege unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			hf, started, release := blockingPlanServer(t, "live/"+tc.writerFile)
+			defer hf.Close()
+			var releaseOnce sync.Once
+			releaseGate := func() { releaseOnce.Do(release) }
+			s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL, MaxActive: 1})
+			job, _, err := s.jobs.CreateJob(DownloadRequest{
+				Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{tc.writerQuant}, Excludes: []string{"blocked"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				releaseGate()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := s.jobs.Close(ctx); err != nil {
+					t.Errorf("close test job manager: %v", err)
+				}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("real downloader did not reach the planned transfer")
+			}
+			s.jobs.mu.Lock()
+			planned := false
+			for _, activity := range s.jobs.runActivities {
+				if activity.job.ID == job.ID && activity.planKnown {
+					planned = true
+					break
+				}
+			}
+			s.jobs.mu.Unlock()
+			if !planned {
+				t.Fatal("transfer began before the production run registered its completed plan")
+			}
+
+			body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != tc.wantStatus {
+				t.Errorf("delete while planned %s transfer is held: status=%d body=%s, want %d", tc.writerQuant, w.Code, w.Body.String(), tc.wantStatus)
+			}
+			if tc.wantStatus == http.StatusConflict {
+				if _, err := os.Stat(selectedFile); err != nil {
+					t.Errorf("conflicting planned writer's selected entry was removed: %v", err)
+				}
+			} else if _, err := os.Stat(selectedFile); !os.IsNotExist(err) {
+				t.Errorf("nonconflicting Q5 writer prevented selected Q4 deletion: %v", err)
+			}
+
+			releaseGate()
+			deadline := time.After(5 * time.Second)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				current, ok := s.jobs.GetJob(job.ID)
+				if ok && (current.Status == JobStatusCompleted || current.Status == JobStatusFailed) {
+					if current.Status != JobStatusCompleted {
+						t.Errorf("planned writer did not complete: %+v", current)
+					}
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("planned writer did not finish after transfer release")
+				case <-ticker.C:
+				}
+			}
+			written := filepath.Join(blocked, tc.writerFile)
+			data, err := os.ReadFile(written)
+			if err != nil || string(data) != "data!" {
+				t.Errorf("planned transfer output=%q err=%v, want recreated/written data", data, err)
+			}
+		})
+	}
+}
+
+func TestSelectedDeleteKeepsKnownAliasConflictWhenSiblingPlanPathCannotFreeze(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blocked := filepath.Join(repoDir, "blocked")
+	selectedFile := filepath.Join(blocked, "model-Q4_K_M.gguf")
+	writeSelectionFile(t, blocked, filepath.Base(selectedFile))
+	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	danglingTarget := filepath.Join(t.TempDir(), "not-created")
+	if err := os.Symlink(danglingTarget, filepath.Join(repoDir, "dangling")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(`[{"type":"file","path":"live/model-Q4_K_M.gguf","size":5},{"type":"file","path":"dangling/model-Q5_K_M.gguf","size":5}]`))
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+				_, _ = w.Write([]byte("data!"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M", "Q5_K_M"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("close test job manager: %v", err)
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production run did not reach the held transfer")
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		s.jobs.mu.RLock()
+		captured := false
+		for _, activity := range s.jobs.runActivities {
+			if activity.job.ID == job.ID && activity.planKnown && !activity.planComplete && len(activity.planned) > 0 {
+				captured = true
+				break
+			}
+		}
+		s.jobs.mu.RUnlock()
+		if captured {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("partial production plan was not retained through transfer")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("partial plan lost known alias conflict: status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(selectedFile); err != nil {
+		t.Fatalf("selected bytes were removed despite the valid planned alias: %v", err)
+	}
+}
+
 func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	storage := t.TempDir()
 	repoDir := filepath.Join(storage, "models", "o", "m")
@@ -1404,6 +1911,1835 @@ func TestSelectedCacheDeleteRemovesOnlyConfirmedLocalGroup(t *testing.T) {
 	}
 	if _, err := os.Stat(otherFile); err != nil {
 		t.Errorf("same file in other location changed: %v", err)
+	}
+}
+
+func TestSelectedDeleteExclusionsResolveRelativeConfiguredRoot(t *testing.T) {
+	work := t.TempDir()
+	t.Chdir(work)
+	selectedPath := filepath.Join("root", "owner", "model")
+	physicalRoot := filepath.Join(work, selectedPath)
+	if err := os.MkdirAll(physicalRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	protectedPhysical := filepath.Join(physicalRoot, "protected")
+	if err := os.MkdirAll(filepath.Join(protectedPhysical, "owner", "model"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	absoluteAlias, err := filepath.Abs(filepath.Join("unrelated-alias"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(protectedPhysical, absoluteAlias); err != nil {
+		t.Fatal(err)
+	}
+	const member = "model-Q4_K_M.gguf"
+	writeSelectionFile(t, physicalRoot, member)
+	marker := filepath.Join(absoluteAlias, "owner", "model", "model-Q4_K_M.gguf")
+	if err := os.Symlink("missing.gguf", marker); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: "root", LocalScanDirs: []string{absoluteAlias}})
+	body := selectedGroupRequest(t, s, "owner/model", selectedPath, member)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(marker); err != nil {
+		t.Fatalf("protected dangling descendant was changed: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(selectedPath, member)); !os.IsNotExist(err) {
+		t.Fatalf("selected outer member remains or changed unexpectedly: %v", err)
+	}
+}
+
+func TestSelectedDeleteExclusionsUseAdmittedSourceAfterAliasRetarget(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	repo := filepath.Join(actual, "owner", "model")
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	selected := &cacheSelectionLocation{Path: filepath.Join(alias, "owner", "model")}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, alias); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalScanDirs: []string{alias, repo}}
+	_, complete := selectedDeleteExclusions(cfg, selected, repo, actual)
+	if complete {
+		t.Fatal("retargeted source alias hid a separately configured owner of the admitted repository")
+	}
+	// Restoring the admitted alias must not make a second projection necessary;
+	// the caller carries the same frozen source identity through the operation.
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(actual, alias); err != nil {
+		t.Fatal(err)
+	}
+	_, complete = selectedDeleteExclusions(cfg, selected, repo, actual)
+	if complete {
+		t.Fatal("restoring the source alias bypassed the configured repository owner")
+	}
+}
+
+func TestSelectedLocalDeleteStaysOnOpenedRootAfterAliasRetarget(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	rel := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, filepath.Join(actual, "owner", "model"), rel)
+	writeSelectionFile(t, filepath.Join(other, "owner", "model"), rel)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: actual, LocalScanDirs: []string{alias}})
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(alias, "owner", "model"), rel)
+	retarget := func() {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, alias); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mutationBlocked bool
+	var writerBlocked bool
+	s.selectedDeleteHooks.afterFinalScan = func() {
+		retarget()
+		job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}})
+		if errors.Is(err, errSelectionWriterBusy) {
+			writerBlocked = true
+		} else if err == nil {
+			s.jobs.CancelJob(job.ID)
+		}
+		if release, ok := s.jobs.beginCacheMutation(filepath.Join(actual, "owner", "model")); ok {
+			release()
+		} else {
+			mutationBlocked = true
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !mutationBlocked {
+		t.Fatal("canonical writer for admitted root was not blocked after alias retarget")
+	}
+	if !writerBlocked {
+		t.Fatal("canonical queued writer for admitted root was not blocked after alias retarget")
+	}
+	if _, err := os.Stat(filepath.Join(actual, "owner", "model", rel)); !os.IsNotExist(err) {
+		t.Fatalf("selected entry in admitted root remains or was replaced: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "owner", "model", rel)); err != nil {
+		t.Fatalf("retarget destination was changed: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, filepath.Join(actual, "owner", "model"))
+	assertNoTemporaryPinContainer(t, filepath.Join(other, "owner", "model"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsParentSwapWithHardlinkPeer(t *testing.T) {
+	root := t.TempDir()
+	selectedParent := filepath.Join(root, "owner", "model", "nested")
+	protectedParent := filepath.Join(root, "protected", "nested")
+	if err := os.MkdirAll(selectedParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(protectedParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	const name = "model-Q4_K_M.gguf"
+	selected := filepath.Join(selectedParent, name)
+	protected := filepath.Join(protectedParent, name)
+	if err := os.WriteFile(selected, []byte("same inode"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(selected, protected); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root})
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(root, "owner", "model"), filepath.Join("nested", name))
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		moved := filepath.Join(root, "owner", "model", "selected-parent")
+		if err := os.Rename(selectedParent, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(protectedParent, selectedParent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "owner", "model", "selected-parent", name)); err != nil {
+		t.Fatalf("stale parent swap changed the selected name: %v", err)
+	}
+	if info, err := os.Stat(protected); err != nil || info.Size() != int64(len("same inode")) {
+		t.Fatalf("protected hardlink peer changed: info=%v err=%v", info, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeletePreservesDifferentSizedRetargetDestination(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	rel := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, filepath.Join(actual, "owner", "model"), rel)
+	otherFile := filepath.Join(other, "owner", "model", rel)
+	if err := os.MkdirAll(filepath.Dir(otherFile), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherFile, []byte("a different-sized destination"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{alias}})
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(alias, "owner", "model"), rel)
+	s.selectedDeleteHooks.afterFinalScan = func() {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, alias); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(actual, "owner", "model", rel)); !os.IsNotExist(err) {
+		t.Fatalf("selected entry in admitted root remains: %v", err)
+	}
+	if data, err := os.ReadFile(otherFile); err != nil || string(data) != "a different-sized destination" {
+		t.Fatalf("different-sized retarget destination changed: data=%q err=%v", data, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsAliasRetargetDuringAdmission(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	rel := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, filepath.Join(actual, "owner", "model"), rel)
+	writeSelectionFile(t, filepath.Join(other, "owner", "model"), rel)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{alias}})
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(alias, "owner", "model"), rel)
+	s.selectedDeleteHooks.afterRootOpen = func() {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, alias); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("retargeted admission status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	for _, path := range []string{filepath.Join(actual, "owner", "model", rel), filepath.Join(other, "owner", "model", rel)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("admission retarget changed %s: %v", path, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteRevalidatesGroupBeforeCreatingPins(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "owner", "model")
+	const name = "model-Q4_K_M.gguf"
+	selected := filepath.Join(repo, name)
+	writeSelectionFile(t, repo, name)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repo, name)
+	pinAttempts := 0
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.afterReservation = func() {
+		if err := os.WriteFile(selected, []byte("changed after reservation"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+		pinAttempts++
+		return nil
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("changed-group delete status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if pinAttempts != 0 {
+		t.Fatalf("created %d identity pins before detecting changed group", pinAttempts)
+	}
+	if data, err := os.ReadFile(selected); err != nil || string(data) != "changed after reservation" {
+		t.Fatalf("changed selected data was altered: data=%q err=%v", data, err)
+	}
+	assertNoTemporaryPinContainer(t, repo)
+}
+
+func TestSelectedLocalDeleteRejectsLatestObservedMemberChangeBeforePinArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		point string
+		role  bool
+	}{{"after-group-validation", false}, {"after-member-lstat", false}, {"role-after-group-validation", true}} {
+		t.Run(tc.point, func(t *testing.T) {
+			root := t.TempDir()
+			repo := filepath.Join(root, "owner", "model")
+			const name = "model-Q4_K_M.gguf"
+			selected := filepath.Join(repo, name)
+			writeSelectionFile(t, repo, name)
+			s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+			registerJobManagerCleanup(t, s)
+			body := selectedGroupRequest(t, s, "owner/model", repo, name)
+			pinAttempts := 0
+			mutate := func() {
+				if tc.role {
+					target := filepath.Join(t.TempDir(), "replacement.gguf")
+					if err := os.WriteFile(target, []byte("unchanged target"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Remove(selected); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, selected); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(selected, []byte("changed after confirmation"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.selectedDeleteHooks.forceHardLinkPin = true
+			if tc.point != "after-member-lstat" {
+				s.selectedDeleteHooks.afterGroupValidation = mutate
+			} else {
+				s.selectedDeleteHooks.beforeIdentityPin = func(string) { mutate() }
+			}
+			s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+				pinAttempts++
+				return nil
+			}
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("changed-group delete status=%d body=%s, want 409", w.Code, w.Body.String())
+			}
+			if pinAttempts != 0 {
+				t.Fatalf("attempted %d hard-link pins after changed metadata was observed", pinAttempts)
+			}
+			if !tc.role {
+				data, err := os.ReadFile(selected)
+				if err != nil || string(data) != "changed after confirmation" {
+					t.Fatalf("changed selected data was altered: data=%q err=%v", data, err)
+				}
+			}
+			assertNoTemporaryPinContainer(t, repo)
+		})
+	}
+}
+
+func TestSelectedLocalDeleteRejectsAliasRetargetDuringOpen(t *testing.T) {
+	actual, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(actual, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	rel := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, filepath.Join(actual, "owner", "model"), rel)
+	writeSelectionFile(t, filepath.Join(other, "owner", "model"), rel)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{alias}})
+	body := selectedGroupRequest(t, s, "owner/model", filepath.Join(alias, "owner", "model"), rel)
+	s.selectedDeleteHooks.beforeRootOpen = func() {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, alias); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("retarget during open status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	for _, path := range []string{filepath.Join(actual, "owner", "model", rel), filepath.Join(other, "owner", "model", rel)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("retarget during open changed %s: %v", path, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteDoesNotBlockWhenLaterDirectoryBecomesFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory-to-FIFO replacement regression requires Linux FIFO semantics")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected := "a-selected-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	laterDir := filepath.Join(repoDir, "z-later-empty-dir")
+	if err := os.Mkdir(laterDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.beforeIdentityPin = func(name string) {
+		if name != selected {
+			return
+		}
+		if err := os.Remove(laterDir); err != nil {
+			t.Errorf("remove later directory: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", laterDir).Run(); err != nil {
+			t.Errorf("replace later directory with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("replacement hook was not reached")
+			return
+		}
+		// Opening a FIFO read/write does not wait for a peer and releases an old
+		// blocking Root.Open implementation even when the regression is present.
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(laterDir, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		// Let the guaranteed FIFO peer release the pre-fix blocking operation.
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked on a replaced directory FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, selected)); err != nil {
+		t.Fatalf("selected GGUF changed: %v", err)
+	}
+	if info, err := os.Lstat(laterDir); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("substituted FIFO changed: info=%v err=%v", info, err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+	paths := []string{filepath.Join(repoDir, selected)}
+	release, ok := s.jobs.reserveSelectedGGUF(paths)
+	if !ok {
+		t.Fatal("selected-file reservation leaked after failed walk")
+	}
+	release()
+}
+
+func TestSelectedDirectoryAcquisitionRejectsFIFOWithoutWaiting(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("nonblocking directory acquisition regression requires Linux FIFO semantics")
+	}
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, acquire := range []struct {
+		name string
+		fn   func() (*os.Root, error)
+	}{
+		{"base", func() (*os.Root, error) { return openSelectedLocalBase(filepath.Join(base, "fifo")) }},
+		{"child", func() (*os.Root, error) { return openSelectedDirectoryRoot(root, "fifo") }},
+	} {
+		if err := exec.Command("mkfifo", filepath.Join(base, "fifo")).Run(); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			opened, err := acquire.fn()
+			if opened != nil {
+				_ = opened.Close()
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s acquisition accepted a FIFO", acquire.name)
+			}
+		case <-time.After(time.Second):
+			// Ensure a regression cannot strand this test process on FIFO open.
+			peer, peerErr := os.OpenFile(filepath.Join(base, "fifo"), os.O_RDWR, 0)
+			if peerErr == nil {
+				_ = peer.Close()
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatalf("%s acquisition remained blocked after FIFO release", acquire.name)
+			}
+			t.Fatalf("%s acquisition blocked while opening a FIFO", acquire.name)
+		}
+		if err := os.Remove(filepath.Join(base, "fifo")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(base, "fifo"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		opened, err := acquire.fn()
+		if err != nil {
+			t.Fatalf("%s acquisition rejected an ordinary directory: %v", acquire.name, err)
+		}
+		_ = opened.Close()
+		if err := os.RemoveAll(filepath.Join(base, "fifo")); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSelectedLocalDeleteRejectsNewContainingRootOwnership(t *testing.T) {
+	base := t.TempDir()
+	rel := "model-Q4_K_M.gguf"
+	repoDir := filepath.Join(base, "owner", "model")
+	writeSelectionFile(t, repoDir, rel)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{base}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, rel)
+	// This independently configured subroot contains the selected repo; GET's
+	// outer-root projection omits it, so DELETE must refuse the stale source.
+	alias := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(repoDir, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{filepath.Join(base, "owner"), alias, repoDir} {
+		s.configMu.Lock()
+		s.config.LocalScanDirs = []string{base, candidate}
+		s.configMu.Unlock()
+		w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("delete through superseded root %q status=%d body=%s, want 409", candidate, w.Code, w.Body.String())
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, rel)); err != nil {
+			t.Fatalf("protected file changed after ownership refusal: %v", err)
+		}
+	}
+}
+
+func TestSelectedLocalDeleteAllowsDeeperSourceRootUnderConfiguredAncestor(t *testing.T) {
+	outer := t.TempDir()
+	deeper := filepath.Join(outer, "deeper")
+	writeSelectionFile(t, filepath.Join(outer, "owner", "model"), "outer-Q4_K_M.gguf")
+	writeSelectionFile(t, filepath.Join(deeper, "owner", "model"), "inner-Q4_K_M.gguf")
+	s := newTestServerWithConfig(t, Config{
+		CacheDir:      filepath.Join(t.TempDir(), "cache"),
+		LocalScanDirs: []string{outer, deeper},
+	})
+	_, selection := getSelection(t, s, "owner/model", "model", "")
+	var selected *cacheSelectionLocation
+	for i := range selection.Locations {
+		if pathIdentityKey(filepath.Clean(selection.Locations[i].Path)) == pathIdentityKey(filepath.Join(deeper, "owner", "model")) {
+			selected = &selection.Locations[i]
+			break
+		}
+	}
+	if selected == nil || !selected.CanDelete || len(selected.Groups) == 0 {
+		t.Fatalf("deeper configured source root was not selectable: %+v", selection.Locations)
+	}
+	group := selected.Groups[0]
+	body, err := json.Marshal(testSelectedDeleteRequest{
+		Repo: "owner/model", Type: "model", LocationID: selected.ID, GroupID: group.ID, Members: group.Members,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete through deeper source root under ancestor status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outer, "owner", "model", "outer-Q4_K_M.gguf")); err != nil {
+		t.Fatalf("ancestor-owned sibling changed: %v", err)
+	}
+}
+
+func TestSelectedLocalDeletePreservesUnrelatedFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory-to-FIFO replacement regression requires Linux FIFO semantics")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected := "a-selected-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	laterDir := filepath.Join(repoDir, "z-later-empty-dir")
+	if err := os.Mkdir(laterDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.afterRootOpen = func() {
+		if err := os.Remove(laterDir); err != nil {
+			t.Errorf("remove later directory: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", laterDir).Run(); err != nil {
+			t.Errorf("replace later directory with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("replacement hook was not reached")
+			return
+		}
+		// This peer is a safety release if a regression opens the FIFO in
+		// blocking mode; it is not the expected successful execution path.
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(laterDir, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked in its initial location scan on a replaced directory FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(repoDir, selected)); !os.IsNotExist(err) {
+		t.Fatalf("selected GGUF was not removed: %v", err)
+	}
+	if info, err := os.Lstat(laterDir); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("unrelated FIFO changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestSelectedLocalDeleteDoesNotBlockWhenSelectedLinkBecomesFIFO(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("selected-link FIFO open regression is covered on Linux and macOS")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	target := filepath.Join(t.TempDir(), "weights.gguf")
+	if err := os.WriteFile(target, []byte("weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repoDir, name)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	replaced := make(chan struct{})
+	s.selectedDeleteHooks.beforeIdentityPin = func(path string) {
+		if path != name {
+			return
+		}
+		if err := os.Remove(link); err != nil {
+			t.Errorf("remove selected link: %v", err)
+			return
+		}
+		if err := exec.Command("mkfifo", link).Run(); err != nil {
+			t.Errorf("replace selected link with FIFO: %v", err)
+			return
+		}
+		close(replaced)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body)) }()
+	peerDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-replaced:
+		case <-time.After(2 * time.Second):
+			peerDone <- fmt.Errorf("FIFO replacement hook was not reached")
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+		f, err := os.OpenFile(link, os.O_RDWR, 0)
+		if err == nil {
+			err = f.Close()
+		}
+		peerDone <- err
+	}()
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-result:
+	case <-time.After(200 * time.Millisecond):
+		select {
+		case err := <-peerDone:
+			if err != nil {
+				t.Fatalf("release substituted FIFO: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO release peer did not finish")
+		}
+		select {
+		case <-result:
+			t.Fatal("DELETE blocked opening a selected link replaced by a FIFO")
+		case <-time.After(2 * time.Second):
+			t.Fatal("DELETE did not return after FIFO peer release")
+		}
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("FIFO release peer: %v", err)
+	}
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("substituted FIFO changed: info=%v err=%v", info, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "weights" {
+		t.Fatalf("link target changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsForgedMemberBeforePinning(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ctime/link-count oracle uses Linux stat metadata")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	selected, foreign := "model-Q4_K_M.gguf", "other-Q5_K_M.gguf"
+	writeSelectionFile(t, repoDir, selected)
+	writeSelectionFile(t, repoDir, foreign)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, selected)
+	var forged testSelectedDeleteRequest
+	if err := json.Unmarshal(body, &forged); err != nil {
+		t.Fatal(err)
+	}
+	forged.GroupID = "gguf-not-a-current-group"
+	forged.Members = []cacheSelectionMember{{Path: foreign, Size: int64(len("gguf"))}}
+	body, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignPath := filepath.Join(repoDir, foreign)
+	before, err := os.Lstat(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeMetadata := linuxPinMutationMetadata(t, before)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	var pinAttempts atomic.Int32
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, _ string) error {
+		pinAttempts.Add(1)
+		return nil
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("forged group status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if got := pinAttempts.Load(); got != 0 {
+		t.Fatalf("invalid request attempted %d identity pins before rejecting", got)
+	}
+	after, err := os.Lstat(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := linuxPinMutationMetadata(t, after); got != beforeMetadata {
+		t.Fatalf("unselected file link/ctime metadata changed: before=%s after=%s", beforeMetadata, got)
+	}
+	for _, name := range []string{selected, foreign} {
+		if data, err := os.ReadFile(filepath.Join(repoDir, name)); err != nil || string(data) != "gguf" {
+			t.Fatalf("%s changed: data=%q err=%v", name, data, err)
+		}
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+}
+
+func linuxPinMutationMetadata(t *testing.T, info os.FileInfo) string {
+	t.Helper()
+	stat := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	links, ctime := stat.FieldByName("Nlink"), stat.FieldByName("Ctim")
+	if !links.IsValid() || !ctime.IsValid() {
+		t.Fatal("Linux file metadata lacks link count or ctime fields")
+	}
+	return fmt.Sprintf("%v/%v", links.Interface(), ctime.Interface())
+}
+
+func TestSelectedLocalDeleteRechecksMemberIdentityBeforeUnlink(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	originalInfo, err := os.Lstat(filepath.Join(repoDir, first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A same-size replacement after complete preflight must be detected before
+	// the first unlink, leaving the replacement untouched and returning 409.
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		path := filepath.Join(repoDir, first)
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.WriteFile(path, []byte("new!"), 0644))
+		replacementInfo, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("replacement reused the selected inode despite the retained identity pin")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("same-size replacement status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, first)); err != nil || string(data) != "new!" {
+		t.Fatalf("replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("unrelated shard changed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteRejectsSizeChangeDuringIdentityCapture(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeIdentityPin = func(name string) {
+		if name != first {
+			return
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, first), []byte("growth!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("size change during identity capture status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, first)); err != nil || string(data) != "growth!" {
+		t.Fatalf("changed selected entry was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("other shard changed: %v", err)
+	}
+}
+
+func TestSelectedLocalDeletePinsUnreadableRegularFileWithHardLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit read denial and Darwin-style hard-link pin are Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	var privateContainer bool
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, destination string) error {
+		container := filepath.Join(repoDir, filepath.Dir(filepath.FromSlash(destination)))
+		info, err := os.Stat(container)
+		if err != nil {
+			return err
+		}
+		privateContainer = info.IsDir() && info.Mode().Perm()&0077 == 0
+		return nil
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("hard-link pin delete status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected mode-000 file remains after deletion: %v", err)
+	}
+	if !privateContainer {
+		t.Fatal("hard-link pin container was not private while the pin was active")
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".hfdesk-delete-pin-") {
+			t.Fatalf("temporary hard-link pin artifact remains after success: %s", entry.Name())
+		}
+	}
+	if release, ok := s.jobs.beginCacheMutation(repoDir); !ok {
+		t.Fatal("writer reservation was not released after hard-link cleanup")
+	} else {
+		release()
+	}
+}
+
+func TestSelectedLocalDeletePlacesHardLinkPinUnderWritableSourceParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(repoDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(repoDir, 0755); err != nil {
+			t.Errorf("restore repo permissions for temporary fixture cleanup: %v", err)
+		}
+	})
+	if err := os.Chmod(sourceParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("source-parent hard-link pin delete status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected nested file remains: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, sourceParent)
+	assertNoTemporaryPinContainer(t, repoDir)
+}
+
+func TestSelectedLocalDeleteUsesKnownRepoRootOnlyAfterSourceParentPinDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hard-link pin fallback fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	var destinations []string
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, destination string) error {
+		destinations = append(destinations, destination)
+		if len(destinations) == 1 {
+			return os.ErrPermission
+		}
+		return nil
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("repo-root fallback status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if len(destinations) != 2 {
+		t.Fatalf("pin attempts=%v, want source-parent attempt then one repo-root fallback", destinations)
+	}
+	sourcePinDir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(destinations[0])))
+	rootPinDir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(destinations[1])))
+	if !strings.HasPrefix(sourcePinDir, "nested/.hfdesk-delete-pin-") || !strings.HasPrefix(rootPinDir, ".hfdesk-delete-pin-") {
+		t.Fatalf("pin did not prefer source parent before repo-root fallback: %v", destinations)
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected entry remains after approved repo-root fallback: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+	assertNoTemporaryPinContainer(t, sourceParent)
+}
+
+func TestSelectedLocalDeleteCleansSourceParentPinThroughRetainedHandle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin binding fixture is Unix-specific")
+	}
+	root, foreign := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceParent := filepath.Join(repoDir, "nested")
+	movedParent := sourceParent + ".moved"
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, sourceParent, name)
+	selectedPath := filepath.Join(sourceParent, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	foreignMarker := filepath.Join(foreign, "keep.txt")
+	if err := os.WriteFile(foreignMarker, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.beforeHardLinkPin = func(source, _ string) error {
+		if source != filepath.ToSlash(filepath.Join("nested", name)) {
+			return nil
+		}
+		if err := os.Rename(sourceParent, movedParent); err != nil {
+			return err
+		}
+		return os.Symlink(foreign, sourceParent)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, filepath.ToSlash(filepath.Join("nested", name)))
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "parent") {
+		t.Fatalf("source-parent retarget status=%d body=%s, want diagnostic 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(movedParent, name)); err != nil {
+		t.Fatalf("retarget removed selected entry from the held parent: %v", err)
+	}
+	if data, err := os.ReadFile(foreignMarker); err != nil || string(data) != "keep" {
+		t.Fatalf("foreign parent target changed during cleanup: data=%q err=%v", data, err)
+	}
+	assertNoTemporaryPinContainer(t, movedParent)
+}
+
+func TestSelectedLocalDeleteHardLinkPinDetectsSameSizeReplacementBeforeFirstEffect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	firstPath := filepath.Join(repoDir, first)
+	if err := os.Chmod(firstPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(firstPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	originalInfo, err := os.Lstat(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		if err := os.Remove(firstPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(firstPath, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		replacementInfo, err := os.Lstat(firstPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("replacement reused the hard-link-pinned inode")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("hard-link-pinned replacement status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(firstPath); err != nil || string(data) != "new!" {
+		t.Fatalf("hard-link-pinned replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("other shard changed: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+}
+
+func TestSelectedLocalDeleteHardLinkPinReportsLaterReplacementTruthfully(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	sourceDir := filepath.Join(repoDir, "nested")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, sourceDir, first)
+	writeSelectionFile(t, sourceDir, second)
+	firstPath, secondPath := filepath.Join(sourceDir, first), filepath.Join(sourceDir, second)
+	if err := os.Chmod(firstPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secondPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(secondPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	if err := os.Chmod(repoDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(repoDir, 0755); err != nil {
+			t.Errorf("restore repo permissions for temporary fixture cleanup: %v", err)
+		}
+	})
+	if err := os.Chmod(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Lstat(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, "nested/"+first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 1 {
+			return
+		}
+		if err := os.Remove(secondPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(secondPath, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		replacementInfo, err := os.Lstat(secondPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("later replacement reused the hard-link-pinned inode")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("later hard-link-pinned replacement status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "nested/"+first || len(result.Remaining) != 1 || result.Remaining[0] != "nested/"+second {
+		t.Fatalf("partial response does not match actual effects: %+v", result)
+	}
+	if data, err := os.ReadFile(secondPath); err != nil || string(data) != "new!" {
+		t.Fatalf("later replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	assertNoTemporaryPinContainer(t, sourceDir)
+}
+
+func TestSelectedLocalDeleteHardLinkPinSetupFailureRefusesAndCleans(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin setup fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.beforeHardLinkPin = func(string, string) error {
+		return errors.New("injected unsupported hard-link pin")
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "injected unsupported hard-link pin") {
+		t.Fatalf("hard-link setup refusal status=%d body=%s, want diagnostic 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(selectedPath); err != nil {
+		t.Fatalf("failed pin setup changed selected file: %v", err)
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".hfdesk-delete-pin-") {
+			t.Fatalf("temporary pin container leaked after setup refusal: %s", entry.Name())
+		}
+	}
+}
+
+func TestSelectedLocalDeleteDoesNotFollowRetargetedPinContainer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin binding fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	foreign := filepath.Join(repoDir, "foreign")
+	if err := os.Mkdir(foreign, 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(foreign, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.beforeHardLinkPin = func(_, destination string) error {
+		container := filepath.Join(repoDir, filepath.Dir(filepath.FromSlash(destination)))
+		moved := container + ".moved"
+		if err := os.Rename(container, moved); err != nil {
+			return err
+		}
+		return os.Symlink(foreign, container)
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "binding changed") || !strings.Contains(w.Body.String(), "possible artifact remains") {
+		t.Fatalf("retargeted pin container status=%d body=%s, want diagnostic 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(selectedPath); err != nil {
+		t.Fatalf("pin-container retarget changed selected file: %v", err)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
+		t.Fatalf("foreign replacement directory changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestSelectedLocalDeleteReportsHardLinkCleanupFailureAfterEffects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin cleanup fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.removeHardLinkPin = func(*os.Root, string) error {
+		return errors.New("injected hard-link cleanup failure")
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("cleanup failure after selected deletion status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || len(result.Removed) != 1 || result.Removed[0] != name || len(result.Remaining) != 0 || !strings.Contains(strings.Join(result.Errors, ";"), "injected hard-link cleanup failure") {
+		t.Fatalf("cleanup-failure accounting is not truthful: %+v", result)
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected entry was not removed: %v", err)
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinContainer string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".hfdesk-delete-pin-") {
+			pinContainer = entry.Name()
+		}
+	}
+	if pinContainer == "" || !strings.Contains(strings.Join(result.Errors, ";"), pinContainer) {
+		t.Fatalf("possible retained pin artifact was not identified in errors: entries=%v errors=%v", entries, result.Errors)
+	}
+	if release, ok := s.jobs.beginCacheMutation(repoDir); !ok {
+		t.Fatal("writer reservation remained held after pin cleanup failure response")
+	} else {
+		release()
+	}
+}
+
+func TestSelectedLocalDeleteReportsPinRootCloseFailureAfterEffects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.closeHardLinkRoot = func(root *os.Root) error {
+		if err := root.Close(); err != nil {
+			return err
+		}
+		return errors.New("injected container close failure")
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("container close failure status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || len(result.Removed) != 1 || result.Removed[0] != name || len(result.Remaining) != 0 || !strings.Contains(strings.Join(result.Errors, ";"), "injected container close failure") {
+		t.Fatalf("container close failure accounting is not truthful: %+v", result)
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected entry was not removed: %v", err)
+	}
+	assertNoTemporaryPinContainer(t, repoDir)
+	if release, ok := s.jobs.beginCacheMutation(repoDir); !ok {
+		t.Fatal("writer reservation remained held after container close failure response")
+	} else {
+		release()
+	}
+}
+
+func TestSelectedLocalDeleteReportsRenamedHardLinkPinArtifact(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if probe, err := os.Open(selectedPath); err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		entries, err := os.ReadDir(repoDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var container string
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".hfdesk-delete-pin-") {
+				container = filepath.Join(repoDir, entry.Name())
+				break
+			}
+		}
+		if container == "" {
+			t.Fatal("temporary hard-link pin container was not created")
+		}
+		pins, err := os.ReadDir(container)
+		if err != nil || len(pins) != 1 {
+			t.Fatalf("temporary hard-link pin contents=%v err=%v", pins, err)
+		}
+		if err := os.Rename(filepath.Join(container, pins[0].Name()), filepath.Join(container, "moved-pin.entry")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("renamed pin artifact status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || len(result.Removed) != 1 || result.Removed[0] != name || len(result.Remaining) != 0 || !strings.Contains(strings.Join(result.Errors, ";"), "possible renamed artifact remains") {
+		t.Fatalf("renamed pin artifact accounting is incorrect: %+v", result)
+	}
+	if _, err := os.Lstat(selectedPath); !os.IsNotExist(err) {
+		t.Fatalf("selected entry was not removed: %v", err)
+	}
+	if release, ok := s.jobs.beginCacheMutation(repoDir); !ok {
+		t.Fatal("writer reservation remained held after renamed-pin cleanup response")
+	} else {
+		release()
+	}
+}
+
+func TestSelectedLocalDeleteReportsPinCleanupFailureBeforeEffects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-bit hard-link pin cleanup fixture is Unix-specific")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	name := "model-Q4_K_M.gguf"
+	writeSelectionFile(t, repoDir, name)
+	selectedPath := filepath.Join(repoDir, name)
+	if err := os.Chmod(selectedPath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(selectedPath)
+	if err == nil {
+		_ = probe.Close()
+		t.Skip("test process can still read mode-000 fixture")
+	}
+	if !os.IsPermission(err) {
+		t.Fatalf("open mode-000 fixture error=%v, want permission denied", err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	s.selectedDeleteHooks.forceHardLinkPin = true
+	s.selectedDeleteHooks.afterFinalScan = func() {
+		if err := os.Chmod(selectedPath, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(selectedPath, []byte("growth!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.selectedDeleteHooks.removeHardLinkPin = func(*os.Root, string) error {
+		return errors.New("injected refusal pin cleanup failure")
+	}
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, name)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "injected refusal pin cleanup failure") || !strings.Contains(w.Body.String(), "possible artifact remains") || !strings.Contains(w.Body.String(), ".hfdesk-delete-pin-") {
+		t.Fatalf("pre-effect cleanup failure status=%d body=%s, want diagnostic 409", w.Code, w.Body.String())
+	}
+	data, err := os.ReadFile(selectedPath)
+	if err != nil || string(data) != "growth!" {
+		t.Fatalf("pre-effect refusal changed selected file: data=%q err=%v", data, err)
+	}
+}
+
+func TestSelectedLocalDeleteDetectsRenamedSameSizeReplacementBeforeFirstUnlink(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		path := filepath.Join(repoDir, first)
+		replacement := path + ".replacement"
+		if err := os.WriteFile(replacement, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.Rename(replacement, path))
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("renamed same-size replacement status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, first)); err != nil || string(data) != "new!" {
+		t.Fatalf("renamed replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("unrelated shard changed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteReportsPartialAfterLaterMemberReplacement(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	originalInfo, err := os.Lstat(filepath.Join(repoDir, second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 1 {
+			return
+		}
+		path := filepath.Join(repoDir, second)
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.WriteFile(path, []byte("new!"), 0644))
+		replacementInfo, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalInfo, replacementInfo) {
+			t.Fatal("later replacement reused the selected inode despite the retained identity pin")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("later replacement status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != first || len(result.Remaining) != 1 || result.Remaining[0] != second {
+		t.Fatalf("partial response does not match actual effects: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, first)); !os.IsNotExist(err) {
+		t.Fatalf("first shard was not removed before the later replacement: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, second)); err != nil || string(data) != "new!" {
+		t.Fatalf("replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteReportsPartialAfterLaterRenameReplacement(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 1 {
+			return
+		}
+		path := filepath.Join(repoDir, second)
+		replacement := path + ".replacement"
+		if err := os.WriteFile(replacement, []byte("new!"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		requireReplacementFixtureOperation(t, os.Remove(path))
+		requireReplacementFixtureOperation(t, os.Rename(replacement, path))
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("later rename replacement status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != first || len(result.Remaining) != 1 || result.Remaining[0] != second {
+		t.Fatalf("partial response does not match actual effects: %+v", result)
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, second)); err != nil || string(data) != "new!" {
+		t.Fatalf("renamed replacement was removed or altered: data=%q err=%v", data, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteReportsInjectedUnlinkFailureTruthfully(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	first, second := "model-Q4_K_M-00001-of-00002.gguf", "model-Q4_K_M-00002-of-00002.gguf"
+	writeSelectionFile(t, repoDir, first)
+	writeSelectionFile(t, repoDir, second)
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, first)
+	s.selectedDeleteHooks.removeEntry = func(root *os.Root, name string) error {
+		if name == filepath.FromSlash(second) {
+			return errors.New("injected unlink failure")
+		}
+		return root.Remove(name)
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("unlink failure status=%d body=%s, want 207", w.Code, w.Body.String())
+	}
+	var result selectedDeleteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != first || len(result.Remaining) != 1 || result.Remaining[0] != second || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "injected unlink failure") {
+		t.Fatalf("unlink failure response does not match actual effects: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, first)); !os.IsNotExist(err) {
+		t.Fatalf("first shard was not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, second)); err != nil {
+		t.Fatalf("failed unlink unexpectedly removed second shard: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedLocalDeleteContinuesAfterOrdinaryUnlinkFailures(t *testing.T) {
+	for _, failIndex := range []int{0, 1} {
+		t.Run(fmt.Sprintf("member-%d", failIndex), func(t *testing.T) {
+			root := t.TempDir()
+			repoDir := filepath.Join(root, "owner", "model")
+			names := []string{
+				"model-Q4_K_M-00001-of-00003.gguf",
+				"model-Q4_K_M-00002-of-00003.gguf",
+				"model-Q4_K_M-00003-of-00003.gguf",
+			}
+			for _, name := range names {
+				writeSelectionFile(t, repoDir, name)
+			}
+			s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+			registerJobManagerCleanup(t, s)
+			body := selectedGroupRequest(t, s, "owner/model", repoDir, names[0])
+			failedName := names[failIndex]
+			s.selectedDeleteHooks.removeEntry = func(parent *os.Root, name string) error {
+				if name == failedName {
+					return errors.New("injected unlink failure")
+				}
+				return parent.Remove(name)
+			}
+
+			w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+			if w.Code != http.StatusMultiStatus {
+				t.Fatalf("unlink failure status=%d body=%s, want 207", w.Code, w.Body.String())
+			}
+			var result selectedDeleteResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			wantRemoved := make([]string, 0, 2)
+			for i, name := range names {
+				if i != failIndex {
+					wantRemoved = append(wantRemoved, name)
+				}
+			}
+			if len(result.Removed) != len(wantRemoved) || len(result.Remaining) != 1 || result.Remaining[0] != failedName || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "injected unlink failure") {
+				t.Fatalf("partial response does not match actual effects: %+v", result)
+			}
+			for i, name := range wantRemoved {
+				if result.Removed[i] != name {
+					t.Fatalf("removed entries=%v, want %v", result.Removed, wantRemoved)
+				}
+			}
+			for _, name := range wantRemoved {
+				if _, err := os.Stat(filepath.Join(repoDir, name)); !os.IsNotExist(err) {
+					t.Errorf("later eligible shard %q was not removed: %v", name, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(repoDir, failedName)); err != nil {
+				t.Errorf("failed shard %q unexpectedly changed: %v", failedName, err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.jobs.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -2004,6 +4340,7 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	modelScopes := freezeTestDirectories(t, rd.Path(), rd.FriendlyPath())
 	for name, job := range map[string]*Job{
 		"localRepo in the selected Hub": {
 			Repo: "upstream/source", LocalRepo: "owner/model", OutputDir: cache.Root, HubDir: cache.HubDir(),
@@ -2016,7 +4353,7 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if !hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, job) {
+			if !hfReservationConflictsJob(modelScopes, job) {
 				t.Fatal("writer to selected HF state was not blocked")
 			}
 		})
@@ -2026,11 +4363,108 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataset := &Job{Repo: "upstream/source", LocalRepo: "owner/model", IsDataset: true, OutputDir: cache.Root, HubDir: cache.HubDir()}
-	if hfReservationConflictsJob([]string{rd.Path(), rd.FriendlyPath()}, dataset) {
+	if hfReservationConflictsJob(modelScopes, dataset) {
 		t.Fatal("dataset actual namespace was mistaken for the selected model namespace")
 	}
-	if !hfReservationConflictsJob([]string{otherDataset.Path(), filepath.Join(cache.DatasetsDir(), "owner", "model")}, dataset) {
+	if !hfReservationConflictsJob(freezeTestDirectories(t, otherDataset.Path(), filepath.Join(cache.DatasetsDir(), "owner", "model")), dataset) {
 		t.Fatal("dataset LocalRepo destination was not recognized")
+	}
+}
+
+func TestHFReservationRejectsCompletedPlanWriter(t *testing.T) {
+	root := t.TempDir()
+	cache := hfdownloader.NewHFCache(root, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := filepath.Join(rd.FriendlyPath(), "weights-Q4_K_M.gguf.part")
+	if err := os.MkdirAll(filepath.Dir(part), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part, []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	planned, ok := plannedDestinationSet([]string{part})
+	if !ok {
+		t.Fatal("could not freeze completed writer plan")
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: root})
+	s.jobs.mu.Lock()
+	s.jobs.runActivities[1] = &jobWriteActivity{
+		job:     &Job{Repo: "owner/model", OutputDir: root, HubDir: cache.HubDir()},
+		planned: planned, planKnown: true, planComplete: true,
+	}
+	s.jobs.mu.Unlock()
+	if _, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
+		t.Fatal("HF reservation admitted while a completed plan retained a part writer in the selected repository")
+	}
+}
+
+func TestHFReservationKeepsBroadJobRepoScopeForCompleteEmptyPlan(t *testing.T) {
+	root := t.TempDir()
+	cache := hfdownloader.NewHFCache(root, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: root})
+	s.jobs.mu.Lock()
+	s.jobs.runActivities[1] = &jobWriteActivity{
+		job:          &Job{Repo: "owner/model", OutputDir: root, HubDir: cache.HubDir()},
+		planned:      map[string]frozenMutationPath{},
+		planKnown:    true,
+		planComplete: true,
+	}
+	s.jobs.mu.Unlock()
+	if _, ok := s.jobs.reserveSelectedHF(rd.Path(), rd.FriendlyPath()); ok {
+		t.Fatal("complete empty plan narrowed the active HF writer's broad repository scope")
+	}
+}
+
+func TestHFReservationBlocksCurrentRawWriterMapping(t *testing.T) {
+	parent := t.TempDir()
+	a, b := filepath.Join(parent, "a"), filepath.Join(parent, "b")
+	for _, dir := range []string{a, b} {
+		if err := os.MkdirAll(filepath.Join(dir, "hub"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(parent, "hub-alias")
+	if err := os.Symlink(a, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	cache := hfdownloader.NewHFCacheResolved(parent, filepath.Join(alias, "hub"), 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(parent, "cache")})
+	release, ok := s.jobs.reserveSelectedHF(rd.Path(), filepath.Join(parent, "selected-friendly"))
+	if !ok {
+		t.Fatal("could not reserve selected raw directory")
+	}
+	defer release()
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, alias); err != nil {
+		t.Fatal(err)
+	}
+	writer := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(alias, "hub")}
+	if !s.jobs.jobBlockedByDeleteLocked(writer) {
+		t.Fatal("writer using current raw Hub mapping was not blocked")
+	}
+	captured := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(a, "hub")}
+	if !s.jobs.jobBlockedByDeleteLocked(captured) {
+		t.Fatal("writer using the reservation's captured directory was not blocked")
+	}
+	disjoint := &Job{Repo: "owner/model", OutputDir: parent, HubDir: filepath.Join(parent, "other-hub")}
+	if s.jobs.jobBlockedByDeleteLocked(disjoint) {
+		t.Fatal("writer using a disjoint Hub was blocked")
 	}
 }
 
@@ -2057,6 +4491,62 @@ func TestSelectedDeleteUnlinksOnlyConfirmedFriendlyLeaf(t *testing.T) {
 	}
 	if _, err := os.Stat(payload); err != nil {
 		t.Fatalf("link target was changed: %v", err)
+	}
+}
+
+func TestSelectedDeleteDetectsReplacedLinkEntryAndPreservesBothTargets(t *testing.T) {
+	root, payloadDir := t.TempDir(), t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	firstTarget := filepath.Join(payloadDir, "first.gguf")
+	secondTarget := filepath.Join(payloadDir, "second.gguf")
+	if err := os.WriteFile(firstTarget, []byte("payload!"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondTarget, []byte("payload!"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repoDir, "model-Q4_K_M.gguf")
+	symlinkOrSkip(t, firstTarget, link)
+	originalLinkInfo, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	registerJobManagerCleanup(t, s)
+	body := selectedGroupRequest(t, s, "owner/model", repoDir, filepath.Base(link))
+	s.selectedDeleteHooks.beforeRemove = func(i int) {
+		if i != 0 {
+			return
+		}
+		requireReplacementFixtureOperation(t, os.Remove(link))
+		requireReplacementFixtureOperation(t, os.Symlink(secondTarget, link))
+		replacementInfo, err := os.Lstat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(originalLinkInfo, replacementInfo) {
+			t.Fatal("replacement symlink reused the pinned link identity")
+		}
+	}
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("replaced link status=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if target, err := os.Readlink(link); err != nil || target != secondTarget {
+		t.Fatalf("replacement link changed: target=%q err=%v", target, err)
+	}
+	for _, target := range []string{firstTarget, secondTarget} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("link deletion changed target %s: %v", target, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -2517,6 +5007,9 @@ func TestSelectedDeleteTracksBothRealGenerationsDuringRetry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("both downloader generations did not unwind")
 	}
+	// Reselect after both writers exit: the in-flight transfer may have changed
+	// the selected member's size, making the earlier request body stale.
+	body = selectedGroupRequest(t, s, "owner/model", root, "model-Q4_K_M.gguf")
 	w = cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete stayed busy after both generations exited: status=%d body=%s", w.Code, w.Body.String())
@@ -2563,16 +5056,136 @@ func TestSelectedDeleteAllowsActualNonOverlappingQ5Plan(t *testing.T) {
 	}
 }
 
+func TestPlannedDestinationSetRetainsRawCaseDistinctLookupPaths(t *testing.T) {
+	root := t.TempDir()
+	upper := filepath.Join(root, "Payload", "model.gguf")
+	lower := filepath.Join(root, "payload", "model.gguf")
+	planned, complete := plannedDestinationSet([]string{upper, lower})
+	if !complete {
+		t.Fatal("could not retain planned destinations")
+	}
+	if len(planned) != 2 {
+		t.Fatalf("case-distinct filesystem paths collapsed: %#v", planned)
+	}
+	for _, path := range []string{upper, lower} {
+		absolute, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := planned[absolute]; !ok {
+			t.Errorf("writer lookup path %q was not retained verbatim", absolute)
+		}
+	}
+}
+
+func TestPlannedDestinationSetFreezesPhysicalIdentityBeforeAliasRetarget(t *testing.T) {
+	actual := filepath.Join(t.TempDir(), "MixedCase", "Owner", "Model")
+	if err := os.MkdirAll(actual, 0755); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(actual, "model-Q4_K_M.gguf")
+	if err := os.WriteFile(selected, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "scan")
+	if err := os.Symlink(filepath.Dir(filepath.Dir(actual)), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	plannedRaw := filepath.Join(alias, "Owner", "Model", filepath.Base(selected))
+	planned, complete := plannedDestinationSet([]string{plannedRaw})
+	if !complete || len(planned) != 1 {
+		t.Fatalf("planned raw destination was not retained: %v complete=%t", planned, complete)
+	}
+	frozen, ok := planned[plannedRaw]
+	if !ok || frozen.physical != selected {
+		t.Fatalf("planned raw path did not retain its admitted physical identity: %+v", frozen)
+	}
+	selectedFrozen, err := freezeMutationEntry(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plannedEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("completed plan did not conflict with the selected physical entry")
+	}
+	other := filepath.Join(t.TempDir(), "OtherCase", "Owner", "Model")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(filepath.Dir(other)), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !plannedEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("retargeting the raw plan alias changed its frozen completed-plan conflict")
+	}
+	retargetedSelected := filepath.Join(other, filepath.Base(selected))
+	retargetedFrozen, err := freezeMutationEntry(retargetedSelected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{retargetedFrozen}, planned) {
+		t.Fatal("current raw plan alias did not conflict with its retargeted destination")
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("frozen plan identity no longer protects the original destination")
+	}
+}
+
+func TestIncompletePlannedRawDestinationIsRecheckedAfterItResolves(t *testing.T) {
+	selected := filepath.Join(t.TempDir(), "model-Q4_K_M.gguf")
+	if err := os.WriteFile(selected, []byte("selected"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "writer")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	plannedRaw := filepath.Join(alias, filepath.Base(selected))
+	planned, complete := plannedDestinationSet([]string{plannedRaw})
+	if complete || len(planned) != 1 {
+		t.Fatalf("unresolvable raw destination was not retained as incomplete: %v complete=%v", planned, complete)
+	}
+	selectedFrozen, err := freezeMutationEntry(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(selected), alias); err != nil {
+		t.Fatal(err)
+	}
+	if !plannedRawEntriesConflict([]frozenMutationPath{selectedFrozen}, planned) {
+		t.Fatal("raw destination that resolved into selected entry was not rechecked")
+	}
+}
+
 func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	root := t.TempDir()
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
 	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
 	running, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		releaseGate()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.jobs.Close(ctx)
+	}()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -2606,13 +5219,13 @@ func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Revision: "other", Filters: []string{"q5_k_m"}}); err != nil {
 		t.Fatalf("non-overlapping new Q5 job was rejected: %v", err)
 	}
-	releaseDelete()
-	release()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if !s.jobs.CancelJob(running.ID) {
 		t.Fatal("cancel active blocker failed")
 	}
+	releaseDelete()
+	releaseGate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
 		t.Fatal(err)
 	}

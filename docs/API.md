@@ -358,7 +358,13 @@ Successful response:
 The server freshly resolves the location and GGUF group and compares their IDs
 and exact member composition (paths, saved versions, size, and link role) with
 the confirmation. Request paths are not used as deletion authority. Local
-deletion removes only selected GGUF entries. For an HF location it removes the
+deletion removes only selected GGUF entries. The local symlink-member behavior
+described below is supported on Linux, Windows, and macOS. On other operating
+systems, the current implementation does not support identity-pinning a selected
+local symlink member, so the request returns `409` before unlinking, leaving the
+selected link and its target unchanged. This platform qualification applies to
+selected local symlink entries; it does not imply that other HFDesk features
+are unsupported on those operating systems. For an HF location it removes the
 selected named snapshot entries across the confirmed saved versions and only
 friendly entries whose relative names match the selected remote paths and
 which provably resolve to those entries: symlinks by their link chain, and
@@ -389,8 +395,37 @@ The server does not cancel jobs. HF mutation excludes writers to the
 selected repository reference namespace and associated friendly view. Local
 queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
 unlink results use `207` and identify removed, remaining, and failed paths
-(`errors`). A local symlink member is unlinked without following or deleting
-its target. The older `DELETE /api/cache/{owner}/{repo}` remains the separate
+(`errors`). On the supported platforms above, a local symlink member is unlinked
+without following or deleting its target. The authoritative delete-time
+enumeration and filesystem operations
+use one opened repository root and recheck each selected entry immediately
+before unlink; a detected configured-root alias change during admission is
+refused, and a later alias change does not redirect the operation to another
+location. The final identity
+check and unlink are not an atomic compare-and-remove against arbitrary external
+changes.
+On Darwin, when a selected regular file cannot be opened for identity pinning,
+the server may retain it with a hard link inside a private, request-local
+mode-0700 directory on the same filesystem, preferring the selected member's
+admitted parent. If permission prevents pin placement there, the known repository
+root may be tried as a fallback; HFDesk does not scan elsewhere for a pin
+location. If no approved pin location succeeds, deletion is refused with `409`
+before selected entries are unlinked. Pin cleanup is attempted before the
+response: cleanup failure before selected effects remains a `409` with artifact diagnostics;
+cleanup failure after selected effects returns `207`, with `removed` and
+`remaining` describing only selected entries and `errors` identifying cleanup
+failures and any possible pin artifacts. A process crash can leave the private
+pin directory behind; HFDesk does not scan for or automatically remove such
+orphaned directories.
+On operating systems other than Linux, Windows, and macOS, selected local
+regular files that cannot be read for identity pinning may also be refused with
+`409` before unlinking, even when the parent directory would otherwise permit
+unlinking. This is a limitation of the current selected-delete identity-pin
+implementation, not an inherent operating-system restriction or a general
+HFDesk support policy. Regular-file deletion remains supported on the released
+platforms above. The Darwin hard-link pin fallback described above is a separate
+platform-specific behavior.
+The older `DELETE /api/cache/{owner}/{repo}` remains the separate
 whole-repository operation.
 
 `GET /api/cache/{owner}/{repo}?type=model|dataset` also honors an explicit
