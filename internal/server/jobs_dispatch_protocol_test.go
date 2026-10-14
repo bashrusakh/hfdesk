@@ -31,7 +31,7 @@ func TestReservationDispatchCollectsOffLockAndCoalescesRequests(t *testing.T) {
 	}
 	target := filepath.Join(jobDestinationBase(job), "some-file.gguf")
 	m.mu.Lock()
-	m.deleteReservations[1] = []string{target}
+	m.deleteReservations[1] = freezeTestEntries(t, target)
 	m.bumpWriteDecisionLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
@@ -76,7 +76,7 @@ func TestReservationDispatchCloseDuringCollectDoesNotStart(t *testing.T) {
 		return inventoryWritableNamespace(base)
 	}
 	m.mu.Lock()
-	m.deleteReservations[1] = []string{filepath.Join(jobDestinationBase(job), "some-file.gguf")}
+	m.deleteReservations[1] = freezeTestEntries(t, filepath.Join(jobDestinationBase(job), "some-file.gguf"))
 	m.bumpWriteDecisionLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
@@ -108,7 +108,7 @@ func TestReservationDispatchKeepsYoungerQueuedBehindBlockedHead(t *testing.T) {
 	}
 	target := filepath.Join(jobDestinationBase(older), "blocked.gguf")
 	m.mu.Lock()
-	m.deleteReservations[1] = []string{target}
+	m.deleteReservations[1] = freezeTestEntries(t, target)
 	m.bumpWriteDecisionLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()
@@ -164,7 +164,7 @@ func TestReservationDispatchRejectsCapacitySnapshotChangedBeforeCommit(t *testin
 		return inventoryWritableNamespace(base)
 	}
 	m.mu.Lock()
-	m.deleteReservations[1] = []string{filepath.Join(root, "reserved.gguf")}
+	m.deleteReservations[1] = freezeTestEntries(t, filepath.Join(root, "reserved.gguf"))
 	m.bumpWriteDecisionLocked()
 	m.dispatchLocked()
 	m.mu.Unlock()

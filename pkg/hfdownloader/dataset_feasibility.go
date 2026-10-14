@@ -440,7 +440,7 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 	if err := datasetDecisionContextErr(c); err != nil {
 		return datasetDecisionQueryResult{Err: err}
 	}
-	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
+	if index < 0 || index >= len(c.Inputs) || !c.IsDataset || c.GGUFMode || len(c.Filters) == 0 {
 		return datasetDecisionQueryResult{}
 	}
 	if !requireIneligible && len(earlierCaseIneligible) == 0 {
@@ -1132,8 +1132,8 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	if err := datasetDecisionContextErr(c); err != nil {
 		return datasetDecisionEvaluation{}, err
 	}
-	if !c.IsDataset || !c.ExactMatch || c.GGUFMode || len(c.Filters) == 0 {
-		return datasetDecisionEvaluation{}, fmt.Errorf("concrete dataset evaluator requires an exact filtered non-GGUF dataset request")
+	if !c.IsDataset || c.GGUFMode || len(c.Filters) == 0 {
+		return datasetDecisionEvaluation{}, fmt.Errorf("concrete dataset evaluator requires a filtered non-GGUF dataset request")
 	}
 	recognizedLabels := make(map[string]bool, len(c.RecognizedLabels))
 	for _, label := range c.RecognizedLabels {
@@ -1144,7 +1144,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		if datasetDecisionContextErr(c) != nil {
 			return datasetDecisionEvaluation{}, datasetDecisionContextErr(c)
 		}
-		if recognizedLabels[f.Normalized] {
+		if recognizedLabels[f.Normalized] || !c.ExactMatch && recognizedDatasetFilter(c, f.Normalized) {
 			groupSelected = true
 			break
 		}
@@ -1191,6 +1191,9 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		}
 		r := &out.Records[i]
 		eligible := !in.Excluded && (direct[i] || (companions[i] && !in.LFS && (path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
+		if strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path) {
+			eligible = false
+		}
 		r.Eligible = eligible
 		if seenExact[in.Path] {
 			r.Skipped = true
@@ -1225,6 +1228,27 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		seenFold[strings.ToLower(in.Path)] = true
 	}
 	return out, nil
+}
+
+func datasetGGUFSelected(c datasetDecisionContext, filePath string) bool {
+	for _, filter := range c.Filters {
+		if filterMatchesPath(filePath, filter.Original, c.ExactMatch) {
+			return true
+		}
+	}
+	return false
+}
+
+func recognizedDatasetFilter(c datasetDecisionContext, filter string) bool {
+	if filter == "" {
+		return false
+	}
+	for _, label := range c.RecognizedLabels {
+		if strings.Contains(label, filter) {
+			return true
+		}
+	}
+	return false
 }
 
 func datasetDecisionContextErr(c datasetDecisionContext) error {

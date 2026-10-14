@@ -109,7 +109,7 @@ func TestPlanRepoPathFiltersKeepCompanionsAndSkipUnmatchedLFS(t *testing.T) {
 		t.Fatalf("PlanRepo: %v", err)
 	}
 	got := planPaths(plan)
-	want := []string{"config.json", "README.md", "diffusers/unet/diffusion_pytorch_model.safetensors", "diffusers/unet/README.md", "diffusers/config.json"}
+	want := []string{"config.json", "README.md", "diffusers/unet/diffusion_pytorch_model.safetensors", "diffusers/unet/README.md", "diffusers/config.json", "diffusers/vae/config.json"}
 	assertPaths(t, got, want)
 }
 
@@ -129,6 +129,198 @@ func TestPlanRepoDatasetSplitPathFilter(t *testing.T) {
 		t.Fatalf("PlanRepo: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"dataset_info.json", "train/data-00000-of-00001.parquet"})
+}
+
+func TestPlanRepoDatasetGGUFGuardComposesWithRootCompanions(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "model-test.gguf", Size: 20},
+		{Type: "file", Path: "model-train.gguf", Size: 30},
+		{Type: "file", Path: "blocked-test.gguf", Size: 40},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true, Excludes: []string{"blocked"}}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "model-train.gguf"})
+	if GGUFPathMayBeEmitted("model-test.gguf", job) {
+		t.Fatal("pre-plan projection admitted an unmatched root GGUF")
+	}
+	job.Excludes = []string{"model-test"}
+	if GGUFPathMayBeEmitted("model-test.gguf", job) {
+		t.Fatal("explicit exclude must dominate conservative projection")
+	}
+}
+
+func TestPlanRepoDatasetOrdinaryFiltersDoNotAdmitUnmatchedPayload(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "validation.csv", Size: 11},
+		{Type: "file", Path: "other.arrow", Size: 12},
+		{Type: "file", Path: "other/large.arrow", LFS: &hfLfsInfo{Size: 17}},
+		{Type: "file", Path: "model-test.gguf", Size: 13},
+		{Type: "file", Path: "config.json", Size: 14},
+		{Type: "file", Path: "nested/config.json", Size: 15},
+		{Type: "file", Path: "nested/other.csv", Size: 16},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	for _, tc := range []struct {
+		name   string
+		filter string
+		exact  bool
+		want   []string
+	}{
+		{"exact filename", "train.csv", true, []string{"train.csv", "config.json", "nested/config.json"}},
+		{"exact substring", "train", false, []string{"train.csv", "config.json"}},
+		{"extension selects matching data only", ".csv", true, []string{"train.csv", "validation.csv", "config.json", "nested/config.json", "nested/other.csv"}},
+		{"folder selects matching data only", "nested/", true, []string{"config.json", "nested/config.json", "nested/other.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{tc.filter}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, ExactMatch: true}
+	if GGUFPathMayBeEmitted("model-test.gguf", job) {
+		t.Fatal("pre-plan upper bound admitted an unmatched dataset root GGUF")
+	}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if containsString(planPaths(plan), "model-test.gguf") {
+		t.Fatal("actual plan emitted GGUF admitted only by the conservative projection")
+	}
+}
+
+func TestPlanRepoDatasetSubstringAndExactPathFiltersRemainDistinct(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{
+		{Type: "file", Path: "samples/trainish.csv", Size: 10},
+		{Type: "file", Path: "samples/other.csv", Size: 11},
+	})
+	defer srv.Close()
+	for _, tc := range []struct {
+		name  string
+		exact bool
+		want  []string
+	}{
+		{"substring", false, []string{"samples/trainish.csv"}},
+		{"exact", true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			if len(tc.want) == 0 {
+				if len(plan.Items) != 0 {
+					t.Fatalf("paths=%v, want no selected payload", planPaths(plan))
+				}
+				return
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
+}
+
+func TestPlanRepoDatasetGGUFFallbackRetainsOnlyRecognizedNonLFSMetadata(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+		{Type: "file", Path: "tokenizer/tokenizer.json", Size: 30},
+		{Type: "file", Path: "tokenizer/config.json", Size: 40},
+		{Type: "file", Path: "tokenizer/records.json", Size: 50},
+		{Type: "file", Path: "tokenizer/large.json", LFS: &hfLfsInfo{Size: 60}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/tokenizer.json", "tokenizer/config.json"})
+
+	plan, err = PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, Excludes: []string{"tokenizer.json"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo with explicit metadata exclude: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/config.json"})
+}
+
+func TestPlanRepoDatasetSubstringAndGGUFMetadataFallback(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "validation.csv", Size: 10},
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+		{Type: "file", Path: "tokenizer/tokenizer.json", Size: 30},
+		{Type: "file", Path: "other/records.json", Size: 40},
+		{Type: "file", Path: "tokenizer/config.json", Size: 50},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"alid"}}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"validation.csv"})
+
+	modelFiles := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+		{Type: "file", Path: "tokenizer/tokenizer.json", Size: 30},
+		{Type: "file", Path: "tokenizer/config.json", Size: 40},
+		{Type: "file", Path: "tokenizer/records.json", Size: 50},
+	}
+	modelServer := mockHFServerForPlan(t, modelFiles)
+	defer modelServer.Close()
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M"}}, Settings{Endpoint: modelServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/tokenizer.json", "tokenizer/config.json"})
+}
+
+func TestPlanRepoMetadataFallbackRespectsExcludesAndDoesNotSeedData(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train/data.parquet", Size: 10},
+		{Type: "file", Path: "other/config.json", Size: 20},
+		{Type: "file", Path: "other/tokenizer/tokenizer.json", Size: 30},
+		{Type: "file", Path: "other/records.json", Size: 40},
+		{Type: "file", Path: "other/blocked_config.json", Size: 50},
+		{Type: "file", Path: "other/large.json", LFS: &hfLfsInfo{Size: 60}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/model", ExactMatch: true,
+		Filters: []string{"train/"}, Excludes: []string{"blocked"},
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train/data.parquet", "other/config.json", "other/tokenizer/tokenizer.json"})
+}
+
+// Model-context tokenizer recognition is established; dataset basename alone
+// is not enough to assign that role. Dataset ambiguity handling is tested in
+// dataset_decision_test.go without selecting an unsupported policy.
+func TestPlanRepoModelTokenizerMetadataRetention(t *testing.T) {
+	model := mockHFServerForPlan(t, []hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20}, {Type: "file", Path: "tokenizer.json", Size: 12}})
+	defer model.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M"}, ExactMatch: true}, Settings{Endpoint: model.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer.json"})
 }
 
 func TestPlanRepoDatasetGroupFiltersSelectMembership(t *testing.T) {
@@ -413,7 +605,7 @@ func TestPlanRepoExactGGUFAndNoFilterRegression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filtered PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(filtered), []string{"model-q6_k.gguf"})
+	assertPaths(t, planPaths(filtered), []string{"model-q6_k.gguf", "config.json"})
 
 	unfiltered, err := PlanRepo(context.Background(), Job{Repo: "owner/gguf", Revision: "main"}, Settings{Endpoint: srv.URL})
 	if err != nil {
@@ -438,7 +630,7 @@ func TestPlanRepoGGUFQuantFilterKeepsMatchedREADMEOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md"})
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md", "config.json", "README.md"})
 }
 
 func TestPlanRepoREADMEOnlyFilterDoesNotEnableGGUFMode(t *testing.T) {
@@ -494,7 +686,7 @@ func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "config.json"})
 }
 
 func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
@@ -512,7 +704,7 @@ func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "config.json"})
 }
 
 // TestPlanRepoRejectsNonCanonicalTreePath is the canonical-path intake

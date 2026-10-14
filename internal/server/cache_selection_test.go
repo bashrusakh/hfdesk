@@ -25,6 +25,20 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
+func freezeTestEntries(t *testing.T, paths ...string) []frozenMutationPath {
+	t.Helper()
+	frozen := make([]frozenMutationPath, 0, len(paths))
+	for _, path := range paths {
+		value, err := freezeMutationEntry(path)
+		if err != nil {
+			t.Fatalf("freeze entry %q: %v", path, err)
+		}
+		value.raw = path
+		frozen = append(frozen, value)
+	}
+	return frozen
+}
+
 type cacheSelectionResponse struct {
 	Repo      string                   `json:"repo"`
 	Type      string                   `json:"type"`
@@ -5459,6 +5473,19 @@ func TestLocalGGUFWriterPredicateMatchesProductionFilters(t *testing.T) {
 	}
 	if hfdownloader.GGUFPathSelected("nested/model-Q4_K_M.gguf", []string{"q4_k_m"}, []string{"nested"}, false) {
 		t.Error("excluded relative path was considered writable")
+	}
+	for _, tc := range []struct {
+		path string
+		job  hfdownloader.Job
+		want bool
+	}{
+		{"model-test.gguf", hfdownloader.Job{IsDataset: true, ExactMatch: true, Filters: []string{"train"}}, false},
+		{"nested/model-test.gguf", hfdownloader.Job{IsDataset: true, ExactMatch: true, Filters: []string{"train"}}, false},
+		{"model-test.gguf", hfdownloader.Job{IsDataset: true, ExactMatch: true, Filters: []string{"train"}, Excludes: []string{"test"}}, false},
+	} {
+		if got := hfdownloader.GGUFPathMayBeEmitted(tc.path, tc.job); got != tc.want {
+			t.Errorf("GGUFPathMayBeEmitted(%q,%+v)=%v want %v", tc.path, tc.job, got, tc.want)
+		}
 	}
 }
 

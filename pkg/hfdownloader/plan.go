@@ -292,7 +292,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// coexist with GGUFs that happen to match the same filter. GGUF mode is the
 	// fallback only when no dataset group is recognized (e.g. a dataset repo
 	// containing a GGUF-only quant selection).
-	datasetGroupRequest := job.IsDataset && job.ExactMatch && len(job.Filters) > 0
+	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
 	if datasetGroupRequest {
 		membership := datasetselection.Recognize(datasetFiles)
 		// The group evaluator is reached only when a filter is recognized as a
@@ -308,7 +308,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				return nil, err
 			}
 			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
-			if containsString(context.RecognizedLabels, normalized) {
+			if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
 				datasetGroupRequest = true
 				break
 			}
@@ -454,15 +454,16 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// Inclusion and attribution come from one concrete dataset world.
 		} else if ggufMode {
 			// Keep only files that match a filter: the selected quant's shards
-			// and any mmproj companion. Everything else is skipped. The loop
-			// this replaced computed exactly directMatchedFilter (same name,
-			// filters, exact mode, longest-match rule).
+			// and any mmproj companion. Recognized model metadata may be retained
+			// when its component ownership is unknown, unless explicitly excluded.
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
-				continue
+				if isLFS || !isRecognizedModelMetadata(rel) {
+					continue
+				}
 			}
 		} else if len(job.Filters) > 0 {
 			// Same computation as the ggufMode branch above: directMatchedFilter.
@@ -478,8 +479,15 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					continue
 				}
 				dir := path.Dir(strings.ReplaceAll(rel, "\\", "/"))
-				if dir != "." {
-					if _, ok := matchedDirs[dir]; !ok {
+				// Dataset payload is never an implicit path-filter companion. The
+				// group evaluator above owns recognized group requests; ordinary
+				// filename/path/folder filters retain only directly matched data.
+				// Recognized non-LFS model metadata remains eligible outside that
+				// scope, as does the established model companion behavior.
+				if job.IsDataset || dir != "." {
+					_, inMatchedDir := matchedDirs[dir]
+					metadata := isRecognizedModelMetadata(rel) || job.IsDataset && isDatasetServiceMetadata(rel)
+					if !metadata && (job.IsDataset || !inMatchedDir) {
 						continue
 					}
 				}
@@ -592,6 +600,15 @@ func GGUFPathSelected(relativePath string, filters, excludes []string, exact boo
 	return false
 }
 
+func datasetFilterMatchesMembership(c datasetDecisionContext, filter string) bool {
+	for _, label := range c.RecognizedLabels {
+		if filterMatchesPath(label, filter, false) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsPath(dirs map[string]struct{}, dir string) bool {
 	for current := dir; current != "." && current != "/"; current = path.Dir(current) {
 		if _, ok := dirs[current]; ok {
@@ -642,6 +659,30 @@ func isExcludedPath(rel string, excludes []string) bool {
 		}
 	}
 	return false
+}
+
+// GGUFPathMayBeEmitted is the safe per-path projection used before a complete
+// plan exists. A GGUF can only be emitted when it survives excludes and directly
+// matches a filter; unlike ordinary root companions, unmatched GGUFs are never
+// emitted through unknown dataset ownership.
+func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
+	return GGUFPathSelected(relativePath, job.Filters, job.Excludes, job.ExactMatch)
+}
+
+// isRecognizedModelMetadata uses narrow, established model-context names. It
+// does not classify arbitrary JSON/TXT files or claim that every such name is
+// metadata in every repository.
+func isRecognizedModelMetadata(relativePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	switch base {
+	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json":
+		return true
+	}
+	return isREADMEPath(relativePath)
+}
+
+func isDatasetServiceMetadata(relativePath string) bool {
+	return strings.EqualFold(path.Base(strings.ReplaceAll(relativePath, "\\", "/")), "dataset_info.json")
 }
 
 // filterMatches reports whether filter fLower matches the file name nameLower

@@ -15,7 +15,7 @@ func createWithDeleteTargets(t *testing.T, m *JobManager, targets ...string) {
 	m.mu.Lock()
 	// Keep dispatcher behavior outside this CreateJob-only test boundary.
 	m.fenced = true
-	m.deleteReservations[1] = append([]string(nil), targets...)
+	m.deleteReservations[1] = freezeTestEntries(t, targets...)
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 }
@@ -34,8 +34,8 @@ func TestCreateJobReservationInventoryRunsOffLockAndUnionsTargets(t *testing.T) 
 	}
 	m.mu.Lock()
 	m.fenced = true
-	m.deleteReservations[1] = []string{filepath.Join(root, "one.gguf")}
-	m.deleteReservations[2] = []string{filepath.Join(root, "two.gguf")}
+	m.deleteReservations[1] = freezeTestEntries(t, filepath.Join(root, "one.gguf"))
+	m.deleteReservations[2] = freezeTestEntries(t, filepath.Join(root, "two.gguf"))
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	done := make(chan error, 1)
@@ -145,7 +145,7 @@ func TestCreateJobReservationBeginEndInvalidatesInventory(t *testing.T) {
 	go func() { _, _, err := m.CreateJob(DownloadRequest{Repo: "owner/reservation"}); done <- err }()
 	<-entered
 	m.mu.Lock()
-	m.deleteReservations[2] = []string{filepath.Join(root, "transient.gguf")}
+	m.deleteReservations[2] = freezeTestEntries(t, filepath.Join(root, "transient.gguf"))
 	m.bumpWriteDecisionLocked()
 	delete(m.deleteReservations, 2)
 	m.bumpWriteDecisionLocked()
@@ -224,10 +224,16 @@ func addRestartCandidate(m *JobManager, root, id string, status JobStatus) *Job 
 	return job
 }
 
-func addTwoDeleteReservations(m *JobManager, root string) {
+func addTwoDeleteReservations(t *testing.T, m *JobManager, root string) {
+	t.Helper()
+	paths := []frozenMutationPath{}
+	for _, name := range []string{"reserved-one.gguf", "reserved-two.gguf"} {
+		frozen := freezeTestEntries(t, filepath.Join(root, name))
+		paths = append(paths, frozen[0])
+	}
 	m.mu.Lock()
-	m.deleteReservations[1] = []string{filepath.Join(root, "reserved-one.gguf")}
-	m.deleteReservations[2] = []string{filepath.Join(root, "reserved-two.gguf")}
+	m.deleteReservations[1] = paths[:1]
+	m.deleteReservations[2] = paths[1:]
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 }
@@ -245,7 +251,7 @@ func TestResumeRetryReservationInventoryRunsOffLockAndUnionsTargets(t *testing.T
 			root := t.TempDir()
 			m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
 			job := addRestartCandidate(m, root, "restart", tc.status)
-			addTwoDeleteReservations(m, root)
+			addTwoDeleteReservations(t, m, root)
 			entered, release := make(chan struct{}), make(chan struct{})
 			var once sync.Once
 			calls := make(map[string]int)
@@ -482,7 +488,7 @@ func TestRestartReservationStateChangeDuringInventoryDoesNotReset(t *testing.T) 
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
 	job := addRestartCandidate(m, root, "changed", JobStatusFailed)
-	addTwoDeleteReservations(m, root)
+	addTwoDeleteReservations(t, m, root)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
@@ -516,7 +522,7 @@ func TestRestartReservationGenerationChangeForcesFreshInventory(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
 	job := addRestartCandidate(m, root, "generation", JobStatusFailed)
-	addTwoDeleteReservations(m, root)
+	addTwoDeleteReservations(t, m, root)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	calls := 0
@@ -553,7 +559,7 @@ func TestRestartReservationCloseDuringInventoryDrainsWithoutReset(t *testing.T) 
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
 	job := addRestartCandidate(m, root, "closing", JobStatusPaused)
-	addTwoDeleteReservations(m, root)
+	addTwoDeleteReservations(t, m, root)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {

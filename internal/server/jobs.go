@@ -618,7 +618,7 @@ resolveRequest:
 		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
 		var targets []string
 		for _, paths := range start.deletes {
-			targets = append(targets, paths...)
+			targets = append(targets, frozenPhysicalPaths(paths)...)
 		}
 		m.mu.Unlock()
 
@@ -880,7 +880,7 @@ func (m *JobManager) restartJob(id string, retry bool) bool {
 		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
 		targets := make([]string, 0)
 		for _, paths := range start.deletes {
-			targets = append(targets, paths...)
+			targets = append(targets, frozenPhysicalPaths(paths)...)
 		}
 		inventory := m.writeInventory
 		if inventory == nil {
@@ -1237,7 +1237,7 @@ func (m *JobManager) dispatchWithReservations() {
 		snapshot := a.start
 		var targets []string
 		for _, scopes := range snapshot.deletes {
-			targets = append(targets, scopes...)
+			targets = append(targets, frozenPhysicalPaths(scopes)...)
 		}
 		m.mu.Unlock()
 
