@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -177,8 +178,8 @@ func TestPlanRepo_GGUFOnlyFilterPreservesNonGGUFCompanionExclusion(t *testing.T)
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "model-Q4_K_M.gguf" {
-		t.Fatalf("GGUF-only selection included companions: %+v", plan.Items)
+	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf", "config.json", "tokenizer.json", "README.md"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GGUF-only selection paths=%v want recognized metadata fallback %v", got, want)
 	}
 }
 
@@ -205,7 +206,7 @@ func TestPlanRepo_GGUFModePreservesExplicitNonGGUFFilterMatches(t *testing.T) {
 			name:    "unmatched companions remain excluded",
 			files:   []hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100}, {Type: "file", Path: "config.json", Size: 20}, {Type: "file", Path: "README.md", Size: 30}},
 			filters: []string{"Q4_K_M"},
-			want:    []string{"model-Q4_K_M.gguf"},
+			want:    []string{"model-Q4_K_M.gguf", "config.json", "README.md"},
 		},
 	}
 	for _, tc := range cases {

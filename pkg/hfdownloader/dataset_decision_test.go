@@ -63,6 +63,25 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
+func TestDatasetMetadataNamesDoNotOverrideMembershipEvidence(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "train.csv"},
+		{Path: "tokenizer.json"},
+		{Path: "nested/dataset_info.json"},
+	}, []string{"train"}, nil)
+	if len(c.Inputs[1].Alternatives) < 2 {
+		t.Fatalf("dataset tokenizer basename must not establish metadata certainty: %+v", c.Inputs[1].Alternatives)
+	}
+	if c.Inputs[2].Excluded || len(c.Inputs[2].Alternatives) == 0 {
+		t.Fatalf("nested dataset_info must retain dataset membership evidence: %+v", c.Inputs[2])
+	}
+
+	excluded := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "nested/dataset_info.json"}}, []string{"train"}, []string{"dataset_info.json"})
+	if !excluded.Inputs[1].Excluded {
+		t.Fatal("explicit exclude did not dominate nested dataset metadata evidence")
+	}
+}
+
 func TestCanEmitDatasetDecisionStopsAtProvenNonEmission(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train/part.parquet"},

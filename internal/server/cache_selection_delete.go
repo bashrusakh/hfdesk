@@ -570,6 +570,7 @@ type selectedWriteEvidence struct {
 	filters     []string
 	excludes    []string
 	exactMatch  bool
+	isDataset   bool
 	aliases     bool
 }
 
@@ -613,6 +614,7 @@ func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamesp
 		filters:     append([]string(nil), job.Filters...),
 		excludes:    append([]string(nil), job.Excludes...),
 		exactMatch:  job.ExactMatch,
+		isDataset:   job.IsDataset,
 	}
 	for _, writable := range bases {
 		inv, ok := inventory(writable.path)
@@ -639,7 +641,7 @@ func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentit
 			if len(candidates) > 0 {
 				targetReachedNamespace = true
 				for _, candidate := range candidates {
-					if hfdownloader.GGUFPathSelected(candidate, evidence.filters, evidence.excludes, evidence.exactMatch) {
+					if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: evidence.filters, Excludes: evidence.excludes, ExactMatch: evidence.exactMatch, IsDataset: evidence.isDataset}) {
 						return true
 					}
 				}
@@ -666,7 +668,7 @@ func jobMayWriteSelectedPathWithinBase(inv writableNamespaceInventory, targetIde
 		return true
 	}
 	for _, candidate := range candidates {
-		if hfdownloader.GGUFPathSelected(candidate, job.Filters, job.Excludes, job.ExactMatch) {
+		if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: job.Filters, Excludes: job.Excludes, ExactMatch: job.ExactMatch, IsDataset: job.IsDataset}) {
 			return true
 		}
 	}
