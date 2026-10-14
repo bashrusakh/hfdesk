@@ -44,13 +44,15 @@ jobs:
           fi
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        # v3.0.3 (efb35369e0ad2afab669f228072c1b0d510eae64)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           body_path: release-notes.md
           draft: false
           prerelease: ${{ steps.version.outputs.prerelease }}
+          make_latest: ${{ steps.version.outputs.prerelease == 'true' && 'false' || '' }}
 
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
@@ -120,10 +122,11 @@ jobs:
           rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
 
       - name: Upload raw binary
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
 
   linux-desktop:
     name: Build Linux RPM
@@ -184,10 +187,11 @@ jobs:
             --define "rpmversion ${RPM_VERSION}"
 
       - name: Upload RPM
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: /tmp/rpm-output/**/*.rpm
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
 
   checksums:
     name: Generate checksums
@@ -212,7 +216,8 @@ jobs:
           cat checksums.txt
 
       - name: Upload checksums
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: release-files/checksums.txt
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
