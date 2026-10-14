@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -26,18 +27,18 @@ jobs:
         id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
+          RELEASE_DATA=$(bash .github/scripts/release-version.sh version "$TAG")
+          mapfile -t RELEASE_VERSION <<< "$RELEASE_DATA"
+          VERSION=${RELEASE_VERSION[0]}
+          PRERELEASE=${RELEASE_VERSION[1]}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
       - name: Extract release notes
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          awk -v version="$VERSION" '
-            /^## \[/ && index($0, "## [" version "]") == 1 { in_section=1; print; next }
-            in_section && /^## \[/ { exit }
-            in_section { print }
-          ' CHANGELOG.md > release-notes.md
+          bash .github/scripts/release-version.sh notes "$VERSION" CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
             printf 'See CHANGELOG.md for release notes.\n' > release-notes.md
           fi
@@ -49,7 +50,7 @@ jobs:
           name: ${{ steps.version.outputs.tag }}
           body_path: release-notes.md
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
 
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
@@ -139,8 +140,12 @@ jobs:
         env:
           TAG: ${{ needs.create-release.outputs.tag }}
         run: |
-          VERSION="${TAG#v}"
+          RELEASE_DATA=$(bash .github/scripts/release-version.sh version "$TAG")
+          mapfile -t RELEASE_VERSION <<< "$RELEASE_DATA"
+          VERSION=${RELEASE_VERSION[0]}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          RPM_VERSION=${RELEASE_VERSION[2]}
+          echo "rpm_version=$RPM_VERSION" >> $GITHUB_OUTPUT
 
       - name: Install rpmbuild
         run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm
@@ -169,12 +174,14 @@ jobs:
       - name: Build RPM
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RPM_VERSION: ${{ steps.version.outputs.rpm_version }}
         run: |
           rpmbuild -ba packaging/rpm/hfdesk.spec \
             --define "_sourcedir /tmp/rpm-sources" \
             --define "_rpmdir /tmp/rpm-output" \
             --define "_srcrpmdir /tmp/rpm-output" \
-            --define "appversion ${VERSION}"
+            --define "appversion ${VERSION}" \
+            --define "rpmversion ${RPM_VERSION}"
 
       - name: Upload RPM
         uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
