@@ -740,6 +740,66 @@ func TestCollectSnapshotIgnoresTerminalAndKnownPlanButFailsRelevantUnknownClosed
 	}
 }
 
+func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "owner", "repo")
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(base, filepath.Join(base, "loop")); err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{ID: "cycle", Repo: "owner/repo", OutputDir: root, Flat: true, Filters: []string{"selected.gguf"}, ExactMatch: true}
+	target := filepath.Join(root, "repoB", "selected.gguf")
+	if jobMayWriteSelectedPath(job, target) {
+		t.Fatal("irrelevant internal alias cycle blocked an unreachable target")
+	}
+	if !jobMayWriteSelectedPath(job, filepath.Join(base, "selected.gguf")) {
+		t.Fatal("reachable selected target was not recognized through the inventoried namespace")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "repoB"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, deleteFirst := range []bool{false, true} {
+		m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
+		m.fenced = true
+		queued := *job
+		queued.ID, queued.Status, queued.partialFilesMu = "cycle-writer", JobStatusQueued, &sync.Mutex{}
+		m.jobs[queued.ID] = &queued
+		if deleteFirst {
+			release, ok := m.reserveSelectedGGUF([]string{target})
+			if !ok {
+				t.Fatal("unreachable repoB deletion conflicted with cyclic repoA writer")
+			}
+			m.mu.Lock()
+			blocked := m.jobBlockedByDeleteLocked(&queued)
+			m.mu.Unlock()
+			release()
+			if blocked {
+				t.Fatal("cyclic repoA admission conflicted with unreachable repoB deletion")
+			}
+		} else if release, ok := m.reserveSelectedGGUF([]string{target}); !ok {
+			t.Fatal("repoB deletion conflicted with cyclic repoA writer")
+		} else {
+			release()
+		}
+		if err := m.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Unknown and outward mappings still prevent a negative answer.
+	if err := os.Remove(filepath.Join(base, "loop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(base, "outward")); err != nil {
+		t.Fatal(err)
+	}
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("outward alias did not retain conservative possible-writer handling")
+	}
+}
+
 func TestFailedInventoryIsMemoizedPerDescriptor(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))

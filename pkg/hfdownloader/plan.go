@@ -288,10 +288,17 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	}
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	var datasetEvaluation datasetDecisionEvaluation
-	datasetGroupRequest := job.IsDataset && job.ExactMatch && !ggufMode && len(job.Filters) > 0
+	// A recognized dataset group remains the governing selection when its files
+	// coexist with GGUFs that happen to match the same filter. GGUF mode is the
+	// fallback only when no dataset group is recognized (e.g. a dataset repo
+	// containing a GGUF-only quant selection).
+	datasetGroupRequest := job.IsDataset && job.ExactMatch && len(job.Filters) > 0
 	if datasetGroupRequest {
 		membership := datasetselection.Recognize(datasetFiles)
-		context := compileDatasetDecisionContextWithContext(ctx, fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, ggufMode)
+		// The group evaluator is reached only when a filter is recognized as a
+		// dataset label; do not let unrelated GGUF matches disable its membership
+		// and attribution model.
+		context := compileDatasetDecisionContextWithContext(ctx, fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, false)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}

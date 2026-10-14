@@ -340,6 +340,31 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 	}
 }
 
+func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train_records.csv", Size: 10},
+		{Type: "file", Path: "model-train.gguf", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "model-train-lfs.gguf", Size: 20},
+		{Type: "file", Path: "test_records.csv", Size: 10},
+		{Type: "file", Path: "model-test.gguf", LFS: &hfLfsInfo{Size: 100}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: []string{"train"}, ExactMatch: true, AppendFilterSubdir: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths=%v, want %v", got, want)
+	}
+	for _, item := range plan.Items {
+		if item.Subdir != "train" {
+			t.Errorf("%s attribution=%q, want train", item.RelativePath, item.Subdir)
+		}
+	}
+}
+
 func TestPlanRepoDatasetCaseSuppressedEligibleInputStillValidatesHash(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "Train.csv", Size: 10},
