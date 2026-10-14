@@ -440,6 +440,13 @@ func joinSlashPath(parts ...string) string {
 // cannot be enumerated finitely, which also forbids a negative answer.
 func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity string) ([]string, bool) {
 	parent := filepath.Dir(targetIdentity)
+	// Every inventoried alias resolves within inv.base. A target parent outside
+	// that closed physical namespace is therefore proved unreachable; do not let
+	// irrelevant alias cycles exhaust the spelling budget before returning this
+	// negative result.
+	if _, reachable := relativeWithin(inv.base, parent); !reachable {
+		return nil, true
+	}
 	spellings := map[string]map[string]struct{}{}
 	add := func(dir, spelling string) (bool, error) {
 		set, ok := spellings[dir]

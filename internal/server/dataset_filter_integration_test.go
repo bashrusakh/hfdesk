@@ -121,3 +121,84 @@ func TestDatasetAnalyzeSelectionAndPlanAPI(t *testing.T) {
 		t.Fatalf("selected plan paths=%v, want %v", got, want)
 	}
 }
+
+func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
+	files := []map[string]any{
+		{"type": "file", "path": "train_records.csv", "size": 10},
+		{"type": "file", "path": "model-train.gguf", "size": 100, "lfs": map[string]any{"size": 100}},
+		{"type": "file", "path": "model-train-lfs.gguf", "size": 20},
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/rev1"):
+			_ = json.NewEncoder(w).Encode(files)
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/refs"):
+			_, _ = w.Write([]byte(`{"branches":[]}`))
+		case strings.Contains(r.URL.Path, "/raw/"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	srv := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), Endpoint: hub.URL})
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/analyze/owner/data?dataset=true&revision=rev1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("analyze status=%d body=%s", response.Code, response.Body.String())
+	}
+	var analyzed struct {
+		SelectableItems []struct {
+			ID string `json:"id"`
+		} `json:"selectable_items"`
+		RecommendedDownload struct {
+			Filters    []string `json:"filters"`
+			ExactMatch bool     `json:"exactMatch"`
+		} `json:"recommended_download"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &analyzed); err != nil {
+		t.Fatal(err)
+	}
+	if !analyzed.RecommendedDownload.ExactMatch || !reflect.DeepEqual(analyzed.RecommendedDownload.Filters, []string{"train"}) {
+		t.Fatalf("recommended selection=%+v", analyzed.RecommendedDownload)
+	}
+	trainAdvertised := false
+	for _, item := range analyzed.SelectableItems {
+		trainAdvertised = trainAdvertised || item.ID == "train"
+	}
+	if !trainAdvertised {
+		t.Fatal("analyzer did not advertise the train group")
+	}
+	body, err := json.Marshal(DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: analyzed.RecommendedDownload.Filters, ExactMatch: analyzed.RecommendedDownload.ExactMatch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("plan status=%d body=%s", response.Code, response.Body.String())
+	}
+	var plan PlanResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0, len(plan.Files))
+	for _, file := range plan.Files {
+		paths = append(paths, file.Path)
+	}
+	if want := []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(paths, want) {
+		t.Fatalf("selected plan paths=%v, want %v", paths, want)
+	}
+	lfsByPath := make(map[string]bool, len(plan.Files))
+	for _, file := range plan.Files {
+		lfsByPath[file.Path] = file.LFS
+	}
+	if !lfsByPath["model-train.gguf"] || lfsByPath["model-train-lfs.gguf"] {
+		t.Fatalf("plan lost LFS/non-LFS representation: %v", lfsByPath)
+	}
+}
