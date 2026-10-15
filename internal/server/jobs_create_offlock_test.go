@@ -356,12 +356,18 @@ func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
 	finishDownload := func() { downloadOnce.Do(releaseDownload) }
 	defer finishDownload()
 	inventoryEntered, releaseInventory := make(chan struct{}), make(chan struct{})
+	schedulerInventoryEntered, releaseSchedulerInventory := make(chan struct{}), make(chan struct{})
 	m := newJobManagerWithStatePath(Config{LocalDir: runDir, Endpoint: hf.URL, MaxActive: 2}, nil, filepath.Join(root, "state"))
 	defer func() {
 		select {
 		case <-releaseInventory:
 		default:
 			close(releaseInventory)
+		}
+		select {
+		case <-releaseSchedulerInventory:
+		default:
+			close(releaseSchedulerInventory)
 		}
 		finishDownload()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -385,7 +391,14 @@ func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
 		if filepath.Clean(base) == candidateBase {
 			inventoryMu.Lock()
 			inventoryCalls++
+			call := inventoryCalls
 			inventoryMu.Unlock()
+			if call == 3 {
+				// A separate scheduler attempt may inventory the candidate after
+				// the retry is accepted. Gate it to scope the retry oracle.
+				close(schedulerInventoryEntered)
+				<-releaseSchedulerInventory
+			}
 			firstInventory.Do(func() {
 				close(inventoryEntered)
 				<-releaseInventory
@@ -465,14 +478,25 @@ func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("off-lock restart did not finish after inventory was released")
 	}
+	select {
+	case <-schedulerInventoryEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted retry did not reach its separate scheduler inventory")
+	}
 	inventoryMu.Lock()
 	gotInventoryCalls := inventoryCalls
 	inventoryMu.Unlock()
-	if gotInventoryCalls != 2 {
-		t.Fatalf("candidate namespace inventories=%d, want first stale attempt plus one fresh attempt", gotInventoryCalls)
+	if gotInventoryCalls != 3 {
+		t.Fatalf("candidate namespace inventories before scheduler release=%d, want two retry scans plus one gated scheduler scan", gotInventoryCalls)
 	}
 	if got, ok := m.GetJob(candidate.ID); !ok || (got.Status != JobStatusQueued && got.Status != JobStatusRunning && got.Status != JobStatusCompleted) || got.Progress.DownloadedBytes != 0 || len(got.Files) != 0 {
 		t.Fatalf("restart did not commit its expected clean retry after fresh evidence: %#v", got)
+	}
+	close(releaseSchedulerInventory)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatched restart runner did not reach its controlled download")
 	}
 	finishDownload()
 	if !m.WaitAll(5 * time.Second) {

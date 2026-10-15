@@ -853,6 +853,53 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 	}
 }
 
+func TestSelectedDeleteLeaseUsesWriterSelectedPathNotNamespace(t *testing.T) {
+	root := t.TempDir()
+	localA := filepath.Join(root, "local-a")
+	baseA := filepath.Join(localA, "owner", "repoA")
+	if err := os.MkdirAll(baseA, 0700); err != nil {
+		t.Fatal(err)
+	}
+	q4 := filepath.Join(baseA, "model-Q4_K_M.gguf")
+	q6 := filepath.Join(baseA, "model-Q6_K.gguf")
+	for _, p := range []string{q4, q6} {
+		if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	localB := filepath.Join(root, "local-b")
+	baseB := filepath.Join(localB, "owner", "repoB")
+	if err := os.MkdirAll(baseB, 0700); err != nil {
+		t.Fatal(err)
+	}
+	q6B := filepath.Join(baseB, "model-Q6_K.gguf")
+	if err := os.WriteFile(q6B, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	m.fenced = true
+	writer := &Job{ID: "writer-A", Repo: "owner/repoA", LocalDir: localA, Flat: true, Filters: []string{"Q6_K"}, ExactMatch: true, Status: JobStatusQueued, partialFilesMu: &sync.Mutex{}}
+	m.jobs[writer.ID] = writer
+	lease, ok := m.reserveSelectedGGUF([]string{q4})
+	if !ok {
+		t.Fatal("disjoint Q4_K entry lease was blocked by Q6_K writer")
+	}
+	otherRepo, ok := m.reserveSelectedGGUF([]string{q6B})
+	if !ok {
+		t.Fatal("repoA entry lease blocked disjoint repoB deletion")
+	}
+	otherRepo()
+	if sameRepo, ok := m.reserveSelectedGGUF([]string{q6}); ok {
+		sameRepo()
+		t.Fatal("queued Q6_K writer did not conflict with its selected Q6_K target")
+	}
+	lease()
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFailedInventoryIsMemoizedPerDescriptor(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))

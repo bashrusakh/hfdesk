@@ -522,16 +522,18 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 					return true
 				}
 			}
+			// A selected-delete lease owns one leaf entry, not its entire
+			// writer namespace. Ask each known writer's filter-aware evidence
+			// whether it can actually emit that entry; unknown inventories stay
+			// conservative because their reachable path set is unproven.
+			for key := range a.failed {
+				if _, known := a.descriptors[key]; known {
+					return true
+				}
+			}
 			for _, ev := range evidence {
-				for _, inv := range ev.inventories {
-					if mutationDirectoryEntryOverlap(inv.base, entry.rawOrPhysical()) {
-						return true
-					}
-					for _, alias := range inv.aliases {
-						if mutationDirectoryEntryOverlap(alias.location, entry.rawOrPhysical()) || mutationDirectoryEntryOverlap(alias.dest, entry.rawOrPhysical()) {
-							return true
-						}
-					}
+				if selectedWriteEvidenceMayWrite(ev, []string{entry.physical}) {
+					return true
 				}
 			}
 		}
