@@ -173,6 +173,11 @@ Request:
 
 Returns the files that would be downloaded without starting a job.
 
+When `filters` is non-empty and no non-excluded repository-relative path matches
+or recognized dataset-group membership selects data, the request fails with
+`400` and error code `no_filter_match`; retained companion/metadata files alone
+never make a filtered request succeed.
+
 ## Download
 
 ```http

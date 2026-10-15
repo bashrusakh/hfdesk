@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -154,14 +155,19 @@ func TestPlanRepo_FilteredGGUFDoesNotIncludeUnmatchedNonLFSQuant(t *testing.T) {
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 
+	// The planner now rejects a filtered request with zero direct matches
+	// outright (this scenario is non-empty Filters with nothing matched), so
+	// no plan exists at all. That subsumes the previous err == nil plus
+	// empty-plan assertion: an unmatched GGUF can never enter a plan, a
+	// fortiori because the scan fails first.
 	plan, err := PlanRepo(context.Background(), Job{
 		Repo: "owner/repo", Revision: "main", Filters: []string{"Q5_K_M"},
 	}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatalf("PlanRepo: %v", err)
+	if !errors.Is(err, ErrNoFilterMatch) {
+		t.Fatalf("PlanRepo error = %v, want ErrNoFilterMatch", err)
 	}
-	if len(plan.Items) != 0 {
-		t.Fatalf("PlanRepo included unmatched GGUF: %+v", plan.Items)
+	if plan != nil {
+		t.Fatalf("PlanRepo returned a plan despite zero filter matches: %+v", plan.Items)
 	}
 }
 

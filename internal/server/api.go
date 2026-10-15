@@ -201,6 +201,14 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	// For now, we'll scan the repo manually
 	err := hfdownloader.ScanPlan(ctx, dlJob, settings, progressFunc)
 	if err != nil {
+		// A filtered request whose filters matched no file is a client-side
+		// selection problem, not a server failure: report it as 400 so callers
+		// can distinguish "nothing matched" from a broken scan.
+		if errors.Is(err, hfdownloader.ErrNoFilterMatch) {
+			writeAPIError(w, http.StatusBadRequest, "no_filter_match",
+				"No files match the requested filters", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to scan repository", err.Error())
 		return
 	}

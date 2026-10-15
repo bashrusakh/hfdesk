@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -24,16 +25,17 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 		label string
 	}
 	tests := []struct {
-		name       string
-		files      []hfNode
-		filter     string
-		exact      bool
-		excludes   []string
-		roles      [][]roleLabel
-		direct     []bool // hand-authored literal/path matches, independent of membership
-		want       []string
-		worldSets  [][]string // independent final sets for role alternatives when relevant
-		wantRefuse bool
+		name        string
+		files       []hfNode
+		filter      string
+		exact       bool
+		excludes    []string
+		roles       [][]roleLabel
+		direct      []bool // hand-authored literal/path matches, independent of membership
+		want        []string
+		wantNoMatch bool
+		worldSets   [][]string // independent final sets for role alternatives when relevant
+		wantRefuse  bool
 	}{
 		{
 			name: "literal train substring is additive to membership",
@@ -79,8 +81,8 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 				{{datasetselection.EvidenceRoleData, "train"}},
 				{{datasetselection.EvidenceRoleData, "default"}},
 			},
-			direct: []bool{true, true},
-			want:   []string{},
+			direct:      []bool{true, true},
+			wantNoMatch: true,
 		},
 		{
 			name: "duplicate direct and membership path emits once",
@@ -243,6 +245,12 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 				wantErr := fmt.Sprintf("dataset filter selection has ambiguous emitted set for %q", tt.files[0].Path)
 				if err == nil || !strings.Contains(err.Error(), wantErr) {
 					t.Fatalf("PlanRepo error=%v; want path-specific ambiguity %q (plan=%v)", err, wantErr, planPaths(plan))
+				}
+				return
+			}
+			if tt.wantNoMatch {
+				if !errors.Is(err, ErrNoFilterMatch) || plan != nil {
+					t.Fatalf("PlanRepo plan=%v error=%v; want nil plan and ErrNoFilterMatch", planPaths(plan), err)
 				}
 				return
 			}

@@ -252,14 +252,14 @@ func TestPlanRepoDatasetSubstringAndExactPathFiltersRemainDistinct(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
-			if err != nil {
-				t.Fatalf("PlanRepo: %v", err)
-			}
-			if len(tc.want) == 0 {
-				if len(plan.Items) != 0 {
-					t.Fatalf("paths=%v, want no selected payload", planPaths(plan))
+			if tc.exact {
+				if !errors.Is(err, ErrNoFilterMatch) || plan != nil {
+					t.Fatalf("PlanRepo plan=%v error=%v; want nil plan and ErrNoFilterMatch", planPaths(plan), err)
 				}
 				return
+			}
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
 			}
 			assertPaths(t, planPaths(plan), tc.want)
 		})

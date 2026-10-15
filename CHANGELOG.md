@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Filtered plan/download scans no longer succeed when no non-excluded path directly matches and no recognized dataset membership selects data: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
+
 ## [1.3.0-beta.1] - 2026-10-15
 
 Beta release; see Beta limitations and compatibility below.

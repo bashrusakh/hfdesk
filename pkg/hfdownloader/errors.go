@@ -24,6 +24,12 @@ var (
 
 	// ErrRateLimited is returned when the API rate limit is exceeded.
 	ErrRateLimited = errors.New("rate limited: too many requests")
+
+	// ErrNoFilterMatch is returned when a filtered scan finds neither a
+	// non-excluded direct path match nor a selected dataset-membership match, so
+	// a successful plan would consist only of companion/metadata files the user
+	// never selected. Distinguishable via errors.Is.
+	ErrNoFilterMatch = errors.New("no files matched requested filters")
 )
 
 // DownloadError wraps an error with file context.

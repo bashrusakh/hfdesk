@@ -225,6 +225,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	var items []PlanItem
 	seen := make(map[string]struct{})      // ensure each relative path appears once in the plan
 	seenLower := make(map[string]struct{}) // ensure each path appears at most once modulo case
+	// A filtered scan must prove that at least one non-excluded file directly
+	// matched the request. Dataset membership selection is tracked separately
+	// below because it can select rows without a literal path match.
+	directFilterMatch := false
+	datasetMembershipMatch := false
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
@@ -279,6 +284,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
+		if len(job.Filters) > 0 && !isExcludedPath(n.Path, job.Excludes) {
+			for _, filter := range job.Filters {
+				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+					directFilterMatch = true
+					break
+				}
+			}
+		}
 	}
 	datasetMembership := datasetselection.Recognize(datasetFiles)
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
@@ -376,6 +389,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			if evalErr != nil {
 				return nil, fmt.Errorf("evaluate dataset selection: %w", evalErr)
 			}
+			if recognizedDatasetGroup {
+				for i, record := range datasetEvaluation.Records {
+					if record.Selected && world.DataLabels[i] != "" && !world.Companion[i] {
+						datasetMembershipMatch = true
+						break
+					}
+				}
+			}
 		}
 	}
 	matchedDirs := make(map[string]struct{})
@@ -435,9 +456,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if excluded {
 			continue
 		}
-
-		// Determine which filter (if any) matches this file name, prefer the longest match
-		// Filter matching is case-insensitive (e.g., q4_0 matches Q4_0)
+		// matchedFilter feeds PlanItem.Subdir and is set only by the established
+		// inclusion branches below; direct selection proof is tracked separately.
 		matchedFilter := ""
 		if datasetGroupRequest {
 			matchedFilter = datasetRecord.Subdir
@@ -576,6 +596,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	// A non-empty filter set must directly match a non-excluded path, or
+	// select data through the recognized dataset-membership contract. Merely
+	// retaining companions/metadata cannot make an otherwise empty selection
+	// succeed. An unfiltered empty repository remains valid.
+	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
+		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
