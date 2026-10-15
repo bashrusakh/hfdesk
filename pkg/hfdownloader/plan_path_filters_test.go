@@ -229,9 +229,9 @@ func TestPlanRepoDatasetOrdinaryFiltersDoNotAdmitUnmatchedPayload(t *testing.T) 
 		want    []string
 		wantErr bool
 	}{
-		{"exact filename refuses role-dependent metadata", "train.csv", true, nil, true},
+		{"exact filename ignores unrelated metadata role ambiguity", "train.csv", true, []string{"train.csv", "config.json"}, false},
 		{"exact substring group ambiguity", "train", false, nil, true},
-		{"extension refuses role-dependent metadata", ".csv", true, nil, true},
+		{"extension selection ignores unrelated metadata role ambiguity", ".csv", true, []string{"train.csv", "validation.csv", "config.json", "nested/other.csv"}, false},
 		{"folder directly selects metadata in both roles", "nested/", true, []string{"config.json", "nested/config.json", "nested/other.csv"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -300,12 +300,14 @@ func TestPlanRepoDatasetGGUFFallbackUsesRoleAwareSelectionAndRetainsMetadata(t *
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"weights/model.gguf"}, ExactMatch: true}
-	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
-		t.Fatalf("role-dependent metadata plan=%+v err=%v; want refusal", plan, err)
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("explicit GGUF path must not be refused due to unrelated metadata role uncertainty: %v", err)
 	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "dataset_info.json"})
 
 	job.Filters = []string{"weights/model.gguf", "nested/config.json"}
-	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("explicit path resolves role alternatives: %v", err)
 	}
@@ -429,7 +431,7 @@ func TestPlanRepoDatasetDoesNotInferModelVocabMetadataFromBasename(t *testing.T)
 	assertPaths(t, planPaths(plan), []string{"train.csv"})
 }
 
-func TestPlanRepoDatasetOrdinaryFilterRefusesOnlyEmittedSetRoleAmbiguity(t *testing.T) {
+func TestPlanRepoDatasetOrdinaryPathSelectionSurvivesMetadataRoleAmbiguity(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "selected.csv", Size: 10},
 		{Type: "file", Path: "train/config.json", Size: 11},
@@ -439,12 +441,14 @@ func TestPlanRepoDatasetOrdinaryFilterRefusesOnlyEmittedSetRoleAmbiguity(t *test
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"selected.csv"}, ExactMatch: true}
-	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
-		t.Fatalf("ordinary filter with differing metadata role outcomes plan=%+v err=%v; want refusal", plan, err)
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("ordinary path selection must not be refused due to unrelated metadata role uncertainty: %v", err)
 	}
+	assertPaths(t, planPaths(plan), []string{"selected.csv"})
 
 	job.Filters = []string{"selected.csv", "nested/dataset_info.json"}
-	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("explicit metadata path should resolve alternatives: %v", err)
 	}

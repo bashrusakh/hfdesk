@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -320,6 +321,57 @@ func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) 
 		if err != nil || string(got) != want {
 			t.Errorf("append-disabled destination %s = %q, err=%v; want %q", rel, got, err, want)
 		}
+	}
+}
+
+func TestDownload_DatasetGroupDestinationIndependentOfMatchedGGUF(t *testing.T) {
+	for _, withGGUF := range []bool{false, true} {
+		t.Run(fmt.Sprintf("matched_gguf_%t", withGGUF), func(t *testing.T) {
+			files := []hfNode{{Type: "file", Path: "train_records.csv", Size: 4}}
+			if withGGUF {
+				files = append(files, hfNode{Type: "file", Path: "model-train.gguf", Size: 4})
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/revision/main"):
+					_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+				case strings.Contains(r.URL.Path, "/tree/"):
+					_ = json.NewEncoder(w).Encode(files)
+				case strings.HasSuffix(r.URL.Path, "/train_records.csv"):
+					_, _ = w.Write([]byte("data"))
+				case strings.HasSuffix(r.URL.Path, "/model-train.gguf"):
+					_, _ = w.Write([]byte("model"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			out := t.TempDir()
+			job := Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: []string{"train"}, ExactMatch: true, AppendFilterSubdir: true}
+			settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
+			if err := Download(context.Background(), job, settings, nil); err != nil {
+				t.Fatalf("Download: %v", err)
+			}
+			base, err := DestinationBase(out, job.Repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(base, "train_records.csv"))
+			if err != nil || string(data) != "data" {
+				t.Fatalf("dataset destination = %q, err=%v; want repo root independent of GGUF matches", data, err)
+			}
+			_, statErr := os.Stat(filepath.Join(base, "train", "train_records.csv"))
+			if !os.IsNotExist(statErr) {
+				t.Errorf("dataset was relocated under train/: stat err=%v", statErr)
+			}
+			if withGGUF {
+				model, err := os.ReadFile(filepath.Join(base, "train", "model-train.gguf"))
+				if err != nil || string(model) != "model" {
+					t.Errorf("selected GGUF destination = %q, err=%v; want train/model-train.gguf", model, err)
+				}
+			}
+		})
 	}
 }
 
