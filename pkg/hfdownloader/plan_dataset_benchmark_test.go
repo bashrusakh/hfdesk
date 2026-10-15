@@ -206,3 +206,38 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPlanRepoDatasetOrdinarySelectorInventory(b *testing.B) {
+	for _, count := range []int{1001, 3001} {
+		b.Run(fmt.Sprintf("files-%d", count), func(b *testing.B) {
+			files := make([]hfNode, 0, count)
+			files = append(files, hfNode{Type: "file", Path: "selected.csv", Size: 10})
+			for i := 1; i < count; i++ {
+				files = append(files, hfNode{Type: "file", Path: fmt.Sprintf("records-%04d.json", i), Size: 10})
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/datasets/owner/data/revision/main":
+					_, _ = w.Write([]byte(`{"sha":"bench"}`))
+				case "/api/datasets/owner/data/tree/main":
+					_ = json.NewEncoder(w).Encode(files)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"selected.csv"}, ExactMatch: true}
+			cfg := Settings{Endpoint: server.URL}
+			if plan, err := PlanRepo(context.Background(), job, cfg); err != nil || len(plan.Items) != 1 || plan.Items[0].RelativePath != "selected.csv" {
+				b.Fatalf("PlanRepo = %+v, err=%v; want only selected.csv", plan, err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := PlanRepo(context.Background(), job, cfg); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -331,38 +331,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// Ordinary non-GGUF dataset selectors also use the shared evaluator,
 			// but retain their distinct path-filter semantics and ambiguity scope.
 			datasetGroupRequest = true
-			// A plan is useful only when every emitted path is invariant across
-			// complete admissible interpretations. Keep the eventual path set and
-			// filter attribution together in one admissible concrete world.
-			for i, n := range fileNodes {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				can, cannot := datasetDecisionRefusal(context, i)
-				if can.Err != nil {
-					return nil, can.Err
-				}
-				if cannot.Err != nil {
-					return nil, cannot.Err
-				}
-				if can.Possible && cannot.Possible {
-					groupSelectionAmbiguous := false
-					for _, filter := range job.Filters {
-						if err := ctx.Err(); err != nil {
-							return nil, err
-						}
-						normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
-						if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
-							groupSelectionAmbiguous = true
-							break
-						}
-					}
-					ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
-					if groupSelectionAmbiguous || ordinaryMetadataAmbiguous {
-						return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q", n.Path)
-					}
-				}
-			}
+			// Whole-inventory refusal proofs run after a concrete selection is
+			// established and only for paths whose uncertainty can trigger refusal.
 			world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
 			for bit := range collisionTokenBits(context) {
 				world.SharedToken[bit] = false
@@ -395,6 +365,39 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 						datasetMembershipMatch = true
 						break
 					}
+				}
+			}
+			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
+				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
+			}
+			groupSelectionAmbiguous := false
+			for _, filter := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+				if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
+					groupSelectionAmbiguous = true
+					break
+				}
+			}
+			for i, n := range fileNodes {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
+				if !groupSelectionAmbiguous && !ordinaryMetadataAmbiguous {
+					continue
+				}
+				can, cannot := datasetDecisionRefusal(context, i)
+				if can.Err != nil {
+					return nil, can.Err
+				}
+				if cannot.Err != nil {
+					return nil, cannot.Err
+				}
+				if can.Possible && cannot.Possible {
+					return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q", n.Path)
 				}
 			}
 		}
