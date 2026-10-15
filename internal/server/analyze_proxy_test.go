@@ -171,6 +171,48 @@ func TestAnalyzeAndPlanProxy(t *testing.T) {
 	}
 }
 
+// TestPlanNoFilterMatchMapsToBadRequest pins the API mapping for a filtered
+// plan whose filters match no file in the tree (the bonsai defect shape:
+// a PQ2_0 quant plus metadata, requested with exact "q2_0"): 400 with error
+// code no_filter_match, not the generic 500 scan-failure path.
+func TestPlanNoFilterMatchMapsToBadRequest(t *testing.T) {
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			io.WriteString(w, `{"sha":"deadbeef"}`)
+		case strings.Contains(r.URL.Path, "/tree/"):
+			io.WriteString(w, `[{"type":"file","path":"model-PQ2_0.gguf","size":100},{"type":"file","path":"README.md","size":20},{"type":"file","path":"LICENSE","size":10},{"type":"file","path":"assets/logo.svg","size":5}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+	s := newTestServerWithConfig(t, Config{
+		Endpoint:  hub.URL,
+		ModelsDir: t.TempDir(),
+		CacheDir:  t.TempDir(),
+		Proxy:     &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+
+	w := httptest.NewRecorder()
+	s.handlePlan(w, httptest.NewRequest("POST", "/api/plan",
+		strings.NewReader(`{"repo":"owner/model","filters":["q2_0"],"exactMatch":true}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		ErrorDetail *struct {
+			Code string `json:"code"`
+		} `json:"error_detail"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ErrorDetail == nil || resp.ErrorDetail.Code != "no_filter_match" {
+		t.Fatalf("error code = %+v, want no_filter_match; body=%s", resp.ErrorDetail, w.Body.String())
+	}
+}
+
 func TestAnalyzeMetadataErrorVisible(t *testing.T) {
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
