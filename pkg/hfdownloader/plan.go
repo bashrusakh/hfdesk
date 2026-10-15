@@ -604,7 +604,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		seenLower[relLower] = struct{}{}
 
 		destinationSubdir := matchedFilter
-		if job.IsDataset && !isLFS {
+		if job.IsDataset && !isLFS && !ggufMode {
 			destinationSubdir = ""
 		}
 		items = append(items, PlanItem{

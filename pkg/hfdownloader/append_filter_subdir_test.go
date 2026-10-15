@@ -158,3 +158,150 @@ func TestDownload_DatasetOrdinaryNonLFSFilterPreservesRootDestinations(t *testin
 		t.Fatalf("append-disabled control destination = %q, err=%v; want downloaded data at repo root", controlBytes, err)
 	}
 }
+
+func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "Q4_K_M/model-Q4_K_M.gguf", Size: 4},
+				{Type: "file", Path: "README-Q4_K_M.md", Size: 4},
+				{Type: "file", Path: "train.csv", Size: 4},
+			})
+		case r.URL.Path == "/datasets/owner/data/raw/main/Q4_K_M/model-Q4_K_M.gguf":
+			_, _ = w.Write([]byte("gguf"))
+		case r.URL.Path == "/datasets/owner/data/raw/main/README-Q4_K_M.md":
+			_, _ = w.Write([]byte("read"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out := t.TempDir()
+	base, err := DestinationBase(out, "owner/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := Job{
+		Repo: "owner/data", Revision: "main", IsDataset: true,
+		Filters: []string{"Q4_K_M"}, ExactMatch: true, AppendFilterSubdir: true,
+	}
+	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
+	plan, err := PlanRepo(context.Background(), job, settings)
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	for _, rel := range []string{"Q4_K_M/model-Q4_K_M.gguf", "README-Q4_K_M.md"} {
+		found := false
+		for _, item := range plan.Items {
+			if item.RelativePath == rel {
+				found = true
+				if item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M" {
+					t.Errorf("%s attribution/destination = %q/%q, want Q4_K_M/Q4_K_M", rel, item.Subdir, item.destinationSubdir)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("plan omitted direct GGUF-mode selection %s", rel)
+		}
+	}
+	var planPaths []string
+	if err := Download(context.Background(), job, settings, func(event ProgressEvent) {
+		if event.Event == "plan_item" {
+			planPaths = append(planPaths, event.Path)
+		}
+	}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	wantPaths := map[string]bool{
+		"Q4_K_M/Q4_K_M/model-Q4_K_M.gguf": true,
+		"Q4_K_M/README-Q4_K_M.md":         true,
+	}
+	for _, p := range planPaths {
+		if !wantPaths[p] {
+			t.Errorf("unexpected plan_item path %q", p)
+		}
+		delete(wantPaths, p)
+	}
+	for p := range wantPaths {
+		t.Errorf("missing plan_item path %q", p)
+	}
+	for rel, want := range map[string]string{
+		"Q4_K_M/Q4_K_M/model-Q4_K_M.gguf": "gguf",
+		"Q4_K_M/README-Q4_K_M.md":         "read",
+	} {
+		got, err := os.ReadFile(filepath.Join(base, filepath.FromSlash(rel)))
+		if err != nil || string(got) != want {
+			t.Errorf("destination %s = %q, err=%v; want %q", rel, got, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(base, "train.csv")); !os.IsNotExist(err) {
+		t.Errorf("unmatched dataset payload exists at root: err=%v", err)
+	}
+
+	cacheRoot := t.TempDir()
+	cacheSettings := Settings{
+		Endpoint: server.URL, CacheDir: cacheRoot,
+		Concurrency: 1, MaxActiveDownloads: 1,
+	}
+	if err := Download(context.Background(), job, cacheSettings, nil); err != nil {
+		t.Fatalf("Download to HF cache: %v", err)
+	}
+	for _, rel := range []string{"Q4_K_M/model-Q4_K_M.gguf", "README-Q4_K_M.md"} {
+		friendly := filepath.Join(cacheRoot, "datasets", "owner", "data", "Q4_K_M", filepath.FromSlash(rel))
+		if _, err := os.Stat(friendly); err != nil {
+			t.Errorf("HF-friendly destination %s: %v", friendly, err)
+		}
+		snapshot := filepath.Join(cacheRoot, "hub", "datasets--owner--data", "snapshots", "deadbeef", filepath.FromSlash(rel))
+		if _, err := os.Stat(snapshot); err != nil {
+			t.Errorf("HF snapshot path %s: %v", snapshot, err)
+		}
+	}
+
+	noAppendOut := t.TempDir()
+	noAppendSettings := Settings{Endpoint: server.URL, OutputDir: noAppendOut, Concurrency: 1, MaxActiveDownloads: 1}
+	noAppendJob := job
+	noAppendJob.AppendFilterSubdir = false
+	if err := Download(context.Background(), noAppendJob, noAppendSettings, nil); err != nil {
+		t.Fatalf("Download with AppendFilterSubdir=false: %v", err)
+	}
+	noAppendBase, err := DestinationBase(noAppendOut, "owner/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{
+		"Q4_K_M/model-Q4_K_M.gguf": "gguf",
+		"README-Q4_K_M.md":         "read",
+	} {
+		got, err := os.ReadFile(filepath.Join(noAppendBase, filepath.FromSlash(rel)))
+		if err != nil || string(got) != want {
+			t.Errorf("append-disabled destination %s = %q, err=%v; want %q", rel, got, err, want)
+		}
+	}
+}
+
+func TestPlanRepo_DatasetGGUFLFSFilterKeepsAppendedDestination(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{{
+		Type: "file", Path: "Q4_K_M/model-Q4_K_M.gguf", Size: 4,
+		LFS: &hfLfsInfo{Size: 4},
+	}})
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"},
+		ExactMatch: true, AppendFilterSubdir: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("plan has %d items, want 1: %+v", len(plan.Items), plan.Items)
+	}
+	item := plan.Items[0]
+	if !item.LFS || item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M" {
+		t.Fatalf("LFS GGUF attribution/destination = %+v; want LFS with Q4_K_M prefix", item)
+	}
+}
