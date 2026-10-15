@@ -286,6 +286,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
 	}
+	datasetMembership := datasetselection.Recognize(datasetFiles)
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	var datasetEvaluation datasetDecisionEvaluation
 	// A recognized dataset group remains the governing selection when its files
@@ -294,7 +295,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// containing a GGUF-only quant selection).
 	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
 	if datasetGroupRequest {
-		membership := datasetselection.Recognize(datasetFiles)
+		membership := datasetMembership
 		// The group evaluator is reached only when a filter is recognized as a
 		// dataset label; do not let unrelated GGUF matches disable its membership
 		// and attribution model.
@@ -313,7 +314,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				break
 			}
 		}
-		if datasetGroupRequest {
+		// Even ordinary filename/path filters use the shared dataset evidence
+		// evaluator so recognized metadata with data/companion alternatives can
+		// be retained or refused based on its actual final emitted-set outcomes.
+		if datasetGroupRequest || job.IsDataset && len(job.Filters) > 0 {
+			context.RetainMetadata = true
+			// Ordinary non-GGUF dataset selectors also use the shared evaluator,
+			// but retain their distinct path-filter semantics and ambiguity scope.
+			datasetGroupRequest = true
 			// A plan is useful only when every emitted path is invariant across
 			// complete admissible interpretations. Keep the eventual path set and
 			// filter attribution together in one admissible concrete world.
@@ -329,14 +337,20 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					return nil, cannot.Err
 				}
 				if can.Possible && cannot.Possible {
+					groupSelectionAmbiguous := false
 					for _, filter := range job.Filters {
 						if err := ctx.Err(); err != nil {
 							return nil, err
 						}
 						normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
-						if containsString(context.RecognizedLabels, normalized) {
-							return nil, fmt.Errorf("dataset filter %q has ambiguous path selection for %q", filter, n.Path)
+						if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
+							groupSelectionAmbiguous = true
+							break
 						}
+					}
+					ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
+					if groupSelectionAmbiguous || ordinaryMetadataAmbiguous {
+						return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q", n.Path)
 					}
 				}
 			}
@@ -461,7 +475,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			}
 			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
-				if isLFS || !isRecognizedModelMetadata(rel) {
+				if isLFS || !isRecognizedModelMetadata(rel) || job.IsDataset && datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
 					continue
 				}
 			}
@@ -675,10 +689,32 @@ func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
 func isRecognizedModelMetadata(relativePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
 	switch base {
-	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json":
+	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt":
 		return true
 	}
 	return isREADMEPath(relativePath)
+}
+
+func isRecognizedMetadataPath(relativePath string) bool {
+	return isRecognizedModelMetadata(relativePath) || isDatasetServiceMetadata(relativePath)
+}
+
+func hasDatasetRoleUncertainty(input datasetDecisionInput) bool {
+	data, companion := false, false
+	for _, alternative := range input.Alternatives {
+		data = data || alternative.Role == datasetselection.EvidenceRoleData
+		companion = companion || alternative.Role == datasetselection.EvidenceRoleCompanion
+	}
+	return data && companion
+}
+
+func datasetHasDefiniteDataRole(membership datasetselection.Result, index int) bool {
+	for _, evidence := range membership.Evidence {
+		if evidence.InputIndex == index && evidence.DefiniteRole == datasetselection.EvidenceRoleData {
+			return true
+		}
+	}
+	return false
 }
 
 func isDatasetServiceMetadata(relativePath string) bool {

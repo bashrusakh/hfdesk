@@ -169,25 +169,32 @@ func TestPlanRepoDatasetOrdinaryFiltersDoNotAdmitUnmatchedPayload(t *testing.T) 
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	for _, tc := range []struct {
-		name   string
-		filter string
-		exact  bool
-		want   []string
+		name    string
+		filter  string
+		exact   bool
+		want    []string
+		wantErr bool
 	}{
-		{"exact filename", "train.csv", true, []string{"train.csv", "config.json", "nested/config.json"}},
-		{"exact substring", "train", false, []string{"train.csv", "config.json"}},
-		{"extension selects matching data only", ".csv", true, []string{"train.csv", "validation.csv", "config.json", "nested/config.json", "nested/other.csv"}},
-		{"folder selects matching data only", "nested/", true, []string{"config.json", "nested/config.json", "nested/other.csv"}},
+		{"exact filename refuses role-dependent metadata", "train.csv", true, nil, true},
+		{"exact substring group ambiguity", "train", false, nil, true},
+		{"extension refuses role-dependent metadata", ".csv", true, nil, true},
+		{"folder directly selects metadata in both roles", "nested/", true, []string{"config.json", "nested/config.json", "nested/other.csv"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{tc.filter}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
 			if err != nil {
+				if tc.wantErr {
+					return
+				}
 				t.Fatalf("PlanRepo: %v", err)
+			}
+			if tc.wantErr {
+				t.Fatal("PlanRepo succeeded; want final-emitted-set ambiguity refusal")
 			}
 			assertPaths(t, planPaths(plan), tc.want)
 		})
 	}
-	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, ExactMatch: true}
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, Excludes: []string{"nested/config.json"}, ExactMatch: true}
 	if GGUFPathMayBeEmitted("model-test.gguf", job) {
 		t.Fatal("pre-plan upper bound admitted an unmatched dataset root GGUF")
 	}
@@ -230,31 +237,33 @@ func TestPlanRepoDatasetSubstringAndExactPathFiltersRemainDistinct(t *testing.T)
 	}
 }
 
-func TestPlanRepoDatasetGGUFFallbackRetainsOnlyRecognizedNonLFSMetadata(t *testing.T) {
+func TestPlanRepoDatasetGGUFFallbackUsesRoleAwareSelectionAndRetainsMetadata(t *testing.T) {
 	files := []hfNode{
-		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
-		{Type: "file", Path: "tokenizer/tokenizer.json", Size: 30},
-		{Type: "file", Path: "tokenizer/config.json", Size: 40},
-		{Type: "file", Path: "tokenizer/records.json", Size: 50},
-		{Type: "file", Path: "tokenizer/large.json", LFS: &hfLfsInfo{Size: 60}},
+		{Type: "file", Path: "weights/model.gguf", Size: 20},
+		{Type: "file", Path: "nested/config.json", Size: 15},
+		{Type: "file", Path: "dataset_info.json", Size: 16},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
-	plan, err := PlanRepo(context.Background(), Job{
-		Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, ExactMatch: true,
-	}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatalf("PlanRepo: %v", err)
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"weights/model.gguf"}, ExactMatch: true}
+	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
+		t.Fatalf("role-dependent metadata plan=%+v err=%v; want refusal", plan, err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/tokenizer.json", "tokenizer/config.json"})
 
-	plan, err = PlanRepo(context.Background(), Job{
-		Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, Excludes: []string{"tokenizer.json"}, ExactMatch: true,
-	}, Settings{Endpoint: srv.URL})
+	job.Filters = []string{"weights/model.gguf", "nested/config.json"}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("explicit path resolves role alternatives: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "nested/config.json", "dataset_info.json"})
+
+	job.Filters = []string{"weights/model.gguf"}
+	job.Excludes = []string{"dataset_info.json", "nested/config.json"}
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("PlanRepo with explicit metadata exclude: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/config.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 }
 
 func TestPlanRepoDatasetSubstringAndGGUFMetadataFallback(t *testing.T) {
@@ -269,10 +278,9 @@ func TestPlanRepoDatasetSubstringAndGGUFMetadataFallback(t *testing.T) {
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"alid"}}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || plan != nil {
+		t.Fatalf("substring split with metadata role variance plan=%+v err=%v; want ambiguity refusal", plan, err)
 	}
-	assertPaths(t, planPaths(plan), []string{"validation.csv"})
 
 	modelFiles := []hfNode{
 		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
@@ -321,6 +329,92 @@ func TestPlanRepoModelTokenizerMetadataRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer.json"})
+}
+
+func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "arbitrary/assets/vocab.json", Size: 12},
+		{Type: "file", Path: "arbitrary/assets/merges.txt", Size: 13},
+		{Type: "file", Path: "arbitrary/assets/unrelated.json", Size: 14},
+		{Type: "file", Path: "arbitrary/assets/unrelated.txt", Size: 15},
+		{Type: "file", Path: "arbitrary/assets/vocab-lfs.json", LFS: &hfLfsInfo{Size: 16}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"weights/model.safetensors"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt"})
+}
+
+func TestPlanRepoDatasetOrdinaryFilterRefusesOnlyEmittedSetRoleAmbiguity(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "selected.csv", Size: 10},
+		{Type: "file", Path: "train/config.json", Size: 11},
+		{Type: "file", Path: "nested/dataset_info.json", Size: 12},
+		{Type: "file", Path: "validation/data.parquet", Size: 13},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"selected.csv"}, ExactMatch: true}
+	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
+		t.Fatalf("ordinary filter with differing metadata role outcomes plan=%+v err=%v; want refusal", plan, err)
+	}
+
+	job.Filters = []string{"selected.csv", "nested/dataset_info.json"}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("explicit metadata path should resolve alternatives: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"selected.csv", "nested/dataset_info.json"})
+
+	job.Filters = []string{"selected.csv"}
+	job.Excludes = []string{"dataset_info.json"}
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("exclude should resolve metadata ambiguity: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"selected.csv"})
+}
+
+func TestPlanRepoDatasetKnownMetadataOwnershipUnknownIsRetained(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "elsewhere/README.md", Size: 11},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("uncertain metadata ownership must retain without refusing: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "elsewhere/README.md"})
+}
+
+func TestPlanRepoDatasetDefiniteDataMetadataNameDoesNotFallback(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "validation/data.parquet", Size: 10},
+		{Type: "file", Path: "train/config.json", Size: 11},
+		{Type: "file", Path: "nested/dataset_info.json", Size: 12},
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 13},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"validation/"}, Excludes: []string{"dataset_info.json"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("validation path plan: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"validation/data.parquet"})
+
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, Excludes: []string{"dataset_info.json"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("GGUF fallback plan: %v", err)
+	}
+	if containsString(planPaths(plan), "train/config.json") {
+		t.Fatalf("definite train data escaped through metadata fallback: %v", planPaths(plan))
+	}
 }
 
 func TestPlanRepoDatasetGroupFiltersSelectMembership(t *testing.T) {
@@ -497,10 +591,10 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 		excludes     []string
 		want         []string
 	}{
-		{"conventional root train", "train", []string{"unknown.json"}, []string{"train.csv", "README.md"}},
+		{"conventional root train", "train", []string{"unknown.json"}, []string{"train.csv", "data/train_data/README.md", "README.md"}},
 		{"underscore custom group with companions", "train_data", []string{"unknown.json"}, []string{"data/train_data/part.parquet", "data/train_data/schema.json", "data/train_data/README.md", "README.md"}},
-		{"unnamed default", "default", []string{"unknown.json", "metadata-lfs.json"}, []string{"other/data.parquet", "README.md"}},
-		{"custom data group", "english", []string{"unknown.json"}, []string{"data/english/chunk.arrow", "README.md"}},
+		{"unnamed default", "default", []string{"unknown.json", "metadata-lfs.json"}, []string{"data/train_data/README.md", "other/data.parquet", "README.md"}},
+		{"custom data group", "english", []string{"unknown.json"}, []string{"data/train_data/README.md", "data/english/chunk.arrow", "README.md"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,7 +614,7 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 	if err != nil {
 		t.Fatalf("exclude resolves relevant root ambiguity: %v", err)
 	}
-	if got, want := planPaths(plan), []string{"train.csv", "README.md"}; !reflect.DeepEqual(got, want) {
+	if got, want := planPaths(plan), []string{"train.csv", "data/train_data/README.md", "README.md"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("excluded ambiguity paths=%v, want %v", got, want)
 	}
 	plan, err = planFor(nil, nil)

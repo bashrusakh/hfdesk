@@ -702,7 +702,7 @@ func TestRunActivityKeepsRegisteredDescriptorAndFullSemanticKey(t *testing.T) {
 	}
 }
 
-func TestCollectSnapshotIgnoresTerminalAndKnownPlanButFailsRelevantUnknownClosed(t *testing.T) {
+func TestCollectSnapshotIgnoresTerminalAndCompletePlanButFailsRelevantUnknownClosed(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
 	badTerminal := &Job{ID: "terminal", Repo: "../escape", OutputDir: root, Status: JobStatusCompleted}
@@ -710,7 +710,8 @@ func TestCollectSnapshotIgnoresTerminalAndKnownPlanButFailsRelevantUnknownClosed
 	relevant := &Job{ID: "active", Repo: "owner/repo", OutputDir: root, Status: JobStatusRunning}
 	m.jobs[badTerminal.ID] = badTerminal
 	m.jobs[relevant.ID] = relevant
-	m.runActivities[1] = &jobWriteActivity{job: badKnown, descriptor: decisionJob(badKnown), planKnown: true, planned: map[string]frozenMutationPath{filepath.Join(root, "exact"): {physical: filepath.Join(root, "exact"), key: filepath.Join(root, "exact")}}}
+	knownPath := filepath.Join(root, "exact")
+	m.runActivities[1] = &jobWriteActivity{job: badKnown, descriptor: decisionJob(badKnown), planKnown: true, planComplete: true, planned: map[string]frozenMutationPath{knownPath: {physical: knownPath, key: pathIdentityKey(knownPath), raw: knownPath}}}
 	m.runActivities[2] = &jobWriteActivity{job: relevant, descriptor: decisionJob(relevant)}
 	a := testCacheWriteAttempt(m)
 	count := 0

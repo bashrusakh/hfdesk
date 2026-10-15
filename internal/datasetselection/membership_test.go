@@ -44,6 +44,17 @@ func TestRecognizeRetainsInputIndexAndCaseInsensitiveRoles(t *testing.T) {
 	assertIndexes(t, r.Groups["validation"], 2)
 }
 
+func TestRecognizeTreatsFlatDataLeavesAsDefaultAndDirectoriesAsGroups(t *testing.T) {
+	files := []File{
+		{Path: "data/part-0000.parquet"},
+		{Path: "data/part-0001.parquet"},
+		{Path: "data/custom/part.parquet"},
+	}
+	r := Recognize(files)
+	assertIndexes(t, r.Groups["default"], 0, 1)
+	assertIndexes(t, r.Groups["custom"], 2)
+}
+
 func TestEvidenceRetainsResolverAlternativesAndReasons(t *testing.T) {
 	files := []File{
 		{Path: "train/records.parquet"},

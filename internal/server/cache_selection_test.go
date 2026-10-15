@@ -2494,6 +2494,151 @@ func TestSelectedDeleteKeepsKnownAliasConflictWhenSiblingPlanPathCannotFreeze(t 
 	}
 }
 
+func TestSelectedDeleteIncompleteKnownPlanDoesNotBlockUnrelatedRepository(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blocked := filepath.Join(repoDir, "blocked")
+	selectedA := filepath.Join(blocked, "model-Q4_K_M.gguf")
+	writeSelectionFile(t, blocked, filepath.Base(selectedA))
+	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	// A regular-file parent blocks freezing this sibling output, but remains
+	// inventoryable so it cannot make B's non-overlap oracle ambiguous.
+	if err := os.WriteFile(filepath.Join(repoDir, "obstruct"), []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(`[{"type":"file","path":"live/model-Q4_K_M.gguf","size":5},{"type":"file","path":"obstruct/model-Q5_K_M.gguf","size":5}]`))
+		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+				_, _ = w.Write([]byte("data!"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hf.Close()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL})
+	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M", "Q5_K_M"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("close test job manager: %v", err)
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production run did not reach held transfer")
+	}
+	var live writeDecisionActivity
+	deadline := time.After(5 * time.Second)
+	for {
+		s.jobs.mu.RLock()
+		found := false
+		for _, activity := range s.jobs.runActivities {
+			if activity.job.ID == job.ID && activity.planKnown && !activity.planComplete && len(activity.planned) > 0 {
+				live = writeDecisionActivity{id: activity.descriptor.activityID, job: activity.descriptor, planKnown: activity.planKnown, planComplete: activity.planComplete}
+				for _, planned := range activity.planned {
+					live.planned = append(live.planned, planned)
+				}
+				found = true
+				break
+			}
+		}
+		s.jobs.mu.RUnlock()
+		if found {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("partial production plan was not retained through transfer")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if live.id == 0 || live.job.generation == 0 {
+		t.Fatalf("live generation/activity identity missing: %+v", live)
+	}
+	var knownConflict bool
+	for _, planned := range live.planned {
+		if plannedRawEntriesConflict([]frozenMutationPath{{physical: selectedA, raw: selectedA, key: pathIdentityKey(selectedA)}}, map[string]frozenMutationPath{planned.rawOrPhysical(): planned}) {
+			knownConflict = true
+		}
+	}
+	if !knownConflict {
+		t.Fatal("known plan no longer identifies selected A's alias conflict")
+	}
+	body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/model-Q4_K_M.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("selected A reservation status=%d body=%s, want known-plan 409", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(selectedA); err != nil {
+		t.Fatalf("selected A bytes changed despite known alias conflict: %v", err)
+	}
+
+	// B is a separate repository root in a distinct writable namespace. A's
+	// completed namespace inventory is therefore a meaningful non-overlap oracle.
+	repoB := filepath.Join(storage, "models", "other", "repo")
+	selectedB := filepath.Join(repoB, "model-Q4_K_M.gguf")
+	writeSelectionFile(t, repoB, filepath.Base(selectedB))
+	jobA := jobFromDecision(live.job)
+	evidence, ok := buildSelectedWriteEvidence(jobA, inventoryWritableNamespace)
+	if !ok {
+		t.Fatal("could not establish successful writable-namespace inventory for A")
+	}
+	identityB, err := captureWriteIdentityProbe(selectedB, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedWriteEvidenceMayWrite(evidence, []string{identityB.identity}) {
+		t.Fatalf("B is not proven outside A's writable namespace: %s", selectedB)
+	}
+	// Confirm incomplete known-plan activities retain their descriptor and
+	// successful non-overlap inventory can establish that B is not writable.
+	attempt, ok := s.jobs.beginCacheWriteAttempt()
+	if !ok {
+		t.Fatal("could not begin diagnostic reservation attempt")
+	}
+	attempt.CollectSnapshot(attempt.start)
+	mayWriteB := attempt.MayWriteDescriptor(live.job, []string{selectedB})
+	_, descriptorCollected := attempt.descriptors[decisionDescriptorKey(live.job)]
+	attempt.Close()
+	if !descriptorCollected || mayWriteB {
+		t.Fatalf("incomplete known-plan evidence lifecycle: collected=%v mayWriteB=%v", descriptorCollected, mayWriteB)
+	}
+	release, ok := s.jobs.reserveSelectedGGUF([]string{selectedB})
+	if !ok {
+		t.Fatal("unrelated B reservation was globally rejected despite complete non-overlap inventory")
+	}
+	release()
+}
+
 func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	storage := t.TempDir()
 	repoDir := filepath.Join(storage, "models", "o", "m")
@@ -5802,6 +5947,9 @@ func TestSelectedDeleteAllowsActualNonOverlappingQ5Plan(t *testing.T) {
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
 	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(release) }
+	defer unblock()
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
 	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q5_k_m"}})
 	if err != nil {
@@ -5821,12 +5969,13 @@ func TestSelectedDeleteAllowsActualNonOverlappingQ5Plan(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")); !os.IsNotExist(err) {
 		t.Fatalf("Q4 remains after selected delete, err=%v", err)
 	}
-	release()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if !s.jobs.CancelJob(job.ID) {
 		t.Fatal("cancel active job failed")
 	}
+	unblock()
+	waitJobStatus(t, s.jobs, job.ID, JobStatusCancelled, 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
