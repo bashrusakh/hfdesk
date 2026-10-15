@@ -113,7 +113,7 @@ func TestPlanRepo_NonLFSDirectFilterMatchSucceeds(t *testing.T) {
 		if it.RelativePath == "config.json" {
 			found = true
 			if it.Subdir != "" {
-				t.Errorf("config.json Subdir = %q, want empty for non-LFS file", it.Subdir)
+				t.Errorf("config.json Subdir = %q, want no model destination prefix", it.Subdir)
 			}
 		}
 	}
