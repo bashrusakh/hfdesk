@@ -347,6 +347,9 @@ type writableNamespaceInventory struct {
 const (
 	maxWritableAliasDepth    = 64
 	maxWritableAliasSpelling = 32
+	// Bound closure work as well as retained spellings. A finite spelling set
+	// can still induce a quadratic number of alias/reached-directory pairs.
+	maxWritableAliasExpansion = 4096
 )
 
 var errWritableNamespaceUnknown = errors.New("writable namespace cannot be inventoried")
@@ -510,7 +513,8 @@ func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity stri
 	// location can route through the alias into every reached directory, which
 	// then unlocks further aliases (nested destinations and chains included).
 	for {
-		pending := make([][2]string, 0, len(inv.aliases))
+		var expansion int
+		changed := false
 		for _, alias := range inv.aliases {
 			prefixDir := filepath.Dir(alias.location)
 			for prefix := range spellings[prefixDir] {
@@ -519,18 +523,16 @@ func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity stri
 					if !ok {
 						continue
 					}
-					pending = append(pending, [2]string{reached, joinSlashPath(prefix, alias.name, relDest)})
+					expansion++
+					if expansion > maxWritableAliasExpansion {
+						return nil, false
+					}
+					did, err := add(reached, joinSlashPath(prefix, alias.name, relDest))
+					if err != nil {
+						return nil, false
+					}
+					changed = changed || did
 				}
-			}
-		}
-		changed := false
-		for _, candidate := range pending {
-			did, err := add(candidate[0], candidate[1])
-			if err != nil {
-				return nil, false
-			}
-			if did {
-				changed = true
 			}
 		}
 		if !changed {

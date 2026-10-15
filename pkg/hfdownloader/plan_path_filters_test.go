@@ -121,6 +121,8 @@ func TestPlanRepoPathFiltersKeepCompanionsAndSkipUnmatchedLFS(t *testing.T) {
 		{Type: "file", Path: "diffusers/vae/model.h5", LFS: &hfLfsInfo{Size: 10}},
 		{Type: "file", Path: "diffusers/vae/model.tflite", LFS: &hfLfsInfo{Size: 10}},
 		{Type: "file", Path: "metadata.json", LFS: &hfLfsInfo{Size: 10}},
+		{Type: "file", Path: "tokenizer.model", Size: 20},
+		{Type: "file", Path: "assets/tokenizer.model", Size: 21},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
@@ -132,7 +134,7 @@ func TestPlanRepoPathFiltersKeepCompanionsAndSkipUnmatchedLFS(t *testing.T) {
 		t.Fatalf("PlanRepo: %v", err)
 	}
 	got := planPaths(plan)
-	want := []string{"config.json", "README.md", "diffusers/unet/diffusion_pytorch_model.safetensors", "diffusers/unet/README.md", "diffusers/config.json", "diffusers/vae/config.json"}
+	want := []string{"config.json", "README.md", "diffusers/unet/diffusion_pytorch_model.safetensors", "diffusers/unet/README.md", "diffusers/config.json", "diffusers/vae/config.json", "tokenizer.model", "assets/tokenizer.model"}
 	assertPaths(t, got, want)
 }
 
@@ -318,7 +320,7 @@ func TestPlanRepoDatasetGGUFFallbackUsesRoleAwareSelectionAndRetainsMetadata(t *
 	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 }
 
-func TestPlanRepoDatasetSubstringAndGGUFMetadataFallback(t *testing.T) {
+func TestPlanRepoDatasetSubstringAndGGUFMatchedOnly(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "validation.csv", Size: 10},
@@ -346,7 +348,7 @@ func TestPlanRepoDatasetSubstringAndGGUFMetadataFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer/tokenizer.json", "tokenizer/config.json"})
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf"})
 }
 
 func TestPlanRepoMetadataFallbackRespectsExcludesAndDoesNotSeedData(t *testing.T) {
@@ -367,7 +369,7 @@ func TestPlanRepoMetadataFallbackRespectsExcludesAndDoesNotSeedData(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPaths(t, planPaths(plan), []string{"train/data.parquet", "other/config.json", "other/tokenizer/tokenizer.json"})
+	assertPaths(t, planPaths(plan), []string{"train/data.parquet", "other/config.json", "other/tokenizer/tokenizer.json", "other/records.json"})
 }
 
 // Model-context tokenizer recognition is established; dataset basename alone
@@ -380,7 +382,7 @@ func TestPlanRepoModelTokenizerMetadataRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "tokenizer.json"})
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf"})
 }
 
 func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
@@ -399,7 +401,7 @@ func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt", "arbitrary/assets/vocab.txt"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt", "arbitrary/assets/vocab.txt", "arbitrary/assets/unrelated.json", "arbitrary/assets/unrelated.txt"})
 
 	plan, err = PlanRepo(context.Background(), Job{
 		Repo: "owner/model", Filters: []string{"weights/model.safetensors"}, Excludes: []string{"vocab.txt"}, ExactMatch: true,
@@ -407,7 +409,7 @@ func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt", "arbitrary/assets/unrelated.json", "arbitrary/assets/unrelated.txt"})
 }
 
 func TestPlanRepoDatasetDoesNotInferModelVocabMetadataFromBasename(t *testing.T) {
@@ -816,7 +818,7 @@ func TestPlanRepoExactGGUFAndNoFilterRegression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filtered PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(filtered), []string{"model-q6_k.gguf", "config.json"})
+	assertPaths(t, planPaths(filtered), []string{"model-q6_k.gguf"})
 
 	unfiltered, err := PlanRepo(context.Background(), Job{Repo: "owner/gguf", Revision: "main"}, Settings{Endpoint: srv.URL})
 	if err != nil {
@@ -841,7 +843,7 @@ func TestPlanRepoGGUFQuantFilterKeepsMatchedREADMEOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md", "config.json", "README.md"})
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md"})
 }
 
 func TestPlanRepoREADMEOnlyFilterDoesNotEnableGGUFMode(t *testing.T) {
@@ -897,7 +899,7 @@ func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "config.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 }
 
 func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
@@ -915,7 +917,7 @@ func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "config.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 }
 
 // TestPlanRepoRejectsNonCanonicalTreePath is the canonical-path intake

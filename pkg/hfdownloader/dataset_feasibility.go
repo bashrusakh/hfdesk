@@ -623,6 +623,10 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 		seenExact[in.Path] = true
 		priorOutcome, priorSeen := seenFold[fold]
 		if !duplicate && !in.Excluded {
+			// The concrete evaluator applies this fixed GGUF eligibility rule
+			// after direct/companion selection. Keep the cached proof domain
+			// identical so a root companion cannot be proven emit-capable here.
+			ggufRejected := strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path)
 			allEligible, anyEligible := true, false
 			for j, alt := range in.Alternatives {
 				directAlways, directPossible := direct[i][j] == 1, direct[i][j] >= 0
@@ -633,6 +637,9 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 					fallback := metadata || dir == "." || guaranteedDirs[dir]
 					maybeFallback := metadata || dir == "." || possibleDirs[dir]
 					eligible, possible = eligible || fallback, possible || maybeFallback
+				}
+				if ggufRejected {
+					eligible, possible = false, false
 				}
 				if !eligible {
 					allEligible = false
