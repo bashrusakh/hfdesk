@@ -196,6 +196,58 @@ func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
 	}
 }
 
+func TestWriteDecisionSnapshotStableForAliasedPlannedPaths(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	aliasDir := filepath.Join(root, "alias")
+	if err := os.Mkdir(realDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatal(err)
+	}
+	firstRaw := filepath.Join(realDir, "model.gguf")
+	secondRaw := filepath.Join(aliasDir, "model.gguf")
+	if err := os.WriteFile(firstRaw, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := freezeMutationEntry(firstRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := freezeMutationEntry(secondRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.raw = firstRaw
+	second.raw = secondRaw
+	if first.key != second.key || first.raw == second.raw {
+		t.Fatalf("fixture must have distinct raw paths sharing physical identity: first=%+v second=%+v", first, second)
+	}
+
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	m.runActivities[1] = &jobWriteActivity{
+		job:       &Job{ID: "active", Repo: "owner/repo"},
+		planKnown: true,
+		planned:   map[string]frozenMutationPath{first.raw: first, second.raw: second},
+	}
+	const attempts = 128
+	wantFirst := first.raw
+	if second.raw < wantFirst {
+		wantFirst = second.raw
+	}
+	for i := 0; i < attempts; i++ {
+		snapshot := m.captureWriteDecision()
+		planned := snapshot.activities[0].planned
+		if len(planned) != 2 {
+			t.Fatalf("snapshot collapsed logical paths: got %d entries", len(planned))
+		}
+		if planned[0].raw != wantFirst {
+			t.Fatalf("snapshot %d is not deterministically ordered by raw identity: first=%q want=%q", i, planned[0].raw, wantFirst)
+		}
+	}
+}
+
 func TestWriteDecisionEpochDetectsCompletedMutation(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
 	s := m.captureWriteDecision()
