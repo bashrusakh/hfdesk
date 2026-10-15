@@ -94,6 +94,14 @@ func mutationScopesOverlap(a, b frozenMutationPath) bool {
 	return false
 }
 
+func frozenScopeOverlapsEntry(scope frozenMutationPath, incoming string, kind writeScopeKind) bool {
+	path := scope.rawOrPhysical()
+	if kind == writeScopeEntry {
+		return frozenMutationOverlapsRawEntry(scope, incoming) || mutationPathsOverlap(path, incoming)
+	}
+	return mutationDirectoryEntryOverlap(scope.physical, incoming) || mutationDirectoryEntryOverlap(path, incoming)
+}
+
 // mutationScopeKindOverlap compares a frozen scope with a frozen entry using
 // the identity kind that produced the scope. Directory scopes retain the raw
 // spelling revalidation in mutationScopesOverlap; entry scopes only compare
@@ -1111,7 +1119,13 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		kind := m.mutationScopeKinds[id]
 		for _, scope := range scopes {
 			for _, write := range writes {
-				if mutationScopeKindOverlap(scope, write, kind) {
+				conflicts := false
+				if kind != writeScopeEntry {
+					conflicts = mutationScopesOverlap(write, scope)
+				} else {
+					conflicts = frozenScopeOverlapsEntry(write, scope.rawOrPhysical(), writeScopeEntry)
+				}
+				if conflicts {
 					m.mu.Unlock()
 					return nil, false
 				}

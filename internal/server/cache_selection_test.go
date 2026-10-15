@@ -1219,6 +1219,59 @@ func TestSelectedDeleteChecksFrozenAndCurrentMutationAlias(t *testing.T) {
 	}
 }
 
+func TestSelectedHFReservationRetainsFrozenAndCurrentBroadMutationDirectories(t *testing.T) {
+	root := t.TempDir()
+	a, b, c := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "c")
+	for _, dir := range []string{a, b, c} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(root, "destination")
+	if err := os.Symlink(a, alias); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(root, "cache")})
+	mutationRelease, ok := s.jobs.beginCacheMutation(alias)
+	if !ok {
+		t.Fatal("could not reserve broad mutation through directory alias")
+	}
+	if err := os.Remove(alias); err != nil {
+		mutationRelease()
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, alias); err != nil {
+		mutationRelease()
+		t.Fatal(err)
+	}
+	var admitted []string
+	for label, repoDir := range map[string]string{"frozen target A": filepath.Join(a, "owner", "model"), "current target B": filepath.Join(b, "owner", "model")} {
+		if release, ok := s.jobs.reserveSelectedHF(repoDir, filepath.Join(c, label+"-friendly")); ok {
+			admitted = append(admitted, label)
+			release()
+		}
+	}
+	unrelatedRelease, ok := s.jobs.reserveSelectedHF(filepath.Join(c, "owner", "model"), filepath.Join(c, "friendly"))
+	mutationRelease()
+	if ok {
+		unrelatedRelease()
+	}
+	if len(admitted) != 0 {
+		t.Fatalf("selected HF reservation crossed active broad mutation for: %v", admitted)
+	}
+	if !ok {
+		t.Fatal("unrelated selected HF reservation was blocked")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.jobs.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMutationEntryIdentityResolvesParentAliasesButNotLeafTargets(t *testing.T) {
 	actual, alias := t.TempDir(), t.TempDir()
 	if err := os.Symlink(actual, filepath.Join(alias, "parent")); err != nil {
