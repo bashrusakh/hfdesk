@@ -526,6 +526,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				}
 			}
 		}
+		// Ordinary non-LFS model files keep their repo-relative destination.
+		// matchedFilter is used by AppendFilterSubdir to alter that destination;
+		// only dataset membership attribution and the established GGUF/LFS
+		// branches provide a destination subdirectory.
+		if !job.IsDataset && !ggufMode && !isLFS {
+			matchedFilter = ""
+		}
 
 		// Build URL and file size
 		var urlStr string

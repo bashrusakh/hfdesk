@@ -111,8 +111,8 @@ func TestPlanRepo_NonLFSDirectFilterMatchSucceeds(t *testing.T) {
 	for _, it := range plan.Items {
 		if it.RelativePath == "config.json" {
 			found = true
-			if it.Subdir != "config.json" {
-				t.Errorf("config.json Subdir = %q, want matched filter attribution", it.Subdir)
+			if it.Subdir != "" {
+				t.Errorf("config.json Subdir = %q, want no model destination prefix", it.Subdir)
 			}
 		}
 	}
