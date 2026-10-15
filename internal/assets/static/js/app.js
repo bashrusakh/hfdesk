@@ -2297,7 +2297,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       `);
       context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
       if (requestedType === 'model') {
-        ($('#modalBody .cache-detail-modal') || $('#modalBody'))?.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
+        const cacheDetailModal = $('#modalBody .cache-detail-modal') || $('#modalBody');
+        const cacheDetailAnchor = cacheDetailModal?.querySelector?.('.cache-detail-stats') || cacheDetailModal?.querySelector?.('.cache-detail-header');
+        if (cacheDetailAnchor) cacheDetailAnchor.insertAdjacentHTML('afterend', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
+        else cacheDetailModal?.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
         const selection = await api('GET', `/cache-selection?repo=${encodeURIComponent(repo)}&type=model`);
         if (!cacheDetailsContextIsCurrent(context)) return;
         const preferred = preferredLocationID && selection.locations?.find(location => location.id === preferredLocationID);
@@ -2350,10 +2353,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       const pending = pendingSelectedCacheDeletes.has(deleteKey);
       const distinctPaths = new Set((group.members || []).map(member => member.path)).size;
       const savedVersions = new Set((group.members || []).flatMap(member => member.versions || [])).size;
+      const quantSuffix = group.quant ? ` · ${group.quant}` : '';
+      const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : group.label;
       return `
       <article class="cache-selection-group">
         <div class="cache-selection-group-row">
-          <div class="cache-selection-group-info"><strong>${escapeHtml(group.label)}</strong>${group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : ''}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
+          <div class="cache-selection-group-info"><strong>${escapeHtml(displayLabel)}</strong>${group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : ''}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
           <button class="btn btn-danger btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeHtml(disabledReason)}"` : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete</button>
         </div>
         <details><summary>Show ${group.members?.length || 0} file record${group.members?.length === 1 ? '' : 's'}</summary>
@@ -2365,20 +2370,23 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     }).join('') : '<p>No GGUF groups were found in this location.</p>';
     const snapshotFiles = Array.isArray(context.snapshotFiles) ? context.snapshotFiles : [];
     const otherFiles = snapshotFiles.filter(file => !/\.gguf$/i.test(file?.name || ''));
-    const otherFilesHtml = !hasGroups ? '' : otherFiles.length ? `<details class="cache-selection-other"><summary>Other files (${otherFiles.length})</summary><p class="cache-selection-readonly">Config, tokenizer, and other non-GGUF files from the opening snapshot.</p><ul>${otherFiles.map(file => `<li><code>${escapeHtml(file.name)}</code>${file.sizeHuman ? ` <span>${escapeHtml(file.sizeHuman)}</span>` : ''}</li>`).join('')}</ul></details>` : '<p class="cache-selection-readonly">No other files in the opening snapshot.</p>';
+    const otherFilesHtml = !hasGroups || !otherFiles.length ? '' : `<details class="cache-selection-other"><summary>Other files (${otherFiles.length})</summary><p class="cache-selection-readonly">Config, tokenizer, and other non-GGUF files from the opening snapshot.</p><ul>${otherFiles.map(file => `<li><code>${escapeHtml(file.name)}</code>${file.sizeHuman ? ` <span>${escapeHtml(file.sizeHuman)}</span>` : ''}</li>`).join('')}</ul></details>`;
     const host = $('#modalBody');
     if (!host || !cacheDetailsContextIsCurrent(context)) return;
     let section = $('#cacheSelectionSection');
     if (!section) {
-      (host.querySelector('.cache-detail-modal') || host).insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      const cacheDetailHost = host.querySelector('.cache-detail-modal') || host;
+      const cacheDetailAnchor = cacheDetailHost.querySelector?.('.cache-detail-stats') || cacheDetailHost.querySelector?.('.cache-detail-header');
+      if (cacheDetailAnchor) cacheDetailAnchor.insertAdjacentHTML('afterend', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      else cacheDetailHost.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
       section = $('#cacheSelectionSection');
     }
     section.innerHTML = `
       <div class="cache-selection-sticky">
         <h4>GGUF files by storage location</h4>
         <p>Choose the location.</p>
-        ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation">${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
-        ${location ? `<p><strong>${escapeHtml(location.source)} location:</strong> <code>${escapeHtml(location.path)}</code></p>${location.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}` : ''}
+        ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation"${location ? ` title="${escapeHtml(location.path)}"` : ''}>${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
+        ${location?.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}
       </div>
       ${location ? `<div class="cache-selection-groups">${groupRows}</div>${otherFilesHtml}` : ''}
       ${selectedLocationID && !location ? '<p class="cache-selection-warning">The previously selected location is no longer available. No other location was selected automatically.</p>' : ''}
