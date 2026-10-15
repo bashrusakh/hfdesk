@@ -283,6 +283,74 @@ func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) 
 	}
 }
 
+func TestDownload_MixedFormatKeepsPerFileGGUFDestination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", Size: 4},
+				{Type: "file", Path: "other.safetensors", Size: 4, LFS: &hfLfsInfo{Size: 4}},
+			})
+		case r.URL.Path == "/owner/model/raw/main/model-Q4_K_M.gguf":
+			_, _ = w.Write([]byte("gguf"))
+		case r.URL.Path == "/owner/model/resolve/main/other.safetensors":
+			_, _ = w.Write([]byte("safe"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out := t.TempDir()
+	job := Job{Repo: "owner/model", Revision: "main", Filters: []string{"Q4_K_M", "safetensors"}, ExactMatch: true, AppendFilterSubdir: true}
+	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
+	plan, err := PlanRepo(context.Background(), job, settings)
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if len(plan.Items) != 2 {
+		t.Fatalf("selected %d files, want both mixed-format matches: %+v", len(plan.Items), plan.Items)
+	}
+	for _, item := range plan.Items {
+		if item.RelativePath == "model-Q4_K_M.gguf" && (item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M") {
+			t.Errorf("mixed-format GGUF attribution/destination = %q/%q; want Q4_K_M/Q4_K_M", item.Subdir, item.destinationSubdir)
+		}
+	}
+	var eventPaths []string
+	if err := Download(context.Background(), job, settings, func(event ProgressEvent) {
+		if event.Event == "plan_item" {
+			eventPaths = append(eventPaths, event.Path)
+		}
+	}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	wantPaths := map[string]bool{"Q4_K_M/model-Q4_K_M.gguf": true, "safetensors/other.safetensors": true}
+	for _, p := range eventPaths {
+		if !wantPaths[p] {
+			t.Errorf("unexpected plan_item path %q", p)
+		}
+		delete(wantPaths, p)
+	}
+	for p := range wantPaths {
+		t.Errorf("missing plan_item path %q", p)
+	}
+	base, err := DestinationBase(out, job.Repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{
+		"Q4_K_M/model-Q4_K_M.gguf":      "gguf",
+		"safetensors/other.safetensors": "safe",
+	} {
+		got, err := os.ReadFile(filepath.Join(base, filepath.FromSlash(rel)))
+		if err != nil || string(got) != want {
+			t.Errorf("destination %s = %q, err=%v; want %q", rel, got, err, want)
+		}
+	}
+}
+
 func TestPlanRepo_DatasetGGUFLFSFilterKeepsAppendedDestination(t *testing.T) {
 	srv := mockHFServerForPlan(t, []hfNode{{
 		Type: "file", Path: "Q4_K_M/model-Q4_K_M.gguf", Size: 4,

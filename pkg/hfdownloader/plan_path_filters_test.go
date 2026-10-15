@@ -736,6 +736,9 @@ func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
 		if item.Subdir != "train" {
 			t.Errorf("%s attribution=%q, want train", item.RelativePath, item.Subdir)
 		}
+		if (item.RelativePath == "model-train.gguf" || item.RelativePath == "model-train-lfs.gguf") && item.destinationSubdir != "train" {
+			t.Errorf("%s destination subdir=%q, want train", item.RelativePath, item.destinationSubdir)
+		}
 	}
 }
 
