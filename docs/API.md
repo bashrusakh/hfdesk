@@ -148,6 +148,11 @@ Request:
 
 Returns the files that would be downloaded without starting a job.
 
+When `filters` is non-empty and no file in the repository matches after
+`excludes` are applied, the request fails with `400` and error code
+`no_filter_match`; a plan that contains only companion/metadata files is never
+returned as a success.
+
 ## Download
 
 ```http
