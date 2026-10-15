@@ -68,3 +68,93 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 		})
 	}
 }
+
+func TestDownload_DatasetOrdinaryNonLFSFilterPreservesRootDestinations(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "train.csv", Size: 4},
+				{Type: "file", Path: "config.json", Size: 4},
+			})
+		case r.URL.Path == "/datasets/owner/data/raw/main/train.csv":
+			_, _ = w.Write([]byte("data"))
+		case r.URL.Path == "/datasets/owner/data/raw/main/config.json":
+			_, _ = w.Write([]byte("meta"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out := t.TempDir()
+	base, err := DestinationBase(out, "owner/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "train.csv"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "config.json"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", Revision: "main", IsDataset: true,
+		Filters: []string{"train.csv"}, ExactMatch: true, AppendFilterSubdir: true,
+	}, Settings{Endpoint: server.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	var selected *PlanItem
+	for i := range plan.Items {
+		if plan.Items[i].RelativePath == "train.csv" {
+			selected = &plan.Items[i]
+		}
+	}
+	if selected == nil || selected.Subdir != "train.csv" || selected.destinationSubdir != "" {
+		t.Fatalf("dataset selection proof/attribution/destination = %+v; want attribution train.csv and unchanged destination", selected)
+	}
+	err = Download(context.Background(), Job{
+		Repo: "owner/data", Revision: "main", IsDataset: true,
+		Filters: []string{"train.csv"}, ExactMatch: true, AppendFilterSubdir: true,
+	}, Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}, nil)
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	for name, want := range map[string]string{"train.csv": "data", "config.json": "meta"} {
+		got, err := os.ReadFile(filepath.Join(base, name))
+		if err != nil {
+			t.Fatalf("read preserved root destination %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s=%q, want %q", name, got, want)
+		}
+	}
+
+	controlOut := t.TempDir()
+	controlBase, err := DestinationBase(controlOut, "owner/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(controlBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(controlBase, "train.csv"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Download(context.Background(), Job{
+		Repo: "owner/data", Revision: "main", IsDataset: true,
+		Filters: []string{"train.csv"}, ExactMatch: true, AppendFilterSubdir: false,
+	}, Settings{Endpoint: server.URL, OutputDir: controlOut, Concurrency: 1, MaxActiveDownloads: 1}, nil); err != nil {
+		t.Fatalf("Download with AppendFilterSubdir=false: %v", err)
+	}
+	controlBytes, err := os.ReadFile(filepath.Join(controlBase, "train.csv"))
+	if err != nil || string(controlBytes) != "data" {
+		t.Fatalf("append-disabled control destination = %q, err=%v; want downloaded data at repo root", controlBytes, err)
+	}
+}
