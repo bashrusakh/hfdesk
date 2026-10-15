@@ -67,6 +67,10 @@ func TestFilterMatchesPath(t *testing.T) {
 		exact, want        bool
 	}{
 		{"nested directory", "diffusers/unet/model.safetensors", "unet", true, true},
+		{"hyphen-delimited directory token", "variants/model-Q6_K/weights.gguf", "q6_k", true, true},
+		{"dot-delimited directory token", "variants/model.Q6_K/weights.gguf", "q6_k", true, true},
+		{"space-delimited directory token", "variants/model Q6_K/weights.gguf", "q6_k", true, true},
+		{"underscore extension in directory is not delimiter", "variants/model-Q6_K_XL/weights.gguf", "q6_k", true, false},
 		{"directory slash", "diffusers/unet/model.safetensors", "unet/", true, true},
 		{"directory boundary", "diffusers/myunet/model.safetensors", "unet/", true, false},
 		{"extension", "train/data-00001.parquet", ".parquet", true, true},
@@ -79,6 +83,25 @@ func TestFilterMatchesPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := filterMatchesPath(tt.path, tt.filter, tt.exact); got != tt.want {
 				t.Fatalf("filterMatchesPath(%q, %q, exact=%v) = %v, want %v", tt.path, tt.filter, tt.exact, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGGUFPathSelectedUsesDirectoryTokenMatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		exclude []string
+		want    bool
+	}{
+		{"delimiter-bounded directory token", "variants/model-Q6_K/weights.gguf", nil, true},
+		{"underscore suffix remains distinct", "variants/model-Q6_K_XL/weights.gguf", nil, false},
+		{"explicit exclude still wins", "variants/model-Q6_K/weights.gguf", []string{"weights"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GGUFPathSelected(tc.path, []string{"q6_k"}, tc.exclude, true); got != tc.want {
+				t.Fatalf("GGUFPathSelected(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
 	}
