@@ -1,6 +1,6 @@
 # TODO
 
-(no open items)
+1. Remove dead `Select this group` button from Repository Details GGUF selection and rework the overloaded Details window (currently two sections showing the same groups/files). Propose/keep variants for simplification: single per-group row with `Show file records` expander + `Delete`, drop `selectedGroupID` plumbing and `A group is selected` / static footer text.
 
 ## Done
 

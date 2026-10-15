@@ -2227,6 +2227,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
               <span class="cache-detail-owner">${escapeHtml(data.owner)}/</span>
               <span class="cache-detail-name">${escapeHtml(data.name)}</span>
             </div>
+            <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm cache-detail-hf" aria-label="View on HuggingFace" title="View on HuggingFace">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+              </svg>
+            </a>
           </div>
 
           <div class="cache-detail-stats">
@@ -2285,17 +2291,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
               </svg>
               Delete entire model cache
             </button>` : ''}
-            <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" class="btn btn-secondary">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-              </svg>
-              View on HuggingFace
-            </a>
             <button class="btn btn-ghost" onclick="hideModal()">Close</button>
           </div>
         </div>
       `);
+      context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
       if (requestedType === 'model') {
         $('#modalBody')?.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
         const selection = await api('GET', `/cache-selection?repo=${encodeURIComponent(repo)}&type=model`);
@@ -2304,7 +2304,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         const defaultLocation = preferredLocationID
           ? preferred
           : selection.locations?.find(location => location.path === data.path) || selection.locations?.[0];
-        renderCacheSelection(selection, defaultLocation?.id || preferredLocationID || '', context, '', '');
+        renderCacheSelection(selection, defaultLocation?.id || preferredLocationID || '', context, '');
       }
     } catch (e) {
       if (cacheDetailsContextIsCurrent(context)) {
@@ -2330,7 +2330,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return JSON.stringify([repo, locationID, groupID]);
   }
 
-  function renderCacheSelection(selection, selectedLocationID, context, selectedGroupID, outcomeHTML = '') {
+  function renderCacheSelection(selection, selectedLocationID, context, outcomeHTML = '') {
     const { requestID, repo } = context;
     const locations = selection.locations || [];
     const location = locations.find(item => item.id === selectedLocationID);
@@ -2338,6 +2338,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       `<option value="${index}"${item.id === selectedLocationID ? ' selected' : ''}>${escapeHtml(item.source)} — ${escapeHtml(item.path)}</option>`
     ).join('');
     const groups = location?.groups || [];
+    const hasGroups = Boolean(location && groups.length);
     const groupRows = groups.length ? groups.map((group, index) => {
       const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
       const canDelete = location.canDelete === true && group.canDelete === true;
@@ -2347,21 +2348,24 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           ? group.warning || 'This GGUF group is not eligible for selected-file deletion.'
           : '';
       const pending = pendingSelectedCacheDeletes.has(deleteKey);
+      const distinctPaths = new Set((group.members || []).map(member => member.path)).size;
+      const savedVersions = new Set((group.members || []).flatMap(member => member.versions || [])).size;
       return `
       <article class="cache-selection-group">
-        <div class="cache-selection-group-heading">
-          <div><strong>${escapeHtml(group.label)}</strong>${group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : ''}</div>
-          <span>${new Set((group.members || []).map(member => member.path)).size} file${new Set((group.members || []).map(member => member.path)).size === 1 ? '' : 's'}${new Set((group.members || []).flatMap(member => member.versions || [])).size ? ` · ${new Set((group.members || []).flatMap(member => member.versions || [])).size} saved versions` : ''}</span>
+        <div class="cache-selection-group-row">
+          <div class="cache-selection-group-info"><strong>${escapeHtml(group.label)}</strong>${group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : ''}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
+          <button class="btn btn-danger btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeHtml(disabledReason)}"` : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete</button>
         </div>
         <details><summary>Show ${group.members?.length || 0} file record${group.members?.length === 1 ? '' : 's'}</summary>
           <ul>${(group.members || []).map(member => `<li><code>${escapeHtml(member.path)}</code>${member.versions?.length ? ` <span>(${member.versions.map(escapeHtml).join(', ')})</span>` : ''}${member.linkOnly ? ` <span class="cache-selection-warning">Link only — ${escapeHtml(member.message || 'the weight file remains')}</span>` : ''}</li>`).join('')}</ul>
         </details>
         ${group.warning ? `<p class="cache-selection-warning">${escapeHtml(group.warning)}</p>` : ''}
-        <button class="btn btn-secondary cache-selection-pick" type="button" data-group-index="${index}" aria-pressed="${group.id === selectedGroupID}">${group.id === selectedGroupID ? 'Selected group' : 'Select this group'}</button>
-        <button class="btn btn-danger cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeHtml(disabledReason)}"` : ''}>Delete this GGUF group</button>
         <span id="cache-selection-help-${index}" class="cache-selection-readonly">${pending ? 'Deletion is in progress for this group.' : disabledReason ? escapeHtml(disabledReason) : 'Only this group will be removed.'}</span>
       </article>`;
     }).join('') : '<p>No GGUF groups were found in this location.</p>';
+    const snapshotFiles = Array.isArray(context.snapshotFiles) ? context.snapshotFiles : [];
+    const otherFiles = snapshotFiles.filter(file => !/\.gguf$/i.test(file?.name || ''));
+    const otherFilesHtml = !hasGroups ? '' : otherFiles.length ? `<details class="cache-selection-other"><summary>Other files (${otherFiles.length})</summary><p class="cache-selection-readonly">Config, tokenizer, and other non-GGUF files from the opening snapshot.</p><ul>${otherFiles.map(file => `<li><code>${escapeHtml(file.name)}</code>${file.sizeHuman ? ` <span>${escapeHtml(file.sizeHuman)}</span>` : ''}</li>`).join('')}</ul></details>` : '<p class="cache-selection-readonly">No other files in the opening snapshot.</p>';
     const host = $('#modalBody');
     if (!host || !cacheDetailsContextIsCurrent(context)) return;
     let section = $('#cacheSelectionSection');
@@ -2370,21 +2374,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       section = $('#cacheSelectionSection');
     }
     section.innerHTML = `
-      <h4>GGUF files by storage location</h4>
-      <p>Choose the actual location. The path shown here is where these files were found.</p>
-      ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation">${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
-      ${location ? `<p><strong>${escapeHtml(location.source)} location:</strong> <code>${escapeHtml(location.path)}</code></p>${location.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}${groupRows}` : ''}
+      <div class="cache-selection-sticky">
+        <h4>GGUF files by storage location</h4>
+        <p>Choose the location.</p>
+        ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation">${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
+        ${location ? `<p><strong>${escapeHtml(location.source)} location:</strong> <code>${escapeHtml(location.path)}</code></p>${location.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}` : ''}
+      </div>
+      ${location ? `<div class="cache-selection-groups">${groupRows}</div>${otherFilesHtml}` : ''}
       ${selectedLocationID && !location ? '<p class="cache-selection-warning">The previously selected location is no longer available. No other location was selected automatically.</p>' : ''}
-      ${outcomeHTML}
-      ${selectedGroupID ? '<p class="cache-selection-readonly">A group is selected in this location.</p>' : ''}
-      <p id="cache-selection-readonly" class="cache-selection-readonly">Only the selected GGUF group is affected; other files and locations remain.</p>`;
+      ${outcomeHTML}`;
+    const genericFiles = host.querySelector('.cache-detail-files');
+    if (genericFiles) genericFiles.style.display = hasGroups ? 'none' : '';
     context.selection = selection;
     context.selectedLocationID = selectedLocationID;
-    section.querySelectorAll('.cache-selection-pick').forEach(button => button.addEventListener('click', () => {
-      const group = groups[Number(button.dataset.groupIndex)];
-      if (!group || !location || !cacheDetailsContextIsCurrent(context)) return;
-      renderCacheSelection(selection, location.id, context, group.id, outcomeHTML);
-    }));
     section.querySelectorAll('.cache-selection-delete').forEach(button => button.addEventListener('click', () => {
       const group = groups[Number(button.dataset.deleteGroupIndex)];
       if (!group || !location || location.canDelete !== true || group.canDelete !== true || !cacheDetailsContextIsCurrent(context)) return;
@@ -2423,7 +2425,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         if (!cacheDetailsContextIsCurrent(context)) return;
         const freshLocation = updated.locations?.find(item => item.id === nextLocation.id);
         const refreshed = { ...selection, locations: locations.map(item => item.id === nextLocation.id && freshLocation ? freshLocation : item) };
-        renderCacheSelection(refreshed, nextLocation.id, context, '', outcomeHTML);
+        renderCacheSelection(refreshed, nextLocation.id, context, outcomeHTML);
       } catch (error) {
         if (cacheDetailsContextIsCurrent(context)) {
           const warning = $('#cacheSelectionSection');
@@ -2584,7 +2586,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (!context.isCurrent()) return;
       $('#modalTitle').textContent = 'Repository Details';
       setModalContent(context.detailsHTML);
-      renderCacheSelection(freshSelection, context.location.id, context.detailsContext, '', notice);
+      renderCacheSelection(freshSelection, context.location.id, context.detailsContext, notice);
       insertCacheDetailsFreshnessNotice();
     } catch (error) {
       if (!context.isCurrent()) return;
