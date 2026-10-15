@@ -2297,7 +2297,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       `);
       context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
       if (requestedType === 'model') {
-        $('#modalBody')?.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
+        ($('#modalBody .cache-detail-modal') || $('#modalBody'))?.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"><p>Loading GGUF groups…</p></section>');
         const selection = await api('GET', `/cache-selection?repo=${encodeURIComponent(repo)}&type=model`);
         if (!cacheDetailsContextIsCurrent(context)) return;
         const preferred = preferredLocationID && selection.locations?.find(location => location.id === preferredLocationID);
@@ -2370,7 +2370,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (!host || !cacheDetailsContextIsCurrent(context)) return;
     let section = $('#cacheSelectionSection');
     if (!section) {
-      host.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      (host.querySelector('.cache-detail-modal') || host).insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
       section = $('#cacheSelectionSection');
     }
     section.innerHTML = `
@@ -2418,7 +2418,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (!Number.isInteger(selectedIndex) || !nextLocation || !cacheDetailsContextIsCurrent(context)) return;
       context.selectedLocationID = nextLocation.id;
       select.disabled = true;
-      section.innerHTML = `<h4>GGUF files by storage location</h4><p>Loading groups from ${escapeHtml(nextLocation.source)} location: <code>${escapeHtml(nextLocation.path)}</code></p>`;
+      section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF files by storage location</h4><p>Loading groups from ${escapeHtml(nextLocation.source)} location: <code>${escapeHtml(nextLocation.path)}</code></p></div>`;
       const query = `/cache-selection?repo=${encodeURIComponent(repo)}&type=model&locationId=${encodeURIComponent(nextLocation.id)}`;
       try {
         const updated = await api('GET', query);
@@ -2429,7 +2429,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       } catch (error) {
         if (cacheDetailsContextIsCurrent(context)) {
           const warning = $('#cacheSelectionSection');
-          if (warning) warning.innerHTML = `<h4>GGUF files by storage location</h4><p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>`;
+          if (warning) warning.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF files by storage location</h4><p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p></div>`;
         }
       }
     });
@@ -2539,7 +2539,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   function insertCacheDetailsFreshnessNotice() {
-    $('#modalBody')?.insertAdjacentHTML('afterbegin', '<p class="cache-selection-readonly">The repository totals and general file list are the snapshot from when Details opened; GGUF groups above were refreshed for the selected locations.</p>');
+    ($('#modalBody .cache-detail-modal') || $('#modalBody'))?.insertAdjacentHTML('afterbegin', '<p class="cache-selection-readonly">The repository totals and general file list are the snapshot from when Details opened; GGUF groups above were refreshed for the selected locations.</p>');
   }
 
   async function submitSelectedCacheDelete(context) {
