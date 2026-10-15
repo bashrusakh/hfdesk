@@ -408,6 +408,21 @@ func TestPlanRepoDatasetOrdinaryFilterRefusesOnlyEmittedSetRoleAmbiguity(t *test
 	assertPaths(t, planPaths(plan), []string{"selected.csv"})
 }
 
+func TestPlanRepoDatasetNoMatchPrecedesRetainedAmbiguity(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "notes.json", Size: 11},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, Excludes: []string{"train.csv"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if plan != nil || !errors.Is(err, ErrNoFilterMatch) {
+		t.Fatalf("PlanRepo = (%+v, %v), want nil plan and ErrNoFilterMatch before companion ambiguity", plan, err)
+	}
+}
+
 func TestPlanRepoDatasetKnownMetadataOwnershipUnknownIsRetained(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
