@@ -390,7 +390,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
+				ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedDatasetMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
 				if !groupSelectionAmbiguous && !ordinaryMetadataAmbiguous {
 					continue
 				}
@@ -444,7 +444,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// their established role-aware membership; the filtered GGUF route
 			// retains recognized model and dataset service metadata.
 			if !recognizedDatasetGroup && ggufMode && !strings.HasSuffix(relLower, ".gguf") &&
-				!isRecognizedMetadataPath(rel) {
+				!isRecognizedDatasetMetadataPath(rel) {
 				continue
 			}
 		}
@@ -494,7 +494,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				}
 			}
 			if matchedFilter == "" {
-				if isLFS || !isRecognizedModelMetadata(rel) || job.IsDataset && datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
+				metadata := isRecognizedModelMetadata(rel)
+				if job.IsDataset {
+					metadata = isRecognizedDatasetMetadataPath(rel)
+				}
+				if isLFS || !metadata || job.IsDataset && datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
 					continue
 				}
 			}
@@ -524,7 +528,10 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				// scope, as does the established model companion behavior.
 				if job.IsDataset || dir != "." {
 					_, inMatchedDir := matchedDirs[dir]
-					metadata := isRecognizedModelMetadata(rel) || job.IsDataset && isDatasetServiceMetadata(rel)
+					metadata := isRecognizedModelMetadata(rel)
+					if job.IsDataset {
+						metadata = isRecognizedDatasetMetadataPath(rel)
+					}
 					if !metadata && (job.IsDataset || !inMatchedDir) {
 						continue
 					}
@@ -725,10 +732,17 @@ func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
 func isRecognizedModelMetadata(relativePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
 	switch base {
-	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt":
+	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt", "vocab.txt":
 		return true
 	}
 	return isREADMEPath(relativePath)
+}
+
+// Dataset metadata keeps its established recognition domain. A basename that
+// is a model tokenizer asset (notably vocab.txt) is not thereby dataset metadata.
+func isRecognizedDatasetMetadataPath(relativePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	return base != "vocab.txt" && isRecognizedMetadataPath(relativePath)
 }
 
 func isRecognizedMetadataPath(relativePath string) bool {

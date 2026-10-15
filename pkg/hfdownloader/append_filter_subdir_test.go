@@ -69,6 +69,46 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 	}
 }
 
+func TestDownload_RetainedModelVocabKeepsRepoRelativeDestination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 6}},
+				{Type: "file", Path: "arbitrary/assets/vocab.txt", Size: 4},
+			})
+		case r.URL.Path == "/owner/model/resolve/main/weights/model.safetensors":
+			_, _ = w.Write([]byte("weight"))
+		case r.URL.Path == "/owner/model/raw/main/arbitrary/assets/vocab.txt":
+			_, _ = w.Write([]byte("vocab"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out := t.TempDir()
+	base, err := DestinationBase(out, "owner/model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Download(context.Background(), Job{
+		Repo: "owner/model", Revision: "main", Filters: []string{"weights/model.safetensors"}, ExactMatch: true, AppendFilterSubdir: true,
+	}, Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}, nil)
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(base, "arbitrary/assets/vocab.txt"))
+	if err != nil || string(got) != "vocab" {
+		t.Fatalf("repo-relative vocab = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "weights", "arbitrary/assets/vocab.txt")); !os.IsNotExist(err) {
+		t.Fatalf("retained vocab unexpectedly relocated under filter directory (stat err=%v)", err)
+	}
+}
+
 func TestDownload_DatasetOrdinaryNonLFSFilterPreservesRootDestinations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
