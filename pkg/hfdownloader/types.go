@@ -44,16 +44,25 @@ type Job struct {
 	//   - "abc123" (commit SHA)
 	Revision string
 
-	// Filters specify which LFS files to download, matched case-insensitively.
-	// If empty, all files are downloaded.
+	// Filters define direct selection matches by case-insensitive name matching
+	// for any file type (not only LFS blobs). If empty, all files are downloaded.
 	//
-	// Each filter is matched as a substring against file names. A file is
-	// included if it contains any of the filter strings.
+	// Each filter is matched against file names: a file is a direct match if its
+	// name contains any of the filter strings (substring mode, the default) or,
+	// when ExactMatch is set, if the filter equals a whole delimiter-bounded
+	// segment of the name. Excludes are applied before selection: a file that
+	// matches a filter but is excluded does not confirm selection. After Excludes
+	// are applied, at least one file must be a direct match or the scan fails
+	// with ErrNoFilterMatch.
+	//
+	// The planner may additionally retain companion/metadata files in the plan
+	// after a successful direct selection (e.g., mmproj companions for GGUF,
+	// or config/tokenizer JSON for non-GGUF downloads).
 	//
 	// Examples:
 	//   - []string{"q4_0"} matches "model.Q4_0.gguf"
 	//   - []string{"q4_k_m", "q5_k_m"} matches either quantization
-	//   - []string{"gguf"} matches all GGUF files
+	//   - []string{"config.json"} matches a plain (non-LFS) config file
 	Filters []string
 
 	// Excludes specify patterns to exclude from download, matched case-insensitively.

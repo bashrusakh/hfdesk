@@ -216,6 +216,12 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	var items []PlanItem
 	seen := make(map[string]struct{})      // ensure each relative path appears once in the plan
 	seenLower := make(map[string]struct{}) // ensure each path appears at most once modulo case
+	// directFilterMatch is the selection proof for non-empty Filters: at least
+	// one non-excluded file in the tree must directly match a requested filter.
+	// It is tracked independently of plan inclusion so companion/metadata
+	// files that enter the plan below can never make a filtered request
+	// succeed on their own.
+	directFilterMatch := false
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
@@ -281,8 +287,27 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			continue
 		}
 
-		// Determine which filter (if any) matches this file name, prefer the longest match
-		// Filter matching is case-insensitive (e.g., q4_0 matches Q4_0)
+		// Direct selection match: proof that a requested filter actually
+		// matched this file. Computed for every non-excluded file before any
+		// GGUF/LFS inclusion decision and regardless of whether the file later
+		// enters the plan, so an excluded file never confirms selection while
+		// a valid direct match of e.g. a plain non-LFS config.json is not
+		// missed. Prefer the longest matching filter (same rule as the
+		// inclusion branches below, which reuse this value).
+		directMatchedFilter := ""
+		for _, f := range job.Filters {
+			if filterMatches(nameLower, strings.ToLower(f), job.ExactMatch) {
+				if len(f) > len(directMatchedFilter) {
+					directMatchedFilter = f
+				}
+			}
+		}
+		if directMatchedFilter != "" {
+			directFilterMatch = true
+		}
+
+		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
+		// branches below; it is not the selection proof (see directMatchedFilter).
 		matchedFilter := ""
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
@@ -293,26 +318,16 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		if ggufMode {
 			// Keep only files that match a filter: the selected quant's shards
-			// and any mmproj companion. Everything else is skipped.
-			for _, f := range job.Filters {
-				if filterMatches(nameLower, strings.ToLower(f), job.ExactMatch) {
-					if len(f) > len(matchedFilter) {
-						matchedFilter = f
-					}
-				}
-			}
+			// and any mmproj companion. Everything else is skipped. The loop
+			// this replaced computed exactly directMatchedFilter (same name,
+			// filters, exact mode, longest-match rule).
+			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
 				continue
 			}
 		} else if isLFS && len(job.Filters) > 0 {
-			for _, f := range job.Filters {
-				fLower := strings.ToLower(f)
-				if filterMatches(nameLower, fLower, job.ExactMatch) {
-					if len(f) > len(matchedFilter) {
-						matchedFilter = f
-					}
-				}
-			}
+			// Same computation as the ggufMode branch above: directMatchedFilter.
+			matchedFilter = directMatchedFilter
 			// If filters provided and none matched, skip typical large LFS blobs
 			if matchedFilter == "" {
 				ln := strings.ToLower(name)
@@ -392,6 +407,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			AcceptRanges: acceptRanges,
 			Subdir:       matchedFilter, // empty when no filter matched
 		})
+	}
+	// A non-empty filter set must have produced at least one direct selection
+	// match across the scanned tree (excludes applied). Companion/metadata
+	// files alone never make a filtered request succeed. An empty repo
+	// without filters still returns a successful empty plan.
+	if len(job.Filters) > 0 && !directFilterMatch {
+		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }

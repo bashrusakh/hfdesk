@@ -88,8 +88,10 @@ The ProgressFunc callback receives events throughout the download:
 
 # Filter Matching
 
-Filters are matched case-insensitively against LFS file names. Multiple filters
-can be specified; a file matches if it contains any of the filter strings:
+Filters are matched case-insensitively against file names of any file type,
+not only LFS file names. Multiple filters can be specified; a file matches if
+it contains any of the filter strings, or (with ExactMatch) equals a whole
+delimiter-bounded name segment:
 
 	job := hfdownloader.Job{
 		Repo:    "TheBloke/Llama-2-7B-GGUF",
