@@ -161,7 +161,10 @@ func pathGroups(p, base string) []string {
 		}
 		return groups
 	}
-	if len(parts) > 1 && parts[0] == "data" && parts[1] != "" {
+	// data/<group>/ is a directory convention. A leaf directly under data/
+	// (for example data/part-0000.parquet) is an unnamed/default file, not a
+	// custom group named after its filename.
+	if len(parts) > 2 && parts[0] == "data" && parts[1] != "" {
 		return []string{parts[1]}
 	}
 	return nil

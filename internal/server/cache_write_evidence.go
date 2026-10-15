@@ -246,8 +246,11 @@ func jobFromDecision(d writeDecisionJob) *Job {
 }
 
 // CollectSnapshot inventories all job and run-activity descriptors in the
-// immutable decision snapshot. A descriptor shared by a queued job and its
-// activity is visited once; a distinct generation remains independent.
+// immutable decision snapshot. Complete plans are represented by their frozen
+// destinations instead; incomplete known plans still need namespace evidence
+// for destinations not covered by those known paths. A descriptor shared by a
+// queued job and its activity is visited once; a distinct generation remains
+// independent.
 func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 	seen := make(map[string]struct{}, len(s.jobs)+len(s.activities))
 	startingActivity := make(map[string][]writeDecisionJob)
@@ -273,7 +276,7 @@ func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 		a.collectDescriptor(d)
 	}
 	for _, activity := range s.activities {
-		if activity.planKnown {
+		if activity.planKnown && activity.planComplete {
 			continue
 		}
 		key := decisionDescriptorKey(activity.job)

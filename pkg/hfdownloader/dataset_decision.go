@@ -76,6 +76,7 @@ type datasetDecisionContext struct {
 	ExactMatch             bool
 	IsDataset              bool
 	GGUFMode               bool
+	RetainMetadata         bool
 	DirectSeedsByDirectory map[string][]int
 	CaseIndexesByPath      map[string][]int
 	uniqueEvaluation       *datasetDecisionUniqueEvaluation

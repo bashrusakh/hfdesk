@@ -274,6 +274,58 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	}
 }
 
+func TestDatasetAnalyzerRoundTripsFlatAndCustomDataGroups(t *testing.T) {
+	paths := []string{"data/part-0000.parquet", "data/part-0001.parquet", "data/custom/part.parquet"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/flat/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/flat/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/flat", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make(map[string][]string)
+	filters := make(map[string]string)
+	for _, item := range DatasetToSelectableItems(info.Dataset) {
+		groups[item.ID] = item.Files
+		filters[item.ID] = item.FilterValue
+	}
+	if strings.Join(groups["default"], ",") != "data/part-0000.parquet,data/part-0001.parquet" {
+		t.Fatalf("flat parquet group = %v; want both flat data leaves under default", groups["default"])
+	}
+	if strings.Join(groups["custom"], ",") != "data/custom/part.parquet" || filters["custom"] != "custom" {
+		t.Fatalf("custom directory analyzer group=%v filter=%q", groups["custom"], filters["custom"])
+	}
+	for _, group := range []string{"default", "custom"} {
+		plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: "owner/flat", Revision: "rev1", IsDataset: true, Filters: []string{filters[group]}, ExactMatch: true, AppendFilterSubdir: true}, hfdownloader.Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo %s: %v", group, err)
+		}
+		var got []string
+		for _, item := range plan.Items {
+			got = append(got, item.RelativePath)
+			if item.Subdir != filters[group] {
+				t.Errorf("group %s item %s attributed to %q; want analyzer filter %q", group, item.RelativePath, item.Subdir, filters[group])
+			}
+		}
+		if strings.Join(got, ",") != strings.Join(groups[group], ",") {
+			t.Fatalf("group %s plan=%v; analyzer advertised %v", group, got, groups[group])
+		}
+	}
+}
+
 func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
 	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/test_data.parquet"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

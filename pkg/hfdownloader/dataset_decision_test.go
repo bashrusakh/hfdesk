@@ -82,6 +82,55 @@ func TestDatasetMetadataNamesDoNotOverrideMembershipEvidence(t *testing.T) {
 	}
 }
 
+func TestDatasetGGUFMetadataRoleRefusalHasCachedAndUncachedWitnesses(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "weights/model.gguf"},
+		{Path: "nested/config.json"},
+	}, []string{"weights/model.gguf"}, nil)
+	c.RetainMetadata = true
+	target := 1
+	if len(c.Inputs[target].Alternatives) < 2 {
+		t.Fatalf("fixture lacks data/companion alternatives: %+v", c.Inputs[target].Alternatives)
+	}
+	data := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: c.Inputs[target].Alternatives[0].Label}
+	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
+	worlds := []datasetDecisionWorld{
+		mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: data}, nil),
+		mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: companion}, nil),
+	}
+	if worlds[0].DataLabels[target] == "" || !worlds[1].Companion[target] {
+		t.Fatalf("role witnesses do not represent distinct established alternatives: %+v", worlds)
+	}
+	for wi, world := range worlds {
+		evaluation, err := evaluateDatasetDecisionWorld(c, world)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if evaluation.Records[target].Selected != (wi == 1) {
+			t.Fatalf("role world %d selected metadata=%t, want %t: %+v", wi, evaluation.Records[target].Selected, wi == 1, evaluation.Records)
+		}
+	}
+	for _, cached := range []bool{true, false} {
+		q := c
+		if !cached {
+			q.uniqueEvaluation = nil
+		}
+		can, cannot := datasetDecisionRefusal(q, target)
+		if !can.Possible || !cannot.Possible || can.Err != nil || cannot.Err != nil {
+			t.Fatalf("cached=%t role-dependent emitted-set witnesses missing: can=%+v cannot=%+v", cached, can, cannot)
+		}
+		for _, witness := range []struct {
+			result datasetDecisionQueryResult
+			want   bool
+		}{{can, true}, {cannot, false}} {
+			evaluation, err := evaluateDatasetDecisionWorld(q, witness.result.World)
+			if err != nil || evaluation.Records[target].Selected != witness.want {
+				t.Fatalf("cached=%t witness selected=%v want=%t err=%v records=%+v", cached, evaluation.Records[target].Selected, witness.want, err, evaluation.Records)
+			}
+		}
+	}
+}
+
 func TestCanEmitDatasetDecisionStopsAtProvenNonEmission(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train/part.parquet"},

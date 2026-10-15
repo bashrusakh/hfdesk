@@ -494,7 +494,7 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 			e, _ := evaluateDatasetDecisionWorld(c, w)
 			return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 		}
-		if path.Dir(strings.ReplaceAll(c.Inputs[index].Path, "\\", "/")) == "." {
+		if path.Dir(strings.ReplaceAll(c.Inputs[index].Path, "\\", "/")) == "." || c.RetainMetadata && isRecognizedMetadataPath(c.Inputs[index].Path) && !c.Inputs[index].LFS {
 			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, nil)
 			if ok && queryWorldEmits(c, w, index) {
 				e, _ := evaluateDatasetDecisionWorld(c, w)
@@ -678,8 +678,9 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 				eligible, possible := directAlways, directPossible
 				if alt.Role == datasetselection.EvidenceRoleCompanion && !in.LFS {
 					dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-					fallback := dir == "." || guaranteedDirs[dir]
-					maybeFallback := dir == "." || possibleDirs[dir]
+					metadata := c.RetainMetadata && isRecognizedMetadataPath(in.Path)
+					fallback := metadata || dir == "." || guaranteedDirs[dir]
+					maybeFallback := metadata || dir == "." || possibleDirs[dir]
 					eligible, possible = eligible || fallback, possible || maybeFallback
 				}
 				if !eligible {
@@ -878,7 +879,7 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			selected := direct[i]
 			if !selected && alt.Role == datasetselection.EvidenceRoleCompanion && !in.LFS {
 				dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-				selected = dir == "." || dirs[dir]
+				selected = c.RetainMetadata && isRecognizedMetadataPath(in.Path) || dir == "." || dirs[dir]
 			}
 			if altIndex > 0 && selected != eligible {
 				return false
@@ -1149,9 +1150,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			break
 		}
 	}
-	if !groupSelected {
-		return datasetDecisionEvaluation{}, fmt.Errorf("concrete dataset evaluator requires at least one recognized group filter")
-	}
+	_ = groupSelected // recognized groups and ordinary path filters share this evaluator.
 	if err := validateDatasetDecisionWorld(c, world); err != nil {
 		return datasetDecisionEvaluation{}, err
 	}
@@ -1190,7 +1189,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			return datasetDecisionEvaluation{}, err
 		}
 		r := &out.Records[i]
-		eligible := !in.Excluded && (direct[i] || (companions[i] && !in.LFS && (path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
+		eligible := !in.Excluded && (direct[i] || (companions[i] && !in.LFS && (c.RetainMetadata && isRecognizedMetadataPath(in.Path) || path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
 		if strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path) {
 			eligible = false
 		}
