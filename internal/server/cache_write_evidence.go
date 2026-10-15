@@ -28,7 +28,7 @@ type writeDecisionActivity struct {
 	job          writeDecisionJob
 	planKnown    bool
 	planComplete bool
-	planned      []string
+	planned      []frozenMutationPath
 }
 
 type writeDecisionSnapshot struct {
@@ -92,8 +92,19 @@ func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 		}
 		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown, planComplete: a.planComplete}
 		if a.planKnown {
-			item.planned = mapKeys(a.planned)
-			sort.Strings(item.planned)
+			for _, path := range a.planned {
+				item.planned = append(item.planned, path)
+			}
+			sort.Slice(item.planned, func(i, j int) bool {
+				a, b := item.planned[i], item.planned[j]
+				if a.key != b.key {
+					return a.key < b.key
+				}
+				if a.raw != b.raw {
+					return a.raw < b.raw
+				}
+				return a.physical < b.physical
+			})
 		}
 		s.activities = append(s.activities, item)
 	}

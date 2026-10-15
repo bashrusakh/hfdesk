@@ -709,6 +709,13 @@ func jobMayWriteFrozenSelectedPath(job *Job, target frozenMutationPath) bool {
 // frozenPhysicalPaths returns the physical spellings of frozen mutation
 // entries. Reservations compare frozen values, but the batched writer checks
 // resolve each target against the job's inventoried namespaces.
+func (p frozenMutationPath) rawOrPhysical() string {
+	if p.raw != "" {
+		return p.raw
+	}
+	return p.physical
+}
+
 func frozenPhysicalPaths(paths []frozenMutationPath) []string {
 	out := make([]string, len(paths))
 	for i, path := range paths {
@@ -721,6 +728,17 @@ func frozenPhysicalPaths(paths []frozenMutationPath) []string {
 func frozenPathsOverlapAny(path string, paths []frozenMutationPath) bool {
 	for _, candidate := range paths {
 		if frozenMutationOverlapsRawEntry(candidate, path) {
+			return true
+		}
+	}
+	return false
+}
+
+// frozenEntryOverlapsAny reports whether a frozen entry overlaps any frozen
+// candidate.
+func frozenEntryOverlapsAny(entry frozenMutationPath, paths []frozenMutationPath) bool {
+	for _, candidate := range paths {
+		if frozenMutationOverlap(entry, candidate) {
 			return true
 		}
 	}
@@ -880,7 +898,7 @@ func (m *JobManager) reserveSelectedGGUFAttempt(paths []string) (func(), bool) {
 	for _, activity := range a.start.activities {
 		if activity.planKnown {
 			for _, planned := range activity.planned {
-				if frozenPathsOverlapAny(planned, clean) {
+				if frozenEntryOverlapsAny(planned, clean) {
 					return nil, false
 				}
 			}

@@ -294,6 +294,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// fallback only when no dataset group is recognized (e.g. a dataset repo
 	// containing a GGUF-only quant selection).
 	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
+	var recognizedDatasetGroup bool
 	if datasetGroupRequest {
 		membership := datasetMembership
 		// The group evaluator is reached only when a filter is recognized as a
@@ -314,6 +315,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				break
 			}
 		}
+		recognizedDatasetGroup = datasetGroupRequest
 		// Even ordinary filename/path filters use the shared dataset evidence
 		// evaluator so recognized metadata with data/companion alternatives can
 		// be retained or refused based on its actual final emitted-set outcomes.
@@ -412,6 +414,15 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				if !caseWinner {
 					continue
 				}
+			}
+			// Ordinary dataset selectors can share the evaluator with dataset
+			// groups, but its companion-role result must not broaden a GGUF-only
+			// quant selection to unrelated model weights. Group selections retain
+			// their established role-aware membership; the filtered GGUF route
+			// retains recognized model and dataset service metadata.
+			if !recognizedDatasetGroup && ggufMode && !strings.HasSuffix(relLower, ".gguf") &&
+				!isRecognizedMetadataPath(rel) {
+				continue
 			}
 		}
 		// Check excludes first - if file matches any exclude pattern, skip it

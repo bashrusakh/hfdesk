@@ -626,6 +626,25 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 	}
 }
 
+func TestPlanRepoDatasetExactQuantFilterDoesNotSelectUnmatchedWeightCompanion(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "other.safetensors", Size: 20},
+		{Type: "file", Path: "dataset_info.json", Size: 8},
+		{Type: "file", Path: "README.md", Size: 5},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf", "dataset_info.json", "README.md"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths=%v, want selected GGUF plus retained root metadata %v", got, want)
+	}
+}
+
 func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train_records.csv", Size: 10},
