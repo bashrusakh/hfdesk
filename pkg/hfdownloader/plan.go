@@ -384,8 +384,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				ordinaryMetadataAmbiguous := context.RetainMetadata && isRecognizedDatasetMetadataPath(n.Path) && hasDatasetRoleUncertainty(context.Inputs[i])
-				if !groupSelectionAmbiguous && !ordinaryMetadataAmbiguous {
+				if !groupSelectionAmbiguous {
 					continue
 				}
 				can, cannot := datasetDecisionRefusal(context, i)
@@ -594,7 +593,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		seenLower[relLower] = struct{}{}
 
 		destinationSubdir := matchedFilter
-		if job.IsDataset && !isLFS && !ggufMode && !strings.HasSuffix(nameLower, ".gguf") {
+		if job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") &&
+			(!ggufMode || datasetHasDefiniteDataRole(datasetMembership, nodeIndex)) {
 			destinationSubdir = ""
 		}
 		items = append(items, PlanItem{
