@@ -388,9 +388,10 @@ func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
 		{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 100}},
 		{Type: "file", Path: "arbitrary/assets/vocab.json", Size: 12},
 		{Type: "file", Path: "arbitrary/assets/merges.txt", Size: 13},
+		{Type: "file", Path: "arbitrary/assets/vocab.txt", Size: 13},
 		{Type: "file", Path: "arbitrary/assets/unrelated.json", Size: 14},
 		{Type: "file", Path: "arbitrary/assets/unrelated.txt", Size: 15},
-		{Type: "file", Path: "arbitrary/assets/vocab-lfs.json", LFS: &hfLfsInfo{Size: 16}},
+		{Type: "file", Path: "arbitrary/assets/vocab-lfs.txt", LFS: &hfLfsInfo{Size: 16}},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
@@ -398,7 +399,32 @@ func TestPlanRepoModelTokenizerVocabularyMetadataRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt", "arbitrary/assets/vocab.txt"})
+
+	plan, err = PlanRepo(context.Background(), Job{
+		Repo: "owner/model", Filters: []string{"weights/model.safetensors"}, Excludes: []string{"vocab.txt"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "arbitrary/assets/vocab.json", "arbitrary/assets/merges.txt"})
+}
+
+func TestPlanRepoDatasetDoesNotInferModelVocabMetadataFromBasename(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "elsewhere/vocab.txt", Size: 11},
+		{Type: "file", Path: "elsewhere/unrelated.txt", Size: 12},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv"})
 }
 
 func TestPlanRepoDatasetOrdinaryFilterRefusesOnlyEmittedSetRoleAmbiguity(t *testing.T) {

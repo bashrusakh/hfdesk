@@ -255,3 +255,42 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 		})
 	}
 }
+
+func TestDatasetVocabTxtDoesNotBecomeMetadataFeasibility(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "elsewhere/vocab.txt", Size: 11},
+	}
+	membershipFiles := []datasetselection.File{{Path: files[0].Path}, {Path: files[1].Path}}
+	membership := datasetselection.Recognize(membershipFiles)
+	c := compileDatasetDecisionContext(files, membership, []string{"train.csv"}, nil, true, true, false)
+
+	// The dataset recognizer still considers TXT data-or-companion, but the
+	// model-only metadata spelling must not make its nested companion eligible.
+	if got := c.Inputs[1].Alternatives; len(got) != 2 || got[0].Role != datasetselection.EvidenceRoleData || got[1].Role != datasetselection.EvidenceRoleCompanion {
+		t.Fatalf("vocab.txt dataset alternatives = %+v; want data/companion alternatives", got)
+	}
+	worlds := []datasetDecisionWorld{
+		{DataLabels: map[int]string{0: "train", 1: "default"}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}},
+		{DataLabels: map[int]string{0: "train"}, Companion: map[int]bool{1: true}, SharedToken: map[uint]bool{}},
+	}
+	for i, world := range worlds {
+		evaluation, err := evaluateDatasetDecisionWorld(c, world)
+		if err != nil {
+			t.Fatalf("evaluate role world %d: %v", i, err)
+		}
+		if evaluation.Records[1].Selected {
+			t.Fatalf("role world %d selected nested vocab.txt without direct filter or dataset directory seed", i)
+		}
+	}
+	for _, cached := range []bool{false, true} {
+		queryContext := c
+		if !cached {
+			queryContext.uniqueEvaluation = nil
+		}
+		can, cannot := datasetDecisionRefusal(queryContext, 1)
+		if can.Err != nil || cannot.Err != nil || can.Possible || cannot.Possible {
+			t.Fatalf("cached=%t vocab.txt feasibility can/cannot=%t/%t errors=%v/%v; want neither", cached, can.Possible, cannot.Possible, can.Err, cannot.Err)
+		}
+	}
+}
