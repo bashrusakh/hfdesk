@@ -189,6 +189,11 @@ func (m *JobManager) beginObservedMutation(paths []string) func() {
 		delete(m.mutationScopes, id)
 		delete(m.mutationScopeKinds, id)
 		m.bumpWriteDecisionLocked()
+		// A reservation-sensitive dispatch may have completed while this
+		// observed mutation was still blocking the FIFO head. Re-evaluate now
+		// that the cleanup scope is gone; a notification alone can leave a
+		// queued job stalled if no later event requests dispatch.
+		m.dispatchLocked()
 		m.mu.Unlock()
 	}
 }

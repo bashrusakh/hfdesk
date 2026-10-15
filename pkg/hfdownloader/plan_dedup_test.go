@@ -171,7 +171,7 @@ func TestPlanRepo_FilteredGGUFDoesNotIncludeUnmatchedNonLFSQuant(t *testing.T) {
 	}
 }
 
-func TestPlanRepo_GGUFOnlyFilterPreservesNonGGUFCompanionExclusion(t *testing.T) {
+func TestPlanRepo_GGUFOnlyFilterExcludesUnmatchedNonGGUFCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100},
 		{Type: "file", Path: "config.json", Size: 20},
@@ -184,8 +184,8 @@ func TestPlanRepo_GGUFOnlyFilterPreservesNonGGUFCompanionExclusion(t *testing.T)
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf", "config.json", "tokenizer.json", "README.md"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("GGUF-only selection paths=%v want recognized metadata fallback %v", got, want)
+	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GGUF-only selection paths=%v want matched-only result %v", got, want)
 	}
 }
 
@@ -209,10 +209,10 @@ func TestPlanRepo_GGUFModePreservesExplicitNonGGUFFilterMatches(t *testing.T) {
 			want:    []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md"},
 		},
 		{
-			name:    "unmatched companions remain excluded",
+			name:    "unmatched metadata companions are excluded",
 			files:   []hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100}, {Type: "file", Path: "config.json", Size: 20}, {Type: "file", Path: "README.md", Size: 30}},
 			filters: []string{"Q4_K_M"},
-			want:    []string{"model-Q4_K_M.gguf", "config.json", "README.md"},
+			want:    []string{"model-Q4_K_M.gguf"},
 		},
 	}
 	for _, tc := range cases {

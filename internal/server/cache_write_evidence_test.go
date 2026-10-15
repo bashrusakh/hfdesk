@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestSelectedDeleteReservationRechecksNewMatchingWriterAfterInventory(t *testing.T) {
@@ -850,6 +852,47 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 	}
 	if !jobMayWriteSelectedPath(job, target) {
 		t.Fatal("outward alias did not retain conservative possible-writer handling")
+	}
+}
+
+func TestSelectedPathCandidateClosureStopsBeforeQuadraticExpansion(t *testing.T) {
+	const aliases = maxWritableAliasExpansion + 16
+	base := filepath.Join(t.TempDir(), "base")
+	inv := writableNamespaceInventory{base: base}
+	for i := 0; i < aliases; i++ {
+		name := fmt.Sprintf("dir-%05d", i)
+		location := filepath.Join(base, name, "back")
+		inv.aliases = append(inv.aliases, writableAlias{location: location, dest: base, name: "back"})
+	}
+	if _, ok := inv.selectedPathCandidates(filepath.Join(base, "dir-00000", "selected.gguf")); ok {
+		t.Fatal("path spelling closure exceeded its bounded expansion budget")
+	}
+}
+
+func TestObservedMutationCleanupRestartsReservationDispatch(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{MaxActive: 1}, nil, filepath.Join(root, "state"))
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
+	m.jobs[job.ID] = job
+	entered := make(chan struct{})
+	m.writeInventory = func(base string) (writableNamespaceInventory, bool) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		return inventoryWritableNamespace(base)
+	}
+	m.deleteReservations[1] = freezeTestEntries(t, filepath.Join(root, "weights.gguf"))
+	finishCleanup := m.beginObservedMutation([]string{filepath.Join(root, "weights.gguf")})
+	finishCleanup()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observed-mutation cleanup did not request reservation dispatch")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

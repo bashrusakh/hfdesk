@@ -49,12 +49,14 @@ func TestRejectedRootGGUFInNonuniqueWorlds(t *testing.T) {
 		t.Fatal("oracle permits the rejected root GGUF to emit")
 	}
 
+	uncached := c
+	uncached.uniqueEvaluation = nil
 	for _, tc := range []struct {
 		name string
 		c    datasetDecisionContext
 	}{
 		{"cached", c},
-		{"uncached", func() datasetDecisionContext { c.uniqueEvaluation = nil; return c }()},
+		{"uncached", uncached},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for i := range tc.c.Inputs {

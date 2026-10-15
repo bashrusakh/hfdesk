@@ -71,16 +71,16 @@ Important response fields:
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
 
-For GGUF repositories, a quantization filter keeps matching GGUF files and
-matching README documents (for example, `model-Q4_K_M.gguf` and
-`README-Q4_K_M.md` for `q4_k_m`); that README filename match does not turn the
-selection into a mixed-format download. Unmatched payload files are omitted
-from this matched-only selection. Recognized non-LFS config/tokenizer metadata
-and README documents may be retained outside selected component directories
-when ownership is unknown; explicit excludes still apply. A filter that
-also selects another payload format, such as safetensors, retains the ordinary
-mixed-format companion behavior. Existing path, directory, and extension
-filters keep their usual matching rules.
+For model repositories, filtered selection retains every non-LFS file as a
+companion, including tokenizer assets and files outside the selected directory;
+this is not a size-limited or filename-whitelist policy. Unmatched LFS files
+remain excluded, and explicit excludes take precedence. A GGUF-only
+quantization selection is the exception: it keeps only matching GGUF/mmproj
+files and directly matched files such as a matching README, with no automatic
+config, tokenizer, vocabulary, or unmatched README fallback. Explicitly
+selecting one of those files remains supported. Unfiltered downloads are
+unchanged. Existing path, directory, and extension filters keep their usual
+matching rules.
 
 For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or

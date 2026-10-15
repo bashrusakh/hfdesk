@@ -407,11 +407,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			}
 		}
 	}
-	matchedDirs := make(map[string]struct{})
-	if !datasetGroupRequest {
-		matchedDirs = matchedFilterDirectories(fileNodes, job, ggufMode)
-	}
-
 	for nodeIndex, n := range fileNodes {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -480,9 +475,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if datasetGroupRequest {
 			// Inclusion and attribution come from one concrete dataset world.
 		} else if ggufMode {
-			// Keep only files that match a filter: the selected quant's shards
-			// and any mmproj companion. Recognized model metadata may be retained
-			// when its component ownership is unknown, unless explicitly excluded.
+			// GGUF-only selection is matched-only: keep selected GGUF/mmproj and
+			// directly matched files, but do not infer metadata companions.
 			for _, f := range job.Filters {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -494,11 +488,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				}
 			}
 			if matchedFilter == "" {
-				metadata := isRecognizedModelMetadata(rel)
-				if job.IsDataset {
-					metadata = isRecognizedDatasetMetadataPath(rel)
-				}
-				if isLFS || !metadata || job.IsDataset && datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
+				metadata := job.IsDataset && isRecognizedDatasetMetadataPath(rel)
+				if isLFS || !metadata || datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
 					continue
 				}
 			}
@@ -520,19 +511,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				if isLFS {
 					continue
 				}
-				dir := path.Dir(strings.ReplaceAll(rel, "\\", "/"))
-				// Dataset payload is never an implicit path-filter companion. The
-				// group evaluator above owns recognized group requests; ordinary
-				// filename/path/folder filters retain only directly matched data.
-				// Recognized non-LFS model metadata remains eligible outside that
-				// scope, as does the established model companion behavior.
-				if job.IsDataset || dir != "." {
-					_, inMatchedDir := matchedDirs[dir]
-					metadata := isRecognizedModelMetadata(rel)
-					if job.IsDataset {
-						metadata = isRecognizedDatasetMetadataPath(rel)
-					}
-					if !metadata && (job.IsDataset || !inMatchedDir) {
+				// Ordinary model selection follows the established upstream
+				// companion policy: retain every non-LFS file, regardless of
+				// basename or directory. Preserve dataset service-metadata rules.
+				if job.IsDataset {
+					if !isRecognizedDatasetMetadataPath(rel) {
 						continue
 					}
 				}
