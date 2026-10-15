@@ -18,12 +18,14 @@ function fakeButton(dataset = {}) {
 }
 function setSectionHTML(section, value) {
   section.html = value;
-  modalHTML = modalHTML.replace(/<section id="cacheSelectionSection"[\s\S]*?<\/section>/, `<section id="cacheSelectionSection">${value}</section>`);
+  modalHTML = modalHTML.replace(/<section id="cacheSelectionSection"[^>]*>[\s\S]*?<\/section>/, `<section id="cacheSelectionSection" class="cache-detail-section">${value}</section>`);
   const buttons = selector => {
     const attribute = selector === '.cache-selection-pick' ? 'data-group-index' : 'data-delete-group-index';
-    return Array.from(value.matchAll(new RegExp(`${attribute}="(\\d+)"`, 'g')), match => fakeButton({
-      [selector === '.cache-selection-pick' ? 'groupIndex' : 'deleteGroupIndex']: match[1]
-    }));
+    return Array.from(value.matchAll(new RegExp(`<button[^>]*${attribute}="(\\d+)"[^>]*>`, 'g')), match => {
+      const button = fakeButton({ [selector === '.cache-selection-pick' ? 'groupIndex' : 'deleteGroupIndex']: match[1] });
+      button.disabled = /\sdisabled(?:\s|>)/.test(match[0]);
+      return button;
+    });
   };
   const buttonLists = new Map(['.cache-selection-pick', '.cache-selection-delete'].map(selector => [selector, buttons(selector)]));
   section.querySelectorAll = selector => buttonLists.get(selector) || [];
@@ -50,7 +52,7 @@ const modalBody = {
     modalHTML = value;
     nodes.delete('#cacheSelectionSection');
     nodes.delete('#cacheSelectionLocation');
-    const sectionMatch = value.match(/<section id="cacheSelectionSection">([\s\S]*?)<\/section>/);
+    const sectionMatch = value.match(/<section id="cacheSelectionSection"[^>]*>([\s\S]*?)<\/section>/);
     if (sectionMatch) {
       const section = { set innerHTML(content) { setSectionHTML(this, content); }, insertAdjacentHTML(_p, content) { modalHTML += content; } };
       nodes.set('#cacheSelectionSection', section);
@@ -58,7 +60,8 @@ const modalBody = {
     }
     syncConfirmButtons();
   },
-  get innerHTML() { return modalHTML; }
+  get innerHTML() { return modalHTML; },
+  querySelector() { return null; }
 };
 function syncConfirmButtons() {
   for (const match of modalHTML.matchAll(/id="(cache-delete-confirm-(\d+))"/g)) {
@@ -149,7 +152,7 @@ vm.runInNewContext(source, context);
 const paths = Array.from({ length: 25 }, (_, i) => `family/file-${i}.gguf`);
 currentSelection = {
   repo: 'org/model', type: 'model', locations: [
-    { id: 'loc-1', source: 'Local', path: '/scan/one', canDelete: true, groups: [
+    { id: 'loc-1', source: 'Local', path: '/scan/one/"archive"', canDelete: true, groups: [
       { id: 'grp-1', label: 'same-q-family-a', quant: 'Q4_K_M', canDelete: true, members: paths.map(path => ({ path, size: 4 })) },
       { id: 'grp-2', label: 'model.gguf', canDelete: true, members: [{ path: 'model.gguf', size: 0, linkOnly: true, message: 'Only this link; weights remain' }] },
       ...['family-b', 'family-c', 'family-d', 'family-e'].map((name, index) => ({
@@ -177,16 +180,15 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(calls.some(call => call.path === '/api/cache/org%2Fmodel?type=model'));
   assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 7);
   assert(modalHTML.includes('/scan/one') && modalHTML.includes('Could not verify this exact group'));
+  assert(modalHTML.includes('title="/scan/one/&quot;archive&quot;"'), 'quoted path is safe in the selector title');
   assert(modalHTML.includes('model.gguf') && modalHTML.includes('Only this link; weights remain'));
   assert(modalHTML.includes('file-24.gguf'), 'all group files beyond 20 remain selectable/visible');
   assert(modalHTML.includes('&lt;img src=x onerror=alert(1)&gt;') && !modalHTML.includes('<img src=x'), 'server-provided filenames are escaped');
-  assert.equal((modalHTML.match(/class="btn btn-danger cache-selection-delete"[^>]* disabled/g) || []).length, 1, 'only the unverifiable local group is disabled');
-  assert(modalHTML.includes('Only the selected GGUF group is affected'));
+  assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 1, 'only the unverifiable local group is disabled');
+  assert(modalHTML.includes('Only this group will be removed.'));
   assert(!modalHTML.includes('onclick="confirmDeleteCache'), 'model groups must not call whole-repository delete');
   assert(!calls.some(call => call.method === 'DELETE'));
-  const pick = nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-pick')[0];
-  pick.click();
-  assert(modalHTML.includes('aria-pressed="true">Selected group</button>'), modalHTML.slice(0, 1800));
+  assert(!modalHTML.includes('cache-selection-pick'), 'Delete is direct; no redundant Select action');
 
   // Explicitly switch to the HF location and ensure it loads the opaque ID.
   currentSelection = { ...currentSelection, locations: [{ ...currentSelection.locations[1] }] };
@@ -197,7 +199,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('/scan/one'), 'location choices remain available after selecting one');
   assert(modalHTML.includes('commit-a') && modalHTML.includes('commit-b'));
   assert(modalHTML.includes('model-00002-of-00002.gguf'));
-  assert.equal((modalHTML.match(/class="btn btn-danger cache-selection-delete"[^>]* disabled/g) || []).length, 0, 'backend-advertised HF group action is enabled');
+  assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 0, 'backend-advertised HF group action is enabled');
 
   // HF confirmation groups four stored entries into two distinct paths and
   // names both saved versions without turning versions into extra shards.
@@ -244,10 +246,11 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // without any GGUF groups, and its scope is explicit (never a group action).
   calls.length = 0;
   detailsSource = 'HF cache';
-  detailsFiles = [{ name: 'weights.safetensors', sizeHuman: '1 GB' }];
+  detailsFiles = [{ name: 'weights.safetensors', sizeHuman: '1 GB' }, ...Array.from({ length: 24 }, (_, i) => ({ name: `metadata-${i}.json`, sizeHuman: '1 KB' }))];
   currentSelection = { repo: 'org/non-gguf', type: 'model', locations: [] };
   await window.test.showCacheDetails('org/non-gguf', 'model');
   assert(modalHTML.includes('weights.safetensors'));
+  assert(modalHTML.includes('metadata-23.json'), 'non-GGUF fallback retains all snapshot files beyond 20');
   assert(modalHTML.includes('Delete entire model cache'));
   assert(!modalHTML.includes('Delete this GGUF group'));
   assert(!calls.some(call => call.method === 'DELETE'), 'displaying the legacy action must not execute it');
@@ -446,5 +449,115 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   finishDetails();
   await pendingDetails;
   assert.equal(modalHTML, '<div class="loading-state"><div class="spinner"></div></div>');
+  if (process.env.CACHE_UI_FIXTURE_URL) await checkBrowserLayout();
   console.log('PASS: typed details, exact local/HF group confirmations and request composition, all saved versions, shared-payload/207/conflict results, cancel, exact refresh/context, legacy actions, full member lists, escaping');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+// Optional real-DOM/layout layer against an isolated read-only fixture serving
+// production index.html/app.js/style.css. No browser dependency is added to the app.
+async function checkBrowserLayout() {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CACHE_UI_BROWSER || undefined, args: ['--no-sandbox'] });
+  const base = process.env.CACHE_UI_FIXTURE_URL;
+  try {
+    for (const width of [1000, 360]) {
+      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      const errors = [];
+      page.on('pageerror', error => errors.push(error.message));
+      page.on('request', request => assert.equal(request.method(), 'GET', 'visual checks never send destructive requests'));
+      await page.goto(base);
+      await page.getByText('Show 25 file records', { exact: true }).waitFor();
+      await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.target?.closest?.('#modal')).map(animation => animation.finished)));
+      const structure = await page.evaluate(() => {
+        const modal = document.querySelector('.cache-detail-modal');
+        const scroll = modal.querySelector('.cache-detail-scroll');
+        const section = document.querySelector('#cacheSelectionSection');
+        return {
+          children: Array.from(modal.children, node => node.className || node.id),
+          scrollCount: modal.querySelectorAll('.cache-detail-scroll').length,
+          groupsInside: scroll.contains(modal.querySelector('.cache-selection-groups')),
+          othersInside: scroll.contains(modal.querySelector('.cache-selection-other')),
+          metadataInside: scroll.contains(modal.querySelector('.cache-detail-metadata')),
+          headingOutside: !scroll.contains(section.querySelector('h4')),
+          collapsed: Array.from(modal.querySelectorAll('details')).every(node => !node.open),
+          stats: modal.querySelector('.cache-detail-stats').children.length,
+          pathTitle: document.querySelector('#cacheSelectionLocation').title,
+          documentOverflow: document.documentElement.scrollWidth > innerWidth,
+          modalWidth: document.querySelector('#modal').getBoundingClientRect().width
+        };
+      });
+      assert.deepEqual(structure.children, ['cache-detail-header', 'cache-detail-stats', 'cache-detail-section', 'cache-detail-actions']);
+      assert.equal(structure.scrollCount, 1);
+      for (const key of ['groupsInside', 'othersInside', 'metadataInside', 'headingOutside', 'collapsed']) assert(structure[key], key);
+      assert.equal(structure.stats, 3);
+      assert(structure.pathTitle.includes('very-long-library-location'));
+      assert(!structure.documentOverflow);
+      assert(structure.modalWidth <= (width === 360 ? 360 : 600));
+      if (width === 1000) assert.equal(structure.modalWidth, 600);
+      const first = page.locator('.cache-selection-group').first();
+      const title = await first.locator('strong').boundingBox();
+      const button = await first.getByRole('button', { name: 'Delete', exact: true }).boundingBox();
+      assert(title.x + title.width <= button.x, 'long name stays in its reserved left column');
+      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-detail-stats', '.cache-selection-sticky', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
+      const before = await stationary();
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-collapsed.png` });
+      const summary = first.locator('summary');
+      await summary.focus();
+      await page.keyboard.press('Enter');
+      assert.equal(await first.locator('details[open] li').count(), 25);
+      await page.locator('.cache-detail-scroll').evaluate(node => { node.scrollTop = 450; });
+      assert.deepEqual(await stationary(), before, 'chrome, identity, stats, location, and footer stay still');
+      const scrolling = await page.evaluate(() => Array.from(document.querySelectorAll('#modal *')).filter(node => ['auto', 'scroll'].includes(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight).map(node => node.className));
+      assert.deepEqual(scrolling, ['cache-detail-scroll'], 'no nested/outer scroll owners');
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-expanded.png` });
+      await page.getByText('Other files (2)', { exact: true }).click();
+      assert.equal(await page.locator('.cache-selection-other[open] li').count(), 2);
+      assert.deepEqual(await stationary(), before, 'expanding Other files does not move the fixed summary or footer');
+      await page.getByLabel('Storage location', { exact: true }).selectOption('1');
+      await page.getByText('2 files · 2 saved versions', { exact: true }).waitFor();
+      assert((await page.getByLabel('Storage location', { exact: true }).getAttribute('title')).includes('/cache/hub/'));
+      await page.locator('.cache-selection-group').first().getByRole('button', { name: 'Delete', exact: true }).click();
+      await page.getByRole('heading', { name: 'Confirm GGUF group deletion', exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-detail-modal').count(), 0, 'confirmation does not inherit Details layout');
+      assert.equal(await page.locator('#modalBody').evaluate(node => getComputedStyle(node).overflowY), 'auto');
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+      for (const variant of ['non-gguf', 'dataset']) {
+        await page.goto(`${base}?case=${variant}`);
+        await page.getByText('weights.safetensors', { exact: true }).waitFor();
+        await page.getByRole('button', { name: `Delete entire ${variant === 'dataset' ? 'dataset' : 'model'} cache`, exact: true }).waitFor();
+        assert.equal(await page.locator('.cache-selection-group').count(), 0);
+        assert.equal(await page.locator('.cache-detail-scroll').count(), 1);
+        assert(await page.locator('.cache-detail-scroll .cache-detail-metadata').count());
+        await page.getByText('Repository metadata', { exact: true }).click();
+        assert(await page.getByText('mmproj-F16.gguf', { exact: true }).isVisible(), 'vision metadata remains reachable');
+        assert(await page.getByText('d1a7b9c'.repeat(5), { exact: true }).isVisible(), 'commit is retained in supplementary metadata');
+        await page.getByText('Repository metadata', { exact: true }).click();
+        await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-${variant}.png` });
+      }
+      await page.route('**/api/cache-selection*', route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture unavailable' }) }));
+      await page.goto(base);
+      await page.getByText('Unable to load GGUF selection:', { exact: false }).waitFor();
+      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-files').count(), 1, 'failed selection preserves the snapshot file fallback');
+      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-metadata').count(), 1);
+      await page.getByRole('button', { name: 'Delete entire model cache', exact: true }).waitFor();
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-selection-error.png` });
+      await page.unroute('**/api/cache-selection*');
+      let releaseSelection;
+      const pendingSelection = new Promise(resolve => { releaseSelection = resolve; });
+      await page.route('**/api/cache-selection*', async route => { await pendingSelection; await route.continue(); });
+      await page.goto(base);
+      await page.getByText('Loading GGUF groups…', { exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-detail-scroll').count(), 1);
+      await page.getByRole('button', { name: 'Close', exact: true }).waitFor();
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-loading.png` });
+      releaseSelection();
+      await page.getByText('Show 25 file records', { exact: true }).waitFor();
+      await page.keyboard.press('Escape');
+      assert.equal(await page.locator('#modalBackdrop.active').count(), 0, 'Escape still closes Details');
+      assert.deepEqual(errors, [], 'no page runtime errors');
+      await page.close();
+    }
+    console.log('PASS: real DOM ancestry/order; 600px modal and 360px viewport; long-name reserved action column; 25 native-details members; sole central scroller with stationary chrome/footer; location switch; dataset/no-GGUF fallback; no writes');
+  } finally { await browser.close(); }
+}

@@ -2081,31 +2081,68 @@ a {
   text-align: right;
 }
 
-/* Detail Modal */
+/* Repository Details: fixed chrome/summary/footer, one central scroll owner. */
+.modal:has(.cache-detail-modal) {
+  position: relative;
+  height: min(740px, 88dvh);
+  max-height: 88dvh;
+}
+
+.modal:has(.cache-detail-modal) .modal-header {
+  flex-shrink: 0;
+  padding: 14px 20px;
+}
+
+.modal:has(.cache-detail-modal) .modal-header h3 {
+  font-size: 16px;
+  padding-right: 44px;
+}
+
+.modal:has(.cache-detail-modal) .modal-body {
+  display: flex;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.modal:has(.cache-detail-modal) .modal-footer {
+  display: none;
+}
+
 .cache-detail-modal {
-  /* Scrolling handled by modal body */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
 }
 
 .cache-detail-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
-  margin-bottom: 24px;
+  gap: 6px;
+  padding: 16px 20px 12px;
+  flex-shrink: 0;
 }
 
 .cache-detail-type {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
+  gap: 5px;
+  padding: 3px 7px;
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
 }
 
 .cache-detail-repo {
-  font-size: 20px;
+  order: -1;
+  flex-basis: 100%;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+  margin-bottom: 5px;
 }
 
 .cache-detail-owner {
@@ -2120,20 +2157,22 @@ a {
 
 .cache-detail-stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 16px;
-  padding: 20px;
-  background: var(--color-bg-tertiary);
-  border-radius: var(--radius-md);
-  margin-bottom: 24px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 20px 14px;
+  flex-shrink: 0;
 }
 
 .cache-detail-stat {
-  text-align: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 9px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .cache-detail-stat-value {
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--color-text);
   margin-bottom: 4px;
@@ -2166,15 +2205,7 @@ a {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   padding: 12px;
-  margin-top: 10px;
-}
-
-.cache-selection-group-heading {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
+  background: var(--color-surface);
 }
 
 .cache-selection-group details summary,
@@ -2186,6 +2217,11 @@ a {
   min-width: 0;
   max-width: 100%;
   overflow-wrap: anywhere;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin: 0;
 }
 
 #cacheSelectionLocation {
@@ -2212,6 +2248,266 @@ a {
 .cache-selection-readonly {
   color: var(--color-text-muted);
   font-size: 13px;
+}
+
+.cache-selection-sticky {
+  background: var(--color-bg-secondary);
+  flex-shrink: 0;
+  padding: 0 20px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.cache-detail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 12px 20px;
+  scrollbar-gutter: stable;
+}
+
+.cache-selection-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.cache-selection-group-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.cache-selection-group-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cache-selection-group-info strong {
+  flex-basis: 100%;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.cache-selection-group-info .cache-badge {
+  background: var(--color-primary);
+  color: var(--color-text-inverse, #fff);
+  font-size: 10px;
+}
+
+.cache-selection-counts {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.cache-selection-other {
+  margin-top: 10px;
+}
+
+.cache-selection-other ul {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-hf {
+  position: absolute;
+  top: 13px;
+  right: 58px;
+}
+
+.cache-detail-modal .cache-selection-sticky h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.cache-detail-modal .cache-selection-sticky p {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-modal .cache-selection-sticky p:last-child {
+  margin-bottom: 0;
+}
+
+.cache-detail-modal .cache-selection-sticky label[for="cacheSelectionLocation"] {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.cache-detail-modal #cacheSelectionLocation {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  font-size: 13px;
+  padding: 7px 10px;
+}
+
+.cache-detail-modal #cacheSelectionLocation:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+
+.cache-detail-modal .cache-selection-sticky code {
+  background: var(--color-bg-tertiary);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 8px;
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-modal .cache-selection-delete.btn-danger {
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-error) 45%, transparent);
+  color: var(--color-error);
+  box-shadow: none;
+}
+
+.cache-detail-modal .cache-selection-delete.btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-error) 18%, transparent);
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.cache-detail-modal .cache-selection-delete.btn-danger:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.cache-detail-modal .cache-selection-group details {
+  margin-top: 4px;
+}
+
+.cache-detail-modal .cache-selection-group details summary,
+.cache-detail-modal .cache-selection-other summary,
+.cache-detail-metadata > summary {
+  cursor: pointer;
+  padding: 4px 0;
+  border-radius: 4px;
+  color: var(--color-primary);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.cache-detail-modal .cache-selection-group details summary::marker,
+.cache-detail-modal .cache-selection-other summary::marker {
+  color: var(--color-primary);
+}
+
+.cache-detail-modal .cache-selection-group details summary:hover,
+.cache-detail-modal .cache-selection-other summary:hover {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cache-detail-modal .cache-selection-group details summary:focus-visible,
+.cache-detail-modal .cache-selection-other summary:focus-visible,
+.cache-detail-metadata > summary:focus-visible,
+.cache-detail-scroll:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.cache-detail-modal .cache-selection-group details[open] > summary {
+  margin-bottom: 8px;
+}
+
+.cache-detail-modal .cache-selection-group details ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--color-bg-secondary);
+  border: 1px dashed var(--color-border-light);
+  border-radius: 10px;
+}
+
+.cache-detail-modal .cache-selection-other ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--color-bg-secondary);
+  border: 1px dashed var(--color-border-light);
+  border-radius: 10px;
+}
+
+.cache-detail-modal .cache-selection-group details li,
+.cache-detail-modal .cache-selection-other li {
+  margin: 6px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-modal .cache-selection-group details li code,
+.cache-detail-modal .cache-selection-other li code {
+  background: var(--color-bg-tertiary);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-modal .cache-detail-hf {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 6px;
+  border-radius: 8px;
+}
+
+.cache-detail-modal .cache-detail-hf:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 480px) {
+  .modal-backdrop:has(.cache-detail-modal) { padding: 12px; }
+  .modal:has(.cache-detail-modal) {
+    height: 92dvh;
+    max-height: 92dvh;
+  }
+  .cache-detail-header { padding: 12px 14px 10px; }
+  .cache-detail-stats { margin: 0 14px 12px; gap: 6px; }
+  .cache-detail-stat { padding: 8px; }
+  .cache-selection-sticky { padding: 0 14px 10px; }
+  .cache-detail-scroll { padding: 10px 14px; }
+  .cache-detail-modal .cache-detail-actions {
+    padding: 12px 14px;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .cache-detail-modal .cache-detail-actions .btn {
+    font-size: 12px;
+    padding: 8px 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cache-detail-modal .cache-selection-delete,
+  .cache-detail-modal .cache-selection-group details summary,
+  .cache-detail-modal .cache-selection-other summary,
+  .cache-detail-modal .cache-detail-hf {
+    transition: none;
+  }
 }
 
 .cache-detail-grid {
@@ -2359,10 +2655,18 @@ a {
   display: flex;
   gap: 12px;
   justify-content: flex-end;
-  padding-top: 20px;
+  padding: 14px 20px;
   border-top: 1px solid var(--color-border);
-  margin-top: 24px;
+  flex-shrink: 0;
 }
+
+.cache-detail-actions > .btn-danger { margin-right: auto; }
+.cache-detail-metadata { margin-top: 12px; }
+.cache-detail-metadata[open] > summary { margin-bottom: 12px; }
+.cache-detail-modal .cache-file-name { white-space: normal; overflow-wrap: anywhere; }
+
+/* Keep both confirmation actions reachable on narrow phones. */
+.cache-selection-confirmation .form-actions { flex-wrap: wrap; }
 
 /* ============================================
    Settings Page
@@ -3067,9 +3371,6 @@ a {
     grid-template-columns: 1fr;
   }
 
-  .cache-detail-stats {
-    grid-template-columns: repeat(2, 1fr);
-  }
 }
 
 @media (max-width: 600px) {
