@@ -1048,9 +1048,9 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		kind := m.mutationScopeKinds[id]
 		for _, scope := range scopes {
 			for _, write := range writes {
-				conflicts := frozenScopeOverlapsEntry(write, scope.rawOrPhysical(), writeScopeDirectory)
+				conflicts := false
 				if kind != writeScopeEntry {
-					conflicts = directoryScopesOverlap(scope.rawOrPhysical(), write.rawOrPhysical())
+					conflicts = mutationScopesOverlap(write, scope)
 				} else {
 					conflicts = frozenScopeOverlapsEntry(write, scope.rawOrPhysical(), writeScopeEntry)
 				}
