@@ -23,11 +23,6 @@ type datasetDecisionPositive struct {
 // datasetDecisionPins restricts inputs to actual compiled alternatives.
 type datasetDecisionPins map[int]datasetDecisionRoleLabel
 
-type datasetDecisionLiteral struct {
-	Bit   uint
-	Value bool
-}
-
 // feasibleDatasetDecisionWorld finds one coherent concrete role/token world
 // satisfying pins, pre-dedup ineligibility, zero-direct constraints and (when
 // present) one positive direct clause. Ineligible is deliberately distinct
@@ -201,11 +196,11 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 		if i < 0 || i >= len(c.Inputs) || c.Inputs[i].Excluded {
 			continue
 		}
-		if decisionHasDirect(c, w, i, collisions) {
+		if decisionHasDirect(c, w, i) {
 			return datasetDecisionWorld{}, false
 		}
 	}
-	if positive != nil && !decisionHasDirect(c, w, positive.Input, collisions) {
+	if positive != nil && !decisionHasDirect(c, w, positive.Input) {
 		return datasetDecisionWorld{}, false
 	}
 	if validateDatasetDecisionWorld(c, w) != nil {
@@ -272,24 +267,10 @@ func choosePositiveDecisionAlternative(c datasetDecisionContext, i int, alts []d
 	return datasetDecisionRoleLabel{}, nil, false
 }
 
-// The compiled matcher/domain gives this reduction its bounded shape: a
-// recognized colliding data term is either one membership literal, one
-// ordinary-path literal, or both complementary literals for the same token;
-// a non-colliding recognized term is constant by role, and companions or
-// unrecognized filters are constant ordinary-path terms. Thus zero-direct is
-// a conjunction of per-filter zero clauses: each clause is a unit assignment
-// or impossible (including complementary literals), and shared assignments
-// are unified in units. The five conventional groups plus default contribute
-// at most six colliding core bits are supplied as a fixed assignment by the
-// caller; residual labels use only these units and deterministic false
-// defaults. This proof depends on datasetselection's
-// actual-label alternatives and the concrete filter matcher, not arbitrary
-// future role/token schemas.
-//
 // constrainDecisionDirect handles one direct condition. A positive condition
-// is a disjunction across filters/actual role alternatives; a negative
-// condition chooses one zero-direct actual role and forces every filter term
-// false. Callers pin zero/positive role choices into the returned world.
+// succeeds when an actual role has any membership or literal-path match; a
+// negative condition chooses one actual role with no direct match. Callers pin
+// zero/positive role choices into the returned world.
 func constrainDecisionDirect(c datasetDecisionContext, i int, alts []datasetDecisionRoleLabel, units map[uint]bool, collisions map[uint]bool, want bool) bool {
 	if i < 0 || i >= len(c.Inputs) || c.Inputs[i].Excluded {
 		return !want
@@ -304,40 +285,19 @@ func constrainDecisionDirect(c datasetDecisionContext, i int, alts []datasetDeci
 			if datasetDecisionContextErr(c) != nil {
 				return false
 			}
-			literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
+			matched := datasetDirectTerm(c, i, alt, f)
 			if want {
-				if constant {
+				if matched {
 					for k, v := range trial {
 						units[k] = v
 					}
 					return true
 				}
-				for _, lit := range literals {
-					if v, fixed := trial[lit.Bit]; !fixed || v == lit.Value {
-						trial[lit.Bit] = lit.Value
-						// This alternative/filter witnesses the positive clause.
-						for k, v := range trial {
-							units[k] = v
-						}
-						return true
-					}
-				}
+				// This role/filter directly matches independently of membership bits.
 				continue
 			}
-			if constant {
+			if matched {
 				ok = false
-				break
-			}
-			// To make this OR-of-literals term false, every literal must be
-			// assigned its opposite. Repeated bits naturally unify in the map.
-			for _, lit := range literals {
-				if v, fixed := trial[lit.Bit]; fixed && v == lit.Value {
-					ok = false
-					break
-				}
-				trial[lit.Bit] = !lit.Value
-			}
-			if !ok {
 				break
 			}
 		}
@@ -365,28 +325,19 @@ func isDatasetCoreBit(c datasetDecisionContext, bit uint) (string, bool) {
 	return "", false
 }
 
-// datasetDirectTerm compiles one actual role/filter term. Its literals are
-// precisely the shared-token interpretation choices that make the concrete
-// evaluator's term true; constant marks an unconditional direct match.
-func datasetDirectTerm(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, f datasetDecisionFilter, collisions map[uint]bool) ([]datasetDecisionLiteral, bool) {
+// datasetDirectTerm reports one actual role/filter literal-or-membership match.
+func datasetDirectTerm(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, f datasetDecisionFilter) bool {
 	pathMatch := filterMatchesPath(c.Inputs[i].Path, f.Original, c.ExactMatch)
 	if alt.Role == datasetselection.EvidenceRoleCompanion || !containsString(c.RecognizedLabels, f.Normalized) {
-		return nil, pathMatch
+		return pathMatch
 	}
-	if !collisions[f.Bit] {
-		return nil, strings.EqualFold(alt.Label, f.Normalized)
-	}
-	var literals []datasetDecisionLiteral
-	if strings.EqualFold(alt.Label, f.Normalized) {
-		literals = append(literals, datasetDecisionLiteral{f.Bit, true})
-	}
-	if pathMatch {
-		literals = append(literals, datasetDecisionLiteral{f.Bit, false})
-	}
-	return literals, false
+	// Membership is an additional reason to select, never an alternative to
+	// ordinary literal path matching. In particular a recognized term can
+	// collide with a different group label while also matching this path.
+	return pathMatch || strings.EqualFold(alt.Label, f.Normalized)
 }
 
-func decisionHasDirect(c datasetDecisionContext, w datasetDecisionWorld, i int, collisions map[uint]bool) bool {
+func decisionHasDirect(c datasetDecisionContext, w datasetDecisionWorld, i int) bool {
 	label := w.DataLabels[i]
 	companion := w.Companion[i]
 	recognized := make(map[string]bool, len(c.RecognizedLabels))
@@ -394,7 +345,7 @@ func decisionHasDirect(c datasetDecisionContext, w datasetDecisionWorld, i int, 
 		recognized[v] = true
 	}
 	for _, f := range c.Filters {
-		if concreteDatasetFilterMatches(c.Inputs[i], f, c, w, label, companion, collisions, recognized) {
+		if concreteDatasetFilterMatches(c.Inputs[i], f, c, label, companion, recognized) {
 			return true
 		}
 	}
@@ -767,12 +718,11 @@ func uniqueDatasetDecisionWorld(c datasetDecisionContext) bool {
 	return true
 }
 
-// stableDirectEvaluation proves, without enumerating role/token worlds, that
-// each input is directly selected under every actual role and shared-token
-// assignment. Consequently companion fallback and role-dependent directory
-// seeds are irrelevant. A false return is only a missed optimization.
+// stableDirectEvaluation proves, without enumerating role worlds, that each
+// input is directly selected under every actual role. Consequently companion
+// fallback and role-dependent directory seeds are irrelevant. A false return
+// is only a missed optimization.
 func stableDirectEvaluation(c datasetDecisionContext) bool {
-	collisions := collisionTokenBits(c)
 	for i, in := range c.Inputs {
 		if datasetDecisionContextErr(c) != nil {
 			return false
@@ -785,24 +735,12 @@ func stableDirectEvaluation(c datasetDecisionContext) bool {
 				return false
 			}
 			fixedTrue := false
-			seenLiterals := make(map[uint]bool)
 			for _, f := range c.Filters {
 				if datasetDecisionContextErr(c) != nil {
 					return false
 				}
-				literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
-				if constant {
+				if datasetDirectTerm(c, i, alt, f) {
 					fixedTrue = true
-					break
-				}
-				for _, literal := range literals {
-					if value, ok := seenLiterals[literal.Bit]; ok && value != literal.Value {
-						fixedTrue = true
-						break
-					}
-					seenLiterals[literal.Bit] = literal.Value
-				}
-				if fixedTrue {
 					break
 				}
 			}
@@ -815,13 +753,13 @@ func stableDirectEvaluation(c datasetDecisionContext) bool {
 }
 
 // stableDatasetDecisionEvaluation certifies a reusable complete evaluation
-// when each input's direct-match result is invariant across its actual roles
-// and every shared-token assignment, then checks that companion fallback
-// eligibility is invariant against the resulting fixed seed directories. Any
-// direct selection seeds its directory regardless of role. Input order and
-// duplicate suppression are consequently deterministic as well. Attribution
-// need not be invariant: the cached records are evaluated in one coherent
-// admissible baseline world, which remains a valid refusal witness.
+// when each input's direct-match result is invariant across its actual roles,
+// then checks that companion fallback eligibility is invariant against the
+// resulting fixed seed directories. Any direct selection seeds its directory
+// regardless of role. Input order and duplicate suppression are consequently
+// deterministic as well. Attribution need not be invariant: the cached records
+// are evaluated in one coherent admissible baseline world, which remains a
+// valid refusal witness.
 func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 	collisions := collisionTokenBits(c)
 	direct := make([]bool, len(c.Inputs))
@@ -900,32 +838,18 @@ func datasetDecisionSeedDirectories(in datasetDecisionInput) []string {
 	return dirs
 }
 
-// invariantDatasetDirect determines whether the OR of one role's filter terms
-// is fixed for all shared-token assignments. A direct term is either constant,
-// one literal, or (for a collision) the complementary membership/path pair;
-// therefore only a constant-true term or both polarities of one shared bit
-// make the disjunction tautological. An empty disjunction is false.
-func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, collisions map[uint]bool) (bool, bool) {
-	seen := make(map[uint]bool)
+// invariantDatasetDirect computes one role's direct selection; membership and
+// path matches are independent reasons, so no token interpretation is needed.
+func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, _ map[uint]bool) (bool, bool) {
 	for _, f := range c.Filters {
 		if datasetDecisionContextErr(c) != nil {
 			return false, false
 		}
-		literals, constant := datasetDirectTerm(c, i, alt, f, collisions)
-		if constant {
+		if datasetDirectTerm(c, i, alt, f) {
 			return true, true
 		}
-		for _, literal := range literals {
-			if value, ok := seen[literal.Bit]; ok && value != literal.Value {
-				return true, true
-			}
-			seen[literal.Bit] = literal.Value
-		}
 	}
-	if len(seen) == 0 {
-		return false, true
-	}
-	return false, false
+	return false, true
 }
 
 // A directly selected file seeds its containing directory and ancestors. A
@@ -1154,7 +1078,6 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 	if err := validateDatasetDecisionWorld(c, world); err != nil {
 		return datasetDecisionEvaluation{}, err
 	}
-	collidingTokens := collisionTokenBits(c)
 	out := datasetDecisionEvaluation{Records: make([]datasetDecisionRecord, len(c.Inputs))}
 	dirs := make(map[string]bool)
 	direct := make([]bool, len(c.Inputs))
@@ -1173,7 +1096,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			if err := datasetDecisionContextErr(c); err != nil {
 				return datasetDecisionEvaluation{}, err
 			}
-			if concreteDatasetFilterMatches(in, f, c, world, labels[i], companions[i], collidingTokens, recognizedLabels) {
+			if concreteDatasetFilterMatches(in, f, c, labels[i], companions[i], recognizedLabels) {
 				direct[i] = true
 			}
 		}
@@ -1219,7 +1142,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			if err := datasetDecisionContextErr(c); err != nil {
 				return datasetDecisionEvaluation{}, err
 			}
-			if concreteDatasetFilterMatches(in, f, c, world, labels[i], companions[i], collidingTokens, recognizedLabels) && len(f.Original) > bestLength {
+			if concreteDatasetFilterMatches(in, f, c, labels[i], companions[i], recognizedLabels) && len(f.Original) > bestLength {
 				r.Subdir, bestLength = f.Original, len(f.Original)
 			}
 		}
@@ -1257,19 +1180,16 @@ func datasetDecisionContextErr(c datasetDecisionContext) error {
 	return c.ctx.Err()
 }
 
-func concreteDatasetFilterMatches(in datasetDecisionInput, f datasetDecisionFilter, c datasetDecisionContext, world datasetDecisionWorld, label string, companion bool, collidingTokens map[uint]bool, recognizedLabels map[string]bool) bool {
+func concreteDatasetFilterMatches(in datasetDecisionInput, f datasetDecisionFilter, c datasetDecisionContext, label string, companion bool, recognizedLabels map[string]bool) bool {
 	if companion {
-		// Ordinary path selection remains available to companions, including
-		// recognized group-token matches in either shared interpretation.
+		// Ordinary path selection remains available to companions.
 		return filterMatchesPath(in.Path, f.Original, c.ExactMatch)
 	}
+	pathMatch := filterMatchesPath(in.Path, f.Original, c.ExactMatch)
 	if recognizedLabels[f.Normalized] {
-		if collidingTokens[f.Bit] && !world.SharedToken[f.Bit] {
-			return filterMatchesPath(in.Path, f.Original, c.ExactMatch)
-		}
-		return label != "" && label == f.Normalized
+		return pathMatch || label != "" && label == f.Normalized
 	}
-	return filterMatchesPath(in.Path, f.Original, c.ExactMatch)
+	return pathMatch
 }
 
 func validateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisionWorld) error {

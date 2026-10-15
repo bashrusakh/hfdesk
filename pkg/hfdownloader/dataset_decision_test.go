@@ -296,7 +296,7 @@ func TestRequiredIneligibilityRejectsRootCompanionAndAcceptsNestedCompanion(t *t
 	}
 }
 
-func TestPositiveDirectAssignsResidualSharedCustomBit(t *testing.T) {
+func TestPositiveDirectDoesNotNeedSharedCustomBitChoice(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{{Path: "data/customdata/other/a.parquet"}, {Path: "data/other/b.parquet"}}, []string{"other"}, nil)
 	alt := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "other"}
 	if !containsString(c.ResidualLabels, "other") {
@@ -307,16 +307,14 @@ func TestPositiveDirectAssignsResidualSharedCustomBit(t *testing.T) {
 		t.Fatalf("fixture did not create the residual shared-token collision: labels=%v inputs=%+v filters=%+v", c.RecognizedLabels, c.Inputs, c.Filters)
 	}
 	w, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{1: alt}, nil, nil, &datasetDecisionPositive{Input: 1, Alternative: alt})
-	if !ok || !w.SharedToken[bit] {
-		t.Fatalf("positive custom membership must assign its shared residual unit true: ok=%v witness=%+v bit=%d", ok, w, bit)
+	if !ok {
+		t.Fatalf("positive custom membership must remain feasible: ok=%v witness=%+v bit=%d", ok, w, bit)
 	}
 }
 
 func TestZeroDirectUsesEveryIndependentGroupTerm(t *testing.T) {
-	// Minimal counterexample to the first draft's aggregation: this file has
-	// actual train/test/validation alternatives, but the pinned validation role
-	// makes train and test direct only under their ordinary-path interpretations.
-	// Both bits can be set to membership, making every direct term false.
+	// The literal path matches both filters even when the chosen data group is
+	// validation, so a membership interpretation cannot make it ineligible.
 	c := compileDecisionFixture([]hfNode{{Path: "train/test/validation/data.csv"}}, []string{"train", "test"}, nil)
 	validation := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "validation"}
 	pins := datasetDecisionPins{0: validation}
@@ -324,25 +322,16 @@ func TestZeroDirectUsesEveryIndependentGroupTerm(t *testing.T) {
 	core := map[uint]bool{c.FilterBits["train"]: true, c.FilterBits["test"]: true}
 	want, oracle := enumerateDecisionFeasibility(c, core, pins, nil, zeros, nil)
 	gotWorld, got := feasibleDatasetDecisionWorld(c, core, pins, nil, zeros, nil)
-	if !want || !got {
-		t.Fatalf("multi-term zero-direct should be feasible: filters=%v roles=%+v pins=%v coreUnits=%v zeroDirect=%v expected=%v oracleWorld=%+v solver=%v witness=%+v", c.Filters, c.Inputs, pins, core, zeros, want, oracle, got, gotWorld)
-	}
-	if !decisionWitnessSatisfies(c, gotWorld, core, pins, nil, zeros, nil) {
-		t.Fatalf("solver returned invalid witness: %+v", gotWorld)
-	}
-	if !gotWorld.SharedToken[c.FilterBits["train"]] || !gotWorld.SharedToken[c.FilterBits["test"]] {
-		t.Fatalf("zero-direct must force both independent group bits to membership: %+v", gotWorld.SharedToken)
+	if want || got {
+		t.Fatalf("a literal train/test path cannot satisfy zero-direct: filters=%v roles=%+v pins=%v coreUnits=%v zeroDirect=%v expected=%v oracleWorld=%+v solver=%v witness=%+v", c.Filters, c.Inputs, pins, core, zeros, want, oracle, got, gotWorld)
 	}
 	contradictoryCore := map[uint]bool{c.FilterBits["train"]: false, c.FilterBits["test"]: true}
 	want, _ = enumerateDecisionFeasibility(c, contradictoryCore, pins, nil, zeros, nil)
 	if want {
-		t.Fatal("oracle found zero-direct under a fixed ordinary interpretation for train")
+		t.Fatal("oracle found zero-direct despite the literal train path match")
 	}
 	if _, ok := feasibleDatasetDecisionWorld(c, contradictoryCore, pins, nil, zeros, nil); ok {
-		t.Fatal("primitive ignored its fixed core assignment")
-	}
-	if _, ok := feasibleDatasetDecisionWorld(c, map[uint]bool{c.FilterBits["train"]: true}, pins, nil, zeros, nil); ok {
-		t.Fatal("primitive accepted an incomplete core assignment")
+		t.Fatal("primitive ignored the literal path match")
 	}
 	positive := &datasetDecisionPositive{Input: 0, Alternative: validation}
 	want, _ = enumerateDecisionFeasibility(c, core, pins, nil, zeros, positive)
@@ -356,8 +345,8 @@ func TestZeroDirectUsesEveryIndependentGroupTerm(t *testing.T) {
 	dupCore := map[uint]bool{duplicate.FilterBits["train"]: true, duplicate.FilterBits["test"]: true}
 	want, _ = enumerateDecisionFeasibility(duplicate, dupCore, pins, nil, zeros, nil)
 	gotWorld, got = feasibleDatasetDecisionWorld(duplicate, dupCore, pins, nil, zeros, nil)
-	if !want || !got || duplicate.Filters[0].Bit != duplicate.Filters[1].Bit || !gotWorld.SharedToken[duplicate.Filters[0].Bit] {
-		t.Fatalf("case-normalized duplicate terms must share the one forced unit: oracle=%v solver=%v world=%+v filters=%+v", want, got, gotWorld, duplicate.Filters)
+	if want || got || duplicate.Filters[0].Bit != duplicate.Filters[1].Bit {
+		t.Fatalf("case-normalized duplicate literal terms cannot be suppressed: oracle=%v solver=%v world=%+v filters=%+v", want, got, gotWorld, duplicate.Filters)
 	}
 	explicit := compileDecisionFixture([]hfNode{{Path: "train/test/validation/data.csv"}}, []string{"train", "test", ".csv"}, nil)
 	want, _ = enumerateAnyCoreDecisionFeasibility(explicit, pins, nil, zeros, nil)
@@ -545,14 +534,8 @@ func concreteOracleDirect(c datasetDecisionContext, w datasetDecisionWorld, i in
 		matched := false
 		if w.Companion[i] || !recognized[filter.Normalized] {
 			matched = pathMatch
-		} else if collisions[filter.Bit] {
-			if w.SharedToken[filter.Bit] {
-				matched = w.DataLabels[i] == filter.Normalized
-			} else {
-				matched = pathMatch
-			}
 		} else {
-			matched = w.DataLabels[i] == filter.Normalized
+			matched = pathMatch || w.DataLabels[i] == filter.Normalized
 		}
 		if matched {
 			return true
@@ -864,8 +847,8 @@ func TestConcreteWorldSharedCollisionAndIndependentFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !a.Records[0].Selected || !b.Records[0].Selected || !a.Records[1].Selected || b.Records[1].Selected {
-		t.Fatalf("shared token interpretations collapsed: membership=%+v ordinary=%+v", a.Records, b.Records)
+	if !a.Records[0].Selected || !b.Records[0].Selected || !a.Records[1].Selected || !b.Records[1].Selected {
+		t.Fatalf("literal matches must survive either membership interpretation: membership=%+v ordinary=%+v", a.Records, b.Records)
 	}
 
 	// An unrelated ordinary extension term independently selects data in
@@ -1032,8 +1015,8 @@ func TestConcreteWorldKeepsMultipleCustomCollisionBitsDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Records[0].Selected || !got.Records[1].Selected || !got.Records[2].Selected || !got.Records[3].Selected {
-		t.Fatalf("distinct custom token interpretations were not applied globally: %+v", got.Records)
+	if !got.Records[0].Selected || !got.Records[1].Selected || !got.Records[2].Selected || !got.Records[3].Selected {
+		t.Fatalf("literal path matches must remain selected alongside custom memberships: %+v", got.Records)
 	}
 }
 
@@ -1196,7 +1179,7 @@ func TestRequiredSkippedDuplicateMayStillBeDirectlyEligible(t *testing.T) {
 				if !e.Records[0].Selected || !e.Records[1].Skipped {
 					t.Fatalf("cached=%t witness did not preserve first-emission suppression: %+v", cached, e.Records)
 				}
-				if !decisionHasDirect(q, got.World, 1, collisionTokenBits(q)) {
+				if !decisionHasDirect(q, got.World, 1) {
 					t.Fatal("skipped duplicate witness incorrectly forced the record to be ineligible")
 				}
 				train := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "train"}
@@ -1320,8 +1303,8 @@ func TestStableDirectEvaluationWithRoleAndSharedTokenAlternatives(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !firstEval.Records[0].Selected || !secondEval.Records[0].Selected || firstEval.Records[0].Subdir == secondEval.Records[0].Subdir {
-		t.Fatalf("fixture must preserve selection while varying attribution: first=%+v second=%+v", firstEval.Records[0], secondEval.Records[0])
+	if !firstEval.Records[0].Selected || !secondEval.Records[0].Selected {
+		t.Fatalf("role alternatives must preserve literal selection: first=%+v second=%+v", firstEval.Records[0], secondEval.Records[0])
 	}
 }
 
@@ -1445,7 +1428,7 @@ func TestStableEvaluationAcrossRealEnglishTokenCollisionAndImplicitCompanions(t 
 	checkDatasetDecisionAgainstOracle(t, c)
 }
 
-func TestStableEvaluationStillFallsBackWhenCollisionChangesSeededCompanionSet(t *testing.T) {
+func TestStableEvaluationWithLiteralCollisionAndSeededCompanionSet(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "test/train.csv"},
@@ -1454,12 +1437,12 @@ func TestStableEvaluationStillFallsBackWhenCollisionChangesSeededCompanionSet(t 
 	if len(collisionTokenBits(c)) == 0 {
 		t.Fatal("fixture must have a shared train-token collision")
 	}
-	if stableDatasetDecisionEvaluation(c) {
-		t.Fatal("token-dependent direct seed must not certify one emitted set")
+	if !stableDatasetDecisionEvaluation(c) {
+		t.Fatal("literal direct selection must provide a stable seed despite group collision")
 	}
 	can, cannot, _ := oracleQueryOutcomes(c, 2)
-	if !can || !cannot {
-		t.Fatalf("fixture must show both seeded and unseeded companion outcomes, oracle can/cannot=%t/%t", can, cannot)
+	if !can || cannot {
+		t.Fatalf("literal direct seed must always retain the same-directory companion, oracle can/cannot=%t/%t", can, cannot)
 	}
 	gotCan, gotCannot := datasetDecisionRefusal(c, 2)
 	if gotCan.Possible != can || gotCannot.Possible != cannot {
@@ -1864,10 +1847,7 @@ func concreteOracleFilterMatch(i int, in datasetDecisionInput, f datasetDecision
 	if !recognized {
 		return pathMatch
 	}
-	if collisions[f.Bit] && !w.SharedToken[f.Bit] {
-		return pathMatch
-	}
-	return w.DataLabels[i] == f.Normalized
+	return pathMatch || w.DataLabels[i] == f.Normalized
 }
 
 func BenchmarkDatasetDecisionQueryThousandFileInventory(b *testing.B) {

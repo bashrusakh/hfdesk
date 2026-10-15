@@ -131,6 +131,35 @@ func TestPlanRepoDatasetSplitPathFilter(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"dataset_info.json", "train/data-00000-of-00001.parquet"})
 }
 
+func TestPlanRepoDatasetLiteralMatchSurvivesMembershipCollision(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "pretrain.csv", Size: 11},
+		{Type: "file", Path: "other/xtrain.csv", LFS: &hfLfsInfo{Size: 12}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		name  string
+		exact bool
+		want  []string
+	}{
+		{"substring preserves literal matches", false, []string{"train.csv", "pretrain.csv", "other/xtrain.csv"}},
+		{"exact retains distinct segment behavior", true, []string{"train.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := PlanRepo(context.Background(), Job{
+				Repo: "owner/dataset", IsDataset: true, Filters: []string{"train"}, ExactMatch: tc.exact,
+			}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
+}
+
 func TestPlanRepoDatasetGGUFGuardComposesWithRootCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
@@ -518,7 +547,7 @@ func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.
 	assertPaths(t, planPaths(plan), []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "metadata.json"})
 }
 
-func TestPlanRepoDatasetGroupLabelPathCollisionRefuses(t *testing.T) {
+func TestPlanRepoDatasetGroupLabelPathCollisionKeepsLiteralMatches(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "test/train.csv", Size: 10},
@@ -526,9 +555,10 @@ func TestPlanRepoDatasetGroupLabelPathCollisionRefuses(t *testing.T) {
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-	if err == nil || plan != nil {
-		t.Fatalf("colliding label/path plan = %+v, err=%v; want refusal", plan, err)
+	if err != nil {
+		t.Fatalf("literal path matches must resolve token collision without refusal: %v", err)
 	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "test/train.csv"})
 }
 
 func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testing.T) {
@@ -553,7 +583,7 @@ func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testin
 	}
 }
 
-func TestPlanRepoDatasetGroupCollisionWithNonDatasetInterpretationRefuses(t *testing.T) {
+func TestPlanRepoDatasetGroupCollisionWithRootCompanionKeepsLiteralMatches(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "test/train.csv", Size: 20},
@@ -563,9 +593,10 @@ func TestPlanRepoDatasetGroupCollisionWithNonDatasetInterpretationRefuses(t *tes
 	defer srv.Close()
 
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-	if err == nil || plan != nil || !strings.Contains(strings.ToLower(err.Error()), "ambiguous") {
-		t.Fatalf("group/path interpretation plan=%+v err=%v; want whole-plan ambiguity refusal", plan, err)
+	if err != nil {
+		t.Fatalf("literal path matches must retain the invariant emitted set: %v", err)
 	}
+	assertPaths(t, planPaths(plan), []string{"train.csv", "test/train.csv", "README.md"})
 }
 
 func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.T) {
