@@ -535,7 +535,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter is used by AppendFilterSubdir to alter that destination;
 		// only dataset membership attribution and the established GGUF/LFS
 		// branches provide a destination subdirectory.
-		if !job.IsDataset && !ggufMode && !isLFS {
+		if !job.IsDataset && !ggufMode && !isLFS && !strings.HasSuffix(nameLower, ".gguf") {
 			matchedFilter = ""
 		}
 
@@ -600,7 +600,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		seenLower[relLower] = struct{}{}
 
 		destinationSubdir := matchedFilter
-		if job.IsDataset && !isLFS && !ggufMode {
+		if job.IsDataset && !isLFS && !ggufMode && !strings.HasSuffix(nameLower, ".gguf") {
 			destinationSubdir = ""
 		}
 		items = append(items, PlanItem{
