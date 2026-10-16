@@ -71,6 +71,42 @@ Important response fields:
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
 
+For model repositories, filtered selection retains every non-LFS file as a
+companion, including tokenizer assets and files outside the selected directory;
+this is not a size-limited or filename-whitelist policy. Unmatched LFS files
+remain excluded, and explicit excludes take precedence. A GGUF-only
+quantization selection is the exception: it keeps only matching GGUF/mmproj
+files and directly matched files such as a matching README, with no automatic
+config, tokenizer, vocabulary, or unmatched README fallback. Explicitly
+selecting one of those files remains supported without changing GGUF-only mode;
+only positive evidence of another model payload (for example a matched
+Safetensors/ONNX/weight-BIN file) selects the ordinary mixed-format behavior.
+Unknown file roles do not broaden selection. Unfiltered downloads are
+unchanged. Existing path, directory, and extension filters keep their usual
+matching rules. In exact mode, a filter ending in `/` selects descendants of
+that directory, not a file whose path is the directory name itself.
+
+For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
+membership can be inferred from conventional split paths/names or
+`data/<group>/` paths. Send a group's `filter_value` with `exactMatch: true` to
+`/api/plan` or `/api/download`; the planner selects that group's data files and
+keeps applicable repository companions. Default substring filters retain
+literal substring matching, including when a substring occurs within a
+recognized split name. Ambiguous files that could affect a
+selected group cause planning to fail with the standard JSON error response,
+rather than silently broadening or narrowing the selection. `POST /api/plan`
+returns HTTP 400 with error code `ambiguous_selection` for this expected
+selection refusal. For normal queued (`dryRun: false`) `POST /api/download`
+requests, work is admitted asynchronously; ambiguity is discovered by the job's
+later planning step and reported as a failed job, not as an immediate HTTP 400.
+With `dryRun: true`, `POST /api/download` returns the planning response, and
+the same ambiguity returns HTTP 400 with error code `ambiguous_selection`, as
+it does for `POST /api/plan`. Excluding the
+ambiguous file resolves that ambiguity. This selection behavior does not claim
+to identify every possible dataset file layout; use explicit path/extension
+filters where appropriate. A README-only filter does not activate GGUF-only
+selection.
+
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
 no root architecture config):
@@ -148,10 +184,10 @@ Request:
 
 Returns the files that would be downloaded without starting a job.
 
-When `filters` is non-empty and no file in the repository matches after
-`excludes` are applied, the request fails with `400` and error code
-`no_filter_match`; a plan that contains only companion/metadata files is never
-returned as a success.
+When `filters` is non-empty and no non-excluded repository-relative path matches
+or recognized dataset-group membership selects data, the request fails with
+`400` and error code `no_filter_match`; retained companion/metadata files alone
+never make a filtered request succeed.
 
 ## Download
 

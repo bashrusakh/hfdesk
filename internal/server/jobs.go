@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -168,11 +169,17 @@ type JobManager struct {
 	runWG sync.WaitGroup
 	// runActivities outlive visible job state and retain each run's immutable
 	// destination/plan until its downloader call has actually returned.
-	runActivities      map[uint64]*jobWriteActivity
-	deleteReservations map[uint64][]frozenMutationPath
-	hfRepoReservations map[uint64][]frozenMutationPath
-	mutationScopes     map[uint64][]frozenMutationPath
-	nextWriteID        uint64
+	runActivities        map[uint64]*jobWriteActivity
+	deleteReservations   map[uint64][]frozenMutationPath
+	hfRepoReservations   map[uint64][]frozenMutationPath
+	mutationScopes       map[uint64][]frozenMutationPath
+	mutationScopeKinds   map[uint64]writeScopeKind
+	nextWriteID          uint64
+	writeDecisionEpoch   uint64
+	writeDecisionChanged chan struct{}
+	writeInventory       func(string) (writableNamespaceInventory, bool)
+	dispatchPending      bool
+	dispatchRunning      bool
 }
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
@@ -193,19 +200,21 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
 	cfg = cfg.captureCacheEnvironment()
 	m := &JobManager{
-		saveMu:             &sync.Mutex{},
-		jobs:               make(map[string]*Job),
-		runActivities:      make(map[uint64]*jobWriteActivity),
-		deleteReservations: make(map[uint64][]frozenMutationPath),
-		hfRepoReservations: make(map[uint64][]frozenMutationPath),
-		mutationScopes:     make(map[uint64][]frozenMutationPath),
-		config:             cfg,
-		statePath:          statePath,
-		persistStateFile:   saveJobsState,
-		loadStateFile:      loadJobsState,
-		closeDone:          make(chan struct{}),
-		wsHub:              wsHub,
-		speedLimiter:       hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+		saveMu:               &sync.Mutex{},
+		jobs:                 make(map[string]*Job),
+		runActivities:        make(map[uint64]*jobWriteActivity),
+		deleteReservations:   make(map[uint64][]frozenMutationPath),
+		hfRepoReservations:   make(map[uint64][]frozenMutationPath),
+		mutationScopes:       make(map[uint64][]frozenMutationPath),
+		mutationScopeKinds:   make(map[uint64]writeScopeKind),
+		writeDecisionChanged: make(chan struct{}),
+		config:               cfg,
+		statePath:            statePath,
+		persistStateFile:     saveJobsState,
+		loadStateFile:        loadJobsState,
+		closeDone:            make(chan struct{}),
+		wsHub:                wsHub,
+		speedLimiter:         hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -298,7 +307,10 @@ func (m *JobManager) Quiesce() {
 	m.mu.Unlock()
 }
 
-func (m *JobManager) quiesceLocked() { m.fenced = true }
+func (m *JobManager) quiesceLocked() {
+	m.fenced = true
+	m.signalWriteDecisionLocked()
+}
 
 // Close rejects new mutations, drains accepted operations and runners, then
 // commits a fresh final state snapshot. A caller timeout does not stop the
@@ -308,6 +320,7 @@ func (m *JobManager) Close(ctx context.Context) error {
 		m.mu.Lock()
 		m.fenced = true
 		m.stopping = true
+		m.signalWriteDecisionLocked()
 		var cancels []context.CancelFunc
 		var snapshots []*Job
 		for _, job := range m.jobs {
@@ -478,6 +491,8 @@ func stringSlicesEqual(a, b []string) bool {
 // destination, destination folder override, or matching mode creates a new
 // job.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
+	reservationRetries := 0
+resolveRequest:
 	revision := req.Revision
 	if revision == "" {
 		revision = "main"
@@ -578,14 +593,111 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		m.mu.Unlock()
 		return nil, false, fmt.Errorf("%w: repository folder escapes its configured root", errInvalidDestination)
 	}
-	if m.jobBlockedByDeleteLocked(job) {
+	for _, scopes := range m.hfRepoReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+	}
+	if len(m.deleteReservations) != 0 {
+		start := m.captureWriteDecisionLocked()
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, existing := range m.jobs {
+			jobPointers[id] = existing
+		}
+		// The candidate is immutable for this attempt and participates in the
+		// same deduplicated namespace inventory as existing queued/starting jobs.
+		candidate := decisionJob(job)
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		m.opWG.Add(1)
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		var targets []string
+		for _, paths := range start.deletes {
+			for _, target := range paths {
+				targets = append(targets, target.physical)
+			}
+		}
 		m.mu.Unlock()
-		return nil, false, errSelectionWriterBusy
+
+		a.CollectSnapshot(inventorySnapshot)
+		for _, target := range targets {
+			probe, probeErr := captureWriteIdentityProbe(target, false)
+			if probeErr != nil {
+				a.failed["create-target"] = true
+				break
+			}
+			a.targets[filepath.Clean(target)] = probe
+		}
+		blocked := a.failed["create-target"] || hfReservationsBlockSnapshot(start, job) || a.HasActiveBroadMutationFor(candidate, nil)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+				break
+			}
+		}
+		probesOK := !a.failed["create-target"] && a.RevalidateProbes(targets)
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return nil, false, errJobManagerStopping
+		}
+		// Re-run dedup while still holding the commit lock even when the
+		// inventory snapshot changed; an equal concurrent admission wins.
+		for _, existing := range m.jobs {
+			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
+				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
+				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
+				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
+				a.Close()
+				snapshot := m.cloneJobLocked(existing)
+				m.mu.Unlock()
+				return snapshot, true, nil
+			}
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for id, existing := range jobPointers {
+				if m.jobs[id] != existing {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			reservationRetries++
+			if reservationRetries < 3 {
+				goto resolveRequest
+			}
+			return nil, false, errSelectionWriterBusy
+		}
+		if blocked {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+		m.opWG.Add(1)
+		m.jobs[job.ID] = job
+		m.signalWriteDecisionLocked()
+		m.dispatchLocked()
+		snapshot := m.cloneJobLocked(job)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		m.opWG.Done()
+		return snapshot, false, nil
 	}
 
 	m.opWG.Add(1)
 	defer m.opWG.Done()
 	m.jobs[job.ID] = job
+	m.signalWriteDecisionLocked()
 	// Queue the job and let the scheduler start it only if we're under the
 	// max-active limit; otherwise it waits as 'queued'.
 	m.dispatchLocked()
@@ -649,6 +761,7 @@ func (m *JobManager) CancelJob(id string) bool {
 		job.cancel()
 	}
 	job.Status = JobStatusCancelled
+	m.signalWriteDecisionLocked()
 	now := time.Now()
 	job.EndedAt = &now
 	snapshot := m.cloneJobLocked(job)
@@ -691,6 +804,7 @@ func (m *JobManager) PauseJob(id string) bool {
 		job.cancel()
 	}
 	job.Status = JobStatusPaused
+	m.signalWriteDecisionLocked()
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
 
@@ -701,58 +815,7 @@ func (m *JobManager) PauseJob(id string) bool {
 
 // ResumeJob resumes a paused job.
 func (m *JobManager) ResumeJob(id string) bool {
-	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
-		return false
-	}
-	job, ok := m.jobs[id]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-
-	if job.Status != JobStatusPaused {
-		m.mu.Unlock()
-		return false
-	}
-	if jobDestinationBase(job) == "" {
-		m.mu.Unlock()
-		return false
-	}
-	if m.jobBlockedByDeleteLocked(job) {
-		m.mu.Unlock()
-		return false
-	}
-	m.opWG.Add(1)
-	defer m.opWG.Done()
-
-	job.Status = JobStatusQueued
-	// Reset progress totals — the downloader will re-scan the repo and
-	// emit fresh plan_item events that rebuild TotalFiles / TotalBytes.
-	// Preserve DownloadedBytes as an initial estimate so the UI doesn't
-	// jump from e.g. 60% to 0% while the scan runs. The downloader's
-	// file_progress and file_done events recompute DownloadedBytes from
-	// the live job.Files list as soon as files are processed (skipped
-	// blob → immediate file_done; partial → file_progress at the on-disk
-	// position from the .part file), so the estimate corrects itself
-	// within a second or two. resumeFloor arms the monotonic guard in
-	// applyJobProgress for this recovery window and is cleared by
-	// applyJobProgress once the running sum catches up.
-	oldBytes := job.Progress.DownloadedBytes
-	job.Progress = JobProgress{}
-	job.Progress.DownloadedBytes = oldBytes
-	job.resumeFloor = oldBytes
-	job.Files = nil
-	snapshot := m.cloneJobLocked(job)
-	// Re-queue through the scheduler so resuming respects max-active.
-	m.dispatchLocked()
-	m.mu.Unlock()
-
-	// Notify listeners of status change
-	m.notifyListeners(snapshot)
-
-	return true
+	return m.restartJob(id, false)
 }
 
 // RetryJob restarts a failed or cancelled job using its original
@@ -760,50 +823,160 @@ func (m *JobManager) ResumeJob(id string) bool {
 // re-queued and run again. Already-downloaded files are skipped by the
 // downloader, so a retry resumes where it left off.
 func (m *JobManager) RetryJob(id string) bool {
+	return m.restartJob(id, true)
+}
+
+// restartJob admits a resume/retry transition. Selected-delete reservations
+// require filesystem inventory, so that evidence is gathered without m.mu and
+// committed only if the complete manager decision is still the one observed.
+func (m *JobManager) restartJob(id string, retry bool) bool {
+	const maxAttempts = 3
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
 		return false
 	}
 	job, ok := m.jobs[id]
-	if !ok {
+	if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
 		m.mu.Unlock()
 		return false
 	}
-
-	if job.Status != JobStatusFailed && job.Status != JobStatusCancelled {
-		m.mu.Unlock()
-		return false
-	}
-	if jobDestinationBase(job) == "" {
-		m.mu.Unlock()
-		return false
-	}
-	if m.jobBlockedByDeleteLocked(job) {
-		m.mu.Unlock()
-		return false
-	}
+	// Register before unlocking: Close fences new work then drains this
+	// operation, including inventory collection and any revalidation retry.
 	m.opWG.Add(1)
+	m.mu.Unlock()
 	defer m.opWG.Done()
 
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		m.mu.Lock()
+		if m.stopping {
+			m.mu.Unlock()
+			return false
+		}
+		job, ok = m.jobs[id]
+		if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
+			m.mu.Unlock()
+			return false
+		}
+		if len(m.deleteReservations) == 0 {
+			if m.jobBlockedByDeleteLocked(job) {
+				m.mu.Unlock()
+				return false
+			}
+			snapshot := resetAndQueueRestartLocked(m, job, retry)
+			m.mu.Unlock()
+			m.notifyListeners(snapshot)
+			return true
+		}
+
+		start := m.captureWriteDecisionLocked()
+		pointers := make(map[string]*Job, len(m.jobs))
+		for jobID, existing := range m.jobs {
+			pointers[jobID] = existing
+		}
+		cfg := m.config
+		candidate := decisionJob(job)
+		candidate.status = JobStatusQueued
+		candidate.starting = false
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		targets := make([]string, 0)
+		for _, paths := range start.deletes {
+			for _, target := range paths {
+				targets = append(targets, target.physical)
+			}
+		}
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		// The attempt owns a separate reference because cacheWriteAttempt.Close
+		// releases it on every success, rejection, and retry path.
+		m.opWG.Add(1)
+		m.mu.Unlock()
+
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		a.CollectSnapshot(inventorySnapshot)
+		blocked := a.HasActiveBroadMutationFor(candidate, nil) || hfReservationsBlockSnapshot(start, job)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+			}
+		}
+		probesOK := a.RevalidateProbes(targets)
+
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		current, exists := m.jobs[id]
+		if !exists || !restartStatusAllowed(current.Status, retry) || jobDestinationBase(current) == "" {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		if current != pointers[id] {
+			a.Close()
+			m.mu.Unlock()
+			continue // The same eligible job was replaced; inventory its new state.
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for jobID, pointer := range pointers {
+				if m.jobs[jobID] != pointer {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			continue // A fresh attempt gets fresh reservation and filesystem evidence.
+		}
+		if blocked {
+			m.mu.Unlock()
+			return false
+		}
+		snapshot := resetAndQueueRestartLocked(m, current, retry)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		return true
+	}
+	return false
+}
+
+func restartStatusAllowed(status JobStatus, retry bool) bool {
+	if retry {
+		return status == JobStatusFailed || status == JobStatusCancelled
+	}
+	return status == JobStatusPaused
+}
+
+func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
 	job.Status = JobStatusQueued
-	job.Error = ""
-	job.EndedAt = nil
-	// Reset progress - the downloader will re-scan and report all files.
-	// No resume floor: a retry is a clean restart from zero, so the
-	// running sum drives DownloadedBytes directly.
-	job.Progress = JobProgress{}
-	job.resumeFloor = 0
+	m.signalWriteDecisionLocked()
+	if retry {
+		job.Error = ""
+		job.EndedAt = nil
+		// Retry is a clean restart from zero; the downloader re-scans and
+		// reports all files, so there is no resume floor.
+		job.Progress = JobProgress{}
+		job.resumeFloor = 0
+	} else {
+		// Keep the visible byte estimate until the next run reports its
+		// on-disk progress while rebuilding file totals from a fresh scan.
+		oldBytes := job.Progress.DownloadedBytes
+		job.Progress = JobProgress{}
+		job.Progress.DownloadedBytes = oldBytes
+		job.resumeFloor = oldBytes
+	}
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
-	// Re-queue through the scheduler so retrying respects max-active.
 	m.dispatchLocked()
-	m.mu.Unlock()
-
-	// Notify listeners of status change
-	m.notifyListeners(snapshot)
-
-	return true
+	return snapshot
 }
 
 // DeleteJob removes a job from the list.
@@ -827,6 +1000,7 @@ func (m *JobManager) DeleteJob(id string) bool {
 	}
 
 	delete(m.jobs, id)
+	m.signalWriteDecisionLocked()
 	m.mu.Unlock()
 	m.opWG.Done()
 	return true
@@ -899,6 +1073,7 @@ func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	m.opWG.Add(1)
 	snapshot := m.cloneJobLocked(job)
 	delete(m.jobs, id)
+	m.signalWriteDecisionLocked()
 	m.mu.Unlock()
 	defer m.opWG.Done()
 
@@ -994,6 +1169,21 @@ func (m *JobManager) dispatchLocked() {
 	if active >= limit || len(queued) == 0 {
 		return
 	}
+	// Namespace inventories can walk large cache trees. Keep those walks off
+	// the manager lock while a selected-delete lease is present.
+	if len(m.deleteReservations) != 0 {
+		m.dispatchPending = true
+		if !m.dispatchRunning && !m.stopping {
+			m.dispatchRunning = true
+			m.opWG.Add(1)
+			go m.dispatchWithReservations()
+		} else if m.dispatchRunning {
+			// A request can arrive after the worker's final locked check but
+			// before it parks on the captured change channel.
+			m.signalWriteDecisionLocked()
+		}
+		return
+	}
 
 	// Oldest first, so downloads start in the order they were added.
 	sort.Slice(queued, func(a, b int) bool {
@@ -1021,6 +1211,164 @@ func (m *JobManager) dispatchLocked() {
 		go m.runJob(j, activityID)
 		active++
 	}
+}
+
+// dispatchWithReservations serializes reservation-sensitive scheduler scans.
+// It claims only the oldest FIFO prefix after collecting evidence off-lock.
+func (m *JobManager) dispatchWithReservations() {
+	defer m.opWG.Done()
+	retries := 0
+	lastChance := false
+	for {
+		m.mu.Lock()
+		if m.stopping || m.fenced {
+			m.finishDispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		m.dispatchPending = false
+		change := m.writeDecisionChanged
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, job := range m.jobs {
+			jobPointers[id] = job
+		}
+		m.opWG.Add(1)
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		a := &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		snapshot := a.start
+		var targets []string
+		for _, scopes := range snapshot.deletes {
+			for _, target := range scopes {
+				targets = append(targets, target.physical)
+			}
+		}
+		m.mu.Unlock()
+
+		a.CollectSnapshot(snapshot)
+		for _, target := range targets {
+			probe, err := captureWriteIdentityProbe(target, false)
+			if err != nil {
+				a.failed["dispatch-target"] = true
+				break
+			}
+			a.targets[filepath.Clean(target)] = probe
+		}
+		blocked := make(map[string]bool)
+		for _, job := range snapshot.jobs {
+			if job.status == JobStatusQueued {
+				if a.HasActiveBroadMutationFor(job, nil) {
+					blocked[job.id] = true
+					continue
+				}
+				for _, target := range targets {
+					if a.MayWriteDescriptor(job, []string{target}) {
+						blocked[job.id] = true
+						break
+					}
+				}
+			}
+		}
+		probesOK := !a.failed["dispatch-target"] && a.RevalidateProbes(targets)
+		select {
+		case <-change:
+			retries = 0
+			lastChance = false
+		default:
+		}
+		a.Close()
+
+		m.mu.Lock()
+		if m.stopping || m.fenced {
+			m.finishDispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		current := m.captureWriteDecisionLocked()
+		unchanged := probesOK && reflect.DeepEqual(snapshot, current)
+		if unchanged {
+			for _, descriptor := range snapshot.jobs {
+				if m.jobs[descriptor.id] != jobPointers[descriptor.id] {
+					unchanged = false
+					break
+				}
+			}
+		}
+		if unchanged && len(current.deletes) == 0 {
+			// The final selected-delete lease was released during collection.
+			// Return to the ordinary locked path, which also enforces HF leases.
+			m.finishDispatchLocked()
+			m.dispatchPending = false
+			m.dispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		if unchanged {
+			retries = 0
+			lastChance = false
+			// All requests observed before this locked snapshot are represented
+			// by the complete ordered queue captured above.
+			m.dispatchPending = false
+			limit := m.effectiveMaxActive()
+			active := 0
+			var queued []*Job
+			for _, j := range m.jobs {
+				if j.Status == JobStatusRunning || j.starting {
+					active++
+				} else if j.Status == JobStatusQueued {
+					queued = append(queued, j)
+				}
+			}
+			sort.Slice(queued, func(i, j int) bool { return queued[i].CreatedAt.Before(queued[j].CreatedAt) })
+			for _, j := range queued {
+				if active >= limit {
+					break
+				}
+				if jobDestinationBase(j) == "" || blocked[j.ID] || hfReservationsBlockSnapshot(current, j) {
+					break
+				}
+				j.starting = true
+				m.runWG.Add(1)
+				activityID := m.registerRunActivityLocked(j)
+				go m.runJob(j, activityID)
+				active++
+			}
+		}
+		if !unchanged && !m.stopping && !m.fenced {
+			m.dispatchPending = false
+			// A signaled transition was captured atomically with this snapshot;
+			// stale manager state or probe-only mismatch gets bounded retries.
+			retries++
+			if retries < 3 {
+				m.mu.Unlock()
+				continue
+			}
+			if !lastChance {
+				// One final scan from the newest state handles a burst of
+				// changes without allowing unbounded revalidation spinning.
+				lastChance = true
+				retries = 0
+				m.mu.Unlock()
+				continue
+			}
+			waitForChange := m.writeDecisionChanged
+			m.mu.Unlock()
+			<-waitForChange
+			retries = 0
+			lastChance = false
+			continue
+		}
+		m.finishDispatchLocked()
+		m.mu.Unlock()
+		return
+	}
+}
+
+func (m *JobManager) finishDispatchLocked() {
+	m.dispatchRunning = false
+	m.signalWriteDecisionLocked()
 }
 
 // enforceLimitLocked re-queues the most-recently-started running jobs when the
@@ -1083,6 +1431,7 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	cfg.cacheEnv = m.config.cacheEnv
 	m.opWG.Add(1)
 	m.config = cfg
+	m.bumpWriteDecisionLocked()
 	if m.speedLimiter != nil {
 		m.speedLimiter.SetLimit(hfdownloader.ParseSize(cfg.MaxSpeed))
 	}
@@ -1314,6 +1663,8 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		if activityID != 0 {
 			m.mu.Lock()
 			delete(m.runActivities, activityID)
+			m.bumpWriteDecisionLocked()
+			m.dispatchLocked()
 			m.mu.Unlock()
 		}
 		m.runWG.Done()
@@ -1331,6 +1682,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	myGeneration := job.generation // Track which generation we are
 	job.Status = JobStatusRunning
 	job.starting = false
+	m.signalWriteDecisionLocked()
 	job.Phase = ""
 	now := time.Now()
 	job.StartedAt = &now
@@ -1448,6 +1800,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 			activity.planned = planned
 			activity.planKnown = true
 			activity.planComplete = complete
+			m.signalWriteDecisionLocked()
 		}
 		m.mu.Unlock()
 	}
@@ -1488,6 +1841,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	} else {
 		job.Status = JobStatusCompleted
 	}
+	m.signalWriteDecisionLocked()
 	endSnap := m.cloneJobLocked(job)
 	// This job finished and freed a slot; start the next queued job.
 	m.dispatchLocked()
@@ -1550,6 +1904,8 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		settings.CacheDir = ""
 		settings.HubDir = ""
 	}
+	endObservedMutation := m.beginObservedMutation(dsts)
+	defer endObservedMutation()
 	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
 		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, err)
 	}

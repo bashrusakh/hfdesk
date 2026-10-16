@@ -1,0 +1,605 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+)
+
+// writeDecisionJob is the manager-owned portion of a reservation decision.
+// It intentionally excludes progress, listeners and other presentation data.
+type writeDecisionJob struct {
+	id, repo, revision, output, hub, local, localRepo string
+	status                                            JobStatus
+	starting, flat, dataset, exact                    bool
+	filters, excludes                                 []string
+	generation                                        int
+	createdAt                                         int64
+	activityID                                        uint64
+}
+
+type writeDecisionActivity struct {
+	id           uint64
+	job          writeDecisionJob
+	planKnown    bool
+	planComplete bool
+	planned      []frozenMutationPath
+}
+
+type writeDecisionSnapshot struct {
+	epoch                              uint64
+	fenced, stopping                   bool
+	maxActive                          int
+	jobs                               []writeDecisionJob
+	activities                         []writeDecisionActivity
+	deletes, hfReservations, mutations map[uint64][]frozenMutationPath
+	mutationKinds                      map[uint64]writeScopeKind
+}
+
+type writeIdentityProbe struct {
+	path, identity, linkTarget string
+	directory                  bool
+	mode                       os.FileMode
+}
+
+type writeScopeKind uint8
+
+const (
+	writeScopeDirectory writeScopeKind = iota
+	writeScopeEntry
+)
+
+func decisionJob(j *Job) writeDecisionJob {
+	return writeDecisionJob{id: j.ID, repo: j.Repo, revision: j.Revision, output: j.OutputDir,
+		hub: j.HubDir, local: j.LocalDir, localRepo: j.LocalRepo, status: j.Status,
+		starting: j.starting, flat: j.Flat, dataset: j.IsDataset, exact: j.ExactMatch,
+		filters: append([]string(nil), j.Filters...), excludes: append([]string(nil), j.Excludes...),
+		generation: j.generation, createdAt: j.CreatedAt.UnixNano()}
+}
+
+func cloneScopes(in map[uint64][]frozenMutationPath) map[uint64][]frozenMutationPath {
+	out := make(map[uint64][]frozenMutationPath, len(in))
+	for id, paths := range in {
+		out[id] = append([]frozenMutationPath(nil), paths...)
+	}
+	return out
+}
+
+func cloneScopeKinds(in map[uint64]writeScopeKind) map[uint64]writeScopeKind {
+	out := make(map[uint64]writeScopeKind, len(in))
+	for id, kind := range in {
+		out[id] = kind
+	}
+	return out
+}
+
+func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
+	s := writeDecisionSnapshot{epoch: m.writeDecisionEpoch, fenced: m.fenced, stopping: m.stopping,
+		maxActive: m.effectiveMaxActive(), deletes: cloneScopes(m.deleteReservations),
+		hfReservations: cloneScopes(m.hfRepoReservations), mutations: cloneScopes(m.mutationScopes), mutationKinds: cloneScopeKinds(m.mutationScopeKinds)}
+	for _, j := range m.jobs {
+		s.jobs = append(s.jobs, decisionJob(j))
+	}
+	for id, a := range m.runActivities {
+		descriptor := a.descriptor
+		if descriptor.id == "" {
+			descriptor = decisionJob(a.job)
+		}
+		item := writeDecisionActivity{id: id, job: descriptor, planKnown: a.planKnown, planComplete: a.planComplete}
+		if a.planKnown {
+			for _, path := range a.planned {
+				item.planned = append(item.planned, path)
+			}
+			sort.Slice(item.planned, func(i, j int) bool {
+				a, b := item.planned[i], item.planned[j]
+				if a.key != b.key {
+					return a.key < b.key
+				}
+				if a.raw != b.raw {
+					return a.raw < b.raw
+				}
+				return a.physical < b.physical
+			})
+		}
+		s.activities = append(s.activities, item)
+	}
+	sort.Slice(s.jobs, func(i, j int) bool { return s.jobs[i].id < s.jobs[j].id })
+	sort.Slice(s.activities, func(i, j int) bool { return s.activities[i].id < s.activities[j].id })
+	return s
+}
+
+func (m *JobManager) captureWriteDecision() writeDecisionSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.captureWriteDecisionLocked()
+}
+
+func (m *JobManager) writeDecisionChangeChannel() <-chan struct{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.writeDecisionChanged
+}
+
+func (m *JobManager) writeDecisionUnchanged(s writeDecisionSnapshot) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return reflect.DeepEqual(s, m.captureWriteDecisionLocked())
+}
+
+func hfReservationsBlockSnapshot(snapshot writeDecisionSnapshot, job *Job) bool {
+	for _, scopes := range snapshot.hfReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *JobManager) signalWriteDecisionLocked() {
+	if m.writeDecisionChanged == nil {
+		m.writeDecisionChanged = make(chan struct{})
+		return
+	}
+	close(m.writeDecisionChanged)
+	m.writeDecisionChanged = make(chan struct{})
+}
+
+func (m *JobManager) bumpWriteDecisionLocked() {
+	m.writeDecisionEpoch++
+	m.signalWriteDecisionLocked()
+}
+
+func (m *JobManager) beginObservedMutation(paths []string) func() {
+	clean := make([]frozenMutationPath, 0, len(paths))
+	for _, p := range paths {
+		if p != "" {
+			frozen, err := freezeMutationEntry(p)
+			if err != nil {
+				// This tracker cannot refuse the cleanup operation. Preserve its
+				// raw spelling and use a lexical identity; overlap helpers treat an
+				// unresolvable current mapping conservatively.
+				if absolute, absErr := filepath.Abs(filepath.Clean(p)); absErr == nil {
+					frozen = frozenMutationPath{physical: absolute, key: pathIdentityKey(absolute)}
+				}
+			}
+			frozen.raw = p
+			clean = append(clean, frozen)
+		}
+	}
+	m.mu.Lock()
+	if m.mutationScopes == nil {
+		m.mutationScopes = make(map[uint64][]frozenMutationPath)
+	}
+	if m.mutationScopeKinds == nil {
+		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
+	}
+	m.nextWriteID++
+	id := m.nextWriteID
+	m.mutationScopes[id] = clean
+	m.mutationScopeKinds[id] = writeScopeEntry
+	m.bumpWriteDecisionLocked()
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.mutationScopes, id)
+		delete(m.mutationScopeKinds, id)
+		m.bumpWriteDecisionLocked()
+		// A reservation-sensitive dispatch may have completed while this
+		// observed mutation was still blocking the FIFO head. Re-evaluate now
+		// that the cleanup scope is gone; a notification alone can leave a
+		// queued job stalled if no later event requests dispatch.
+		m.dispatchLocked()
+		m.mu.Unlock()
+	}
+}
+
+// cacheWriteAttempt owns an immutable inventory assembled outside manager
+// locks. Begin under m.mu so Close cannot race WaitGroup.Add.
+type cacheWriteAttempt struct {
+	manager     *JobManager
+	start       writeDecisionSnapshot
+	evidence    map[string]selectedWriteEvidence
+	failed      map[string]bool
+	descriptors map[string]writeDecisionJob
+	probes      map[string]writeIdentityProbe
+	targets     map[string]writeIdentityProbe
+	inventory   func(string) (writableNamespaceInventory, bool)
+}
+
+func (m *JobManager) beginCacheWriteAttempt() (*cacheWriteAttempt, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping {
+		return nil, false
+	}
+	m.opWG.Add(1)
+	inventory := m.writeInventory
+	if inventory == nil {
+		inventory = inventoryWritableNamespace
+	}
+	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}, true
+}
+
+func (a *cacheWriteAttempt) Close() {
+	if a != nil {
+		a.manager.opWG.Done()
+	}
+}
+
+func decisionJobKey(j *Job) string {
+	return decisionDescriptorKey(decisionJob(j))
+}
+
+func decisionDescriptorKey(d writeDecisionJob) string {
+	b, _ := json.Marshal(struct {
+		ID, Repo, Revision, Output, Hub, Local, LocalRepo string
+		Filters, Excludes                                 []string
+		Generation                                        int
+		Exact, Flat, Dataset                              bool
+		ActivityID                                        uint64
+	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.activityID})
+	return string(b)
+}
+
+func descriptorForStartingJob(job, activity writeDecisionJob) bool {
+	job.generation = activity.generation
+	job.activityID = activity.activityID
+	return decisionDescriptorKey(job) == decisionDescriptorKey(activity)
+}
+
+func jobFromDecision(d writeDecisionJob) *Job {
+	return &Job{ID: d.id, Repo: d.repo, Revision: d.revision, OutputDir: d.output, HubDir: d.hub,
+		LocalDir: d.local, LocalRepo: d.localRepo, Status: d.status, starting: d.starting,
+		Flat: d.flat, IsDataset: d.dataset, ExactMatch: d.exact, Filters: append([]string(nil), d.filters...),
+		Excludes: append([]string(nil), d.excludes...), generation: d.generation}
+}
+
+// CollectSnapshot inventories all job and run-activity descriptors in the
+// immutable decision snapshot. Complete plans are represented by their frozen
+// destinations instead; incomplete known plans still need namespace evidence
+// for destinations not covered by those known paths. A descriptor shared by a
+// queued job and its activity is visited once; a distinct generation remains
+// independent.
+func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
+	seen := make(map[string]struct{}, len(s.jobs)+len(s.activities))
+	startingActivity := make(map[string][]writeDecisionJob)
+	for _, activity := range s.activities {
+		if !activity.planKnown {
+			startingActivity[activity.job.id] = append(startingActivity[activity.job.id], activity.job)
+		}
+	}
+	for _, d := range s.jobs {
+		if d.status != JobStatusQueued && !d.starting {
+			continue
+		}
+		if d.starting {
+			for _, activity := range startingActivity[d.id] {
+				if descriptorForStartingJob(d, activity) {
+					d = activity
+					break
+				}
+			}
+		}
+		key := decisionDescriptorKey(d)
+		seen[key] = struct{}{}
+		a.collectDescriptor(d)
+	}
+	for _, activity := range s.activities {
+		if activity.planKnown && activity.planComplete {
+			continue
+		}
+		key := decisionDescriptorKey(activity.job)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		a.collectDescriptor(activity.job)
+	}
+}
+
+// Collect builds each semantic job's writable namespace once, independent
+// of target count. It is safe to call only on the attempt-local job copies.
+func (a *cacheWriteAttempt) Collect(job *Job) {
+	if a == nil || job == nil {
+		return
+	}
+	a.collectDescriptor(decisionJob(job))
+}
+
+func (a *cacheWriteAttempt) collectDescriptor(descriptor writeDecisionJob) {
+	job := jobFromDecision(descriptor)
+	key := decisionDescriptorKey(descriptor)
+	if a.failed[key] {
+		return
+	}
+	if _, ok := a.evidence[key]; ok {
+		return
+	}
+	a.descriptors[key] = descriptor
+	inventory := a.inventory
+	if inventory == nil {
+		inventory = inventoryWritableNamespace
+	}
+	bases := jobWritableBases(job)
+	baseProbes := make([]writeIdentityProbe, len(bases))
+	for i, base := range bases {
+		probe, err := captureWriteIdentityProbe(base, true)
+		if err != nil {
+			a.failed[key] = true
+			return
+		}
+		baseProbes[i] = probe
+	}
+	ev, ok := buildSelectedWriteEvidence(job, inventory)
+	if !ok {
+		a.failed[key] = true
+		return
+	}
+	a.evidence[key] = ev
+	for i, base := range bases {
+		probe, err := captureWriteIdentityProbe(base, true)
+		if err != nil || !reflect.DeepEqual(probe, baseProbes[i]) || i >= len(ev.inventories) || probe.identity != ev.inventories[i].base {
+			a.failed[key] = true
+			delete(a.evidence, key)
+			return
+		}
+		a.probes[probe.path] = probe
+	}
+	for _, inv := range ev.inventories {
+		for _, alias := range inv.aliases {
+			probe, err := captureWriteIdentityProbe(alias.location, true)
+			if err != nil || probe.identity != pathIdentityKey(alias.dest) {
+				a.failed[key] = true
+				delete(a.evidence, key)
+				return
+			}
+			a.probes[probe.path] = probe
+		}
+	}
+}
+
+func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
+	if job == nil {
+		return true
+	}
+	return a.MayWriteDescriptor(decisionJob(job), targets)
+}
+
+func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targets []string) bool {
+	if a == nil {
+		return true
+	}
+	base := descriptor
+	wasActivity := base.activityID != 0
+	base.activityID = 0
+	// registerRunActivityLocked already advances the descriptor generation
+	// when a run claims a starting job. Preserve that generation when checking
+	// the activity; only a starting job descriptor needs the claim adjustment.
+	if base.starting && !wasActivity {
+		base.generation++
+	}
+	baseKey := decisionDescriptorKey(base)
+	identities := make([]string, len(targets))
+	for i, p := range targets {
+		probe, err := captureWriteIdentityProbe(p, false)
+		if err != nil {
+			return true
+		}
+		identities[i] = probe.identity
+		a.targets[filepath.Clean(p)] = probe
+	}
+	found := false
+	for key, descriptor := range a.descriptors {
+		candidate := descriptor
+		candidate.activityID = 0
+		if decisionDescriptorKey(candidate) != baseKey {
+			continue
+		}
+		found = true
+		if a.failed[key] {
+			return true
+		}
+		ev, ok := a.evidence[key]
+		if !ok || selectedWriteEvidenceMayWrite(ev, identities) {
+			return true
+		}
+	}
+	return !found
+}
+
+// Revalidate probes only the explicit bounded identities supplied by the
+// caller. It is not a guarantee against unmanaged external filesystem writes.
+func (a *cacheWriteAttempt) Revalidate(paths []string) bool {
+	if a == nil || !a.manager.writeDecisionUnchanged(a.start) {
+		return false
+	}
+	return a.RevalidateProbes(paths)
+}
+
+// RevalidateProbes checks bounded filesystem observations only. Callers that
+// need an atomic manager-state commit must compare start with
+// captureWriteDecisionLocked while holding manager.mu after this returns.
+func (a *cacheWriteAttempt) RevalidateProbes(paths []string) bool {
+	if a == nil {
+		return false
+	}
+	for _, probe := range a.probes {
+		current, err := captureWriteIdentityProbe(probe.path, probe.directory)
+		if err != nil || !reflect.DeepEqual(probe, current) {
+			return false
+		}
+	}
+	for _, p := range paths {
+		probe, ok := a.targets[filepath.Clean(p)]
+		if !ok {
+			return false
+		}
+		current, err := captureWriteIdentityProbe(p, probe.directory)
+		if err != nil || !reflect.DeepEqual(probe, current) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *cacheWriteAttempt) HasActiveBroadMutation(targets []string) bool {
+	return a.hasActiveBroadMutation(nil, targets, true)
+}
+
+func (a *cacheWriteAttempt) HasActiveBroadMutationFor(descriptor writeDecisionJob, targets []string) bool {
+	// Selected-delete reservations are checked separately using the job's
+	// path-filter-aware evidence; only broad managed scopes belong here.
+	return a.hasActiveBroadMutation(&descriptor, targets, false)
+}
+
+func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob, targets []string, includeDeletes bool) bool {
+	if a == nil {
+		return true
+	}
+	var evidence []selectedWriteEvidence
+	if descriptor == nil {
+		for _, ev := range a.evidence {
+			evidence = append(evidence, ev)
+		}
+	} else {
+		key := decisionDescriptorKey(*descriptor)
+		if ev, ok := a.evidence[key]; ok {
+			evidence = append(evidence, ev)
+		}
+	}
+	// beginCacheMutation and HF reservations name directory scopes; selected
+	// GGUF deletes name leaf entries whose final symlink must remain unfollowed.
+	for id, scopes := range a.start.mutations {
+		kind := a.start.mutationKinds[id]
+		for _, scope := range scopes {
+			for _, target := range targets {
+				if frozenScopeOverlapsEntry(scope, target, kind) {
+					return true
+				}
+			}
+			for _, ev := range evidence {
+				for _, inv := range ev.inventories {
+					if scopeOverlapsDirectory(scope.rawOrPhysical(), inv.base, kind) {
+						return true
+					}
+					for _, alias := range inv.aliases {
+						if scopeOverlapsDirectory(scope.rawOrPhysical(), alias.location, kind) || scopeOverlapsDirectory(scope.rawOrPhysical(), alias.dest, kind) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, scopes := range a.start.hfReservations {
+		for _, scope := range scopes {
+			for _, target := range targets {
+				if frozenScopeOverlapsEntry(scope, target, writeScopeDirectory) {
+					return true
+				}
+			}
+			for _, ev := range evidence {
+				for _, inv := range ev.inventories {
+					if directoryScopesOverlap(scope.rawOrPhysical(), inv.base) {
+						return true
+					}
+					for _, alias := range inv.aliases {
+						if directoryScopesOverlap(scope.rawOrPhysical(), alias.location) || directoryScopesOverlap(scope.rawOrPhysical(), alias.dest) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	if !includeDeletes {
+		return false
+	}
+	for _, scopes := range a.start.deletes {
+		for _, entry := range scopes {
+			for _, target := range targets {
+				if frozenScopeOverlapsEntry(entry, target, writeScopeEntry) {
+					return true
+				}
+			}
+			// A selected-delete lease owns one leaf entry, not its entire
+			// writer namespace. Ask each known writer's filter-aware evidence
+			// whether it can actually emit that entry; unknown inventories stay
+			// conservative because their reachable path set is unproven.
+			for key := range a.failed {
+				if _, known := a.descriptors[key]; known {
+					return true
+				}
+			}
+			for _, ev := range evidence {
+				if selectedWriteEvidenceMayWrite(ev, []string{entry.physical}) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func directoryScopesOverlap(a, b string) bool {
+	a, errA := mutationDirectoryIdentity(a)
+	b, errB := mutationDirectoryIdentity(b)
+	if errA != nil || errB != nil {
+		return true
+	}
+	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
+}
+
+func scopeOverlapsDirectory(scope, directory string, kind writeScopeKind) bool {
+	if kind == writeScopeEntry {
+		return mutationDirectoryEntryOverlap(directory, scope)
+	}
+	return directoryScopesOverlap(scope, directory)
+}
+
+func captureWriteIdentityProbe(path string, directory bool) (writeIdentityProbe, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return writeIdentityProbe{}, err
+	}
+	var identity string
+	if directory {
+		identity, err = mutationDirectoryIdentity(abs)
+	} else {
+		identity, err = mutationEntryIdentity(abs)
+	}
+	if err != nil {
+		return writeIdentityProbe{}, err
+	}
+	p := writeIdentityProbe{path: abs, identity: identity, directory: directory}
+	info, lerr := os.Lstat(abs)
+	if lerr == nil {
+		p.mode = info.Mode()
+		if info.Mode()&os.ModeSymlink != 0 {
+			p.linkTarget, err = os.Readlink(abs)
+			if err != nil {
+				return writeIdentityProbe{}, err
+			}
+		}
+	} else if !os.IsNotExist(lerr) {
+		return writeIdentityProbe{}, lerr
+	}
+	return p, nil
+}
+
+func jobWritableBases(job *Job) []string {
+	base := jobDestinationBase(job)
+	if base == "" {
+		return nil
+	}
+	bases := []string{base}
+	if snapshot := jobSnapshotBase(job); snapshot != "" && snapshot != base {
+		bases = append(bases, snapshot)
+	}
+	return bases
+}

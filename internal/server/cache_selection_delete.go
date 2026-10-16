@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -21,6 +22,7 @@ import (
 
 type jobWriteActivity struct {
 	job          *Job
+	descriptor   writeDecisionJob
 	planned      map[string]frozenMutationPath
 	planKnown    bool
 	planComplete bool
@@ -63,6 +65,21 @@ func freezeMutationDirectoryWithKey(path string, key func(string) string) (froze
 
 func frozenMutationOverlap(a, b frozenMutationPath) bool {
 	return pathKeysOverlap(a.key, b.key)
+}
+
+func (p frozenMutationPath) rawOrPhysical() string {
+	if p.raw != "" {
+		return p.raw
+	}
+	return p.physical
+}
+
+func frozenScopeOverlapsEntry(scope frozenMutationPath, incoming string, kind writeScopeKind) bool {
+	path := scope.rawOrPhysical()
+	if kind == writeScopeEntry {
+		return frozenMutationOverlapsRawEntry(scope, incoming) || mutationPathsOverlap(path, incoming)
+	}
+	return mutationDirectoryEntryOverlap(scope.physical, incoming) || mutationDirectoryEntryOverlap(path, incoming)
 }
 
 // mutationScopesOverlap checks both immutable admission snapshots and the
@@ -275,52 +292,402 @@ func mutationDirectoryPhysicalIdentity(name string) (string, error) {
 	return mutationEntryPhysicalIdentity(abs)
 }
 
-func jobMayWriteSelectedPath(job *Job, target string) bool {
-	base := jobDestinationBase(job)
-	if base == "" {
-		return false
-	}
-	targetIdentity, targetErr := mutationEntryIdentity(target)
-	if targetErr != nil {
-		return true
-	}
-	if pathWithinWriterBase(base, targetIdentity) {
-		// Canonical directory names prove physical overlap, not the raw remote path
-		// spelling used by PlanRepo's path-based excludes. The basename is invariant
-		// across parent aliases, so it is safe for a negative filter decision; a
-		// directory-only exclude may conservatively classify this as a writer.
-		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, targetIdentity) {
-		// Until the plan completes, its resolved commit and remote paths are
-		// unknown. Keep the frozen repository snapshots subtree reserved, but use
-		// only the basename for sound negative GGUF/filter decisions.
-		return hfdownloader.GGUFPathSelected(filepath.Base(targetIdentity), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	return false
+// writableAlias is a directory symlink inside a writable base whose fully
+// resolved destination stays inside that same base, so the alias participates
+// in a finite set of repository-relative spellings.
+type writableAlias struct {
+	location string // absolute path of the symlink entry itself
+	dest     string // absolute fully resolved destination directory
+	name     string // name of the entry inside its parent directory
 }
 
-func jobMayWriteFrozenSelectedPath(job *Job, target frozenMutationPath) bool {
-	base := jobDestinationBase(job)
-	if base == "" {
-		return false
-	}
-	if pathWithinWriterBase(base, target.key) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, target.key) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	return false
+// writableNamespaceInventory records the resolved identity of one writable
+// base and every directory alias it contains. ok=false (reported by the
+// constructor) marks a mapping that can no longer be proven complete: an
+// unreadable entry, a dangling or looping symlink, a resolution failure, or a
+// directory alias whose destination leaves the base all forbid a negative
+// pre-plan writer decision.
+type writableNamespaceInventory struct {
+	base    string
+	aliases []writableAlias
+	// snapshotNamespace is the job-semantic namespace kind: it is set only
+	// when this inventory was built from the job's configured snapshot base
+	// (jobSnapshotBase) and is never derived from the resolved physical
+	// basename. A snapshot base aliased to a directory with another name must
+	// still strip the unknown commit prefix below, and a friendly base whose
+	// resolved basename happens to be "snapshots" must never do so.
+	snapshotNamespace bool
 }
 
-func pathWithinWriterBase(base, targetIdentity string) bool {
+const (
+	maxWritableAliasDepth    = 64
+	maxWritableAliasSpelling = 32
+	// Bound closure work as well as retained spellings. A finite spelling set
+	// can still induce a quadratic number of alias/reached-directory pairs.
+	maxWritableAliasExpansion = 4096
+)
+
+var errWritableNamespaceUnknown = errors.New("writable namespace cannot be inventoried")
+
+// inventoryWritableNamespace resolves the writable base and enumerates every
+// directory alias below it. A base that does not exist yet is trivially
+// alias-free; every other failure is reported as an unknown mapping.
+func inventoryWritableNamespace(base string) (writableNamespaceInventory, bool) {
 	baseIdentity, err := mutationDirectoryIdentity(base)
 	if err != nil {
+		return writableNamespaceInventory{}, false
+	}
+	inv := writableNamespaceInventory{base: baseIdentity}
+	if _, err := os.Lstat(baseIdentity); err != nil {
+		if os.IsNotExist(err) {
+			return inv, true
+		}
+		return writableNamespaceInventory{}, false
+	}
+	var walk func(dir string, depth int) error
+	walk = func(dir string, depth int) error {
+		if depth > maxWritableAliasDepth {
+			return errWritableNamespaceUnknown
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				if err := walk(path, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				continue
+			}
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				// Dangling targets, loops, and permission failures make the
+				// mapping unknown; never derive a negative from them.
+				return err
+			}
+			target, err := os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+			if !target.IsDir() {
+				// Leaf entries (including friendly/snapshot file links into
+				// blobs) never reorganize directory spellings.
+				continue
+			}
+			rel, err := filepath.Rel(baseIdentity, resolved)
+			if err != nil {
+				return err
+			}
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				// An alias destination outside the writer base can redirect a
+				// repository path to an arbitrary physical target, so the
+				// mapping cannot be proven complete from inside this base.
+				return errWritableNamespaceUnknown
+			}
+			inv.aliases = append(inv.aliases, writableAlias{
+				location: path,
+				dest:     resolved,
+				name:     entry.Name(),
+			})
+		}
+		return nil
+	}
+	if err := walk(baseIdentity, 0); err != nil {
+		return writableNamespaceInventory{}, false
+	}
+	return inv, true
+}
+
+// relativeWithin returns the slash-normalized path of p relative to base when
+// p is lexically contained in base.
+func relativeWithin(base, p string) (string, bool) {
+	rel, err := filepath.Rel(base, p)
+	if err != nil || filepath.IsAbs(rel) {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if rel == "." {
+		return "", true
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// joinSlashPath joins non-empty slash-separated components.
+func joinSlashPath(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "/")
+}
+
+// selectedPathCandidates returns every repository-relative spelling through
+// which the target can be written from this writable namespace. The set starts
+// from the canonical containment (when the target's parent lies inside the
+// base) and is closed under the inventoried directory aliases, including
+// nested alias destinations and alias chains. ok=false means the spelling set
+// cannot be enumerated finitely, which also forbids a negative answer.
+func (inv writableNamespaceInventory) selectedPathCandidates(targetIdentity string) ([]string, bool) {
+	parent := filepath.Dir(targetIdentity)
+	// Every inventoried alias resolves within inv.base. A target parent outside
+	// that closed physical namespace is therefore proved unreachable; do not let
+	// irrelevant alias cycles exhaust the spelling budget before returning this
+	// negative result.
+	if _, reachable := relativeWithin(inv.base, parent); !reachable {
+		return nil, true
+	}
+	spellings := map[string]map[string]struct{}{}
+	add := func(dir, spelling string) (bool, error) {
+		set, ok := spellings[dir]
+		if !ok {
+			set = map[string]struct{}{}
+			spellings[dir] = set
+		}
+		if _, exists := set[spelling]; exists {
+			return false, nil
+		}
+		if len(set) >= maxWritableAliasSpelling {
+			return false, errWritableNamespaceUnknown
+		}
+		set[spelling] = struct{}{}
+		return true, nil
+	}
+	seed := func(dir string) error {
+		spelling, ok := relativeWithin(inv.base, dir)
+		if !ok {
+			return nil
+		}
+		_, err := add(dir, spelling)
+		return err
+	}
+	// Canonical spellings: the target's parent when it lies inside the base
+	// (missing ordinary suffixes stay lexical), and each alias location.
+	if err := seed(parent); err != nil {
+		return nil, false
+	}
+	for _, alias := range inv.aliases {
+		if err := seed(filepath.Dir(alias.location)); err != nil {
+			return nil, false
+		}
+	}
+	// Close the spelling sets under the aliases: any spelling of an alias
+	// location can route through the alias into every reached directory, which
+	// then unlocks further aliases (nested destinations and chains included).
+	for {
+		var expansion int
+		changed := false
+		for _, alias := range inv.aliases {
+			prefixDir := filepath.Dir(alias.location)
+			for prefix := range spellings[prefixDir] {
+				for reached := range spellings {
+					relDest, ok := relativeWithin(alias.dest, reached)
+					if !ok {
+						continue
+					}
+					expansion++
+					if expansion > maxWritableAliasExpansion {
+						return nil, false
+					}
+					did, err := add(reached, joinSlashPath(prefix, alias.name, relDest))
+					if err != nil {
+						return nil, false
+					}
+					changed = changed || did
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	name := filepath.ToSlash(filepath.Base(targetIdentity))
+	candidates := make([]string, 0, len(spellings[parent])*2)
+	for spelling := range spellings[parent] {
+		candidate := joinSlashPath(spelling, name)
+		candidates = append(candidates, candidate)
+		// A semantic snapshot namespace is physically rooted at
+		// snapshots/<commit>, while the plan's RelativePath starts below that
+		// commit directory. The commit is not known until planning completes,
+		// and it may be multi-component (e.g. the revision-name fallback
+		// "feature/v2" when the revision-info lookup fails), so compare every
+		// suffix after the first k = 1..n-1 leading components of the full
+		// spelling, not just the suffix after the first component. Any suffix
+		// that does not correspond to the real commit prefix only adds an
+		// over-conservative possible-writer answer, which is safe; deriving a
+		// negative from a one-component strip would not be. The snapshot kind
+		// comes from the job's configured snapshot base, never from a resolved
+		// physical basename: whenever the semantic base and its
+		// resolved/aliased identity diverge in a way that leaves the spelling
+		// closure incomplete (unreadable entries, dangling/looping symlinks,
+		// outward alias destinations, or spelling overflow), the inventory or
+		// the enumeration above already failed closed with the conservative
+		// possible-writer answer, so no negative is ever derived from a
+		// basename-resolved namespace type.
+		if inv.snapshotNamespace {
+			rest := candidate
+			for {
+				idx := strings.Index(rest, "/")
+				if idx < 0 {
+					break
+				}
+				rest = rest[idx+1:]
+				candidates = append(candidates, rest)
+			}
+		}
+	}
+	return candidates, true
+}
+
+// writableNamespaceBase pairs one writable base of the job with its
+// job-semantic namespace kind. The kind is decided by which configured job
+// base produced the path, never by inspecting a resolved physical basename.
+type writableNamespaceBase struct {
+	path     string
+	snapshot bool
+}
+
+func jobMayWriteSelectedPath(job *Job, target string) bool {
+	return jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace)
+}
+
+// selectedWriteEvidence is an immutable reservation-attempt snapshot. Its
+// namespace inventories are built before evaluation; evaluation only consumes
+// these values and never consults the filesystem or mutable Job slices.
+type selectedWriteEvidence struct {
+	inventories []writableNamespaceInventory
+	filters     []string
+	excludes    []string
+	exactMatch  bool
+	isDataset   bool
+	aliases     bool
+}
+
+// jobMayWriteSelectedPaths builds each job namespace inventory once and reuses
+// it for all targets in this single reservation/admission check. inventory is
+// an injected seam so tests can assert the work scales with jobs, not targets.
+func jobMayWriteSelectedPaths(job *Job, targets []string, inventory func(string) (writableNamespaceInventory, bool)) bool {
+	evidence, ok := buildSelectedWriteEvidence(job, inventory)
+	if !ok {
 		return true
 	}
-	rel, err := filepath.Rel(baseIdentity, targetIdentity)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	base := jobDestinationBase(job)
+	if base == "" {
+		return false
+	}
+	targetIdentities := make([]string, len(targets))
+	for i, target := range targets {
+		targetIdentity, targetErr := mutationEntryIdentity(target)
+		if targetErr != nil {
+			return true
+		}
+		targetIdentities[i] = targetIdentity
+	}
+	return selectedWriteEvidenceMayWrite(evidence, targetIdentities)
+}
+
+func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamespaceInventory, bool)) (selectedWriteEvidence, bool) {
+	base := jobDestinationBase(job)
+	if base == "" {
+		return selectedWriteEvidence{}, true
+	}
+	bases := []writableNamespaceBase{{path: base}}
+	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && snapshotBase != base {
+		bases = append(bases, writableNamespaceBase{path: snapshotBase, snapshot: true})
+	}
+	// A negative pre-plan answer requires a complete physical-to-repo mapping
+	// proof for every writable namespace of the job. Any unknown or outward
+	// mapping short-circuits to the conservative possible-writer answer.
+	evidence := selectedWriteEvidence{
+		inventories: make([]writableNamespaceInventory, 0, len(bases)),
+		filters:     append([]string(nil), job.Filters...),
+		excludes:    append([]string(nil), job.Excludes...),
+		exactMatch:  job.ExactMatch,
+		isDataset:   job.IsDataset,
+	}
+	for _, writable := range bases {
+		inv, ok := inventory(writable.path)
+		if !ok {
+			return selectedWriteEvidence{}, false
+		}
+		inv.snapshotNamespace = writable.snapshot
+		if len(inv.aliases) > 0 {
+			evidence.aliases = true
+		}
+		evidence.inventories = append(evidence.inventories, inv)
+	}
+	return evidence, true
+}
+
+func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentities []string) bool {
+	for _, targetIdentity := range targetIdentities {
+		targetReachedNamespace := false
+		for _, inv := range evidence.inventories {
+			candidates, ok := inv.selectedPathCandidates(targetIdentity)
+			if !ok {
+				return true
+			}
+			if len(candidates) > 0 {
+				targetReachedNamespace = true
+				for _, candidate := range candidates {
+					if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: evidence.filters, Excludes: evidence.excludes, ExactMatch: evidence.exactMatch, IsDataset: evidence.isDataset}) {
+						return true
+					}
+				}
+			}
+		}
+		// Keep the conservative path-filter residual only for targets actually
+		// reachable through a completely inventoried namespace. An unrelated
+		// repository outside every writable namespace cannot be selected by an
+		// internal alias there. Unknown/outward mappings returned above remain
+		// fail-closed before this narrowing is considered.
+		if evidence.aliases && targetReachedNamespace && hasPathFilter(evidence.filters) {
+			return true
+		}
+	}
+	return false
+}
+
+// jobMayWriteSelectedPathWithinBase reports whether any proven repository
+// spelling of the target inside one writable namespace survives the job's
+// filters and excludes.
+func jobMayWriteSelectedPathWithinBase(inv writableNamespaceInventory, targetIdentity string, job *Job) bool {
+	candidates, ok := inv.selectedPathCandidates(targetIdentity)
+	if !ok {
+		return true
+	}
+	for _, candidate := range candidates {
+		if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: job.Filters, Excludes: job.Excludes, ExactMatch: job.ExactMatch, IsDataset: job.IsDataset}) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPathFilter reports whether a filter names a path rather than a bare
+// name. It is only used to keep reservations conservative; a slashless filter
+// is never treated as proof of a negative, because bare filters also select
+// directory components.
+func hasPathFilter(filters []string) bool {
+	for _, filter := range filters {
+		if strings.ContainsAny(filepath.ToSlash(strings.TrimSpace(filter)), "/\\") {
+			return true
+		}
+	}
+	return false
 }
 
 func jobSnapshotBase(job *Job) string {
@@ -397,6 +764,25 @@ func mutationDirectoryEntryOverlap(directory, entry string) bool {
 }
 
 func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
+	// Manager mutations that begin and end during an off-lock walk invalidate
+	// that attempt. Retry from a fresh snapshot a small bounded number of times;
+	// persistent churn fails conservatively without holding m.mu across scans.
+	for attempt := 0; attempt < 3; attempt++ {
+		release, ok := m.reserveSelectedGGUFAttempt(paths)
+		if ok {
+			return release, true
+		}
+		m.mu.RLock()
+		stopping := m.stopping
+		m.mu.RUnlock()
+		if stopping {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func (m *JobManager) reserveSelectedGGUFAttempt(paths []string) (func(), bool) {
 	clean := make([]frozenMutationPath, 0, len(paths))
 	for _, p := range paths {
 		// Freeze the selected entry's physical parent at admission. The final
@@ -408,9 +794,60 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		}
 		clean = append(clean, identity)
 	}
+	a, ok := m.beginCacheWriteAttempt()
+	if !ok {
+		return nil, false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			a.Close()
+		}
+	}()
+	// Collect namespace inventories and bounded identities without holding
+	// the manager lock. The final snapshot comparison rejects crossed writes.
+	a.CollectSnapshot(a.start)
+	targetPaths := make([]string, 0, len(clean))
+	for _, target := range clean {
+		p := target.physical
+		targetPaths = append(targetPaths, p)
+		probe, err := captureWriteIdentityProbe(p, false)
+		if err != nil {
+			return nil, false
+		}
+		a.targets[filepath.Clean(p)] = probe
+	}
+	if a.HasActiveBroadMutation(targetPaths) || !a.Revalidate(targetPaths) {
+		return nil, false
+	}
+	for _, activity := range a.start.activities {
+		if activity.planKnown {
+			plannedSet := make(map[string]frozenMutationPath, len(activity.planned))
+			for _, planned := range activity.planned {
+				plannedSet[planned.rawOrPhysical()] = planned
+			}
+			if plannedRawEntriesConflict(clean, plannedSet) {
+				return nil, false
+			}
+			if activity.planComplete {
+				continue
+			}
+		}
+		if a.MayWriteDescriptor(activity.job, targetPaths) {
+			return nil, false
+		}
+	}
+	for _, job := range a.start.jobs {
+		if job.status != JobStatusQueued && !job.starting {
+			continue
+		}
+		if a.MayWrite(jobFromDecision(job), targetPaths) {
+			return nil, false
+		}
+	}
 	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
+	defer m.mu.Unlock()
+	if m.stopping || !reflect.DeepEqual(a.start, m.captureWriteDecisionLocked()) {
 		return nil, false
 	}
 	entryConflicts := func(scopes []frozenMutationPath) bool {
@@ -425,7 +862,6 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 	}
 	for _, scopes := range m.deleteReservations {
 		if entryConflicts(scopes) {
-			m.mu.Unlock()
 			return nil, false
 		}
 	}
@@ -433,65 +869,50 @@ func (m *JobManager) reserveSelectedGGUF(paths []string) (func(), bool) {
 		for _, scope := range scopes {
 			for _, entry := range clean {
 				if mutationScopesOverlap(scope, entry) {
-					m.mu.Unlock()
 					return nil, false
 				}
 			}
 		}
 	}
-	for _, scopes := range m.mutationScopes {
+	for id, scopes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
 		for _, scope := range scopes {
 			for _, entry := range clean {
-				if mutationScopesOverlap(scope, entry) {
-					m.mu.Unlock()
+				conflicts := mutationScopesOverlap(scope, entry)
+				if kind == writeScopeEntry {
+					conflicts = frozenMutationOverlap(scope, entry)
+				}
+				if conflicts {
 					return nil, false
 				}
-			}
-		}
-	}
-	for _, activity := range m.runActivities {
-		if activity.planKnown {
-			if plannedRawEntriesConflict(clean, activity.planned) {
-				m.mu.Unlock()
-				return nil, false
-			}
-			if activity.planComplete {
-				continue
-			}
-		}
-		for _, target := range clean {
-			if jobMayWriteFrozenSelectedPath(activity.job, target) {
-				m.mu.Unlock()
-				return nil, false
-			}
-		}
-	}
-	for _, job := range m.jobs {
-		if job.Status != JobStatusQueued && !job.starting {
-			continue
-		}
-		for _, target := range clean {
-			if jobMayWriteFrozenSelectedPath(job, target) {
-				m.mu.Unlock()
-				return nil, false
 			}
 		}
 	}
 	if m.deleteReservations == nil {
 		m.deleteReservations = make(map[uint64][]frozenMutationPath)
 	}
-	m.opWG.Add(1)
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.deleteReservations[id] = clean
-	m.mu.Unlock()
+	m.bumpWriteDecisionLocked()
+	committed = true // the lease now owns the attempt operation reference
 	return func() {
 		m.mu.Lock()
 		delete(m.deleteReservations, id)
+		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
 	}, true
+}
+
+func mutationPathsOverlapAny(path string, paths []string) bool {
+	for _, candidate := range paths {
+		if mutationPathsOverlap(path, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func hfJobRepoPath(job *Job) string {
@@ -625,10 +1046,21 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 			return nil, false
 		}
 	}
-	for _, writes := range m.mutationScopes {
-		if conflictScopes(writes) {
-			m.mu.Unlock()
-			return nil, false
+	for id, writes := range m.mutationScopes {
+		kind := m.mutationScopeKinds[id]
+		for _, scope := range scopes {
+			for _, write := range writes {
+				conflicts := false
+				if kind != writeScopeEntry {
+					conflicts = mutationScopesOverlap(write, scope)
+				} else {
+					conflicts = frozenScopeOverlapsEntry(write, scope.rawOrPhysical(), writeScopeEntry)
+				}
+				if conflicts {
+					m.mu.Unlock()
+					return nil, false
+				}
+			}
 		}
 	}
 	for _, activity := range m.runActivities {
@@ -654,10 +1086,12 @@ func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), boo
 		m.hfRepoReservations = make(map[uint64][]frozenMutationPath)
 	}
 	m.hfRepoReservations[id] = scopes
+	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.hfRepoReservations, id)
+		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
@@ -730,14 +1164,21 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 	if m.mutationScopes == nil {
 		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
+	if m.mutationScopeKinds == nil {
+		m.mutationScopeKinds = make(map[uint64]writeScopeKind)
+	}
 	m.opWG.Add(1)
 	m.nextWriteID++
 	id := m.nextWriteID
 	m.mutationScopes[id] = clean
+	m.mutationScopeKinds[id] = writeScopeDirectory
+	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
 		delete(m.mutationScopes, id)
+		delete(m.mutationScopeKinds, id)
+		m.bumpWriteDecisionLocked()
 		m.dispatchLocked()
 		m.mu.Unlock()
 		m.opWG.Done()
@@ -752,7 +1193,7 @@ func (m *JobManager) jobBlockedByDeleteLocked(job *Job) bool {
 	}
 	for _, targets := range m.deleteReservations {
 		for _, target := range targets {
-			if jobMayWriteFrozenSelectedPath(job, target) {
+			if jobMayWriteSelectedPath(job, target.rawOrPhysical()) {
 				return true
 			}
 		}
@@ -766,7 +1207,11 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	}
 	m.nextWriteID++
 	id := m.nextWriteID
-	m.runActivities[id] = &jobWriteActivity{job: job, planned: make(map[string]frozenMutationPath)}
+	descriptor := decisionJob(job)
+	descriptor.generation++ // runJob claims this generation when it starts.
+	descriptor.activityID = id
+	m.runActivities[id] = &jobWriteActivity{job: job, descriptor: descriptor, planned: make(map[string]frozenMutationPath)}
+	m.bumpWriteDecisionLocked()
 	return id
 }
 
@@ -1616,7 +2061,7 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	if !hfdownloader.IsValidModelName(req.Repo) || req.Type != "model" || req.LocationID == "" || req.GroupID == "" || len(req.Members) == 0 {
+	if !hfdownloader.IsValidModelName(req.Repo) || !filepath.IsLocal(req.Repo) || req.Type != "model" || req.LocationID == "" || req.GroupID == "" || len(req.Members) == 0 {
 		writeError(w, http.StatusBadRequest, "Invalid selection", "Expected a model repo, current locationId, groupId, and confirmed members")
 		return
 	}

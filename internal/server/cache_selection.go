@@ -469,6 +469,9 @@ func isRegisteredLocalSelectionRoot(cfg Config, candidate string) bool {
 }
 
 func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
+	if !filepath.IsLocal(repo) {
+		return nil
+	}
 	cache := cfg.cache()
 	roots := localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
 	locations := []cacheSelectionLocation{}
@@ -560,7 +563,7 @@ func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
 
 func (s *Server) handleCacheSelection(w http.ResponseWriter, r *http.Request) {
 	repo, repoType := r.URL.Query().Get("repo"), r.URL.Query().Get("type")
-	if !hfdownloader.IsValidModelName(repo) {
+	if !hfdownloader.IsValidModelName(repo) || !filepath.IsLocal(repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected repo=owner/name")
 		return
 	}

@@ -4,8 +4,14 @@
 package smartdl
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 func TestAnalyzeDataset(t *testing.T) {
@@ -147,6 +153,311 @@ func TestAnalyzeDataset(t *testing.T) {
 			t.Errorf("FileCount = %d, want 3", info.Splits[0].FileCount)
 		}
 	})
+}
+
+func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
+	paths := []string{
+		"data/train-000.parquet",
+		"data/test_records.csv",
+		"data/customdata/shard.arrow",
+		"ambiguous.json",
+		"notes.txt",
+		"config.json",
+		"dataset_info.json",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/revision-1"):
+			nodes := make([]map[string]interface{}, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]interface{}{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/refs"):
+			_, _ = w.Write([]byte(`{"branches":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/data", true, "revision-1")
+	if err != nil {
+		t.Fatalf("AnalyzeWithRevision: %v", err)
+	}
+	if len(info.Files) != len(paths) {
+		t.Fatalf("repository inventory has %d files, want %d", len(info.Files), len(paths))
+	}
+	if info.Dataset == nil || len(info.Dataset.Splits) != 3 {
+		t.Fatalf("dataset groups = %+v, want train/test/customdata", info.Dataset)
+	}
+	items := DatasetToSelectableItems(info.Dataset)
+	if len(items) != 3 {
+		t.Fatalf("selectable items = %+v, want three definite groups", items)
+	}
+	byID := make(map[string]SelectableItem, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	for id, path := range map[string]string{"train": paths[0], "test": paths[1], "customdata": paths[2]} {
+		item := byID[id]
+		if len(item.Files) != 1 || item.Files[0] != path {
+			t.Errorf("selectable %q files = %v, want [%s]", id, item.Files, path)
+		}
+	}
+	if _, ok := byID["default"]; ok {
+		t.Fatal("unresolved JSON/TXT files were advertised as a default selection")
+	}
+	if got := info.Dataset.Formats; len(got) != 5 || got[0] != "arrow" || got[1] != "csv" || got[2] != "json" || got[3] != "parquet" || got[4] != "txt" {
+		t.Errorf("dataset formats = %v, want [arrow csv json parquet txt]", got)
+	}
+}
+
+func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
+	paths := []string{"train.csv", "corpus_train_000.parquet", "corpus_test_000.parquet", "pretrain_000.parquet", "test_data.csv", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/data", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.PopulateDownloadSelection()
+	request := info.RecommendedDownload
+	if request == nil || !request.ExactMatch || len(request.Filters) != 1 || request.Filters[0] != "train" {
+		t.Fatalf("recommended request = %+v", request)
+	}
+	plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: request.Filters, ExactMatch: request.ExactMatch}, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, item := range plan.Items {
+		got = append(got, item.RelativePath)
+	}
+	want := []string{"train.csv", "corpus_train_000.parquet", "config.json", "dataset_info.json", "README.md"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("planned paths = %v, want %v", got, want)
+	}
+	var selectedGroups []string
+	for _, selectable := range info.SelectableItems {
+		if selectable.ID == "customdata" || selectable.ID == "default" {
+			selectedGroups = append(selectedGroups, selectable.FilterValue)
+		}
+	}
+	if len(selectedGroups) != 2 {
+		t.Fatalf("custom/default selectable filters = %v, want both groups", selectedGroups)
+	}
+	plan, err = hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: selectedGroups, ExactMatch: true}, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("public planner custom/default groups: %v", err)
+	}
+	got = got[:0]
+	for _, item := range plan.Items {
+		got = append(got, item.RelativePath)
+	}
+	want = []string{"pretrain_000.parquet", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("custom/default planned paths = %v, want %v", got, want)
+	}
+}
+
+func TestDatasetAnalyzerRoundTripsFlatAndCustomDataGroups(t *testing.T) {
+	paths := []string{"data/part-0000.parquet", "data/part-0001.parquet", "data/custom/part.parquet"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/flat/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/flat/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/flat", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make(map[string][]string)
+	filters := make(map[string]string)
+	for _, item := range DatasetToSelectableItems(info.Dataset) {
+		groups[item.ID] = item.Files
+		filters[item.ID] = item.FilterValue
+	}
+	if strings.Join(groups["default"], ",") != "data/part-0000.parquet,data/part-0001.parquet" {
+		t.Fatalf("flat parquet group = %v; want both flat data leaves under default", groups["default"])
+	}
+	if strings.Join(groups["custom"], ",") != "data/custom/part.parquet" || filters["custom"] != "custom" {
+		t.Fatalf("custom directory analyzer group=%v filter=%q", groups["custom"], filters["custom"])
+	}
+	for _, group := range []string{"default", "custom"} {
+		plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{Repo: "owner/flat", Revision: "rev1", IsDataset: true, Filters: []string{filters[group]}, ExactMatch: true, AppendFilterSubdir: true}, hfdownloader.Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo %s: %v", group, err)
+		}
+		var got []string
+		for _, item := range plan.Items {
+			got = append(got, item.RelativePath)
+			if item.Subdir != filters[group] {
+				t.Errorf("group %s item %s attributed to %q; want analyzer filter %q", group, item.RelativePath, item.Subdir, filters[group])
+			}
+		}
+		if strings.Join(got, ",") != strings.Join(groups[group], ",") {
+			t.Fatalf("group %s plan=%v; analyzer advertised %v", group, got, groups[group])
+		}
+	}
+}
+
+func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
+	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/test_data.parquet"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				node := map[string]any{"type": "file", "path": p, "size": 10}
+				if p == "train/test_data.parquet" {
+					node["lfs"] = map[string]any{"size": 1000, "sha256": strings.Repeat("b", 64)}
+				}
+				nodes = append(nodes, node)
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/ambiguous", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.PopulateDownloadSelection()
+	request := info.RecommendedDownload
+	if request == nil || len(request.Filters) != 1 || request.Filters[0] != "train" {
+		t.Fatalf("recommended request = %+v", request)
+	}
+	job := hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: request.Filters, ExactMatch: request.ExactMatch}
+	if plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL}); err == nil || plan != nil {
+		t.Fatalf("ambiguous public plan = %+v, err=%v; want refusal", plan, err)
+	}
+	job.Excludes = []string{"unknown.json", "train/test_data.parquet"}
+	plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("excluded ambiguity plan: %v", err)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "train.csv" {
+		t.Fatalf("excluded plan paths = %+v", plan.Items)
+	}
+	job.Filters = []string{"train", "train/test_data.parquet"}
+	job.Excludes = []string{"unknown.json"}
+	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("exact ambiguous-file request: %v", err)
+	}
+	if len(plan.Items) != 2 || plan.Items[1].RelativePath != "train/test_data.parquet" {
+		t.Fatalf("explicit exact-path plan = %+v", plan.Items)
+	}
+	job.Filters = nil
+	job.Excludes = nil
+	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("unfiltered public plan: %v", err)
+	}
+	if len(plan.Items) != len(paths) {
+		t.Fatalf("unfiltered plan has %d items, want %d", len(plan.Items), len(paths))
+	}
+}
+
+func TestDatasetGroupAndExplicitFiltersUnionThroughPublicPlanner(t *testing.T) {
+	paths := []string{
+		"data/train_data.parquet", "other/data.parquet", "train.csv", "test.csv",
+		"train/records.csv", "test/records.csv", "train/part.parquet",
+		"data/unrelated/notes.txt", "config.json", "README.md",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/union/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/union/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				node := map[string]any{"type": "file", "path": p, "size": 10}
+				if p == "data/train_data.parquet" {
+					node["lfs"] = map[string]any{"size": 1000, "sha256": strings.Repeat("a", 64)}
+				}
+				nodes = append(nodes, node)
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/union", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Dataset == nil {
+		t.Fatal("analyzer did not identify dataset groups")
+	}
+	groupFilters := make(map[string]string)
+	for _, item := range info.SelectableItems {
+		groupFilters[item.ID] = item.FilterValue
+	}
+	if groupFilters["train"] == "" || groupFilters["default"] == "" {
+		t.Fatalf("analyzer selectable group filters = %v, want train and default", groupFilters)
+	}
+	cases := []struct {
+		name    string
+		filters []string
+		want    []string
+	}{
+		{"matched LFS underscore group and companions", []string{groupFilters["train"]}, []string{"data/train_data.parquet", "train.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"synthetic default and companions", []string{groupFilters["default"]}, []string{"other/data.parquet", "config.json", "README.md"}},
+		{"group plus exact explicit file", []string{groupFilters["train"], "test.csv"}, []string{"data/train_data.parquet", "train.csv", "test.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"group plus explicit directory", []string{groupFilters["train"], "test/"}, []string{"data/train_data.parquet", "train.csv", "train/records.csv", "test/records.csv", "train/part.parquet", "config.json", "README.md"}},
+		{"group plus extension", []string{groupFilters["train"], ".parquet"}, []string{"data/train_data.parquet", "other/data.parquet", "train.csv", "train/records.csv", "train/part.parquet", "config.json", "README.md"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := hfdownloader.Job{Repo: "owner/union", Revision: "rev1", IsDataset: true, Filters: tc.filters, ExactMatch: true}
+			plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			got := make([]string, 0, len(plan.Items))
+			for _, item := range plan.Items {
+				got = append(got, item.RelativePath)
+				if item.RelativePath == "data/train_data.parquet" && (item.Size != 1000 || (len(tc.filters) == 1 && item.Subdir != groupFilters["train"])) {
+					t.Errorf("matched group item = %+v; want LFS size 1000 and group attribution when train is the only filter", item)
+				}
+			}
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("planned paths = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestIsDataFileExtension(t *testing.T) {
