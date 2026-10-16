@@ -431,8 +431,15 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// quant selection to unrelated model weights. Group selections retain
 			// their established role-aware membership; the filtered GGUF route
 			// retains recognized model and dataset service metadata.
+			directDatasetMatch := false
+			for _, filter := range job.Filters {
+				if filterMatchesPath(rel, filter, job.ExactMatch) {
+					directDatasetMatch = true
+					break
+				}
+			}
 			if !recognizedDatasetGroup && ggufMode && !strings.HasSuffix(relLower, ".gguf") &&
-				!isRecognizedDatasetMetadataPath(rel) {
+				!directDatasetMatch && !isRecognizedDatasetMetadataPath(rel) {
 				continue
 			}
 		}

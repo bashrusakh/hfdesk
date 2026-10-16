@@ -213,6 +213,44 @@ func TestPlanRepoDatasetGGUFGuardComposesWithRootCompanions(t *testing.T) {
 	}
 }
 
+func TestPlanRepoDatasetExplicitFileAndGGUFFilterUnion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		file   hfNode
+		filter string
+	}{
+		{"non-LFS explicit data", hfNode{Type: "file", Path: "train.csv", Size: 10}, "train.csv"},
+		{"LFS explicit data", hfNode{Type: "file", Path: "train.csv", LFS: &hfLfsInfo{Size: 10}}, "train.csv"},
+		{"extension-selected non-LFS data", hfNode{Type: "file", Path: "train.parquet", Size: 11}, ".parquet"},
+		{"extension-selected LFS data", hfNode{Type: "file", Path: "train.parquet", LFS: &hfLfsInfo{Size: 11}}, ".parquet"},
+		{"directory-selected non-LFS data", hfNode{Type: "file", Path: "data/train.csv", Size: 12}, "data/"},
+		{"directory-selected LFS data", hfNode{Type: "file", Path: "data/train.csv", LFS: &hfLfsInfo{Size: 12}}, "data/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []hfNode{tc.file, {Type: "file", Path: "model-Q4_K_M.gguf", Size: 20}}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			filters := []string{"Q4_K_M", tc.filter}
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			assertPaths(t, planPaths(plan), []string{tc.file.Path, "model-Q4_K_M.gguf"})
+			for _, item := range plan.Items {
+				if item.RelativePath == tc.file.Path && tc.file.LFS == nil && item.destinationSubdir != "" {
+					t.Fatalf("explicit dataset path destination subdir = %q; want repo-relative destination", item.destinationSubdir)
+				}
+			}
+			job := Job{Repo: "owner/data", IsDataset: true, Filters: filters, Excludes: []string{tc.file.Path}, ExactMatch: true}
+			excludedPlan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo with exclude: %v", err)
+			}
+			assertPaths(t, planPaths(excludedPlan), []string{"model-Q4_K_M.gguf"})
+		})
+	}
+}
+
 func TestPlanRepoDatasetOrdinaryFiltersDoNotAdmitUnmatchedPayload(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
