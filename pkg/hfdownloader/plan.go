@@ -299,6 +299,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 	}
 	datasetMembership := datasetselection.Recognize(datasetFiles)
+	// Evidence is input-indexed; project definite data roles once instead of
+	// rescanning the complete evidence slice for every planned file.
+	datasetDataRoles := make([]bool, len(fileNodes))
+	for _, evidence := range datasetMembership.Evidence {
+		if evidence.InputIndex >= 0 && evidence.InputIndex < len(datasetDataRoles) && evidence.DefiniteRole == datasetselection.EvidenceRoleData {
+			datasetDataRoles[evidence.InputIndex] = true
+		}
+	}
 	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	var datasetEvaluation datasetDecisionEvaluation
 	// A recognized dataset group remains the governing selection when its files
@@ -495,7 +503,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			}
 			if matchedFilter == "" {
 				metadata := job.IsDataset && isRecognizedDatasetMetadataPath(rel)
-				if isLFS || !metadata || datasetHasDefiniteDataRole(datasetMembership, nodeIndex) {
+				if isLFS || !metadata || datasetDataRoles[nodeIndex] {
 					continue
 				}
 			}
@@ -597,7 +605,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 		destinationSubdir := matchedFilter
 		if job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") &&
-			(!ggufMode || datasetHasDefiniteDataRole(datasetMembership, nodeIndex)) {
+			(!ggufMode || datasetDataRoles[nodeIndex]) {
 			destinationSubdir = ""
 		}
 		items = append(items, PlanItem{
@@ -748,15 +756,6 @@ func hasDatasetRoleUncertainty(input datasetDecisionInput) bool {
 	return data && companion
 }
 
-func datasetHasDefiniteDataRole(membership datasetselection.Result, index int) bool {
-	for _, evidence := range membership.Evidence {
-		if evidence.InputIndex == index && evidence.DefiniteRole == datasetselection.EvidenceRoleData {
-			return true
-		}
-	}
-	return false
-}
-
 func isDatasetServiceMetadata(relativePath string) bool {
 	return strings.EqualFold(path.Base(strings.ReplaceAll(relativePath, "\\", "/")), "dataset_info.json")
 }
@@ -894,9 +893,39 @@ func isModelPayloadPath(filePath string) bool {
 		return true
 	case ".bin":
 		return !strings.Contains(base, "tokenizer")
-	default:
+	}
+	// These exact Hugging Face/framework filenames are documented parameter
+	// artifacts. Extension alone is not sufficient: arbitrary files such as
+	// custom.msgpack or checkpoint.h5 remain unknown and do not activate mixed
+	// model fallback. Numbered shard forms are accepted only for the established
+	// Transformers Flax and TensorFlow names.
+	if base == "flax_model.msgpack" || base == "diffusion_flax_model.msgpack" ||
+		isNumberedArtifactShard(base, "flax_model", ".msgpack") ||
+		base == "tf_model.h5" || isNumberedArtifactShard(base, "tf_model", ".h5") ||
+		base == "model.tflite" || base == "rust_model.ot" {
+		return true
+	}
+	return false
+}
+
+func isNumberedArtifactShard(base, stem, extension string) bool {
+	prefix := stem + "-"
+	if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, extension) {
 		return false
 	}
+	shard := strings.TrimSuffix(strings.TrimPrefix(base, prefix), extension)
+	parts := strings.Split(shard, "-of-")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	for _, part := range parts {
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isREADMEPath identifies README documents that may carry a selected GGUF
