@@ -154,6 +154,42 @@ func TestPlanRepo_GGUFModeRecognizesOtherPayloadEvenWhenNonLFS(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "weights/model.safetensors", "config.json"})
 }
 
+func TestPlanRepo_GGUFModeRecognizesSupportedPyTorchPayloads(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter string
+		path   string
+		lfs    bool
+	}{
+		{name: "pt directory non-lfs", filter: "weights/", path: "weights/model.pt"},
+		{name: "pt explicit lfs", filter: "weights/model.pt", path: "weights/model.pt", lfs: true},
+		{name: "pth directory non-lfs", filter: "weights/", path: "weights/model.pth"},
+		{name: "pth explicit lfs", filter: "weights/model.pth", path: "weights/model.pth", lfs: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 20}},
+				{Type: "file", Path: tc.path, Size: 2},
+				{Type: "file", Path: "config.json", Size: 2},
+				{Type: "file", Path: "tokenizer/model.json", Size: 2},
+				{Type: "file", Path: "optimizer.pt", Size: 2},
+			}
+			if tc.lfs {
+				files[1].LFS = &hfLfsInfo{Size: 2}
+			}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{
+				Repo: "owner/model", Filters: []string{"Q4_K_M", tc.filter}, ExactMatch: true,
+			}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", tc.path, "config.json", "tokenizer/model.json", "optimizer.pt"})
+		})
+	}
+}
+
 // TestPlanRepo_ExcludedDirectMatchDoesNotConfirmSelection: excludes enter the
 // effective selection. The only file the filter matches is excluded, so no
 // direct match remains and the plan must fail rather than succeed on the
