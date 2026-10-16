@@ -70,6 +70,47 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 	}
 }
 
+func TestDownload_GGUFSelectionKeepsExplicitNonGGUFAtRepoPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", Size: 4},
+				{Type: "file", Path: "config.json", Size: 4},
+				{Type: "file", Path: "tokenizer/model.json", Size: 4},
+			})
+		case strings.HasSuffix(r.URL.Path, "/model-Q4_K_M.gguf"):
+			_, _ = w.Write([]byte("gguf"))
+		case strings.HasSuffix(r.URL.Path, "/config.json"):
+			_, _ = w.Write([]byte("conf"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	out := t.TempDir()
+	job := Job{Repo: "owner/model", Filters: []string{"Q4_K_M", "config.json"}, ExactMatch: true, AppendFilterSubdir: true}
+	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
+	if err := Download(context.Background(), job, settings, nil); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	base, err := DestinationBase(out, job.Repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{"Q4_K_M/model-Q4_K_M.gguf": "gguf", "config.json": "conf"} {
+		got, err := os.ReadFile(filepath.Join(base, filepath.FromSlash(rel)))
+		if err != nil || string(got) != want {
+			t.Errorf("destination %s = %q, err=%v; want %q", rel, got, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(base, "tokenizer/model.json")); !os.IsNotExist(err) {
+		t.Errorf("unmatched companion was included: err=%v", err)
+	}
+}
+
 func TestDownload_RetainedModelVocabKeepsRepoRelativeDestination(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

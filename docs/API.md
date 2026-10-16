@@ -78,9 +78,13 @@ remain excluded, and explicit excludes take precedence. A GGUF-only
 quantization selection is the exception: it keeps only matching GGUF/mmproj
 files and directly matched files such as a matching README, with no automatic
 config, tokenizer, vocabulary, or unmatched README fallback. Explicitly
-selecting one of those files remains supported. Unfiltered downloads are
+selecting one of those files remains supported without changing GGUF-only mode;
+only positive evidence of another model payload (for example a matched
+Safetensors/ONNX/weight-BIN file) selects the ordinary mixed-format behavior.
+Unknown file roles do not broaden selection. Unfiltered downloads are
 unchanged. Existing path, directory, and extension filters keep their usual
-matching rules.
+matching rules. In exact mode, a filter ending in `/` selects descendants of
+that directory, not a file whose path is the directory name itself.
 
 For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or

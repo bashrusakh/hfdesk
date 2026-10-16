@@ -121,6 +121,39 @@ func TestPlanRepo_NonLFSDirectFilterMatchSucceeds(t *testing.T) {
 	}
 }
 
+func TestPlanRepo_GGUFModeRequiresPayloadEvidenceAndKeepsExplicitCompanions(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 20}},
+		{Type: "file", Path: "config.json", Size: 2},
+		{Type: "file", Path: "tokenizer.json", Size: 2},
+		{Type: "file", Path: "README.md", Size: 2},
+		{Type: "file", Path: "vocab.txt", Size: 2},
+		{Type: "file", Path: "notes.unknown", Size: 2},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M", "config.json"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "config.json"})
+}
+
+func TestPlanRepo_GGUFModeRecognizesOtherPayloadEvenWhenNonLFS(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+		{Type: "file", Path: "weights/model.safetensors", Size: 2},
+		{Type: "file", Path: "config.json", Size: 2},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M", "safetensors"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "weights/model.safetensors", "config.json"})
+}
+
 // TestPlanRepo_ExcludedDirectMatchDoesNotConfirmSelection: excludes enter the
 // effective selection. The only file the filter matches is excluded, so no
 // direct match remains and the plan must fail rather than succeed on the
