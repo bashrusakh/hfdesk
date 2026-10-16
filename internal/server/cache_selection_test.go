@@ -310,6 +310,13 @@ func TestCacheSelectionLocalGroupsAndExplicitLocation(t *testing.T) {
 }
 
 func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
+	runCacheSelectionRejectsNonLocalRepoBeforeJoining(t, runtime.GOOS, os.Symlink)
+}
+
+// The injected creator exercises optional-fixture admission on the actual
+// locality/API scenario without pretending Linux filepath.IsLocal has Windows semantics.
+func runCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T, fixtureGOOS string, createSymlink func(string, string) error) {
+	t.Helper()
 	root := t.TempDir()
 	alias := filepath.Join(t.TempDir(), "configured-alias")
 	cases := []struct {
@@ -329,11 +336,12 @@ func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
 			writeSelectionFile(t, filepath.Join(root, filepath.FromSlash(repo)), "model-Q4_K_M.gguf")
 		}
 	}
-	aliasErr := os.Symlink(root, alias)
-	roots, err := configuredRootsWithOptionalAlias(root, alias, aliasErr, runtime.GOOS)
+	aliasErr := createSymlink(root, alias)
+	roots, err := configuredRootsWithOptionalAlias(root, alias, aliasErr, fixtureGOOS)
 	if err != nil {
 		t.Fatalf("create configured-root alias: %v", err)
 	}
+	aliasAvailable := len(roots) == 2 && roots[1] == alias
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: roots})
 	for _, tc := range cases {
 		repo := tc.repo
@@ -381,7 +389,7 @@ func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
 			t.Errorf("nested owner/name repo %q did not expose its GGUF selection", repo)
 		}
 		aliasFound := false
-		if alias != "" {
+		if aliasAvailable {
 			for _, loc := range selection.Locations {
 				if strings.HasPrefix(loc.Path, alias) {
 					aliasFound = true
@@ -392,6 +400,13 @@ func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestCacheSelectionLocalityScenarioContinuesWithoutUnsupportedOptionalAlias(t *testing.T) {
+	wrappedUnsupported := &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: syscall.Errno(1314)}
+	runCacheSelectionRejectsNonLocalRepoBeforeJoining(t, "windows", func(_, _ string) error {
+		return wrappedUnsupported
+	})
 }
 
 func TestSelectedDeleteRefusesOwnerSymlinkEscape(t *testing.T) {
