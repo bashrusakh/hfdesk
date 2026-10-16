@@ -888,8 +888,13 @@ func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exa
 // selected. Keep this deliberately separate from storage/LFS status.
 func isModelPayloadPath(filePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	// Match the established weight-file exclusions from smartdl: these are
+	// recognized training artifacts, not evidence of another model payload.
+	if strings.Contains(base, "optimizer") || strings.Contains(base, "training") {
+		return false
+	}
 	switch path.Ext(base) {
-	case ".safetensors", ".onnx":
+	case ".safetensors", ".onnx", ".pt", ".pth":
 		return true
 	case ".bin":
 		return !strings.Contains(base, "tokenizer")

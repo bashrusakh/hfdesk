@@ -49,3 +49,27 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		})
 	}
 }
+
+func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"weights/model.safetensors", true},
+		{"weights/model.onnx", true},
+		{"weights/pytorch_model.bin", true},
+		{"weights/model.pt", true},
+		{"weights/model.pth", true},
+		{"weights/tokenizer.bin", false},
+		{"weights/optimizer.pt", false},
+		{"weights/training-state.pth", false},
+		{"config.json", false},
+		{"notes.unknown", false},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := isModelPayloadPath(tc.path); got != tc.want {
+				t.Errorf("isModelPayloadPath(%q) = %t, want %t", tc.path, got, tc.want)
+			}
+		})
+	}
+}
