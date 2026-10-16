@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -129,10 +130,72 @@ func assertNoTemporaryPinContainer(t *testing.T, dir string) {
 func symlinkOrSkip(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatalf("create symlink: %v", err)
+	}
+}
+
+func isSymlinkPrivilegeUnavailable(goos string, err error) bool {
+	if goos != "windows" || err == nil {
+		return false
+	}
+	return os.IsPermission(err) || errors.Is(err, syscall.Errno(1314)) // ERROR_PRIVILEGE_NOT_HELD
+}
+
+func configuredRootsWithOptionalAlias(root, alias string, symlinkErr error, goos string) ([]string, error) {
+	roots := []string{root}
+	if symlinkErr == nil {
+		roots = append(roots, alias)
+		return roots, nil
+	}
+	if isSymlinkPrivilegeUnavailable(goos, symlinkErr) {
+		return roots, nil
+	}
+	return nil, symlinkErr
+}
+
+func TestIsSymlinkPrivilegeUnavailable(t *testing.T) {
+	wrapped := func(err error) error {
+		return &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: err}
+	}
+	for _, tc := range []struct {
+		name string
+		goos string
+		err  error
+		want bool
+	}{
+		{name: "Windows permission denied", goos: "windows", err: wrapped(os.ErrPermission), want: true},
+		{name: "Windows access denied", goos: "windows", err: wrapped(syscall.EACCES), want: true},
+		{name: "Windows privilege not held", goos: "windows", err: wrapped(syscall.Errno(1314)), want: true},
+		{name: "Windows unrelated errno", goos: "windows", err: wrapped(syscall.Errno(2))},
+		{name: "non-Windows permission error", goos: "linux", err: wrapped(os.ErrPermission)},
+		{name: "nil error", goos: "windows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSymlinkPrivilegeUnavailable(tc.goos, tc.err); got != tc.want {
+				t.Fatalf("isSymlinkPrivilegeUnavailable(%q, %v) = %v, want %v", tc.goos, tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfiguredRootsRetainCoreRootWhenOptionalAliasUnavailable(t *testing.T) {
+	aliasErr := &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: syscall.Errno(1314)}
+	roots, err := configuredRootsWithOptionalAlias("root", "alias", aliasErr, "windows")
+	if err != nil {
+		t.Fatalf("unsupported optional alias should not fail core setup: %v", err)
+	}
+	if len(roots) != 1 || roots[0] != "root" {
+		t.Fatalf("unsupported optional alias roots = %v, want [root]", roots)
+	}
+	roots, err = configuredRootsWithOptionalAlias("root", "alias", nil, "windows")
+	if err != nil || len(roots) != 2 || roots[1] != "alias" {
+		t.Fatalf("created optional alias roots = %v, err %v; want [root alias]", roots, err)
+	}
+	if roots, err = configuredRootsWithOptionalAlias("root", "alias", syscall.Errno(2), "windows"); err == nil || roots != nil {
+		t.Fatalf("unrelated symlink failure roots = %v, err %v; want error", roots, err)
 	}
 }
 
@@ -266,16 +329,10 @@ func TestCacheSelectionRejectsNonLocalRepoBeforeJoining(t *testing.T) {
 			writeSelectionFile(t, filepath.Join(root, filepath.FromSlash(repo)), "model-Q4_K_M.gguf")
 		}
 	}
-	if err := os.Symlink(root, alias); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
-			alias = ""
-		} else {
-			t.Fatalf("create configured-root alias: %v", err)
-		}
-	}
-	roots := []string{root}
-	if alias != "" {
-		roots = append(roots, alias)
+	aliasErr := os.Symlink(root, alias)
+	roots, err := configuredRootsWithOptionalAlias(root, alias, aliasErr, runtime.GOOS)
+	if err != nil {
+		t.Fatalf("create configured-root alias: %v", err)
 	}
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: roots})
 	for _, tc := range cases {
@@ -1229,7 +1286,7 @@ func TestSelectedHFReservationRetainsFrozenAndCurrentBroadMutationDirectories(t 
 	}
 	alias := filepath.Join(root, "destination")
 	if err := os.Symlink(a, alias); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1245,6 +1302,9 @@ func TestSelectedHFReservationRetainsFrozenAndCurrentBroadMutationDirectories(t 
 	}
 	if err := os.Symlink(b, alias); err != nil {
 		mutationRelease()
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
 		t.Fatal(err)
 	}
 	var admitted []string
@@ -1641,7 +1701,7 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 	}
 	alias := filepath.Join(jobDestinationBase(job), "weights")
 	if err := os.Symlink(actual, alias); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1785,7 +1845,7 @@ func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join(base, "physical"), filepath.Join(base, "weights")); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1795,9 +1855,7 @@ func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T
 	}
 
 	nestedAlias := filepath.Join(base, "physical", "weights")
-	if err := os.Symlink(filepath.Join(base, "physical", "nested"), nestedAlias); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, filepath.Join(base, "physical", "nested"), nestedAlias)
 	job.Filters = []string{"weights/model.gguf"}
 	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "model.gguf")) {
 		t.Fatal("full path filter missed a nested alias destination")
@@ -1816,7 +1874,7 @@ func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join(storage, "missing-target"), alias); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1851,7 +1909,7 @@ func TestSelectedDeleteBlocksPunctuatedBareDirectoryFilterThroughAlias(t *testin
 		t.Fatal(err)
 	}
 	if err := os.Symlink(actual, filepath.Join(base, "Q5_K_M")); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1937,7 +1995,7 @@ func TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(base, "weights")); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -2554,7 +2612,7 @@ func TestSelectedDeleteIncompleteKnownPlanDoesNotBlockUnrelatedRepository(t *tes
 	selectedA := filepath.Join(blocked, "model-Q4_K_M.gguf")
 	writeSelectionFile(t, blocked, filepath.Base(selectedA))
 	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
+		if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
 			t.Skipf("symlink privilege unavailable: %v", err)
 		}
 		t.Fatal(err)

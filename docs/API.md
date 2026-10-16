@@ -96,9 +96,12 @@ recognized split name. Ambiguous files that could affect a
 selected group cause planning to fail with the standard JSON error response,
 rather than silently broadening or narrowing the selection. `POST /api/plan`
 returns HTTP 400 with error code `ambiguous_selection` for this expected
-selection refusal. `POST /api/download` admits work asynchronously; ambiguity
-is discovered by the job's later planning step and reported as a failed job,
-not as an immediate HTTP 400. Excluding the
+selection refusal. For normal queued (`dryRun: false`) `POST /api/download`
+requests, work is admitted asynchronously; ambiguity is discovered by the job's
+later planning step and reported as a failed job, not as an immediate HTTP 400.
+With `dryRun: true`, `POST /api/download` returns the planning response, and
+the same ambiguity returns HTTP 400 with error code `ambiguous_selection`, as
+it does for `POST /api/plan`. Excluding the
 ambiguous file resolves that ambiguity. This selection behavior does not claim
 to identify every possible dataset file layout; use explicit path/extension
 filters where appropriate. A README-only filter does not activate GGUF-only
