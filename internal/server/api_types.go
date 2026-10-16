@@ -12,8 +12,13 @@ type DownloadRequest struct {
 	Excludes           []string `json:"excludes,omitempty"`
 	AppendFilterSubdir bool     `json:"appendFilterSubdir,omitempty"`
 	DryRun             bool     `json:"dryRun,omitempty"`
-	// ExactMatch matches filters against whole name segments instead of
-	// substrings, so "q6_k" selects Q6_K but not Q6_K_XL (github issue #78).
+	// ExactMatch uses case-insensitive matching against repository-relative
+	// paths instead of substring matching. Exact filters can select directory
+	// components and their descendants with a trailing slash (for example,
+	// "weights/"), filename segments (for example, "q6_k" without matching
+	// "Q6_K_XL"), an extension (for example, ".safetensors"), or a full
+	// slash-containing relative path (for example, "weights/model.gguf").
+	// Exact segment boundaries preserve quantization tokens such as "Q6_K".
 	ExactMatch bool `json:"exactMatch,omitempty"`
 	// LocalDir overrides the download destination for this specific request,
 	// writing real files (flat mode) instead of the HF cache layout.

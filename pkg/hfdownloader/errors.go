@@ -30,6 +30,10 @@ var (
 	// a successful plan would consist only of companion/metadata files the user
 	// never selected. Distinguishable via errors.Is.
 	ErrNoFilterMatch = errors.New("no files matched requested filters")
+
+	// ErrAmbiguousSelection is returned when dataset membership ambiguity could
+	// change the emitted files for a recognized dataset-group selection.
+	ErrAmbiguousSelection = errors.New("dataset selection is ambiguous")
 )
 
 // DownloadError wraps an error with file context.

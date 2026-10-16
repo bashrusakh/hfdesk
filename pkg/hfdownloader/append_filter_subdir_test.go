@@ -92,9 +92,28 @@ func TestDownload_GGUFSelectionKeepsExplicitNonGGUFAtRepoPath(t *testing.T) {
 	defer server.Close()
 	out := t.TempDir()
 	job := Job{Repo: "owner/model", Filters: []string{"Q4_K_M", "config.json"}, ExactMatch: true, AppendFilterSubdir: true}
-	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
-	if err := Download(context.Background(), job, settings, nil); err != nil {
+	var completed Plan
+	var progressPaths []string
+	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1, OnPlanComplete: func(plan Plan) { completed = plan }}
+	if err := Download(context.Background(), job, settings, func(event ProgressEvent) {
+		if event.Event == "plan_item" {
+			progressPaths = append(progressPaths, event.Path)
+		}
+	}); err != nil {
 		t.Fatalf("Download: %v", err)
+	}
+	var exportedDestination string
+	for _, item := range completed.Items {
+		if item.RelativePath == "model-Q4_K_M.gguf" {
+			exportedDestination = item.DestinationSubdir
+		}
+	}
+	if exportedDestination != "Q4_K_M" || !containsString(progressPaths, "Q4_K_M/model-Q4_K_M.gguf") {
+		t.Fatalf("public plan destination=%q progress paths=%v; want Q4_K_M prefix matching actual write", exportedDestination, progressPaths)
+	}
+	encodedPlan, err := json.Marshal(completed)
+	if err != nil || !strings.Contains(string(encodedPlan), `"destinationSubdir":"Q4_K_M"`) {
+		t.Fatalf("serialized public plan=%s err=%v; want observable destinationSubdir", encodedPlan, err)
 	}
 	base, err := DestinationBase(out, job.Repo)
 	if err != nil {
@@ -108,6 +127,38 @@ func TestDownload_GGUFSelectionKeepsExplicitNonGGUFAtRepoPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(base, "tokenizer/model.json")); !os.IsNotExist(err) {
 		t.Errorf("unmatched companion was included: err=%v", err)
+	}
+}
+
+func TestScanPlanKeepsRepositoryRelativePathsWithAppendFilterSubdir(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: 4}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	for _, appendSubdir := range []bool{false, true} {
+		var paths []string
+		err := ScanPlan(context.Background(), Job{
+			Repo: "owner/model", Revision: "main", Filters: []string{"Q4_K_M"}, ExactMatch: true,
+			AppendFilterSubdir: appendSubdir,
+		}, Settings{Endpoint: server.URL}, func(event ProgressEvent) {
+			if event.Event == "plan_item" {
+				paths = append(paths, event.Path)
+			}
+		})
+		if err != nil {
+			t.Fatalf("ScanPlan append=%t: %v", appendSubdir, err)
+		}
+		if len(paths) != 1 || paths[0] != "model-Q4_K_M.gguf" {
+			t.Errorf("ScanPlan append=%t paths=%v; want repository-relative preview path", appendSubdir, paths)
+		}
 	}
 }
 
@@ -198,7 +249,7 @@ func TestDownload_DatasetOrdinaryNonLFSFilterPreservesRootDestinations(t *testin
 			selected = &plan.Items[i]
 		}
 	}
-	if selected == nil || selected.Subdir != "train.csv" || selected.destinationSubdir != "" {
+	if selected == nil || selected.Subdir != "train.csv" || selected.DestinationSubdir != "" {
 		t.Fatalf("dataset selection proof/attribution/destination = %+v; want attribution train.csv and unchanged destination", selected)
 	}
 	err = Download(context.Background(), Job{
@@ -281,8 +332,8 @@ func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) 
 		for _, item := range plan.Items {
 			if item.RelativePath == rel {
 				found = true
-				if item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M" {
-					t.Errorf("%s attribution/destination = %q/%q, want Q4_K_M/Q4_K_M", rel, item.Subdir, item.destinationSubdir)
+				if item.Subdir != "Q4_K_M" || item.DestinationSubdir != "Q4_K_M" {
+					t.Errorf("%s attribution/destination = %q/%q, want Q4_K_M/Q4_K_M", rel, item.Subdir, item.DestinationSubdir)
 				}
 			}
 		}
@@ -447,8 +498,8 @@ func TestDownload_MixedFormatKeepsPerFileGGUFDestination(t *testing.T) {
 		t.Fatalf("selected %d files, want both mixed-format matches: %+v", len(plan.Items), plan.Items)
 	}
 	for _, item := range plan.Items {
-		if item.RelativePath == "model-Q4_K_M.gguf" && (item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M") {
-			t.Errorf("mixed-format GGUF attribution/destination = %q/%q; want Q4_K_M/Q4_K_M", item.Subdir, item.destinationSubdir)
+		if item.RelativePath == "model-Q4_K_M.gguf" && (item.Subdir != "Q4_K_M" || item.DestinationSubdir != "Q4_K_M") {
+			t.Errorf("mixed-format GGUF attribution/destination = %q/%q; want Q4_K_M/Q4_K_M", item.Subdir, item.DestinationSubdir)
 		}
 	}
 	var eventPaths []string
@@ -502,7 +553,7 @@ func TestPlanRepo_DatasetGGUFLFSFilterKeepsAppendedDestination(t *testing.T) {
 		t.Fatalf("plan has %d items, want 1: %+v", len(plan.Items), plan.Items)
 	}
 	item := plan.Items[0]
-	if !item.LFS || item.Subdir != "Q4_K_M" || item.destinationSubdir != "Q4_K_M" {
+	if !item.LFS || item.Subdir != "Q4_K_M" || item.DestinationSubdir != "Q4_K_M" {
 		t.Fatalf("LFS GGUF attribution/destination = %+v; want LFS with Q4_K_M prefix", item)
 	}
 }

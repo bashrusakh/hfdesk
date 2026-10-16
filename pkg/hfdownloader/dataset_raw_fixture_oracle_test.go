@@ -243,7 +243,7 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 			}, Settings{Endpoint: srv.URL})
 			if tt.wantRefuse {
 				wantErr := fmt.Sprintf("dataset filter selection has ambiguous emitted set for %q", tt.files[0].Path)
-				if err == nil || !strings.Contains(err.Error(), wantErr) {
+				if !errors.Is(err, ErrAmbiguousSelection) || !strings.Contains(err.Error(), wantErr) {
 					t.Fatalf("PlanRepo error=%v; want path-specific ambiguity %q (plan=%v)", err, wantErr, planPaths(plan))
 				}
 				return

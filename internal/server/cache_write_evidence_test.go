@@ -85,10 +85,7 @@ func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T
 		return inventoryWritableNamespace(base)
 	}
 	done := make(chan bool, 1)
-	go func() {
-		_, ok := m.reserveSelectedGGUF([]string{target})
-		done <- ok
-	}()
+	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
 	<-entered
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- m.Close(context.Background()) }()
@@ -141,7 +138,16 @@ func TestSelectedDeleteReservationRejectsCompletedManagedAliasMutationDuringInve
 		return inventory, ok
 	}
 	done := make(chan bool, 1)
-	go func() { _, ok := m.reserveSelectedGGUF([]string{target}); done <- ok }()
+	reservationReturned := make(chan struct{})
+	go func() {
+		defer close(reservationReturned)
+		_, ok := m.reserveSelectedGGUF([]string{target})
+		done <- ok
+	}()
+	t.Cleanup(func() {
+		resumeOnce.Do(func() { close(resume) })
+		<-reservationReturned
+	})
 	<-entered
 	// This admitted managed mutation changes the writer's real filesystem
 	// namespace while inventory is off-lock, then completes before commit.
@@ -151,14 +157,16 @@ func TestSelectedDeleteReservationRejectsCompletedManagedAliasMutationDuringInve
 		<-done
 		t.Fatal("managed alias mutation was not admitted")
 	}
+	mutationActive := true
+	defer func() {
+		if mutationActive {
+			finish()
+		}
+	}()
 	outside := t.TempDir()
-	if err := os.Symlink(outside, alias); err != nil {
-		finish()
-		resumeOnce.Do(func() { close(resume) })
-		<-done
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, outside, alias)
 	finish()
+	mutationActive = false
 	resumeOnce.Do(func() { close(resume) })
 	if <-done {
 		t.Fatal("reservation committed from evidence collected before the managed outward alias existed")
@@ -205,9 +213,7 @@ func TestWriteDecisionSnapshotStableForAliasedPlannedPaths(t *testing.T) {
 	if err := os.Mkdir(realDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(realDir, aliasDir); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, realDir, aliasDir)
 	firstRaw := filepath.Join(realDir, "model.gguf")
 	secondRaw := filepath.Join(aliasDir, "model.gguf")
 	if err := os.WriteFile(firstRaw, []byte("fixture"), 0600); err != nil {
@@ -338,9 +344,7 @@ func TestCacheWriteAttemptRevalidatesCapturedTargetsAndNamespaceAliases(t *testi
 			t.Fatal(err)
 		}
 	}
-	if err := os.Symlink(first, link); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, first, link)
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
 	a, ok := m.beginCacheWriteAttempt()
 	if !ok {
@@ -357,9 +361,7 @@ func TestCacheWriteAttemptRevalidatesCapturedTargetsAndNamespaceAliases(t *testi
 	if err := os.Remove(link); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(second, link); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, second, link)
 	if a.Revalidate([]string{target}) {
 		t.Fatal("valid symlink retarget was not detected")
 	}
@@ -526,9 +528,7 @@ func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t
 		t.Fatal(err)
 	}
 	hubLink := filepath.Join(root, "hub-link")
-	if err := os.Symlink(physicalHub, hubLink); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, physicalHub, hubLink)
 	job := &Job{ID: "writer", Repo: "owner/model", OutputDir: filepath.Join(root, "friendly-root"), HubDir: hubLink, Status: JobStatusRunning}
 	repo := hfJobRepoPath(job)
 	if repo == "" {
@@ -673,9 +673,7 @@ func TestSelectedLocalDeleteKeepsFinalSymlinkEntryIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	leaf := filepath.Join(outside, "selected.gguf")
-	if err := os.Symlink(physical, leaf); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, physical, leaf)
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
 	release, ok := m.reserveSelectedGGUF([]string{leaf})
 	if !ok {
@@ -785,9 +783,7 @@ func TestCollectSnapshotIgnoresTerminalAndCompletePlanButFailsRelevantUnknownClo
 		t.Fatal(err)
 	}
 	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(base, "escape")); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, outside, filepath.Join(base, "escape"))
 	a = testCacheWriteAttempt(m)
 	a.Collect(relevant)
 	if !a.MayWrite(relevant, []string{filepath.Join(base, "weights.gguf")}) {
@@ -801,9 +797,7 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 	if err := os.MkdirAll(base, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(base, filepath.Join(base, "loop")); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, base, filepath.Join(base, "loop"))
 	job := &Job{ID: "cycle", Repo: "owner/repo", OutputDir: root, Flat: true, Filters: []string{"selected.gguf"}, ExactMatch: true}
 	target := filepath.Join(root, "repoB", "selected.gguf")
 	if jobMayWriteSelectedPath(job, target) {
@@ -847,9 +841,7 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 	if err := os.Remove(filepath.Join(base, "loop")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(t.TempDir(), filepath.Join(base, "outward")); err != nil {
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, t.TempDir(), filepath.Join(base, "outward"))
 	if !jobMayWriteSelectedPath(job, target) {
 		t.Fatal("outward alias did not retain conservative possible-writer handling")
 	}

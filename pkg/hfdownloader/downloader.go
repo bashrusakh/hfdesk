@@ -321,8 +321,8 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Emit ALL plan_item events upfront so TUI knows total size immediately
 	for _, item := range plan.Items {
 		displayRel := item.RelativePath
-		if job.AppendFilterSubdir && item.destinationSubdir != "" {
-			displayRel = filepath.ToSlash(filepath.Join(item.destinationSubdir, item.RelativePath))
+		if job.AppendFilterSubdir && item.DestinationSubdir != "" {
+			displayRel = filepath.ToSlash(filepath.Join(item.DestinationSubdir, item.RelativePath))
 		}
 		emit(ProgressEvent{Event: "plan_item", Path: displayRel, Total: item.Size})
 	}
@@ -426,9 +426,9 @@ LOOP:
 
 			finalRel := it.RelativePath
 			filterSubdir := ""
-			if job.AppendFilterSubdir && it.destinationSubdir != "" {
-				filterSubdir = it.destinationSubdir
-				finalRel = filepath.ToSlash(filepath.Join(it.destinationSubdir, it.RelativePath))
+			if job.AppendFilterSubdir && it.DestinationSubdir != "" {
+				filterSubdir = it.DestinationSubdir
+				finalRel = filepath.ToSlash(filepath.Join(it.DestinationSubdir, it.RelativePath))
 			}
 
 			var dst string
