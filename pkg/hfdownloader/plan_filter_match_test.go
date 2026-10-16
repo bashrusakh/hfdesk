@@ -191,6 +191,58 @@ func TestPlanRepo_GGUFModeRecognizesSupportedPyTorchPayloads(t *testing.T) {
 	}
 }
 
+func TestPlanRepo_GGUFModeRecognizesCanonicalPayloadFamilies(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		lfs        bool
+	}{
+		{"flax", "diffusion_flax_model.msgpack", false},
+		{"flax-shard-lfs", "text_encoder/flax_model-00001-of-00002.msgpack", true},
+		{"tensorflow-lfs", "tf_model.h5", true},
+		{"tensorflow-shard", "text_encoder/tf_model-00001-of-00002.h5", false},
+		{"tflite", "model.tflite", false},
+		{"torchscript", "traced_model.pt", false},
+		{"rust-bert", "rust_model.ot", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 20}},
+				{Type: "file", Path: tc.path, Size: 2},
+				{Type: "file", Path: "config.json", Size: 2},
+			}
+			if tc.lfs {
+				files[1].LFS = &hfLfsInfo{Size: 2}
+			}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M", tc.path}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", tc.path, "config.json"})
+		})
+	}
+}
+
+func TestPlanRepo_GGUFModeUnknownSameExtensionDoesNotActivateFallback(t *testing.T) {
+	for _, ext := range []string{".msgpack", ".h5", ".tflite", ".ot"} {
+		t.Run(ext, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 20}},
+				{Type: "file", Path: "custom/unknown" + ext, Size: 2},
+				{Type: "file", Path: "config.json", Size: 2},
+			}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"Q4_K_M", "unknown" + ext}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "custom/unknown" + ext})
+		})
+	}
+}
+
 // TestPlanRepo_ExcludedDirectMatchDoesNotConfirmSelection: excludes enter the
 // effective selection. The only file the filter matches is excluded, so no
 // direct match remains and the plan must fail rather than succeed on the

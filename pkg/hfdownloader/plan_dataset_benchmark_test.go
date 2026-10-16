@@ -15,7 +15,7 @@ import (
 
 func BenchmarkPlanRepoDatasetSelectionInventory(b *testing.B) {
 	for _, count := range []int{1000, 10000} {
-		for _, mode := range []string{"one-train-rest-test", "all-train", "all-train-with-root-companions"} {
+		for _, mode := range []string{"one-train-rest-test", "all-train", "all-train-with-root-companions", "all-train-with-matching-gguf"} {
 			b.Run(fmt.Sprintf("files-%d/%s", count, mode), func(b *testing.B) {
 				files := make([]hfNode, 0, count+2)
 				want := make([]string, 0, count+2)
@@ -33,6 +33,10 @@ func BenchmarkPlanRepoDatasetSelectionInventory(b *testing.B) {
 				if mode == "all-train-with-root-companions" {
 					files = append(files, hfNode{Type: "file", Path: "README.md", Size: 10}, hfNode{Type: "file", Path: "config.json", Size: 10})
 					want = append(want, "README.md", "config.json")
+				}
+				if mode == "all-train-with-matching-gguf" {
+					files = append(files, hfNode{Type: "file", Path: "train/model.gguf", Size: 10})
+					want = append(want, "train/model.gguf")
 				}
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch {

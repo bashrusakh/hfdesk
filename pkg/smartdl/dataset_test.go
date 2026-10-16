@@ -214,7 +214,7 @@ func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
 }
 
 func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
-	paths := []string{"train.csv", "test_data.csv", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	paths := []string{"train.csv", "corpus_train_000.parquet", "corpus_test_000.parquet", "pretrain_000.parquet", "test_data.csv", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
@@ -247,7 +247,7 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	for _, item := range plan.Items {
 		got = append(got, item.RelativePath)
 	}
-	want := []string{"train.csv", "config.json", "dataset_info.json", "README.md"}
+	want := []string{"train.csv", "corpus_train_000.parquet", "config.json", "dataset_info.json", "README.md"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("planned paths = %v, want %v", got, want)
 	}
@@ -268,7 +268,7 @@ func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	for _, item := range plan.Items {
 		got = append(got, item.RelativePath)
 	}
-	want = []string{"data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
+	want = []string{"pretrain_000.parquet", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("custom/default planned paths = %v, want %v", got, want)
 	}
