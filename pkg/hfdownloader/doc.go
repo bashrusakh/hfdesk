@@ -106,6 +106,11 @@ With AppendFilterSubdir, matched files are organized into subdirectories:
 		AppendFilterSubdir: true,  // Creates q4_0/ and q5_0/ subdirectories
 	}
 
+The public `PlanItem.DestinationSubdir` is the effective relative prefix for a
+planned item, separate from `PlanItem.Subdir` filter attribution. Combine it
+with `PlanItem.RelativePath` when `AppendFilterSubdir` is enabled to determine
+the download destination. `ScanPlan` preview event paths remain repository-relative.
+
 # Resume Behavior
 
 Resume is always enabled. Skip decisions are filesystem-based:

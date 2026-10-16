@@ -192,13 +192,12 @@ type PlanItem struct {
 	SHA256       string `json:"sha256,omitempty"`
 	Size         int64  `json:"size"`
 	AcceptRanges bool   `json:"acceptRanges"`
-	// Subdir holds the matched filter attribution (if any). The planner keeps
-	// actual destination routing separately where moving a file is unsafe.
+	// Subdir holds the matched filter attribution (if any).
 	Subdir string `json:"subdir,omitempty"`
-	// destinationSubdir is deliberately separate from Subdir: dataset selection
-	// attribution may be useful to callers even when relocating a small ordinary
-	// file would collide with its existing repo-relative destination.
-	destinationSubdir string
+	// DestinationSubdir is the relative prefix applied to this file when the
+	// request enables AppendFilterSubdir. It is empty when the file remains at
+	// its repository-relative path. This is distinct from Subdir attribution.
+	DestinationSubdir string `json:"destinationSubdir,omitempty"`
 }
 
 // Plan contains the list of files to download.
@@ -403,7 +402,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					return nil, cannot.Err
 				}
 				if can.Possible && cannot.Possible {
-					return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q", n.Path)
+					return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q: %w", n.Path, ErrAmbiguousSelection)
 				}
 			}
 		}
@@ -620,7 +619,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			Size:              size,
 			AcceptRanges:      acceptRanges,
 			Subdir:            matchedFilter, // empty when no filter matched
-			destinationSubdir: destinationSubdir,
+			DestinationSubdir: destinationSubdir,
 		})
 	}
 	if err := ctx.Err(); err != nil {

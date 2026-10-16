@@ -97,11 +97,11 @@ func TestDatasetAnalyzeSelectionAndPlanAPI(t *testing.T) {
 		t.Fatalf("unfiltered plan has %d entries; want all %d: %+v", len(unfiltered.Files), len(files), unfiltered.Files)
 	}
 	response = postPlan(analyzed.RecommendedDownload.Filters, nil)
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("ambiguous plan status=%d body=%s; want explicit refusal", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("ambiguous plan status=%d body=%s; want client error", response.Code, response.Body.String())
 	}
-	var refusal map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &refusal); err != nil || refusal["error"] == nil || !strings.Contains(strings.ToLower(response.Body.String()), "ambiguous") {
+	var refusal ErrorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &refusal); err != nil || refusal.ErrorDetail == nil || refusal.ErrorDetail.Code != "ambiguous_selection" || !strings.Contains(strings.ToLower(response.Body.String()), "ambiguous") {
 		t.Fatalf("ambiguous plan error payload=%s err=%v", response.Body.String(), err)
 	}
 	response = postPlan([]string{"customdata", "default"}, []string{"unknown.json"})
@@ -174,7 +174,8 @@ func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
 	if !trainAdvertised {
 		t.Fatal("analyzer did not advertise the train group")
 	}
-	body, err := json.Marshal(DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: analyzed.RecommendedDownload.Filters, ExactMatch: analyzed.RecommendedDownload.ExactMatch})
+	request := DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: analyzed.RecommendedDownload.Filters, ExactMatch: analyzed.RecommendedDownload.ExactMatch, AppendFilterSubdir: true}
+	body, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,5 +201,25 @@ func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
 	}
 	if !lfsByPath["model-train.gguf"] || lfsByPath["model-train-lfs.gguf"] {
 		t.Fatalf("plan lost LFS/non-LFS representation: %v", lfsByPath)
+	}
+	request.AppendFilterSubdir = false
+	body, err = json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("append-disabled plan status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	paths = paths[:0]
+	for _, file := range plan.Files {
+		paths = append(paths, file.Path)
+	}
+	if want := []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(paths, want) {
+		t.Fatalf("append-disabled plan paths=%v; want legacy repository-relative paths %v", paths, want)
 	}
 }

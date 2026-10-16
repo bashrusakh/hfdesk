@@ -237,8 +237,8 @@ func TestPlanRepoDatasetExplicitFileAndGGUFFilterUnion(t *testing.T) {
 			}
 			assertPaths(t, planPaths(plan), []string{tc.file.Path, "model-Q4_K_M.gguf"})
 			for _, item := range plan.Items {
-				if item.RelativePath == tc.file.Path && tc.file.LFS == nil && item.destinationSubdir != "" {
-					t.Fatalf("explicit dataset path destination subdir = %q; want repo-relative destination", item.destinationSubdir)
+				if item.RelativePath == tc.file.Path && tc.file.LFS == nil && item.DestinationSubdir != "" {
+					t.Fatalf("explicit dataset path destination subdir = %q; want repo-relative destination", item.DestinationSubdir)
 				}
 			}
 			job := Job{Repo: "owner/data", IsDataset: true, Filters: filters, Excludes: []string{tc.file.Path}, ExactMatch: true}
@@ -810,8 +810,8 @@ func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
 		if item.Subdir != "train" {
 			t.Errorf("%s attribution=%q, want train", item.RelativePath, item.Subdir)
 		}
-		if (item.RelativePath == "model-train.gguf" || item.RelativePath == "model-train-lfs.gguf") && item.destinationSubdir != "train" {
-			t.Errorf("%s destination subdir=%q, want train", item.RelativePath, item.destinationSubdir)
+		if (item.RelativePath == "model-train.gguf" || item.RelativePath == "model-train-lfs.gguf") && item.DestinationSubdir != "train" {
+			t.Errorf("%s destination subdir=%q, want train", item.RelativePath, item.DestinationSubdir)
 		}
 	}
 }

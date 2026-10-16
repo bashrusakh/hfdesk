@@ -226,6 +226,11 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 				"No files match the requested filters", err.Error())
 			return
 		}
+		if errors.Is(err, hfdownloader.ErrAmbiguousSelection) {
+			writeAPIError(w, http.StatusBadRequest, "ambiguous_selection",
+				"Dataset selection is ambiguous", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to scan repository", err.Error())
 		return
 	}
