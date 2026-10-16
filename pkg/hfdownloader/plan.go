@@ -528,7 +528,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter is used by AppendFilterSubdir to alter that destination;
 		// only dataset membership attribution and the established GGUF/LFS
 		// branches provide a destination subdirectory.
-		if !job.IsDataset && !ggufMode && !isLFS && !strings.HasSuffix(nameLower, ".gguf") {
+		if !job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") {
 			matchedFilter = ""
 		}
 
@@ -810,7 +810,7 @@ func filterMatchesPath(rel, filter string, exact bool) bool {
 	// path component boundary, so "unet/" does not select "myunet/".
 	if strings.HasSuffix(filter, "/") {
 		dir := strings.TrimSuffix(filter, "/")
-		return rel == dir || strings.HasPrefix(rel, dir+"/") || strings.Contains(rel, "/"+dir+"/")
+		return strings.HasPrefix(rel, dir+"/") || strings.Contains(rel, "/"+dir+"/")
 	}
 	// Extension filters are written as ".safetensors" and select that exact
 	// extension without making the leading dot a filename delimiter.
@@ -866,13 +866,29 @@ func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exa
 			}
 			if strings.HasSuffix(filePath, ".gguf") {
 				matchedGGUF = true
-			} else if !isREADMEPath(filePath) {
+			} else if isModelPayloadPath(filePath) {
 				matchedNonGGUF = true
 			}
 			break
 		}
 	}
 	return matchedGGUF && !matchedNonGGUF
+}
+
+// isModelPayloadPath is positive evidence that a directly matched non-GGUF
+// entry is another model payload. Unknown files and recognized companions do
+// not change GGUF selection mode; they remain downloadable only when directly
+// selected. Keep this deliberately separate from storage/LFS status.
+func isModelPayloadPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	switch path.Ext(base) {
+	case ".safetensors", ".onnx":
+		return true
+	case ".bin":
+		return !strings.Contains(base, "tokenizer")
+	default:
+		return false
+	}
 }
 
 // isREADMEPath identifies README documents that may carry a selected GGUF

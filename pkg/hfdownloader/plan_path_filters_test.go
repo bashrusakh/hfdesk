@@ -72,6 +72,10 @@ func TestFilterMatchesPath(t *testing.T) {
 		{"space-delimited directory token", "variants/model Q6_K/weights.gguf", "q6_k", true, true},
 		{"underscore extension in directory is not delimiter", "variants/model-Q6_K_XL/weights.gguf", "q6_k", true, false},
 		{"directory slash", "diffusers/unet/model.safetensors", "unet/", true, true},
+		{"directory slash does not select directory leaf", "unet", "unet/", true, false},
+		{"directory slash selects descendants of same-named directory", "unet/model.safetensors", "unet/", true, true},
+		{"directory slash selects nested directory descendants", "diffusers/unet/model.safetensors", "unet/", true, true},
+		{"directory slash does not select similarly named directory", "diffusers/myunet/model.safetensors", "unet/", true, false},
 		{"directory boundary", "diffusers/myunet/model.safetensors", "unet/", true, false},
 		{"extension", "train/data-00001.parquet", ".parquet", true, true},
 		{"exact relative path", "text_encoder/config.json", "text_encoder/config.json", true, true},
@@ -904,6 +908,18 @@ func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {
 		t.Fatalf("PlanRepo: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
+}
+
+func TestPlanRepoTrailingSlashDoesNotSelectDirectoryLeaf(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{{Type: "file", Path: "unet", LFS: &hfLfsInfo{Size: 10}}})
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/model", Filters: []string{"unet/"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if !errors.Is(err, ErrNoFilterMatch) {
+		t.Fatalf("PlanRepo error = %v, want ErrNoFilterMatch", err)
+	}
+	if plan != nil {
+		t.Fatalf("directory leaf unexpectedly selected: %+v", plan.Items)
+	}
 }
 
 func TestPlanRepoExcludedNonGGUFDoesNotDisableGGUFMode(t *testing.T) {
