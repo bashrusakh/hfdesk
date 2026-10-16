@@ -14,7 +14,9 @@ func TestSelectedDeleteReservationRechecksNewMatchingWriterAfterInventory(t *tes
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
 	m.fenced = true // Keep scheduler execution outside this reservation test.
-	queued := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
+	// Keep this lifecycle test's initial nonmatch control in the narrow dataset
+	// projection; ordinary-model pre-plan negatives require complete plan proof.
+	queued := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, IsDataset: true, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
 	m.jobs[queued.ID] = queued
 	target := filepath.Join(jobDestinationBase(queued), "weights.gguf")
 	// Establish that the target is genuinely reservable before introducing a
@@ -44,7 +46,7 @@ func TestSelectedDeleteReservationRechecksNewMatchingWriterAfterInventory(t *tes
 	// Admit a new queued writer after its namespace was inventoried. Its exact
 	// filter matches the selected path, so refreshed evidence must reject.
 	m.mu.Lock()
-	late := &Job{ID: "late", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"weights.gguf"}, partialFilesMu: &sync.Mutex{}}
+	late := &Job{ID: "late", Repo: "owner/repo", OutputDir: root, IsDataset: true, Status: JobStatusQueued, Filters: []string{"weights.gguf"}, partialFilesMu: &sync.Mutex{}}
 	m.jobs[late.ID] = late
 	m.bumpWriteDecisionLocked()
 	m.mu.Unlock()
@@ -60,7 +62,8 @@ func TestSelectedDeleteReservationRechecksNewMatchingWriterAfterInventory(t *tes
 func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
+	// This is a narrow dataset nonmatch control, not model-mode evidence.
+	job := &Job{ID: "queued", Repo: "owner/repo", OutputDir: root, IsDataset: true, Status: JobStatusQueued, Filters: []string{"different.gguf"}, partialFilesMu: &sync.Mutex{}}
 	m.fenced = true // Keep scheduler execution outside this reservation test.
 	m.jobs[job.ID] = job
 	target := filepath.Join(jobDestinationBase(job), "other.gguf")
@@ -914,7 +917,9 @@ func TestSelectedDeleteLeaseUsesWriterSelectedPathNotNamespace(t *testing.T) {
 
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
 	m.fenced = true
-	writer := &Job{ID: "writer-A", Repo: "owner/repoA", LocalDir: localA, Flat: true, Filters: []string{"Q6_K"}, ExactMatch: true, Status: JobStatusQueued, partialFilesMu: &sync.Mutex{}}
+	// Dataset's direct-match projection preserves the selected-path lease
+	// precision this test isolates without claiming a model pre-plan negative.
+	writer := &Job{ID: "writer-A", Repo: "owner/repoA", LocalDir: localA, Flat: true, IsDataset: true, Filters: []string{"Q6_K"}, ExactMatch: true, Status: JobStatusQueued, partialFilesMu: &sync.Mutex{}}
 	m.jobs[writer.ID] = writer
 	lease, ok := m.reserveSelectedGGUF([]string{q4})
 	if !ok {

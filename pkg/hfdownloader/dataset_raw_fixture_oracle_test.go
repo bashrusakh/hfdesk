@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"

@@ -496,7 +496,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
 		// requested companions.
-		if !datasetGroupRequest && strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
+		if !datasetGroupRequest && ggufMode && strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
@@ -635,10 +635,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
 
-// GGUFPathSelected reports whether a known relative GGUF filename survives the
-// same excludes and filter predicate used by PlanRepo. It is also used by the
-// job manager to prove that a queued filtered job cannot write a selected
-// local GGUF path before that job has been dispatched and planned.
+// GGUFPathSelected is the direct per-path predicate for a known relative GGUF
+// filename in matched-only contexts, including GGUF-only planning and the
+// dataset GGUF projection. It does not describe the complete ordinary-model
+// emission policy: an unmatched non-LFS file can still be emitted by an
+// ordinary model plan.
 func GGUFPathSelected(relativePath string, filters, excludes []string, exact bool) bool {
 	name := strings.ToLower(filepath.Base(relativePath))
 	if !strings.HasSuffix(name, ".gguf") {
@@ -719,11 +720,23 @@ func isExcludedPath(rel string, excludes []string) bool {
 	return false
 }
 
-// GGUFPathMayBeEmitted is the safe per-path projection used before a complete
-// plan exists. A GGUF can only be emitted when it survives excludes and directly
-// matches a filter; unlike ordinary root companions, unmatched GGUFs are never
-// emitted through unknown dataset ownership.
+// GGUFPathMayBeEmitted is a conservative per-path projection for use when a
+// complete plan is not yet available; it is not a substitute for PlanRepo or
+// its completed destinations. Ordinary model selection retains every non-LFS
+// file, so without the remote tree the storage type and selection mode are
+// unknown and any non-excluded path may be emitted. Dataset selection retains
+// its narrower role-aware policy. Server admission scopes this projection to
+// reachable writable namespaces and prefers complete frozen destinations
+// when available; the projection does not imply a global conflict.
 func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
+	for _, exclude := range job.Excludes {
+		if strings.Contains(strings.ToLower(relativePath), strings.ToLower(exclude)) {
+			return false
+		}
+	}
+	if !job.IsDataset {
+		return true
+	}
 	return GGUFPathSelected(relativePath, job.Filters, job.Excludes, job.ExactMatch)
 }
 

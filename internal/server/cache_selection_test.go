@@ -1626,8 +1626,8 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 	if !jobMayWriteSelectedPath(job, selected) {
 		t.Fatal("HF writer was not recognized as a possible writer beneath the frozen repository snapshots")
 	}
-	if jobMayWriteSelectedPath(job, filepath.Join(rd.SnapshotsDir(), "saved-version", "model-Q5_K_M.gguf")) {
-		t.Fatal("nonmatching Q5 snapshot was treated as a Q4 writer")
+	if !jobMayWriteSelectedPath(job, filepath.Join(rd.SnapshotsDir(), "saved-version", "model-Q5_K_M.gguf")) {
+		t.Fatal("pre-plan model projection inferred pure-GGUF mode from the quant filter")
 	}
 	dataset, err := cache.Repo("owner/model", hfdownloader.RepoTypeDataset)
 	if err != nil {
@@ -1727,8 +1727,8 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 	}
 
 	job.Filters = []string{"Q5_K_M"}
-	if jobMayWriteSelectedPath(job, filepath.Join(actual, "model-Q4_K_M.gguf")) {
-		t.Fatal("known non-overlapping quant was blocked through an internal alias")
+	if !jobMayWriteSelectedPath(job, filepath.Join(actual, "model-Q4_K_M.gguf")) {
+		t.Fatal("pre-plan model projection must allow for unmatched non-LFS companions")
 	}
 
 	cache := hfdownloader.NewHFCache(storage, 0)
@@ -1877,8 +1877,8 @@ func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T
 	}
 
 	job.Filters = []string{"Q5_K_M"}
-	if jobMayWriteSelectedPath(job, filepath.Join(base, "canonical", "model-Q4_K_M.gguf")) {
-		t.Fatal("canonical filename with no matching quant was not allowed to prove non-overlap")
+	if !jobMayWriteSelectedPath(job, filepath.Join(base, "canonical", "model-Q4_K_M.gguf")) {
+		t.Fatal("pre-plan model projection must not infer pure-GGUF mode from the filter alone")
 	}
 }
 
@@ -2108,8 +2108,8 @@ func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
 		t.Fatal("snapshot-base alias mapping was treated as a proven non-match")
 	}
 	job.Filters = []string{"Q5_K_M"}
-	if jobMayWriteSelectedPath(job, filepath.Join(physical, "saved-commit", "weights", "model-Q4_K_M.gguf")) {
-		t.Fatal("snapshot-base alias was treated as a possible writer for a proven non-overlapping quant")
+	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "saved-commit", "weights", "model-Q4_K_M.gguf")) {
+		t.Fatal("pre-plan model projection inferred pure-GGUF mode from the quant filter")
 	}
 	job.Filters = []string{"weights/model.gguf"}
 
@@ -2339,8 +2339,8 @@ func TestJobAdmissionPredicateResolvesSelectedRootAliases(t *testing.T) {
 	if !jobMayWriteSelectedPath(job, filepath.Join(actual, "models", "owner", "model", "model-Q4_K_M.gguf")) {
 		t.Fatal("shared writer predicate missed the canonical spelling of the selected entry")
 	}
-	if jobMayWriteSelectedPath(job, filepath.Join(alias, "models", "owner", "model", "model-Q5_K_M.gguf")) {
-		t.Fatal("nonmatching Q5 was treated as a Q4 writer through the alias")
+	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "models", "owner", "model", "model-Q5_K_M.gguf")) {
+		t.Fatal("pre-plan model projection inferred pure-GGUF mode through the alias")
 	}
 
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: actual})
@@ -2374,8 +2374,11 @@ func TestJobAdmissionPredicateResolvesSelectedRootAliases(t *testing.T) {
 	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}); !errors.Is(err, errSelectionWriterBusy) {
 		t.Fatalf("new matching aliased writer crossed reservation: %v", err)
 	}
-	if jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}}, target) {
-		t.Fatal("nonmatching Q5 writer was blocked by Q4 reservation")
+	if !jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}}, target) {
+		t.Fatal("pre-plan Q5 model projection failed to account for non-LFS companions")
+	}
+	if jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "other/source", LocalRepo: "other/model", Filters: []string{"Q5_K_M"}}, target) {
+		t.Fatal("unrelated repository outside the writable namespace was treated as a writer")
 	}
 	release()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2770,12 +2773,7 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	repoDir := filepath.Join(storage, "models", "o", "m")
 	blockedDir := filepath.Join(repoDir, "blocked")
 	writeSelectionFile(t, blockedDir, "model-Q4_K_M.gguf")
-	if err := os.Symlink(blockedDir, filepath.Join(repoDir, "live")); err != nil {
-		if runtime.GOOS == "windows" && os.IsPermission(err) {
-			t.Skipf("symlink privilege unavailable: %v", err)
-		}
-		t.Fatal(err)
-	}
+	symlinkOrSkip(t, blockedDir, filepath.Join(repoDir, "live"))
 	selected := filepath.Join(blockedDir, "model-Q4_K_M.gguf")
 
 	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2790,7 +2788,7 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer hf.Close()
+	t.Cleanup(hf.Close)
 
 	plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{
 		Repo: "upstream/source", Revision: "main", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"},
@@ -2812,8 +2810,11 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	}
 
 	runHF, started, releaseRun := blockingRevisionServer(t, "model-Q4_K_M.gguf")
-	defer runHF.Close()
+	t.Cleanup(runHF.Close)
 	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: runHF.URL, MaxActive: 1})
+	var releaseRunOnce sync.Once
+	letRunProceed := func() { releaseRunOnce.Do(releaseRun) }
+	t.Cleanup(letRunProceed)
 	blocker, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
 	if err != nil {
 		t.Fatal(err)
@@ -2830,7 +2831,8 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	if queued.Status != JobStatusQueued {
 		t.Fatalf("matching writer status=%s, want queued", queued.Status)
 	}
-	if _, ok := s.jobs.reserveSelectedGGUF([]string{selected}); ok {
+	if releaseUnexpected, ok := s.jobs.reserveSelectedGGUF([]string{selected}); ok {
+		releaseUnexpected()
 		t.Fatal("queued production-path writer through live alias did not block selected deletion")
 	}
 	if !s.jobs.CancelJob(queued.ID) {
@@ -2845,6 +2847,9 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	if !ok {
 		t.Fatal("could not reserve selected physical entry")
 	}
+	var releaseDeleteOnce sync.Once
+	releaseDelete := func() { releaseDeleteOnce.Do(release) }
+	t.Cleanup(releaseDelete)
 	if s.jobs.ResumeJob(paused.ID) || s.jobs.RetryJob(queued.ID) {
 		t.Fatal("paused/retry admission crossed selected reservation for alias-excluded writer")
 	}
@@ -2855,26 +2860,20 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 		if created != nil {
 			_ = s.jobs.CancelJob(created.ID)
 		}
-		release()
+		releaseDelete()
 		t.Fatalf("matching aliased writer crossed selected reservation: job=%+v err=%v", created, createErr)
 	}
-	q5, _, err := s.jobs.CreateJob(DownloadRequest{
+	_, _, err = s.jobs.CreateJob(DownloadRequest{
 		Repo: "upstream/source", Revision: "other", LocalRepo: "o/m", Filters: []string{"Q5_K_M"}, Excludes: []string{"blocked"},
 	})
-	if err != nil {
-		t.Fatalf("nonmatching Q5 was rejected by Q4 reservation: %v", err)
+	if !errors.Is(err, errSelectionWriterBusy) {
+		t.Fatalf("pre-plan model job was not conservatively blocked by selected reservation: %v", err)
 	}
-	if q5.Status != JobStatusQueued {
-		t.Fatalf("Q5 status=%s, want queued behind blocker", q5.Status)
-	}
-	if !s.jobs.CancelJob(q5.ID) {
-		t.Fatal("could not cancel nonmatching Q5 test job")
-	}
-	release()
+	releaseDelete()
 	if !s.jobs.CancelJob(blocker.ID) {
 		t.Fatal("could not cancel blocking test job")
 	}
-	releaseRun()
+	letRunProceed()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
@@ -6223,20 +6222,18 @@ func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	root := t.TempDir()
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")
 	hf, started, release := blockingPlanServer(t, "model-Q5_K_M.gguf")
-	defer hf.Close()
-	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	t.Cleanup(hf.Close)
 	var releaseOnce sync.Once
-	closeJobs := func() error {
-		releaseOnce.Do(release)
+	releaseGate := func() { releaseOnce.Do(release) }
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root, Endpoint: hf.URL, MaxActive: 1})
+	t.Cleanup(func() {
+		releaseGate()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return s.jobs.Close(ctx)
-	}
-	defer func() {
-		if err := closeJobs(); err != nil {
+		if err := s.jobs.Close(ctx); err != nil {
 			t.Errorf("close job manager during cleanup: %v", err)
 		}
-	}()
+	})
 	_, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/blocker"})
 	if err != nil {
 		t.Fatal(err)
@@ -6258,26 +6255,39 @@ func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 		t.Fatalf("jobs did not remain queued behind blocker: Q4=%s Q5=%s", q4.Status, q5.Status)
 	}
 	target := filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")
-	if _, ok := s.jobs.reserveSelectedGGUF([]string{target}); ok {
+	if releaseUnexpected, ok := s.jobs.reserveSelectedGGUF([]string{target}); ok {
+		releaseUnexpected()
 		t.Fatal("queued Q4 job did not veto deletion")
 	}
 	if !s.jobs.CancelJob(q4.ID) {
 		t.Fatal("could not manually cancel queued Q4 job")
 	}
 	releaseDelete, ok := s.jobs.reserveSelectedGGUF([]string{target})
+	if ok {
+		releaseDelete()
+		t.Fatal("pre-plan Q5 model job failed to conservatively reserve for possible non-LFS companions")
+	}
+	if !s.jobs.CancelJob(q5.ID) {
+		t.Fatal("could not cancel queued Q5 writer before establishing unrelated-repo lease control")
+	}
+	releaseDelete, ok = s.jobs.reserveSelectedGGUF([]string{target})
 	if !ok {
-		t.Fatal("queued Q5 job in same folder incorrectly vetoed Q4 deletion")
+		t.Fatal("could not acquire selected-delete lease after conflicting queued writers were cancelled")
 	}
+	var releaseDeleteOnce sync.Once
+	releaseHeldDelete := func() { releaseDeleteOnce.Do(releaseDelete) }
+	t.Cleanup(releaseHeldDelete)
 	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Filters: []string{"q4_k_m"}}); !errors.Is(err, errSelectionWriterBusy) {
-		t.Fatalf("new matching job crossed active deletion: %v", err)
+		t.Fatalf("matching model job crossed held selected-delete lease: %v", err)
 	}
-	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model", Revision: "other", Filters: []string{"q5_k_m"}}); err != nil {
-		t.Fatalf("non-overlapping new Q5 job was rejected: %v", err)
+	unrelated, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/unrelated", Revision: "other", Filters: []string{"q5_k_m"}})
+	if err != nil {
+		t.Fatalf("unrelated repository job was rejected under a held selected-delete lease: %v", err)
 	}
-	releaseDelete()
-	if err := closeJobs(); err != nil {
-		t.Fatal(err)
+	if !s.jobs.CancelJob(unrelated.ID) {
+		t.Fatal("could not cancel unrelated queued lease-control job")
 	}
+	releaseHeldDelete()
 }
 
 func TestCacheSelectionLocalSymlinkIsVisibleAsLinkOnly(t *testing.T) {

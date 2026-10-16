@@ -728,9 +728,16 @@ prevent deleting a completed selection; ordinary opaque keys and `.part` /
 `.parts.json` names outside these producer-shaped namespaces remain eligible.
 The server does not cancel jobs. HF mutation excludes writers to the
 selected repository reference namespace and associated friendly view. Local
-queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
-unlink results use `207` and identify removed, remaining, and failed paths
-(`errors`). On the supported platforms above, a local symlink member is unlinked
+selected-delete admission uses complete frozen plan destinations when
+available. For queued or incomplete model plans, it conservatively considers
+non-excluded candidate paths within the job's inventoried writable namespace
+potentially writable: ordinary model plans may retain unmatched non-LFS files,
+including GGUFs, and a raw quant-filter mismatch alone is not generally proof
+that the job is in GGUF-only mode. This is scoped to reachable writable
+namespaces, not a global conflict; dataset GGUF selection keeps its existing
+narrower direct filter/exclude policy, and unknown or outward namespace mappings
+remain fail-closed. Partial unlink results use `207` and identify removed,
+remaining, and failed paths (`errors`). On the supported platforms above, a local symlink member is unlinked
 without following or deleting its target. The authoritative delete-time
 enumeration and filesystem operations
 use one opened repository root and recheck each selected entry immediately

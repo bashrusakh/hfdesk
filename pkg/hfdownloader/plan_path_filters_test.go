@@ -931,6 +931,30 @@ func TestPlanRepoMixedGGUFFolderFilterKeepsCompanions(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "weights/model.safetensors", "weights/other.safetensors", "weights/README.md", "config.json"})
 }
 
+func TestPlanRepoOrdinaryModelRetainsUnmatchedNonLFSGGUF(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 100}},
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+		{Type: "file", Path: "large-unmatched.gguf", Size: 30},
+		{Type: "file", Path: "excluded.gguf", Size: 40},
+		{Type: "file", Path: "unmatched-lfs.gguf", LFS: &hfLfsInfo{Size: 50}},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	job := Job{Repo: "owner/mixed-model", Filters: []string{"weights/model.safetensors"}, ExactMatch: true, Excludes: []string{"excluded"}}
+	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"weights/model.safetensors", "model-Q4_K_M.gguf", "large-unmatched.gguf"})
+	if !GGUFPathMayBeEmitted("large-unmatched.gguf", job) {
+		t.Fatal("pre-plan projection ruled out a non-LFS ordinary-model companion")
+	}
+	if GGUFPathMayBeEmitted("excluded.gguf", job) {
+		t.Fatal("exclude must dominate conservative model projection")
+	}
+}
+
 func TestPlanRepoPureGGUFFolderFilterRemainsMatchedOnly(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "weights/model.gguf", LFS: &hfLfsInfo{Size: 100}},
