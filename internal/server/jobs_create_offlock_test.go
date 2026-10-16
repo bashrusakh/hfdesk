@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,9 @@ func TestRestartChecksFrozenHFReservationDespiteUnrelatedSelectedDelete(t *testi
 				}
 			}
 			if err := os.Symlink(physicalA, alias); err != nil {
+				if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
+					t.Skipf("symlink privilege unavailable: %v", err)
+				}
 				t.Fatal(err)
 			}
 			m := newJobManagerWithStatePath(Config{CacheDir: root, MaxActive: 1}, nil, filepath.Join(root, "state"))
@@ -319,6 +323,13 @@ func TestRestartChecksFrozenHFReservationDespiteUnrelatedSelectedDelete(t *testi
 				t.Fatal(err)
 			}
 			if err := os.Symlink(physicalB, alias); err != nil {
+				if isSymlinkPrivilegeUnavailable(runtime.GOOS, err) {
+					release()
+					if closeErr := m.Close(context.Background()); closeErr != nil {
+						t.Fatalf("close manager after unavailable symlink fixture: %v", closeErr)
+					}
+					t.Skipf("symlink privilege unavailable: %v", err)
+				}
 				t.Fatal(err)
 			}
 			// A distinct selected entry makes restartJob use its off-lock evidence
