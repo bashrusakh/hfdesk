@@ -1056,6 +1056,61 @@ func datasetDecisionRefusal(c datasetDecisionContext, index int) (can, cannot da
 	return
 }
 
+// queryDatasetGroupSelection finds one coherent world in which an actual data
+// record is selected by a recognized membership filter. A possible emission
+// alone is insufficient: companions and metadata retention are not membership.
+func queryDatasetGroupSelection(c datasetDecisionContext) datasetDecisionQueryResult {
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
+	if !c.IsDataset || c.GGUFMode || len(c.Filters) == 0 {
+		return datasetDecisionQueryResult{}
+	}
+	labels := make(map[string]bool, len(c.RecognizedLabels))
+	for _, label := range c.RecognizedLabels {
+		labels[label] = true
+	}
+	wanted := make(map[string]bool)
+	for _, f := range c.Filters {
+		if labels[f.Normalized] || !c.ExactMatch && recognizedDatasetFilter(c, f.Normalized) {
+			wanted[f.Normalized] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return datasetDecisionQueryResult{}
+	}
+	for _, core := range datasetCoreAssignments(c) {
+		for i, in := range c.Inputs {
+			if err := datasetDecisionContextErr(c); err != nil {
+				return datasetDecisionQueryResult{Err: err}
+			}
+			if in.Excluded {
+				continue
+			}
+			for _, alt := range in.Alternatives {
+				if alt.Role != datasetselection.EvidenceRoleData || !wanted[strings.ToLower(alt.Label)] {
+					continue
+				}
+				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{i: alt}, nil, nil, nil)
+				if !ok {
+					continue
+				}
+				e, err := evaluateDatasetDecisionWorld(c, w)
+				if err != nil {
+					return datasetDecisionQueryResult{Err: err}
+				}
+				if e.Records[i].Selected {
+					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[i]}
+				}
+			}
+		}
+	}
+	if err := datasetDecisionContextErr(c); err != nil {
+		return datasetDecisionQueryResult{Err: err}
+	}
+	return datasetDecisionQueryResult{}
+}
+
 // evaluateDatasetDecisionWorld applies the exact-dataset-group concrete
 // selection contract to one admissible role/token interpretation. No-filter,
 // inexact, non-dataset, and GGUF requests are outside this evaluator's

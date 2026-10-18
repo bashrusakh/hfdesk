@@ -372,6 +372,20 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 						break
 					}
 				}
+				if !datasetMembershipMatch {
+					witness := queryDatasetGroupSelection(context)
+					if witness.Err != nil {
+						return nil, witness.Err
+					}
+					if witness.Possible {
+						datasetMembershipMatch = true
+						datasetEvaluation, evalErr = evaluateDatasetDecisionWorld(context, witness.World)
+						if evalErr != nil {
+							return nil, fmt.Errorf("evaluate dataset selection witness: %w", evalErr)
+						}
+						world = witness.World
+					}
+				}
 			}
 			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
@@ -490,6 +504,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
 		// branches below; it is not the selection proof (see directMatchedFilter).
 		matchedFilter := ""
+		matchedFilterLength := 0
 		if datasetGroupRequest {
 			matchedFilter = datasetRecord.Subdir
 		}
@@ -505,8 +520,16 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		} else if ggufMode {
 			// GGUF-only selection is matched-only: keep selected GGUF/mmproj and
 			// directly matched files, but do not infer metadata companions.
-			if err := ctx.Err(); err != nil {
-				return nil, err
+			for _, f := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if filterMatchesPath(rel, f, job.ExactMatch) {
+					if len(f) > matchedFilterLength {
+						matchedFilter = f
+						matchedFilterLength = len(f)
+					}
+				}
 			}
 			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
@@ -516,9 +539,16 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				}
 			}
 		} else if len(job.Filters) > 0 {
-			// Same computation as the ggufMode branch above: directMatchedFilter.
-			if err := ctx.Err(); err != nil {
-				return nil, err
+			for _, f := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if filterMatchesPath(rel, f, job.ExactMatch) {
+					if len(f) > matchedFilterLength {
+						matchedFilter = f
+						matchedFilterLength = len(f)
+					}
+				}
 			}
 			matchedFilter = directMatchedFilter
 			// Filters select payloads by their full repo-relative path. An unmatched
@@ -545,6 +575,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if !job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") {
 			matchedFilter = ""
 		}
+		// Normalize attribution once after the inclusion branch has chosen its
+		// winning filter. Dataset feasibility retains the original selector for
+		// matching/precedence, but its public Subdir must not expose the identity
+		// marker any more than the direct model-selection branches do.
+		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
 		// Build URL and file size
 		var urlStr string
@@ -835,11 +870,17 @@ func filterMatchesPath(rel, filter string, exact bool) bool {
 	if strings.HasPrefix(filter, ".") && !strings.Contains(filter[1:], "/") {
 		return strings.HasSuffix(rel, filter)
 	}
+	// "./name" is the additive exact-only spelling for a literal root basename.
+	// Canonical repository paths cannot contain a dot segment, so this spelling
+	// is distinct from every pre-existing path or basename filter.
+	if strings.HasPrefix(filter, "./") {
+		name := strings.TrimPrefix(filter, "./")
+		return name != "" && name != "." && name != ".." && !strings.Contains(name, "/") && rel == name
+	}
 	// A slash-containing filter is a complete relative path form.
 	if strings.Contains(filter, "/") {
 		return rel == filter
 	}
-
 	parts := strings.Split(rel, "/")
 	for _, part := range parts[:len(parts)-1] {
 		if filterMatches(part, filter, true) {
@@ -847,6 +888,23 @@ func filterMatchesPath(rel, filter string, exact bool) bool {
 		}
 	}
 	return filterMatches(parts[len(parts)-1], filter, true)
+}
+
+// filterAttribution removes the root-selector marker before a matched filter
+// becomes a public Subdir or DestinationSubdir. Selection identity and output
+// attribution are separate: the marker must never become part of a destination.
+func filterAttribution(filter string, exact bool) string {
+	if !exact {
+		return filter
+	}
+	filter = strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/")
+	if strings.HasPrefix(filter, "./") {
+		name := strings.TrimPrefix(filter, "./")
+		if name != "" && name != "." && name != ".." && !strings.Contains(name, "/") {
+			return name
+		}
+	}
+	return filter
 }
 
 // isFilterDelimiter reports whether r separates segments for exact-match

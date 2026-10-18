@@ -148,6 +148,17 @@ func TestCanEmitDatasetDecisionStopsAtProvenNonEmission(t *testing.T) {
 	}
 }
 
+func TestQueryDatasetGroupSelectionCancellationIsErrorNotNegativeProof(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{{Path: "train_test.csv"}}, []string{"train"}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.ctx = ctx
+	got := queryDatasetGroupSelection(c)
+	if !errors.Is(got.Err, context.Canceled) || got.Possible {
+		t.Fatalf("cancelled group-selection proof = %+v, want cancellation error", got)
+	}
+}
+
 func TestCompileDatasetDecisionContextPreservesActualRolesAndAlternatives(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "notes.txt"},

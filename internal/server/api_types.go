@@ -17,8 +17,10 @@ type DownloadRequest struct {
 	// components and their descendants with a trailing slash (for example,
 	// "weights/"), filename segments (for example, "q6_k" without matching
 	// "Q6_K_XL"), an extension (for example, ".safetensors"), or a full
-	// slash-containing relative path (for example, "weights/model.gguf").
-	// Exact segment boundaries preserve quantization tokens such as "Q6_K".
+	// slash-containing relative path (for example, "weights/model.gguf"). The
+	// explicit "./name" form selects only a literal root-level basename, without
+	// changing legacy unqualified basename/token matching. Exact segment
+	// boundaries preserve quantization tokens such as "Q6_K".
 	ExactMatch bool `json:"exactMatch,omitempty"`
 	// LocalDir overrides the download destination for this specific request,
 	// writing real files (flat mode) instead of the HF cache layout.

@@ -1853,7 +1853,7 @@ async function loadRepositoryDetails(entry) {
 
       if (resp.status === 404) {
         data.selectable_items.forEach(item => {
-          const key = item.filter_value || item.id || '';
+          const key = selectableStatusKey(item);
           if (!key || map[key] !== 'done') return;
           delete map[key];
           changed = true;
@@ -1865,7 +1865,7 @@ async function loadRepositoryDetails(entry) {
         const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
 
         data.selectable_items.forEach(item => {
-          const key = item.filter_value || item.id || '';
+          const key = selectableStatusKey(item);
           const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
           if (!key || !files.length) return;
 
@@ -1895,6 +1895,27 @@ async function loadRepositoryDetails(entry) {
 
   function normalizeRepoPath(path) {
     return String(path || '').replace(/\\/g, '/').toLowerCase();
+  }
+
+  function selectableStatusKey(item) {
+    const files = Array.isArray(item?.files) ? item.files : [];
+    if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
+      return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
+    }
+    return item?.filter_value || item?.id || '';
+  }
+
+  function artifactRequestPaths(files) {
+    return files.map(path => {
+      const normalized = String(path || '').replace(/\\/g, '/');
+      return normalized && !normalized.includes('/') ? `./${normalized}` : normalized;
+    });
+  }
+
+  function artifactJobStatusKey(filters) {
+    if (!Array.isArray(filters) || !filters.length) return '';
+    const rawPaths = filters.map(path => String(path || '').replace(/\\/g, '/').replace(/^\.\//, ''));
+    return `artifact:${JSON.stringify(rawPaths.map(normalizeRepoPath))}`;
   }
 
   function renderAnalysisResult(data) {
@@ -5267,6 +5288,12 @@ async function loadRepositoryDetails(entry) {
       const visibleRepo = j.localRepo || j.repo;
       if (visibleRepo !== repo) return;
       const f = (j.filters || []).join(',') || '__all__';
+      const artifactKey = artifactJobStatusKey(j.filters);
+      if (artifactKey) {
+        if (j.status === 'completed') active[artifactKey] = 'done';
+        else if (j.status === 'running') active[artifactKey] = 'running';
+        else if (j.status === 'queued') active[artifactKey] = 'queued';
+      }
       if (j.status === 'completed') active[f] = 'done';
       else if (j.status === 'running') active[f] = 'running';
       else if (j.status === 'queued') active[f] = 'queued';
@@ -5345,7 +5372,10 @@ async function loadRepositoryDetails(entry) {
         const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
 
         const fv = item.filter_value || item.id || '';
-        const dlStatus = dlMap[fv] || '';
+        const dlFiles = Array.isArray(item.files) ? item.files : [];
+        const exactArtifact = dlFiles.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+        const statusKey = exactArtifact ? selectableStatusKey(item) : fv;
+        const dlStatus = dlMap[statusKey] || '';
         // upstream_repo is set for vision_encoder items sourced from a base-model
         // repo; in that case the download must target that repo, not the current one.
         const dlRepo = item.upstream_repo || repo;
@@ -5364,8 +5394,8 @@ async function loadRepositoryDetails(entry) {
             ? `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`
           : dlStatus === 'running'
             ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
-          : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}','${item.upstream_repo ? escapeHtml(repo) : ''}','${escapeHtml(statusRepo)}')">${dlIcon}</button>`;
+          : `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
+               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? dlFiles : null}))}">${dlIcon}</button>`;
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
@@ -5386,8 +5416,15 @@ async function loadRepositoryDetails(entry) {
     return html;
   }
 
+  window.downloadQuantFromButton = function(button) {
+    try {
+      const args = JSON.parse(decodeURIComponent(button.dataset.download));
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey);
+    } catch (e) { console.error('Invalid selectable download data', e); }
+  };
+
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey) {
     try {
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
@@ -5399,8 +5436,8 @@ async function loadRepositoryDetails(entry) {
         repo,
         revision,
         dataset: isDataset,
-        filters: filterValue ? [filterValue] : [],
-        exactMatch: !!filterValue
+        filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
+        exactMatch: files ? true : !!filterValue
       };
       // Send the labeled destination choice when type folders are configured.
       // For an upstream companion (mmproj) this still resolves to the analyzed
@@ -5419,9 +5456,9 @@ async function loadRepositoryDetails(entry) {
       }
 
       state.jobs.set(data.id, data);
-      setDlStatus(statusRepo || repo, filterValue, 'queued');
+      setDlStatus(statusRepo || repo, statusKey || filterValue, 'queued');
       // Replace the download button with the queued chip immediately.
-      const row = document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
+      const row = sourceRow || document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
       if (row) {
         const btn = row.querySelector('.quant-dl-btn');
         if (btn) btn.outerHTML = `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;

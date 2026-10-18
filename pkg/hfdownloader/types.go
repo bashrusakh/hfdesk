@@ -50,10 +50,12 @@ type Job struct {
 	// Each filter is matched against file names: a file is a direct match if its
 	// name contains any of the filter strings (substring mode, the default) or,
 	// when ExactMatch is set, if the filter equals a whole delimiter-bounded
-	// segment of the name. Excludes are applied before selection: a file that
-	// matches a filter but is excluded does not confirm selection. After Excludes
-	// are applied, at least one file must be a direct match or the scan fails
-	// with ErrNoFilterMatch.
+	// path segment. Exact filters can use "./name" to select only the literal
+	// root-level basename; nested artifacts use their full relative path. Excludes
+	// are applied before selection: a file that matches a
+	// filter but is excluded does not confirm selection. After Excludes are
+	// applied, at least one file must directly match or be selected by recognized
+	// dataset membership, or the scan fails with ErrNoFilterMatch.
 	//
 	// The planner may additionally retain companion/metadata files in the plan
 	// after a successful direct selection (e.g., mmproj companions for GGUF,

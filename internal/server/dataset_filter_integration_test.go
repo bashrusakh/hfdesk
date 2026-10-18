@@ -122,6 +122,40 @@ func TestDatasetAnalyzeSelectionAndPlanAPI(t *testing.T) {
 	}
 }
 
+func TestDatasetAlternativeAmbiguityPlanAndDryRunAPI(t *testing.T) {
+	files := []map[string]any{{"type": "file", "path": "train_test.csv", "size": 10}}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/rev1"):
+			_ = json.NewEncoder(w).Encode(files)
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/refs"):
+			_, _ = w.Write([]byte(`{"branches":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+	srv := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), Endpoint: hub.URL})
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+	for _, label := range []string{"train", "test"} {
+		for _, route := range []struct {
+			path string
+			dry  bool
+		}{{"/api/plan", false}, {"/api/download", true}} {
+			body, _ := json.Marshal(DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: []string{label}, ExactMatch: true, DryRun: route.dry})
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, route.path, bytes.NewReader(body)))
+			var response ErrorResponse
+			if w.Code != http.StatusBadRequest || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.ErrorDetail == nil || response.ErrorDetail.Code != "ambiguous_selection" {
+				t.Errorf("%s label=%s status=%d body=%s; want 400 ambiguous_selection", route.path, label, w.Code, w.Body.String())
+			}
+		}
+	}
+}
+
 func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
 	files := []map[string]any{
 		{"type": "file", "path": "train_records.csv", "size": 10},

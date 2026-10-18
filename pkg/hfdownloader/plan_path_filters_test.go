@@ -520,6 +520,19 @@ func TestPlanRepoDatasetNoMatchPrecedesRetainedAmbiguity(t *testing.T) {
 	}
 }
 
+func TestPlanRepoDatasetAmbiguityDoesNotDependOnFirstAlternative(t *testing.T) {
+	for _, filter := range []string{"train", "test"} {
+		t.Run(filter, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{{Type: "file", Path: "train_test.csv", Size: 10}})
+			defer srv.Close()
+			_, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{filter}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if !errors.Is(err, ErrAmbiguousSelection) {
+				t.Fatalf("PlanRepo error = %v, want ErrAmbiguousSelection", err)
+			}
+		})
+	}
+}
+
 func TestPlanRepoDatasetKnownMetadataOwnershipUnknownIsRetained(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},

@@ -200,6 +200,20 @@ unchanged. Existing path, directory, and extension filters keep their usual
 matching rules. In exact mode, a filter ending in `/` selects descendants of
 that directory, not a file whose path is the directory name itself.
 
+Exact filters also support an explicit literal root-basename selector:
+`./model-Q4_0.gguf` selects only that root-level repository path. Nested files
+must use their complete repository-relative path, such as
+`weights/model-Q4_0.gguf`. The `./` form is reserved for exact mode; without
+`exactMatch: true`, filters retain their existing substring behavior. This
+additive selector does not change legacy unqualified basename/token matching.
+
+For GGUF `selectable_items`, `files` contains raw repository-relative paths for
+the complete artifact (including every shard). Use those paths as exact
+selection identities: prefix root-level entries with `./` in `filters`, and
+send nested entries unchanged. `filter_value` is a legacy human/filter token,
+not a unique artifact identity when multiple artifacts share a quant label.
+The analyzer's `recommended_download` already contains encoded exact selectors.
+
 For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or
 `data/<group>/` paths. Send a group's `filter_value` with `exactMatch: true` to

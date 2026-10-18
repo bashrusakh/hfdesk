@@ -4,6 +4,7 @@
 package smartdl
 
 import (
+	"encoding/base64"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -173,7 +174,7 @@ var quantDescriptions = map[string]string{
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32))`)
+	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32)))(?:[-_./]|$)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -209,8 +210,8 @@ func ggufQuantType(f FileInfo) string {
 			continue
 		}
 		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
-			quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
-			if m[1] != "" {
+			quant := strings.ReplaceAll(strings.ToUpper(m[3]), "-", "_")
+			if m[2] != "" {
 				return "UD_" + quant
 			}
 			return quant
@@ -330,23 +331,19 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	groups := make(map[string]*quantGroup)
 
 	for _, f := range llmFiles {
-		quantType := ggufQuantType(f)
-
-		// Grouping key: shards of the same quant share a key. When the quant type
-		// is recognized, group by it (all shards of Q4_K_M merge). When it is not,
-		// group by the filename with its shard suffix removed, so multi-shard
-		// "unknown" files still merge while genuinely different files stay apart.
+		// Artifact identity is the shard-normalized repository path, not the
+		// human-readable quant label. Distinct artifacts may share a quant token
+		// (for example a QAD variant and an ordinary Q4_0); splitting is based
+		// only on the existing explicit shard-name convention.
 		//
 		// MTP (Multi-Token Prediction) variants carry the same quant token as
 		// their non-MTP twin (model-MTP-Q4_K_M.gguf vs model-Q4_K_M.gguf) but are
 		// distinct downloadable models, so they get a separate key — otherwise
 		// the two would merge into one row with a bogus summed size. MTP-ness is
 		// uniform across a quant's shards, so this still merges shards correctly.
-		var key string
-		if quantType != "" {
-			key = quantType
-		} else {
-			key = "unknown:" + strings.ToLower(stripSplitSuffix(filepath.Base(f.Name)))
+		key := strings.ToLower(stripSplitSuffix(f.Path))
+		if key == "" {
+			key = strings.ToLower(stripSplitSuffix(f.Name))
 		}
 		if hasMTPMarker(f.Name) {
 			key += "|MTP"
@@ -545,10 +542,8 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	// Track if we have a (non-MTP) Q4_K_M (common recommended default).
 	hasQ4KM := false
-	// Track whether any MTP variant is present. When it is, the bare quant token
-	// is no longer a unique download filter (model-Q4_K_M.gguf and
-	// model-MTP-Q4_K_M.gguf both contain "q4_k_m"), so every quant row falls back
-	// to its full base filename as the filter to keep selections unambiguous.
+	// Keep FilterValue compatible as a legacy label, but derive row uniqueness
+	// from artifact paths below; a quant token or basename is not identity.
 	repoHasMTP := false
 	for _, q := range info.Quantizations {
 		if (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") && !q.IsMTP {
@@ -579,10 +574,8 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			files = []string{q.File.Path}
 		}
 
-		// Filter value used by the downloader's substring match. For recognized
-		// quants the quant token appears in every shard name, so the lowercased
-		// name matches the whole set. For "Unknown" groups the name won't match
-		// any filename, so use the shared base of the files instead.
+		// FilterValue remains a legacy human/filter label. Smart GGUF request
+		// builders should use Files as the exact artifact identity instead.
 		filterValue := strings.ToLower(strings.TrimPrefix(q.Name, "UD_"))
 		if strings.HasPrefix(q.Name, "APEX_") {
 			filterValue = strings.ToLower(strings.ReplaceAll(q.Name, "_", "-"))
@@ -604,14 +597,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			desc = fmt.Sprintf("%s · %d files", desc, q.Parts)
 		}
 
-		// MTP variants share a quant token with their non-MTP twin, so give them
-		// a distinct label and ID; otherwise the picker shows two identical rows.
-		label := q.Name
-		id := strings.ToLower(q.Name)
-		if q.IsMTP {
-			label = q.Name + " (MTP)"
-			id = strings.ToLower(q.Name) + "-mtp"
-		}
+		label, id := ggufSelectableIdentity(q)
 
 		item := SelectableItem{
 			ID:           id,
@@ -674,5 +660,40 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 		}
 	}
 
+	return disambiguateGGUFSelectableItems(items)
+}
+
+// disambiguateGGUFSelectableItems appends a reversible, collision-free path
+// identity only when existing labels or IDs collide. This applies uniformly to
+// quantizations, MTP variants, and vision-encoder files.
+func disambiguateGGUFSelectableItems(items []SelectableItem) []SelectableItem {
+	idCounts, labelCounts := make(map[string]int), make(map[string]int)
+	for _, item := range items {
+		idCounts[item.ID]++
+		labelCounts[item.Label]++
+	}
+	for i := range items {
+		files := append([]string(nil), items[i].Files...)
+		sort.Strings(files)
+		identity := strings.Join(files, "\x00")
+		if idCounts[items[i].ID] > 1 {
+			items[i].ID += "-artifact-" + base64.RawURLEncoding.EncodeToString([]byte(identity))
+		}
+		if labelCounts[items[i].Label] > 1 {
+			items[i].Label += " · " + strings.Join(files, ", ")
+		}
+	}
 	return items
+}
+
+// ggufSelectableIdentity returns stable display and UI identities derived from
+// the quant label plus the existing MTP distinction. Callers add a path
+// discriminator only when multiple artifacts would otherwise collide.
+func ggufSelectableIdentity(q GGUFQuantization) (label, id string) {
+	label, id = q.Name, strings.ToLower(q.Name)
+	if q.IsMTP {
+		label += " (MTP)"
+		id += "-mtp"
+	}
+	return label, id
 }

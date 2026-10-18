@@ -29,7 +29,10 @@
 //	}
 package smartdl
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // RepoType identifies the type of HuggingFace repository.
 type RepoType string
@@ -599,7 +602,9 @@ type SelectableItem struct {
 	// Category groups items (e.g., "quantization", "variant", "component", "split", "format").
 	Category string `json:"category,omitempty"`
 
-	// FilterValue is the value to pass to -F flag for downloading.
+	// FilterValue is the legacy filter/display token. For GGUF selections, use
+	// Files as the exact artifact identity; the token may be shared by distinct
+	// artifacts and remains for compatibility with existing consumers.
 	FilterValue string `json:"filter_value"`
 
 	// Files is the list of files included in this selection.
@@ -657,10 +662,29 @@ func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
 		if item.Recommended {
-			recommended = append(recommended, item.FilterValue)
+			if item.Category == "quantization" || item.Category == "vision_encoder" {
+				for _, file := range item.Files {
+					recommended = append(recommended, exactArtifactFilter(file))
+				}
+				if len(item.Files) == 0 {
+					recommended = append(recommended, item.FilterValue)
+				}
+			} else {
+				recommended = append(recommended, item.FilterValue)
+			}
 		}
 	}
 	return recommended
+}
+
+// exactArtifactFilter encodes a raw repository path for ExactMatch filters.
+// Slash-containing paths already have literal path semantics; a leading ./ is
+// the additive, unambiguous spelling for a literal root basename.
+func exactArtifactFilter(repoPath string) string {
+	if repoPath != "" && !strings.Contains(repoPath, "/") {
+		return "./" + repoPath
+	}
+	return repoPath
 }
 
 // PopulateDownloadSelection sets recommended download fields for the web UI.
@@ -670,7 +694,7 @@ func (r *RepoInfo) PopulateDownloadSelection() {
 		Repo:       r.Repo,
 		Dataset:    r.IsDataset,
 		Filters:    r.RecommendedFilters,
-		ExactMatch: r.IsDataset,
+		ExactMatch: r.IsDataset || r.Type == TypeGGUF,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch
