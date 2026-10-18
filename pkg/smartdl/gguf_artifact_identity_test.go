@@ -18,6 +18,9 @@ func TestGGUFQuantClassificationUsesWholeTokensAndPathSeparators(t *testing.T) {
 	for _, tc := range []struct{ path, want string }{
 		{"Ternary-Bonsai-PQ2_0.gguf", ""},
 		{"model-Q4_0CUSTOM.gguf", ""},
+		{"model-Q6_K_FUTURE.gguf", ""},
+		{"model-Q4_0_CUSTOM.gguf", ""},
+		{"model-IQ3_XXS_EXTRA.gguf", ""},
 		{"variants/Q4_K_M/shard-00001-of-00002.gguf", "Q4_K_M"},
 		{"variants/UD-Q4_K_XL/shard-00001-of-00002.gguf", "UD_Q4_K_XL"},
 		{"model-IQ3_XXS.gguf", "IQ3_XXS"},

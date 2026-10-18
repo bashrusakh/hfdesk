@@ -333,7 +333,7 @@ func TestPlanRepoDatasetSubstringAndExactPathFiltersRemainDistinct(t *testing.T)
 	}
 }
 
-func TestPlanRepoDatasetGGUFFallbackUsesRoleAwareSelectionAndRetainsMetadata(t *testing.T) {
+func TestPlanRepoDatasetGGUFFallbackUsesMatchedOnlySelection(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "weights/model.gguf", Size: 20},
 		{Type: "file", Path: "nested/config.json", Size: 15},
@@ -346,14 +346,14 @@ func TestPlanRepoDatasetGGUFFallbackUsesRoleAwareSelectionAndRetainsMetadata(t *
 	if err != nil {
 		t.Fatalf("explicit GGUF path must not be refused due to unrelated metadata role uncertainty: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "dataset_info.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf"})
 
 	job.Filters = []string{"weights/model.gguf", "nested/config.json"}
 	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("explicit path resolves role alternatives: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "nested/config.json", "dataset_info.json"})
+	assertPaths(t, planPaths(plan), []string{"weights/model.gguf", "nested/config.json"})
 
 	job.Filters = []string{"weights/model.gguf"}
 	job.Excludes = []string{"dataset_info.json", "nested/config.json"}
@@ -782,12 +782,14 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 	}
 }
 
-func TestPlanRepoDatasetExactQuantFilterDoesNotSelectUnmatchedWeightCompanion(t *testing.T) {
+func TestPlanRepoDatasetExactQuantFilterIsMatchedOnly(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "model-Q4_K_M.gguf", LFS: &hfLfsInfo{Size: 100}},
 		{Type: "file", Path: "other.safetensors", Size: 20},
 		{Type: "file", Path: "dataset_info.json", Size: 8},
 		{Type: "file", Path: "README.md", Size: 5},
+		{Type: "file", Path: "config.json", Size: 3},
+		{Type: "file", Path: "tokenizer.json", Size: 4},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
@@ -796,8 +798,18 @@ func TestPlanRepoDatasetExactQuantFilterDoesNotSelectUnmatchedWeightCompanion(t 
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf", "dataset_info.json", "README.md"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("paths=%v, want selected GGUF plus retained root metadata %v", got, want)
+	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths=%v, want matched-only GGUF selection %v", got, want)
+	}
+
+	for _, metadata := range []string{"dataset_info.json", "README.md", "config.json", "tokenizer.json"} {
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{metadata}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo explicit metadata %q: %v", metadata, err)
+		}
+		if !containsString(planPaths(plan), metadata) {
+			t.Errorf("explicit metadata %q was not selected: %v", metadata, planPaths(plan))
+		}
 	}
 }
 

@@ -451,7 +451,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			// groups, but its companion-role result must not broaden a GGUF-only
 			// quant selection to unrelated model weights. Group selections retain
 			// their established role-aware membership; the filtered GGUF route
-			// retains recognized model and dataset service metadata.
+			// is matched-only, while directly requested metadata remains eligible.
 			directDatasetMatch := false
 			for _, filter := range job.Filters {
 				if filterMatchesPath(rel, filter, job.ExactMatch) {
@@ -460,7 +460,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 				}
 			}
 			if !recognizedDatasetGroup && ggufMode && !strings.HasSuffix(relLower, ".gguf") &&
-				!directDatasetMatch && !isRecognizedDatasetMetadataPath(rel) {
+				!directDatasetMatch {
 				continue
 			}
 		}
