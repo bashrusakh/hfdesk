@@ -586,7 +586,7 @@ func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, co
 			eligible[i] = true
 			continue
 		}
-		if !w.Companion[i] || in.LFS {
+		if !w.Companion[i] || !canRetainDatasetCompanion(in) {
 			continue
 		}
 		dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
@@ -1812,7 +1812,7 @@ func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, co
 			continue
 		}
 		if !direct[i] {
-			if !w.Companion[i] || in.LFS {
+			if !w.Companion[i] || !canRetainDatasetCompanion(in) {
 				continue
 			}
 			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))

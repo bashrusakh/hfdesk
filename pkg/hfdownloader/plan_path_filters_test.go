@@ -582,7 +582,27 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 		{Type: "file", Path: "docs/guide.md", Size: 4},
 		{Type: "file", Path: "utils/tool.py", Size: 5},
 		{Type: "file", Path: "elsewhere/notes.txt", Size: 6},
+		{Type: "file", Path: "config.json", Size: 7},
+		{Type: "file", Path: "README.md", Size: 8},
+		{Type: "file", Path: "tokenizer/tokenizer.bin", Size: 9},
+		{Type: "file", Path: "weights/model.safetensors", Size: 100},
+		{Type: "file", Path: "weights/model.onnx", Size: 101},
+		{Type: "file", Path: "weights/model.pt", Size: 102},
+		{Type: "file", Path: "weights/training-model.safetensors", Size: 103},
+		{Type: "file", Path: "weights/custom.msgpack", Size: 104},
+		{Type: "file", Path: "weights/checkpoint.h5", Size: 105},
+		{Type: "file", Path: "weights/weights.ggml", Size: 106},
 	}
+	rejected := []string{
+		"weights/model.safetensors",
+		"weights/model.onnx",
+		"weights/model.pt",
+		"weights/training-model.safetensors",
+		"weights/custom.msgpack",
+		"weights/checkpoint.h5",
+		"weights/weights.ggml",
+	}
+	want := []string{"train.csv", "docs/guide.md", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"}
 	for _, tc := range []struct {
 		name    string
 		filters []string
@@ -599,7 +619,16 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 			}
 			// Definite non-data companions are retained, while the ambiguous
 			// nested .txt file keeps its established unselected behavior.
-			assertPaths(t, planPaths(plan), []string{"train.csv", "docs/guide.md", "utils/tool.py"})
+			assertPaths(t, planPaths(plan), want)
+			// Unmatched model payload paths are not safe companions: the role
+			// evidence only proves they are not dataset data.
+			for _, path := range planPaths(plan) {
+				for _, reject := range rejected {
+					if path == reject {
+						t.Errorf("unmatched model payload %q was retained by filters=%v", path, tc.filters)
+					}
+				}
+			}
 		})
 	}
 
@@ -610,7 +639,7 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PlanRepo with excluded companion: %v", err)
 		}
-		assertPaths(t, planPaths(plan), []string{"train.csv", "utils/tool.py"})
+		assertPaths(t, planPaths(plan), []string{"train.csv", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"})
 	})
 
 	t.Run("LFS companion", func(t *testing.T) {
@@ -642,6 +671,101 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 		}
 		assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf"})
 	})
+}
+
+// TestPlanRepoDatasetSkipsUnmatchedModelPayloads keeps the positive companion
+// controls in every case: only payload safety changes, not ordinary dataset
+// companion retention.
+func TestPlanRepoDatasetSkipsUnmatchedModelPayloads(t *testing.T) {
+	payloads := []string{
+		"weights/model.safetensors",
+		"weights/model.onnx",
+		"weights/model.pt",
+		"weights/model.pth",
+		"weights/custom.msgpack",
+		"weights/checkpoint.h5",
+		"weights/custom.tflite",
+		"weights/model.ot",
+		"weights/model.ggml",
+		"weights/training-model.safetensors",
+		"weights/model-training.pt",
+	}
+	want := []string{"train.csv", "docs/guide.md", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"}
+	for _, payload := range payloads {
+		for _, tc := range []struct {
+			name    string
+			filters []string
+		}{
+			{name: "recognized group", filters: []string{"train"}},
+			{name: "ordinary path", filters: []string{"train.csv"}},
+		} {
+			t.Run(tc.name+"/"+payload, func(t *testing.T) {
+				files := []hfNode{
+					{Type: "file", Path: "train.csv", Size: 10},
+					{Type: "file", Path: "docs/guide.md", Size: 4},
+					{Type: "file", Path: "utils/tool.py", Size: 5},
+					{Type: "file", Path: "config.json", Size: 7},
+					{Type: "file", Path: "README.md", Size: 8},
+					{Type: "file", Path: "tokenizer/tokenizer.bin", Size: 9},
+					{Type: "file", Path: payload, Size: 100},
+				}
+				srv := mockHFServerForPlan(t, files)
+				defer srv.Close()
+				plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+				if err != nil {
+					t.Fatalf("PlanRepo filters=%v payload=%q: %v", tc.filters, payload, err)
+				}
+				assertPaths(t, planPaths(plan), want)
+				for _, path := range planPaths(plan) {
+					if path == payload {
+						t.Fatalf("unmatched model payload %q was retained by filters=%v", payload, tc.filters)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestPlanRepoDatasetSkipsPayloadsInRetainedCompanionScopes covers the root
+// and directory-seed fallbacks, not only definite role evidence.
+func TestPlanRepoDatasetSkipsPayloadsInRetainedCompanionScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		files   []hfNode
+		filters []string
+		want    []string
+	}{
+		{
+			name: "root",
+			files: []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: "model.safetensors", Size: 100},
+				{Type: "file", Path: "config.json", Size: 7},
+			},
+			filters: []string{"train"},
+			want:    []string{"train.csv", "config.json"},
+		},
+		{
+			name: "seeded ancestor directory",
+			files: []hfNode{
+				{Type: "file", Path: "foo/train/part.csv", Size: 10},
+				{Type: "file", Path: "foo/model.safetensors", Size: 100},
+				{Type: "file", Path: "foo/README.md", Size: 7},
+			},
+			filters: []string{"train"},
+			want:    []string{"foo/train/part.csv", "foo/README.md"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, tc.files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
 }
 
 func TestPlanRepoDatasetUnknownRootMetadataStaysAmbiguousOrUnselected(t *testing.T) {

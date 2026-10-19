@@ -984,7 +984,7 @@ func isTrainingArtifactBase(base string) bool {
 		return false
 	}
 	for i, token := range tokens {
-		if i == 0 && token == "optimizer" {
+		if token == "optimizer" {
 			return true
 		}
 		if i+1 >= len(tokens) {

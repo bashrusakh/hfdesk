@@ -191,6 +191,53 @@ func TestPlanRepo_GGUFModeRecognizesSupportedPyTorchPayloads(t *testing.T) {
 	}
 }
 
+// TestPlanRepo_GGUFModePrefixedOptimizerNamesAreNotPayloadEvidence keeps a
+// selected prefixed optimizer artifact from activating mixed-model companions.
+// The selected optimizer itself remains a direct match.
+func TestPlanRepo_GGUFModePrefixedOptimizerNamesAreNotPayloadEvidence(t *testing.T) {
+	for _, name := range []string{"adam_optimizer.pt", "training_optimizer.pt", "my_optimizer.pt"} {
+		t.Run(name, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+				{Type: "file", Path: name, Size: 2},
+				{Type: "file", Path: "config.json", Size: 2},
+			}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{
+				Repo: "owner/model", Filters: []string{"Q4_K_M", name}, ExactMatch: true,
+			}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", name})
+		})
+	}
+}
+
+// TestPlanRepo_GGUFModeTrainingNamedWeightsRemainPayloadEvidence preserves the
+// positive payload evidence that must still activate mixed-model companions.
+func TestPlanRepo_GGUFModeTrainingNamedWeightsRemainPayloadEvidence(t *testing.T) {
+	for _, name := range []string{"training-model.safetensors", "model-training.pt"} {
+		t.Run(name, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "model-Q4_K_M.gguf", Size: 20},
+				{Type: "file", Path: "weights/" + name, Size: 2},
+				{Type: "file", Path: "config.json", Size: 2},
+			}
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{
+				Repo: "owner/model", Filters: []string{"Q4_K_M", "weights/" + name}, ExactMatch: true,
+			}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf", "weights/" + name, "config.json"})
+		})
+	}
+}
+
 func TestPlanRepo_GGUFModeRecognizesCanonicalPayloadFamilies(t *testing.T) {
 	for _, tc := range []struct {
 		name, path string

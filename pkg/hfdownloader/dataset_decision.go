@@ -337,6 +337,31 @@ func isDefiniteCompanionEvidence(e datasetselection.Evidence) bool {
 	return true
 }
 
+// isDatasetPayloadPath reports positive evidence that an unmatched file is a
+// model/checkpoint payload rather than a small companion. Definite companion
+// role evidence only proves the file is not dataset data; it does not make
+// unrelated weights safe to retain. Established payload names reuse
+// isModelPayloadPath, while datasets also carry ambiguous weight/checkpoint
+// extensions that are not dataset data formats.
+func isDatasetPayloadPath(filePath string) bool {
+	if isModelPayloadPath(filePath) {
+		return true
+	}
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	switch path.Ext(base) {
+	case ".safetensors", ".onnx", ".pt", ".pth", ".msgpack", ".h5", ".tflite", ".ot", ".gguf", ".ggml":
+		return true
+	}
+	return false
+}
+
+// canRetainDatasetCompanion reports whether an unmatched input is safe to
+// retain as a dataset companion. Payload paths are excluded regardless of role
+// evidence or placement; only an actual direct match selects them.
+func canRetainDatasetCompanion(in datasetDecisionInput) bool {
+	return !in.LFS && !isDatasetPayloadPath(in.Path)
+}
+
 func stableSortedKeys(set map[string]struct{}) []string {
 	keys := make([]string, 0, len(set))
 	for key := range set {
