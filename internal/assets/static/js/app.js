@@ -1514,8 +1514,17 @@ async function loadRepositoryDetails(entry) {
       return;
     }
 
+    // Reconcile live job state before the cache check. Cache presence (and a
+    // 404) remains the final authority for artifact 'done' status, while a
+    // completed job contributes 'done' only when its per-file outcomes cover
+    // every requested artifact file.
+    refreshDlStatusFromJobs(data.repo);
     await syncLocalAnalysisStatus(data);
     if (requestId !== analyzeRequestId) return;
+    // Restore completed legacy token statuses after the cache check, matching
+    // the previous behavior for non-artifact rows. Artifact keys stay owned by
+    // cache presence, so a 404 or missing file still clears their done state.
+    refreshDlStatusFromJobs(data.repo, { includeArtifactDone: false });
 
     currentAnalysis = data;
     currentSelectedRepo = data.repo;
@@ -1912,10 +1921,32 @@ async function loadRepositoryDetails(entry) {
     });
   }
 
+  function artifactJobPaths(filters) {
+    if (!Array.isArray(filters) || !filters.length) return [];
+    return filters.map(path => normalizeRepoPath(String(path || '').replace(/\\/g, '/').replace(/^\.\//, '')));
+  }
+
   function artifactJobStatusKey(filters) {
-    if (!Array.isArray(filters) || !filters.length) return '';
-    const rawPaths = filters.map(path => String(path || '').replace(/\\/g, '/').replace(/^\.\//, ''));
-    return `artifact:${JSON.stringify(rawPaths.map(normalizeRepoPath))}`;
+    const paths = artifactJobPaths(filters);
+    if (!paths.length) return '';
+    return `artifact:${JSON.stringify(paths)}`;
+  }
+
+  // A completed job only proves the exact artifact is complete when every
+  // requested file has a successful per-file outcome. Requested filters can
+  // still include files the planner excluded or could not emit (for example an
+  // excluded shard), so completion must not be inferred from filters alone.
+  function artifactJobFilesCompleted(job) {
+    const requested = artifactJobPaths(job?.filters);
+    if (!requested.length) return false;
+    const files = Array.isArray(job?.files) ? job.files : [];
+    const completed = new Set();
+    files.forEach(file => {
+      if (file?.status !== 'complete' && file?.status !== 'skipped') return;
+      const filePath = normalizeRepoPath(file?.path);
+      if (filePath) completed.add(filePath);
+    });
+    return requested.every(path => completed.has(path));
   }
 
   function renderAnalysisResult(data) {
@@ -5278,10 +5309,12 @@ async function loadRepositoryDetails(entry) {
     map[filterValue] = status;
     localStorage.setItem('dlStatus:' + repo, JSON.stringify(map));
   }
-  function refreshDlStatusFromJobs(repo) {
+  function refreshDlStatusFromJobs(repo, { includeArtifactDone = true } = {}) {
     // Reconcile per-quant status with the live job list. Active jobs set
-    // running/queued/done; stale running/queued entries (job gone, cancelled or
-    // failed) are cleared so the Download button reappears. 'done' is kept.
+    // running/queued; a completed artifact is done only when its per-file
+    // outcomes cover the requested files. Stale running/queued entries (job
+    // gone, cancelled or failed) are cleared so the Download button reappears.
+    // 'done' is kept.
     const map = getDlStatus(repo);
     const active = {};
     Array.from(state.jobs.values()).forEach(j => {
@@ -5290,7 +5323,7 @@ async function loadRepositoryDetails(entry) {
       const f = (j.filters || []).join(',') || '__all__';
       const artifactKey = artifactJobStatusKey(j.filters);
       if (artifactKey) {
-        if (j.status === 'completed') active[artifactKey] = 'done';
+        if (j.status === 'completed' && includeArtifactDone && artifactJobFilesCompleted(j)) active[artifactKey] = 'done';
         else if (j.status === 'running') active[artifactKey] = 'running';
         else if (j.status === 'queued') active[artifactKey] = 'queued';
       }
@@ -5318,7 +5351,9 @@ async function loadRepositoryDetails(entry) {
     if (!items || items.length === 0) return '';
 
     const repo = currentAnalysis?.repo || '';
-    refreshDlStatusFromJobs(repo);
+    // loadRepositoryDetails reconciles live jobs and cache presence before this
+    // render. Do not re-apply job-derived artifact completion here, or a cache
+    // 404/missing file could be overwritten after sync cleared it.
     const dlMap = getDlStatus(repo);
 
     const categories = {};
