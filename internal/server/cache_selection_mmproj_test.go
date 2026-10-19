@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -620,14 +621,7 @@ func TestCacheSelectionClassifiesDotSeparatedMMProjCompanion(t *testing.T) {
 	}
 	// The cache-browser endpoint reports the companion as a companion instead
 	// of listing it under quantizations.
-	w := cacheRequest(t, s, "GET", "/api/cache/owner/model?type=model", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("cache info status=%d body=%s", w.Code, w.Body.String())
-	}
-	var info CachedRepoInfo
-	if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
-		t.Fatalf("decode cache info: %v: %s", err, w.Body.String())
-	}
+	info := mmprojCacheInfo(t, s, "owner/model")
 	if !info.HasMMProj {
 		t.Fatalf("cache info did not report the companion: %+v", info)
 	}
@@ -770,6 +764,91 @@ func TestSelectedHFDeleteKeepsMMProjCompanionWhenDeletingLLMQuant(t *testing.T) 
 	if !group.CanDelete || group.Kind != cacheSelectionKindVisionEncoder {
 		t.Fatalf("HF companion group=%+v", group)
 	}
+}
+
+// The artifact-role rule matches the basename only. Names that merely look
+// like a projector stay model quantizations, a companion-looking directory
+// does not change a file's role, and only a real companion is reported as a
+// vision encoder.
+func TestCacheSelectionKeepsNonMMProjNamesAsLLMGroups(t *testing.T) {
+	t.Run("a repository without a real companion", func(t *testing.T) {
+		root := t.TempDir()
+		repoDir := filepath.Join(root, "owner", "model")
+		writeSelectionFile(t, repoDir, "projector-F16.gguf")
+		writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+		// The rule matches the basename only, so a companion-looking
+		// directory does not make its ordinary weight file a companion.
+		writeSelectionFile(t, filepath.Join(repoDir, "mmproj"), "nested-Q8_0.gguf")
+		s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+		code, selection := getSelection(t, s, "owner/model", "model", "")
+		if code != http.StatusOK {
+			t.Fatalf("selection status=%d", code)
+		}
+		location := mmprojLocalLocation(t, selection, root)
+		for path, wantQuant := range map[string]string{
+			"projector-F16.gguf":      "F16",
+			"model-Q4_K_M.gguf":       "Q4_K_M",
+			"mmproj/nested-Q8_0.gguf": "Q8_0",
+		} {
+			group := mmprojSelectionGroup(t, location, path)
+			if group.Kind != cacheSelectionKindLLM || group.Quant != wantQuant {
+				t.Fatalf("group %q=%+v, want an llm group with quant %q", path, group, wantQuant)
+			}
+		}
+		info := mmprojCacheInfo(t, s, "owner/model")
+		if info.HasMMProj || len(info.MMProjFiles) != 0 {
+			t.Fatalf("cache info reported a companion for a repository without one: %+v", info)
+		}
+		wantQuantizations := []string{"F16", "Q4_K_M", "Q8_0"}
+		if !reflect.DeepEqual(info.Quantizations, wantQuantizations) {
+			t.Fatalf("cache info quantizations=%v, want %v", info.Quantizations, wantQuantizations)
+		}
+	})
+	t.Run("a real companion stays a vision encoder", func(t *testing.T) {
+		root := t.TempDir()
+		repoDir := filepath.Join(root, "owner", "model")
+		writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
+		writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+		s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+		code, selection := getSelection(t, s, "owner/model", "model", "")
+		if code != http.StatusOK {
+			t.Fatalf("selection status=%d", code)
+		}
+		location := mmprojLocalLocation(t, selection, root)
+		companion := mmprojSelectionGroup(t, location, "mmproj-F32.gguf")
+		if companion.Kind != cacheSelectionKindVisionEncoder || companion.Quant != "" {
+			t.Fatalf("real companion group=%+v", companion)
+		}
+		quant := mmprojSelectionGroup(t, location, "model-Q4_K_M.gguf")
+		if quant.Kind != cacheSelectionKindLLM || quant.Quant != "Q4_K_M" {
+			t.Fatalf("llm group=%+v", quant)
+		}
+		info := mmprojCacheInfo(t, s, "owner/model")
+		if !info.HasMMProj {
+			t.Fatalf("cache info did not report the real companion: %+v", info)
+		}
+		if len(info.MMProjFiles) != 1 || filepath.Base(info.MMProjFiles[0]) != "mmproj-F32.gguf" {
+			t.Fatalf("cache info mmprojFiles=%v, want only the real companion", info.MMProjFiles)
+		}
+		if !reflect.DeepEqual(info.Quantizations, []string{"Q4_K_M"}) {
+			t.Fatalf("cache info quantizations=%v, want only the model quantization", info.Quantizations)
+		}
+	})
+}
+
+// mmprojCacheInfo reads the cache-browser response for a repository, the same
+// way the dot-separated companion test does.
+func mmprojCacheInfo(t *testing.T, s *Server, repo string) CachedRepoInfo {
+	t.Helper()
+	w := cacheRequest(t, s, "GET", "/api/cache/"+repo+"?type=model", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache info status=%d body=%s", w.Code, w.Body.String())
+	}
+	var info CachedRepoInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
+		t.Fatalf("decode cache info: %v: %s", err, w.Body.String())
+	}
+	return info
 }
 
 // A numbered companion split groups as one artifact and keeps the existing
