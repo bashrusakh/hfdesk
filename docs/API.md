@@ -130,13 +130,16 @@ Select the namespace explicitly:
 
 - `type=model` forces a model-only analysis. The dataset namespace is not
   probed, so a dual-type repository does not return `needsSelection` again.
-- `dataset=true` forces a dataset analysis.
+- `type=dataset` forces a dataset analysis. The model namespace is not probed.
+- `dataset=true` without `type` forces a dataset analysis.
 - Omitting both parameters keeps auto-detection (including the
   `needsSelection` response above).
 
-`type=model` and `dataset=true` are mutually exclusive and return HTTP 400 with
-error code `bad_request` when combined. Any `type` value other than `model`
-also returns HTTP 400.
+`type` accepts only the exact values `model` and `dataset`. A contradictory
+legacy selector (`type=model&dataset=true`) returns HTTP 400 with error code
+`bad_request`, while `type=dataset&dataset=true` is consistent and selects the
+dataset namespace. Any other `type` value, including an unknown, repeated, or
+case-mismatched value, returns HTTP 400.
 
 The selected model or dataset path then runs the same gated-access auth-check
 described in [Gated repositories](#gated-repositories), so a gated dual-type
