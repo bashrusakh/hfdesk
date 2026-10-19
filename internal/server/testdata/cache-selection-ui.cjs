@@ -287,11 +287,23 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   function deleteControl(index = 0) {
     return nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete')[index];
   }
+  // The rendered group kind decides the dialog title: a companion group is a
+  // vision encoder, every other group is a GGUF group.
+  function renderedGroupKind(index = 0) {
+    const articles = modalHTML.match(/<article class="cache-selection-group">[\s\S]*?<\/article>/g) || [];
+    const article = articles[index];
+    assert(article, `rendered group ${index} is present in the current location`);
+    return article.includes('cache-badge-vision-encoder') ? 'vision_encoder' : 'llm';
+  }
+  function expectedConfirmationTitle(kind) {
+    return kind === 'vision_encoder' ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion';
+  }
   async function startGroupConfirmation(index = 0) {
     const control = deleteControl(index);
     assert(control && !control.disabled, 'eligible local group has an enabled delete action');
+    const kind = renderedGroupKind(index);
     await control.click();
-    assert.equal(nodes.get('#modalTitle').textContent, 'Confirm GGUF group deletion');
+    assert.equal(nodes.get('#modalTitle').textContent, expectedConfirmationTitle(kind));
     return Number(modalHTML.match(/id="cache-delete-confirm-(\d+)"/)[1]);
   }
   function confirmButton(sequence) { return nodes.get(`#cache-delete-confirm-button-${sequence}`); }
@@ -342,17 +354,36 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   const companionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
   assert(companionConfirmation.includes('Vision encoder (mmproj companion):'), 'the companion confirmation names the vision-encoder role');
   assert(companionConfirmation.includes('mmproj-F32.gguf'), 'the companion confirmation names the selected companion');
+  assert(companionConfirmation.includes('Delete selected vision encoder files'), 'the companion confirm button names the vision encoder');
+  assert(!companionConfirmation.includes('Delete selected GGUF files'), 'the generic gguf confirm label is not used for a companion');
   assert(!companionConfirmation.includes('Other variants, companion files, metadata, directories, and other locations remain.'), 'the companion confirmation does not claim companion files remain');
   assert(companionConfirmation.includes('This removes only the selected vision encoder companion files.'), 'the companion scope statement is limited to the selected companion');
   assert(companionConfirmation.includes('Other quantization groups, other companion files, metadata, directories, and other locations remain.'), 'the companion scope statement keeps the remaining scope explicit');
   const beforeCompanion = deletedBodies.length;
-  await confirmButton(companionSequence).click();
-  assert.equal(deletedBodies.length, beforeCompanion + 1);
+  let resolveCompanionDelete;
+  pendingDelete = { promise: new Promise(resolve => { resolveCompanionDelete = resolve; }) };
+  const pendingCompanion = confirmButton(companionSequence).click();
+  assert.equal(nodes.get('#cache-delete-progress').textContent, 'Deleting the selected vision encoder…', 'the companion progress line names the vision encoder');
+  resolveCompanionDelete();
+  pendingDelete = null;
+  await pendingCompanion;
+  assert.equal(deletedBodies.length, beforeCompanion + 1, 'the guarded companion confirmation still sends the DELETE');
   const companionBody = deletedBodies.at(-1);
   assert.equal(companionBody.groupId, 'grp-mmproj-f32');
   assert.deepEqual(companionBody.members.map(member => member.path), ['mmproj-F32.gguf']);
   assert.equal(companionBody.members[0].versions.length, 0);
   assert(!companionBody.members.some(member => member.path !== 'mmproj-F32.gguf'), 'only the companion member is sent');
+  assert(modalHTML.includes('Selected vision encoder removed.'), 'the companion success outcome names the vision encoder');
+  assert(!modalHTML.includes('Selected GGUF group removed.'), 'the generic gguf outcome heading is not used for a companion');
+
+  // A cancelled companion confirmation stays read-only: the guarded cancel
+  // path must not be rejected by the role-dependent title.
+  await openLocalDetails();
+  const cancelledCompanionSequence = await startGroupConfirmation(companionIndex);
+  const beforeCancelledCompanion = deletedBodies.length;
+  await cancelButton(cancelledCompanionSequence).click();
+  assert.equal(deletedBodies.length, beforeCancelledCompanion, 'a cancelled companion confirmation sends no DELETE');
+  assert.equal(nodes.get('#modalTitle').textContent, 'Repository Details', 'a cancelled companion confirmation restores the details view');
 
   // An LLM group keeps its current confirmation wording.
   await openLocalDetails();
@@ -360,9 +391,20 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   const llmConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
   assert(llmConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
   assert(!llmConfirmation.includes('Vision encoder'), 'an llm confirmation does not claim a vision-encoder role');
+  assert(llmConfirmation.includes('Delete selected GGUF files'), 'an llm group keeps its confirm button label');
+  assert(!llmConfirmation.includes('Delete selected vision encoder files'), 'the companion confirm label is not used for an llm group');
   assert(llmConfirmation.includes('This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.'), 'the llm scope statement is unchanged');
-  await cancelButton(llmSequence).click();
-  assert.equal(deletedBodies.length, beforeCompanion + 1, 'cancelling the llm confirmation sends no mutation');
+  const beforeLLM = deletedBodies.length;
+  let resolveLLMDelete;
+  pendingDelete = { promise: new Promise(resolve => { resolveLLMDelete = resolve; }) };
+  const pendingLLM = confirmButton(llmSequence).click();
+  assert.equal(nodes.get('#cache-delete-progress').textContent, 'Deleting the selected GGUF group…', 'the llm progress line is unchanged');
+  resolveLLMDelete();
+  pendingDelete = null;
+  await pendingLLM;
+  assert.equal(deletedBodies.length, beforeLLM + 1, 'the guarded llm confirmation still sends the DELETE');
+  assert(modalHTML.includes('Selected GGUF group removed.'), 'the llm success outcome heading is unchanged');
+  assert(!modalHTML.includes('Selected vision encoder removed.'), 'the companion outcome heading is not used for an llm group');
 
   // Link-only local member metadata survives confirmation into the exact request.
   await openLocalDetails();
@@ -578,8 +620,11 @@ async function checkBrowserLayout() {
       await page.getByLabel('Storage location', { exact: true }).selectOption('1');
       await page.getByText('2 files · 2 saved versions', { exact: true }).waitFor();
       assert((await page.getByLabel('Storage location', { exact: true }).getAttribute('title')).includes('/cache/hub/'));
-      await page.locator('.cache-selection-group').first().getByRole('button', { name: 'Delete', exact: true }).click();
-      await page.getByRole('heading', { name: 'Confirm GGUF group deletion', exact: true }).waitFor();
+      // The confirmation title names the artifact role, so read the rendered
+      // group's badge and wait for the matching title.
+      const firstIsVisionEncoder = await first.locator('.cache-badge-vision-encoder').count() > 0;
+      await first.getByRole('button', { name: 'Delete', exact: true }).click();
+      await page.getByRole('heading', { name: firstIsVisionEncoder ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion', exact: true }).waitFor();
       assert.equal(await page.locator('.cache-detail-modal').count(), 0, 'confirmation does not inherit Details layout');
       assert.equal(await page.locator('#modalBody').evaluate(node => getComputedStyle(node).overflowY), 'auto');
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();

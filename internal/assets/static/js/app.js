@@ -3722,6 +3722,10 @@ async function loadRepositoryDetails(entry) {
     // the confirmation names its role and never claims the selected artifact
     // class remains.
     const isVisionEncoder = group.kind === 'vision_encoder';
+    // The dialog strings name the artifact role. The LLM wording is unchanged.
+    const confirmationTitle = isVisionEncoder ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion';
+    const confirmButtonLabel = isVisionEncoder ? 'Delete selected vision encoder files' : 'Delete selected GGUF files';
+    const progressLabel = isVisionEncoder ? 'Deleting the selected vision encoder…' : 'Deleting the selected GGUF group…';
     const groupLine = isVisionEncoder
       ? `Vision encoder (mmproj companion): <strong>${escapeHtml(group.label)}</strong>`
       : `GGUF group: <strong>${escapeHtml(group.label)}</strong>`;
@@ -3732,7 +3736,7 @@ async function loadRepositoryDetails(entry) {
       ? 'This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'
       : 'This removes only the selected vision encoder companion files. Other quantization groups, other companion files, metadata, directories, and other locations remain.';
     const scopeStatement = isVisionEncoder ? visionEncoderScopeStatement : llmScopeStatement;
-    showModal('Confirm GGUF group deletion', `
+    showModal(confirmationTitle, `
       <div id="${confirmationID}" class="delete-confirm cache-selection-confirmation">
         <p>Repository: <strong>${escapeHtml(repo)}</strong></p>
         <p>Type: <strong>Model</strong></p>
@@ -3744,13 +3748,16 @@ async function loadRepositoryDetails(entry) {
         <p id="cache-delete-progress" role="status"></p>
         <div class="form-actions">
           <button id="cache-delete-cancel-${sequence}" class="btn btn-ghost" type="button">Cancel</button>
-          <button id="cache-delete-confirm-button-${sequence}" class="btn btn-danger" type="button">Delete selected GGUF files</button>
+          <button id="cache-delete-confirm-button-${sequence}" class="btn btn-danger" type="button">${confirmButtonLabel}</button>
         </div>
       </div>`);
+    // The title is captured here so the guard keeps an exact comparison
+    // against the title this confirmation actually used, whatever role the
+    // selected group has.
     const isCurrent = () => detailsContext === activeCacheDetailsContext
       && detailsContext.requestID === cacheDetailsRequest
       && $('#modalBackdrop')?.classList.contains('active')
-      && $('#modalTitle')?.textContent === 'Confirm GGUF group deletion'
+      && $('#modalTitle')?.textContent === confirmationTitle
       && document.querySelector(`#${confirmationID}`);
     $(`#cache-delete-cancel-${sequence}`)?.addEventListener('click', () => {
       if (isCurrent()) return window.showCacheDetails(repo, 'model', location.id);
@@ -3765,7 +3772,7 @@ async function loadRepositoryDetails(entry) {
       if (confirmButton) confirmButton.disabled = true;
       if (cancelButton) cancelButton.disabled = true;
       const progress = $('#cache-delete-progress');
-      if (progress) progress.textContent = 'Deleting the selected GGUF group…';
+      if (progress) progress.textContent = progressLabel;
       const requestBody = {
         repo,
         type: 'model',
@@ -3786,13 +3793,33 @@ async function loadRepositoryDetails(entry) {
     });
   }
 
+  // Outcome headings name the artifact role of the selected group. The LLM
+  // wording is unchanged.
+  const cacheDeleteOutcomeHeadings = {
+    llm: {
+      retained: 'Selected GGUF group entries removed; shared payloads were retained.',
+      success: 'Selected GGUF group removed.',
+      partial: 'Partial result while removing the selected GGUF group.',
+      error: 'The selected GGUF group was not confirmed as removed.'
+    },
+    vision_encoder: {
+      retained: 'Selected vision encoder entries removed; shared payloads were retained.',
+      success: 'Selected vision encoder removed.',
+      partial: 'Partial result while removing the selected vision encoder.',
+      error: 'The selected vision encoder was not confirmed as removed.'
+    }
+  };
+
   function selectedCacheDeleteOutcomeHTML(outcome, context) {
     const retainedPayloads = outcome.retainedPayloads || [];
+    const headings = context.group.kind === 'vision_encoder'
+      ? cacheDeleteOutcomeHeadings.vision_encoder
+      : cacheDeleteOutcomeHeadings.llm;
     const title = outcome.kind === 'success' && retainedPayloads.length
-      ? 'Selected GGUF group entries removed; shared payloads were retained.'
-      : outcome.kind === 'success' ? 'Selected GGUF group removed.'
-      : outcome.kind === 'partial' ? 'Partial result while removing the selected GGUF group.'
-        : 'The selected GGUF group was not confirmed as removed.';
+      ? headings.retained
+      : outcome.kind === 'success' ? headings.success
+      : outcome.kind === 'partial' ? headings.partial
+        : headings.error;
     return `<div class="cache-selection-outcome ${outcome.kind === 'success' ? '' : 'cache-selection-warning'}" role="status">
       <h4>${title}</h4>
       <p>Repository ${escapeHtml(context.repo)} — ${escapeHtml(context.location.source)} location <code>${escapeHtml(context.location.path)}</code> — group ${escapeHtml(context.group.label)}.</p>
