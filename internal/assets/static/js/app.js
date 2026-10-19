@@ -1318,8 +1318,8 @@ function openRepositoryInDetails(repo, repoType = null, revision = null, navigat
       && (!entry.repoType || !current.repoType || entry.repoType === current.repoType);
     // Dedupe may compare against the current view, but a caller that omitted
     // the type (the Analyze field) must keep auto-detection. Copying the
-    // current view's type here would send dataset=true for a same-name repo
-    // and skip the server's model/dataset selection flow.
+    // current view's type here would send an explicit repoType for a
+    // same-name repo and skip the server's model/dataset selection flow.
     if (sameRepo && effectiveRepoRevision(entry.revision) === effectiveRepoRevision(current.revision)) {
       // Same repository view (including a root link while the default view is
       // already shown): refine the current entry instead of adding a
@@ -1414,8 +1414,11 @@ async function loadRepositoryDetails(entry) {
   }
 
   try {
+    // Explicit history entries select the namespace with repoType. An
+    // auto-detect entry (the Analyze field or an unresolved navigation) sends
+    // neither repoType nor the legacy dataset parameter.
     let queryParams = [];
-    if (entry.repoType) queryParams.push(`dataset=${entry.repoType === 'dataset'}`);
+    if (entry.repoType) queryParams.push(`repoType=${entry.repoType === 'dataset' ? 'dataset' : 'model'}`);
     if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
     const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
 

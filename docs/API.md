@@ -40,21 +40,37 @@ Searches Hugging Face models or datasets through the configured endpoint/proxy.
 
 ```http
 GET /api/analyze/{owner}/{repo}?revision=main
+GET /api/analyze/{owner}/{repo}?revision=main&repoType=model
+GET /api/analyze/{owner}/{repo}?revision=main&repoType=dataset
 GET /api/analyze/{owner}/{repo}?revision=main&type=model
 GET /api/analyze/{owner}/{repo}?revision=main&dataset=true
+GET /api/analyze/{owner}/{repo}?revision=main&dataset=false
 ```
 
-With no `type` or `dataset` parameter, analyze auto-detects whether the
-repository is a model or a dataset. `dataset=false` keeps the same
+With no `repoType`, `type`, or `dataset` parameter, analyze auto-detects
+whether the repository is a model or a dataset. `dataset=false` keeps the same
 auto-detection behavior for backwards compatibility.
+
+Selector precedence is `repoType` (when present) > `type` (model only) >
+legacy `dataset`. A lower-precedence selector is ignored when `repoType` is
+present; without `repoType`, `type=model` and `dataset=true` remain mutually
+exclusive.
 
 Returns repository metadata, files, type-specific analysis, selectable download items, and recommended download defaults.
 
-`dataset` is a tri-state selector:
+`repoType` is the preferred explicit namespace selector:
 
-- absent: auto-detect the repository namespace (model first, then dataset). If the same name exists as both, the response is `{"needsSelection": true, "options": ["model", "dataset"]}` instead of repository analysis.
+- `model`: force model analysis. The dataset namespace is not probed.
+- `dataset`: force dataset analysis. The model namespace is not probed.
+- `auto` (or absent): auto-detect the repository namespace (model first, then dataset). If the same name exists as both, the response is `{"needsSelection": true, "options": ["model", "dataset"]}` instead of repository analysis.
+
+`repoType` is matched case-insensitively after trimming whitespace; any other value returns `400` with an `Invalid repoType` error. When `repoType` and the legacy `dataset` parameter are both present, `repoType` takes precedence.
+
+The legacy `dataset` parameter keeps its pre-#135 semantics:
+
+- absent: auto-detect, as described for `repoType`.
 - `true`: force dataset analysis. The model namespace is not probed.
-- `false` (or any other present value): force model analysis. The dataset namespace is not probed, so a same-named dataset cannot trigger `needsSelection`.
+- `false`, any other present value, or an empty value: auto-detect. In particular, `dataset=false` does not force the model namespace; use `repoType=model` for an explicit model selection.
 
 Important response fields:
 

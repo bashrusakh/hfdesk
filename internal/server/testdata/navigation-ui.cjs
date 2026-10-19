@@ -18,6 +18,9 @@ if (!fixture.serverHtml || !fixture.markdown || !fixture.serverReservedRoutes ||
 
 // Auto-detection of this fixture repository finds both namespaces.
 const DUAL_REPO = 'owner/both';
+// This fixture repository exists only as a dataset, so auto-detection resolves
+// it to the dataset namespace.
+const DATASET_ONLY_REPO = 'owner/data-only';
 
 let assertions = 0;
 function ok(value, message) { assertions++; assert.ok(value, message); }
@@ -107,6 +110,7 @@ function parseAnalyzePath(rawPath) {
   const u = new URL(rawPath, 'https://hfdesk.test');
   return {
     repo: decodeURIComponent(u.pathname.slice('/api/analyze/'.length)),
+    repoType: u.searchParams.get('repoType'),
     dataset: u.searchParams.get('dataset'),
     revision: u.searchParams.get('revision') || null
   };
@@ -114,7 +118,15 @@ function parseAnalyzePath(rawPath) {
 
 function defaultAnalyze(rawPath) {
   const p = parseAnalyzePath(rawPath);
-  if (p.dataset === null && p.repo === DUAL_REPO) {
+  // repoType takes precedence over the legacy dataset parameter. Only "model"
+  // and "dataset" select a namespace explicitly; "auto" and an absent repoType
+  // auto-detect.
+  const hasRepoType = p.repoType !== null;
+  const selectedType = hasRepoType && (p.repoType === 'model' || p.repoType === 'dataset')
+    ? p.repoType
+    : null;
+  const autoDetect = !hasRepoType || p.repoType === 'auto';
+  if (autoDetect && p.repo === DUAL_REPO) {
     return {
       needsSelection: true,
       repo: p.repo,
@@ -122,9 +134,11 @@ function defaultAnalyze(rawPath) {
       options: ['model', 'dataset']
     };
   }
-  // A present dataset value selects explicitly: only "true" is the dataset
-  // namespace; "false" (or any other present value) is the model namespace.
-  const isDataset = p.dataset === 'true';
+  // Legacy dataset only forces the dataset namespace for the literal "true";
+  // every other value auto-detects, matching the server contract.
+  const isDataset = selectedType
+    ? selectedType === 'dataset'
+    : (!hasRepoType && p.dataset === 'true') || (autoDetect && p.repo === DATASET_ONLY_REPO);
   return {
     repo: p.repo,
     is_dataset: isDataset,
@@ -321,14 +335,14 @@ async function testAnalyzeFieldAutoDetectAndRefresh() {
   await ui.openRepositoryInDetails('owner/shared', 'dataset', null, 'push');
   eq(ui.history().length, 1, 'dataset view must create one history stop');
   eq(ui.history()[0].repoType, 'dataset', 'explicit dataset view must be stored as dataset');
-  eq(lastAnalyzePath(), '/api/analyze/owner/shared?dataset=true', 'dataset entry sends dataset=true');
+  eq(lastAnalyzePath(), '/api/analyze/owner/shared?repoType=dataset', 'dataset entry sends repoType=dataset');
 
   // Analyze field omits the type and must not inherit the current dataset type.
   calls = [];
   analyzeImpl = () => ({ needsSelection: true, repo: 'owner/shared', message: 'choose model or dataset' });
   nodes.get('#analyzeInput').value = 'owner/shared';
   await ui.analyzeRepo();
-  eq(lastAnalyzePath(), '/api/analyze/owner/shared', 'Analyze field must auto-detect, not inherit dataset=true');
+  eq(lastAnalyzePath(), '/api/analyze/owner/shared', 'Analyze field must auto-detect, not inherit repoType=dataset');
   eq(ui.history().at(-1).repoType, null, 'pending auto-detect entry must not force a type');
 
   // Refresh while type selection is pending targets the pending repo and keeps
@@ -346,7 +360,20 @@ async function testAnalyzeFieldAutoDetectAndRefresh() {
   calls = [];
   click('#analyzeBtn');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/shared?dataset=true&revision=main', 'refresh of a resolved dataset keeps dataset=true and its resolved revision');
+  eq(lastAnalyzePath(), '/api/analyze/owner/shared?repoType=dataset&revision=main', 'refresh of a resolved dataset keeps repoType=dataset and its resolved revision');
+}
+
+async function testDatasetOnlyAutoDetect() {
+  resetTest();
+
+  // A dataset-only repository auto-detects successfully through a
+  // parameter-free Analyze-field request.
+  nodes.get('#analyzeInput').value = DATASET_ONLY_REPO;
+  await ui.analyzeRepo();
+  eq(lastAnalyzePath(), `/api/analyze/${DATASET_ONLY_REPO}`, 'Analyze field on a dataset-only repository sends no type selector');
+  eq(ui.getCurrentAnalysis().is_dataset, true, 'dataset-only auto-detection resolves the dataset namespace');
+  eq(ui.history().at(-1).repoType, 'dataset', 'resolved dataset-only auto-detection stores dataset identity');
+  eq(ui.history().length, 1, 'dataset-only auto-detection creates one resolved stop');
 }
 
 async function testReadmeLinkNavigation() {
@@ -379,7 +406,7 @@ async function testReadmeLinkNavigation() {
   ui.handleReadmePreviewClick(modelEvent);
   eq(modelEvent.defaultPrevented, true, 'model README link must prevent the external navigation');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false', 'model README link navigates internally with an explicit model type');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model', 'model README link navigates internally with an explicit model type');
   eq(ui.history().at(-1).repo, 'owner/model', 'model README link enters history');
   eq(ui.history().at(-1).repoType, 'model', 'model README link restores its model type');
 
@@ -392,7 +419,7 @@ async function testReadmeLinkNavigation() {
   ui.handleReadmePreviewClick(datasetEvent);
   eq(datasetEvent.defaultPrevented, true, 'dataset README link must prevent the external navigation');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/data?dataset=true', 'dataset README link navigates internally with dataset=true');
+  eq(lastAnalyzePath(), '/api/analyze/owner/data?repoType=dataset', 'dataset README link navigates internally with repoType=dataset');
   eq(ui.history().at(-1).repoType, 'dataset', 'dataset README link restores its dataset type');
 
   resetTest();
@@ -405,7 +432,7 @@ async function testReadmeLinkNavigation() {
   ui.handleReadmePreviewClick(revisionEvent);
   eq(revisionEvent.defaultPrevented, true, 'revision README link must prevent the external navigation');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'revision README link keeps the revision');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=dev', 'revision README link keeps the revision');
   eq(ui.history().at(-1).revision, 'dev', 'revision README link restores the revision');
 }
 
@@ -418,7 +445,7 @@ async function testDualNamespaceSelection() {
   analyzeImpl = defaultAnalyze;
   nodes.get('#analyzeInput').value = DUAL_REPO;
   await ui.analyzeRepo();
-  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}`, 'Analyze field on a dual repository omits dataset and auto-detects');
+  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}`, 'Analyze field on a dual repository omits repoType and dataset and auto-detects');
   eq(ui.history().at(-1).repoType, null, 'pending type selection keeps the history entry untyped');
   match(nodes.get('#analyzeResult').innerHTML, /Selection Required/, 'dual repository renders the type selector');
 
@@ -427,7 +454,7 @@ async function testDualNamespaceSelection() {
   calls = [];
   ui.selectAnalysisType('model', DUAL_REPO);
   await flush();
-  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?dataset=false`, 'Analyze as Model sends exactly dataset=false');
+  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?repoType=model`, 'Analyze as Model sends exactly repoType=model');
   eq(ui.getCurrentAnalysis().is_dataset, false, 'Analyze as Model restores the model view');
   eq(ui.getCurrentAnalysis().type, 'gguf', 'Analyze as Model renders model analysis');
   eq(ui.history().at(-1).repoType, 'model', 'Analyze as Model replaces the pending entry with a model stop');
@@ -444,7 +471,7 @@ async function testDualNamespaceSelection() {
   ui.handleReadmePreviewClick(modelEvent);
   eq(modelEvent.defaultPrevented, true, 'dual model README link prevents external navigation');
   await flush();
-  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?dataset=false`, 'dual model README link sends dataset=false');
+  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?repoType=model`, 'dual model README link sends repoType=model');
   eq(ui.getCurrentAnalysis().is_dataset, false, 'dual model README link restores the model view');
   eq(ui.history().at(-1).repoType, 'model', 'dual model README link restores model history');
 
@@ -457,7 +484,7 @@ async function testDualNamespaceSelection() {
   ui.handleReadmePreviewClick(datasetEvent);
   eq(datasetEvent.defaultPrevented, true, 'dual dataset README link prevents external navigation');
   await flush();
-  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?dataset=true`, 'dual dataset README link sends dataset=true');
+  eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}?repoType=dataset`, 'dual dataset README link sends repoType=dataset');
   eq(ui.getCurrentAnalysis().is_dataset, true, 'dual dataset README link restores the dataset view');
   eq(ui.history().at(-1).repoType, 'dataset', 'dual dataset README link restores dataset history');
 }
@@ -493,7 +520,7 @@ async function testLineageAndRelatedDownloads() {
   analyzeImpl = defaultAnalyze;
   ui.analyzeRelatedRepo('owner/base');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/base?dataset=false', 'lineage ancestor navigates internally as a model');
+  eq(lastAnalyzePath(), '/api/analyze/owner/base?repoType=model', 'lineage ancestor navigates internally as a model');
   deepEq(historyRepos(), ['owner/tuned', 'owner/base'], 'lineage ancestor participates in history');
 
   await ui.traverseRepoHistory(-1);
@@ -502,7 +529,7 @@ async function testLineageAndRelatedDownloads() {
   calls = [];
   ui.analyzeRelatedRepo('owner/mmproj');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/mmproj?dataset=false', 'Related Downloads navigates internally');
+  eq(lastAnalyzePath(), '/api/analyze/owner/mmproj?repoType=model', 'Related Downloads navigates internally');
   deepEq(historyRepos(), ['owner/tuned', 'owner/mmproj'], 'Related Downloads participates in history');
   await ui.traverseRepoHistory(-1);
   eq(ui.currentRepoHistoryEntry().repo, 'owner/tuned', 'Back returns from Related Downloads');
@@ -520,9 +547,9 @@ async function testSameRepoModelDatasetHistory() {
 
   calls = [];
   await ui.traverseRepoHistory(-1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/both?dataset=false&revision=main', 'Back restores the model view of the same repo');
+  eq(lastAnalyzePath(), '/api/analyze/owner/both?repoType=model&revision=main', 'Back restores the model view of the same repo');
   await ui.traverseRepoHistory(1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/both?dataset=true&revision=main', 'Forward restores the dataset view of the same repo');
+  eq(lastAnalyzePath(), '/api/analyze/owner/both?repoType=dataset&revision=main', 'Forward restores the dataset view of the same repo');
 }
 
 async function testHistoryTraversalAndForwardTruncation() {
@@ -540,17 +567,17 @@ async function testHistoryTraversalAndForwardTruncation() {
 
   calls = [];
   await ui.traverseRepoHistory(-1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/b?dataset=true&revision=main', 'first Back restores B as a dataset');
+  eq(lastAnalyzePath(), '/api/analyze/owner/b?repoType=dataset&revision=main', 'first Back restores B as a dataset');
   eq(ui.historyIndex(), 1, 'first Back moves the cursor to B');
 
   await ui.traverseRepoHistory(-1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/a?dataset=false&revision=dev', 'second Back restores A at dev');
+  eq(lastAnalyzePath(), '/api/analyze/owner/a?repoType=model&revision=dev', 'second Back restores A at dev');
   eq(ui.historyIndex(), 0, 'second Back moves the cursor to A');
 
   await ui.traverseRepoHistory(1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/b?dataset=true&revision=main', 'first Forward restores B again');
+  eq(lastAnalyzePath(), '/api/analyze/owner/b?repoType=dataset&revision=main', 'first Forward restores B again');
   await ui.traverseRepoHistory(1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/c?dataset=false&revision=v2', 'second Forward restores C at v2');
+  eq(lastAnalyzePath(), '/api/analyze/owner/c?repoType=model&revision=v2', 'second Forward restores C at v2');
   eq(ui.historyIndex(), 2, 'Forward returns to C');
 
   // Back then a new target truncates the forward branch.
@@ -571,7 +598,7 @@ async function testSameRepoRootKeepsRevisionStop() {
   calls = [];
   click('#analyzeBtn');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'refresh of a resolved model keeps its explicit type and revision');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=dev', 'refresh of a resolved model keeps its explicit type and revision');
 
   await ui.openRepositoryInDetails('owner/model', 'model', null, 'push');
   deepEq(historyRevisions(), ['dev', 'main'], 'same-repo root pushes a new stop instead of replacing dev');
@@ -579,7 +606,7 @@ async function testSameRepoRootKeepsRevisionStop() {
 
   calls = [];
   await ui.traverseRepoHistory(-1);
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'Back restores the preserved dev stop');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=dev', 'Back restores the preserved dev stop');
   eq(ui.historyIndex(), 0, 'Back returns to dev');
 }
 
@@ -595,7 +622,7 @@ async function testSameRepoRootLinkKeepsResolvedRevision() {
   // from a settled stop instead of the initial pending picker.
   await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
   deepEq(historyTuples(), [['owner/model', 'model', 'main']], 'resolved main view creates one stop');
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'resolved main view loads revision=main');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=main', 'resolved main view loads revision=main');
   eq(nodes.get('#modalBackdrop').classList.contains('active'), false, 'resolved main view shows no revision picker');
 
   // The real README renderer emits a same-repo root link without a revision.
@@ -623,8 +650,8 @@ async function testSameRepoRootLinkKeepsResolvedRevision() {
   eq(ui.currentRepoHistoryEntry().revision, 'main', 'same-repo root link keeps the resolved revision');
   eq(ui.historyIndex(), 0, 'same-repo root link keeps the current stop');
   eq(analyzePaths().length, 1, 'same-repo root link makes one analyze request');
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'same-repo root link refreshes with revision=main');
-  ok(!analyzePaths().includes('/api/analyze/owner/model?dataset=false'), 'same-repo root link never falls back to bare auto-detection');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=main', 'same-repo root link refreshes with revision=main');
+  ok(!analyzePaths().includes('/api/analyze/owner/model?repoType=model'), 'same-repo root link never reloads the unresolved model view');
   eq(nodes.get('#modalBackdrop').classList.contains('active'), false, 'same-repo root link does not reopen the revision picker');
   eq(nodes.get('#modelsDetailBack').disabled, true, 'same-repo root link leaves Back disabled');
 }
@@ -647,7 +674,7 @@ async function testRefreshPendingRevisionPicker() {
   calls = [];
   click('#analyzeBtn');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/pending?dataset=false', 'refresh during the revision picker targets the pending repo');
+  eq(lastAnalyzePath(), '/api/analyze/owner/pending?repoType=model', 'refresh during the revision picker targets the pending repo');
   eq(ui.history().length, 2, 'refresh refines the pending entry instead of duplicating it');
   eq(ui.historyIndex(), 1, 'refresh keeps the pending entry current');
 }
@@ -675,7 +702,7 @@ async function testRevisionChangeFromRenderedAnalysis() {
     [['owner/model', 'model', 'main']],
     'initial picker selection refines the pending entry into one main stop'
   );
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'initial picker selection loads main');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=main', 'initial picker selection loads main');
   match(nodes.get('#analyzeResult').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'rendered analysis header exposes the change picker link');
 
   // The rendered analysis header's change link reopens the picker for a view
@@ -694,7 +721,7 @@ async function testRevisionChangeFromRenderedAnalysis() {
   eq(ui.historyIndex(), 1, 'rendered analysis revision change is the current stop');
   eq(ui.currentRepoHistoryEntry().revision, 'dev', 'the current stop is dev');
   eq(ui.getCurrentAnalysis().branch, 'dev', 'the current analysis renders dev');
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'revision change loads dev');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=dev', 'revision change loads dev');
   eq(nodes.get('#modelsDetailBack').disabled, false, 'Back remains enabled after the revision change');
 
   calls = [];
@@ -702,7 +729,7 @@ async function testRevisionChangeFromRenderedAnalysis() {
   eq(ui.historyIndex(), 0, 'Back returns to the preserved main stop');
   eq(ui.currentRepoHistoryEntry().revision, 'main', 'the current stop is main again');
   eq(ui.getCurrentAnalysis().branch, 'main', 'the rendered analysis is main again');
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'Back reloads the main analysis');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=main', 'Back reloads the main analysis');
   eq(nodes.get('#modelsDetailBack').disabled, true, 'Back is disabled at the first stop');
   eq(nodes.get('#modelsDetailForward').disabled, false, 'Forward is enabled after returning to main');
 
@@ -723,7 +750,7 @@ async function testRevisionChangeFromRenderedAnalysis() {
   calls = [];
   await ui.traverseRepoHistory(1);
   eq(ui.historyIndex(), 1, 'Forward returns to dev');
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'Forward reloads the dev analysis');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model&revision=dev', 'Forward reloads the dev analysis');
 }
 
 async function testRefreshInFlightNavigation() {
@@ -737,12 +764,12 @@ async function testRefreshInFlightNavigation() {
   });
   const navigation = ui.openRepositoryInDetails('owner/inflight', 'model', null, 'push');
   await new Promise(resolve => setImmediate(resolve));
-  eq(lastAnalyzePath(), '/api/analyze/owner/inflight?dataset=false', 'in-flight navigation starts against the new repo');
+  eq(lastAnalyzePath(), '/api/analyze/owner/inflight?repoType=model', 'in-flight navigation starts against the new repo');
 
   calls = [];
   click('#analyzeBtn');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/inflight?dataset=false', 'refresh during an in-flight navigation targets the pending repo');
+  eq(lastAnalyzePath(), '/api/analyze/owner/inflight?repoType=model', 'refresh during an in-flight navigation targets the pending repo');
 
   while (pending.length) pending.shift()();
   await navigation;
@@ -952,7 +979,7 @@ async function testSearchRowAndDetailHeader() {
   const row = makeNode({ dataset: { repoType: 'dataset' } });
   ui.modelsSelectRow(row, 'owner/data');
   await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/data?dataset=true', 'dataset search rows keep their explicit type');
+  eq(lastAnalyzePath(), '/api/analyze/owner/data?repoType=dataset', 'dataset search rows keep their explicit type');
 
   resetTest();
   ui.state.settings = { endpoint: 'https://hf.example.test:443' };
@@ -963,6 +990,7 @@ async function testSearchRowAndDetailHeader() {
 
 (async () => {
   await testAnalyzeFieldAutoDetectAndRefresh();
+  await testDatasetOnlyAutoDetect();
   await testReadmeLinkNavigation();
   await testDualNamespaceSelection();
   await testLineageAndRelatedDownloads();
