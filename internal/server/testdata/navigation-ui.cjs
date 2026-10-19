@@ -651,11 +651,13 @@ async function testReadmePreviewContract() {
   const stalePreviewHtml = '<p class="stale-readme">stale preview</p>';
 
   resetTest();
-  readmeImpl = () => ({ html: serverHtml });
+  readmeImpl = () => ({ html: serverHtml, markdown: unsafeMarkdown });
   await ui.loadReadmePreview({ repo: 'owner/model', branch: 'main' });
   eq(lastReadmePath(), '/api/readme/owner/model?revision=main', 'README request keeps the revision parameter');
-  eq(nodes.get('#readmePreview').innerHTML, serverHtml, 'server-rendered README HTML is used verbatim');
+  eq(nodes.get('#readmePreview').innerHTML, serverHtml, 'server-rendered README HTML is used verbatim when markdown is also present');
   eq(nodes.get('#readmeSection').hidden, false, 'server-rendered README reveals the section');
+  ok(!/javascript:/i.test(nodes.get('#readmePreview').innerHTML), 'server html precedence never emits the fallback javascript: URL');
+  ok(!/document\.body/.test(nodes.get('#readmePreview').innerHTML), 'server html precedence never renders raw markdown');
 
   resetTest();
   readmeImpl = () => ({ html: serverHtml });

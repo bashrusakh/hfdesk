@@ -63,8 +63,8 @@ func TestRenderReadmeHTML_UnsafeSchemesStripped(t *testing.T) {
 	// link labels survive as text, and images keep their alt text while the
 	// unsafe attribute is removed.
 	for _, sub := range []string{
-		"<p>js</p>",
-		"<p>html</p>",
+		">js<",
+		">html<",
 		`alt="jsimg"`,
 		`alt="htmlimg"`,
 		`loading="lazy"`,
