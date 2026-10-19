@@ -89,7 +89,7 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 					}
 					post := func() *httptest.ResponseRecorder {
 						t.Helper()
-						body, err := json.Marshal(DownloadRequest{Repo: "owner/data", Dataset: true, Filters: []string{"train"}, ExactMatch: true, AppendFilterSubdir: false})
+						body, err := json.Marshal(DownloadRequest{Repo: "owner/data", Dataset: true, Filters: []string{"train", "model-train.gguf"}, ExactMatch: true, AppendFilterSubdir: false})
 						if err != nil {
 							t.Fatal(err)
 						}

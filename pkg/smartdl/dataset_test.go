@@ -327,7 +327,7 @@ func TestDatasetAnalyzerRoundTripsFlatAndCustomDataGroups(t *testing.T) {
 }
 
 func TestDatasetRecommendedFilterSkipsUnknownMetadata(t *testing.T) {
-	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/test_data.parquet"}
+	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/records.parquet"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/api/datasets/owner/ambiguous/revision/rev1"):
@@ -336,7 +336,7 @@ func TestDatasetRecommendedFilterSkipsUnknownMetadata(t *testing.T) {
 			nodes := make([]map[string]any, 0, len(paths))
 			for _, p := range paths {
 				node := map[string]any{"type": "file", "path": p, "size": 10}
-				if p == "train/test_data.parquet" {
+				if p == "train/records.parquet" {
 					node["lfs"] = map[string]any{"size": 1000, "sha256": strings.Repeat("b", 64)}
 				}
 				nodes = append(nodes, node)
@@ -361,10 +361,10 @@ func TestDatasetRecommendedFilterSkipsUnknownMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unknown root metadata should be skipped, not refused: %v", err)
 	}
-	if len(plan.Items) != 2 || plan.Items[0].RelativePath != "train.csv" || plan.Items[1].RelativePath != "train/test_data.parquet" {
+	if len(plan.Items) != 2 || plan.Items[0].RelativePath != "train.csv" || plan.Items[1].RelativePath != "train/records.parquet" {
 		t.Fatalf("selected plan paths = %+v", plan.Items)
 	}
-	job.Excludes = []string{"unknown.json", "train/test_data.parquet"}
+	job.Excludes = []string{"unknown.json", "train/records.parquet"}
 	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("excluded plan: %v", err)
@@ -372,13 +372,13 @@ func TestDatasetRecommendedFilterSkipsUnknownMetadata(t *testing.T) {
 	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "train.csv" {
 		t.Fatalf("excluded plan paths = %+v", plan.Items)
 	}
-	job.Filters = []string{"train", "train/test_data.parquet"}
+	job.Filters = []string{"train", "train/records.parquet"}
 	job.Excludes = []string{"unknown.json"}
 	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("exact ambiguous-file request: %v", err)
 	}
-	if len(plan.Items) != 2 || plan.Items[1].RelativePath != "train/test_data.parquet" {
+	if len(plan.Items) != 2 || plan.Items[1].RelativePath != "train/records.parquet" {
 		t.Fatalf("explicit exact-path plan = %+v", plan.Items)
 	}
 	job.Filters = nil

@@ -221,9 +221,15 @@ For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or
 `data/<group>/` paths. Send a group's `filter_value` with `exactMatch: true` to
 `/api/plan` or `/api/download`; the planner selects that group's data files and
-keeps applicable repository companions. Default substring filters retain
-literal substring matching, including when a substring occurs within a
-recognized split name. Ambiguous files that could affect a
+keeps applicable repository companions. A filter whose complete normalized value
+is a recognized group label is a membership selector, not a literal path term:
+`train` selects files inferred to belong to `train` (and applicable companions)
+even when another path merely contains the spelling `train`. Literal files or
+directories with that spelling remain selectable through an explicit path form
+such as `./train.csv`, `train/`, `train.csv`, or an extension filter. Default
+substring filters still retain literal substring matching for filters that are
+not themselves a recognized group label, including when a substring occurs
+within a recognized split name. Ambiguous files that could affect a
 selected group cause planning to fail with the standard JSON error response,
 rather than silently broadening or narrowing the selection. `POST /api/plan`
 returns HTTP 400 with error code `ambiguous_selection` for this expected

@@ -169,6 +169,30 @@ func TestGGUFToSelectableItems_RecommendedFallbackPicksOneArtifact(t *testing.T)
 	}
 }
 
+// TestGGUFToSelectableItems_UniqueMMProjUsesLegacyID verifies that a lone
+// mmproj file keeps the historical basename-only ID. Path discrimination is
+// added only when labels or IDs actually collide.
+func TestGGUFToSelectableItems_UniqueMMProjUsesLegacyID(t *testing.T) {
+	files := []FileInfo{
+		ggufRecommendationTestFile("model-Q4_K_M.gguf", 4_000_000_000),
+		ggufRecommendationTestFile("nested/mmproj-F16.gguf", 100),
+	}
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	vision := selectableItemsByCategory(GGUFToSelectableItems(info), "vision_encoder")
+	if len(vision) != 1 {
+		t.Fatalf("got %d vision_encoder items, want 1: %+v", len(vision), vision)
+	}
+	if got, want := vision[0].ID, "mmproj-mmproj-f16"; got != want {
+		t.Fatalf("unique mmproj ID = %q, want legacy %q", got, want)
+	}
+	if got, want := vision[0].Files, []string{"nested/mmproj-F16.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unique mmproj Files = %v, want %v", got, want)
+	}
+}
+
 // TestGGUFToSelectableItems_PathDistinctMMProjArtifacts verifies that two
 // mmproj files sharing a basename in different directories are both emitted
 // with path-distinct, deterministic IDs and exact Files, while only the
@@ -203,6 +227,11 @@ func TestGGUFToSelectableItems_PathDistinctMMProjArtifacts(t *testing.T) {
 	}
 	if vision[0].ID == vision[1].ID {
 		t.Errorf("path-distinct mmproj items share ID %q", vision[0].ID)
+	}
+	for _, id := range []string{vision[0].ID, vision[1].ID} {
+		if !strings.HasPrefix(id, "mmproj-mmproj-f16-artifact-") {
+			t.Errorf("colliding mmproj ID %q does not carry the path discriminator", id)
+		}
 	}
 
 	// IDs must be deterministic across repeated conversions of the same analysis.

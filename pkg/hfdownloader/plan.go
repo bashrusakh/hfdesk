@@ -327,6 +327,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// A recognized group label is a membership selector, so a literal path
+		// match on that label cannot satisfy the no-match guard for an otherwise
+		// empty selection. Explicit path forms have different normalized values
+		// and retain their ordinary direct-match semantics.
+		directFilterMatch = datasetDirectPathMatch(fileNodes, job, context.RecognizedLabels)
 		datasetGroupRequest = false
 		for _, filter := range job.Filters {
 			if err := ctx.Err(); err != nil {
@@ -468,7 +473,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					break
 				}
 			}
-			if !recognizedDatasetGroup && ggufMode && !strings.HasSuffix(relLower, ".gguf") &&
+			if !recognizedDatasetGroup && ggufMode && !isGGUFFilePath(relLower) &&
 				!directDatasetMatch {
 				continue
 			}
@@ -500,7 +505,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
 		// requested companions.
-		if !datasetGroupRequest && ggufMode && strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
+		if !datasetGroupRequest && ggufMode && isGGUFFilePath(nameLower) && len(job.Filters) > 0 &&
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
@@ -559,7 +564,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// matchedFilter is used by AppendFilterSubdir to alter that destination;
 		// only dataset membership attribution and the established GGUF/LFS
 		// branches provide a destination subdirectory.
-		if !job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") {
+		if !job.IsDataset && !isLFS && !isGGUFFilePath(nameLower) {
 			matchedFilter = ""
 		}
 		// Normalize attribution once after the inclusion branch has chosen its
@@ -629,7 +634,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		seenLower[relLower] = struct{}{}
 
 		destinationSubdir := matchedFilter
-		if job.IsDataset && !isLFS && !strings.HasSuffix(nameLower, ".gguf") &&
+		if job.IsDataset && !isLFS && !isGGUFFilePath(nameLower) &&
 			(!ggufMode || datasetDataRoles[nodeIndex]) {
 			destinationSubdir = ""
 		}
@@ -657,6 +662,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
 
+// isGGUFFilePath reports whether a path names a GGUF artifact, including the
+// legacy ".gguf-split" shard extension. It is intentionally a suffix check:
+// callers use it to classify known paths, not to infer file types.
+func isGGUFFilePath(relativePath string) bool {
+	lower := strings.ToLower(relativePath)
+	return strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".gguf-split")
+}
+
 // GGUFPathSelected is the direct per-path predicate for a known relative GGUF
 // filename in matched-only contexts, including GGUF-only planning and the
 // dataset GGUF projection. It does not describe the complete ordinary-model
@@ -664,7 +677,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 // ordinary model plan.
 func GGUFPathSelected(relativePath string, filters, excludes []string, exact bool) bool {
 	name := strings.ToLower(filepath.Base(relativePath))
-	if !strings.HasSuffix(name, ".gguf") {
+	if !isGGUFFilePath(name) {
 		return false
 	}
 	if isExcludedPath(relativePath, excludes) {
@@ -685,6 +698,28 @@ func datasetFilterMatchesMembership(c datasetDecisionContext, filter string) boo
 	for _, label := range c.RecognizedLabels {
 		if filterMatchesPath(label, filter, false) {
 			return true
+		}
+	}
+	return false
+}
+
+// datasetDirectPathMatch reports whether any non-excluded inventory path is
+// selected by a filter that is not itself a recognized dataset group label.
+// Group labels select through membership evidence instead, so their path
+// spellings must not keep an otherwise empty filtered selection alive.
+func datasetDirectPathMatch(nodes []hfNode, job Job, recognizedLabels []string) bool {
+	for _, n := range nodes {
+		if isExcludedPath(n.Path, job.Excludes) {
+			continue
+		}
+		for _, filter := range job.Filters {
+			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+			if containsString(recognizedLabels, normalized) {
+				continue
+			}
+			if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+				return true
+			}
 		}
 	}
 	return false
@@ -986,8 +1021,9 @@ func isFilterDelimiter(r rune) bool {
 	return r == '-' || r == '.' || r == ' '
 }
 
-// isGGUFFilterDownload reports whether the given filters select only .gguf files
-// in the supplied set of file paths (all expected lowercased). When true the
+// isGGUFFilterDownload reports whether the given filters select only GGUF files
+// (`.gguf` or legacy `.gguf-split` shards) in the supplied set of file paths
+// (all expected lowercased). When true the
 // download is treated as GGUF-only: because a GGUF file is self-contained, the
 // plan keeps just the filter-matched files (the chosen quant's shards plus any
 // mmproj companion) and drops config/tokenizer JSON, README, .gitattributes and
@@ -1012,7 +1048,7 @@ func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exa
 			if !filterMatchesPath(filePath, f, exact) {
 				continue
 			}
-			if strings.HasSuffix(filePath, ".gguf") {
+			if isGGUFFilePath(filePath) {
 				matchedGGUF = true
 			} else if isModelPayloadPath(filePath) {
 				matchedNonGGUF = true
@@ -1036,7 +1072,7 @@ func isModelPayloadPath(filePath string) bool {
 		return false
 	}
 	switch path.Ext(base) {
-	case ".safetensors", ".onnx", ".pt", ".pth":
+	case ".safetensors", ".onnx", ".pt", ".pth", ".gguf-split":
 		return true
 	case ".bin":
 		return !strings.Contains(base, "tokenizer")

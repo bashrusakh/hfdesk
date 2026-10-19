@@ -416,12 +416,14 @@ func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) 
 	}
 }
 
-func TestDownload_DatasetGroupDestinationIndependentOfMatchedGGUF(t *testing.T) {
+func TestDownload_DatasetGroupDestinationIndependentOfExplicitGGUFFilter(t *testing.T) {
 	for _, withGGUF := range []bool{false, true} {
-		t.Run(fmt.Sprintf("matched_gguf_%t", withGGUF), func(t *testing.T) {
+		t.Run(fmt.Sprintf("selected_gguf_%t", withGGUF), func(t *testing.T) {
 			files := []hfNode{{Type: "file", Path: "train_records.csv", Size: 4}}
+			filters := []string{"train"}
 			if withGGUF {
 				files = append(files, hfNode{Type: "file", Path: "model-train.gguf", Size: 4})
+				filters = append(filters, "model-train.gguf")
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
@@ -440,7 +442,7 @@ func TestDownload_DatasetGroupDestinationIndependentOfMatchedGGUF(t *testing.T) 
 			defer server.Close()
 
 			out := t.TempDir()
-			job := Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: []string{"train"}, ExactMatch: true, AppendFilterSubdir: true}
+			job := Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: filters, ExactMatch: true, AppendFilterSubdir: true}
 			settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}
 			if err := Download(context.Background(), job, settings, nil); err != nil {
 				t.Fatalf("Download: %v", err)
@@ -451,16 +453,18 @@ func TestDownload_DatasetGroupDestinationIndependentOfMatchedGGUF(t *testing.T) 
 			}
 			data, err := os.ReadFile(filepath.Join(base, "train_records.csv"))
 			if err != nil || string(data) != "data" {
-				t.Fatalf("dataset destination = %q, err=%v; want repo root independent of GGUF matches", data, err)
+				t.Fatalf("dataset destination = %q, err=%v; want repo root independent of GGUF selection", data, err)
 			}
 			_, statErr := os.Stat(filepath.Join(base, "train", "train_records.csv"))
 			if !os.IsNotExist(statErr) {
 				t.Errorf("dataset was relocated under train/: stat err=%v", statErr)
 			}
 			if withGGUF {
-				model, err := os.ReadFile(filepath.Join(base, "train", "model-train.gguf"))
+				// Explicit path selection attributes its own filter prefix; the
+				// group selection must not relocate the dataset data above.
+				model, err := os.ReadFile(filepath.Join(base, "model-train.gguf", "model-train.gguf"))
 				if err != nil || string(model) != "model" {
-					t.Errorf("selected GGUF destination = %q, err=%v; want train/model-train.gguf", model, err)
+					t.Errorf("selected GGUF destination = %q, err=%v; want model-train.gguf/model-train.gguf", model, err)
 				}
 			}
 		})

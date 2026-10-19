@@ -160,7 +160,7 @@ func TestPlanRepoDatasetSplitPathFilter(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"dataset_info.json", "train/data-00000-of-00001.parquet"})
 }
 
-func TestPlanRepoDatasetLiteralMatchSurvivesMembershipCollision(t *testing.T) {
+func TestPlanRepoDatasetGroupLabelIsMembershipOnly(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "pretrain.csv", Size: 11},
@@ -174,8 +174,8 @@ func TestPlanRepoDatasetLiteralMatchSurvivesMembershipCollision(t *testing.T) {
 		exact bool
 		want  []string
 	}{
-		{"substring preserves literal matches", false, []string{"train.csv", "pretrain.csv", "other/xtrain.csv"}},
-		{"exact retains distinct segment behavior", true, []string{"train.csv"}},
+		{"substring group label ignores literal matches", false, []string{"train.csv"}},
+		{"exact group label ignores literal matches", true, []string{"train.csv"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan, err := PlanRepo(context.Background(), Job{
@@ -183,6 +183,29 @@ func TestPlanRepoDatasetLiteralMatchSurvivesMembershipCollision(t *testing.T) {
 			}, Settings{Endpoint: srv.URL})
 			if err != nil {
 				t.Fatalf("PlanRepo: %v", err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
+
+	// Explicit path forms remain available for literal selection of a file
+	// whose spelling merely contains a recognized group label.
+	for _, tc := range []struct {
+		name   string
+		filter string
+		exact  bool
+		want   []string
+	}{
+		{"plain basename", "pretrain.csv", true, []string{"pretrain.csv"}},
+		{"root literal", "./pretrain.csv", true, []string{"pretrain.csv"}},
+		{"directory", "other/", true, []string{"other/xtrain.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := PlanRepo(context.Background(), Job{
+				Repo: "owner/dataset", IsDataset: true, Filters: []string{tc.filter}, ExactMatch: tc.exact,
+			}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filter %q: %v", tc.filter, err)
 			}
 			assertPaths(t, planPaths(plan), tc.want)
 		})
@@ -203,7 +226,18 @@ func TestPlanRepoDatasetGGUFGuardComposesWithRootCompanions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A recognized group label is membership-only; an unmatched GGUF whose
+	// name merely contains the label is not a companion selection.
+	assertPaths(t, planPaths(plan), []string{"train.csv"})
+
+	job.Filters = []string{"train", "model-train.gguf"}
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	assertPaths(t, planPaths(plan), []string{"train.csv", "model-train.gguf"})
+
+	job.Filters = []string{"train"}
 	if GGUFPathMayBeEmitted("model-test.gguf", job) {
 		t.Fatal("pre-plan projection admitted an unmatched root GGUF")
 	}
@@ -311,7 +345,7 @@ func TestPlanRepoDatasetSubstringAndExactPathFiltersRemainDistinct(t *testing.T)
 		{"exact", true, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"traini"}, ExactMatch: tc.exact}, Settings{Endpoint: srv.URL})
 			if tc.exact {
 				if !errors.Is(err, ErrNoFilterMatch) || plan != nil {
 					t.Fatalf("PlanRepo plan=%v error=%v; want nil plan and ErrNoFilterMatch", planPaths(plan), err)
@@ -1234,7 +1268,7 @@ func TestPlanRepoDatasetUnknownRootMetadataSkippedAndExplicitSelectionWorks(t *t
 	assertPaths(t, planPaths(plan), []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "metadata.json"})
 }
 
-func TestPlanRepoDatasetGroupLabelPathCollisionKeepsLiteralMatches(t *testing.T) {
+func TestPlanRepoDatasetGroupLabelPathCollisionIsMembershipOnly(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "test/train.csv", Size: 10},
@@ -1242,10 +1276,16 @@ func TestPlanRepoDatasetGroupLabelPathCollisionKeepsLiteralMatches(t *testing.T)
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatalf("literal path matches must resolve token collision without refusal: %v", err)
+	if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+		t.Fatalf("PlanRepo = (%v, %v), want nil plan and fail-closed ErrAmbiguousSelection; test/train.csv is a conflicting membership, not a literal train selection", planPaths(plan), err)
 	}
-	assertPaths(t, planPaths(plan), []string{"train.csv", "test/train.csv"})
+
+	// The conflicting file is still selectable through an explicit path form.
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"test/train.csv"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("explicit conflicting path PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"test/train.csv"})
 }
 
 func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testing.T) {
@@ -1264,13 +1304,17 @@ func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testin
 		t.Fatalf("paths=%v, want %v", got, want)
 	}
 	for _, item := range plan.Items {
-		if item.Subdir != "train" {
-			t.Errorf("%s attribution=%q, want longest applicable filter train", item.RelativePath, item.Subdir)
+		want := ".csv"
+		if item.RelativePath == "train.csv" {
+			want = "train"
+		}
+		if item.Subdir != want {
+			t.Errorf("%s attribution=%q, want longest applicable filter %q", item.RelativePath, item.Subdir, want)
 		}
 	}
 }
 
-func TestPlanRepoDatasetGroupCollisionWithRootCompanionKeepsLiteralMatches(t *testing.T) {
+func TestPlanRepoDatasetGroupCollisionWithRootCompanionRefuses(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "test/train.csv", Size: 20},
@@ -1280,10 +1324,9 @@ func TestPlanRepoDatasetGroupCollisionWithRootCompanionKeepsLiteralMatches(t *te
 	defer srv.Close()
 
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatalf("literal path matches must retain the invariant emitted set: %v", err)
+	if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+		t.Fatalf("PlanRepo = (%v, %v), want nil plan and fail-closed ErrAmbiguousSelection", planPaths(plan), err)
 	}
-	assertPaths(t, planPaths(plan), []string{"train.csv", "test/train.csv", "README.md"})
 }
 
 func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.T) {
@@ -1379,7 +1422,7 @@ func TestPlanRepoDatasetExactQuantFilterIsMatchedOnly(t *testing.T) {
 	}
 }
 
-func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
+func TestPlanRepoDatasetTrainGroupIgnoresMatchedGGUFCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train_records.csv", Size: 10},
 		{Type: "file", Path: "model-train.gguf", LFS: &hfLfsInfo{Size: 100}},
@@ -1394,15 +1437,27 @@ func TestPlanRepoDatasetTrainGroupSurvivesMatchedGGUFs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	if got, want := planPaths(plan), []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(got, want) {
+	// The group label selects membership only. GGUF companions whose names
+	// merely contain "train" are not selected; explicit path filters are.
+	if got, want := planPaths(plan), []string{"train_records.csv"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("paths=%v, want %v", got, want)
 	}
 	for _, item := range plan.Items {
 		if item.Subdir != "train" {
 			t.Errorf("%s attribution=%q, want train", item.RelativePath, item.Subdir)
 		}
-		if (item.RelativePath == "model-train.gguf" || item.RelativePath == "model-train-lfs.gguf") && item.DestinationSubdir != "train" {
-			t.Errorf("%s destination subdir=%q, want train", item.RelativePath, item.DestinationSubdir)
+	}
+
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", Revision: "main", IsDataset: true, Filters: []string{"train", "model-train.gguf", "model-train-lfs.gguf"}, ExactMatch: true, AppendFilterSubdir: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo explicit GGUF companions: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("explicit paths=%v, want %v", got, want)
+	}
+	for _, item := range plan.Items {
+		if (item.RelativePath == "model-train.gguf" || item.RelativePath == "model-train-lfs.gguf") && item.DestinationSubdir == "" {
+			t.Errorf("%s explicit GGUF destination subdir is empty, want a matched-filter prefix", item.RelativePath)
 		}
 	}
 }
@@ -1631,6 +1686,47 @@ func TestPlanRepoRejectsNonCanonicalTreePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPlanRepoLegacyGGUFSplitFilterSelectsCompleteQuant is the planner
+// regression for the old ".gguf-split" shard extension: the selected quant's
+// complete split group is planned, while another quant and ordinary model
+// metadata are not.
+func TestPlanRepoLegacyGGUFSplitFilterSelectsCompleteQuant(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M-00001-of-00002.gguf-split", Size: 100},
+		{Type: "file", Path: "model-Q4_K_M-00002-of-00002.gguf-split", Size: 110},
+		{Type: "file", Path: "model-Q6_K-00001-of-00002.gguf-split", Size: 90},
+		{Type: "file", Path: "config.json", Size: 10},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/model", Revision: "main", Filters: []string{"Q4_K_M"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q4_K_M-00002-of-00002.gguf-split",
+	})
+
+	// An ordinary non-GGUF model selection keeps its established non-LFS
+	// companion retention; the legacy split recognition must not narrow it.
+	plan, err = PlanRepo(context.Background(), Job{
+		Repo: "owner/model", Revision: "main", Filters: []string{"config.json"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo ordinary selection: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q4_K_M-00002-of-00002.gguf-split",
+		"model-Q6_K-00001-of-00002.gguf-split",
+		"config.json",
+	})
 }
 
 func planPaths(plan *Plan) []string {

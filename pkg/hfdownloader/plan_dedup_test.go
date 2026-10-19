@@ -9,7 +9,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -236,8 +235,14 @@ func TestPlanRepo_GGUFModePreservesExplicitNonGGUFFilterMatches(t *testing.T) {
 
 func TestGGUFPathSelectedMatchesFilteredGGUFPlanDecision(t *testing.T) {
 	filters, excludes := []string{"Q4_K_M"}, []string{"draft"}
-	for _, path := range []string{"model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "draft-Q4_K_M.gguf", "config.json"} {
-		want := strings.Contains(strings.ToLower(path), "q4_k_m") && !strings.Contains(strings.ToLower(path), "draft") && strings.EqualFold(filepath.Ext(path), ".gguf")
+	for _, path := range []string{
+		"model-Q4_K_M.gguf",
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q5_K_M.gguf",
+		"draft-Q4_K_M.gguf",
+		"config.json",
+	} {
+		want := strings.Contains(strings.ToLower(path), "q4_k_m") && !strings.Contains(strings.ToLower(path), "draft") && isGGUFFilePath(path)
 		if got := GGUFPathSelected(path, filters, excludes, false); got != want {
 			t.Errorf("GGUFPathSelected(%q)=%v want %v", path, got, want)
 		}

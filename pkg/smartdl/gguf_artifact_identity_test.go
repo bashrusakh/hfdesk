@@ -28,6 +28,11 @@ func TestGGUFQuantClassificationUsesWholeTokensAndPathSeparators(t *testing.T) {
 		{"model-BF16.gguf", "BF16"},
 		{"model-F16.gguf", "F16"},
 		{"model-Q6_K_XL.gguf", "Q6_K_XL"},
+		{"Mistral 7B Q4_K_M.gguf", "Q4_K_M"},
+		{"model Q6_K.gguf", "Q6_K"},
+		{"model Q4_K_MX.gguf", ""},
+		{"model Q4_K_M_EXTRA.gguf", ""},
+		{"Mistral 7B Q4_K_M_EXTRA.gguf", ""},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			if got := ggufQuantType(FileInfo{Name: filepath.Base(tc.path), Path: tc.path}); got != tc.want {

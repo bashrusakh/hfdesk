@@ -28,6 +28,11 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		"model-q4_k_m.gguf",
 		"training-model.safetensors",
 	}
+	legacySplitRepo := []string{
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q4_K_M-00002-of-00002.gguf-split",
+		"config.json",
+	}
 
 	cases := []struct {
 		name    string
@@ -43,6 +48,7 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		{"mmproj filter targets a gguf", multimodalRepo, []string{"q4_k_m", "mmproj"}, false, true},
 		{"safetensors filter is not gguf", transformersRepo, []string{"safetensors"}, false, false},
 		{"training-named payload keeps mixed mode", trainingNamedRepo, []string{"q4_k_m", "training-model"}, false, false},
+		{"legacy .gguf-split quant selected", legacySplitRepo, []string{"Q4_K_M"}, false, true},
 		{"non-gguf filter in gguf repo", ggufRepo, []string{"config.json"}, false, false},
 	}
 
@@ -65,6 +71,7 @@ func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T)
 		{"weights/pytorch_model.bin", true},
 		{"weights/model.pt", true},
 		{"weights/model.pth", true},
+		{"weights/model.gguf-split", true},
 		{"weights/flax_model.msgpack", true},
 		{"weights/flax_model-00001-of-00002.msgpack", true},
 		{"weights/diffusion_flax_model.msgpack", true},

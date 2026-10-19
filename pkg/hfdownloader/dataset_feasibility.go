@@ -285,16 +285,18 @@ func isDatasetCoreBit(c datasetDecisionContext, bit uint) (string, bool) {
 	return "", false
 }
 
-// datasetDirectTerm reports one actual role/filter literal-or-membership match.
+// datasetDirectTerm reports one actual role/filter direct match. A filter that
+// names a recognized dataset group label is membership-only: it selects data
+// whose concrete label matches, and it does not use literal path matching to
+// add conflicting files or bypass companion allowlist/ambiguity rules.
 func datasetDirectTerm(c datasetDecisionContext, i int, alt datasetDecisionRoleLabel, f datasetDecisionFilter) bool {
-	pathMatch := filterMatchesPath(c.Inputs[i].Path, f.Original, c.ExactMatch)
-	if alt.Role == datasetselection.EvidenceRoleCompanion || !containsString(c.RecognizedLabels, f.Normalized) {
-		return pathMatch
+	if containsString(c.RecognizedLabels, f.Normalized) {
+		if alt.Role == datasetselection.EvidenceRoleCompanion {
+			return false
+		}
+		return strings.EqualFold(alt.Label, f.Normalized)
 	}
-	// Membership is an additional reason to select, never an alternative to
-	// ordinary literal path matching. In particular a recognized term can
-	// collide with a different group label while also matching this path.
-	return pathMatch || strings.EqualFold(alt.Label, f.Normalized)
+	return filterMatchesPath(c.Inputs[i].Path, f.Original, c.ExactMatch)
 }
 
 func decisionHasDirect(c datasetDecisionContext, w datasetDecisionWorld, i int) bool {
@@ -549,7 +551,7 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 			// The concrete evaluator applies this fixed GGUF eligibility rule
 			// after direct/companion selection. Keep the cached proof domain
 			// identical so a root companion cannot be proven emit-capable here.
-			ggufRejected := strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path)
+			ggufRejected := isGGUFFilePath(in.Path) && !datasetGGUFSelected(c, in.Path)
 			allEligible, anyEligible := true, false
 			for j, alt := range in.Alternatives {
 				directAlways, directPossible := direct[i][j] == 1, direct[i][j] >= 0
@@ -1047,7 +1049,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		}
 		r := &out.Records[i]
 		eligible := !in.Excluded && (direct[i] || (companions[i] && canRetainDatasetCompanion(in)))
-		if strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path) {
+		if isGGUFFilePath(in.Path) && !datasetGGUFSelected(c, in.Path) {
 			eligible = false
 		}
 		r.Eligible = eligible
@@ -1115,15 +1117,17 @@ func datasetDecisionContextErr(c datasetDecisionContext) error {
 }
 
 func concreteDatasetFilterMatches(in datasetDecisionInput, f datasetDecisionFilter, c datasetDecisionContext, label string, companion bool, recognizedLabels map[string]bool) bool {
-	if companion {
-		// Ordinary path selection remains available to companions.
-		return filterMatchesPath(in.Path, f.Original, c.ExactMatch)
-	}
-	pathMatch := filterMatchesPath(in.Path, f.Original, c.ExactMatch)
 	if recognizedLabels[f.Normalized] {
-		return pathMatch || label != "" && label == f.Normalized
+		// A recognized group label is a membership selector for data. It does
+		// not add literal path matches, and companions cannot claim a direct
+		// selection through it; they remain governed by the companion allowlist
+		// and the evaluator's ambiguity/refusal rules.
+		if companion {
+			return false
+		}
+		return label != "" && label == f.Normalized
 	}
-	return pathMatch
+	return filterMatchesPath(in.Path, f.Original, c.ExactMatch)
 }
 
 func validateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisionWorld) error {

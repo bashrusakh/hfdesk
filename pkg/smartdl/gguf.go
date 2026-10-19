@@ -170,11 +170,12 @@ var quantDescriptions = map[string]string{
 //     S/M/L/XL/XXL suffixes (XL/XXL are unsloth "Unsloth Dynamic" quants)
 //   - F16/F32/BF16 float precisions
 //   - MXFP4_MOE and APEX profile-style GGUF quantizations
+//   - space-delimited quant names as well as path/underscore delimiters
 //
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32)))(?:[-./]|$)`)
+	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./\s])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32)))(?:\s|[-./]|$)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -182,14 +183,33 @@ var (
 	// Match model name from filename (before quant type).
 	modelNamePattern = regexp.MustCompile(`^(.+?)[-._](?:IQ|Q|BF|F)\d`)
 
-	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003" optionally
-	// followed by ".gguf". HuggingFace/llama.cpp use 5-digit indices; allow 4-5
-	// digits to be safe. Used to group shards of the same quantization together.
-	splitSuffixPattern = regexp.MustCompile(`(?i)-\d{4,5}-of-\d{4,5}(?:\.gguf)?$`)
+	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003"
+	// optionally followed by ".gguf" or the legacy ".gguf-split" extension,
+	// or delimited by a space (space-delimited shard names). HuggingFace/
+	// llama.cpp use 5-digit indices; allow 4-5 digits to be safe. Used to group
+	// shards of the same quantization together.
+	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ]\d{4,5}-of-\d{4,5}(?:\.gguf(?:-split)?)?$`)
 )
 
-// stripSplitSuffix removes the "-NNNNN-of-MMMMM[.gguf]" shard suffix from a
-// filename, returning the base used to group shards of one quantization.
+// isGGUFFileName reports whether name carries a recognized GGUF suffix,
+// including the legacy ".gguf-split" shard extension.
+func isGGUFFileName(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".gguf-split")
+}
+
+// trimGGUFSuffix removes a recognized GGUF extension, including the legacy
+// ".gguf-split" spelling, for legacy basename/filter derivation.
+func trimGGUFSuffix(name string) string {
+	if strings.HasSuffix(strings.ToLower(name), ".gguf-split") {
+		return name[:len(name)-len(".gguf-split")]
+	}
+	return strings.TrimSuffix(name, ".gguf")
+}
+
+// stripSplitSuffix removes the "-NNNNN-of-MMMMM[.gguf|.gguf-split]" shard
+// suffix from a filename, returning the base used to group shards of one
+// quantization.
 func stripSplitSuffix(name string) string {
 	return splitSuffixPattern.ReplaceAllString(name, "")
 }
@@ -260,7 +280,7 @@ func isGGUFMTPFile(name string) bool {
 // segment so it never trips on substrings inside other tokens.
 func hasMTPMarker(name string) bool {
 	base := strings.ToLower(filepath.Base(name))
-	base = strings.TrimSuffix(base, ".gguf")
+	base = trimGGUFSuffix(base)
 	for _, seg := range strings.FieldsFunc(base, func(r rune) bool {
 		return r == '-' || r == '_' || r == '.'
 	}) {
@@ -280,10 +300,11 @@ func hasMTPMarker(name string) bool {
 func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	info := &GGUFInfo{}
 
-	// Partition .gguf files into LLM quants vs mmproj vision encoders.
+	// Partition GGUF files (including legacy ".gguf-split" shards) into LLM
+	// quants vs mmproj vision encoders.
 	var llmFiles []FileInfo
 	for _, f := range files {
-		if !strings.HasSuffix(strings.ToLower(f.Name), ".gguf") {
+		if !isGGUFFileName(f.Name) {
 			continue
 		}
 		if IsMMProjFile(f.Name) {
@@ -519,14 +540,14 @@ func preferredMMProj(files []FileInfo) (FileInfo, string) {
 		for i := range files {
 			name := strings.ToLower(filepath.Base(files[i].Name))
 			if strings.Contains(name, p) {
-				return files[i], strings.TrimSuffix(name, ".gguf")
+				return files[i], trimGGUFSuffix(name)
 			}
 		}
 	}
 	// Fallback: pick the first file and build a filter from its full basename
 	// so the filter still matches exactly one file.
 	name := strings.ToLower(filepath.Base(files[0].Name))
-	return files[0], strings.TrimSuffix(name, ".gguf")
+	return files[0], trimGGUFSuffix(name)
 }
 
 // artifactPath returns the repository-relative path used as an artifact's
@@ -538,16 +559,16 @@ func artifactPath(f FileInfo) string {
 	return f.Name
 }
 
-// mmprojArtifactID returns a deterministic, collision-free ID derived from the
-// mmproj artifact's repository path. Encoding the whole path rather than only
-// the basename keeps same-named files in different directories distinct while
-// avoiding slash/separator collisions in IDs.
+// mmprojArtifactID returns the legacy deterministic basename ID for an mmproj
+// artifact. Same-basename files in different directories are distinguished by
+// disambiguateGGUFSelectableItems, which appends a path discriminator only when
+// IDs actually collide.
 func mmprojArtifactID(f FileInfo) string {
-	filter := strings.ToLower(strings.TrimSuffix(filepath.Base(f.Name), ".gguf"))
+	filter := strings.ToLower(trimGGUFSuffix(filepath.Base(f.Name)))
 	if filter == "" {
 		filter = "mmproj"
 	}
-	return "mmproj-" + filter + "-" + base64.RawURLEncoding.EncodeToString([]byte(artifactPath(f)))
+	return "mmproj-" + filter
 }
 
 // recommendedQuantIndex returns the index of the single quantization artifact
@@ -692,7 +713,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 		for _, f := range ordered {
 			base := filepath.Base(f.Name)
-			filter := strings.ToLower(strings.TrimSuffix(base, ".gguf"))
+			filter := strings.ToLower(trimGGUFSuffix(base))
 			items = append(items, SelectableItem{
 				ID:           mmprojArtifactID(f),
 				Label:        base,

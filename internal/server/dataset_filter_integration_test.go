@@ -206,7 +206,7 @@ func TestDatasetAlternativeAsyncAmbiguityDownloadFailsJob(t *testing.T) {
 	}
 }
 
-func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
+func TestDatasetAnalyzerPlannerGroupRoundTrip(t *testing.T) {
 	files := []map[string]any{
 		{"type": "file", "path": "train_records.csv", "size": 10},
 		{"type": "file", "path": "model-train.gguf", "size": 100, "lfs": map[string]any{"size": 100}},
@@ -238,7 +238,8 @@ func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
 	}
 	var analyzed struct {
 		SelectableItems []struct {
-			ID string `json:"id"`
+			ID    string   `json:"id"`
+			Files []string `json:"files"`
 		} `json:"selectable_items"`
 		RecommendedDownload struct {
 			Filters    []string `json:"filters"`
@@ -251,59 +252,116 @@ func TestDatasetRecommendedTrainPlanKeepsMatchedGGUFCompanions(t *testing.T) {
 	if !analyzed.RecommendedDownload.ExactMatch || !reflect.DeepEqual(analyzed.RecommendedDownload.Filters, []string{"train"}) {
 		t.Fatalf("recommended selection=%+v", analyzed.RecommendedDownload)
 	}
-	trainAdvertised := false
+	var trainFiles []string
 	for _, item := range analyzed.SelectableItems {
-		trainAdvertised = trainAdvertised || item.ID == "train"
+		if item.ID == "train" {
+			trainFiles = item.Files
+		}
 	}
-	if !trainAdvertised {
-		t.Fatal("analyzer did not advertise the train group")
+	if want := []string{"train_records.csv"}; !reflect.DeepEqual(trainFiles, want) {
+		t.Fatalf("analyzer train Files=%v, want %v", trainFiles, want)
 	}
-	request := DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: analyzed.RecommendedDownload.Filters, ExactMatch: analyzed.RecommendedDownload.ExactMatch, AppendFilterSubdir: true}
-	body, err := json.Marshal(request)
-	if err != nil {
-		t.Fatal(err)
+
+	planPathsFor := func(filters []string, appendSubdir bool) ([]string, map[string]bool) {
+		t.Helper()
+		request := DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: filters, ExactMatch: true, AppendFilterSubdir: appendSubdir}
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("plan filters=%v status=%d body=%s", filters, response.Code, response.Body.String())
+		}
+		var plan PlanResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+			t.Fatal(err)
+		}
+		paths := make([]string, 0, len(plan.Files))
+		lfsByPath := make(map[string]bool, len(plan.Files))
+		for _, file := range plan.Files {
+			paths = append(paths, file.Path)
+			lfsByPath[file.Path] = file.LFS
+		}
+		return paths, lfsByPath
 	}
-	response = httptest.NewRecorder()
-	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body)))
-	if response.Code != http.StatusOK {
-		t.Fatalf("plan status=%d body=%s", response.Code, response.Body.String())
+
+	// The analyzer's membership-only Files are exactly what the planner selects
+	// for the recommended group filter, with or without destination prefixes.
+	for _, appendSubdir := range []bool{false, true} {
+		paths, _ := planPathsFor(analyzed.RecommendedDownload.Filters, appendSubdir)
+		if !reflect.DeepEqual(paths, trainFiles) {
+			t.Fatalf("appendSubdir=%t plan paths=%v, want analyzer train Files %v", appendSubdir, paths, trainFiles)
+		}
 	}
-	var plan PlanResponse
-	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
-		t.Fatal(err)
-	}
-	paths := make([]string, 0, len(plan.Files))
-	for _, file := range plan.Files {
-		paths = append(paths, file.Path)
-	}
+
+	// Explicit path filters still select the GGUF companions that a mere group
+	// label no longer pulls in through literal path matching.
+	explicitFilters := []string{"train", "model-train.gguf", "model-train-lfs.gguf"}
+	paths, lfsByPath := planPathsFor(explicitFilters, true)
 	if want := []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(paths, want) {
-		t.Fatalf("selected plan paths=%v, want %v", paths, want)
-	}
-	lfsByPath := make(map[string]bool, len(plan.Files))
-	for _, file := range plan.Files {
-		lfsByPath[file.Path] = file.LFS
+		t.Fatalf("explicit plan paths=%v, want %v", paths, want)
 	}
 	if !lfsByPath["model-train.gguf"] || lfsByPath["model-train-lfs.gguf"] {
 		t.Fatalf("plan lost LFS/non-LFS representation: %v", lfsByPath)
 	}
-	request.AppendFilterSubdir = false
-	body, err = json.Marshal(request)
-	if err != nil {
+}
+
+func TestDatasetAnalyzerPlannerGroupConflictRefuses(t *testing.T) {
+	files := []map[string]any{
+		{"type": "file", "path": "train.csv", "size": 10},
+		{"type": "file", "path": "test/train.csv", "size": 20},
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/tree/rev1"):
+			_ = json.NewEncoder(w).Encode(files)
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/data/refs"):
+			_, _ = w.Write([]byte(`{"branches":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+	srv := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), Endpoint: hub.URL})
+	mux := http.NewServeMux()
+	srv.registerAPIRoutes(mux)
+
+	// The analyzer's train group excludes the conflicting test/train.csv. The
+	// planner must not add it back through the literal label spelling, and the
+	// established ambiguity policy refuses rather than guessing.
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/analyze/owner/data?dataset=true&revision=rev1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("analyze status=%d body=%s", response.Code, response.Body.String())
+	}
+	var analyzed struct {
+		SelectableItems []struct {
+			ID    string   `json:"id"`
+			Files []string `json:"files"`
+		} `json:"selectable_items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &analyzed); err != nil {
 		t.Fatal(err)
 	}
+	var trainFiles []string
+	for _, item := range analyzed.SelectableItems {
+		if item.ID == "train" {
+			trainFiles = item.Files
+		}
+	}
+	if want := []string{"train.csv"}; !reflect.DeepEqual(trainFiles, want) {
+		t.Fatalf("analyzer train Files=%v, want %v (conflicting file excluded)", trainFiles, want)
+	}
+
+	body, _ := json.Marshal(DownloadRequest{Repo: "owner/data", Revision: "rev1", Dataset: true, Filters: []string{"train"}, ExactMatch: true})
 	response = httptest.NewRecorder()
 	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body)))
-	if response.Code != http.StatusOK {
-		t.Fatalf("append-disabled plan status=%d body=%s", response.Code, response.Body.String())
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
-		t.Fatal(err)
-	}
-	paths = paths[:0]
-	for _, file := range plan.Files {
-		paths = append(paths, file.Path)
-	}
-	if want := []string{"train_records.csv", "model-train.gguf", "model-train-lfs.gguf"}; !reflect.DeepEqual(paths, want) {
-		t.Fatalf("append-disabled plan paths=%v; want legacy repository-relative paths %v", paths, want)
+	var errorResponse ErrorResponse
+	if response.Code != http.StatusBadRequest || json.Unmarshal(response.Body.Bytes(), &errorResponse) != nil || errorResponse.ErrorDetail == nil || errorResponse.ErrorDetail.Code != "ambiguous_selection" {
+		t.Fatalf("plan status=%d body=%s; want 400 ambiguous_selection", response.Code, response.Body.String())
 	}
 }

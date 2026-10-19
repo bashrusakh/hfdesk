@@ -31,14 +31,14 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 		exact       bool
 		excludes    []string
 		roles       [][]roleLabel
-		direct      []bool // hand-authored literal/path matches, independent of membership
+		direct      []bool // hand-authored literal/path-matcher result, independent of membership
 		want        []string
 		wantNoMatch bool
 		worldSets   [][]string // independent final sets for role alternatives when relevant
 		wantRefuse  bool
 	}{
 		{
-			name: "literal train substring is additive to membership",
+			name: "group label membership ignores literal substring",
 			files: []hfNode{
 				{Type: "file", Path: "train.csv", Size: 10},
 				{Type: "file", Path: "pretrain.csv", LFS: &hfLfsInfo{Size: 11}},
@@ -51,7 +51,7 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 				{{datasetselection.EvidenceRoleData, "validation"}},
 			},
 			direct: []bool{true, true, false},
-			want:   []string{"train.csv", "pretrain.csv"},
+			want:   []string{"train.csv"},
 		},
 		{
 			name: "exact literal does not collapse pretrain membership",
@@ -70,7 +70,7 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 			want:   []string{"train.csv"},
 		},
 		{
-			name: "explicit exclude overrides direct literal match",
+			name: "explicit exclude removes the only membership selection",
 			files: []hfNode{
 				{Type: "file", Path: "train.csv", Size: 10},
 				{Type: "file", Path: "pretrain.csv", LFS: &hfLfsInfo{Size: 11}},

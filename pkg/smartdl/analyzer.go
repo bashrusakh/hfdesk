@@ -633,9 +633,9 @@ func (a *Analyzer) detectType(files []FileInfo, isDataset bool) RepoType {
 
 	// Priority-based detection
 
-	// 1. GGUF - presence of .gguf files
+	// 1. GGUF - presence of .gguf or legacy .gguf-split files
 	for _, ext := range extensions {
-		if ext == ".gguf" {
+		if ext == ".gguf" || ext == ".gguf-split" {
 			return TypeGGUF
 		}
 	}
@@ -1179,7 +1179,7 @@ func (a *Analyzer) fetchMMProjFromRepo(ctx context.Context, repo string) []FileI
 	}
 	var out []FileInfo
 	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f.Name), ".gguf") && IsMMProjFile(f.Name) {
+		if isGGUFFileName(f.Name) && IsMMProjFile(f.Name) {
 			out = append(out, f)
 		}
 	}
