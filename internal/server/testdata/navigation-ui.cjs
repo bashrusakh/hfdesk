@@ -1,4 +1,5 @@
-// Run through TestNavigationUIHistory: real app.js navigation/history/classifier.
+// Run through TestNavigationUIHistory: real app.js navigation, history and
+// README link delegation.
 //
 // The harness loads the shipped app.js inside Node's VM with DOM and fetch
 // stubs. It drives the actual navigation owner (openRepositoryInDetails,
@@ -10,9 +11,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const fixture = JSON.parse(process.env.HFDESK_NAV_FIXTURE || '{}');
-if (!fixture.serverHtml || !fixture.markdown || !fixture.serverReservedRoutes ||
-    !fixture.pathPrefixedServerHtml || !fixture.pathPrefixedMarkdown) {
-  console.error('navigation-ui: HFDESK_NAV_FIXTURE is missing server/client README fixtures');
+if (!fixture.serverHtml || !fixture.pathPrefixedServerHtml || !fixture.markdown) {
+  console.error('navigation-ui: HFDESK_NAV_FIXTURE is missing the README fixtures');
   process.exit(1);
 }
 
@@ -246,9 +246,6 @@ const hook = `
     currentRepoHistoryEntry,
     history: () => repoHistory.map(entry => ({ ...entry })),
     historyIndex: () => repoHistoryIndex,
-    classifyHfRepoURL,
-    readmeRepoLinkAttributes,
-    renderMarkdownPreview,
     loadReadmePreview,
     handleReadmePreviewClick,
     loadAppVersion,
@@ -263,7 +260,6 @@ const hook = `
     hideModal,
     reopenRevisionPicker: window.reopenRevisionPicker,
     showRevisionPickerFromAnalysis: window.showRevisionPickerFromAnalysis,
-    readmeReservedRoutes: () => Array.from(README_RESERVED_MODEL_ROUTES),
     getCurrentAnalysis: () => currentAnalysis,
     getSelectionState: () => ({
       repo: currentSelectedRepo,
@@ -383,8 +379,8 @@ function fakeAnchor(attrs) {
     }
   };
 }
-function clickEvent(anchor, hasInternalLink = true) {
-  return {
+function clickEvent(anchor, hasInternalLink = true, overrides = {}) {
+  return Object.assign({
     target: { closest() { return hasInternalLink ? anchor : null; } },
     defaultPrevented: false,
     button: 0,
@@ -392,8 +388,12 @@ function clickEvent(anchor, hasInternalLink = true) {
     ctrlKey: false,
     shiftKey: false,
     altKey: false,
-    preventDefault() { this.defaultPrevented = true; }
-  };
+    preventDefaultCalls: 0,
+    preventDefault() {
+      this.defaultPrevented = true;
+      this.preventDefaultCalls++;
+    }
+  }, overrides);
 }
 
 function decodeEntities(value) {
@@ -420,6 +420,28 @@ function extractLinks(html) {
     });
   }
   return links;
+}
+
+// internalLinkTuples reduces server-rendered HTML to the repository identity
+// the click delegation consumes. The Go renderer owns this classification.
+function internalLinkTuples(html) {
+  return extractLinks(html)
+    .filter(link => link.repo)
+    .map(link => [link.repo, link.type, link.revision]);
+}
+
+function serverLink(html, repo, revision = undefined) {
+  return extractLinks(html).find(link =>
+    link.repo === repo && (revision === undefined || link.revision === revision));
+}
+
+// linkAnchor turns a server-emitted link into the anchor attributes the
+// delegated click handler reads. The harness never re-derives classification.
+function linkAnchor(link) {
+  const attrs = { 'data-hf-repo': link.repo };
+  if (link.type) attrs['data-hf-repo-type'] = link.type;
+  if (link.revision) attrs['data-hf-repo-revision'] = link.revision;
+  return fakeAnchor(attrs);
 }
 
 async function testAnalyzeFieldAutoDetectAndRefresh() {
@@ -470,64 +492,212 @@ async function testDatasetOnlyAutoDetect() {
   eq(ui.history().length, 1, 'dataset-only auto-detection creates one resolved stop');
 }
 
-async function testReadmeLinkNavigation() {
-  resetTest();
-
-  const fallback = ui.renderMarkdownPreview(
-    '[model](https://huggingface.co/owner/model)\n\n' +
-    '[data](https://huggingface.co/datasets/owner/data)\n\n' +
-    '[dev](https://huggingface.co/owner/model/tree/dev)\n\n' +
-    '[encoded](https://huggingface.co/owner/model/tree/refs%2Fpr%2F1)\n\n' +
-    '[nested](https://huggingface.co/owner/model/tree/main/folder/file.md)\n\n' +
-    '[pr](https://huggingface.co/owner/model/tree/refs/pr/1)',
-    fixture.baseRawURL,
-    fixture.baseBlobURL
+async function testReadmeServerLinks() {
+  // The Go renderer is the only README HTML/URL owner. These fixtures are
+  // produced by renderReadmeHTML in TestNavigationUIHistory, so asserting the
+  // emitted link set covers classification without a client-side mirror.
+  deepEq(
+    internalLinkTuples(fixture.serverHtml),
+    [
+      ['owner/model', 'model', null],
+      ['owner/data', 'dataset', null],
+      ['owner/model', 'model', 'dev'],
+      ['owner/model', 'model', 'refs/pr/1']
+    ],
+    'server-rendered README internal links (default endpoint)'
   );
-  match(fallback, /data-hf-repo="owner\/model"/, 'model README link must be classified internal');
-  match(fallback, /data-hf-repo-type="dataset"/, 'dataset README link must be classified internal');
-  match(fallback, /data-hf-repo-revision="dev"/, 'revision README link must keep its revision');
-  match(fallback, /data-hf-repo-revision="refs\/pr\/1"/, 'encoded revision slash must stay within one revision');
-  const nestedAnchor = fallback.match(/<a href="[^"]*tree\/main\/folder\/file\.md"[^>]*>/)?.[0] || '';
-  ok(nestedAnchor !== '' && !/data-hf-repo/.test(nestedAnchor), 'tree subpath README link must stay external');
-  const rawRefsAnchor = fallback.match(/<a href="[^"]*tree\/refs\/pr\/1"[^>]*>/)?.[0] || '';
-  ok(rawRefsAnchor !== '' && !/data-hf-repo/.test(rawRefsAnchor), 'raw multi-segment revision must stay external');
 
-  calls = [];
-  const modelEvent = clickEvent(fakeAnchor({
-    'data-hf-repo': 'owner/model',
-    'data-hf-repo-type': 'model'
-  }));
-  ui.handleReadmePreviewClick(modelEvent);
-  eq(modelEvent.defaultPrevented, true, 'model README link must prevent the external navigation');
+  // Reserved Hub routes, blob/tree file paths, same-host links outside the
+  // endpoint prefix and other hosts all stay external.
+  for (const href of [
+    'https://huggingface.co/hardware/a10',
+    'https://huggingface.co/inference/models',
+    'https://huggingface.co/solutions/models',
+    'https://huggingface.co/chat/assistants',
+    'https://huggingface.co/owner/model/blob/main/config.json',
+    'https://huggingface.co/owner/model/tree/main/folder/file.md',
+    'https://huggingface.co/datasets/owner/data/tree/v1/train',
+    'https://example.com/owner/model',
+    'https://example.com/?a=1&b=2'
+  ]) {
+    const link = extractLinks(fixture.serverHtml).find(candidate => candidate.href === href);
+    ok(link, `server-rendered README must keep ${href}`);
+    eq(link.repo, null, `${href} must stay external`);
+  }
+
+  deepEq(
+    internalLinkTuples(fixture.pathPrefixedServerHtml),
+    [
+      ['owner/model', 'model', null],
+      ['owner/data', 'dataset', 'v1']
+    ],
+    'server-rendered README internal links (path-prefixed endpoint)'
+  );
+  for (const href of [
+    'https://mirror.example/owner/model',
+    'https://mirror.example/hf/owner/model/tree/dev/folder/file.md'
+  ]) {
+    const link = extractLinks(fixture.pathPrefixedServerHtml).find(candidate => candidate.href === href);
+    ok(link, `path-prefixed README must keep ${href}`);
+    eq(link.repo, null, `${href} must stay external under the endpoint prefix`);
+  }
+
+  // Drive the real server-emitted anchors through the delegated click handler.
+  resetTest();
+  let link = serverLink(fixture.serverHtml, 'owner/model', null);
+  ok(link, 'server-rendered README must expose the model root link');
+  let event = clickEvent(linkAnchor(link));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'model README link must prevent the external navigation');
   await flush();
   eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model', 'model README link navigates internally with an explicit model type');
   eq(ui.history().at(-1).repo, 'owner/model', 'model README link enters history');
   eq(ui.history().at(-1).repoType, 'model', 'model README link restores its model type');
 
   resetTest();
-  calls = [];
-  const datasetEvent = clickEvent(fakeAnchor({
-    'data-hf-repo': 'owner/data',
-    'data-hf-repo-type': 'dataset'
-  }));
-  ui.handleReadmePreviewClick(datasetEvent);
-  eq(datasetEvent.defaultPrevented, true, 'dataset README link must prevent the external navigation');
+  link = serverLink(fixture.serverHtml, 'owner/data', null);
+  ok(link, 'server-rendered README must expose the dataset root link');
+  event = clickEvent(linkAnchor(link));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'dataset README link must prevent the external navigation');
   await flush();
   eq(lastAnalyzePath(), '/api/analyze/owner/data?type=dataset', 'dataset README link navigates internally with type=dataset');
   eq(ui.history().at(-1).repoType, 'dataset', 'dataset README link restores its dataset type');
 
   resetTest();
-  calls = [];
-  const revisionEvent = clickEvent(fakeAnchor({
-    'data-hf-repo': 'owner/model',
-    'data-hf-repo-type': 'model',
-    'data-hf-repo-revision': 'dev'
-  }));
-  ui.handleReadmePreviewClick(revisionEvent);
-  eq(revisionEvent.defaultPrevented, true, 'revision README link must prevent the external navigation');
+  link = serverLink(fixture.serverHtml, 'owner/model', 'dev');
+  ok(link, 'server-rendered README must expose the revision link');
+  event = clickEvent(linkAnchor(link));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'revision README link must prevent the external navigation');
   await flush();
   eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model&revision=dev', 'revision README link keeps the revision');
   eq(ui.history().at(-1).revision, 'dev', 'revision README link restores the revision');
+
+  resetTest();
+  link = serverLink(fixture.serverHtml, 'owner/model', 'refs/pr/1');
+  ok(link, 'server-rendered README must expose the encoded-slash revision link');
+  event = clickEvent(linkAnchor(link));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'encoded revision README link must prevent the external navigation');
+  await flush();
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model&revision=refs%2Fpr%2F1', 'encoded revision stays one revision segment');
+  eq(ui.history().at(-1).revision, 'refs/pr/1', 'encoded revision restores its decoded value');
+}
+
+async function assertReadmeClickStaysExternal(event, label, expectedPrevented = false) {
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, expectedPrevented, `${label} must not change the default action`);
+  eq(event.preventDefaultCalls, 0, `${label} must not call preventDefault`);
+  await flush();
+  eq(ui.history().length, 0, `${label} must not enter history`);
+  eq(analyzePaths().length, 0, `${label} must not request analysis`);
+}
+
+async function testReadmeClickDelegation() {
+  const modelLink = serverLink(fixture.serverHtml, 'owner/model', null);
+  ok(modelLink, 'server-rendered README must expose the model root link');
+
+  for (const [label, overrides] of [
+    ['Ctrl-modified', { ctrlKey: true }],
+    ['Meta-modified', { metaKey: true }],
+    ['Shift-modified', { shiftKey: true }],
+    ['Alt-modified', { altKey: true }],
+    ['middle', { button: 1 }]
+  ]) {
+    resetTest();
+    calls = [];
+    const event = clickEvent(linkAnchor(modelLink), true, overrides);
+    await assertReadmeClickStaysExternal(event, `${label} README link click`);
+  }
+
+  resetTest();
+  calls = [];
+  const preventedEvent = clickEvent(linkAnchor(modelLink), true, { defaultPrevented: true });
+  await assertReadmeClickStaysExternal(preventedEvent, 'already-prevented README link click', true);
+
+  resetTest();
+  calls = [];
+  const externalEvent = clickEvent(fakeAnchor({}), false);
+  await assertReadmeClickStaysExternal(externalEvent, 'anchor without data-hf-repo');
+
+  // Server attributes are the only internal-link source; forged repository or
+  // revision values must fail closed before navigation starts.
+  for (const forged of ['owner', 'owner/model/extra', '../model', 'owner/..', 'owner\\model', 'owner/model\x00']) {
+    resetTest();
+    calls = [];
+    const event = clickEvent(fakeAnchor({
+      'data-hf-repo': forged,
+      'data-hf-repo-type': 'model'
+    }));
+    await assertReadmeClickStaysExternal(event, `forged repository ${JSON.stringify(forged)}`);
+  }
+
+  for (const forged of ['..', '.', 'bad\nrevision', 'bad\x00revision', 'bad\\revision']) {
+    resetTest();
+    calls = [];
+    const event = clickEvent(fakeAnchor({
+      'data-hf-repo': 'owner/model',
+      'data-hf-repo-type': 'model',
+      'data-hf-repo-revision': forged
+    }));
+    await assertReadmeClickStaysExternal(event, `forged revision ${JSON.stringify(forged)}`);
+  }
+}
+
+async function testReadmePreviewContract() {
+  const serverHtml = '<p class="server-markup">server</p>';
+  const unsafeMarkdown = "[x](javascript:document.body.innerHTML='pwn')";
+
+  resetTest();
+  readmeImpl = () => ({ html: serverHtml });
+  await ui.loadReadmePreview({ repo: 'owner/model', branch: 'main' });
+  eq(lastReadmePath(), '/api/readme/owner/model?revision=main', 'README request keeps the revision parameter');
+  eq(nodes.get('#readmePreview').innerHTML, serverHtml, 'server-rendered README HTML is used verbatim');
+  eq(nodes.get('#readmeSection').hidden, false, 'server-rendered README reveals the section');
+
+  resetTest();
+  readmeImpl = () => ({ html: serverHtml });
+  await ui.loadReadmePreview({ repo: 'owner/data', branch: 'dev', is_dataset: true });
+  eq(lastReadmePath(), '/api/readme/owner/data?revision=dev&dataset=true', 'README request keeps revision and dataset');
+
+  // Empty server HTML is valid: sanitization removed everything, so raw
+  // markdown must never be rendered and the section stays hidden.
+  resetTest();
+  readmeImpl = () => ({ html: '', markdown: unsafeMarkdown });
+  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
+  eq(nodes.get('#readmePreview').innerHTML, '', 'empty html leaves the preview empty');
+  eq(nodes.get('#readmeSection').hidden, true, 'empty html hides the README section');
+  ok(!/javascript:/i.test(nodes.get('#readmePreview').innerHTML), 'empty html never emits a javascript: URL');
+  ok(!/document\.body/.test(nodes.get('#readmePreview').innerHTML), 'empty html never renders raw markdown');
+
+  // A 200 response missing html (or carrying null/non-string html) is a
+  // contract error even when markdown is present. The raw markdown must not be
+  // rendered, so the preview stays empty and the section stays hidden.
+  for (const [html, label, present] of [
+    [null, 'null html', true],
+    [42, 'non-string html', true],
+    [undefined, 'missing html', false]
+  ]) {
+    resetTest();
+    const payload = { markdown: fixture.markdown };
+    if (present) payload.html = html;
+    readmeImpl = () => payload;
+    await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
+    eq(nodes.get('#readmePreview').innerHTML, '', `${label} leaves the preview empty`);
+    eq(nodes.get('#readmeSection').hidden, true, `${label} hides the README section`);
+    ok(!/<a\b/i.test(nodes.get('#readmePreview').innerHTML), `${label} never renders markdown links`);
+    ok(!/data-hf-repo|javascript:/i.test(nodes.get('#readmePreview').innerHTML), `${label} never exposes unsafe markup or URLs`);
+  }
+
+  // A fetch or API error clears any previous README and hides the section.
+  resetTest();
+  nodes.get('#readmePreview').innerHTML = '<p class="stale">stale</p>';
+  nodes.get('#readmeSection').hidden = false;
+  readmeImpl = () => { throw new Error('readme unavailable'); };
+  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
+  eq(nodes.get('#readmePreview').innerHTML, '', 'failed README request clears the preview');
+  eq(nodes.get('#readmeSection').hidden, true, 'failed README request hides the README section');
 }
 
 async function testDualNamespaceSelection() {
@@ -719,22 +889,13 @@ async function testSameRepoRootLinkKeepsResolvedRevision() {
   eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model&revision=main', 'resolved main view loads revision=main');
   eq(nodes.get('#modalBackdrop').classList.contains('active'), false, 'resolved main view shows no revision picker');
 
-  // The real README renderer emits a same-repo root link without a revision.
-  const rootHtml = ui.renderMarkdownPreview(
-    '[root](https://huggingface.co/owner/model)',
-    fixture.baseRawURL,
-    fixture.baseBlobURL
-  );
-  const rootLink = extractLinks(rootHtml).find(link => link.repo === 'owner/model');
-  ok(rootLink, 'README root link must be classified internal');
+  // The real server renderer emits a same-repo root link without a revision.
+  const rootLink = serverLink(fixture.serverHtml, 'owner/model', null);
+  ok(rootLink, 'server-rendered README must expose the same-repo root link');
   eq(rootLink.type, 'model', 'README root link keeps the model type');
-  eq(rootLink.revision, null, 'README root link carries no revision');
 
   calls = [];
-  const event = clickEvent(fakeAnchor({
-    'data-hf-repo': rootLink.repo,
-    'data-hf-repo-type': rootLink.type
-  }));
+  const event = clickEvent(linkAnchor(rootLink));
   ui.handleReadmePreviewClick(event);
   eq(event.defaultPrevented, true, 'same-repo README root link must prevent external navigation');
   await flush();
@@ -1315,260 +1476,6 @@ async function testHeaderResyncDuringInFlightNavigation() {
   eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 're-synced dataset link survives response resolution');
 }
 
-function testClassifierAndReservedRoutes() {
-  resetTest();
-
-  const reserved = Array.from(ui.readmeReservedRoutes()).sort();
-  deepEq(reserved, fixture.serverReservedRoutes.slice().sort(), 'client and server reserved Hub route lists must stay identical');
-  for (const route of ['hardware', 'inference', 'solutions', 'chat']) {
-    ok(reserved.includes(route), `reserved Hub route ${route} must be rejected as an owner`);
-  }
-
-  for (const url of [
-    'https://huggingface.co/hardware/a10',
-    'https://huggingface.co/inference/models',
-    'https://huggingface.co/solutions/models',
-    'https://huggingface.co/chat/assistants',
-    'https://huggingface.co/owner/model/blob/main/config.json',
-    'https://huggingface.co/owner/model/resolve/main/model.gguf',
-    'https://huggingface.co/owner/model/raw/main/config.json',
-    'https://huggingface.co/owner/model/tree/main/folder/file.md',
-    'https://huggingface.co/datasets/owner/data/tree/v1/train',
-    'https://huggingface.co/owner/model/tree/refs/pr/1',
-    'https://example.com/owner/model'
-  ]) {
-    eq(ui.classifyHfRepoURL(url, fixture.baseBlobURL), null, `${url} must stay external`);
-  }
-  ok(ui.classifyHfRepoURL('https://huggingface.co/datasets/hardware/a10', fixture.baseBlobURL), 'datasets namespace remains a repository even with a reserved-looking owner');
-  deepEq(
-    { ...ui.classifyHfRepoURL('https://huggingface.co/owner/model/tree/refs%2Fpr%2F1', fixture.baseBlobURL) },
-    { repo: 'owner/model', repoType: 'model', revision: 'refs/pr/1' },
-    'encoded revision slash remains one revision segment'
-  );
-  deepEq(
-    { ...ui.classifyHfRepoURL('https://huggingface.co/datasets/owner/data/tree/v1', fixture.baseBlobURL) },
-    { repo: 'owner/data', repoType: 'dataset', revision: 'v1' },
-    'dataset tree revision remains internal'
-  );
-
-  // A click without the server/fallback-owned internal attribute is untouched.
-  const externalEvent = clickEvent(fakeAnchor({}), false);
-  ui.handleReadmePreviewClick(externalEvent);
-  eq(externalEvent.defaultPrevented, false, 'unsupported external URL must stay external');
-  eq(ui.history().length, 0, 'unsupported external URL must not enter history');
-
-  // Custom configured endpoint.
-  ui.state.settings = { endpoint: 'https://hf.example.test' };
-  const custom = ui.classifyHfRepoURL('https://hf.example.test/owner/model/tree/dev', fixture.baseBlobURL);
-  deepEq(
-    { ...custom },
-    { repo: 'owner/model', repoType: 'model', revision: 'dev' },
-    'custom endpoint repository links are internal'
-  );
-  eq(ui.classifyHfRepoURL('https://huggingface.co/owner/model', fixture.baseBlobURL), null, 'default Hub links are external on a custom endpoint');
-
-  // A configured endpoint path prefix must precede the repository path. The
-  // same host without that prefix stays external, and the prefix must match a
-  // whole path segment.
-  ui.state.settings = { endpoint: fixture.pathPrefixedEndpoint };
-  deepEq(
-    { ...ui.classifyHfRepoURL(fixture.pathPrefixedEndpoint + '/owner/model/tree/dev', fixture.pathPrefixedBaseBlobURL) },
-    { repo: 'owner/model', repoType: 'model', revision: 'dev' },
-    'path-prefixed endpoint repository tree links are internal'
-  );
-  deepEq(
-    { ...ui.classifyHfRepoURL(fixture.pathPrefixedEndpoint + '/datasets/owner/data/tree/v1', fixture.pathPrefixedBaseBlobURL) },
-    { repo: 'owner/data', repoType: 'dataset', revision: 'v1' },
-    'path-prefixed endpoint dataset tree revisions are internal'
-  );
-  eq(ui.classifyHfRepoURL('https://mirror.example/owner/model', fixture.pathPrefixedBaseBlobURL), null, 'same-host link without the endpoint prefix stays external');
-  eq(ui.classifyHfRepoURL('https://mirror.example/hfold/owner/model', fixture.pathPrefixedBaseBlobURL), null, 'endpoint prefix must match a whole path segment');
-
-  // Default ports are normalized the same way the server normalizes them.
-  ui.state.settings = { endpoint: 'https://huggingface.co' };
-  ok(ui.classifyHfRepoURL('https://huggingface.co:443/owner/model', fixture.baseBlobURL), 'explicit https default port is internal');
-  ui.state.settings = { endpoint: 'https://huggingface.co:443' };
-  ok(ui.classifyHfRepoURL('https://huggingface.co/owner/model', fixture.baseBlobURL), 'endpoint with an explicit default port is equivalent');
-  ui.state.settings = { endpoint: 'http://hf.example.test:80' };
-  ok(ui.classifyHfRepoURL('http://hf.example.test/owner/model', 'http://hf.example.test:80/owner/model/blob/main/'), 'explicit http default port is internal');
-}
-
-async function testServerClientEquivalence() {
-  resetTest();
-  ui.state.settings = { endpoint: fixture.endpoint };
-  const clientHtml = ui.renderMarkdownPreview(fixture.markdown, fixture.baseRawURL, fixture.baseBlobURL);
-  deepEq(extractLinks(clientHtml), extractLinks(fixture.serverHtml), 'server-rendered and client-fallback README links must agree');
-
-  const internal = extractLinks(fixture.serverHtml).filter(link => link.repo);
-  deepEq(
-    internal.map(link => [link.repo, link.type, link.revision]),
-    [
-      ['owner/model', 'model', null],
-      ['owner/data', 'dataset', null],
-      ['owner/model', 'model', 'dev'],
-      ['owner/model', 'model', 'refs/pr/1']
-    ],
-    'only repository roots and single-segment tree revisions become internal links'
-  );
-
-  ui.state.settings = { endpoint: fixture.pathPrefixedEndpoint };
-  const prefixedClientHtml = ui.renderMarkdownPreview(
-    fixture.pathPrefixedMarkdown,
-    fixture.pathPrefixedBaseRawURL,
-    fixture.pathPrefixedBaseBlobURL
-  );
-  deepEq(
-    extractLinks(prefixedClientHtml),
-    extractLinks(fixture.pathPrefixedServerHtml),
-    'server-rendered and client-fallback README links must agree under a path-prefixed endpoint'
-  );
-  const prefixedInternal = extractLinks(fixture.pathPrefixedServerHtml).filter(link => link.repo);
-  deepEq(
-    prefixedInternal.map(link => [link.repo, link.type, link.revision]),
-    [
-      ['owner/model', 'model', null],
-      ['owner/data', 'dataset', 'v1']
-    ],
-    'path-prefixed endpoint classifies only prefixed repository views as internal'
-  );
-}
-
-async function testBaseBlobURLConsumption() {
-  resetTest();
-  const baseRaw = 'https://huggingface.co/owner/readme/resolve/main/';
-  const baseBlob = 'https://huggingface.co/owner/readme/blob/main/';
-
-  calls = [];
-  readmeImpl = () => ({
-    markdown: '[file](config.json)\n\n![logo](assets/logo.png)',
-    baseRawURL: baseRaw,
-    baseBlobURL: baseBlob
-  });
-  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'dev', is_dataset: true });
-  eq(lastReadmePath(), '/api/readme/owner/readme?revision=dev&dataset=true', 'README request keeps revision and dataset');
-  const fallbackHtml = nodes.get('#readmePreview').innerHTML;
-  match(fallbackHtml, /href="https:\/\/huggingface\.co\/owner\/readme\/blob\/main\/config\.json"/, 'fallback links consume baseBlobURL');
-  match(fallbackHtml, /src="https:\/\/huggingface\.co\/owner\/readme\/resolve\/main\/assets\/logo\.png"/, 'fallback images consume baseRawURL');
-
-  readmeImpl = () => ({
-    html: '<p class="server-markup">server</p>',
-    markdown: '[file](config.json)',
-    baseRawURL: baseRaw,
-    baseBlobURL: baseBlob
-  });
-  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
-  eq(nodes.get('#readmePreview').innerHTML, '<p class="server-markup">server</p>', 'server-rendered HTML is used verbatim');
-
-  readmeImpl = () => ({ markdown: '[file](config.json)', baseRawURL: baseRaw });
-  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
-  match(nodes.get('#readmePreview').innerHTML, /href="https:\/\/huggingface\.co\/owner\/readme\/blob\/main\/config\.json"/, 'missing baseBlobURL derives the blob base');
-}
-
-async function testReadmeFallbackDerivesEndpointWithoutSettings() {
-  resetTest();
-  ui.state.settings = {};
-
-  const endpoint = fixture.pathPrefixedEndpoint;
-  const endpointOrigin = new URL(endpoint).origin;
-
-  // Initial page load or a failed settings fetch leaves no configured endpoint.
-  // A legacy server response has markdown but no html, so the client fallback
-  // must recover the endpoint path prefix from baseBlobURL + the known repo.
-  readmeImpl = () => ({
-    markdown: `[model](${endpoint}/owner/model)\n\n[same-host](${endpointOrigin}/owner/model)`,
-    baseRawURL: fixture.pathPrefixedBaseRawURL,
-    baseBlobURL: fixture.pathPrefixedBaseBlobURL
-  });
-  await ui.loadReadmePreview({ repo: 'owner/model', branch: 'main' });
-
-  const links = extractLinks(nodes.get('#readmePreview').innerHTML);
-  const prefixed = links.find(link => link.href === `${endpoint}/owner/model`);
-  const sameHost = links.find(link => link.href === `${endpointOrigin}/owner/model`);
-  ok(prefixed, 'settings-less fallback renders the prefixed repository link');
-  eq(prefixed.repo, 'owner/model', 'settings-less fallback classifies the prefixed link as owner/model');
-  eq(prefixed.type, 'model', 'settings-less fallback keeps the model type');
-  ok(sameHost, 'settings-less fallback renders the same-host link');
-  eq(sameHost.repo, null, 'same-host link without the endpoint prefix stays external');
-
-  calls = [];
-  const event = clickEvent(fakeAnchor({
-    'data-hf-repo': prefixed.repo,
-    'data-hf-repo-type': prefixed.type
-  }));
-  ui.handleReadmePreviewClick(event);
-  eq(event.defaultPrevented, true, 'settings-less prefixed README link prevents external navigation');
-  await flush();
-  eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model', 'settings-less prefixed README link navigates to Model Details');
-
-  // Older server responses omit baseBlobURL. The blob base derived from
-  // baseRawURL must feed the same endpoint recovery, including the dataset
-  // namespace.
-  resetTest();
-  ui.state.settings = {};
-  readmeImpl = () => ({
-    markdown: `[data](${endpoint}/datasets/owner/data)\n\n[same-host](${endpointOrigin}/datasets/owner/data)`,
-    baseRawURL: `${endpoint}/datasets/owner/data/resolve/main/`
-  });
-  await ui.loadReadmePreview({ repo: 'owner/data', branch: 'main', is_dataset: true });
-
-  const datasetLinks = extractLinks(nodes.get('#readmePreview').innerHTML);
-  const datasetLink = datasetLinks.find(link => link.href === `${endpoint}/datasets/owner/data`);
-  const externalDataset = datasetLinks.find(link => link.href === `${endpointOrigin}/datasets/owner/data`);
-  ok(datasetLink, 'derived baseBlobURL still renders the prefixed dataset link');
-  eq(datasetLink.repo, 'owner/data', 'derived baseBlobURL strips the endpoint prefix for datasets');
-  eq(datasetLink.type, 'dataset', 'derived baseBlobURL keeps the dataset type');
-  ok(externalDataset, 'derived baseBlobURL still renders the same-host dataset link');
-  eq(externalDataset.repo, null, 'same-host dataset link without the endpoint prefix stays external');
-}
-
-async function testReadmeFallbackSafety() {
-  resetTest();
-  const baseRaw = 'https://huggingface.co/owner/readme/resolve/main/';
-  const baseBlob = 'https://huggingface.co/owner/readme/blob/main/';
-
-  // A server response with html:'' means sanitization removed everything. It
-  // must never fall back to the raw markdown, even when that markdown contains
-  // an executable link.
-  readmeImpl = () => ({
-    html: '',
-    markdown: "[x](javascript:document.body.innerHTML='pwn')",
-    baseRawURL: baseRaw,
-    baseBlobURL: baseBlob
-  });
-  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
-  eq(nodes.get('#readmePreview').innerHTML, '', 'empty server html suppresses the markdown fallback');
-  eq(nodes.get('#readmeSection').hidden, true, 'empty server html hides the README section');
-  ok(!/javascript:/i.test(nodes.get('#readmePreview').innerHTML), 'empty server html never emits javascript:');
-
-  // Older servers have no html property, so the fallback renders markdown.
-  // Unsafe schemes become plain escaped labels; safe URLs are single-escaped.
-  resetTest();
-  readmeImpl = () => ({
-    markdown: [
-      '[js](javascript:alert)',
-      '[html](data:text/html,alert)',
-      '[query](https://example.com/?a=1&b=2)',
-      '![jsimg](javascript:alert)',
-      '![dataimg](data:image/png;base64,AAAA)',
-      '<img src=x onerror=alert(1)>'
-    ].join('\n\n'),
-    baseRawURL: baseRaw,
-    baseBlobURL: baseBlob
-  });
-  await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
-  const fallbackHtml = nodes.get('#readmePreview').innerHTML;
-  ok(!/href="javascript:/i.test(fallbackHtml), 'unsafe javascript links are not emitted');
-  ok(!/href="data:/i.test(fallbackHtml), 'data: links are not emitted as anchors');
-  ok(!/src="javascript:/i.test(fallbackHtml), 'unsafe javascript images are omitted');
-  ok(!/src="data:text\/html/i.test(fallbackHtml), 'unsafe data images are omitted');
-  match(fallbackHtml, />js</, 'unsafe link label remains visible as escaped text');
-  match(fallbackHtml, /href="https:\/\/example\.com\/\?a=1&amp;b=2"/, 'safe query-string href is escaped exactly once');
-  ok(!/&amp;amp;/.test(fallbackHtml), 'query-string URL is not double-escaped');
-  match(fallbackHtml, /src="data:image\/png;base64,AAAA"/, 'safe data:image sources remain allowed');
-  ok(!/<img src=x onerror/i.test(fallbackHtml), 'raw HTML is not emitted as markup');
-  match(fallbackHtml, /&lt;img src=x onerror=alert\(1\)&gt;/, 'raw HTML remains escaped text');
-}
-
 async function testSearchRowAndDetailHeader() {
   resetTest();
   const row = makeNode({ dataset: { repoType: 'dataset' } });
@@ -1734,7 +1641,9 @@ async function testNavigationPreservesCommunityPanel() {
 (async () => {
   await testAnalyzeFieldAutoDetectAndRefresh();
   await testDatasetOnlyAutoDetect();
-  await testReadmeLinkNavigation();
+  await testReadmeServerLinks();
+  await testReadmeClickDelegation();
+  await testReadmePreviewContract();
   await testDualNamespaceSelection();
   await testLineageAndRelatedDownloads();
   await testSameRepoModelDatasetHistory();
@@ -1755,17 +1664,12 @@ async function testNavigationPreservesCommunityPanel() {
   await testSearchRowDatasetHeaderDuringLoading();
   await testUntypedNavigationHidesHubLinkUntilResolved();
   await testHeaderResyncDuringInFlightNavigation();
-  testClassifierAndReservedRoutes();
-  await testServerClientEquivalence();
-  await testBaseBlobURLConsumption();
-  await testReadmeFallbackDerivesEndpointWithoutSettings();
-  await testReadmeFallbackSafety();
   await testSearchRowAndDetailHeader();
   await testDetailHeaderEndpointFromHealth();
   await testDetailHeaderEndpointFromSettings();
   await testSettingsEndpointAuthoritativeOverLateHealth();
   await testNavigationPreservesCommunityPanel();
-  console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);
+  console.log(`PASS: ${assertions} navigation/history/readme assertions against real app.js`);
 })().catch(error => {
   console.error('navigation-ui FAILED:', error && error.message ? error.message : error);
   if (error && error.stack) console.error(error.stack);
