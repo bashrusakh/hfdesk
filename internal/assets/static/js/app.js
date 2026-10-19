@@ -17,6 +17,11 @@
     // the window before /api/settings resolves (or when that fetch fails), and
     // settings overwrite it so a changed or default endpoint never goes stale.
     serverEndpoint: '',
+    // settingsEndpointResolved records that a successful /api/settings load
+    // supplied the endpoint preference, including the empty default. Once set,
+    // settings remain authoritative and a late /api/health response must not
+    // replace the remembered endpoint with its stale startup snapshot.
+    settingsEndpointResolved: false,
     wsConnected: false,
     ws: null,
     currentPage: 'analyze',
@@ -409,6 +414,12 @@ let revisionPickerNavigationMode = 'replace';
 // it, while selection and any other modal clear it, so closing an unrelated
 // dialog can never roll back or render a pending navigation.
 let revisionPickerCancelHandler = null;
+// The navigation request (and repository) that owns the open revision picker.
+// A selection only applies while this identity is still current; a newer
+// repository transition dismisses and disarms the picker so stale buttons
+// cannot save the old repository or navigation mode over the new stop.
+let revisionPickerRequestId = null;
+let revisionPickerRepo = null;
 let currentSelectedRepo = null;
 // Explicit type of the selected repo. null means the type is not known yet
 // (auto-detect), so a header refresh must not force model or dataset.
@@ -480,9 +491,12 @@ function configuredHfEndpointURL() {
 // /api/health value, and the default (empty) preference records the public Hub.
 // That keeps the remembered value from going stale after a settings change and
 // makes the default endpoint known even when health failed or returned none.
+// The resolved flag also stops a late health response from restoring a startup
+// custom endpoint after settings have already supplied the default.
 function rememberSettingsEndpoint(settings) {
   const configured = String(settings?.endpoint || '').trim();
   state.serverEndpoint = configured || 'https://huggingface.co';
+  state.settingsEndpointResolved = true;
 }
 
 // Parse one endpoint base into the pieces README link classification needs:
@@ -1443,6 +1457,11 @@ async function loadRepositoryDetails(entry) {
   const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
   if (!resultDiv) return;
 
+  // A new repository transition supersedes a revision picker opened by the
+  // previous navigation. Close it and disarm its handlers without running the
+  // pending-picker cancel hook; the new navigation owns the view now.
+  dismissRevisionPickerForNavigation();
+
   const repo = entry.repo;
   const revision = entry.revision;
   const isDataset = entry.repoType === 'dataset';
@@ -1667,6 +1686,19 @@ async function loadRepositoryDetails(entry) {
     });
   }
 
+  // A new navigation supersedes any picker from the previous one. Dismiss it
+  // without invoking its cancel hook: the old pending stop must not be rendered
+  // or rolled back while the new transition is taking over.
+  function dismissRevisionPickerForNavigation() {
+    if (revisionPickerRequestId === null) return;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
+    revisionPickerNavigationMode = 'replace';
+    revisionPickerCancelHandler = null;
+    const backdrop = $('#modalBackdrop');
+    if (backdrop?.classList.contains('active')) backdrop.classList.remove('active');
+  }
+
   // Show revision picker when multiple refs exist. Initial navigation shows the
   // picker for a pending entry; the analysis header reopens it for a rendered
   // view that must remain in history.
@@ -1733,7 +1765,11 @@ async function loadRepositoryDetails(entry) {
         <button class="btn btn-ghost" ${revisionAttrs('main')} onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)">Use default (main)</button>
       </div>
     `);
-    // showModal clears this hook; arm it only for the initial pending picker.
+    // showModal clears picker identity; bind this picker to the navigation
+    // request that opened it so a stale button cannot act after a new one.
+    revisionPickerRequestId = requestId;
+    revisionPickerRepo = String(data.repo || '');
+    // Arm the cancel hook only for the initial pending picker.
     revisionPickerCancelHandler = cancelOnClose
       ? () => cancelPendingRevisionPicker(data, requestId)
       : null;
@@ -1792,11 +1828,17 @@ async function loadRepositoryDetails(entry) {
   // navigation. Picker selections made from a rendered analysis push a new
   // stop so the previous revision remains reachable with Back.
   window.selectRevision = function(revision, isDataset, repoOverride = null) {
+    // A picker button belongs to the navigation that opened it. Ignore it once
+    // another navigation superseded that identity or the picker was closed, so
+    // the old repository/revision cannot overwrite the newer history stop.
+    if (revisionPickerRequestId === null || revisionPickerRequestId !== analyzeRequestId) return;
+    if (revisionPickerRepo && repoOverride && repoOverride !== revisionPickerRepo) return;
     // Selection is not cancellation: disarm the pending-picker hook first.
+    const navigationMode = revisionPickerNavigationMode;
+    const pickerRepo = revisionPickerRepo;
     revisionPickerCancelHandler = null;
     hideModal();
-    const repo = repoOverride || currentAnalysis?.repo || currentSelectedRepo || null;
-    const navigationMode = revisionPickerNavigationMode;
+    const repo = repoOverride || pickerRepo || currentAnalysis?.repo || currentSelectedRepo || null;
     revisionPickerNavigationMode = 'replace';
     openRepositoryInDetails(repo, isDataset === true || isDataset === 'true' ? 'dataset' : 'model', revision, navigationMode);
   };
@@ -5366,8 +5408,11 @@ async function loadRepositoryDetails(entry) {
   // =========================================
 
   function showModal(title, content) {
-    // Opening any modal supersedes a pending revision-picker close hook.
+    // Opening any modal supersedes a pending revision-picker close hook and
+    // invalidates any selection identity from a previous picker.
     revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = content;
     $('#modalBackdrop').classList.add('active');
@@ -5381,6 +5426,8 @@ async function loadRepositoryDetails(entry) {
     // Run the scoped cancel hook exactly once, after the dialog is closed.
     const cancel = revisionPickerCancelHandler;
     revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
     $('#modalBackdrop').classList.remove('active');
     if (cancel) cancel();
   }
@@ -6288,7 +6335,10 @@ async function loadRepositoryDetails(entry) {
       if (el && data.version) el.textContent = 'v' + data.version;
       const endpoint = typeof data.endpoint === 'string' ? data.endpoint.trim() : '';
       if (!endpoint) return;
-      state.serverEndpoint = endpoint;
+      // Settings are authoritative once they have successfully supplied the
+      // endpoint (including the default). A health response that resolves late
+      // must not overwrite that remembered value with its stale startup state.
+      if (!state.settingsEndpointResolved) state.serverEndpoint = endpoint;
       syncSelectedModelHeader();
     } catch (_) { /* leave blank if unavailable */ }
   }

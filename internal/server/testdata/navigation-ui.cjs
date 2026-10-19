@@ -289,6 +289,8 @@ const hook = `
       hasShownRevisionPicker = false;
       revisionPickerNavigationMode = 'replace';
       revisionPickerCancelHandler = null;
+      revisionPickerRequestId = null;
+      revisionPickerRepo = null;
       repoHistory = [];
       repoHistoryIndex = -1;
       syncRepoHistoryButtons();
@@ -311,6 +313,7 @@ function resetTest() {
   ui.state.settings = { endpoint: fixture.endpoint };
   ui.state.settingsLoadFailed = false;
   ui.state.serverEndpoint = '';
+  ui.state.settingsEndpointResolved = false;
   nodes.get('#analyzeInput').value = '';
   nodes.get('#analyzeResult').innerHTML = '';
   nodes.get('#modelsOverviewPanel').innerHTML = '';
@@ -992,6 +995,56 @@ async function testRevisionChangeFromRenderedAnalysis() {
   eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model&revision=dev', 'Forward reloads the dev analysis');
 }
 
+async function testRevisionPickerScopedToItsNavigation() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    if (data.repo === 'owner/a' || data.repo === 'owner/c') {
+      data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    }
+    return data;
+  };
+
+  // Open the picker for A, then leave its revision unresolved.
+  await ui.openRepositoryInDetails('owner/a', 'model', null, 'push');
+  eq(ui.getModal().active, true, 'A revision picker opens');
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/a', 'A pending stop is current while its picker is open');
+  eq(ui.currentRepoHistoryEntry().revision, null, 'A pending stop has no revision yet');
+
+  // Start a new repository transition to B. B has one ref, so it resolves
+  // without opening a replacement picker.
+  const navigation = ui.openRepositoryInDetails('owner/b', 'model', null, 'push');
+  eq(ui.getModal().active, false, 'a new repository transition closes the A picker immediately');
+  await flush();
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/b', 'B becomes the current history stop');
+  eq(ui.currentRepoHistoryEntry().revision, 'main', 'B resolves to its default revision');
+  eq(ui.getCurrentAnalysis().repo, 'owner/b', 'B is the rendered analysis');
+  await navigation;
+
+  const beforeHistory = historyTuples();
+  const beforeSelection = { ...ui.getSelectionState() };
+
+  // A stale A button call must be ignored: it belongs to the superseded
+  // navigation and would otherwise replace B's stop with A at dev.
+  window.selectRevision('dev', false, 'owner/a');
+  await flush();
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/b', 'stale A selection leaves B as the current stop');
+  eq(ui.currentRepoHistoryEntry().revision, 'main', 'stale A selection leaves B on its revision');
+  eq(ui.getCurrentAnalysis().repo, 'owner/b', 'stale A selection leaves B rendered');
+  deepEq(historyTuples(), beforeHistory, 'stale A selection does not rewrite history');
+  deepEq({ ...ui.getSelectionState() }, beforeSelection, 'stale A selection does not change the selection state');
+
+  // Normal selection still applies while its own navigation is current.
+  await ui.openRepositoryInDetails('owner/c', 'model', null, 'push');
+  eq(ui.getModal().active, true, 'C revision picker opens for the current navigation');
+  window.selectRevision('dev', false, 'owner/c');
+  await flush();
+  eq(ui.getModal().active, false, 'C selection closes its picker');
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/c', 'C remains the current stop after selection');
+  eq(ui.currentRepoHistoryEntry().revision, 'dev', 'C selection resolves the same stop to dev');
+  eq(ui.getCurrentAnalysis().branch, 'dev', 'C selection renders the selected revision');
+}
+
 async function testRefreshInFlightNavigation() {
   resetTest();
   await ui.openRepositoryInDetails('owner/previous', 'model', null, 'push');
@@ -1496,6 +1549,40 @@ async function testDetailHeaderEndpointFromSettings() {
   eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/model', 'default settings endpoint supplies the Hub href');
 }
 
+async function testSettingsEndpointAuthoritativeOverLateHealth() {
+  const customEndpoint = 'https://hf.example.test';
+
+  resetTest();
+  ui.state.settings = {};
+  ui.state.settingsLoadFailed = true;
+  settingsImpl = () => ({ endpoint: '' });
+
+  // Health snapshotted the custom endpoint at startup but its response is
+  // deferred. Settings resolve first with the default (empty) preference.
+  let settleHealth;
+  healthImpl = () => new Promise(resolve => { settleHealth = resolve; });
+  const health = ui.loadAppVersion();
+
+  await ui.openRepositoryInDetails('owner/model', 'model', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().hidden, true, 'Hub action stays hidden until settings or health supplies an endpoint');
+
+  await ui.loadStorageModeBadge();
+  await flush();
+  eq(ui.state.serverEndpoint, 'https://huggingface.co', 'default settings endpoint is remembered');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/model', 'default settings endpoint drives the Hub action before health resolves');
+
+  // The late health response must not restore its stale custom snapshot over
+  // the settings-authoritative default.
+  settleHealth({ status: 'ok', version: 'test', endpoint: customEndpoint });
+  await health;
+  await flush();
+
+  eq(ui.state.serverEndpoint, 'https://huggingface.co', 'late health response does not overwrite the remembered endpoint');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/model', 'late health endpoint never replaces the settings-authoritative link');
+  ok(!/hf\.example\.test/.test(ui.getDetailHeader().href), 'late custom health endpoint never appears in the Hub link');
+}
+
 async function testNavigationPreservesCommunityPanel() {
   resetTest();
 
@@ -1539,6 +1626,7 @@ async function testNavigationPreservesCommunityPanel() {
   await testCancelInitialRevisionPickerWithEscape();
   await testCancelAnalysisRevisionPickerKeepsRenderedView();
   await testRevisionChangeFromRenderedAnalysis();
+  await testRevisionPickerScopedToItsNavigation();
   await testRefreshInFlightNavigation();
   await testDetailHeaderTracksTypedInFlightNavigation();
   await testDetailHeaderSurvivesGenericAnalyzeError();
@@ -1553,6 +1641,7 @@ async function testNavigationPreservesCommunityPanel() {
   await testSearchRowAndDetailHeader();
   await testDetailHeaderEndpointFromHealth();
   await testDetailHeaderEndpointFromSettings();
+  await testSettingsEndpointAuthoritativeOverLateHealth();
   await testNavigationPreservesCommunityPanel();
   console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);
 })().catch(error => {
