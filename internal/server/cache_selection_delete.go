@@ -702,20 +702,6 @@ func jobMayWriteSelectedPathWithinBase(inv writableNamespaceInventory, targetIde
 	return false
 }
 
-func jobMayWriteFrozenSelectedPath(job *Job, target frozenMutationPath) bool {
-	base := jobDestinationBase(job)
-	if base == "" {
-		return false
-	}
-	if pathWithinWriterBase(base, target.key) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	if snapshotBase := jobSnapshotBase(job); snapshotBase != "" && pathWithinWriterBase(snapshotBase, target.key) {
-		return hfdownloader.GGUFPathSelected(filepath.Base(target.physical), job.Filters, job.Excludes, job.ExactMatch)
-	}
-	return false
-}
-
 // frozenPhysicalPaths returns the physical spellings of frozen mutation
 // entries. Reservations compare frozen values, but the batched writer checks
 // resolve each target against the job's inventoried namespaces.
@@ -732,36 +718,6 @@ func frozenPhysicalPaths(paths []frozenMutationPath) []string {
 		out[i] = path.physical
 	}
 	return out
-}
-
-// frozenPathsOverlapAny reports whether a raw path overlaps any frozen entry.
-func frozenPathsOverlapAny(path string, paths []frozenMutationPath) bool {
-	for _, candidate := range paths {
-		if frozenMutationOverlapsRawEntry(candidate, path) {
-			return true
-		}
-	}
-	return false
-}
-
-// frozenEntryOverlapsAny reports whether a frozen entry overlaps any frozen
-// candidate.
-func frozenEntryOverlapsAny(entry frozenMutationPath, paths []frozenMutationPath) bool {
-	for _, candidate := range paths {
-		if frozenMutationOverlap(entry, candidate) {
-			return true
-		}
-	}
-	return false
-}
-
-func pathWithinWriterBase(base, targetIdentity string) bool {
-	baseIdentity, err := mutationDirectoryIdentity(base)
-	if err != nil {
-		return true
-	}
-	rel, err := filepath.Rel(baseIdentity, targetIdentity)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // hasPathFilter reports whether a filter names a path rather than a bare
@@ -907,10 +863,12 @@ func (m *JobManager) reserveSelectedGGUFAttempt(paths []string) (func(), bool) {
 	}
 	for _, activity := range a.start.activities {
 		if activity.planKnown {
+			plannedSet := make(map[string]frozenMutationPath, len(activity.planned))
 			for _, planned := range activity.planned {
-				if frozenEntryOverlapsAny(planned, clean) {
-					return nil, false
-				}
+				plannedSet[planned.rawOrPhysical()] = planned
+			}
+			if plannedRawEntriesConflict(clean, plannedSet) {
+				return nil, false
 			}
 			if activity.planComplete {
 				continue
@@ -1282,14 +1240,6 @@ func (m *JobManager) registerRunActivityLocked(job *Job) uint64 {
 	m.runActivities[id] = &jobWriteActivity{job: job, descriptor: descriptor, planned: make(map[string]frozenMutationPath)}
 	m.bumpWriteDecisionLocked()
 	return id
-}
-
-func mapKeys[V any](values map[string]V) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	return keys
 }
 
 type selectedDeleteRequest struct {

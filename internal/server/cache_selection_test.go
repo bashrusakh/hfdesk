@@ -6218,6 +6218,49 @@ func TestIncompletePlannedRawDestinationIsRecheckedAfterItResolves(t *testing.T)
 	}
 }
 
+func TestSelectedDeleteReservationRevalidatesCompletedPlanRawAliasRetarget(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "actual-a")
+	dirB := filepath.Join(root, "actual-b")
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(root, "alias")
+	symlinkOrSkip(t, dirA, alias)
+	plannedRaw := filepath.Join(alias, "model.gguf")
+	planned, complete := plannedDestinationSet([]string{plannedRaw})
+	if !complete || len(planned) != 1 {
+		t.Fatalf("planned raw destination was not frozen: %v complete=%t", planned, complete)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, dirB, alias)
+
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	// A completed plan keeps its admitted raw lookup spelling and frozen
+	// physical identity. Retargeting the alias must still be revalidated at
+	// reservation time against the plan's current raw mapping.
+	m.mu.Lock()
+	m.runActivities[1] = &jobWriteActivity{
+		job:          &Job{ID: "completed", Repo: "owner/repo", OutputDir: root},
+		planKnown:    true,
+		planComplete: true,
+		planned:      planned,
+	}
+	m.mu.Unlock()
+	release, ok := m.reserveSelectedGGUF([]string{filepath.Join(dirB, "model.gguf")})
+	if ok {
+		release()
+		t.Fatal("reservation admitted although the completed plan's raw alias now resolves to the selected entry")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSelectedDeleteUsesProductionPredicateForQueuedJobs(t *testing.T) {
 	root := t.TempDir()
 	writeSelectionFile(t, filepath.Join(root, "owner", "model"), "model-Q4_K_M.gguf")

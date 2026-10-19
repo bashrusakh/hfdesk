@@ -44,11 +44,13 @@ type Job struct {
 	//   - "abc123" (commit SHA)
 	Revision string
 
-	// Filters define direct selection matches by case-insensitive name matching
-	// for any file type (not only LFS blobs). If empty, all files are downloaded.
+	// Filters define case-insensitive direct selection matches against the full
+	// repository-relative path for any file type (not only LFS blobs). Recognized
+	// dataset group filters may also select files by dataset membership. If empty,
+	// all files are downloaded.
 	//
-	// Each filter is matched against file names: a file is a direct match if its
-	// name contains any of the filter strings (substring mode, the default) or,
+	// Each filter is matched against repository-relative paths: a file is a direct
+	// match if its path contains any filter string (substring mode, the default) or,
 	// when ExactMatch is set, if the filter equals a whole delimiter-bounded
 	// path segment. Exact filters can use "./name" to select only the literal
 	// root-level basename; nested artifacts use their full relative path. Excludes

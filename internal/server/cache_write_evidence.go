@@ -157,17 +157,19 @@ func (m *JobManager) bumpWriteDecisionLocked() {
 func (m *JobManager) beginObservedMutation(paths []string) func() {
 	clean := make([]frozenMutationPath, 0, len(paths))
 	for _, p := range paths {
-		if p == "" {
-			continue
+		if p != "" {
+			frozen, err := freezeMutationEntry(p)
+			if err != nil {
+				// This tracker cannot refuse the cleanup operation. Preserve its
+				// raw spelling and use a lexical identity; overlap helpers treat an
+				// unresolvable current mapping conservatively.
+				if absolute, absErr := filepath.Abs(filepath.Clean(p)); absErr == nil {
+					frozen = frozenMutationPath{physical: absolute, key: pathIdentityKey(absolute)}
+				}
+			}
+			frozen.raw = p
+			clean = append(clean, frozen)
 		}
-		frozen, err := freezeMutationEntry(p)
-		if err != nil {
-			// The mutation still happens; the epoch bump below keeps decision
-			// waiters from treating their pre-mutation snapshot as current.
-			continue
-		}
-		frozen.raw = p
-		clean = append(clean, frozen)
 	}
 	m.mu.Lock()
 	if m.mutationScopes == nil {
@@ -472,23 +474,21 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 	}
 	// beginCacheMutation and HF reservations name directory scopes; selected
 	// GGUF deletes name leaf entries whose final symlink must remain unfollowed.
-	// The frozen identity kind is encoded in each scope key, so entry and
-	// directory scopes compare correctly without re-deriving it here.
 	for id, scopes := range a.start.mutations {
-		_ = id
+		kind := a.start.mutationKinds[id]
 		for _, scope := range scopes {
 			for _, target := range targets {
-				if frozenMutationOverlapsRawEntry(scope, target) {
+				if frozenScopeOverlapsEntry(scope, target, kind) {
 					return true
 				}
 			}
 			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
-					if frozenMutationOverlapsRawDirectory(scope, inv.base) {
+					if scopeOverlapsDirectory(scope.rawOrPhysical(), inv.base, kind) {
 						return true
 					}
 					for _, alias := range inv.aliases {
-						if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
+						if scopeOverlapsDirectory(scope.rawOrPhysical(), alias.location, kind) || scopeOverlapsDirectory(scope.rawOrPhysical(), alias.dest, kind) {
 							return true
 						}
 					}
@@ -499,17 +499,17 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 	for _, scopes := range a.start.hfReservations {
 		for _, scope := range scopes {
 			for _, target := range targets {
-				if frozenMutationOverlapsRawEntry(scope, target) {
+				if frozenScopeOverlapsEntry(scope, target, writeScopeDirectory) {
 					return true
 				}
 			}
 			for _, ev := range evidence {
 				for _, inv := range ev.inventories {
-					if frozenMutationOverlapsRawDirectory(scope, inv.base) {
+					if directoryScopesOverlap(scope.rawOrPhysical(), inv.base) {
 						return true
 					}
 					for _, alias := range inv.aliases {
-						if frozenMutationOverlapsRawDirectory(scope, alias.location) || frozenMutationOverlapsRawDirectory(scope, alias.dest) {
+						if directoryScopesOverlap(scope.rawOrPhysical(), alias.location) || directoryScopesOverlap(scope.rawOrPhysical(), alias.dest) {
 							return true
 						}
 					}
@@ -523,7 +523,7 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 	for _, scopes := range a.start.deletes {
 		for _, entry := range scopes {
 			for _, target := range targets {
-				if frozenMutationOverlapsRawEntry(entry, target) {
+				if frozenScopeOverlapsEntry(entry, target, writeScopeEntry) {
 					return true
 				}
 			}
@@ -544,6 +544,22 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 		}
 	}
 	return false
+}
+
+func directoryScopesOverlap(a, b string) bool {
+	a, errA := mutationDirectoryIdentity(a)
+	b, errB := mutationDirectoryIdentity(b)
+	if errA != nil || errB != nil {
+		return true
+	}
+	return withinLocalRoot(a, b) || withinLocalRoot(b, a)
+}
+
+func scopeOverlapsDirectory(scope, directory string, kind writeScopeKind) bool {
+	if kind == writeScopeEntry {
+		return mutationDirectoryEntryOverlap(directory, scope)
+	}
+	return directoryScopesOverlap(scope, directory)
 }
 
 func captureWriteIdentityProbe(path string, directory bool) (writeIdentityProbe, error) {

@@ -579,6 +579,94 @@ func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t
 	}
 }
 
+func TestCacheWriteEvidenceRevalidatesRawMutationScopeAfterAliasRetarget(t *testing.T) {
+	root := t.TempDir()
+	dirA := filepath.Join(root, "actual-a")
+	dirB := filepath.Join(root, "actual-b")
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(root, "managed-alias")
+	symlinkOrSkip(t, dirA, alias)
+
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	release, ok := m.beginCacheMutation(alias)
+	if !ok {
+		t.Fatal("cache mutation scope rejected")
+	}
+	defer func() {
+		release()
+		if err := m.Close(context.Background()); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+	}()
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, dirB, alias)
+
+	job := &Job{ID: "writer", Repo: "owner/repo", LocalDir: dirB, Flat: true, Status: JobStatusQueued}
+	base := jobDestinationBase(job)
+	if base == "" {
+		t.Fatal("writer destination base unavailable")
+	}
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	a, ok := m.beginCacheWriteAttempt()
+	if !ok {
+		t.Fatal("evidence attempt rejected")
+	}
+	defer a.Close()
+	a.Collect(job)
+	if !a.HasActiveBroadMutationFor(decisionJob(job), nil) {
+		t.Fatal("retargeted raw mutation scope did not block the writer's current namespace")
+	}
+}
+
+func TestWriteEvidenceObservedMutationRetainsUnfreezableCleanupScope(t *testing.T) {
+	root := t.TempDir()
+	obstruction := filepath.Join(root, "obstruct")
+	if err := os.WriteFile(obstruction, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := filepath.Join(obstruction, "partial")
+	if _, err := freezeMutationEntry(cleanup); err == nil {
+		t.Skip("platform resolved an entry below a regular file; lexical fallback is unreachable")
+	}
+	absolute, err := filepath.Abs(filepath.Clean(cleanup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	finish := m.beginObservedMutation([]string{cleanup})
+	defer finish()
+	a := testCacheWriteAttempt(m)
+	found := false
+	for _, scopes := range a.start.mutations {
+		for _, scope := range scopes {
+			if scope.raw != cleanup {
+				continue
+			}
+			found = true
+			if scope.key != pathIdentityKey(absolute) {
+				t.Fatalf("unfreezable cleanup key=%q want lexical %q", scope.key, pathIdentityKey(absolute))
+			}
+		}
+	}
+	if !found {
+		t.Fatal("unfreezable cleanup operation was dropped from the mutation snapshot")
+	}
+	if !a.HasActiveBroadMutation([]string{obstruction}) {
+		t.Fatal("unfreezable cleanup scope did not block overlapping writer evidence")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestObservedCleanupEntryScopeIsTypedAndNamespaceSensitive(t *testing.T) {
 	root := t.TempDir()
 	writerRoot := filepath.Join(root, "writer")
