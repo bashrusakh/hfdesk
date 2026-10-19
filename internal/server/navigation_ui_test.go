@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
-	"sort"
 	"testing"
 )
 
-// Node's built-in VM drives the shipped app.js navigation/history/classifier
-// code with DOM and fetch stubs. The server-rendered README HTML is produced by
-// the real renderer so the harness can compare both link-classification paths.
+// Node's built-in VM drives the shipped app.js navigation/history and README
+// click-delegation code with DOM and fetch stubs. The server-rendered README
+// HTML is produced by the real Go renderer, so the harness consumes the
+// server's link classification instead of reimplementing it in JavaScript.
 func TestNavigationUIHistory(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -49,24 +49,12 @@ func TestNavigationUIHistory(t *testing.T) {
 		"[nested](" + pathEndpoint + "/owner/model/tree/dev/folder/file.md)\n\n" +
 		"[same-host](https://mirror.example/owner/model)\n"
 
-	reserved := make([]string, 0, len(readmeReservedModelRoutes))
-	for route := range readmeReservedModelRoutes {
-		reserved = append(reserved, route)
-	}
-	sort.Strings(reserved)
-
 	fixture, err := json.Marshal(map[string]any{
-		"endpoint":                endpoint,
-		"baseRawURL":              baseRaw,
-		"baseBlobURL":             baseBlob,
-		"markdown":                markdown,
-		"serverHtml":              renderReadmeHTML(markdown, baseRaw, baseBlob, endpoint),
-		"serverReservedRoutes":    reserved,
-		"pathPrefixedEndpoint":    pathEndpoint,
-		"pathPrefixedBaseRawURL":  pathBaseRaw,
-		"pathPrefixedBaseBlobURL": pathBaseBlob,
-		"pathPrefixedMarkdown":    pathMarkdown,
-		"pathPrefixedServerHtml":  renderReadmeHTML(pathMarkdown, pathBaseRaw, pathBaseBlob, pathEndpoint),
+		"endpoint":               endpoint,
+		"markdown":               markdown,
+		"serverHtml":             renderReadmeHTML(markdown, baseRaw, baseBlob, endpoint),
+		"pathPrefixedEndpoint":   pathEndpoint,
+		"pathPrefixedServerHtml": renderReadmeHTML(pathMarkdown, pathBaseRaw, pathBaseBlob, pathEndpoint),
 	})
 	if err != nil {
 		t.Fatal(err)

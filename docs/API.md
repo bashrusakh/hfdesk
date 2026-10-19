@@ -363,10 +363,24 @@ Important response fields:
 }
 ```
 
-`html` is sanitized README HTML and must be preferred whenever present,
-including an empty string (sanitization removed all content). `markdown`,
-`baseRawURL`, and `baseBlobURL` support the older-server client fallback:
-`baseRawURL` resolves images and `baseBlobURL` resolves relative links.
+`html` is sanitized, URL-rewritten README HTML whose repository links are
+classified by the server. It is present on every successful response, including
+an empty string when sanitization removed all content. The bundled client
+renders only `html`; it does not render raw Markdown, and it treats a successful
+response without a string `html` field as a contract error.
+
+`markdown`, `baseRawURL`, and `baseBlobURL` remain in the response for API
+compatibility and for consumers that need the raw source or URL bases:
+`baseRawURL` is the base for images and `baseBlobURL` is the base for relative
+links. The bundled client does not render them.
+
+Internal repository links on the configured endpoint — repository roots and
+single-revision `/tree/{revision}` views — carry `data-hf-repo`,
+`data-hf-repo-type`, and, for tree views, `data-hf-repo-revision`. File URLs
+(`blob`, `resolve`, and `raw`) and unsupported paths remain external and carry
+no `data-hf-repo*` attributes. The bundled client uses these server-classified
+attributes for in-app Model Details navigation; `href` remains the external
+fallback.
 
 ## Plan
 

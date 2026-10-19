@@ -49,6 +49,45 @@ func TestRenderReadmeHTML(t *testing.T) {
 	}
 }
 
+func TestRenderReadmeHTML_UnsafeSchemesStripped(t *testing.T) {
+	md := "[js](javascript:alert(1))\n\n" +
+		"![jsimg](javascript:alert(1))\n\n" +
+		"[html](data:text/html,alert(1))\n\n" +
+		"![htmlimg](data:text/html,alert(1))\n"
+	html := renderReadmeHTML(md,
+		"https://huggingface.co/owner/model/resolve/main/",
+		"https://huggingface.co/owner/model/blob/main/",
+		"https://huggingface.co")
+
+	// The unsafe anchors and images are sanitized down to harmless content:
+	// link labels survive as text, and images keep their alt text while the
+	// unsafe attribute is removed.
+	for _, sub := range []string{
+		">js<",
+		">html<",
+		`alt="jsimg"`,
+		`alt="htmlimg"`,
+		`loading="lazy"`,
+	} {
+		if !strings.Contains(html, sub) {
+			t.Errorf("missing safe sanitized content %q in:\n%s", sub, html)
+		}
+	}
+
+	for _, sub := range []string{
+		"javascript:",
+		"data:text/html",
+		`href="javascript:`,
+		`src="javascript:`,
+		`href="data:text/html`,
+		`src="data:text/html`,
+	} {
+		if strings.Contains(html, sub) {
+			t.Errorf("rendered HTML retained unsafe value %q:\n%s", sub, html)
+		}
+	}
+}
+
 func TestClassifyReadmeRepoURL(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -562,6 +601,58 @@ func TestHandleReadmeEscapesRevision(t *testing.T) {
 	}
 	if want := "/owner/model/raw/refs%2Fpr%2F1/README.md"; gotRequestURI != want || gotEscapedPath != want {
 		t.Errorf("upstream request = %q (escaped path %q), want %q", gotRequestURI, gotEscapedPath, want)
+	}
+}
+
+func TestHandleReadme_EmptySanitizedHTMLPresent(t *testing.T) {
+	// A script-only README renders and sanitizes to empty HTML. Successful
+	// responses must still include a string html field: the bundled client
+	// renders only that field and treats a missing field as a contract error,
+	// while an empty string is valid and leaves the section hidden.
+	const markdown = "<script>alert(1)</script>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/owner/model/raw/main/README.md" {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, markdown)
+	}))
+	defer upstream.Close()
+
+	srv := newTestServerWithConfig(t, Config{Endpoint: upstream.URL})
+	req := httptest.NewRequest(http.MethodGet, "/api/readme/owner/model", nil)
+	req.SetPathValue("repo", "owner/model")
+	w := httptest.NewRecorder()
+	srv.handleReadme(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Pointers distinguish missing/null fields from present empty strings.
+	var got struct {
+		HTML        *string `json:"html"`
+		Markdown    *string `json:"markdown"`
+		BaseRawURL  *string `json:"baseRawURL"`
+		BaseBlobURL *string `json:"baseBlobURL"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.HTML == nil {
+		t.Fatalf("html field missing or null on success; the client requires a string html: %s", w.Body.String())
+	}
+	if *got.HTML != "" {
+		t.Fatalf("html = %q, want the empty sanitized output that must remain accepted", *got.HTML)
+	}
+	if got.Markdown == nil || *got.Markdown != markdown {
+		t.Errorf("markdown = %v, want the raw README %q", got.Markdown, markdown)
+	}
+	if got.BaseRawURL == nil || *got.BaseRawURL != upstream.URL+"/owner/model/resolve/main/" {
+		t.Errorf("baseRawURL = %v, want %q", got.BaseRawURL, upstream.URL+"/owner/model/resolve/main/")
+	}
+	if got.BaseBlobURL == nil || *got.BaseBlobURL != upstream.URL+"/owner/model/blob/main/" {
+		t.Errorf("baseBlobURL = %v, want %q", got.BaseBlobURL, upstream.URL+"/owner/model/blob/main/")
 	}
 }
 

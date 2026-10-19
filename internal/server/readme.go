@@ -433,10 +433,9 @@ func classifyReadmeRepoURLForEndpoint(rawURL string, endpoint readmeEndpointInfo
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", false, "", false
 	}
-	// Compare normalized host:port values. Browsers drop an explicit default
-	// port from URL.host, so the server must do the same or a link such as
-	// https://huggingface.co:443/owner/model would classify differently in the
-	// server-rendered HTML and the client fallback. Non-default ports still
+	// Compare normalized host:port values, dropping an explicit default port
+	// so a link such as https://huggingface.co:443/owner/model still matches an
+	// endpoint configured as https://huggingface.co. Non-default ports still
 	// have to match exactly.
 	if normalizeReadmeHost(u.Host, u.Scheme) != normalizeReadmeHost(endpoint.host, u.Scheme) {
 		return "", false, "", false
