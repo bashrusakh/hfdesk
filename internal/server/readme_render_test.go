@@ -565,6 +565,58 @@ func TestHandleReadmeEscapesRevision(t *testing.T) {
 	}
 }
 
+func TestHandleReadme_EmptySanitizedHTMLPresent(t *testing.T) {
+	// A script-only README renders and sanitizes to empty HTML. Successful
+	// responses must still include a string html field: the bundled client
+	// renders only that field and treats a missing field as a contract error,
+	// while an empty string is valid and leaves the section hidden.
+	const markdown = "<script>alert(1)</script>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/owner/model/raw/main/README.md" {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, markdown)
+	}))
+	defer upstream.Close()
+
+	srv := newTestServerWithConfig(t, Config{Endpoint: upstream.URL})
+	req := httptest.NewRequest(http.MethodGet, "/api/readme/owner/model", nil)
+	req.SetPathValue("repo", "owner/model")
+	w := httptest.NewRecorder()
+	srv.handleReadme(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Pointers distinguish missing/null fields from present empty strings.
+	var got struct {
+		HTML        *string `json:"html"`
+		Markdown    *string `json:"markdown"`
+		BaseRawURL  *string `json:"baseRawURL"`
+		BaseBlobURL *string `json:"baseBlobURL"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.HTML == nil {
+		t.Fatalf("html field missing or null on success; the client requires a string html: %s", w.Body.String())
+	}
+	if *got.HTML != "" {
+		t.Fatalf("html = %q, want the empty sanitized output that must remain accepted", *got.HTML)
+	}
+	if got.Markdown == nil || *got.Markdown != markdown {
+		t.Errorf("markdown = %v, want the raw README %q", got.Markdown, markdown)
+	}
+	if got.BaseRawURL == nil || *got.BaseRawURL != upstream.URL+"/owner/model/resolve/main/" {
+		t.Errorf("baseRawURL = %v, want %q", got.BaseRawURL, upstream.URL+"/owner/model/resolve/main/")
+	}
+	if got.BaseBlobURL == nil || *got.BaseBlobURL != upstream.URL+"/owner/model/blob/main/" {
+		t.Errorf("baseBlobURL = %v, want %q", got.BaseBlobURL, upstream.URL+"/owner/model/blob/main/")
+	}
+}
+
 func TestRenderReadmeHTML_InternalLinkAttrsAreRewriterOwned(t *testing.T) {
 	md := "<a href=\"https://huggingface.co/owner/model/tree/dev\" data-hf-repo=\"forged/model\" data-hf-repo-type=\"dataset\" data-hf-repo-revision=\"forged\" onclick=\"alert(1)\">model</a>\n" +
 		"<a href=\"https://example.com/evil\" data-hf-repo=\"forged/model\" data-hf-repo-type=\"dataset\">external</a>\n" +
