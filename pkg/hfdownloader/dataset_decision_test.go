@@ -63,33 +63,45 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
-func TestDatasetKnownMetadataNamesAreCompanionOnly(t *testing.T) {
+func TestDatasetKnownMetadataNamesAreCompanionOnlyInScope(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "tokenizer.json"},
-		{Path: "nested/dataset_info.json"},
+		{Path: "docs/dataset_info.json"},
+		{Path: "test/config.json"},
+		{Path: "nested/config.json"},
 	}, []string{"train"}, nil)
 	for i := 1; i <= 2; i++ {
 		got := c.Inputs[i].Alternatives
 		if len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
-			t.Fatalf("known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
+			t.Fatalf("in-scope known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
 		}
 	}
+	for i := 3; i <= 4; i++ {
+		got := c.Inputs[i].Alternatives
+		if len(got) == 1 && got[0].Role == datasetselection.EvidenceRoleCompanion {
+			t.Fatalf("out-of-scope known metadata %q was forced companion-only: %+v", c.Inputs[i].Path, got)
+		}
+	}
+	if got := c.Inputs[4].Alternatives; len(got) < 2 || got[0].Role != datasetselection.EvidenceRoleData || got[1].Role != datasetselection.EvidenceRoleCompanion {
+		t.Fatalf("arbitrary nested config alternatives = %+v; want data/companion ambiguity", got)
+	}
 
-	excluded := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "nested/dataset_info.json"}}, []string{"train"}, []string{"dataset_info.json"})
+	excluded := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "docs/dataset_info.json"}}, []string{"train"}, []string{"dataset_info.json"})
 	if !excluded.Inputs[1].Excluded {
-		t.Fatal("explicit exclude did not dominate nested dataset metadata evidence")
+		t.Fatal("explicit exclude did not dominate scoped dataset metadata evidence")
 	}
 }
 
-func TestDatasetKnownConfigIsCompanionOnly(t *testing.T) {
+func TestDatasetKnownConfigRoleScope(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "weights/model.gguf"},
-		{Path: "nested/config.json"},
+		{Path: "config.json"},
+		{Path: "test/config.json"},
 	}, []string{"weights/model.gguf"}, nil)
 	target := 1
 	if got := c.Inputs[target].Alternatives; len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
-		t.Fatalf("known config alternatives = %+v; want companion-only", got)
+		t.Fatalf("root config alternatives = %+v; want companion-only", got)
 	}
 	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 	world := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: companion}, nil)
@@ -98,7 +110,11 @@ func TestDatasetKnownConfigIsCompanionOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !evaluation.Records[target].Selected {
-		t.Fatalf("known config companion was not selected: %+v", evaluation.Records)
+		t.Fatalf("root config companion was not selected: %+v", evaluation.Records)
+	}
+	nested := c.Inputs[2].Alternatives
+	if len(nested) == 1 && nested[0].Role == datasetselection.EvidenceRoleCompanion {
+		t.Fatalf("test/config.json was forced companion-only: %+v", nested)
 	}
 	for _, cached := range []bool{true, false} {
 		q := c
@@ -578,18 +594,39 @@ func oracleDatasetPayloadPath(filePath string) bool {
 func oracleKnownDatasetCompanionPath(filePath string) bool {
 	p := strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
 	base := strings.ToLower(path.Base(p))
+	if oracleReadmeOrLicense(base) {
+		return true
+	}
+	if !oracleConventionalCompanionDirectory(p) {
+		return false
+	}
 	switch base {
 	case "config.json", "tokenizer.json", "tokenizer_config.json",
 		"special_tokens_map.json", "added_tokens.json", "vocab.json",
 		"merges.txt", "vocab.txt", "dataset_info.json", "dataset_infos.json",
-		"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
-		"environment.yml", "environment.yaml", "dockerfile", "makefile",
-		".gitattributes", ".gitignore", "tokenizer.bin":
+		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
+		"environment.yaml", "dockerfile", "makefile", ".gitattributes",
+		".gitignore", "tokenizer.bin", "copying", "notice":
 		return true
 	}
 	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
 		return true
 	}
+	if strings.HasPrefix(base, "environment") &&
+		(strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml")) {
+		return true
+	}
+	switch path.Ext(base) {
+	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2",
+		".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
+		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".cff":
+		return true
+	}
+	return false
+}
+
+func oracleReadmeOrLicense(base string) bool {
 	if strings.HasPrefix(base, "readme") {
 		if base == "readme" {
 			return true
@@ -599,27 +636,18 @@ func oracleKnownDatasetCompanionPath(filePath string) bool {
 			return true
 		}
 	}
-	if strings.HasPrefix(base, "license") {
-		rest := strings.TrimPrefix(base, "license")
-		if rest == "" || strings.HasPrefix(rest, "-") && len(rest) > 1 {
-			return true
-		}
-		switch rest {
-		case ".md", ".markdown", ".rst", ".txt":
-			return true
-		}
-	}
-	switch path.Ext(base) {
-	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2", ".cff":
+	if base == "license" {
 		return true
 	}
-	if !oracleConventionalCompanionDirectory(p) {
+	rest, ok := strings.CutPrefix(base, "license")
+	if !ok {
 		return false
 	}
-	switch path.Ext(base) {
-	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
-		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
-		".sql", ".html", ".css", ".js", ".ts", ".ipynb":
+	if strings.HasPrefix(rest, "-") {
+		return len(rest) > 1
+	}
+	switch rest {
+	case ".md", ".markdown", ".rst", ".txt":
 		return true
 	}
 	return false
@@ -632,8 +660,8 @@ func oracleConventionalCompanionDirectory(filePath string) bool {
 		return true
 	}
 	first, _, _ := strings.Cut(dir, "/")
-	switch first {
-	case "docs", "doc", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
+	switch strings.ToLower(first) {
+	case "docs", "doc", "notebooks", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
 		return true
 	}
 	return false

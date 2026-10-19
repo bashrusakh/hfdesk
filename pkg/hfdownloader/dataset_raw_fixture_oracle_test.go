@@ -267,14 +267,14 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 func TestDatasetVocabTxtIsKnownCompanion(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
-		{Type: "file", Path: "elsewhere/vocab.txt", Size: 11},
+		{Type: "file", Path: "tokenizer/vocab.txt", Size: 11},
 	}
 	membershipFiles := []datasetselection.File{{Path: files[0].Path}, {Path: files[1].Path}}
 	membership := datasetselection.Recognize(membershipFiles)
 	c := compileDatasetDecisionContext(files, membership, []string{"train.csv"}, nil, true, true, false)
 
-	// vocab.txt is a known tokenizer companion, so the role override removes
-	// its data(default) alternative and retains it outside selected dirs.
+	// vocab.txt is a known tokenizer companion in a conventional directory, so
+	// the role override removes its data(default) alternative and retains it.
 	if got := c.Inputs[1].Alternatives; len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
 		t.Fatalf("vocab.txt dataset alternatives = %+v; want companion-only", got)
 	}

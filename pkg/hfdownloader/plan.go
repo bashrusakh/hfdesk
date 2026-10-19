@@ -786,55 +786,86 @@ func isRecognizedMetadataPath(relativePath string) bool {
 }
 
 // isKnownDatasetCompanionPath is the positive allowlist for unmatched dataset
-// companions. Unknown extensions are skipped by default. Documentation,
-// config, and script extensions are path-scoped so unrelated split directories
-// cannot retain their code files; known tokenizer/citation assets are allowed
-// by name/extension regardless of placement.
+// companions. README/LICENSE variants are recognized metadata and allowed
+// anywhere; every other known name or extension is scoped to the repository
+// root or a conventional non-data directory. Unknown names remain unknown.
 func isKnownDatasetCompanionPath(relativePath string) bool {
-	if isRecognizedDatasetMetadataPath(relativePath) {
-		return true
-	}
-	p := strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
-	base := strings.ToLower(path.Base(p))
-	switch base {
-	case "vocab.txt", "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
-		"environment.yml", "environment.yaml", "dockerfile", "makefile",
-		".gitattributes", ".gitignore", "tokenizer.bin":
-		return true
-	}
-	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
-		return true
-	}
-	// Tokenizer/citation assets are known by extension independently of the
-	// directory that carries them.
-	switch path.Ext(base) {
-	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2", ".cff":
+	p := normalizeDatasetCompanionPath(relativePath)
+	if isDatasetReadmeOrLicensePath(p) {
 		return true
 	}
 	if !isConventionalCompanionDirectory(p) {
 		return false
 	}
+	return isKnownScopedDatasetCompanionBase(strings.ToLower(path.Base(p)))
+}
+
+func normalizeDatasetCompanionPath(relativePath string) string {
+	return strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
+}
+
+func isDatasetReadmeOrLicensePath(relativePath string) bool {
+	base := strings.ToLower(path.Base(normalizeDatasetCompanionPath(relativePath)))
+	if isREADMEPath(relativePath) {
+		return true
+	}
+	if base == "license" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(base, "license")
+	if !ok {
+		return false
+	}
+	if strings.HasPrefix(rest, "-") {
+		return len(rest) > 1
+	}
+	switch rest {
+	case ".md", ".markdown", ".rst", ".txt":
+		return true
+	}
+	return false
+}
+
+func isKnownScopedDatasetCompanionBase(base string) bool {
+	switch base {
+	case "config.json", "tokenizer.json", "tokenizer_config.json",
+		"special_tokens_map.json", "added_tokens.json", "vocab.json",
+		"merges.txt", "vocab.txt", "dataset_info.json", "dataset_infos.json",
+		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
+		"environment.yaml", "dockerfile", "makefile", ".gitattributes",
+		".gitignore", "tokenizer.bin", "copying", "notice":
+		return true
+	}
+	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
+		return true
+	}
+	if strings.HasPrefix(base, "environment") &&
+		(strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml")) {
+		return true
+	}
 	switch path.Ext(base) {
-	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
+	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2",
+		".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
 		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
-		".sql", ".html", ".css", ".js", ".ts", ".ipynb":
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".cff":
 		return true
 	}
 	return false
 }
 
 // isConventionalCompanionDirectory reports whether a path is at the repository
-// root or below a top-level docs/config/script/tokenizer directory. Split-like
-// directories and arbitrary nested paths are excluded.
+// root or below a top-level docs/config/script/tokenizer directory. Directory
+// matching is case-insensitive; split-like directories and arbitrary nested
+// paths are excluded.
 func isConventionalCompanionDirectory(relativePath string) bool {
-	p := strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
+	p := normalizeDatasetCompanionPath(relativePath)
 	dir := path.Dir(p)
 	if dir == "." || dir == "" {
 		return true
 	}
 	first, _, _ := strings.Cut(dir, "/")
-	switch first {
-	case "docs", "doc", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
+	switch strings.ToLower(first) {
+	case "docs", "doc", "notebooks", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
 		return true
 	}
 	return false
