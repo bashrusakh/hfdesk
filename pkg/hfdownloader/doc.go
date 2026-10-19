@@ -112,10 +112,12 @@ With AppendFilterSubdir, matched files are organized into subdirectories:
 		AppendFilterSubdir: true,  // Creates q4_0/ and q5_0/ subdirectories
 	}
 
-The public `PlanItem.DestinationSubdir` is the effective relative prefix for a
-planned item, separate from `PlanItem.Subdir` filter attribution. Combine it
-with `PlanItem.RelativePath` when `AppendFilterSubdir` is enabled to determine
-the download destination. `ScanPlan` preview event paths remain repository-relative.
+The public `PlanItem.DestinationSubdir` is the candidate relative prefix for a
+planned item, separate from `PlanItem.Subdir` filter attribution. It is
+populated even when `AppendFilterSubdir` is disabled. The downloader applies it
+only when the job enables `AppendFilterSubdir`; consumers must check that flag
+before combining it with `PlanItem.RelativePath` to determine the download
+destination. `ScanPlan` preview event paths remain repository-relative.
 
 # Resume Behavior
 

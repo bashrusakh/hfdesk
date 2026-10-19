@@ -194,9 +194,11 @@ type PlanItem struct {
 	AcceptRanges bool   `json:"acceptRanges"`
 	// Subdir holds the matched filter attribution (if any).
 	Subdir string `json:"subdir,omitempty"`
-	// DestinationSubdir is the relative prefix applied to this file when the
-	// request enables AppendFilterSubdir. It is empty when the file remains at
-	// its repository-relative path. This is distinct from Subdir attribution.
+	// DestinationSubdir is the candidate relative prefix selected for this
+	// file. The downloader applies it only when the job enables
+	// AppendFilterSubdir; consumers must check that flag before combining it
+	// with RelativePath. The field is populated independently of that flag and
+	// is distinct from Subdir filter attribution.
 	DestinationSubdir string `json:"destinationSubdir,omitempty"`
 }
 
@@ -943,9 +945,10 @@ func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exa
 // selected. Keep this deliberately separate from storage/LFS status.
 func isModelPayloadPath(filePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
-	// Match the established weight-file exclusions from smartdl: these are
-	// recognized training artifacts, not evidence of another model payload.
-	if strings.Contains(base, "optimizer") || strings.Contains(base, "training") {
+	// Exclude recognized optimizer/trainer artifact names, not every basename
+	// that happens to contain those words. A model weight such as
+	// training-model.safetensors is still another payload.
+	if isTrainingArtifactBase(base) {
 		return false
 	}
 	switch path.Ext(base) {
@@ -964,6 +967,36 @@ func isModelPayloadPath(filePath string) bool {
 		base == "tf_model.h5" || isNumberedArtifactShard(base, "tf_model", ".h5") ||
 		base == "model.tflite" || base == "rust_model.ot" {
 		return true
+	}
+	return false
+}
+
+// isTrainingArtifactBase recognizes delimiter-bounded optimizer/trainer state
+// names. It deliberately does not match arbitrary substrings: model weights may
+// legitimately carry a "training" token (training-model.safetensors,
+// model-training.pt) without being training artifacts.
+func isTrainingArtifactBase(base string) bool {
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	tokens := strings.FieldsFunc(stem, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	})
+	if len(tokens) == 0 {
+		return false
+	}
+	for i, token := range tokens {
+		if i == 0 && token == "optimizer" {
+			return true
+		}
+		if i+1 >= len(tokens) {
+			continue
+		}
+		switch token {
+		case "training", "trainer":
+			next := tokens[i+1]
+			if next == "args" || next == "state" || next == "states" {
+				return true
+			}
+		}
 	}
 	return false
 }

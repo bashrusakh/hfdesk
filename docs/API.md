@@ -451,7 +451,12 @@ Request:
 }
 ```
 
-Returns the files that would be downloaded without starting a job.
+Returns the files that would be downloaded without starting a job. Each item's
+`destinationSubdir` is the candidate relative prefix selected by the matched
+filter, and `subdir` is its filter attribution. `destinationSubdir` is populated
+independently of `appendFilterSubdir`; the downloader applies it only when that
+job flag is enabled, so consumers must check the flag before combining it with
+`path`.
 
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with

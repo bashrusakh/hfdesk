@@ -576,6 +576,74 @@ func TestPlanRepoDatasetKnownRootMetadataResolvesAsCompanion(t *testing.T) {
 	}
 }
 
+func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "docs/guide.md", Size: 4},
+		{Type: "file", Path: "utils/tool.py", Size: 5},
+		{Type: "file", Path: "elsewhere/notes.txt", Size: 6},
+	}
+	for _, tc := range []struct {
+		name    string
+		filters []string
+	}{
+		{name: "recognized group", filters: []string{"train"}},
+		{name: "ordinary path", filters: []string{"train.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			// Definite non-data companions are retained, while the ambiguous
+			// nested .txt file keeps its established unselected behavior.
+			assertPaths(t, planPaths(plan), []string{"train.csv", "docs/guide.md", "utils/tool.py"})
+		})
+	}
+
+	t.Run("excluded companion", func(t *testing.T) {
+		srv := mockHFServerForPlan(t, files)
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, Excludes: []string{"docs/guide.md"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo with excluded companion: %v", err)
+		}
+		assertPaths(t, planPaths(plan), []string{"train.csv", "utils/tool.py"})
+	})
+
+	t.Run("LFS companion", func(t *testing.T) {
+		lfsFiles := []hfNode{
+			{Type: "file", Path: "train.csv", Size: 10},
+			{Type: "file", Path: "docs/guide.md", LFS: &hfLfsInfo{Size: 4}},
+			{Type: "file", Path: "utils/tool.py", Size: 5},
+		}
+		srv := mockHFServerForPlan(t, lfsFiles)
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo with LFS companion: %v", err)
+		}
+		assertPaths(t, planPaths(plan), []string{"train.csv", "utils/tool.py"})
+	})
+
+	t.Run("GGUF-only remains matched-only", func(t *testing.T) {
+		ggufFiles := []hfNode{
+			{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100},
+			{Type: "file", Path: "docs/guide.md", Size: 4},
+			{Type: "file", Path: "utils/tool.py", Size: 5},
+		}
+		srv := mockHFServerForPlan(t, ggufFiles)
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo GGUF-only: %v", err)
+		}
+		assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf"})
+	})
+}
+
 func TestPlanRepoDatasetUnknownRootMetadataStaysAmbiguousOrUnselected(t *testing.T) {
 	for _, metadata := range []string{"notes.txt", "data.json"} {
 		t.Run("group/"+metadata, func(t *testing.T) {

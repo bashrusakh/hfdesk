@@ -273,13 +273,17 @@ func TestFeasibleDatasetDecisionWorldAgainstIndependentSmallOracle(t *testing.T)
 }
 
 func TestRequiredIneligibilityRejectsRootCompanionAndAcceptsNestedCompanion(t *testing.T) {
-	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "config.json"}, {Path: "nested/notes.md"}}, []string{"train"}, nil)
+	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "config.json"}, {Path: "nested/notes.txt"}}, []string{"train"}, nil)
 	rootCompanion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); ok {
 		t.Fatal("root non-LFS companion cannot satisfy required ineligibility")
 	}
 	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{2: rootCompanion}, []int{2}, nil, nil); !ok {
-		t.Fatal("unseeded nested companion should satisfy required ineligibility")
+		t.Fatal("unseeded nested ambiguous companion should satisfy required ineligibility")
+	}
+	definite := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "nested/notes.md"}}, []string{"train"}, nil)
+	if _, ok := feasibleAnyCoreDecisionWorld(definite, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); ok {
+		t.Fatal("unseeded nested definite companion must remain retained")
 	}
 	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{99: rootCompanion}, nil, nil, nil); ok {
 		t.Fatal("pin to unknown input accepted")
@@ -297,7 +301,7 @@ func TestRequiredIneligibilityRejectsRootCompanionAndAcceptsNestedCompanion(t *t
 	if _, ok := feasibleAnyCoreDecisionWorld(directLFS, datasetDecisionPins{0: rootCompanion}, []int{0}, nil, nil); ok {
 		t.Fatal("directly matched LFS companion is eligible")
 	}
-	excludedSeed := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/notes.md"}}, []string{"train"}, []string{"train.csv"})
+	excludedSeed := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/notes.txt"}}, []string{"train"}, []string{"train.csv"})
 	train := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "train"}
 	if _, ok := feasibleAnyCoreDecisionWorld(excludedSeed, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); !ok {
 		t.Fatal("excluded direct candidate must not seed companion scope")
@@ -586,7 +590,7 @@ func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, co
 			continue
 		}
 		dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-		eligible[i] = dir == "." || dirs[dir]
+		eligible[i] = in.DefiniteCompanion || dir == "." || dirs[dir]
 	}
 	return eligible
 }
@@ -1485,7 +1489,7 @@ func TestStableEvaluationRejectsConditionallySeededAmbiguousRole(t *testing.T) {
 func TestStableEvaluationRejectsRoleDependentDirectorySeed(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "folder/data.json"},
-		{Path: "folder/README.md"},
+		{Path: "folder/notes.txt"},
 	}, []string{"default"}, nil)
 	if len(c.Inputs[0].Alternatives) < 2 {
 		t.Fatalf("fixture needs data/companion ambiguity: %+v", c.Inputs[0].Alternatives)
@@ -1812,7 +1816,7 @@ func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, co
 				continue
 			}
 			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-			if d != "." && !dirs[d] {
+			if !in.DefiniteCompanion && d != "." && !dirs[d] {
 				continue
 			}
 		}

@@ -60,7 +60,12 @@ type datasetDecisionInput struct {
 	CaseDuplicateOf        int
 	ExactDuplicateEligible bool
 	CaseDuplicateEligible  bool
-	LFS                    bool
+	// DefiniteCompanion is evidence-backed: every finite role alternative is a
+	// companion, or the resolver recorded a definite companion role. Unlike a
+	// recognized metadata/root/directory fallback, this signal identifies files
+	// that are companions by their own evidence rather than by placement.
+	DefiniteCompanion bool
+	LFS               bool
 }
 
 // datasetDecisionContext is an immutable, deterministic snapshot of inputs
@@ -173,6 +178,7 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 		in := datasetDecisionInput{Path: n.Path, LFS: n.LFS != nil, ExactDuplicateOf: -1, CaseDuplicateOf: -1}
 		e, hasEvidence := evidence[i]
 		if hasEvidence {
+			in.DefiniteCompanion = isDefiniteCompanionEvidence(e)
 			for _, role := range e.PossibleRoles {
 				if role == datasetselection.EvidenceRoleCompanion {
 					in.Alternatives = append(in.Alternatives, datasetDecisionRoleLabel{Role: role})
@@ -311,6 +317,24 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 	}
 	c.uniqueEvaluation = &datasetDecisionUniqueEvaluation{}
 	return c
+}
+
+// isDefiniteCompanionEvidence reports that membership evidence leaves no data
+// interpretation for the input. Ambiguous data/companion alternatives therefore
+// remain non-definite and keep their established selection behavior.
+func isDefiniteCompanionEvidence(e datasetselection.Evidence) bool {
+	if e.DefiniteRole == datasetselection.EvidenceRoleCompanion {
+		return true
+	}
+	if len(e.PossibleRoles) == 0 {
+		return false
+	}
+	for _, role := range e.PossibleRoles {
+		if role != datasetselection.EvidenceRoleCompanion {
+			return false
+		}
+	}
+	return true
 }
 
 func stableSortedKeys(set map[string]struct{}) []string {

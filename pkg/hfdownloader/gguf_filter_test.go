@@ -24,6 +24,10 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		"config.json",
 		"tokenizer.json",
 	}
+	trainingNamedRepo := []string{
+		"model-q4_k_m.gguf",
+		"training-model.safetensors",
+	}
 
 	cases := []struct {
 		name    string
@@ -38,6 +42,7 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		{"filter matches no gguf in repo", ggufRepo, []string{"q4_k_m"}, false, false},
 		{"mmproj filter targets a gguf", multimodalRepo, []string{"q4_k_m", "mmproj"}, false, true},
 		{"safetensors filter is not gguf", transformersRepo, []string{"safetensors"}, false, false},
+		{"training-named payload keeps mixed mode", trainingNamedRepo, []string{"q4_k_m", "training-model"}, false, false},
 		{"non-gguf filter in gguf repo", ggufRepo, []string{"config.json"}, false, false},
 	}
 
@@ -73,8 +78,12 @@ func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T)
 		{"weights/model.ot", false},
 		{"weights/pytorch_model.bin.index.json", false},
 		{"weights/tokenizer.bin", false},
+		{"weights/training-model.safetensors", true},
+		{"weights/model-training.pt", true},
 		{"weights/optimizer.pt", false},
 		{"weights/training-state.pth", false},
+		{"weights/training_args.bin", false},
+		{"weights/optimizer.bin", false},
 		{"config.json", false},
 		{"notes.unknown", false},
 	} {
