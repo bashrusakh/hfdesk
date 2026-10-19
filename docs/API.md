@@ -748,11 +748,13 @@ repository type and returns only that cache type (or `404` when absent). An
 invalid supplied type returns `400`. Omitting `type` preserves the legacy
 model-first, then dataset/local lookup behavior.
 
-Its `quantizations` list contains only model quantization labels. A multimodal
-projector companion is reported separately: `hasMMProj` is `true` and the
-companion paths are listed in `mmprojFiles`. A dot-separated companion
-(`model.mmproj-f16.gguf`) is therefore reported under `mmprojFiles` instead of
-appearing as an `F16` quantization.
+Its `quantizations` list contains only model quantization labels. A file is
+reported as a multimodal projector companion when its basename contains
+"mmproj" (case-insensitively), so a dot-separated companion
+(`model.mmproj-f16.gguf`) and a name that merely starts with "mmproj"
+(`mmprojector-f16.gguf`) are both companions. A companion is reported
+separately: `hasMMProj` is `true` and the companion paths are listed in
+`mmprojFiles` instead of appearing as a quantization label.
 
 Cache entries may come from:
 

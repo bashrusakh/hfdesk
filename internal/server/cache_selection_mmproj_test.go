@@ -592,6 +592,56 @@ func TestCacheSelectionHFMMProjCompanionGroup(t *testing.T) {
 	}
 }
 
+// A companion does not inherit the parent-directory quantization fallback that
+// LLM groups use, while an ordinary weight file in the same directory does.
+func TestCacheSelectionMMProjDoesNotInheritDirectoryQuant(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	quantDir := filepath.Join(repoDir, "Q4_K_M")
+	// The companion's own name carries no quantization token.
+	writeSelectionFile(t, quantDir, "mmproj.gguf")
+	// An ordinary weight file takes the directory's quantization label.
+	writeSelectionFile(t, quantDir, "model.gguf")
+	// A file with its own token keeps that token.
+	writeSelectionFile(t, quantDir, "model-Q8_0.gguf")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalScanDirs: []string{root}})
+	code, selection := getSelection(t, s, "owner/model", "model", "")
+	if code != http.StatusOK {
+		t.Fatalf("selection status=%d", code)
+	}
+	location := mmprojLocalLocation(t, selection, root)
+	companion := mmprojSelectionGroup(t, location, "Q4_K_M/mmproj.gguf")
+	if companion.Kind != cacheSelectionKindVisionEncoder {
+		t.Fatalf("companion kind=%q, want %q", companion.Kind, cacheSelectionKindVisionEncoder)
+	}
+	if companion.Quant != "" {
+		t.Fatalf("companion inherited the directory quantisation label %q", companion.Quant)
+	}
+	if !strings.HasPrefix(companion.ID, "mmproj-") {
+		t.Fatalf("companion group id=%q must use the mmproj- prefix", companion.ID)
+	}
+	fallback := mmprojSelectionGroup(t, location, "Q4_K_M/model.gguf")
+	if fallback.Kind != cacheSelectionKindLLM || fallback.Quant != "Q4_K_M" {
+		t.Fatalf("llm group=%+v, want the directory quantisation fallback", fallback)
+	}
+	own := mmprojSelectionGroup(t, location, "Q4_K_M/model-Q8_0.gguf")
+	if own.Kind != cacheSelectionKindLLM || own.Quant != "Q8_0" {
+		t.Fatalf("llm group=%+v, want its own quantisation label", own)
+	}
+	info := mmprojCacheInfo(t, s, "owner/model")
+	if !info.HasMMProj || len(info.MMProjFiles) != 1 || filepath.Base(info.MMProjFiles[0]) != "mmproj.gguf" {
+		t.Fatalf("cache info did not report the companion: %+v", info)
+	}
+	for _, quantization := range info.Quantizations {
+		if quantization == "Q4_K_M" {
+			t.Fatalf("cache info listed the companion's directory quantisation: %v", info.Quantizations)
+		}
+	}
+	if !reflect.DeepEqual(info.Quantizations, []string{"Q8_0"}) {
+		t.Fatalf("cache info quantizations=%v, want only the file's own token", info.Quantizations)
+	}
+}
+
 // A dot-separated companion is classified by the same rule the download side
 // uses, so the selection model and the cache metadata agree that it is a
 // vision encoder and never a model quantization.
