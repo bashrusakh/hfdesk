@@ -1105,11 +1105,15 @@ func isNumberedArtifactShard(base, stem, extension string) bool {
 	return true
 }
 
-// isREADMEPath identifies README documents that may carry a selected GGUF
-// quant token in their filename. They are descriptive companions, not evidence
-// that a filter also selected a non-GGUF payload.
+// isREADMEPath identifies README documents (bare README or a recognized text
+// extension) that may carry a selected GGUF quant token in their filename.
+// They are descriptive companions, not evidence that a filter also selected a
+// non-GGUF payload.
 func isREADMEPath(filePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	if base == "readme" {
+		return true
+	}
 	if !strings.HasPrefix(base, "readme") {
 		return false
 	}

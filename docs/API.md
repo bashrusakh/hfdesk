@@ -451,12 +451,20 @@ Request:
 }
 ```
 
-Returns the files that would be downloaded without starting a job. Each item's
-`destinationSubdir` is the candidate relative prefix selected by the matched
-filter, and `subdir` is its filter attribution. `destinationSubdir` is populated
-independently of `appendFilterSubdir`; the downloader applies it only when that
-job flag is enabled, so consumers must check the flag before combining it with
-`path`.
+Returns the files that would be downloaded without starting a job. Each HTTP
+response item exposes only `path`, `size`, and `lfs`; `path` is
+repository-relative. The response does not include filter-attribution or
+destination-prefix fields.
+
+The public Go planning contract is broader. `hfdownloader.PlanItem`, returned by
+`PlanRepo` and delivered to `Settings.OnPlanComplete`, also exposes
+`DestinationSubdir` (`destinationSubdir`) and `Subdir` (`subdir`).
+`DestinationSubdir` is the candidate relative prefix selected by the matched
+filter; it is populated independently of `appendFilterSubdir`, and the
+downloader applies it only when that job flag is enabled, so Go consumers must
+check the flag before combining it with `RelativePath`. `Subdir` is the matched
+filter attribution. `ScanPlan` preview events and the `/api/plan` response
+remain repository-relative.
 
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with

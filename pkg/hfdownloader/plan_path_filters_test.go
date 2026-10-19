@@ -570,6 +570,37 @@ func TestPlanRepoDatasetKnownRootMetadataResolvesAsCompanion(t *testing.T) {
 	}
 }
 
+func TestPlanRepoDatasetBareReadmeCompanion(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "README", Size: 11},
+		{Type: "file", Path: "train/README", Size: 12},
+		{Type: "file", Path: "README.md", Size: 13},
+		{Type: "file", Path: "MAINTAINERS", Size: 14},
+	}
+	want := []string{"train.csv", "README", "train/README", "README.md"}
+	for _, tc := range []struct {
+		name    string
+		filters []string
+	}{
+		{name: "recognized group", filters: []string{"train"}},
+		{name: "ordinary path", filters: []string{"train.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			// Bare README variants are companions at the root and any depth,
+			// matching README.md's established behavior. Arbitrary bare names
+			// such as MAINTAINERS remain unknown and are not retained.
+			assertPaths(t, planPaths(plan), want)
+		})
+	}
+}
+
 func TestPlanRepoDatasetRetainsKnownCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},

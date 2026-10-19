@@ -134,7 +134,7 @@ async function reconcile(items) {
   const data = { repo: REPO, selectable_items: items };
   ui.refreshDlStatusFromJobs(REPO);
   await ui.syncLocalAnalysisStatus(data);
-  ui.refreshDlStatusFromJobs(REPO, { includeArtifactDone: false });
+  ui.refreshDlStatusFromJobs(REPO);
   const html = ui.renderSelectableItems(items, 'selectableItems');
   return { map: ui.getDlStatus(REPO), html };
 }
@@ -181,6 +181,10 @@ function assertRunning(html, message) {
   match(html, /quant-dl-btn-running/, `${message}: running chip`);
   doesNotMatch(html, /data-download=/, `${message}: no Download button while running`);
 }
+function assertQueued(html, message) {
+  match(html, /quant-dl-btn-queued/, `${message}: queued chip`);
+  doesNotMatch(html, /data-download=/, `${message}: no Download button while queued`);
+}
 
 const scenarios = [];
 function scenario(name, fn) { scenarios.push({ name, fn }); }
@@ -219,15 +223,38 @@ scenario('verified cache presence completes a partially planned job', async () =
   assertDone(html, '', 'cache-complete artifact');
 });
 
-scenario('job outcome completes an artifact when cache lookup errors', async () => {
+scenario('job outcome does not complete an artifact when cache lookup errors', async () => {
   reset({ jobs: [completedJob()], cacheError: new Error('cache lookup failed') });
   const { map, html } = await reconcile([artifactItem(FILES)]);
-  eq(map[ARTIFACT_KEY], 'done', 'full job outcome is sufficient when cache is unknown');
-  assertDone(html, '', 'job-complete artifact');
+  eq(map[ARTIFACT_KEY], undefined, 'cache-unknown artifact must stay not-done');
+  assertIdle(html, '', 'cache-unknown artifact');
 });
 
-scenario('cache 404 clears job-derived done', async () => {
-  reset({ jobs: [completedJob()], cacheStatus: 404 });
+scenario('skipped in-flight shard with cache lookup error stays not done', async () => {
+  // A BlobDownloading skip reaches the server as a completed per-file outcome;
+  // the removed helper also accepted skipped. Either way, a completed job can
+  // include a shard another process is still downloading, so it does not prove
+  // the shard is cached.
+  reset({
+    jobs: [completedJob({
+      files: [
+        { path: SHARD1, status: 'complete' },
+        { path: SHARD2, status: 'skipped' }
+      ]
+    })],
+    cacheError: new Error('cache lookup failed')
+  });
+  const { map, html } = await reconcile([artifactItem(FILES)]);
+  eq(map[ARTIFACT_KEY], undefined, 'unverified skip must not become done');
+  assertIdle(html, '', 'skipped in-flight artifact');
+});
+
+scenario('cache 404 clears previously cached done', async () => {
+  reset({
+    jobs: [completedJob()],
+    cacheStatus: 404,
+    initial: { [ARTIFACT_KEY]: 'done' }
+  });
   const { map, html } = await reconcile([artifactItem(FILES)]);
   eq(map[ARTIFACT_KEY], undefined, '404 must remain authoritative');
   assertIdle(html, '', '404 artifact');
@@ -238,6 +265,13 @@ scenario('running status is preserved', async () => {
   const { map, html } = await reconcile([artifactItem(FILES)]);
   eq(map[ARTIFACT_KEY], 'running', 'running status must be preserved');
   assertRunning(html, 'running artifact');
+});
+
+scenario('queued status is preserved', async () => {
+  reset({ jobs: [completedJob({ status: 'queued', files: [] })], cacheFiles: FILES });
+  const { map, html } = await reconcile([artifactItem(FILES)]);
+  eq(map[ARTIFACT_KEY], 'queued', 'queued status must be preserved');
+  assertQueued(html, 'queued artifact');
 });
 
 scenario('missing file evidence is not inferred from filters', async () => {
