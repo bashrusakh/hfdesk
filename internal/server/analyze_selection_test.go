@@ -16,15 +16,17 @@ import (
 )
 
 // TestAnalyzeExplicitNamespaceSelection pins the /api/analyze namespace
-// contract: repoType=model|dataset selects one namespace without probing the
-// other, repoType=auto and an absent selector auto-detect, and the legacy
+// contract: type=model|dataset is the one explicit selector and neither value
+// probes the other namespace. An absent type auto-detects, and the legacy
 // dataset parameter keeps its pre-#135 behavior (only "true" forces dataset;
-// every other value auto-detects, including false).
+// every other value auto-detects, including false). repoType is no longer a
+// selector.
 func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 	tests := []struct {
 		name             string
 		query            string
 		wantStatus       int
+		wantError        string
 		wantDataset      bool
 		wantNeedsSelect  bool
 		wantModelTrees   int64
@@ -37,42 +39,41 @@ func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 			wantDatasetTrees: 1,
 		},
 		{
-			name:           "repoType model forces model without dataset probe",
-			query:          "?repoType=model",
+			name:           "type model forces model without dataset probe",
+			query:          "?type=model",
 			wantModelTrees: 1,
 		},
 		{
-			name:           "repoType model is case-insensitive and trimmed",
-			query:          "?repoType=%20MODEL%20",
-			wantModelTrees: 1,
-		},
-		{
-			name:             "repoType dataset forces dataset without model probe",
-			query:            "?repoType=dataset",
+			name:             "type dataset forces dataset without model probe",
+			query:            "?type=dataset",
 			wantDataset:      true,
 			wantDatasetTrees: 1,
 		},
 		{
-			name:             "repoType auto auto-detects",
-			query:            "?repoType=auto",
-			wantNeedsSelect:  true,
-			wantModelTrees:   1,
-			wantDatasetTrees: 1,
-		},
-		{
-			name:             "repoType auto takes precedence over legacy dataset=true",
-			query:            "?repoType=auto&dataset=true",
-			wantNeedsSelect:  true,
-			wantModelTrees:   1,
-			wantDatasetTrees: 1,
-		},
-		{
-			name:           "repoType model takes precedence over legacy dataset=true",
-			query:          "?repoType=model&dataset=true",
+			name:           "type model with legacy dataset=false selects model",
+			query:          "?type=model&dataset=false",
 			wantModelTrees: 1,
 		},
 		{
-			name:             "legacy dataset=false auto-detects",
+			name:             "type dataset with legacy dataset=false selects dataset",
+			query:            "?type=dataset&dataset=false",
+			wantDataset:      true,
+			wantDatasetTrees: 1,
+		},
+		{
+			name:             "type dataset with legacy dataset=true stays dataset",
+			query:            "?type=dataset&dataset=true",
+			wantDataset:      true,
+			wantDatasetTrees: 1,
+		},
+		{
+			name:       "type model with legacy dataset=true conflicts",
+			query:      "?type=model&dataset=true",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "Conflicting repository type selection",
+		},
+		{
+			name:             "legacy dataset=false auto-detects the dual repository",
 			query:            "?dataset=false",
 			wantNeedsSelect:  true,
 			wantModelTrees:   1,
@@ -106,9 +107,23 @@ func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 			wantDatasetTrees: 1,
 		},
 		{
-			name:       "invalid repoType is rejected",
-			query:      "?repoType=invalid",
+			name:       "invalid type is rejected",
+			query:      "?type=invalid",
 			wantStatus: http.StatusBadRequest,
+			wantError:  "Invalid repository type",
+		},
+		{
+			name:       "type matching stays case-sensitive",
+			query:      "?type=MODEL",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "Invalid repository type",
+		},
+		{
+			name:             "repoType is no longer a selector",
+			query:            "?repoType=dataset",
+			wantNeedsSelect:  true,
+			wantModelTrees:   1,
+			wantDatasetTrees: 1,
 		},
 	}
 
@@ -154,8 +169,8 @@ func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 				t.Fatalf("status = %d, want %d; body=%s", w.Code, wantStatus, w.Body.String())
 			}
 			if wantStatus != http.StatusOK {
-				if !strings.Contains(w.Body.String(), "Invalid repoType") {
-					t.Fatalf("body = %s, want an Invalid repoType error", w.Body.String())
+				if tt.wantError != "" && !strings.Contains(w.Body.String(), tt.wantError) {
+					t.Fatalf("body = %s, want a %q error", w.Body.String(), tt.wantError)
 				}
 				if modelTrees.Load() != tt.wantModelTrees || datasetTrees.Load() != tt.wantDatasetTrees {
 					t.Fatalf("model/dataset tree requests = %d/%d, want %d/%d",

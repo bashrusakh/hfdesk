@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- `GET /api/analyze` now supports an explicit `repoType=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
+- `GET /api/analyze` now supports an explicit `type=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). `type` takes precedence over the legacy `dataset` parameter, and `type=model` combined with `dataset=true` is rejected as a conflict. The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
 - The client README fallback now keeps server-sanitized empty HTML empty and refuses unsafe link/image schemes while escaping URL attributes exactly once (#135).
 - Filtered plan/download scans no longer succeed when no file matches the requested filters: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
 

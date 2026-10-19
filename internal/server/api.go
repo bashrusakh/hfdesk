@@ -666,49 +666,29 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 
-	// Selector precedence: repoType (when present) > type (model only) >
-	// legacy dataset. The newer selectors must never reinterpret a legacy
-	// dataset=false request: only the literal dataset=true forces the dataset
-	// namespace, while every other value keeps auto-detection.
-	repoTypeValues, repoTypeSelected := query["repoType"]
-	repoType := ""
-	if repoTypeSelected && len(repoTypeValues) > 0 {
-		repoType = strings.ToLower(strings.TrimSpace(repoTypeValues[0]))
-	}
-	if repoTypeSelected {
-		switch repoType {
-		case "model", "dataset", "auto":
-		default:
-			writeError(w, http.StatusBadRequest, "Invalid repoType", "Expected repoType=model, repoType=dataset, or repoType=auto")
+	// The one explicit namespace selector is type=model|dataset. Values are
+	// matched exactly (no trimming or case folding): an unknown or repeated
+	// type is rejected instead of silently falling back to auto-detection, so a
+	// client always knows which namespace it selected.
+	selectedType := ""
+	if typeValues, ok := query["type"]; ok {
+		if len(typeValues) != 1 || (typeValues[0] != "model" && typeValues[0] != "dataset") {
+			writeError(w, http.StatusBadRequest, "Invalid repository type",
+				"Expected type=model or type=dataset; omit type for automatic detection")
 			return
 		}
+		selectedType = typeValues[0]
 	}
 
-	// type=model lets callers resolve a dual-type repository after the user
-	// chose the model namespace. A forced model analyze must not fall back to
-	// dataset auto-detection, which would return needsSelection again. It is
-	// ignored when the higher-precedence repoType selector is present.
-	forceModel := false
-	if !repoTypeSelected {
-		if typeValues, ok := query["type"]; ok {
-			if len(typeValues) != 1 || typeValues[0] != "model" {
-				writeError(w, http.StatusBadRequest, "Invalid repository type",
-					"Expected type=model; use dataset=true to analyze a dataset, or omit both for automatic detection")
-				return
-			}
-			if query.Get("dataset") == "true" {
-				writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
-					"type=model cannot be combined with dataset=true; choose one repository type")
-				return
-			}
-			forceModel = true
-		}
+	// type takes precedence over the legacy dataset parameter, but a
+	// contradictory pair is rejected rather than silently choosing one.
+	// dataset=true is consistent with type=dataset.
+	datasetTrue := query.Get("dataset") == "true"
+	if selectedType == "model" && datasetTrue {
+		writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
+			"type=model cannot be combined with dataset=true; choose one repository type")
+		return
 	}
-
-	// Legacy dataset semantics are preserved exactly: only the literal "true"
-	// forces dataset analysis. Every other value, including "false" and an
-	// empty value, keeps the historical model-then-dataset auto-detection.
-	datasetTrue := !repoTypeSelected && !forceModel && query.Get("dataset") == "true"
 
 	// Get revision (defaults to "main")
 	revision := query.Get("revision")
@@ -736,15 +716,14 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	var info *smartdl.RepoInfo
 	switch {
-	case repoTypeSelected && repoType == "model":
+	case selectedType == "model":
 		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
-	case repoTypeSelected && repoType == "dataset":
+	case selectedType == "dataset":
 		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
-	case repoTypeSelected: // auto
-		info, err = analyzer.AnalyzeWithRevision(ctx, repo, false, revision)
-	case forceModel:
-		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
 	case datasetTrue:
+		// Legacy dataset=true forces the dataset namespace even though every
+		// other dataset value (including false and an empty value) still
+		// auto-detects.
 		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
 	default:
 		info, err = analyzer.AnalyzeWithRevision(ctx, repo, false, revision)
