@@ -39,8 +39,14 @@ Searches Hugging Face models or datasets through the configured endpoint/proxy.
 ## Analyze
 
 ```http
-GET /api/analyze/{owner}/{repo}?revision=main&dataset=false
+GET /api/analyze/{owner}/{repo}?revision=main
+GET /api/analyze/{owner}/{repo}?revision=main&type=model
+GET /api/analyze/{owner}/{repo}?revision=main&dataset=true
 ```
+
+With no `type` or `dataset` parameter, analyze auto-detects whether the
+repository is a model or a dataset. `dataset=false` keeps the same
+auto-detection behavior for backwards compatibility.
 
 Returns repository metadata, files, type-specific analysis, selectable download items, and recommended download defaults.
 
@@ -70,6 +76,76 @@ Important response fields:
 ```
 
 `recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
+
+### Model/dataset selection
+
+If the repository exists as both a model and a dataset, auto-detection returns
+HTTP 200 with a selection request instead of analyzing either namespace:
+
+```json
+{
+  "needsSelection": true,
+  "repo": "owner/name",
+  "message": "This repository exists as both a model and a dataset. Please select which one you want to analyze.",
+  "options": ["model", "dataset"]
+}
+```
+
+Select the namespace explicitly:
+
+- `type=model` forces a model-only analysis. The dataset namespace is not
+  probed, so a dual-type repository does not return `needsSelection` again.
+- `dataset=true` forces a dataset analysis.
+- Omitting both parameters keeps auto-detection (including the
+  `needsSelection` response above).
+
+`type=model` and `dataset=true` are mutually exclusive and return HTTP 400 with
+error code `bad_request` when combined. Any `type` value other than `model`
+also returns HTTP 400.
+
+The selected model or dataset path then runs the same gated-access auth-check
+described in [Gated repositories](#gated-repositories), so a gated dual-type
+repository returns the structured HTTP 403 response for the selected
+namespace.
+
+### Gated repositories
+
+When Hugging Face reports that read access requires accepting a repository
+agreement (`X-Error-Code: GatedRepo`), analyze returns HTTP 403 with a
+structured error instead of a partial analysis:
+
+```json
+{
+  "ok": false,
+  "error": "Gated repository",
+  "details": "Configure a Hugging Face token in Settings, accept the repository agreement or request access on the repository page, then retry.",
+  "error_detail": {
+    "code": "gated_repo",
+    "message": "Gated repository",
+    "details": "Configure a Hugging Face token in Settings, accept the repository agreement or request access on the repository page, then retry."
+  },
+  "gated": true,
+  "repo": "owner/name",
+  "repo_type": "model",
+  "accept_url": "https://huggingface.co/owner/name",
+  "has_token": false
+}
+```
+
+- `repo_type` is `"model"` or `"dataset"`.
+- `accept_url` is the repository page on the configured endpoint
+  (`{endpoint}/{repo}` for models, `{endpoint}/datasets/{repo}` for datasets)
+  where the agreement can be accepted or access requested.
+- `has_token` only reports whether a token is configured. The token value is
+  never returned.
+- When a token is configured, the guidance explains that the token does not
+  currently have access and to check its gated-repository permission.
+
+The backend probes `GET {endpoint}/api/{models|datasets}/{repo}/auth-check`
+after resolving or explicitly selecting the repository type. Mirrors that do
+not implement the endpoint (404), transient/server failures, network errors, and
+non-gated responses do not block analysis; the existing tree/metadata analysis
+is used instead.
 
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
@@ -126,6 +202,105 @@ silently dropped; declared widths are still presented as declared.
 The literal config header remains available under `metadata` (for oversized
 configs it is the recovered head with the markers described above). Unknown
 methods keep their name with an empty `method_description` and no `backends`.
+
+## Community
+
+```http
+GET /api/community/{owner}/{repo}
+GET /api/community/{owner}/{repo}?dataset=true&page=0&type=all&status=all
+GET /api/community/{owner}/{repo}?num=2
+```
+
+Proxies Hugging Face Discussions and Pull Requests read-only through the
+configured endpoint, proxy, and token. The token is added server-side and is
+never returned to the browser. Both model and dataset repositories are
+supported, including gated/private repositories when the configured credentials
+allow access.
+
+Query parameters:
+
+- `dataset` – `true` to use the dataset API (case-insensitive; default `false`).
+- `num` – when present, return that thread instead of the list page. Must be a
+  positive integer.
+- `page` – list page, non-negative (default `0`).
+- `type` – `all`, `discussion`, or `pull_request` (default `all`).
+- `status` – `all`, `open`, or `closed` (default `all`).
+
+`page`, `type`, and `status` apply to the list response only.
+
+List response:
+
+```json
+{
+  "repo": "owner/name",
+  "is_dataset": false,
+  "page": 0,
+  "count": 289,
+  "start": 0,
+  "has_more": true,
+  "discussions": [
+    {
+      "num": 294,
+      "title": "Question about usage",
+      "author": "alice",
+      "status": "closed",
+      "is_pull_request": false,
+      "created_at": "2026-08-17T20:53:39.000Z",
+      "num_comments": 1,
+      "pinned": false
+    }
+  ]
+}
+```
+
+`has_more` is `start + len(discussions) < count`. A deleted or missing upstream
+author is normalized to `"deleted"`. Pull requests are distinguished by
+`is_pull_request`; `status` can be `draft`, `open`, `closed`, or `merged`.
+
+Thread response (`?num=N`):
+
+```json
+{
+  "repo": "owner/name",
+  "is_dataset": false,
+  "num": 2,
+  "title": "Upload LICENSE",
+  "author": "meg",
+  "status": "merged",
+  "is_pull_request": true,
+  "created_at": "2022-06-02T12:01:38.000Z",
+  "events": [
+    {
+      "id": "6299dba1e0753998f1f6e7df",
+      "type": "comment",
+      "author": "meg",
+      "created_at": "2022-06-03T10:00:01.000Z",
+      "body_html": "<p>Sounds good.</p>",
+      "edited": false,
+      "hidden": false
+    },
+    {
+      "id": "629de1ab4f4ea45707b07143",
+      "type": "status-change",
+      "author": "meg",
+      "created_at": "2022-06-03T10:05:00.000Z",
+      "summary": "changed status to merged"
+    }
+  ]
+}
+```
+
+Comment `body_html` is rendered from upstream Markdown through the shared README
+Markdown and URL-rewrite pipeline, but README frontmatter stripping does not
+apply to comments. The result is sanitized with the README sanitizer and then
+every `id` and `name` attribute is removed, so comment HTML cannot clobber
+application DOM IDs. When raw Markdown is unavailable, upstream HTML goes
+through the same URL rewriting, sanitization, and identifier removal. Other
+event types carry a human-readable `summary`. Event order matches upstream.
+
+Upstream `400`, `401`, `403`, `404`, and `429` responses keep their status;
+network failures, other upstream statuses, and malformed upstream JSON return
+`502`.
 
 ## Plan
 

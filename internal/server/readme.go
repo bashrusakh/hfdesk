@@ -188,29 +188,47 @@ func stripFrontmatter(md string) string {
 // through the local asset proxy (so gated repos load with the server token),
 // while external images (badges, etc.) keep their original URL.
 func renderReadmeHTML(markdown, baseRawURL, baseBlobURL, endpointHost string) string {
-	md := stripFrontmatter(markdown)
+	return renderMarkdownHTML(stripFrontmatter(markdown), baseRawURL, baseBlobURL, endpointHost, readmePolicy.Sanitize)
+}
+
+// htmlFragmentSanitizer sanitizes a rendered HTML fragment. README rendering
+// supplies readmePolicy.Sanitize directly; comment rendering supplies a
+// stricter sanitizer that also removes DOM identifiers.
+type htmlFragmentSanitizer func(string) string
+
+// renderMarkdownHTML converts Markdown to sanitized HTML using the shared URL
+// rewriting pipeline. The caller decides whether the Markdown gets README
+// frontmatter stripping and which sanitizer runs last, so comment content can
+// opt out of model-card frontmatter handling without duplicating rendering.
+func renderMarkdownHTML(markdown, baseRawURL, baseBlobURL, endpointHost string, sanitize htmlFragmentSanitizer) string {
 	var buf bytes.Buffer
-	if err := readmeMarkdown.Convert([]byte(md), &buf); err != nil {
+	if err := readmeMarkdown.Convert([]byte(markdown), &buf); err != nil {
 		return ""
 	}
+	return sanitizeRewrittenHTML(buf.String(), baseRawURL, baseBlobURL, endpointHost, sanitize)
+}
 
-	doc, err := xhtml.Parse(strings.NewReader("<html><body>" + buf.String() + "</body></html>"))
+// sanitizeRewrittenHTML parses an HTML fragment, rewrites relative image and
+// link URLs against the repo bases, and runs the result through sanitize. It is
+// shared by README rendering and the community upstream-HTML fallback.
+func sanitizeRewrittenHTML(fragment, baseRawURL, baseBlobURL, endpointHost string, sanitize htmlFragmentSanitizer) string {
+	doc, err := xhtml.Parse(strings.NewReader("<html><body>" + fragment + "</body></html>"))
 	if err != nil {
-		return readmePolicy.Sanitize(buf.String())
+		return sanitize(fragment)
 	}
 	body := findReadmeBody(doc)
 	if body == nil {
-		return readmePolicy.Sanitize(buf.String())
+		return sanitize(fragment)
 	}
 	rewriteReadmeNodes(body, baseRawURL, baseBlobURL, endpointHost)
 
 	var out bytes.Buffer
 	for c := body.FirstChild; c != nil; c = c.NextSibling {
 		if err := xhtml.Render(&out, c); err != nil {
-			return readmePolicy.Sanitize(buf.String())
+			return sanitize(fragment)
 		}
 	}
-	return readmePolicy.Sanitize(out.String())
+	return sanitize(out.String())
 }
 
 // findReadmeBody walks an xhtml tree and returns the first <body>

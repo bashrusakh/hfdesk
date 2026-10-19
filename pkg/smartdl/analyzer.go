@@ -75,17 +75,40 @@ func (a *Analyzer) Analyze(ctx context.Context, repo string, isDataset bool) (*R
 
 // AnalyzeWithRevision fetches and analyzes a HuggingFace repository at a specific revision.
 // If isDataset is false, it will first try to fetch as a model, then as a dataset if not found.
+// If both namespaces exist, it returns ErrBothExist so the caller can ask the
+// user to select one.
 func (a *Analyzer) AnalyzeWithRevision(ctx context.Context, repo string, isDataset bool, revision string) (*RepoInfo, error) {
+	return a.analyzeWithRevision(ctx, repo, isDataset, false, revision)
+}
+
+// AnalyzeModelWithRevision fetches and analyzes a HuggingFace repository as a
+// model at a specific revision. Unlike AnalyzeWithRevision with isDataset=false,
+// it never probes the dataset namespace, so a repository that also exists as a
+// dataset is analyzed as a model instead of returning ErrBothExist.
+func (a *Analyzer) AnalyzeModelWithRevision(ctx context.Context, repo, revision string) (*RepoInfo, error) {
+	return a.analyzeWithRevision(ctx, repo, false, true, revision)
+}
+
+func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDataset, forceModel bool, revision string) (*RepoInfo, error) {
 	if revision == "" {
 		revision = "main"
 	}
 
-	// Fetch file tree - auto-detect model vs dataset if not explicitly a dataset
-	files, detectedIsDataset, commit, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, revision)
+	// Fetch file tree - auto-detect model vs dataset unless the caller forced a
+	// namespace or explicitly selected a dataset.
+	files, detectedIsDataset, commit, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, forceModel, revision)
 	if err != nil {
 		return nil, fmt.Errorf("fetch file tree: %w", err)
 	}
 	isDataset = detectedIsDataset
+
+	// A gated repository can still serve metadata/tree responses, leaving the
+	// analysis with a partial view while README/community access fails. Now
+	// that the repository type is known, confirm read access with the Hub's
+	// auth-check endpoint so gated repositories fail explicitly instead.
+	if err := a.checkRepoAccess(ctx, repo, isDataset); err != nil {
+		return nil, err
+	}
 
 	// Build RepoInfo
 	info := &RepoInfo{
@@ -162,14 +185,143 @@ type hfTreeNode struct {
 // ErrBothExist is returned when a repo exists as both model and dataset.
 var ErrBothExist = fmt.Errorf("repository exists as both model and dataset")
 
+// GatedRepoError reports that the Hub requires the user to accept an access
+// agreement or obtain approval before the repository can be read. It carries
+// only non-secret access state so callers can show the repository page and
+// token guidance without exposing the configured token.
+type GatedRepoError struct {
+	Repo      string
+	IsDataset bool
+	Endpoint  string
+	HasToken  bool
+	Message   string
+}
+
+func (e *GatedRepoError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("repository %s is gated", e.Repo)
+	}
+	return fmt.Sprintf("repository %s is gated: %s", e.Repo, e.Message)
+}
+
+// AcceptURL returns the repository page where the access agreement can be
+// accepted or access requested.
+func (e *GatedRepoError) AcceptURL() string {
+	if e.IsDataset {
+		return fmt.Sprintf("%s/datasets/%s", e.Endpoint, e.Repo)
+	}
+	return fmt.Sprintf("%s/%s", e.Endpoint, e.Repo)
+}
+
+const (
+	// authCheckTimeout bounds the optional access probe so a mirror that does
+	// not implement /auth-check cannot delay analysis.
+	authCheckTimeout = 5 * time.Second
+	// maxGatedMessageBytes bounds how much of an upstream gated response is
+	// read for diagnostics.
+	maxGatedMessageBytes = 4 << 10
+)
+
+// checkRepoAccess probes Hugging Face's auth-check endpoint for the resolved
+// repository type. It is deliberately fail-open: only an explicit
+// 401/403 with X-Error-Code: GatedRepo blocks analysis. Mirrors without the
+// endpoint (404), transient failures, and other statuses fall back to the
+// existing tree/metadata behavior.
+func (a *Analyzer) checkRepoAccess(ctx context.Context, repo string, isDataset bool) error {
+	checkCtx, cancel := context.WithTimeout(ctx, authCheckTimeout)
+	defer cancel()
+
+	api := "models"
+	if isDataset {
+		api = "datasets"
+	}
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
+		fmt.Sprintf("%s/api/%s/%s/auth-check", a.endpoint, api, repo), nil)
+	if err != nil {
+		return nil
+	}
+	a.addAuth(req)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if !isGatedResponse(resp) {
+		return nil
+	}
+	return a.newGatedRepoError(repo, isDataset, gatedUpstreamMessage(resp, resp.Body))
+}
+
+// isGatedResponse reports whether resp is the Hub's explicit gated-access
+// response: 401/403 with X-Error-Code: GatedRepo.
+func isGatedResponse(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Error-Code")), "GatedRepo")
+}
+
+// gatedUpstreamMessage returns the non-secret diagnostic carried by a gated
+// response, preferring the Hub's error-message header. body may be nil when
+// the caller only has response headers (the tree walker closes the body before
+// handing the response to its status mapper).
+func gatedUpstreamMessage(resp *http.Response, body io.Reader) string {
+	if msg := strings.TrimSpace(resp.Header.Get("X-Error-Message")); msg != "" {
+		return msg
+	}
+	if body != nil {
+		content, err := io.ReadAll(io.LimitReader(body, maxGatedMessageBytes))
+		if err == nil {
+			var payload struct {
+				Error   string `json:"error"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(content, &payload) == nil {
+				if msg := strings.TrimSpace(payload.Error); msg != "" {
+					return msg
+				}
+				if msg := strings.TrimSpace(payload.Message); msg != "" {
+					return msg
+				}
+			}
+		}
+	}
+	return resp.Status
+}
+
+// newGatedRepoError builds the typed access error for a repository.
+func (a *Analyzer) newGatedRepoError(repo string, isDataset bool, message string) *GatedRepoError {
+	if strings.TrimSpace(message) == "" {
+		message = "repository access requires accepting the agreement or requesting access"
+	}
+	return &GatedRepoError{
+		Repo:      repo,
+		IsDataset: isDataset,
+		Endpoint:  a.endpoint,
+		HasToken:  a.token != "",
+		Message:   message,
+	}
+}
+
 // fetchFileTreeAutoDetect tries to fetch as model first, then as dataset if 404.
 // Returns the files, whether it's a dataset, the resolved commit SHA, and any
-// error. If both model and dataset exist, returns ErrBothExist.
-func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset bool, revision string) ([]FileInfo, bool, string, error) {
+// error. If both model and dataset exist, returns ErrBothExist. When forceModel
+// is true, only the model namespace is fetched and no dataset probe follows; a
+// missing model is reported as an error instead of falling back.
+func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset, forceModel bool, revision string) ([]FileInfo, bool, string, error) {
 	// If explicitly marked as dataset, fetch as dataset directly
 	if isDataset {
 		files, commit, err := a.fetchFileTree(ctx, repo, true, revision)
 		return files, true, commit, err
+	}
+
+	// A forced model analyze must not auto-detect: probing the dataset
+	// namespace here would turn a valid model selection back into ErrBothExist.
+	if forceModel {
+		files, commit, err := a.fetchFileTree(ctx, repo, false, revision)
+		return files, false, commit, err
 	}
 
 	// Try as model first
@@ -178,7 +330,9 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	// Helper to check if error indicates repo doesn't exist as model
 	// HuggingFace reports namespace misses as HTTP 401 or 404. Only status
 	// errors created from an HTTP response are authoritative; transport error
-	// messages may contain the same words or numbers.
+	// messages may contain the same words or numbers. A GatedRepoError is
+	// deliberately excluded: the repository exists but requires access, so it
+	// must surface as gated rather than collapse into "not found".
 	isModelNotFound := func(err error) bool {
 		if err == nil || errors.Is(err, hubtree.ErrPagination) {
 			return false
@@ -281,6 +435,11 @@ func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, re
 		UserAgent: "hfdownloader/3",
 		Client:    a.client,
 		StatusErr: func(resp *http.Response) error {
+			// The walker closes the body before calling this mapper, so only
+			// the status and headers are available for the diagnostic.
+			if isGatedResponse(resp) {
+				return a.newGatedRepoError(repo, isDataset, gatedUpstreamMessage(resp, nil))
+			}
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				return &treeHTTPStatusError{status: resp.StatusCode, message: "unauthorized: repo requires token or you do not have access"}
