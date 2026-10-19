@@ -4898,6 +4898,17 @@ a {
   min-width: 0;
 }
 
+.models-history-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.models-history-btn {
+  padding: 3px 6px !important;
+}
+
 .models-detail-repo {
   font-size: 14px;
   font-weight: 600;

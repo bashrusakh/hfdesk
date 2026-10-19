@@ -50,6 +50,12 @@ auto-detection behavior for backwards compatibility.
 
 Returns repository metadata, files, type-specific analysis, selectable download items, and recommended download defaults.
 
+`dataset` is a tri-state selector:
+
+- absent: auto-detect the repository namespace (model first, then dataset). If the same name exists as both, the response is `{"needsSelection": true, "options": ["model", "dataset"]}` instead of repository analysis.
+- `true`: force dataset analysis. The model namespace is not probed.
+- `false` (or any other present value): force model analysis. The dataset namespace is not probed, so a same-named dataset cannot trigger `needsSelection`.
+
 Important response fields:
 
 ```json

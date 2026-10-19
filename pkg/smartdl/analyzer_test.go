@@ -4,7 +4,13 @@
 package smartdl
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,6 +52,84 @@ func TestNewAnalyzer(t *testing.T) {
 		analyzer := NewAnalyzer(AnalyzerOptions{HTTPClient: customClient})
 		if analyzer.client != customClient {
 			t.Error("custom client not used")
+		}
+	})
+}
+
+func TestAnalyzeExplicitNamespace(t *testing.T) {
+	const repo = "owner/both"
+	newHub := func(t *testing.T) (*httptest.Server, *atomic.Int64, *atomic.Int64) {
+		t.Helper()
+		var modelTrees, datasetTrees atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/models/owner/both/tree/main":
+				modelTrees.Add(1)
+				io.WriteString(w, `[{"type":"file","path":"model.safetensors","size":10}]`)
+			case r.URL.Path == "/api/datasets/owner/both/tree/main":
+				datasetTrees.Add(1)
+				io.WriteString(w, `[{"type":"file","path":"data.parquet","size":20}]`)
+			case strings.HasSuffix(r.URL.Path, "/refs"):
+				io.WriteString(w, `{"branches":[]}`)
+			default:
+				t.Errorf("unexpected request: %s", r.URL)
+				http.NotFound(w, r)
+			}
+		}))
+		return srv, &modelTrees, &datasetTrees
+	}
+
+	t.Run("explicit model", func(t *testing.T) {
+		hub, modelTrees, datasetTrees := newHub(t)
+		defer hub.Close()
+		analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL})
+
+		info, err := analyzer.AnalyzeExplicitWithRevision(context.Background(), repo, false, "main")
+		if err != nil || info == nil {
+			t.Fatalf("info = %v, error = %v; want model analysis", info, err)
+		}
+		if info.IsDataset || info.Type == TypeDataset {
+			t.Fatalf("is_dataset/type = %v/%v; want model", info.IsDataset, info.Type)
+		}
+		if len(info.Files) != 1 || info.Files[0].Path != "model.safetensors" {
+			t.Fatalf("files = %+v; want model namespace", info.Files)
+		}
+		if modelTrees.Load() != 1 || datasetTrees.Load() != 0 {
+			t.Fatalf("model/dataset tree requests = %d/%d; explicit model must not probe the dataset", modelTrees.Load(), datasetTrees.Load())
+		}
+	})
+
+	t.Run("explicit dataset", func(t *testing.T) {
+		hub, modelTrees, datasetTrees := newHub(t)
+		defer hub.Close()
+		analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL})
+
+		info, err := analyzer.AnalyzeExplicitWithRevision(context.Background(), repo, true, "main")
+		if err != nil || info == nil {
+			t.Fatalf("info = %v, error = %v; want dataset analysis", info, err)
+		}
+		if !info.IsDataset || info.Type != TypeDataset {
+			t.Fatalf("is_dataset/type = %v/%v; want dataset", info.IsDataset, info.Type)
+		}
+		if len(info.Files) != 1 || info.Files[0].Path != "data.parquet" {
+			t.Fatalf("files = %+v; want dataset namespace", info.Files)
+		}
+		if modelTrees.Load() != 0 || datasetTrees.Load() != 1 {
+			t.Fatalf("model/dataset tree requests = %d/%d; explicit dataset must not probe the model", modelTrees.Load(), datasetTrees.Load())
+		}
+	})
+
+	t.Run("auto detect still needs selection", func(t *testing.T) {
+		hub, modelTrees, datasetTrees := newHub(t)
+		defer hub.Close()
+		analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL})
+
+		info, err := analyzer.Analyze(context.Background(), repo, false)
+		if info != nil || !errors.Is(err, ErrBothExist) {
+			t.Fatalf("info = %v, error = %v; want ErrBothExist", info, err)
+		}
+		if modelTrees.Load() != 1 || datasetTrees.Load() != 1 {
+			t.Fatalf("model/dataset tree requests = %d/%d; auto detection must probe both", modelTrees.Load(), datasetTrees.Load())
 		}
 	})
 }

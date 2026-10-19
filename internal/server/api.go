@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -665,26 +666,49 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 
-	// Check if it's a dataset (explicit selection)
-	isDataset := query.Get("dataset") == "true"
+	// Selector precedence: repoType (when present) > type (model only) >
+	// legacy dataset. The newer selectors must never reinterpret a legacy
+	// dataset=false request: only the literal dataset=true forces the dataset
+	// namespace, while every other value keeps auto-detection.
+	repoTypeValues, repoTypeSelected := query["repoType"]
+	repoType := ""
+	if repoTypeSelected && len(repoTypeValues) > 0 {
+		repoType = strings.ToLower(strings.TrimSpace(repoTypeValues[0]))
+	}
+	if repoTypeSelected {
+		switch repoType {
+		case "model", "dataset", "auto":
+		default:
+			writeError(w, http.StatusBadRequest, "Invalid repoType", "Expected repoType=model, repoType=dataset, or repoType=auto")
+			return
+		}
+	}
 
 	// type=model lets callers resolve a dual-type repository after the user
 	// chose the model namespace. A forced model analyze must not fall back to
-	// dataset auto-detection, which would return needsSelection again.
+	// dataset auto-detection, which would return needsSelection again. It is
+	// ignored when the higher-precedence repoType selector is present.
 	forceModel := false
-	if typeValues, ok := query["type"]; ok {
-		if len(typeValues) != 1 || typeValues[0] != "model" {
-			writeError(w, http.StatusBadRequest, "Invalid repository type",
-				"Expected type=model; use dataset=true to analyze a dataset, or omit both for automatic detection")
-			return
+	if !repoTypeSelected {
+		if typeValues, ok := query["type"]; ok {
+			if len(typeValues) != 1 || typeValues[0] != "model" {
+				writeError(w, http.StatusBadRequest, "Invalid repository type",
+					"Expected type=model; use dataset=true to analyze a dataset, or omit both for automatic detection")
+				return
+			}
+			if query.Get("dataset") == "true" {
+				writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
+					"type=model cannot be combined with dataset=true; choose one repository type")
+				return
+			}
+			forceModel = true
 		}
-		if isDataset {
-			writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
-				"type=model cannot be combined with dataset=true; choose one repository type")
-			return
-		}
-		forceModel = true
 	}
+
+	// Legacy dataset semantics are preserved exactly: only the literal "true"
+	// forces dataset analysis. Every other value, including "false" and an
+	// empty value, keeps the historical model-then-dataset auto-detection.
+	datasetTrue := !repoTypeSelected && !forceModel && query.Get("dataset") == "true"
 
 	// Get revision (defaults to "main")
 	revision := query.Get("revision")
@@ -711,14 +735,23 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var info *smartdl.RepoInfo
-	if forceModel {
+	switch {
+	case repoTypeSelected && repoType == "model":
 		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
-	} else {
-		info, err = analyzer.AnalyzeWithRevision(ctx, repo, isDataset, revision)
+	case repoTypeSelected && repoType == "dataset":
+		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
+	case repoTypeSelected: // auto
+		info, err = analyzer.AnalyzeWithRevision(ctx, repo, false, revision)
+	case forceModel:
+		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
+	case datasetTrue:
+		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
+	default:
+		info, err = analyzer.AnalyzeWithRevision(ctx, repo, false, revision)
 	}
 	if err != nil {
-		// Check if both model and dataset exist (the analyzer wraps the
-		// sentinel with the failing operation, so compare with errors.Is).
+		// Check if both model and dataset exist. AnalyzeWithRevision wraps
+		// ErrBothExist with fetch context, so compare with errors.Is.
 		if errors.Is(err, smartdl.ErrBothExist) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"needsSelection": true,
@@ -807,8 +840,9 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	client.Timeout = 20 * time.Second
 
 	candidates := []string{"README.md", "readme.md", "Readme.md"}
+	escapedRevision := url.PathEscape(revision)
 	for _, name := range candidates {
-		rawURL := fmt.Sprintf("%s/%s%s/raw/%s/%s", endpoint, prefix, repo, revision, name)
+		rawURL := fmt.Sprintf("%s/%s%s/raw/%s/%s", endpoint, prefix, repo, escapedRevision, name)
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
 		if err != nil {
 			continue
@@ -825,15 +859,16 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 768<<10))
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && readErr == nil && len(body) > 0 {
-			baseRaw := fmt.Sprintf("%s/%s%s/resolve/%s/", endpoint, prefix, repo, revision)
-			baseBlob := fmt.Sprintf("%s/%s%s/blob/%s/", endpoint, prefix, repo, revision)
+			baseRaw := fmt.Sprintf("%s/%s%s/resolve/%s/", endpoint, prefix, repo, escapedRevision)
+			baseBlob := fmt.Sprintf("%s/%s%s/blob/%s/", endpoint, prefix, repo, escapedRevision)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"repo":       repo,
-				"revision":   revision,
-				"path":       name,
-				"markdown":   string(body),
-				"baseRawURL": baseRaw,
-				"html":       renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointHost(cfg.Endpoint)),
+				"repo":        repo,
+				"revision":    revision,
+				"path":        name,
+				"markdown":    string(body),
+				"baseRawURL":  baseRaw,
+				"baseBlobURL": baseBlob,
+				"html":        renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointBase(cfg.Endpoint)),
 			})
 			return
 		}
