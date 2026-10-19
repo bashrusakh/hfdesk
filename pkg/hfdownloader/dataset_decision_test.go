@@ -559,6 +559,38 @@ func concreteOracleDirect(c datasetDecisionContext, w datasetDecisionWorld, i in
 	return false
 }
 
+// oracleDatasetPayloadPath is an independent reference for dataset companion
+// payload exclusion. It reimplements name/extension recognition rather than
+// calling isDatasetPayloadPath, so a production predicate bug cannot be
+// mirrored by the oracle it is meant to check.
+func oracleDatasetPayloadPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	tokens := strings.FieldsFunc(stem, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	})
+	for i, token := range tokens {
+		if token == "optimizer" {
+			return true
+		}
+		if i+1 < len(tokens) && (token == "training" || token == "trainer") {
+			next := tokens[i+1]
+			if next == "args" || next == "state" || next == "states" {
+				return true
+			}
+		}
+	}
+	switch path.Ext(base) {
+	case ".safetensors", ".onnx", ".pt", ".pth", ".msgpack", ".h5", ".tflite", ".ot", ".gguf", ".gguf-split", ".ggml", ".ckpt":
+		return true
+	case ".bin":
+		// Tokenizer binaries are small dataset companions; other binaries are
+		// model payload by the same established model-selection convention.
+		return !strings.Contains(base, "tokenizer")
+	}
+	return false
+}
+
 // concreteOracleSkipped is a deliberately small independent reference for
 // the evaluator's direct-selection, directory-seed, and input-order retention
 // rules. It does not call the production world evaluator or validate helper.
@@ -586,7 +618,7 @@ func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, co
 			eligible[i] = true
 			continue
 		}
-		if !w.Companion[i] || !canRetainDatasetCompanion(in) {
+		if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) {
 			continue
 		}
 		dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
@@ -1812,7 +1844,7 @@ func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, co
 			continue
 		}
 		if !direct[i] {
-			if !w.Companion[i] || !canRetainDatasetCompanion(in) {
+			if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) {
 				continue
 			}
 			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))

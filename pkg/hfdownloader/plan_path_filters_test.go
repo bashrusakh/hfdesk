@@ -689,6 +689,12 @@ func TestPlanRepoDatasetSkipsUnmatchedModelPayloads(t *testing.T) {
 		"weights/model.ggml",
 		"weights/training-model.safetensors",
 		"weights/model-training.pt",
+		"weights/model.ckpt",
+		"weights/checkpoint.ckpt",
+		"weights/model.gguf-split",
+		"weights/optimizer.bin",
+		"weights/training_state.bin",
+		"weights/training_args.bin",
 	}
 	want := []string{"train.csv", "docs/guide.md", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"}
 	for _, payload := range payloads {
@@ -740,6 +746,8 @@ func TestPlanRepoDatasetSkipsPayloadsInRetainedCompanionScopes(t *testing.T) {
 			files: []hfNode{
 				{Type: "file", Path: "train.csv", Size: 10},
 				{Type: "file", Path: "model.safetensors", Size: 100},
+				{Type: "file", Path: "optimizer.bin", Size: 101},
+				{Type: "file", Path: "checkpoint.ckpt", Size: 102},
 				{Type: "file", Path: "config.json", Size: 7},
 			},
 			filters: []string{"train"},
@@ -750,6 +758,8 @@ func TestPlanRepoDatasetSkipsPayloadsInRetainedCompanionScopes(t *testing.T) {
 			files: []hfNode{
 				{Type: "file", Path: "foo/train/part.csv", Size: 10},
 				{Type: "file", Path: "foo/model.safetensors", Size: 100},
+				{Type: "file", Path: "foo/optimizer.bin", Size: 101},
+				{Type: "file", Path: "foo/checkpoint.ckpt", Size: 102},
 				{Type: "file", Path: "foo/README.md", Size: 7},
 			},
 			filters: []string{"train"},
@@ -758,6 +768,52 @@ func TestPlanRepoDatasetSkipsPayloadsInRetainedCompanionScopes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := mockHFServerForPlan(t, tc.files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
+		})
+	}
+}
+
+// TestPlanRepoDatasetExplicitPayloadSelectionRemainsSelected keeps payload
+// exclusion limited to unmatched companion fallback.
+func TestPlanRepoDatasetExplicitPayloadSelectionRemainsSelected(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		filters []string
+		want    []string
+	}{
+		{
+			name:    "group and payload",
+			payload: "weights/model.ckpt",
+			filters: []string{"train", "weights/model.ckpt"},
+			want:    []string{"train.csv", "weights/model.ckpt", "config.json", "tokenizer/tokenizer.bin"},
+		},
+		{
+			name:    "payload only",
+			payload: "weights/optimizer.bin",
+			filters: []string{"weights/optimizer.bin"},
+			want:    []string{"weights/optimizer.bin", "config.json", "tokenizer/tokenizer.bin"},
+		},
+		{
+			name:    "payload and tokenizer companion",
+			payload: "weights/training_state.bin",
+			filters: []string{"train", "weights/training_state.bin"},
+			want:    []string{"train.csv", "weights/training_state.bin", "config.json", "tokenizer/tokenizer.bin"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: tc.payload, Size: 100},
+				{Type: "file", Path: "config.json", Size: 7},
+				{Type: "file", Path: "tokenizer/tokenizer.bin", Size: 9},
+			}
+			srv := mockHFServerForPlan(t, files)
 			defer srv.Close()
 			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
 			if err != nil {

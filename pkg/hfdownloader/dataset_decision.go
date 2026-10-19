@@ -344,12 +344,19 @@ func isDefiniteCompanionEvidence(e datasetselection.Evidence) bool {
 // isModelPayloadPath, while datasets also carry ambiguous weight/checkpoint
 // extensions that are not dataset data formats.
 func isDatasetPayloadPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	// isModelPayloadPath deliberately treats optimizer/trainer state as
+	// non-payload for GGUF mixed-mode selection. Dataset companion retention
+	// needs the opposite answer: checkpoint/training binaries are large state
+	// artifacts, not small companion files.
+	if isTrainingArtifactBase(base) {
+		return true
+	}
 	if isModelPayloadPath(filePath) {
 		return true
 	}
-	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
 	switch path.Ext(base) {
-	case ".safetensors", ".onnx", ".pt", ".pth", ".msgpack", ".h5", ".tflite", ".ot", ".gguf", ".ggml":
+	case ".safetensors", ".onnx", ".pt", ".pth", ".msgpack", ".h5", ".tflite", ".ot", ".gguf", ".gguf-split", ".ggml", ".ckpt":
 		return true
 	}
 	return false
