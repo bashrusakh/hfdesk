@@ -5408,8 +5408,15 @@ async function loadRepositoryDetails(entry) {
   // =========================================
 
   function showModal(title, content) {
-    // Opening any modal supersedes a pending revision-picker close hook and
-    // invalidates any selection identity from a previous picker.
+    // Opening any modal supersedes a revision picker. If an initial (pending)
+    // picker is open, settle its pending navigation first with the same explicit
+    // prompt the close hook renders, so an unrelated dialog that replaces the
+    // picker can never leave the pane on its indefinite loading spinner.
+    // Selection is not involved. A repository transition disarms this hook in
+    // dismissRevisionPickerForNavigation before it opens anything, so the old
+    // pending stop is never rolled back while a new navigation takes over.
+    const cancel = revisionPickerCancelHandler;
+    if (cancel) cancel();
     revisionPickerCancelHandler = null;
     revisionPickerRequestId = null;
     revisionPickerRepo = null;

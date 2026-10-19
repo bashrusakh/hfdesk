@@ -259,6 +259,8 @@ const hook = `
     modelsSelectRow: window.modelsSelectRow,
     initModelsPage,
     initModal,
+    showModal,
+    hideModal,
     reopenRevisionPicker: window.reopenRevisionPicker,
     showRevisionPickerFromAnalysis: window.showRevisionPickerFromAnalysis,
     readmeReservedRoutes: () => Array.from(README_RESERVED_MODEL_ROUTES),
@@ -919,6 +921,124 @@ async function testCancelAnalysisRevisionPickerKeepsRenderedView() {
   eq(ui.historyIndex(), 0, 'Escape on the analysis picker keeps the rendered stop current');
   eq(ui.getCurrentAnalysis().branch, 'main', 'Escape on the analysis picker keeps the rendered revision');
   eq(nodes.get('#modelsOverviewPanel').innerHTML, rendered, 'Escape on the analysis picker keeps the rendered view unchanged');
+}
+
+async function testUnrelatedModalSettlesPendingRevisionPicker() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    return data;
+  };
+
+  // A resolved view, then a pending navigation whose repository has multiple
+  // refs: the real picker opens and the pane shows its loading spinner.
+  await ui.openRepositoryInDetails('owner/previous', 'model', 'main', 'push');
+  await ui.openRepositoryInDetails('owner/pending', 'model', null, 'push');
+  eq(ui.getModal().active, true, 'the initial pending picker opens before the unrelated modal');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Analyzing owner\/pending/, 'the pending picker leaves the pane loading');
+
+  // An unrelated dialog (for example a finished cache rebuild) replaces the
+  // picker. It must settle the pending navigation instead of silently
+  // discarding the picker identity and leaving the spinner behind.
+  ui.showModal('Rebuild Complete', '<p>Rebuild finished</p>');
+  eq(ui.getModal().active, true, 'the unrelated modal opens over the pending navigation');
+  eq(ui.getModal().title, 'Rebuild Complete', 'the unrelated modal replaces the revision picker');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'superseding the pending picker clears the loading spinner');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'superseding the pending picker renders the explicit pending prompt');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /reopenRevisionPicker\(\)/, 'the settled pending prompt can reopen the picker');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', null]],
+    'superseding the picker keeps both history stops and no selection'
+  );
+  eq(ui.historyIndex(), 1, 'the pending stop stays current after supersession');
+  eq(ui.getDetailHeader().repo, 'owner/pending', 'the header agrees with the pending history entry after supersession');
+  eq(nodes.get('#modelsDetailBack').disabled, false, 'Back stays enabled after supersession');
+  eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward stays disabled at the latest pending stop');
+  deepEq(
+    { ...ui.getSelectionState() },
+    { repo: 'owner/pending', type: 'model', isDataset: false, branch: null },
+    'supersession leaves no revision selected while the pending repository/type stay resolved'
+  );
+
+  // Closing the unrelated modal must leave the coherent pending state, not the
+  // indefinite loading state.
+  click('#modalClose');
+  eq(ui.getModal().active, false, 'the X button closes the unrelated modal');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'closing the unrelated modal leaves no loading spinner');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'closing the unrelated modal keeps the explicit pending prompt');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', null]],
+    'closing the unrelated modal does not rewrite history'
+  );
+  eq(ui.historyIndex(), 1, 'closing the unrelated modal keeps the pending stop current');
+  eq(ui.getDetailHeader().repo, 'owner/pending', 'closing the unrelated modal keeps the header coherent');
+  eq(nodes.get('#modelsDetailBack').disabled, false, 'Back stays enabled after closing the unrelated modal');
+  eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward stays disabled after closing the unrelated modal');
+
+  // The pending stop can still be reopened and resolved normally.
+  ui.reopenRevisionPicker();
+  eq(ui.getModal().active, true, 'the settled prompt reopens the picker after the unrelated modal');
+  match(ui.getModal().body, /data-revision="dev"/, 'the reopened picker lists the revisions again');
+  window.selectRevision('dev', false, 'owner/pending');
+  await flush();
+  eq(ui.getModal().active, false, 'selecting a revision closes the reopened picker');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', 'dev']],
+    'the pending stop resolves normally after the unrelated modal'
+  );
+  eq(ui.getCurrentAnalysis().branch, 'dev', 'the revision selected after supersession is rendered');
+
+  // Escape on the unrelated modal follows the same coherent path.
+  await ui.openRepositoryInDetails('owner/pending2', 'model', null, 'push');
+  eq(ui.getModal().active, true, 'a second initial pending picker opens');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Analyzing owner\/pending2/, 'the second pending picker leaves the pane loading');
+  ui.showModal('Rebuild Complete', '<p>Rebuild finished</p>');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'supersession settles the second pending picker');
+  pressEscape();
+  eq(ui.getModal().active, false, 'Escape closes the unrelated modal');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'Escape close leaves no loading spinner');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'Escape close keeps the explicit pending prompt');
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/pending2', 'Escape close keeps the second pending stop current');
+  eq(ui.currentRepoHistoryEntry().revision, null, 'Escape close does not invent a revision selection');
+}
+
+async function testUnrelatedModalKeepsAnalysisRevisionPickerView() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    return data;
+  };
+  await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
+
+  const rendered = nodes.get('#modelsOverviewPanel').innerHTML;
+  const renderedHistory = historyTuples();
+  const renderedHeader = ui.getDetailHeader();
+  const renderedSelection = { ...ui.getSelectionState() };
+  ok(rendered.includes('showRevisionPickerFromAnalysis'), 'the rendered analysis exposes the change-revision action');
+
+  // A picker reopened from a rendered analysis is a view transition. An
+  // unrelated modal that replaces it must not settle anything or touch the
+  // rendered analysis.
+  window.showRevisionPickerFromAnalysis();
+  eq(ui.getModal().active, true, 'the analysis picker opens');
+  ui.showModal('Rebuild Complete', '<p>Rebuild finished</p>');
+  eq(ui.getModal().active, true, 'the unrelated modal replaces the analysis picker');
+  eq(nodes.get('#modelsOverviewPanel').innerHTML, rendered, 'an unrelated modal leaves the rendered analysis unchanged');
+  ok(!/Select a revision|loading-state/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'an unrelated modal renders neither a pending prompt nor a spinner for the analysis picker');
+  deepEq(historyTuples(), renderedHistory, 'an unrelated modal adds no history stop for the analysis picker');
+  eq(ui.getDetailHeader().repo, renderedHeader.repo, 'an unrelated modal keeps the analysis header unchanged');
+  deepEq({ ...ui.getSelectionState() }, renderedSelection, 'an unrelated modal keeps the rendered selection state unchanged');
+
+  click('#modalClose');
+  eq(ui.getModal().active, false, 'the unrelated modal closes');
+  eq(nodes.get('#modelsOverviewPanel').innerHTML, rendered, 'closing the unrelated modal leaves the rendered analysis unchanged');
+  ok(!/Select a revision|loading-state/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'closing the unrelated modal renders neither a pending prompt nor a spinner for the analysis picker');
+  deepEq(historyTuples(), renderedHistory, 'closing the unrelated modal keeps the analysis history unchanged');
 }
 
 async function testRevisionChangeFromRenderedAnalysis() {
@@ -1625,6 +1745,8 @@ async function testNavigationPreservesCommunityPanel() {
   await testCancelInitialRevisionPickerWithCloseButton();
   await testCancelInitialRevisionPickerWithEscape();
   await testCancelAnalysisRevisionPickerKeepsRenderedView();
+  await testUnrelatedModalSettlesPendingRevisionPicker();
+  await testUnrelatedModalKeepsAnalysisRevisionPickerView();
   await testRevisionChangeFromRenderedAnalysis();
   await testRevisionPickerScopedToItsNavigation();
   await testRefreshInFlightNavigation();
