@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
@@ -415,6 +418,108 @@ func TestSelectedDeleteProtectsAliasedMMProjDescendant(t *testing.T) {
 	}
 }
 
+// Acceptance case 4 (planned writer): a running writer whose completed plan
+// covers the selected companion blocks the companion deletion.
+//
+// The writer writes through a directory alias ("live" -> "blocked"), so the
+// plan's raw destination spelling differs from the selected entry's spelling
+// while both resolve to the same physical file. While the transfer is held the
+// run activity carries a known, complete plan, so the queued-job filter branch
+// and the activity's own filter fallback are both skipped and the planned
+// writer reservation branch is the only mechanism that can refuse the
+// deletion.
+func TestSelectedDeleteBlockedByPlannedMMProjWriter(t *testing.T) {
+	storage := t.TempDir()
+	repoDir := filepath.Join(storage, "models", "o", "m")
+	blocked := filepath.Join(repoDir, "blocked")
+	const companion = "mmproj-F32.gguf"
+	selectedFile := filepath.Join(blocked, companion)
+	writeSelectionFile(t, blocked, companion)
+	if err := os.Symlink(blocked, filepath.Join(repoDir, "live")); err != nil {
+		if runtime.GOOS == "windows" && os.IsPermission(err) {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	hf, started, release := blockingPlanServer(t, "live/"+companion)
+	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
+	defer releaseGate()
+	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL, MaxActive: 1})
+	registerJobManagerCleanup(t, s)
+	job, _, err := s.jobs.CreateJob(DownloadRequest{
+		Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"mmproj-f32"}, Excludes: []string{"blocked"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real downloader did not reach the planned companion transfer")
+	}
+	// The writer is a running job with a registered, complete plan. Prove the
+	// two filter-predicate branches cannot produce the refusal: the job is
+	// neither queued nor starting, and the run activity's plan is complete, so
+	// only the planned-writer branch of the reservation is still consulted.
+	s.jobs.mu.Lock()
+	planKnown, planComplete := false, false
+	for _, activity := range s.jobs.runActivities {
+		if activity.job.ID == job.ID && activity.planKnown {
+			planKnown, planComplete = true, activity.planComplete
+		}
+	}
+	running := false
+	if live, ok := s.jobs.jobs[job.ID]; ok {
+		running = live.Status == JobStatusRunning && !live.starting
+	}
+	s.jobs.mu.Unlock()
+	if !planKnown {
+		t.Fatal("transfer began before the production run registered its completed plan")
+	}
+	if !planComplete {
+		t.Fatal("the planned companion writer did not register a complete plan")
+	}
+	if !running {
+		t.Fatal("the planned companion writer is not a running job")
+	}
+
+	body := selectedGroupRequest(t, s, "o/m", repoDir, "blocked/"+companion)
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete while the planned companion transfer is held: status=%d body=%s, want %d", w.Code, w.Body.String(), http.StatusConflict)
+	}
+	if _, err := os.Stat(selectedFile); err != nil {
+		t.Fatalf("the planned writer's selected companion was removed: %v", err)
+	}
+
+	releaseGate()
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, ok := s.jobs.GetJob(job.ID)
+		if ok && (current.Status == JobStatusCompleted || current.Status == JobStatusFailed) {
+			if current.Status != JobStatusCompleted {
+				t.Fatalf("planned companion writer did not complete: %+v", current)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("planned companion writer did not finish after transfer release")
+		case <-ticker.C:
+		}
+	}
+	// The writer's plan targets the selected entry itself, so the completed
+	// transfer replaces the selected file's content.
+	data, err := os.ReadFile(selectedFile)
+	if err != nil || string(data) != "data!" {
+		t.Fatalf("planned companion transfer output=%q err=%v, want the written data", data, err)
+	}
+}
+
 // Acceptance case 1 (HF cache): a saved mmproj companion is its own group in
 // the HF location and can be removed without touching the LLM quantization.
 func TestCacheSelectionHFMMProjCompanionGroup(t *testing.T) {
@@ -461,6 +566,13 @@ func TestCacheSelectionHFMMProjCompanionGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The friendly-view entries exist before the delete, so their removal
+	// below is a real assertion and not a vacuous one.
+	for _, entry := range []string{companion.FriendlyPath, llm.FriendlyPath} {
+		if _, err := os.Lstat(entry); err != nil {
+			t.Fatalf("friendly entry %q missing before the delete: %v", entry, err)
+		}
+	}
 	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("HF companion delete status=%d body=%s", w.Code, w.Body.String())
@@ -468,8 +580,14 @@ func TestCacheSelectionHFMMProjCompanionGroup(t *testing.T) {
 	if _, err := os.Lstat(companion.SnapshotPath); !os.IsNotExist(err) {
 		t.Fatalf("selected HF companion snapshot remains: %v", err)
 	}
+	if _, err := os.Lstat(companion.FriendlyPath); !os.IsNotExist(err) {
+		t.Fatalf("selected HF companion friendly entry remains: %v", err)
+	}
 	if _, err := os.Lstat(llm.SnapshotPath); err != nil {
 		t.Fatalf("other quant snapshot changed: %v", err)
+	}
+	if _, err := os.Lstat(llm.FriendlyPath); err != nil {
+		t.Fatalf("other quant friendly entry changed: %v", err)
 	}
 }
 
