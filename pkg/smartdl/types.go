@@ -208,7 +208,11 @@ type RepoInfo struct {
 	RecommendedFilters []string `json:"recommended_filters,omitempty"`
 
 	// RecommendedDownload is a ready-to-send request body for /api/download
-	// using the default/recommended items.
+	// using the default/recommended items from this repository. A selection
+	// targets exactly one repository, so recommended items whose files live in
+	// a different repository (UpstreamRepo != "") are excluded. Those items
+	// remain individually selectable through SelectableItems, where UpstreamRepo
+	// identifies the repository their Files paths belong to.
 	RecommendedDownload *DownloadSelection `json:"recommended_download,omitempty"`
 
 	// RelatedDownloads lists related repositories (e.g., base model for LoRA).
@@ -658,20 +662,31 @@ type DownloadSelection struct {
 }
 
 // RecommendedFilterValues returns filters for recommended selectable items.
+//
+// The result is intended for one DownloadSelection targeting r.Repo. Items
+// sourced from another repository (UpstreamRepo != "") are omitted: their
+// Files paths are relative to that upstream repository and cannot be fetched
+// by a request for r.Repo. Those items stay individually selectable with their
+// UpstreamRepo and exact Files intact. If no recommended item belongs to the
+// analyzed repository, the result is empty.
 func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
-		if item.Recommended {
-			if item.Category == "quantization" || item.Category == "vision_encoder" {
-				for _, file := range item.Files {
-					recommended = append(recommended, exactArtifactFilter(file))
-				}
-				if len(item.Files) == 0 {
-					recommended = append(recommended, item.FilterValue)
-				}
-			} else {
+		if !item.Recommended {
+			continue
+		}
+		if item.UpstreamRepo != "" {
+			continue
+		}
+		if item.Category == "quantization" || item.Category == "vision_encoder" {
+			for _, file := range item.Files {
+				recommended = append(recommended, exactArtifactFilter(file))
+			}
+			if len(item.Files) == 0 {
 				recommended = append(recommended, item.FilterValue)
 			}
+		} else {
+			recommended = append(recommended, item.FilterValue)
 		}
 	}
 	return recommended

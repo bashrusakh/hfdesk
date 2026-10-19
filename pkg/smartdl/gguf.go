@@ -365,12 +365,19 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	}
 
 	// Sort with the least-compressed / largest variants first so the list reads
-	// from full precision and heavier quants down toward smaller files.
-	sort.Slice(info.Quantizations, func(i, j int) bool {
-		if info.Quantizations[i].File.Size != info.Quantizations[j].File.Size {
-			return info.Quantizations[i].File.Size > info.Quantizations[j].File.Size
+	// from full precision and heavier quants down toward smaller files. The
+	// repository path is the final tie-breaker so artifacts with the same size
+	// and quant label keep a deterministic order; that order also decides the
+	// single default selection in recommendedQuantIndex.
+	sort.SliceStable(info.Quantizations, func(i, j int) bool {
+		a, b := info.Quantizations[i], info.Quantizations[j]
+		if a.File.Size != b.File.Size {
+			return a.File.Size > b.File.Size
 		}
-		return info.Quantizations[i].Name < info.Quantizations[j].Name
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.File.Path < b.File.Path
 	})
 
 	return info
@@ -522,14 +529,62 @@ func preferredMMProj(files []FileInfo) (FileInfo, string) {
 	return files[0], strings.TrimSuffix(name, ".gguf")
 }
 
+// artifactPath returns the repository-relative path used as an artifact's
+// identity, falling back to the filename for callers that do not populate Path.
+func artifactPath(f FileInfo) string {
+	if f.Path != "" {
+		return f.Path
+	}
+	return f.Name
+}
+
+// mmprojArtifactID returns a deterministic, collision-free ID derived from the
+// mmproj artifact's repository path. Encoding the whole path rather than only
+// the basename keeps same-named files in different directories distinct while
+// avoiding slash/separator collisions in IDs.
+func mmprojArtifactID(f FileInfo) string {
+	filter := strings.ToLower(strings.TrimSuffix(filepath.Base(f.Name), ".gguf"))
+	if filter == "" {
+		filter = "mmproj"
+	}
+	return "mmproj-" + filter + "-" + base64.RawURLEncoding.EncodeToString([]byte(artifactPath(f)))
+}
+
+// recommendedQuantIndex returns the index of the single quantization artifact
+// that the default/recommended GGUF selection should include. Quantizations are
+// ordered by descending size, then name, then path (see analyzeGGUF). The rule
+// is deterministic:
+//
+//  1. the first non-MTP Q4_K_M/UD_Q4_K_M artifact (the conventional default);
+//  2. otherwise the first non-MTP artifact with quality >= 4 and size < 10 GiB.
+//
+// Exactly one index is returned, so a repository containing several artifacts
+// with the same quant token cannot put all of them in one recommended request.
+func recommendedQuantIndex(quants []GGUFQuantization) int {
+	for i := range quants {
+		q := &quants[i]
+		if !q.IsMTP && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+			return i
+		}
+	}
+	for i := range quants {
+		q := &quants[i]
+		if !q.IsMTP && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
+			return i
+		}
+	}
+	return -1
+}
+
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
 // This provides a unified interface for the web UI.
 //
-// When the repo contains mmproj vision-encoder files (multimodal models),
-// an additional SelectableItem with Category="vision_encoder" is emitted
-// for the preferred mmproj file. It is Recommended=true by default so that
-// the recommended download selection auto-bundles the vision encoder
-// alongside any selected LLM quant.
+// Exactly one non-MTP quantization artifact is Recommended, following the
+// deterministic rule in recommendedQuantIndex. When the repo contains mmproj
+// vision-encoder files (multimodal models), an additional SelectableItem with
+// Category="vision_encoder" is emitted for the preferred mmproj file. It is
+// Recommended=true by default so that the recommended download selection
+// auto-bundles the vision encoder alongside the chosen LLM quant.
 func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	if info == nil {
 		return nil
@@ -540,32 +595,22 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	items := make([]SelectableItem, 0, len(info.Quantizations)+1)
 
-	// Track if we have a (non-MTP) Q4_K_M (common recommended default).
-	hasQ4KM := false
+	recommendedIndex := recommendedQuantIndex(info.Quantizations)
+
 	// Keep FilterValue compatible as a legacy label, but derive row uniqueness
 	// from artifact paths below; a quant token or basename is not identity.
 	repoHasMTP := false
 	for _, q := range info.Quantizations {
-		if (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") && !q.IsMTP {
-			hasQ4KM = true
-		}
 		if q.IsMTP {
 			repoHasMTP = true
 		}
 	}
 
-	for _, q := range info.Quantizations {
-		// Determine if this should be recommended. Q4_K_M is a good default,
-		// otherwise highest quality in 4-bit range. MTP variants are a
-		// specialist option (speculative decoding) and are never auto-recommended.
-		recommended := false
-		if q.IsMTP {
-			recommended = false
-		} else if hasQ4KM && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
-			recommended = true
-		} else if !hasQ4KM && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
-			recommended = true
-		}
+	for i, q := range info.Quantizations {
+		// Only the deterministic default artifact is recommended. MTP variants
+		// are a specialist option (speculative decoding) and are never
+		// auto-recommended; recommendedQuantIndex already excludes them.
+		recommended := i == recommendedIndex
 
 		// Files to download for this quant: all shards when split, else the one
 		// file. Fall back to the representative path if Files wasn't populated.
@@ -619,19 +664,22 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	// Append a vision-encoder companion item for EVERY mmproj file present, so
 	// the user can pick the precision they want (f16 / bf16 / f32 / …) instead
-	// of being limited to one. The preferred file (preferredMMProj precedence)
-	// is marked Recommended so the recommended selection still auto-bundles a
-	// sensible mmproj alongside the chosen quant (github issue #76). Each item
-	// gets a filter derived from its own filename so it matches exactly one
-	// file via the comma-separated -F filter list.
+	// of being limited to one. Files are compared by repository path, not
+	// basename: two directories may each contain "mmproj-F16.gguf", and those
+	// are distinct artifacts. The preferred file (preferredMMProj precedence)
+	// is the only one marked Recommended so the recommended selection still
+	// auto-bundles a sensible mmproj alongside the chosen quant (issue #76).
+	// FilterValue stays a legacy basename token; Files carries the exact
+	// artifact identity (including the directory).
 	if len(info.MMProjFiles) > 0 {
 		preferred, _ := preferredMMProj(info.MMProjFiles)
+		preferredPath := artifactPath(preferred)
 		// Emit the preferred file first (default/recommended pick), then the
 		// rest, so the recommended mmproj appears at the top of the list.
 		ordered := make([]FileInfo, 0, len(info.MMProjFiles))
 		ordered = append(ordered, preferred)
 		for _, f := range info.MMProjFiles {
-			if f.Name != preferred.Name {
+			if artifactPath(f) != preferredPath {
 				ordered = append(ordered, f)
 			}
 		}
@@ -646,15 +694,15 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			base := filepath.Base(f.Name)
 			filter := strings.ToLower(strings.TrimSuffix(base, ".gguf"))
 			items = append(items, SelectableItem{
-				ID:           "mmproj-" + filter,
+				ID:           mmprojArtifactID(f),
 				Label:        base,
 				Description:  mmDesc,
 				Size:         f.Size,
 				SizeHuman:    f.SizeHuman,
-				Recommended:  f.Name == preferred.Name,
+				Recommended:  artifactPath(f) == preferredPath,
 				Category:     "vision_encoder",
 				FilterValue:  filter,
-				Files:        []string{f.Path},
+				Files:        []string{artifactPath(f)},
 				UpstreamRepo: info.MMProjUpstreamRepo,
 			})
 		}

@@ -111,7 +111,9 @@ Important response fields:
 }
 ```
 
-`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset.
+`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request.
+
+`recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
 ### Model/dataset selection
 
