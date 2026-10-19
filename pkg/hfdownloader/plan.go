@@ -786,24 +786,55 @@ func isRecognizedMetadataPath(relativePath string) bool {
 }
 
 // isKnownDatasetCompanionPath is the positive allowlist for unmatched dataset
-// companions. Unknown extensions are skipped by default; only recognized
-// metadata plus documented docs/config/script/tokenizer assets are retained.
+// companions. Unknown extensions are skipped by default. Documentation,
+// config, and script extensions are path-scoped so unrelated split directories
+// cannot retain their code files; known tokenizer/citation assets are allowed
+// by name/extension regardless of placement.
 func isKnownDatasetCompanionPath(relativePath string) bool {
 	if isRecognizedDatasetMetadataPath(relativePath) {
 		return true
 	}
-	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	p := strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
+	base := strings.ToLower(path.Base(p))
 	switch base {
-	case "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+	case "vocab.txt", "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
 		"environment.yml", "environment.yaml", "dockerfile", "makefile",
 		".gitattributes", ".gitignore", "tokenizer.bin":
 		return true
 	}
+	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
+		return true
+	}
+	// Tokenizer/citation assets are known by extension independently of the
+	// directory that carries them.
+	switch path.Ext(base) {
+	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2", ".cff":
+		return true
+	}
+	if !isConventionalCompanionDirectory(p) {
+		return false
+	}
 	switch path.Ext(base) {
 	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
 		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
-		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".model", ".spm",
-		".tiktoken", ".vocab", ".merges", ".jinja", ".j2":
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb":
+		return true
+	}
+	return false
+}
+
+// isConventionalCompanionDirectory reports whether a path is at the repository
+// root or below a top-level docs/config/script/tokenizer directory. Split-like
+// directories and arbitrary nested paths are excluded.
+func isConventionalCompanionDirectory(relativePath string) bool {
+	p := strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
+	dir := path.Dir(p)
+	if dir == "." || dir == "" {
+		return true
+	}
+	first, _, _ := strings.Cut(dir, "/")
+	switch first {
+	case "docs", "doc", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
 		return true
 	}
 	return false

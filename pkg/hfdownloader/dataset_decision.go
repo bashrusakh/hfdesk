@@ -192,7 +192,12 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 				in.Alternatives = []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}
 			}
 		}
+		in.Alternatives = forceKnownDatasetCompanionRole(n.Path, in.Alternatives)
+		hasDataAlternative := false
 		for _, alt := range in.Alternatives {
+			if alt.Role == datasetselection.EvidenceRoleData {
+				hasDataAlternative = true
+			}
 			if bit, ok := coreBits[alt.Label]; ok && alt.Role == datasetselection.EvidenceRoleData {
 				in.PossibleCore |= 1 << bit
 			}
@@ -200,7 +205,7 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 				in.PossibleResidual = appendUnique(in.PossibleResidual, alt.Label)
 			}
 		}
-		if hasEvidence && e.DefiniteRole == datasetselection.EvidenceRoleData {
+		if hasEvidence && e.DefiniteRole == datasetselection.EvidenceRoleData && hasDataAlternative {
 			for _, label := range e.DefiniteLabels {
 				label = strings.ToLower(label)
 				if bit, ok := coreBits[label]; ok {
@@ -308,6 +313,17 @@ func isDatasetPayloadPath(filePath string) bool {
 		return true
 	}
 	return false
+}
+
+// forceKnownDatasetCompanionRole makes an allowlisted metadata/config/tokenizer
+// path companion-only before world evaluation. Membership evidence may offer a
+// data(default) alternative for a .json/.txt name, but these names are known
+// companions and must not create role ambiguity. Unknown names are unchanged.
+func forceKnownDatasetCompanionRole(filePath string, alternatives []datasetDecisionRoleLabel) []datasetDecisionRoleLabel {
+	if !isKnownDatasetCompanionPath(filePath) {
+		return alternatives
+	}
+	return []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}
 }
 
 // canRetainDatasetCompanion reports whether an unmatched input is safe to

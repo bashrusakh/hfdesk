@@ -63,17 +63,17 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
-func TestDatasetMetadataNamesDoNotOverrideMembershipEvidence(t *testing.T) {
+func TestDatasetKnownMetadataNamesAreCompanionOnly(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "tokenizer.json"},
 		{Path: "nested/dataset_info.json"},
 	}, []string{"train"}, nil)
-	if len(c.Inputs[1].Alternatives) < 2 {
-		t.Fatalf("dataset tokenizer basename must not establish metadata certainty: %+v", c.Inputs[1].Alternatives)
-	}
-	if c.Inputs[2].Excluded || len(c.Inputs[2].Alternatives) == 0 {
-		t.Fatalf("nested dataset_info must retain dataset membership evidence: %+v", c.Inputs[2])
+	for i := 1; i <= 2; i++ {
+		got := c.Inputs[i].Alternatives
+		if len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
+			t.Fatalf("known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
+		}
 	}
 
 	excluded := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "nested/dataset_info.json"}}, []string{"train"}, []string{"dataset_info.json"})
@@ -82,32 +82,23 @@ func TestDatasetMetadataNamesDoNotOverrideMembershipEvidence(t *testing.T) {
 	}
 }
 
-func TestDatasetGGUFMetadataRoleRefusalHasCachedAndUncachedWitnesses(t *testing.T) {
+func TestDatasetKnownConfigIsCompanionOnly(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "weights/model.gguf"},
 		{Path: "nested/config.json"},
 	}, []string{"weights/model.gguf"}, nil)
 	target := 1
-	if len(c.Inputs[target].Alternatives) < 2 {
-		t.Fatalf("fixture lacks data/companion alternatives: %+v", c.Inputs[target].Alternatives)
+	if got := c.Inputs[target].Alternatives; len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
+		t.Fatalf("known config alternatives = %+v; want companion-only", got)
 	}
-	data := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: c.Inputs[target].Alternatives[0].Label}
 	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
-	worlds := []datasetDecisionWorld{
-		mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: data}, nil),
-		mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: companion}, nil),
+	world := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: companion}, nil)
+	evaluation, err := evaluateDatasetDecisionWorld(c, world)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if worlds[0].DataLabels[target] == "" || !worlds[1].Companion[target] {
-		t.Fatalf("role witnesses do not represent distinct established alternatives: %+v", worlds)
-	}
-	for wi, world := range worlds {
-		evaluation, err := evaluateDatasetDecisionWorld(c, world)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if evaluation.Records[target].Selected != (wi == 1) {
-			t.Fatalf("role world %d selected metadata=%t, want %t: %+v", wi, evaluation.Records[target].Selected, wi == 1, evaluation.Records)
-		}
+	if !evaluation.Records[target].Selected {
+		t.Fatalf("known config companion was not selected: %+v", evaluation.Records)
 	}
 	for _, cached := range []bool{true, false} {
 		q := c
@@ -115,17 +106,8 @@ func TestDatasetGGUFMetadataRoleRefusalHasCachedAndUncachedWitnesses(t *testing.
 			q.uniqueEvaluation = nil
 		}
 		can, cannot := datasetDecisionRefusal(q, target)
-		if !can.Possible || !cannot.Possible || can.Err != nil || cannot.Err != nil {
-			t.Fatalf("cached=%t role-dependent emitted-set witnesses missing: can=%+v cannot=%+v", cached, can, cannot)
-		}
-		for _, witness := range []struct {
-			result datasetDecisionQueryResult
-			want   bool
-		}{{can, true}, {cannot, false}} {
-			evaluation, err := evaluateDatasetDecisionWorld(q, witness.result.World)
-			if err != nil || evaluation.Records[target].Selected != witness.want {
-				t.Fatalf("cached=%t witness selected=%v want=%t err=%v records=%+v", cached, evaluation.Records[target].Selected, witness.want, err, evaluation.Records)
-			}
+		if !can.Possible || cannot.Possible || can.Err != nil || cannot.Err != nil {
+			t.Fatalf("cached=%t config feasibility can/cannot=%t/%t errors=%v/%v; want possible/impossible", cached, can.Possible, cannot.Possible, can.Err, cannot.Err)
 		}
 	}
 }
@@ -271,7 +253,7 @@ func TestFeasibleDatasetDecisionWorldAgainstIndependentSmallOracle(t *testing.T)
 	t.Logf("independent concrete oracle matched solver for %d generated queries", queries)
 }
 
-func TestRequiredIneligibilityRejectsRootCompanionAndAcceptsNestedCompanion(t *testing.T) {
+func TestRequiredIneligibilityUsesAllowlist(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "config.json"}, {Path: "nested/notes.txt"}}, []string{"train"}, nil)
 	rootCompanion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); ok {
@@ -281,16 +263,16 @@ func TestRequiredIneligibilityRejectsRootCompanionAndAcceptsNestedCompanion(t *t
 		t.Fatal("unseeded nested ambiguous companion should satisfy required ineligibility")
 	}
 	definite := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "nested/notes.md"}}, []string{"train"}, nil)
-	if _, ok := feasibleAnyCoreDecisionWorld(definite, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); ok {
-		t.Fatal("unseeded nested definite companion must remain retained")
+	if _, ok := feasibleAnyCoreDecisionWorld(definite, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); !ok {
+		t.Fatal("arbitrarily nested docs path must be skippable")
 	}
 	if _, ok := feasibleAnyCoreDecisionWorld(c, datasetDecisionPins{99: rootCompanion}, nil, nil, nil); ok {
 		t.Fatal("pin to unknown input accepted")
 	}
-	seeded := compileDecisionFixture([]hfNode{{Path: "train/data.csv"}, {Path: "train/meta.json"}}, []string{"train"}, nil)
+	seeded := compileDecisionFixture([]hfNode{{Path: "train/data.csv"}, {Path: "partition/meta.json"}}, []string{"train"}, nil)
 	positiveSeed := &datasetDecisionPositive{Input: 0, Alternative: seeded.Inputs[0].Alternatives[0]}
-	if _, ok := feasibleAnyCoreDecisionWorld(seeded, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, positiveSeed); ok {
-		t.Fatal("positive direct source cannot coexist with ineligible companion descendant")
+	if _, ok := feasibleAnyCoreDecisionWorld(seeded, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, positiveSeed); !ok {
+		t.Fatal("unknown companion must remain skippable next to a direct data source")
 	}
 	lfs := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "other/weights.bin", LFS: &hfLfsInfo{Size: 3}}}, []string{"train"}, nil)
 	if _, ok := feasibleAnyCoreDecisionWorld(lfs, datasetDecisionPins{1: rootCompanion}, []int{1}, nil, nil); !ok {
@@ -594,14 +576,18 @@ func oracleDatasetPayloadPath(filePath string) bool {
 // dataset companion allowlist for the oracle. It must not call the production
 // allowlist/predicate helpers.
 func oracleKnownDatasetCompanionPath(filePath string) bool {
-	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	p := strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
+	base := strings.ToLower(path.Base(p))
 	switch base {
 	case "config.json", "tokenizer.json", "tokenizer_config.json",
 		"special_tokens_map.json", "added_tokens.json", "vocab.json",
-		"merges.txt", "dataset_info.json", "dataset_infos.json",
+		"merges.txt", "vocab.txt", "dataset_info.json", "dataset_infos.json",
 		"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
 		"environment.yml", "environment.yaml", "dockerfile", "makefile",
 		".gitattributes", ".gitignore", "tokenizer.bin":
+		return true
+	}
+	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
 		return true
 	}
 	if strings.HasPrefix(base, "readme") {
@@ -624,10 +610,30 @@ func oracleKnownDatasetCompanionPath(filePath string) bool {
 		}
 	}
 	switch path.Ext(base) {
+	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2", ".cff":
+		return true
+	}
+	if !oracleConventionalCompanionDirectory(p) {
+		return false
+	}
+	switch path.Ext(base) {
 	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
 		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
-		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".model", ".spm",
-		".tiktoken", ".vocab", ".merges", ".jinja", ".j2":
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb":
+		return true
+	}
+	return false
+}
+
+func oracleConventionalCompanionDirectory(filePath string) bool {
+	p := strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
+	dir := path.Dir(p)
+	if dir == "." || dir == "" {
+		return true
+	}
+	first, _, _ := strings.Cut(dir, "/")
+	switch first {
+	case "docs", "doc", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
 		return true
 	}
 	return false
