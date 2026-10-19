@@ -777,7 +777,7 @@ func isRecognizedModelMetadata(relativePath string) bool {
 // is a model tokenizer asset (notably vocab.txt) is not thereby dataset metadata.
 func isRecognizedDatasetMetadataPath(relativePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
-	return base != "vocab.txt" && isRecognizedMetadataPath(relativePath)
+	return base != "vocab.txt" && (isRecognizedMetadataPath(relativePath) || datasetselection.IsMetadata(relativePath))
 }
 
 func isRecognizedMetadataPath(relativePath string) bool {

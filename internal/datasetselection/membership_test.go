@@ -44,6 +44,106 @@ func TestRecognizeRetainsInputIndexAndCaseInsensitiveRoles(t *testing.T) {
 	assertIndexes(t, r.Groups["validation"], 2)
 }
 
+func TestIsMetadataRecognizesKnownNamesAtAnyDepth(t *testing.T) {
+	for _, p := range []string{
+		"README", "README.txt", "README.md", "train/README.txt", "data/README.md",
+		"LICENSE", "LICENSE.txt", "LICENSE.md", "LICENSE-MIT", "nested/LICENSE.txt", "data/LICENSE-APACHE-2.0",
+		"dataset_info.json", "dataset_infos.json", "train/dataset_info.json", "data/dataset_infos.json",
+		"config.json", "./LICENSE.txt",
+	} {
+		if !IsMetadata(p) {
+			t.Errorf("IsMetadata(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{
+		"", "notes.txt", "train/notes.txt", "data.json", "license.json", "vocab.txt",
+		"nested/config.json", "train/config.json", "readme.json",
+	} {
+		if IsMetadata(p) {
+			t.Errorf("IsMetadata(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestIsRootMetadataRecognizesOnlyKnownRootNames(t *testing.T) {
+	for _, p := range []string{
+		"README", "README.txt", "README.md", "readme.rst",
+		"LICENSE", "LICENSE.txt", "LICENSE.md", "LICENSE-MIT", "LICENSE-APACHE-2.0",
+		"dataset_info.json", "dataset_infos.json", "config.json", "./LICENSE.txt",
+	} {
+		if !IsRootMetadata(p) {
+			t.Errorf("IsRootMetadata(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{
+		"", "notes.txt", "data.json", "license.json", "vocab.txt",
+		"nested/README.txt", "nested/LICENSE.txt", "nested/dataset_infos.json", "nested/config.json",
+	} {
+		if IsRootMetadata(p) {
+			t.Errorf("IsRootMetadata(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestRecognizeKnownMetadataIsCompanionOnly(t *testing.T) {
+	files := []File{
+		{Path: "README.txt"},
+		{Path: "README.md"},
+		{Path: "LICENSE.txt"},
+		{Path: "LICENSE.md"},
+		{Path: "LICENSE"},
+		{Path: "dataset_infos.json"},
+		{Path: "config.json"},
+		{Path: "train/README.txt"},
+		{Path: "train/LICENSE.txt"},
+		{Path: "data/dataset_infos.json"},
+		{Path: "nested/dataset_info.json"},
+		{Path: "nested/README.md"},
+		{Path: "notes.txt"},
+		{Path: "data.json"},
+		{Path: "nested/config.json"},
+		{Path: "nested/notes.txt"},
+	}
+	r := Recognize(files)
+	knownRoot := []int{0, 1, 2, 3, 4, 5, 6}
+	for _, i := range knownRoot {
+		if len(r.Evidence) <= i {
+			t.Fatalf("missing evidence for input %d", i)
+		}
+		assertEvidence(t, r.Evidence[i], i, EvidenceRootMetadata, nil, nil, []EvidenceRole{EvidenceRoleCompanion}, "")
+	}
+	knownNested := []int{7, 8, 9, 10, 11}
+	for _, i := range knownNested {
+		if len(r.Evidence) <= i {
+			t.Fatalf("missing evidence for input %d", i)
+		}
+		assertEvidence(t, r.Evidence[i], i, EvidenceMetadataCompanion, nil, nil, []EvidenceRole{EvidenceRoleCompanion}, "")
+	}
+	unknown := []int{12, 13, 14, 15}
+	for _, i := range unknown {
+		assertEvidence(t, r.Evidence[i], i, EvidenceUnnamedAmbiguous, []string{"default"}, nil, []EvidenceRole{EvidenceRoleData, EvidenceRoleCompanion}, "")
+	}
+	assertIndexes(t, r.Unresolved, unknown...)
+	if len(r.Groups) != 0 {
+		t.Fatalf("metadata or unknown files were classified as dataset groups: %v", r.Groups)
+	}
+}
+
+func TestRecognizeSplitDirectoryConfigAndUnknownKeepDataRole(t *testing.T) {
+	files := []File{
+		{Path: "train/config.json"},
+		{Path: "train/notes.txt"},
+	}
+	r := Recognize(files)
+	assertIndexes(t, r.Groups["train"], 0, 1)
+	for i := range files {
+		assertEvidence(t, r.Evidence[i], i, EvidenceConventional, []string{"train"}, []string{"train"}, []EvidenceRole{EvidenceRoleData}, EvidenceRoleData)
+	}
+	if len(r.Unresolved) != 0 {
+		t.Fatalf("split-directory config/unknown unexpectedly became ambiguous: %v", r.Unresolved)
+	}
+}
+
 func TestRecognizeSplitPrefixBoundaries(t *testing.T) {
 	files := []File{
 		{Path: "corpus_train_000.parquet"},

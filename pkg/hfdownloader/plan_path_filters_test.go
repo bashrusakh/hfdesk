@@ -477,7 +477,7 @@ func TestPlanRepoDatasetOrdinaryPathSelectionSurvivesMetadataRoleAmbiguity(t *te
 	files := []hfNode{
 		{Type: "file", Path: "selected.csv", Size: 10},
 		{Type: "file", Path: "train/config.json", Size: 11},
-		{Type: "file", Path: "nested/dataset_info.json", Size: 12},
+		{Type: "file", Path: "nested/config.json", Size: 12},
 		{Type: "file", Path: "validation/data.parquet", Size: 13},
 	}
 	srv := mockHFServerForPlan(t, files)
@@ -489,15 +489,15 @@ func TestPlanRepoDatasetOrdinaryPathSelectionSurvivesMetadataRoleAmbiguity(t *te
 	}
 	assertPaths(t, planPaths(plan), []string{"selected.csv"})
 
-	job.Filters = []string{"selected.csv", "nested/dataset_info.json"}
+	job.Filters = []string{"selected.csv", "nested/config.json"}
 	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("explicit metadata path should resolve alternatives: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"selected.csv", "nested/dataset_info.json"})
+	assertPaths(t, planPaths(plan), []string{"selected.csv", "nested/config.json"})
 
 	job.Filters = []string{"selected.csv"}
-	job.Excludes = []string{"dataset_info.json"}
+	job.Excludes = []string{"config.json"}
 	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("exclude should resolve metadata ambiguity: %v", err)
@@ -545,6 +545,141 @@ func TestPlanRepoDatasetKnownMetadataOwnershipUnknownIsRetained(t *testing.T) {
 		t.Fatalf("uncertain metadata ownership must retain without refusing: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"train.csv", "elsewhere/README.md"})
+}
+
+func TestPlanRepoDatasetKnownRootMetadataResolvesAsCompanion(t *testing.T) {
+	for _, metadata := range []string{"README.txt", "README.md", "LICENSE.txt", "LICENSE.md", "LICENSE", "dataset_infos.json", "dataset_info.json", "config.json"} {
+		t.Run("group/"+metadata, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: metadata, Size: 11},
+			})
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("group filter with known root metadata %q: %v", metadata, err)
+			}
+			assertPaths(t, planPaths(plan), []string{"train.csv", metadata})
+		})
+		t.Run("ordinary/"+metadata, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: metadata, Size: 11},
+			})
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("ordinary path filter with known root metadata %q: %v", metadata, err)
+			}
+			assertPaths(t, planPaths(plan), []string{"train.csv", metadata})
+		})
+	}
+}
+
+func TestPlanRepoDatasetUnknownRootMetadataStaysAmbiguousOrUnselected(t *testing.T) {
+	for _, metadata := range []string{"notes.txt", "data.json"} {
+		t.Run("group/"+metadata, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: metadata, Size: 11},
+			})
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+				t.Fatalf("unknown root metadata %q group plan = (%+v, %v), want nil plan and ErrAmbiguousSelection", metadata, plan, err)
+			}
+		})
+		t.Run("ordinary/"+metadata, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, []hfNode{
+				{Type: "file", Path: "train.csv", Size: 10},
+				{Type: "file", Path: metadata, Size: 11},
+			})
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train.csv"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("ordinary path filter with unknown root metadata %q: %v", metadata, err)
+			}
+			assertPaths(t, planPaths(plan), []string{"train.csv"})
+		})
+	}
+}
+
+func TestPlanRepoDatasetKnownNestedMetadataResolvesAsCompanion(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "train/README.txt", Size: 11},
+		{Type: "file", Path: "train/LICENSE.txt", Size: 12},
+		{Type: "file", Path: "data/dataset_infos.json", Size: 13},
+		{Type: "file", Path: "nested/dataset_info.json", Size: 14},
+		{Type: "file", Path: "nested/README.md", Size: 15},
+	}
+	want := []string{"train.csv", "train/README.txt", "train/LICENSE.txt", "data/dataset_infos.json", "nested/dataset_info.json", "nested/README.md"}
+	for _, tc := range []struct {
+		name    string
+		filters []string
+	}{
+		{name: "group", filters: []string{"train"}},
+		{name: "ordinary", filters: []string{"train.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			assertPaths(t, planPaths(plan), want)
+		})
+	}
+}
+
+func TestPlanRepoDatasetNestedConfigAndUnknownKeepEstablishedRoles(t *testing.T) {
+	t.Run("nested config outside split directory stays ambiguous", func(t *testing.T) {
+		srv := mockHFServerForPlan(t, []hfNode{
+			{Type: "file", Path: "train.csv", Size: 10},
+			{Type: "file", Path: "nested/config.json", Size: 11},
+		})
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+			t.Fatalf("nested config plan = (%+v, %v), want nil plan and ErrAmbiguousSelection", plan, err)
+		}
+	})
+	t.Run("split-directory config and unknown stay data", func(t *testing.T) {
+		srv := mockHFServerForPlan(t, []hfNode{
+			{Type: "file", Path: "train.csv", Size: 10},
+			{Type: "file", Path: "train/config.json", Size: 11},
+			{Type: "file", Path: "train/notes.txt", Size: 12},
+		})
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("split-directory config/unknown PlanRepo: %v", err)
+		}
+		assertPaths(t, planPaths(plan), []string{"train.csv", "train/config.json", "train/notes.txt"})
+	})
+}
+
+func TestPlanRepoDatasetKnownRootMetadataDoesNotBroadenGGUFOnly(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100},
+		{Type: "file", Path: "README.txt", Size: 10},
+		{Type: "file", Path: "LICENSE.txt", Size: 11},
+		{Type: "file", Path: "dataset_infos.json", Size: 12},
+		{Type: "file", Path: "dataset_info.json", Size: 13},
+		{Type: "file", Path: "config.json", Size: 14},
+		{Type: "file", Path: "README.md", Size: 15},
+		{Type: "file", Path: "train/README.txt", Size: 16},
+		{Type: "file", Path: "train/LICENSE.txt", Size: 17},
+		{Type: "file", Path: "data/dataset_infos.json", Size: 18},
+	})
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"Q4_K_M"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"model-Q4_K_M.gguf"})
 }
 
 func TestPlanRepoDatasetDefiniteDataMetadataNameDoesNotFallback(t *testing.T) {

@@ -51,13 +51,13 @@ type Job struct {
 	//
 	// Each filter is matched against repository-relative paths: a file is a direct
 	// match if its path contains any filter string (substring mode, the default) or,
-	// when ExactMatch is set, if the filter equals a whole delimiter-bounded
-	// path segment. Exact filters can use "./name" to select only the literal
-	// root-level basename; nested artifacts use their full relative path. Excludes
-	// are applied before selection: a file that matches a
-	// filter but is excluded does not confirm selection. After Excludes are
-	// applied, at least one file must directly match or be selected by recognized
-	// dataset membership, or the scan fails with ErrNoFilterMatch.
+	// when ExactMatch is set, if the filter matches the path by the exact-mode
+	// component and path forms described on ExactMatch. Exact filters can use
+	// "./name" to select only the literal root-level basename; nested artifacts
+	// use their full relative path. Excludes are applied before selection: a file
+	// that matches a filter but is excluded does not confirm selection. After
+	// Excludes are applied, at least one file must directly match or be selected
+	// by recognized dataset membership, or the scan fails with ErrNoFilterMatch.
 	//
 	// The planner may additionally retain companion/metadata files in the plan
 	// after a successful direct selection (e.g., mmproj companions for GGUF,
@@ -82,11 +82,27 @@ type Job struct {
 	Excludes []string
 
 	// ExactMatch controls how Filters are matched. When false (the default),
-	// each filter is matched as a case-insensitive substring (see Filters).
-	// When true, a filter matches only when it equals a whole delimiter-bounded
-	// segment of the file name (segments are split on '-', '.', and spaces;
-	// underscores stay within a segment). This lets a filter like "q6_k" select
-	// "model-Q6_K.gguf" without also matching "model-UD-Q6_K_XL.gguf".
+	// each filter is matched as a case-insensitive substring of the complete
+	// repository-relative path (see Filters). When true, filters select by
+	// repository-relative path form:
+	//
+	//   - a filter ending in "/" selects descendants of that directory at a
+	//     path-component boundary;
+	//   - a filter beginning with "." and containing no "/" is an extension
+	//     selector (for example ".safetensors");
+	//   - "./name" is an additive selector for the literal root-level basename,
+	//     so it does not match a same-named file in a subdirectory;
+	//   - a filter containing "/" is a complete repository-relative path;
+	//   - any other filter matches a directory component or the basename as a
+	//     whole delimiter-bounded segment (segments are split on '-', '.', and
+	//     spaces; underscores stay within a segment).
+	//
+	// The segment form lets a filter like "q6_k" select "model-Q6_K.gguf"
+	// without also matching "model-UD-Q6_K_XL.gguf". A directory-component
+	// filter such as "unet" selects files below a unet/ directory, and a full
+	// slash path such as "weights/model.gguf" matches only that path. The "./"
+	// form is reserved for exact mode; without ExactMatch, filters retain their
+	// existing substring behavior.
 	//
 	// Excludes are always matched as substrings, regardless of this setting.
 	ExactMatch bool

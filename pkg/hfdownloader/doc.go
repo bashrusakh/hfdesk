@@ -90,10 +90,14 @@ The ProgressFunc callback receives events throughout the download:
 
 Filters are matched case-insensitively against repository-relative paths of any
 file type, not only LFS files. Multiple filters can be specified; a file
-matches if its path contains any filter string, or (with ExactMatch) the filter
-equals a whole delimiter-bounded path segment. Recognized dataset group filters
-also select data by membership. A filtered request with no surviving direct or
-membership selection returns `ErrNoFilterMatch`:
+matches if its path contains any filter string. With ExactMatch, filters select
+by repository-relative path form: a trailing "/" selects descendants of a
+directory, a leading-dot extension such as ".safetensors" selects that
+extension, a filter containing "/" is a complete relative path, "./name" selects
+only the literal root-level basename, and any other filter matches a whole
+delimiter-bounded path component (a directory name or the basename). Recognized
+dataset group filters also select data by membership. A filtered request with
+no surviving direct or membership selection returns `ErrNoFilterMatch`:
 
 	job := hfdownloader.Job{
 		Repo:    "TheBloke/Llama-2-7B-GGUF",

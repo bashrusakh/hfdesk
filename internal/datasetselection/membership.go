@@ -3,7 +3,8 @@
 
 // Package datasetselection recognizes repository files that belong to dataset
 // groups. It intentionally does not infer membership from an ambiguous file
-// extension alone.
+// extension alone; known metadata names resolve to a companion role before any
+// data/companion alternative is considered.
 package datasetselection
 
 import (
@@ -59,6 +60,7 @@ const (
 	EvidenceUnnamedDefault    EvidenceReason = "unnamed-default-data"
 	EvidenceUnnamedAmbiguous  EvidenceReason = "unnamed-data-or-companion"
 	EvidenceRootMetadata      EvidenceReason = "root-metadata-companion"
+	EvidenceMetadataCompanion EvidenceReason = "metadata-companion"
 	EvidenceOrdinaryCompanion EvidenceReason = "ordinary-companion"
 )
 
@@ -78,9 +80,14 @@ func Recognize(files []File) Result {
 		if strings.HasSuffix(base, ".tar.gz") {
 			ext = "tar.gz"
 		}
-		if !dataExtension[ext] || isServiceMetadata(p) {
-			if isServiceMetadata(p) {
-				r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleRoles: []EvidenceRole{EvidenceRoleCompanion}, Reason: EvidenceRootMetadata})
+		knownMetadata := IsMetadata(p)
+		if !dataExtension[ext] || knownMetadata {
+			if knownMetadata {
+				reason := EvidenceMetadataCompanion
+				if IsRootMetadata(p) {
+					reason = EvidenceRootMetadata
+				}
+				r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleRoles: []EvidenceRole{EvidenceRoleCompanion}, Reason: reason})
 			} else if !dataExtension[ext] {
 				r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleRoles: []EvidenceRole{EvidenceRoleCompanion}, Reason: EvidenceOrdinaryCompanion})
 			}
@@ -129,16 +136,58 @@ var dataExtension = map[string]bool{
 	"tar.gz": true, "zip": true, "gz": true, "zst": true,
 }
 
-func isServiceMetadata(p string) bool {
-	if strings.Contains(p, "/") {
+// IsMetadata reports whether p is a recognized metadata or companion file.
+// README and LICENSE variants and dataset_info(s).json are recognized by
+// basename at any depth. config.json is recognized only at the repository root,
+// so a nested config.json keeps its established data/ambiguous classification.
+// Other .json/.jsonl/.txt files remain data/companion ambiguous.
+func IsMetadata(p string) bool {
+	p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
+	if p == "" {
 		return false
 	}
-	switch strings.ToLower(p) {
-	case "config.json", "dataset_info.json":
+	base := strings.ToLower(path.Base(p))
+	if isReadmeVariant(base) || isLicenseVariant(base) {
 		return true
+	}
+	switch base {
+	case "dataset_info.json", "dataset_infos.json":
+		return true
+	case "config.json":
+		return !strings.Contains(p, "/")
 	default:
 		return false
 	}
+}
+
+// IsRootMetadata reports whether p is a known repository-root metadata or
+// companion name. It is the root-only view of IsMetadata and keeps config.json
+// recognition scoped to the repository root.
+func IsRootMetadata(p string) bool {
+	p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
+	return p != "" && !strings.Contains(p, "/") && IsMetadata(p)
+}
+
+var metadataTextExtension = map[string]bool{
+	".md": true, ".markdown": true, ".rst": true, ".txt": true,
+}
+
+func isReadmeVariant(base string) bool {
+	return strings.HasPrefix(base, "readme") && (base == "readme" || metadataTextExtension[path.Ext(base)])
+}
+
+func isLicenseVariant(base string) bool {
+	if base == "license" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(base, "license")
+	if !ok || rest == "" {
+		return false
+	}
+	if strings.HasPrefix(rest, "-") {
+		return len(rest) > 1
+	}
+	return metadataTextExtension[rest]
 }
 
 func pathGroups(p, base string) []string {
