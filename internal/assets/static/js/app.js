@@ -185,6 +185,20 @@
     }
   }
 
+  // Page navigation is local to this closure. Rendered guidance that needs to
+  // send the user to Settings (for example the gated-repository state) uses
+  // this small global bridge instead of embedding a navigation call in HTML.
+  window.openSettingsPage = function() {
+    navigateTo('settings');
+    const tokenInput = $('#hfToken');
+    if (tokenInput && !tokenInput.disabled) {
+      tokenInput.focus();
+      return;
+    }
+    const heading = $('#settingsPageTitle');
+    if (heading) heading.focus();
+  };
+
   // =========================================
   // WebSocket
   // =========================================
@@ -324,6 +338,8 @@
       const message = data.error_detail?.message || data.error || 'API error';
       const error = new Error(message);
       error.details = data.error_detail?.details || data.details || '';
+      error.code = data.error_detail?.code || '';
+      error.payload = data;
       throw error;
     }
     return data;
@@ -379,11 +395,51 @@
 
 // Store current analysis for wizard
 let currentAnalysis = null;
+let currentGatedState = null;
 let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
 let currentSelectedRepo = null;
+// Explicit type of the selected repo. null means the type is not known yet
+// (auto-detect), so a header refresh must not force model or dataset.
+let currentSelectedType = null;
 let currentSelectedIsDataset = false;
 let currentSelectedBranch = 'main';
 let analyzeRequestId = 0;
+// Set just before a gated-card Retry so the loading state and its eventual
+// result can receive focus without changing analyzeRepo's public signature.
+let retryFocusPending = false;
+
+// Detail tabs and Community are local UI state only. Do not mirror them into
+// the URL/history: a page refresh intentionally returns to the empty state.
+const DETAIL_TAB_ORDER = ['overview', 'community'];
+const COMMUNITY_TYPE_VALUES = ['all', 'discussion', 'pull_request'];
+let detailActiveTab = 'overview';
+const detailScrollPositions = { overview: 0, list: 0, thread: 0 };
+
+// Community state is scoped to one repository + dataset flag. Re-analyzing the
+// same repo keeps it; a different repo (or dataset type) resets it.
+const communityState = {
+  repo: '',
+  isDataset: false,
+  listLoaded: false,
+  entries: [],
+  page: 0,
+  hasMore: false,
+  count: 0,
+  type: 'all',
+  listLoading: false,
+  listError: '',
+  view: 'list',
+  threadNum: 0,
+  thread: null,
+  threadLoading: false,
+  threadError: '',
+  listRequestId: 0,
+  threadRequestId: 0
+};
+
+// Set by an action that will replace its own focused control (Load more or a
+// Retry button), then consumed by renderCommunityPanel() once the request ends.
+let communityFocusIntent = null;
 
 function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
   const header = $('#modelsDetailHeader');
@@ -398,9 +454,752 @@ function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
   }
 }
 
+// =========================================
+// Detail tabs + read-only Community view
+// =========================================
+
+function normalizeCommunityRepo(repo) {
+  return String(repo || '').trim();
+}
+
+function sameCommunityRepo(a, b) {
+  const left = normalizeCommunityRepo(a).toLowerCase();
+  const right = normalizeCommunityRepo(b).toLowerCase();
+  return left !== '' && left === right;
+}
+
+function communityInt(value) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : 0;
+}
+
+function detailViewKey() {
+  if (detailActiveTab === 'community') {
+    return communityState.view === 'thread' ? 'thread' : 'list';
+  }
+  return 'overview';
+}
+
+function saveDetailScrollPosition() {
+  const scroller = $('#analyzeResult');
+  if (!scroller) return;
+  detailScrollPositions[detailViewKey()] = scroller.scrollTop;
+}
+
+function restoreDetailScrollPosition() {
+  const scroller = $('#analyzeResult');
+  if (!scroller) return;
+  scroller.scrollTop = detailScrollPositions[detailViewKey()] || 0;
+  updateScrollArrows();
+}
+
+function renderDetailTabs(visible) {
+  const tablist = $('#modelsDetailTabs');
+  if (tablist && typeof visible === 'boolean') tablist.hidden = !visible;
+  const tabsVisible = !!tablist && !tablist.hidden;
+
+  const overviewTab = $('#modelsTabOverview');
+  const communityTab = $('#modelsTabCommunity');
+  const setTabState = (tab, name) => {
+    if (!tab) return;
+    const selected = detailActiveTab === name;
+    tab.classList.toggle('is-active', selected);
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.tabIndex = selected ? 0 : -1;
+  };
+  setTabState(overviewTab, 'overview');
+  setTabState(communityTab, 'community');
+
+  const setPanelState = (panel, tabId, active) => {
+    if (!panel) return;
+    panel.hidden = !active;
+    if (tabsVisible) {
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', tabId);
+      panel.tabIndex = 0;
+    } else {
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-labelledby');
+      panel.removeAttribute('tabindex');
+    }
+  };
+  setPanelState($('#modelsOverviewPanel'), 'modelsTabOverview', detailActiveTab === 'overview');
+  setPanelState($('#modelsCommunityPanel'), 'modelsTabCommunity', detailActiveTab === 'community');
+}
+
+function activateDetailTab(name) {
+  const next = name === 'community' ? 'community' : 'overview';
+  if (detailActiveTab === next) {
+    if (next === 'community') ensureCommunityList();
+    return;
+  }
+
+  saveDetailScrollPosition();
+  detailActiveTab = next;
+  renderDetailTabs();
+  if (next === 'community') ensureCommunityList();
+  restoreDetailScrollPosition();
+  updateScrollArrows();
+}
+
+function initDetailTabs() {
+  const tablist = $('#modelsDetailTabs');
+  if (!tablist) return;
+
+  const overviewTab = $('#modelsTabOverview');
+  const communityTab = $('#modelsTabCommunity');
+  overviewTab?.addEventListener('click', () => activateDetailTab('overview'));
+  communityTab?.addEventListener('click', () => activateDetailTab('community'));
+
+  tablist.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const focused = event.target.closest('[role="tab"]');
+    if (!focused) return;
+
+    let index = DETAIL_TAB_ORDER.indexOf(focused.id === 'modelsTabCommunity' ? 'community' : 'overview');
+    if (index < 0) return;
+    event.preventDefault();
+
+    if (event.key === 'ArrowRight') index = (index + 1) % DETAIL_TAB_ORDER.length;
+    else if (event.key === 'ArrowLeft') index = (index + DETAIL_TAB_ORDER.length - 1) % DETAIL_TAB_ORDER.length;
+    else if (event.key === 'Home') index = 0;
+    else index = DETAIL_TAB_ORDER.length - 1;
+
+    const next = DETAIL_TAB_ORDER[index];
+    activateDetailTab(next);
+    $(next === 'community' ? '#modelsTabCommunity' : '#modelsTabOverview')?.focus();
+  });
+
+  renderDetailTabs(false);
+}
+
+function prepareDetailForAnalysis(repo, isDataset = false) {
+  saveDetailScrollPosition();
+  detailActiveTab = 'overview';
+  detailScrollPositions.overview = 0;
+
+  const nextRepo = normalizeCommunityRepo(repo);
+  if (!communityState.repo) {
+    communityState.repo = nextRepo;
+    communityState.isDataset = !!isDataset;
+  } else if (!sameCommunityRepo(communityState.repo, nextRepo)) {
+    resetCommunityState(nextRepo, !!isDataset);
+  } else if (isDataset && !communityState.isDataset) {
+    resetCommunityState(nextRepo, true);
+  }
+
+  renderDetailTabs(false);
+  const scroller = $('#analyzeResult');
+  if (scroller) scroller.scrollTop = 0;
+  updateScrollArrows();
+}
+
+function resetCommunityState(repo = '', isDataset = false) {
+  communityFocusIntent = null;
+  communityState.listRequestId += 1;
+  communityState.threadRequestId += 1;
+  communityState.repo = normalizeCommunityRepo(repo);
+  communityState.isDataset = !!isDataset;
+  communityState.listLoaded = false;
+  communityState.entries = [];
+  communityState.page = 0;
+  communityState.hasMore = false;
+  communityState.count = 0;
+  communityState.type = 'all';
+  communityState.listLoading = false;
+  communityState.listError = '';
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailScrollPositions.list = 0;
+  detailScrollPositions.thread = 0;
+  const panel = $('#modelsCommunityPanel');
+  if (panel) panel.innerHTML = '';
+}
+
+function ensureCommunityScope(repo, isDataset) {
+  const nextRepo = normalizeCommunityRepo(repo);
+  const nextDataset = !!isDataset;
+  if (sameCommunityRepo(communityState.repo, nextRepo) && communityState.isDataset === nextDataset) {
+    return;
+  }
+  resetCommunityState(nextRepo, nextDataset);
+}
+
+function communityAPIPath(repo, isDataset, num, page, type) {
+  const repoPath = normalizeCommunityRepo(repo).split('/').map(encodeURIComponent).join('/');
+  const params = new URLSearchParams();
+  if (isDataset) params.set('dataset', 'true');
+  if (num != null) {
+    params.set('num', String(num));
+  } else {
+    params.set('page', String(page));
+    params.set('type', type);
+  }
+  return `/community/${repoPath}?${params.toString()}`;
+}
+
+function announceCommunity(message) {
+  const region = document.getElementById('communityLiveRegion');
+  if (!region || !message) return;
+  region.textContent = message;
+}
+
+function communityListNoun(count) {
+  if (communityState.type === 'discussion') return count === 1 ? 'discussion' : 'discussions';
+  if (communityState.type === 'pull_request') return count === 1 ? 'pull request' : 'pull requests';
+  return count === 1 ? 'thread' : 'threads';
+}
+
+function communityEmptyLabel() {
+  if (communityState.type === 'discussion') return 'No discussions found.';
+  if (communityState.type === 'pull_request') return 'No pull requests found.';
+  return 'No discussions or pull requests found.';
+}
+
+function announceCommunityList(phase, added) {
+  if (!communityState.entries.length) {
+    announceCommunity(communityEmptyLabel());
+    return;
+  }
+  const count = communityState.count;
+  if (phase === 'append' || phase === 'appendRetry') {
+    const addedCount = added > 0 ? added : 0;
+    announceCommunity(`Loaded ${addedCount} more ${communityListNoun(addedCount)}.`);
+    return;
+  }
+  const noun = communityListNoun(count);
+  if (phase === 'filter') {
+    announceCommunity(`Filter results: ${count} ${noun}.`);
+    return;
+  }
+  announceCommunity(`Community loaded: ${count} ${noun}.`);
+}
+
+async function loadCommunityList(page = 0, phase = '') {
+  const repo = communityState.repo;
+  if (!repo) return;
+
+  const isDataset = communityState.isDataset;
+  const type = communityState.type;
+  const append = page > 0 && communityState.listLoaded;
+  const loadPhase = append ? 'append' : (phase || 'initial');
+  const beforeCount = communityState.entries.length;
+  const targetPage = append ? page : 0;
+  const requestId = ++communityState.listRequestId;
+
+  if (!append) {
+    communityState.entries = [];
+    communityState.page = 0;
+    communityState.hasMore = false;
+    communityState.count = 0;
+    communityState.listLoaded = false;
+    detailScrollPositions.list = 0;
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+  }
+  communityState.listLoading = true;
+  communityState.listError = '';
+  renderCommunityPanel();
+  updateScrollArrows();
+
+  try {
+    const data = await api('GET', communityAPIPath(repo, isDataset, null, targetPage, type));
+    if (requestId !== communityState.listRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.type !== type) return;
+
+    const items = Array.isArray(data.discussions) ? data.discussions : [];
+    if (append) {
+      const seen = new Set(communityState.entries.map(item => communityInt(item?.num)));
+      for (const item of items) {
+        const num = communityInt(item?.num);
+        if (num > 0 && seen.has(num)) continue;
+        if (num > 0) seen.add(num);
+        communityState.entries.push(item);
+      }
+    } else {
+      communityState.entries = items;
+    }
+
+    const responsePage = Number(data.page);
+    communityState.page = Number.isSafeInteger(responsePage) && responsePage >= 0 ? responsePage : targetPage;
+    const responseCount = Number(data.count);
+    communityState.count = Number.isSafeInteger(responseCount) && responseCount >= 0
+      ? responseCount
+      : communityState.entries.length;
+    communityState.hasMore = data.has_more === true;
+    communityState.listLoaded = true;
+    communityState.listLoading = false;
+    communityState.listError = '';
+    announceCommunityList(loadPhase, communityState.entries.length - beforeCount);
+  } catch (e) {
+    if (requestId !== communityState.listRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.type !== type) return;
+    communityState.listLoading = false;
+    communityState.listError = e?.message || 'Failed to load community';
+    if (!append) communityState.listLoaded = false;
+  }
+
+  renderCommunityPanel();
+  updateScrollArrows();
+}
+
+function ensureCommunityList() {
+  if (!communityState.repo) {
+    renderCommunityPanel();
+    return;
+  }
+  if (communityState.listLoaded || communityState.listLoading || communityState.listError) {
+    renderCommunityPanel();
+    return;
+  }
+  loadCommunityList(0, 'initial');
+}
+
+function loadMoreCommunity() {
+  if (!communityState.listLoaded || communityState.listLoading || !communityState.hasMore) return;
+  communityFocusIntent = { kind: 'append', before: communityState.entries.length };
+  loadCommunityList(communityState.page + 1, 'append');
+}
+
+function retryCommunityLoadMore() {
+  if (!communityState.listLoaded || communityState.listLoading || !communityState.hasMore) return;
+  communityFocusIntent = { kind: 'appendRetry', before: communityState.entries.length };
+  loadCommunityList(communityState.page + 1, 'appendRetry');
+}
+
+function setCommunityType(value) {
+  const type = COMMUNITY_TYPE_VALUES.includes(value) ? value : 'all';
+  if (type === communityState.type && (communityState.listLoaded || communityState.listLoading)) return;
+
+  communityFocusIntent = null;
+  communityState.type = type;
+  communityState.listRequestId += 1;
+  communityState.threadRequestId += 1;
+  communityState.listLoaded = false;
+  communityState.entries = [];
+  communityState.page = 0;
+  communityState.hasMore = false;
+  communityState.count = 0;
+  communityState.listError = '';
+  communityState.listLoading = false;
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailActiveTab = 'community';
+  detailScrollPositions.list = 0;
+  renderDetailTabs();
+  loadCommunityList(0, 'filter');
+}
+
+function retryCommunityList() {
+  if (communityState.listLoading) return;
+  communityFocusIntent = { kind: 'listRetry' };
+  loadCommunityList(0, 'retry');
+}
+
+async function openCommunityThread(num) {
+  const threadNum = communityInt(num);
+  if (!communityState.repo || threadNum <= 0) return;
+
+  saveDetailScrollPosition();
+  communityFocusIntent = null;
+  detailActiveTab = 'community';
+  communityState.view = 'thread';
+  communityState.threadNum = threadNum;
+  communityState.thread = null;
+  communityState.threadLoading = true;
+  communityState.threadError = '';
+  detailScrollPositions.thread = 0;
+
+  const requestId = ++communityState.threadRequestId;
+  const repo = communityState.repo;
+  const isDataset = communityState.isDataset;
+  renderDetailTabs();
+  renderCommunityPanel();
+  restoreDetailScrollPosition();
+  $('#communityBackBtn')?.focus({ preventScroll: true });
+  updateScrollArrows();
+
+  try {
+    const data = await api('GET', communityAPIPath(repo, isDataset, threadNum));
+    if (requestId !== communityState.threadRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.threadNum !== threadNum) return;
+
+    communityState.thread = data && typeof data === 'object' ? data : null;
+    communityState.threadLoading = false;
+    communityState.threadError = communityState.thread ? '' : 'Empty community response';
+  } catch (e) {
+    if (requestId !== communityState.threadRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.threadNum !== threadNum) return;
+    communityState.threadLoading = false;
+    communityState.threadError = e?.message || 'Failed to load thread';
+  }
+
+  renderCommunityPanel();
+  updateScrollArrows();
+
+  if (communityState.threadError) {
+    $('#communityThreadRetryBtn')?.focus();
+  } else if (communityState.thread) {
+    const title = String(communityState.thread.title || '').trim() || '(untitled)';
+    announceCommunity(`Thread loaded: ${title}.`);
+    $('#communityThreadTitle')?.focus();
+  }
+}
+
+function closeCommunityThread() {
+  if (communityState.view !== 'thread') return;
+
+  saveDetailScrollPosition();
+  communityFocusIntent = null;
+  const threadNum = communityState.threadNum;
+  communityState.threadRequestId += 1;
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailActiveTab = 'community';
+
+  renderDetailTabs();
+  renderCommunityPanel();
+  restoreDetailScrollPosition();
+  updateScrollArrows();
+
+  if (threadNum > 0) {
+    $('#modelsCommunityPanel')?.querySelector(`[data-community-num="${threadNum}"]`)?.focus();
+  }
+}
+
+function retryCommunityThread() {
+  if (communityState.threadNum > 0) openCommunityThread(communityState.threadNum);
+}
+
+function communityStatusText(status) {
+  const text = String(status || '').trim().toLowerCase();
+  if (!text) return 'unknown';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function communityStatusClass(status) {
+  const text = String(status || '').trim().toLowerCase();
+  return ['open', 'closed', 'merged', 'draft'].includes(text) ? text : 'unknown';
+}
+
+function communityTime(value) {
+  if (!value) return '';
+  const text = String(value);
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return '';
+  return formatRelativeDate(text);
+}
+
+function communityCommentText(entry) {
+  if (entry?.num_comments == null) return '';
+  const count = Number(entry.num_comments);
+  if (!Number.isSafeInteger(count) || count < 0) return '';
+  return count === 1 ? '1 comment' : `${count} comments`;
+}
+
+function communityStatusBadge(status) {
+  const key = communityStatusClass(status);
+  return `<span class="community-badge community-status-${key}">${escapeHtml(communityStatusText(status))}</span>`;
+}
+
+function communityTypeBadge(isPullRequest) {
+  return `<span class="community-badge${isPullRequest ? ' community-badge-pr' : ''}">${isPullRequest ? 'Pull Request' : 'Discussion'}</span>`;
+}
+
+function renderCommunityRow(entry) {
+  const num = communityInt(entry?.num);
+  const title = String(entry?.title || '').trim() || '(untitled)';
+  const author = String(entry?.author || '').trim() || 'deleted';
+  const created = communityTime(entry?.created_at);
+  const comments = communityCommentText(entry);
+  const isPullRequest = !!(entry && entry.is_pull_request);
+  const numText = num > 0 ? `#${num}` : `#${escapeHtml(String(entry?.num ?? '?'))}`;
+  const rowOpen = num > 0
+    ? `<button type="button" class="community-row" data-community-num="${num}" onclick="openCommunityThread(${num})">`
+    : '<button type="button" class="community-row community-row-static" disabled>';
+
+  return `${rowOpen}
+    <span class="community-row-main">
+      <span class="community-row-title">${escapeHtml(title)}</span>
+      <span class="community-row-meta">
+        <span class="community-row-num">${numText}</span>
+        ${communityTypeBadge(isPullRequest)}
+        ${communityStatusBadge(entry?.status)}
+        <span>by ${escapeHtml(author)}</span>
+        ${created ? `<span>${escapeHtml(created)}</span>` : ''}
+        ${comments ? `<span>${escapeHtml(comments)}</span>` : ''}
+      </span>
+    </span>
+    <span class="community-row-chevron" aria-hidden="true">›</span>
+  </button>`;
+}
+
+function renderCommunityListView() {
+  const entries = communityState.entries;
+  const hasEntries = entries.length > 0;
+
+  let countLabel = 'Discussions & pull requests';
+  if (communityState.listLoaded) {
+    countLabel = `${communityState.count} ${communityListNoun(communityState.count)}`;
+  }
+
+  const typeOptions = [
+    ['all', 'All'],
+    ['discussion', 'Discussions'],
+    ['pull_request', 'Pull requests']
+  ].map(([value, label]) => (
+    `<option value="${value}"${communityState.type === value ? ' selected' : ''}>${label}</option>`
+  )).join('');
+
+  let content = '';
+  if (communityState.listLoading && !hasEntries) {
+    content = `<div class="community-loading" role="status">
+      <span class="spinner-sm" aria-hidden="true"></span><span>Loading community…</span>
+    </div>`;
+  } else if (communityState.listError && !hasEntries) {
+    content = `<div class="community-error" role="alert">
+      <strong>Couldn't load community.</strong>
+      <div>${escapeHtml(communityState.listError)}</div>
+      <button type="button" id="communityRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityList()">Retry</button>
+    </div>`;
+  } else if (!hasEntries) {
+    content = `<div class="community-empty">${communityEmptyLabel()}</div>`;
+  } else {
+    content = `<div class="community-list">${entries.map(renderCommunityRow).join('')}</div>`;
+    if (communityState.listError) {
+      content += `<div class="community-error community-inline-error" role="alert">
+        <strong>Couldn't load more.</strong>
+        <div>${escapeHtml(communityState.listError)}</div>
+        <button type="button" id="communityLoadMoreRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityLoadMore()">Retry</button>
+      </div>`;
+    }
+    if (communityState.listLoading) {
+      content += `<div class="community-load-more">
+        <button type="button" class="btn btn-secondary btn-xs" id="communityLoadMoreBtn" disabled>Loading…</button>
+      </div>`;
+    } else if (communityState.hasMore) {
+      content += `<div class="community-load-more">
+        <button type="button" class="btn btn-secondary btn-xs" id="communityLoadMoreBtn" onclick="loadMoreCommunity()">Load more</button>
+      </div>`;
+    } else if (communityState.listLoaded) {
+      content += '<div class="community-list-end">End of list</div>';
+    }
+  }
+
+  return `<div class="community-view">
+    <div class="community-toolbar">
+      <div class="community-summary">${escapeHtml(countLabel)}</div>
+      <label class="community-filter" for="communityTypeFilter">
+        <span>Type</span>
+        <select id="communityTypeFilter" class="community-select" onchange="setCommunityType(this.value)">
+          ${typeOptions}
+        </select>
+      </label>
+    </div>
+    ${content}
+  </div>`;
+}
+
+function renderCommunityEvent(event) {
+  if (!event || typeof event !== 'object') return '';
+
+  const type = String(event.type || '').toLowerCase();
+  const author = String(event.author || '').trim() || 'deleted';
+  const time = communityTime(event.created_at);
+
+  if (type === 'comment') {
+    const body = typeof event.body_html === 'string' ? event.body_html : '';
+    const flags = [];
+    if (event.edited === true) flags.push('<span class="community-event-flag">edited</span>');
+    if (event.hidden === true) flags.push('<span class="community-event-flag community-event-flag-hidden">hidden</span>');
+
+    return `<article class="community-event community-event-comment">
+      <div class="community-event-head">
+        <span class="community-event-author">${escapeHtml(author)}</span>
+        ${time ? `<span>${escapeHtml(time)}</span>` : ''}
+        ${flags.join('')}
+      </div>
+      <div class="community-event-body readme-preview">${body}</div>
+    </article>`;
+  }
+
+  const summary = String(event.summary || '').trim()
+    || String(event.type || '').trim()
+    || 'Event';
+  return `<div class="community-event community-event-system">
+    <span class="community-event-system-summary">${escapeHtml(summary)}</span>
+    <span>${escapeHtml(author)}${time ? ` · ${escapeHtml(time)}` : ''}</span>
+  </div>`;
+}
+
+function renderCommunityThreadView() {
+  const back = `<button type="button" id="communityBackBtn" class="btn btn-ghost btn-xs community-back" onclick="closeCommunityThread()">← Community</button>`;
+
+  if (communityState.threadLoading) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-loading" role="status">
+        <span class="spinner-sm" aria-hidden="true"></span><span>Loading thread…</span>
+      </div>
+    </div>`;
+  }
+
+  if (communityState.threadError) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-error" role="alert">
+        <strong>Couldn't load this thread.</strong>
+        <div>${escapeHtml(communityState.threadError)}</div>
+        <button type="button" id="communityThreadRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityThread()">Retry</button>
+      </div>
+    </div>`;
+  }
+
+  const thread = communityState.thread;
+  if (!thread) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-empty">Thread unavailable.</div>
+    </div>`;
+  }
+
+  const num = communityInt(thread.num);
+  const title = String(thread.title || '').trim() || '(untitled)';
+  const author = String(thread.author || '').trim() || 'deleted';
+  const created = communityTime(thread.created_at);
+  const isPullRequest = !!thread.is_pull_request;
+  const events = Array.isArray(thread.events) ? thread.events : [];
+  const eventsHtml = events.length
+    ? `<div class="community-events">${events.map(renderCommunityEvent).join('')}</div>`
+    : '<div class="community-empty">No events in this thread.</div>';
+
+  return `<div class="community-view">
+    ${back}
+    <header class="community-thread-header">
+      <h3 id="communityThreadTitle" class="community-thread-title" tabindex="-1">${escapeHtml(title)}</h3>
+      <div class="community-thread-meta">
+        ${num > 0 ? `<span class="community-row-num">#${num}</span>` : ''}
+        ${communityTypeBadge(isPullRequest)}
+        ${communityStatusBadge(thread.status)}
+        <span>by ${escapeHtml(author)}</span>
+        ${created ? `<span>${escapeHtml(created)}</span>` : ''}
+      </div>
+    </header>
+    ${eventsHtml}
+  </div>`;
+}
+
+function renderCommunityPanel() {
+  const panel = $('#modelsCommunityPanel');
+  if (!panel) return;
+
+  const focused = document.activeElement;
+  let focusId = '';
+  let focusNum = '';
+  if (focused && panel.contains(focused)) {
+    focusId = focused.id || '';
+    focusNum = focused.getAttribute('data-community-num') || '';
+  }
+
+  panel.innerHTML = communityState.view === 'thread'
+    ? renderCommunityThreadView()
+    : renderCommunityListView();
+
+  // Restore focus that was lost because the action replaced its own control.
+  if (communityFocusIntent) {
+    const intent = communityFocusIntent;
+    if (communityState.view === 'list' && communityState.listLoading) {
+      // The pressed control is gone during loading; keep focus in the list
+      // rather than dropping it onto <body>.
+      const rows = panel.querySelectorAll('.community-row');
+      if (rows.length) rows[rows.length - 1].focus();
+      else panel.focus();
+      return;
+    }
+    if (communityState.view === 'list' && communityState.listError) {
+      const retryId = (intent.kind === 'append' || intent.kind === 'appendRetry')
+        ? 'communityLoadMoreRetryBtn'
+        : 'communityRetryBtn';
+      const retry = document.getElementById(retryId);
+      communityFocusIntent = null;
+      if (retry && panel.contains(retry)) {
+        retry.focus();
+        return;
+      }
+      panel.focus();
+      return;
+    }
+    if (communityState.view === 'list' && communityState.listLoaded) {
+      if (intent.kind === 'append' || intent.kind === 'appendRetry') {
+        const rows = panel.querySelectorAll('.community-row');
+        const firstNewRow = rows[intent.before];
+        communityFocusIntent = null;
+        if (firstNewRow && !firstNewRow.disabled) {
+          firstNewRow.focus();
+          return;
+        }
+        const loadMore = document.getElementById('communityLoadMoreBtn');
+        if (loadMore && panel.contains(loadMore) && !loadMore.disabled) {
+          loadMore.focus();
+          return;
+        }
+        if (rows.length) {
+          rows[rows.length - 1].focus();
+          return;
+        }
+        panel.focus();
+        return;
+      }
+      if (intent.kind === 'listRetry') {
+        const firstRow = panel.querySelector('.community-row:not([disabled])');
+        communityFocusIntent = null;
+        if (firstRow) firstRow.focus();
+        else panel.focus();
+        return;
+      }
+    }
+  }
+
+  if (focusId) {
+    const byId = document.getElementById(focusId);
+    if (byId && panel.contains(byId)) {
+      byId.focus();
+      return;
+    }
+  }
+  if (focusNum) {
+    panel.querySelector(`[data-community-num="${focusNum}"]`)?.focus();
+  }
+}
+
+window.loadMoreCommunity = loadMoreCommunity;
+window.retryCommunityLoadMore = retryCommunityLoadMore;
+window.setCommunityType = setCommunityType;
+window.retryCommunityList = retryCommunityList;
+window.openCommunityThread = openCommunityThread;
+window.closeCommunityThread = closeCommunityThread;
+window.retryCommunityThread = retryCommunityThread;
+
 async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
   const input = $('#analyzeInput');
-  const resultDiv = $('#analyzeResult');
+  const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
   const isDataset = forceType === 'dataset'; // Only set if user explicitly selected dataset
 
   const repo = (repoOverride || input?.value || '').trim();
@@ -409,17 +1208,37 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return;
   }
 
+  // Only an explicit caller choice is a known type. Auto-detect entry points
+  // (typed search, row click, legacy navigation) clear it so refresh can let
+  // the server detect the type again instead of forcing a stale model choice.
+  currentSelectedType = forceType === 'dataset' || forceType === 'model' ? forceType : null;
+
+  const focusAfterRetry = retryFocusPending;
+  retryFocusPending = false;
   const requestId = ++analyzeRequestId;
+
+  // A new request supersedes any rendered gated guidance. Retry and refresh
+  // read the previous state before calling this function.
+  currentGatedState = null;
 
   // Reset revision picker flag when analyzing a new repo
   if (!revision) {
     hasShownRevisionPicker = false;
   }
 
+  // A new analysis always starts on Overview. Hide the tabs until the
+  // repository analysis is actually displayed, and drop another repository's
+  // Community state before any request for it can render.
+  prepareDetailForAnalysis(repo, isDataset);
+
   // Show loading — build with DOM methods to avoid XSS via repo/revision values
   {
     const loadingDiv = document.createElement('div');
     loadingDiv.className = 'loading-state';
+    loadingDiv.id = 'analyzeLoadingStatus';
+    loadingDiv.setAttribute('role', 'status');
+    loadingDiv.setAttribute('aria-live', 'polite');
+    loadingDiv.setAttribute('tabindex', '-1');
     const spinner = document.createElement('div');
     spinner.className = 'spinner';
     const p = document.createElement('p');
@@ -428,21 +1247,35 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     loadingDiv.appendChild(p);
     resultDiv.innerHTML = '';
     resultDiv.appendChild(loadingDiv);
+    if (focusAfterRetry) loadingDiv.focus();
   }
 
   try {
     let queryParams = [];
-    if (forceType) queryParams.push(`dataset=${forceType === 'dataset'}`);
+    if (forceType === 'dataset') queryParams.push('dataset=true');
+    else if (forceType === 'model') queryParams.push('type=model');
     if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
     const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
 
     const data = await api('GET', `/analyze/${repo}${queryString}`);
 
     if (requestId !== analyzeRequestId) return;
+    currentGatedState = null;
 
     // Check if we need user to select model vs dataset
     if (data.needsSelection) {
+      // The repo exists as both, so the type is unknown until the user picks
+      // one. Point selection/header state at this repo and drop the previous
+      // analysis so refresh auto-detects instead of forcing its type.
+      const selectionRepo = data.repo || repo;
+      currentSelectedType = null;
+      currentSelectedRepo = selectionRepo || null;
+      currentSelectedIsDataset = false;
+      currentSelectedBranch = revision || 'main';
+      currentAnalysis = null;
+      if (selectionRepo) syncModelsDetailHeader(selectionRepo, false, currentSelectedBranch);
       renderTypeSelection(data);
+      if (focusAfterRetry) resultDiv.querySelector('button')?.focus();
       return;
     }
 
@@ -450,19 +1283,45 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (data.refs && data.refs.length > 1 && !hasShownRevisionPicker && !revision) {
       hasShownRevisionPicker = true;
       currentAnalysis = data;
+      currentSelectedRepo = data.repo;
+      currentSelectedBranch = revision || 'main';
+      currentSelectedType = data.is_dataset ? 'dataset' : 'model';
+      currentSelectedIsDataset = !!data.is_dataset;
+      syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
       showRevisionPicker(data);
+      if (focusAfterRetry) {
+        const firstRef = $('#modalBody .ref-btn');
+        (firstRef || $('#modalClose'))?.focus();
+      }
       return;
     }
 
     currentAnalysis = data;
     currentSelectedRepo = data.repo;
+    currentSelectedType = data.is_dataset ? 'dataset' : 'model';
     currentSelectedIsDataset = !!data.is_dataset;
     currentSelectedBranch = data.branch || 'main';
     syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
     await syncLocalAnalysisStatus(data);
     renderAnalysisResult(data);
+    if (focusAfterRetry) {
+      const tabs = $('#modelsDetailTabs');
+      if (tabs && !tabs.hidden) $('#modelsTabOverview')?.focus();
+      else resultDiv.focus();
+    }
   } catch (e) {
     if (requestId !== analyzeRequestId) return;
+    detailActiveTab = 'overview';
+    renderDetailTabs(false);
+    currentGatedState = null;
+
+    if (e.code === 'gated_repo' || e.payload?.gated === true) {
+      renderGatedRepo(e.payload || {}, repo, isDataset, revision, e.details);
+      if (focusAfterRetry) document.getElementById('gatedRepoTitle')?.focus();
+      updateScrollArrows();
+      return;
+    }
+
     resultDiv.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon" style="color: var(--color-error);">
@@ -470,12 +1329,88 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
           </svg>
         </div>
-        <h3>Analysis Failed</h3>
+        <h3 id="analysisErrorTitle" tabindex="-1">Analysis Failed</h3>
         <p>${escapeHtml(e.message)}</p>
       </div>
     `;
+    if (focusAfterRetry) document.getElementById('analysisErrorTitle')?.focus();
+    updateScrollArrows();
   }
 }
+
+  function safeGatedAcceptURL(value) {
+    try {
+      const url = new URL(String(value || ''));
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function renderGatedRepo(payload, fallbackRepo, fallbackIsDataset, revision = null, fallbackDetails = '') {
+    const repo = String(payload.repo || fallbackRepo || '').trim();
+    const isDataset = payload.repo_type
+      ? payload.repo_type === 'dataset'
+      : !!fallbackIsDataset;
+    const details = String(payload.details || fallbackDetails || '').trim();
+    const acceptURL = safeGatedAcceptURL(payload.accept_url);
+    const hasToken = payload.has_token === true;
+
+    // A gated response is an access state, not an analysis result. Drop the
+    // previous analysis so stale options/download actions cannot target it.
+    currentAnalysis = null;
+    currentSelectedRepo = repo || null;
+    currentSelectedType = isDataset ? 'dataset' : 'model';
+    currentSelectedIsDataset = isDataset;
+    currentSelectedBranch = revision || 'main';
+    currentGatedState = { repo, isDataset, revision: revision || null };
+    if (repo) syncModelsDetailHeader(repo, isDataset, currentSelectedBranch);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (!resultDiv) return;
+
+    const tokenNote = hasToken
+      ? 'Token configured; repository access not granted.'
+      : 'No Hugging Face token configured.';
+    const tokenClass = hasToken ? 'gated-token-note' : 'gated-token-note is-warning';
+    const settingsClass = hasToken ? 'btn btn-secondary' : 'btn btn-warning';
+    const acceptAction = acceptURL
+      ? '<a id="gatedAcceptLink" class="btn btn-primary" href="#" target="_blank" rel="noopener">Open on Hugging Face ↗</a>'
+      : '';
+
+    resultDiv.innerHTML = `
+      <div class="empty-state gated-state" role="alert" aria-atomic="true" aria-labelledby="gatedRepoTitle">
+        <div class="empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+            <rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+          </svg>
+        </div>
+        <h3 id="gatedRepoTitle" tabindex="-1">Gated repository</h3>
+        ${repo ? `<p class="gated-repo-id">${escapeHtml(repo)}</p>` : ''}
+        ${details ? `<p class="gated-details">${escapeHtml(details)}</p>` : ''}
+        <p class="${tokenClass}">${escapeHtml(tokenNote)}</p>
+        <div class="gated-actions">
+          ${acceptAction}
+          <button type="button" id="gatedSettingsBtn" class="${settingsClass}">Open Settings</button>
+          <button type="button" id="gatedRetryBtn" class="btn btn-ghost">Retry analysis</button>
+        </div>
+      </div>
+    `;
+
+    const acceptLink = $('#gatedAcceptLink');
+    if (acceptLink && acceptURL) acceptLink.href = acceptURL;
+
+    $('#gatedSettingsBtn')?.addEventListener('click', () => {
+      if (typeof window.openSettingsPage === 'function') window.openSettingsPage();
+    });
+
+    $('#gatedRetryBtn')?.addEventListener('click', () => {
+      const gated = currentGatedState;
+      if (!gated?.repo) return;
+      retryFocusPending = true;
+      analyzeRepo(gated.isDataset ? 'dataset' : 'model', gated.revision, gated.repo);
+    });
+  }
 
   // Show revision picker when multiple refs exist
   function showRevisionPicker(data) {
@@ -537,7 +1472,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Handle revision selection
   window.selectRevision = function(revision, isDataset, repoOverride = null) {
     hideModal();
-    const forceType = isDataset ? 'dataset' : null;
+    const forceType = isDataset ? 'dataset' : 'model';
     analyzeRepo(forceType, revision, repoOverride || currentAnalysis?.repo || null);
   };
 
@@ -551,7 +1486,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
   // Render type selection when both model and dataset exist
   function renderTypeSelection(data) {
-    const resultDiv = $('#analyzeResult');
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
     resultDiv.innerHTML = `
       <div class="analysis-card">
         <div class="analysis-header">
@@ -638,8 +1573,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   function renderAnalysisResult(data) {
-    const resultDiv = $('#analyzeResult');
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
     if (!resultDiv) return;
+
+    // The response's dataset flag is authoritative for the Community scope.
+    ensureCommunityScope(data.repo, !!data.is_dataset);
 
     const filesHtml = data.files?.slice(0, 20).map(f => `
       <div class="analysis-file">
@@ -891,11 +1829,25 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       </div>
     `;
 
+    detailActiveTab = 'overview';
+    detailScrollPositions.overview = 0;
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+    renderDetailTabs(true);
+    updateScrollArrows();
     loadReadmePreview(data);
   }
 
   let _scrollArrowUp = null;
   let _scrollArrowDown = null;
+
+  function setScrollArrowVisibility(arrow, visible) {
+    if (!arrow) return;
+    arrow.classList.toggle('visible', visible);
+    arrow.tabIndex = visible ? 0 : -1;
+    if (visible) arrow.removeAttribute('aria-hidden');
+    else arrow.setAttribute('aria-hidden', 'true');
+  }
 
   function updateScrollArrows() {
     const scroller = $('#analyzeResult');
@@ -908,8 +1860,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const atTop = top < 20;
     const atBottom = maxScroll <= 0 || top >= maxScroll - 20;
 
-    _scrollArrowUp.classList.toggle('visible', !atTop);
-    _scrollArrowDown.classList.toggle('visible', !atBottom);
+    setScrollArrowVisibility(_scrollArrowUp, !atTop);
+    setScrollArrowVisibility(_scrollArrowDown, !atBottom);
   }
 
   async function loadReadmePreview(data) {
@@ -1026,10 +1978,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // Clear analysis and reset to initial state
   window.clearAnalysis = function() {
     currentAnalysis = null;
+    currentGatedState = null;
     currentSelectedRepo = null;
+    currentSelectedType = null;
     currentSelectedIsDataset = false;
-    if (_scrollArrowUp) _scrollArrowUp.classList.remove('visible');
-    if (_scrollArrowDown) _scrollArrowDown.classList.remove('visible');
+    setScrollArrowVisibility(_scrollArrowUp, false);
+    setScrollArrowVisibility(_scrollArrowDown, false);
     currentSelectedBranch = 'main';
     const header = $('#modelsDetailHeader');
     const hfLink = $('#modelsDetailHFLink');
@@ -1040,7 +1994,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (input) input.value = '';
     _syncModelsSearchClear();
 
-    const resultDiv = $('#analyzeResult');
+    detailActiveTab = 'overview';
+    detailScrollPositions.overview = 0;
+    resetCommunityState('', false);
+    renderDetailTabs(false);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
     if (resultDiv) {
       resultDiv.innerHTML = `
         <div class="empty-state">
@@ -1084,6 +2043,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
         });
       });
     }
+
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+    updateScrollArrows();
   };
 
   // Store advanced options (filter/exclude only - revision comes from analysis)
@@ -4258,6 +5221,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (_modelsInitialized) return;
     _modelsInitialized = true;
 
+    initDetailTabs();
+
     const input = $('#analyzeInput');
     const btn   = $('#analyzeBtn');
     const clearBtn = $('#modelsSearchClear');
@@ -4304,16 +5269,23 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     // Analyze/refresh button. On the unified Models page this refreshes the
     // selected repo, not whatever text happens to be in the search field.
     btn?.addEventListener('click', () => {
-      const repo = currentSelectedRepo || currentAnalysis?.repo || input?.value?.trim();
-      if (!repo) {
-        analyzeRepo();
+      const selectedRepo = currentSelectedRepo || currentAnalysis?.repo || '';
+      if (selectedRepo) {
+        // Refresh a known type explicitly. When the type is unknown (a dual
+        // type selection, a search-result row, or a failed generic analysis),
+        // pass null so the server auto-detects instead of forcing model.
+        const selectedType = currentSelectedType === 'dataset'
+          ? 'dataset'
+          : currentSelectedType === 'model' ? 'model' : null;
+        analyzeRepo(
+          selectedType,
+          currentSelectedBranch || currentAnalysis?.branch || 'main',
+          selectedRepo
+        );
         return;
       }
-      analyzeRepo(
-        currentSelectedIsDataset || currentAnalysis?.is_dataset ? 'dataset' : null,
-        currentSelectedBranch || currentAnalysis?.branch || 'main',
-        repo
-      );
+      // A typed-in repo with no selection is a new search, so auto-detect it.
+      analyzeRepo();
     });
 
     // Example buttons
@@ -4467,8 +5439,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     el.classList.add('model-row-active');
     _currentSelectedRow = el;
 
-    // Update detail header
+    // Update detail header. The row does not tell us whether the repo is a
+    // model or dataset, so leave the type unknown until analysis resolves it.
     currentSelectedRepo = repoId;
+    currentSelectedType = null;
     currentSelectedIsDataset = false;
     currentSelectedBranch = 'main';
     syncModelsDetailHeader(repoId, false, currentSelectedBranch);

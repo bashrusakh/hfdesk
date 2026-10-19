@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
+- Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
+
 ### Fixed
 
 - Filtered plan/download scans no longer succeed when no file matches the requested filters: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.

@@ -92,6 +92,15 @@ type ErrorResponse struct {
 	Error       string          `json:"error"` // Legacy flat message for existing UI/tests.
 	Details     string          `json:"details,omitempty"`
 	ErrorDetail *APIErrorDetail `json:"error_detail,omitempty"`
+
+	// Gated-access fields are set only for analyze errors caused by a gated
+	// repository. HasToken is a pointer so an explicit false is serialized for
+	// gated errors while all other error responses omit the field.
+	Gated     bool   `json:"gated,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	RepoType  string `json:"repo_type,omitempty"`
+	AcceptURL string `json:"accept_url,omitempty"`
+	HasToken  *bool  `json:"has_token,omitempty"`
 }
 
 // APIErrorDetail is the structured error payload for API clients.

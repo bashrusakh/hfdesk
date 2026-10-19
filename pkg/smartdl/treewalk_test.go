@@ -41,6 +41,12 @@ func TestAnalyze_StructuralPaginationClassification(t *testing.T) {
 						}
 						treePath := "/api/" + api + "/owner/repo/tree/main"
 						srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							// Optional access probe for successful analysis: this
+							// fake mirror does not implement /auth-check.
+							if strings.HasSuffix(r.URL.Path, "/auth-check") {
+								http.NotFound(w, r)
+								return
+							}
 							if strings.Contains(r.URL.Path, "/tree/") && r.URL.Path != treePath && r.URL.Path != treePath+"/sub" {
 								oppositeReqs.Add(1)
 								if mode == "fallback401" {
@@ -135,6 +141,11 @@ func TestAnalyze_NamespaceFallbackPreserved(t *testing.T) {
 						status = datasetStatus
 					} else if strings.HasSuffix(r.URL.Path, "/refs") {
 						_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+						return
+					} else if strings.HasSuffix(r.URL.Path, "/auth-check") {
+						// Optional access probe: this fake mirror does not
+						// implement /auth-check, so analysis stays fail-open.
+						http.NotFound(w, r)
 						return
 					} else {
 						t.Errorf("unexpected request: %s", r.URL)
@@ -282,6 +293,11 @@ func TestAnalyze_PaginationOriginBoundary(t *testing.T) {
 						}
 						if r.URL.Path == "/api/"+api+"/owner/repo/refs" {
 							_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+							return
+						}
+						if strings.HasSuffix(r.URL.Path, "/auth-check") {
+							// Fake mirror without the optional access probe.
+							http.NotFound(w, r)
 							return
 						}
 						page := treeReqs.Add(1)
@@ -676,6 +692,10 @@ func TestAnalyze_TokenMetadataPagination(t *testing.T) {
 						}
 						if r.URL.Path == "/api/"+api+"/owner/repo/refs" {
 							_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+							return
+						}
+						if strings.HasSuffix(r.URL.Path, "/auth-check") {
+							http.NotFound(w, r)
 							return
 						}
 						t.Errorf("unexpected analysis request: %s", r.URL)

@@ -663,11 +663,31 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	query := r.URL.Query()
+
 	// Check if it's a dataset (explicit selection)
-	isDataset := r.URL.Query().Get("dataset") == "true"
+	isDataset := query.Get("dataset") == "true"
+
+	// type=model lets callers resolve a dual-type repository after the user
+	// chose the model namespace. A forced model analyze must not fall back to
+	// dataset auto-detection, which would return needsSelection again.
+	forceModel := false
+	if typeValues, ok := query["type"]; ok {
+		if len(typeValues) != 1 || typeValues[0] != "model" {
+			writeError(w, http.StatusBadRequest, "Invalid repository type",
+				"Expected type=model; use dataset=true to analyze a dataset, or omit both for automatic detection")
+			return
+		}
+		if isDataset {
+			writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
+				"type=model cannot be combined with dataset=true; choose one repository type")
+			return
+		}
+		forceModel = true
+	}
 
 	// Get revision (defaults to "main")
-	revision := r.URL.Query().Get("revision")
+	revision := query.Get("revision")
 	if revision == "" {
 		revision = "main"
 	}
@@ -690,10 +710,16 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	info, err := analyzer.AnalyzeWithRevision(ctx, repo, isDataset, revision)
+	var info *smartdl.RepoInfo
+	if forceModel {
+		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
+	} else {
+		info, err = analyzer.AnalyzeWithRevision(ctx, repo, isDataset, revision)
+	}
 	if err != nil {
-		// Check if both model and dataset exist
-		if err == smartdl.ErrBothExist {
+		// Check if both model and dataset exist (the analyzer wraps the
+		// sentinel with the failing operation, so compare with errors.Is).
+		if errors.Is(err, smartdl.ErrBothExist) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"needsSelection": true,
 				"repo":           repo,
@@ -702,11 +728,48 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// A gated repository is a user-actionable access state, not a server
+		// failure: return the repository page and token availability so the UI
+		// can guide the user without ever exposing the token.
+		var gatedErr *smartdl.GatedRepoError
+		if errors.As(err, &gatedErr) {
+			details := gatedRepoAccessMessage(gatedErr.HasToken)
+			repoType := "model"
+			if gatedErr.IsDataset {
+				repoType = "dataset"
+			}
+			hasToken := gatedErr.HasToken
+			writeJSON(w, http.StatusForbidden, ErrorResponse{
+				OK:      false,
+				Error:   "Gated repository",
+				Details: details,
+				ErrorDetail: &APIErrorDetail{
+					Code:    "gated_repo",
+					Message: "Gated repository",
+					Details: details,
+				},
+				Gated:     true,
+				Repo:      gatedErr.Repo,
+				RepoType:  repoType,
+				AcceptURL: gatedErr.AcceptURL(),
+				HasToken:  &hasToken,
+			})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Analysis failed", err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, info)
+}
+
+// gatedRepoAccessMessage returns concise, non-secret guidance for a repository
+// that requires accepting an agreement or obtaining access.
+func gatedRepoAccessMessage(hasToken bool) string {
+	if hasToken {
+		return "The configured Hugging Face token does not currently have access to this gated repository. Accept the repository agreement or request access on the repository page, check that the token has gated-repository access, then retry."
+	}
+	return "Configure a Hugging Face token in Settings, accept the repository agreement or request access on the repository page, then retry."
 }
 
 // handleReadme returns a minimal README payload for the analysis panel.

@@ -364,6 +364,9 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/readme/{repo...}", s.handleReadme)
 	mux.HandleFunc("GET /api/readme-asset", s.handleReadmeAsset)
 
+	// Community (read-only Discussions / Pull Requests proxy)
+	mux.HandleFunc("GET /api/community/{repo...}", s.handleCommunity)
+
 	// Cache browser
 	mux.HandleFunc("GET /api/cache", s.handleCacheList)
 	mux.HandleFunc("GET /api/cache-selection", s.handleCacheSelection)

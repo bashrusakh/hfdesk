@@ -669,6 +669,87 @@ a {
   margin-bottom: 24px;
 }
 
+/* Gated repository access state */
+.gated-state {
+  max-width: 640px;
+  margin: 0 auto;
+  align-items: flex-start;
+  text-align: left;
+}
+
+.gated-state .empty-icon {
+  color: var(--color-warning);
+  opacity: 0.85;
+}
+
+.gated-state .gated-repo-id {
+  max-width: 100%;
+  margin-bottom: 12px;
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.gated-state .gated-details {
+  max-width: 100%;
+  margin-bottom: 16px;
+  white-space: pre-line;
+}
+
+.gated-state .gated-token-note {
+  max-width: 100%;
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.gated-state .gated-token-note.is-warning {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--color-text);
+}
+
+.gated-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.gated-actions .btn {
+  max-width: 100%;
+  white-space: normal;
+  text-align: center;
+}
+
+/* Solid indigo keeps white text above 4.5:1; the global gradient measures
+   about 4.25-4.47:1 and must stay unchanged for other primary actions. */
+.gated-state .btn-primary {
+  background: #4f46e5;
+  color: #fff;
+}
+
+.gated-state .btn-primary:hover:not(:disabled) {
+  background: #4338ca;
+}
+
+.gated-state #gatedRepoTitle:focus,
+.gated-state #gatedRepoTitle:focus-visible,
+#analysisErrorTitle:focus,
+#analysisErrorTitle:focus-visible,
+#settingsPageTitle:focus,
+#settingsPageTitle:focus-visible {
+  outline: 2px solid var(--color-primary-hover);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
 .example-repos {
   display: flex;
   flex-wrap: wrap;
@@ -3111,6 +3192,13 @@ a {
   color: var(--color-text-secondary);
 }
 
+.loading-state:focus,
+.loading-state:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-md);
+}
+
 .spinner {
   width: 40px;
   height: 40px;
@@ -4835,6 +4923,66 @@ a {
   white-space: nowrap;
 }
 
+/* Detail tabs (Overview / Community) — directly below the detail header */
+.models-detail-tabs {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 0 10px;
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.models-detail-tabs[hidden] {
+  display: none;
+}
+
+.models-detail-tab {
+  flex: 0 0 auto;
+  padding: 9px 8px 8px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.models-detail-tab:hover {
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+.models-detail-tab.is-active,
+.models-detail-tab[aria-selected="true"] {
+  color: var(--color-primary-hover);
+  border-bottom-color: var(--color-primary);
+  background: transparent;
+}
+
+.models-detail-tab:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+.models-detail-view:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+.models-detail-view[hidden] {
+  display: none;
+}
+
 .models-analyze-result {
   flex: 1;
   overflow-y: auto;
@@ -4847,6 +4995,377 @@ a {
   border-radius: 0;
   margin: 0;
   overflow: visible;
+}
+
+/* ============================================
+   Community (read-only Discussions / PRs)
+   ============================================ */
+
+.community-live-region {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.community-view {
+  padding: 18px 20px 28px;
+  min-width: 0;
+}
+
+.community-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+  margin-bottom: 14px;
+}
+
+.community-summary {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.community-filter {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.community-select {
+  max-width: 100%;
+  padding: 5px 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.community-select:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.community-list {
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.community-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.community-row:last-child {
+  border-bottom: none;
+}
+
+.community-row:hover {
+  background: var(--color-surface-hover);
+}
+
+.community-row:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+.community-row-static {
+  cursor: default;
+}
+
+.community-row-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.community-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.community-row:hover .community-row-title {
+  color: var(--color-primary-hover);
+}
+
+.community-row-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.community-row-num {
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+}
+
+.community-row-chevron {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.community-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.community-badge-pr {
+  color: var(--color-primary-hover);
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.community-status-open {
+  color: var(--color-success);
+}
+
+.community-status-merged {
+  color: var(--color-primary-hover);
+}
+
+.community-status-closed {
+  color: var(--color-text-secondary);
+}
+
+.community-status-draft {
+  color: var(--color-warning);
+}
+
+.community-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 30px 16px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.community-loading .spinner-sm {
+  margin: 0;
+  border-color: var(--color-border);
+  border-top-color: var(--color-primary);
+}
+
+.community-empty {
+  padding: 30px 16px;
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.community-error {
+  padding: 16px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.community-error strong {
+  color: var(--color-error);
+}
+
+.community-error .btn {
+  margin-top: 10px;
+}
+
+.community-load-more {
+  display: flex;
+  justify-content: center;
+  padding-top: 14px;
+}
+
+.community-list-end {
+  padding-top: 12px;
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.community-inline-error {
+  margin-top: 12px;
+}
+
+.community-back {
+  margin-bottom: 14px;
+}
+
+.community-thread-header {
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.community-thread-title {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.community-thread-title:focus,
+.community-thread-title:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.community-thread-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.community-events {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.community-event-comment {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.community-event-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--color-bg-tertiary);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.community-event-author {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.community-event-flag {
+  padding: 0 6px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.community-event-flag-hidden {
+  color: var(--color-warning);
+}
+
+.community-event-body {
+  padding: 12px 14px;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* Sanitized upstream comment HTML may start at h1; keep it subordinate to the
+   thread title instead of rendering page-level heading sizes. */
+.community-event-body h1,
+.community-event-body h2,
+.community-event-body h3,
+.community-event-body h4,
+.community-event-body h5,
+.community-event-body h6 {
+  margin: 14px 0 6px;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.community-event-body > :first-child {
+  margin-top: 0;
+}
+
+.community-event-body > :last-child {
+  margin-bottom: 0;
+}
+
+.community-event-body a {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.community-event-system {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 7px 12px;
+  border-left: 2px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.community-event-system-summary {
+  color: var(--color-text-secondary);
 }
 
 /* btn-xs variant */
@@ -5062,7 +5581,8 @@ button.quant-dl-btn:hover {
 }
 
 .scroll-arrow-up {
-  top: 56px;
+  /* Clear the detail header plus the Overview/Community tab row. */
+  top: 100px;
 }
 
 .scroll-arrow-down {
