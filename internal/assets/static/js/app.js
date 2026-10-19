@@ -533,7 +533,7 @@ function resolveHfEndpoint(endpointBase = '', baseBlobURL = '') {
   return parseHfEndpointBase('https://huggingface.co');
 }
 
-function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
+function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main', typeKnown = true) {
   const header = $('#modelsDetailHeader');
   const repoLabel = $('#modelsDetailRepo');
   const hfLink = $('#modelsDetailHFLink');
@@ -541,6 +541,14 @@ function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
   if (header) header.style.display = '';
   if (repoLabel && repoId) repoLabel.textContent = repoId;
   if (!hfLink || !repoId) return;
+  if (!typeKnown) {
+    // An auto-detect transition knows the repository but not yet whether it is
+    // a model or dataset. Hide the action instead of guessing a model URL or
+    // leaving the previous view's link on screen.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
+  }
   const endpoint = configuredHfEndpointURL();
   if (!endpoint) {
     // The configured endpoint is not known yet (settings failed or are still
@@ -553,6 +561,20 @@ function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
   }
   hfLink.href = `${endpoint}/${isDataset ? 'datasets/' : ''}${repoId}`;
   hfLink.hidden = false;
+}
+
+// Re-sync the Model Details header from the current selection state. Endpoint
+// loads (settings/health) and other late callbacks must use this instead of
+// reading the view they were started for, so an in-flight navigation to a new
+// repository never reverts the header to the previous one.
+function syncSelectedModelHeader() {
+  if (!currentSelectedRepo) return;
+  syncModelsDetailHeader(
+    currentSelectedRepo,
+    currentSelectedIsDataset,
+    currentSelectedBranch,
+    currentSelectedType !== null
+  );
 }
 
 // =========================================
@@ -1427,6 +1449,14 @@ async function loadRepositoryDetails(entry) {
   // The history entry is the explicit type chosen for this navigation. An
   // auto-detect entry has no type, so refresh must not force a stale choice.
   currentSelectedType = entry.repoType || null;
+  // Selection state belongs to the transition, not to its result. Point it at
+  // the target before the request so an in-flight or failed navigation never
+  // leaves the previous repository's identity on screen. An untyped entry
+  // keeps its Hub action hidden until analysis resolves the namespace.
+  currentSelectedRepo = repo;
+  currentSelectedIsDataset = isDataset;
+  currentSelectedBranch = revision || 'main';
+  syncSelectedModelHeader();
 
   const focusAfterRetry = retryFocusPending;
   retryFocusPending = false;
@@ -1490,7 +1520,7 @@ async function loadRepositoryDetails(entry) {
       currentSelectedIsDataset = false;
       currentSelectedBranch = revision || 'main';
       currentAnalysis = null;
-      if (selectionRepo) syncModelsDetailHeader(selectionRepo, false, currentSelectedBranch);
+      syncSelectedModelHeader();
       renderTypeSelection(data);
       if (focusAfterRetry) resultDiv.querySelector('button')?.focus();
       return;
@@ -2725,9 +2755,7 @@ async function loadRepositoryDetails(entry) {
       // opened from the Models page without visiting Settings first.
       state.settings = s;
       rememberSettingsEndpoint(s);
-      if (currentSelectedRepo) {
-        syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
-      }
+      syncSelectedModelHeader();
       if (s.storageMode === 'local') {
         badge.textContent = `Storage: local files → ${s.localDir}`;
         badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
@@ -4435,9 +4463,7 @@ async function loadRepositoryDetails(entry) {
     // Settings are authoritative for the configured endpoint, so refresh the
     // Model Details Hub action when they (re)load after a repository was
     // already selected.
-    if (currentSelectedRepo) {
-      syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
-    }
+    syncSelectedModelHeader();
 
     // Populating the form is separated from the fetch: a partially missing DOM
     // must not be treated as an unknown server state that blocks saving.
@@ -5968,16 +5994,10 @@ async function loadRepositoryDetails(entry) {
     el.classList.add('model-row-active');
     _currentSelectedRow = el;
 
-    // Update detail header. The row does not tell us whether the repo is a
-    // model or dataset, so leave the type unknown until analysis resolves it.
-    currentSelectedRepo = repoId;
-    currentSelectedType = null;
-    currentSelectedIsDataset = false;
-    currentSelectedBranch = 'main';
-    syncModelsDetailHeader(repoId, false, currentSelectedBranch);
-
     // Keep the search field user-owned; analyze the clicked repo separately.
-    // Search result rows know whether they came from the model or dataset API.
+    // Search result rows know whether they came from the model or dataset API,
+    // so the common transition owner sets the header and selection identity
+    // (including the dataset Hub URL) from that type.
     const repoType = el?.dataset?.repoType === 'dataset' ? 'dataset' : 'model';
     openRepositoryInDetails(repoId, repoType, null, 'push');
   };
@@ -6269,9 +6289,7 @@ async function loadRepositoryDetails(entry) {
       const endpoint = typeof data.endpoint === 'string' ? data.endpoint.trim() : '';
       if (!endpoint) return;
       state.serverEndpoint = endpoint;
-      if (currentSelectedRepo) {
-        syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
-      }
+      syncSelectedModelHeader();
     } catch (_) { /* leave blank if unavailable */ }
   }
 

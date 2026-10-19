@@ -87,6 +87,18 @@ for (const selector of [
   nodes.set(selector, makeNode());
 }
 
+// The real Hub anchor's href property reflects its href attribute, so removing
+// the attribute (the header hides an unknown link) must also clear the
+// property. A plain node property would keep the previous URL visible.
+const detailHfLinkNode = nodes.get('#modelsDetailHFLink');
+detailHfLinkNode.attributes.href = '#';
+Object.defineProperty(detailHfLinkNode, 'href', {
+  get() {
+    return Object.prototype.hasOwnProperty.call(this.attributes, 'href') ? this.attributes.href : '';
+  },
+  set(value) { this.attributes.href = String(value); }
+});
+
 // #modelsOverviewPanel and #modelsCommunityPanel are real children of
 // #analyzeResult. Writing the shared container's innerHTML replaces both tab
 // panels, so mirror that relationship: a regression that renders into
@@ -334,6 +346,20 @@ function readmePaths() {
 }
 function lastAnalyzePath() { return analyzePaths().at(-1); }
 function lastReadmePath() { return readmePaths().at(-1); }
+
+// Defer one analyze response so a test can inspect the transition state while
+// the request is in flight. settle.resolve() uses the normal fixture response
+// for the request path (or supplied data); settle.reject(error) fails it.
+function deferredAnalyze() {
+  let settle;
+  const pending = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+  let requestPath = null;
+  analyzeImpl = (rawPath) => {
+    requestPath = rawPath;
+    return pending.then(data => data || defaultAnalyze(rawPath));
+  };
+  return { path: () => requestPath, settle };
+}
 function historyRepos() { return Array.from(ui.history(), entry => entry.repo); }
 function historyRevisions() { return Array.from(ui.history(), entry => entry.revision); }
 function historyTuples() { return Array.from(ui.history(), entry => [entry.repo, entry.repoType, entry.revision]); }
@@ -990,6 +1016,132 @@ async function testRefreshInFlightNavigation() {
   eq(ui.currentRepoHistoryEntry().repo, 'owner/inflight', 'refresh keeps the in-flight repo current');
 }
 
+async function testDetailHeaderTracksTypedInFlightNavigation() {
+  resetTest();
+  await ui.openRepositoryInDetails('owner/previous', 'model', null, 'push');
+  eq(ui.getDetailHeader().repo, 'owner/previous', 'rendered model view labels the previous repository');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/previous', 'rendered model view links the previous repository');
+
+  // Start A -> B typed navigation and stop before the response resolves.
+  const deferred = deferredAnalyze();
+  const navigation = ui.openRepositoryInDetails('owner/next', 'dataset', null, 'push');
+  await flush();
+  eq(deferred.path(), '/api/analyze/owner/next?type=dataset', 'typed transition requests the target dataset namespace');
+  eq(ui.getDetailHeader().repo, 'owner/next', 'header identifies the target while it loads');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 'dataset Hub link targets the new repository while loading');
+  ok(!/owner\/previous/.test(ui.getDetailHeader().href), 'in-flight dataset link never keeps the previous href');
+  deepEq(
+    { ...ui.getSelectionState() },
+    { repo: 'owner/next', type: 'dataset', isDataset: true, branch: 'main' },
+    'selection state reflects the target transition before the response'
+  );
+
+  deferred.settle.resolve();
+  await navigation;
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/next', 'header stays on the target after resolution');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 'dataset Hub link stays correct after resolution');
+  eq(ui.getDetailHeader().hidden, false, 'resolved dataset keeps the Hub action visible');
+}
+
+async function testDetailHeaderSurvivesGenericAnalyzeError() {
+  resetTest();
+  await ui.openRepositoryInDetails('owner/previous', 'model', null, 'push');
+
+  const deferred = deferredAnalyze();
+  const navigation = ui.openRepositoryInDetails('owner/failing', 'dataset', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/failing', 'loading target labels the failing repository');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/failing', 'loading target links the failing dataset');
+
+  deferred.settle.reject(new Error('analysis unavailable'));
+  await navigation;
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/failing', 'generic analyze error leaves the header on the target repository');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/failing', 'generic analyze error keeps the target dataset Hub link');
+  eq(ui.getDetailHeader().hidden, false, 'generic analyze error keeps the known target type visible');
+  deepEq(
+    { ...ui.getSelectionState() },
+    { repo: 'owner/failing', type: 'dataset', isDataset: true, branch: 'main' },
+    'generic analyze error leaves selection state on the target repository'
+  );
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Analysis Failed/, 'generic analyze error renders the failure state');
+  ok(!/owner\/previous/.test(ui.getDetailHeader().repo + ui.getDetailHeader().href), 'generic analyze error never reverts to the previous repository');
+}
+
+async function testSearchRowDatasetHeaderDuringLoading() {
+  resetTest();
+  const deferred = deferredAnalyze();
+  const row = makeNode({ dataset: { repoType: 'dataset' } });
+  ui.modelsSelectRow(row, 'owner/data');
+  await flush();
+
+  eq(deferred.path(), '/api/analyze/owner/data?type=dataset', 'dataset search row requests the dataset namespace');
+  eq(ui.getDetailHeader().repo, 'owner/data', 'dataset search row labels the target while loading');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/data', 'dataset search row uses the dataset Hub URL while loading');
+  ok(ui.getDetailHeader().href !== 'https://huggingface.co/owner/data', 'dataset search row never builds the model Hub URL');
+  eq(ui.getSelectionState().isDataset, true, 'dataset search row state is dataset during loading');
+  eq(ui.getSelectionState().type, 'dataset', 'dataset search row type is dataset during loading');
+
+  deferred.settle.resolve();
+  await flush();
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/data', 'dataset search row keeps the dataset Hub URL after resolution');
+}
+
+async function testUntypedNavigationHidesHubLinkUntilResolved() {
+  resetTest();
+  await ui.openRepositoryInDetails('owner/previous', 'model', null, 'push');
+  ok(ui.getDetailHeader().href !== '', 'previous view exposes its Hub link');
+
+  const deferred = deferredAnalyze();
+  nodes.get('#analyzeInput').value = 'owner/auto';
+  const navigation = ui.analyzeRepo();
+  await flush();
+  eq(deferred.path(), '/api/analyze/owner/auto', 'untyped Analyze-field transition keeps auto-detection');
+  eq(ui.getDetailHeader().repo, 'owner/auto', 'untyped transition labels the target immediately');
+  eq(ui.getDetailHeader().hidden, true, 'untyped transition hides the Hub action while the type is unknown');
+  eq(ui.getDetailHeader().href, '', 'untyped transition clears the previous Hub href');
+  ok(!/owner\/previous/.test(ui.getDetailHeader().href), 'untyped transition never keeps the previous href');
+  eq(ui.getSelectionState().repo, 'owner/auto', 'untyped transition selects the target repository');
+  eq(ui.getSelectionState().type, null, 'untyped transition leaves the namespace unresolved');
+
+  deferred.settle.resolve();
+  await navigation;
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/auto', 'auto-detected view keeps the target repository');
+  eq(ui.getDetailHeader().hidden, false, 'auto-detection reveals the Hub action once the type resolves');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/auto', 'auto-detected model resolves the model Hub link');
+  eq(ui.getSelectionState().type, 'model', 'auto-detection resolves the selection type');
+}
+
+async function testHeaderResyncDuringInFlightNavigation() {
+  resetTest();
+  await ui.openRepositoryInDetails('owner/previous', 'model', null, 'push');
+
+  const deferred = deferredAnalyze();
+  const navigation = ui.openRepositoryInDetails('owner/next', 'dataset', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/next', 'in-flight target is selected before re-sync');
+
+  // Settings and health can resolve after a navigation starts. Their re-sync
+  // must use the target selection state rather than the previous view.
+  await ui.loadStorageModeBadge();
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/next', 'settings re-sync keeps the in-flight target repository');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 'settings re-sync keeps the in-flight dataset link');
+
+  await ui.loadAppVersion();
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/next', 'health re-sync keeps the in-flight target repository');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 'health re-sync keeps the in-flight dataset link');
+
+  deferred.settle.resolve();
+  await navigation;
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/next', 're-synced target survives response resolution');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/next', 're-synced dataset link survives response resolution');
+}
+
 function testClassifierAndReservedRoutes() {
   resetTest();
 
@@ -1388,6 +1540,11 @@ async function testNavigationPreservesCommunityPanel() {
   await testCancelAnalysisRevisionPickerKeepsRenderedView();
   await testRevisionChangeFromRenderedAnalysis();
   await testRefreshInFlightNavigation();
+  await testDetailHeaderTracksTypedInFlightNavigation();
+  await testDetailHeaderSurvivesGenericAnalyzeError();
+  await testSearchRowDatasetHeaderDuringLoading();
+  await testUntypedNavigationHidesHubLinkUntilResolved();
+  await testHeaderResyncDuringInFlightNavigation();
   testClassifierAndReservedRoutes();
   await testServerClientEquivalence();
   await testBaseBlobURLConsumption();
