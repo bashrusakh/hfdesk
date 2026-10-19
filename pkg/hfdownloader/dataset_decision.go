@@ -192,7 +192,8 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 				in.Alternatives = []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}
 			}
 		}
-		in.Alternatives = forceKnownDatasetCompanionRole(n.Path, in.Alternatives)
+		var forcedCompanion bool
+		in.Alternatives, forcedCompanion = forceKnownDatasetCompanionRole(n.Path, in.Alternatives)
 		hasDataAlternative := false
 		for _, alt := range in.Alternatives {
 			if alt.Role == datasetselection.EvidenceRoleData {
@@ -262,6 +263,12 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 				}
 			}
 		}
+		if forcedCompanion {
+			// The record has no data alternative; do not retain direct state
+			// computed from a core/residual label that no longer applies.
+			in.DirectCoreConditions = 0
+			in.DirectResidualConditions = nil
+		}
 		key := n.Path
 		if prior, ok := firstExact[key]; ok {
 			in.ExactDuplicateOf = prior
@@ -319,11 +326,11 @@ func isDatasetPayloadPath(filePath string) bool {
 // path companion-only before world evaluation. Membership evidence may offer a
 // data(default) alternative for a .json/.txt name, but these names are known
 // companions and must not create role ambiguity. Unknown names are unchanged.
-func forceKnownDatasetCompanionRole(filePath string, alternatives []datasetDecisionRoleLabel) []datasetDecisionRoleLabel {
+func forceKnownDatasetCompanionRole(filePath string, alternatives []datasetDecisionRoleLabel) ([]datasetDecisionRoleLabel, bool) {
 	if !isKnownDatasetCompanionPath(filePath) {
-		return alternatives
+		return alternatives, false
 	}
-	return []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}
+	return []datasetDecisionRoleLabel{{Role: datasetselection.EvidenceRoleCompanion}}, true
 }
 
 // canRetainDatasetCompanion reports whether an unmatched input is safe to

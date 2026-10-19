@@ -791,13 +791,21 @@ func isRecognizedMetadataPath(relativePath string) bool {
 // root or a conventional non-data directory. Unknown names remain unknown.
 func isKnownDatasetCompanionPath(relativePath string) bool {
 	p := normalizeDatasetCompanionPath(relativePath)
-	if isDatasetReadmeOrLicensePath(p) {
+	if isDatasetReadmeOrLicensePath(p) || isDatasetInfoCompanionPath(p) {
 		return true
 	}
 	if !isConventionalCompanionDirectory(p) {
 		return false
 	}
 	return isKnownScopedDatasetCompanionBase(strings.ToLower(path.Base(p)))
+}
+
+func isDatasetInfoCompanionPath(relativePath string) bool {
+	switch strings.ToLower(path.Base(normalizeDatasetCompanionPath(relativePath))) {
+	case "dataset_info.json", "dataset_infos.json":
+		return true
+	}
+	return false
 }
 
 func normalizeDatasetCompanionPath(relativePath string) string {
@@ -830,7 +838,7 @@ func isKnownScopedDatasetCompanionBase(base string) bool {
 	switch base {
 	case "config.json", "tokenizer.json", "tokenizer_config.json",
 		"special_tokens_map.json", "added_tokens.json", "vocab.json",
-		"merges.txt", "vocab.txt", "dataset_info.json", "dataset_infos.json",
+		"merges.txt", "vocab.txt",
 		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
 		"environment.yaml", "dockerfile", "makefile", ".gitattributes",
 		".gitignore", "tokenizer.bin", "copying", "notice":

@@ -750,12 +750,18 @@ func TestPlanRepoDatasetCompanionPathScope(t *testing.T) {
 	negatives := []string{
 		"test/code.js",
 		"test/page.html",
+		"test/query.sql",
+		"test/run.ipynb",
+		"test/config.yaml",
 		"test/config.json",
 		"test/tokenizer.json",
 		"test/vocab.txt",
 		"test/requirements.txt",
+		"tests/requirements.txt",
 		"test/setup.py",
 		"test/CITATION.cff",
+		"test/COPYING",
+		"test/NOTICE",
 		"validation/query.sql",
 		"dev/run.ipynb",
 		"eval/helper.py",
@@ -980,16 +986,17 @@ func TestPlanRepoDatasetUnknownRootMetadataIsNotRetained(t *testing.T) {
 	}
 }
 
-func TestPlanRepoDatasetReadmeLicenseAnywhereAndScopedMetadata(t *testing.T) {
+func TestPlanRepoDatasetReadmeLicenseAndDatasetInfoAnywhere(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "train/README.txt", Size: 11},
 		{Type: "file", Path: "train/LICENSE.txt", Size: 12},
-		{Type: "file", Path: "data/dataset_infos.json", Size: 13},
-		{Type: "file", Path: "nested/dataset_info.json", Size: 14},
-		{Type: "file", Path: "nested/README.md", Size: 15},
+		{Type: "file", Path: "data/dataset_info.json", Size: 13},
+		{Type: "file", Path: "data/dataset_infos.json", Size: 14},
+		{Type: "file", Path: "nested/dataset_info.json", Size: 15},
+		{Type: "file", Path: "nested/README.md", Size: 16},
 	}
-	want := []string{"train.csv", "train/README.txt", "train/LICENSE.txt", "nested/README.md"}
+	want := []string{"train.csv", "train/README.txt", "train/LICENSE.txt", "data/dataset_info.json", "data/dataset_infos.json", "nested/dataset_info.json", "nested/README.md"}
 	for _, tc := range []struct {
 		name    string
 		filters []string
@@ -1034,6 +1041,18 @@ func TestPlanRepoDatasetKnownConfigPathScope(t *testing.T) {
 			t.Fatalf("split-directory config/unknown PlanRepo: %v", err)
 		}
 		assertPaths(t, planPaths(plan), []string{"train.csv"})
+	})
+	t.Run("train config keeps data role, not unmatched companion", func(t *testing.T) {
+		srv := mockHFServerForPlan(t, []hfNode{
+			{Type: "file", Path: "validation.csv", Size: 10},
+			{Type: "file", Path: "train/config.json", Size: 11},
+		})
+		defer srv.Close()
+		plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"validation.csv"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("train config PlanRepo: %v", err)
+		}
+		assertPaths(t, planPaths(plan), []string{"validation.csv"})
 	})
 }
 

@@ -68,22 +68,24 @@ func TestDatasetKnownMetadataNamesAreCompanionOnlyInScope(t *testing.T) {
 		{Path: "train.csv"},
 		{Path: "tokenizer.json"},
 		{Path: "docs/dataset_info.json"},
+		{Path: "nested/dataset_info.json"},
+		{Path: "data/dataset_infos.json"},
 		{Path: "test/config.json"},
 		{Path: "nested/config.json"},
 	}, []string{"train"}, nil)
-	for i := 1; i <= 2; i++ {
+	for i := 1; i <= 4; i++ {
 		got := c.Inputs[i].Alternatives
 		if len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
 			t.Fatalf("in-scope known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
 		}
 	}
-	for i := 3; i <= 4; i++ {
+	for i := 5; i <= 6; i++ {
 		got := c.Inputs[i].Alternatives
 		if len(got) == 1 && got[0].Role == datasetselection.EvidenceRoleCompanion {
 			t.Fatalf("out-of-scope known metadata %q was forced companion-only: %+v", c.Inputs[i].Path, got)
 		}
 	}
-	if got := c.Inputs[4].Alternatives; len(got) < 2 || got[0].Role != datasetselection.EvidenceRoleData || got[1].Role != datasetselection.EvidenceRoleCompanion {
+	if got := c.Inputs[6].Alternatives; len(got) < 2 || got[0].Role != datasetselection.EvidenceRoleData || got[1].Role != datasetselection.EvidenceRoleCompanion {
 		t.Fatalf("arbitrary nested config alternatives = %+v; want data/companion ambiguity", got)
 	}
 
@@ -594,7 +596,7 @@ func oracleDatasetPayloadPath(filePath string) bool {
 func oracleKnownDatasetCompanionPath(filePath string) bool {
 	p := strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
 	base := strings.ToLower(path.Base(p))
-	if oracleReadmeOrLicense(base) {
+	if oracleReadmeOrLicense(base) || oracleDatasetInfo(base) {
 		return true
 	}
 	if !oracleConventionalCompanionDirectory(p) {
@@ -603,7 +605,7 @@ func oracleKnownDatasetCompanionPath(filePath string) bool {
 	switch base {
 	case "config.json", "tokenizer.json", "tokenizer_config.json",
 		"special_tokens_map.json", "added_tokens.json", "vocab.json",
-		"merges.txt", "vocab.txt", "dataset_info.json", "dataset_infos.json",
+		"merges.txt", "vocab.txt",
 		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
 		"environment.yaml", "dockerfile", "makefile", ".gitattributes",
 		".gitignore", "tokenizer.bin", "copying", "notice":
@@ -651,6 +653,10 @@ func oracleReadmeOrLicense(base string) bool {
 		return true
 	}
 	return false
+}
+
+func oracleDatasetInfo(base string) bool {
+	return base == "dataset_info.json" || base == "dataset_infos.json"
 }
 
 func oracleConventionalCompanionDirectory(filePath string) bool {
@@ -841,6 +847,23 @@ func TestCompileDatasetDecisionContextPathPredicatesAndDuplicates(t *testing.T) 
 	}
 	if !c.Inputs[1].ExactDuplicateEligible || !c.Inputs[1].CaseDuplicateEligible {
 		t.Fatal("first path should be eligible for both dedup emissions")
+	}
+}
+
+func TestKnownCompanionRoleOverrideClearsDirectDataConditions(t *testing.T) {
+	c := compileDecisionFixture([]hfNode{
+		{Path: "docs/train/config.json"},
+		{Path: "test/train/config.json"},
+	}, []string{"train"}, nil)
+	inScope := c.Inputs[0]
+	if len(inScope.Alternatives) != 1 || inScope.Alternatives[0].Role != datasetselection.EvidenceRoleCompanion {
+		t.Fatalf("in-scope config alternatives = %+v; want companion-only", inScope.Alternatives)
+	}
+	if inScope.DirectCoreConditions != 0 || len(inScope.DirectResidualConditions) != 0 {
+		t.Fatalf("in-scope companion retained stale direct data state: %+v", inScope)
+	}
+	if c.Inputs[1].DirectCoreConditions == 0 {
+		t.Fatalf("out-of-scope config unexpectedly lost direct data state: %+v", c.Inputs[1])
 	}
 }
 
