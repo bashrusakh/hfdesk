@@ -201,10 +201,14 @@ func isGGUFFileName(name string) bool {
 // trimGGUFSuffix removes a recognized GGUF extension, including the legacy
 // ".gguf-split" spelling, for legacy basename/filter derivation.
 func trimGGUFSuffix(name string) string {
-	if strings.HasSuffix(strings.ToLower(name), ".gguf-split") {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".gguf-split") {
 		return name[:len(name)-len(".gguf-split")]
 	}
-	return strings.TrimSuffix(name, ".gguf")
+	if strings.HasSuffix(lower, ".gguf") {
+		return name[:len(name)-len(".gguf")]
+	}
+	return name
 }
 
 // stripSplitSuffix removes the "-NNNNN-of-MMMMM[.gguf|.gguf-split]" shard

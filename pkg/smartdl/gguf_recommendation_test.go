@@ -193,6 +193,34 @@ func TestGGUFToSelectableItems_UniqueMMProjUsesLegacyID(t *testing.T) {
 	}
 }
 
+// TestGGUFToSelectableItems_UniqueUppercaseMMProjUsesLegacyID verifies that a
+// recognized uppercase GGUF extension is trimmed case-insensitively, so a lone
+// uppercase mmproj file keeps the same legacy basename ID and FilterValue as
+// its lowercase equivalent.
+func TestGGUFToSelectableItems_UniqueUppercaseMMProjUsesLegacyID(t *testing.T) {
+	files := []FileInfo{
+		ggufRecommendationTestFile("model-Q4_K_M.gguf", 4_000_000_000),
+		ggufRecommendationTestFile("nested/mmproj-F16.GGUF", 100),
+	}
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	vision := selectableItemsByCategory(GGUFToSelectableItems(info), "vision_encoder")
+	if len(vision) != 1 {
+		t.Fatalf("got %d vision_encoder items, want 1: %+v", len(vision), vision)
+	}
+	if got, want := vision[0].ID, "mmproj-mmproj-f16"; got != want {
+		t.Fatalf("uppercase mmproj ID = %q, want legacy %q", got, want)
+	}
+	if got, want := vision[0].FilterValue, "mmproj-f16"; got != want {
+		t.Fatalf("uppercase mmproj FilterValue = %q, want %q", got, want)
+	}
+	if got, want := vision[0].Files, []string{"nested/mmproj-F16.GGUF"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("uppercase mmproj Files = %v, want %v", got, want)
+	}
+}
+
 // TestGGUFToSelectableItems_PathDistinctMMProjArtifacts verifies that two
 // mmproj files sharing a basename in different directories are both emitted
 // with path-distinct, deterministic IDs and exact Files, while only the
