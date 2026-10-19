@@ -308,6 +308,34 @@ Upstream `400`, `401`, `403`, `404`, and `429` responses keep their status;
 network failures, other upstream statuses, and malformed upstream JSON return
 `502`.
 
+## README
+
+```http
+GET /api/readme/{owner}/{repo}?revision=main&dataset=false
+```
+
+Returns the repository README for a revision. `dataset=true` selects the dataset
+namespace; `revision` defaults to `main`.
+
+Important response fields:
+
+```json
+{
+  "repo": "owner/name",
+  "revision": "main",
+  "path": "README.md",
+  "markdown": "# Name\n...",
+  "baseRawURL": "https://huggingface.co/owner/name/resolve/main/",
+  "baseBlobURL": "https://huggingface.co/owner/name/blob/main/",
+  "html": "<h1>Name</h1>"
+}
+```
+
+`html` is sanitized README HTML and must be preferred whenever present,
+including an empty string (sanitization removed all content). `markdown`,
+`baseRawURL`, and `baseBlobURL` support the older-server client fallback:
+`baseRawURL` resolves images and `baseBlobURL` resolves relative links.
+
 ## Plan
 
 ```http
