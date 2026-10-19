@@ -139,6 +139,30 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   }
   await run('quant', 'gguf', { choice: '' });
   if (fixture.routes?.audio) await run('quant', 'gguf', { choice: 'audio' });
+  // File-list downloads select a repository-relative path exactly: a root-level
+  // entry is encoded as "./name" so a same-named nested alias is not selected,
+  // while a nested entry keeps its canonical relative path. The displayed name
+  // and toast stay unencoded.
+  ui.setAnalysis({ repo: 'fixture/filelist', type: 'audio', branch: 'main' });
+  const rootFileList = ui.renderNonSelectableFiles({ repo: 'fixture/filelist', files: [{ path: 'model.bin' }] });
+  assert(rootFileList.includes('>model.bin<'), 'root file-list display name must stay unencoded');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadSingleFile('fixture/filelist', 'model.bin', false);
+  let fileDownload = calls.find(c => c.path === '/api/download');
+  assert(fileDownload, 'root file-list request missing');
+  assert.deepEqual(fileDownload.body.filters, ['./model.bin']);
+  assert(fileDownload.body.exactMatch);
+  assert(!fileDownload.body.filters.includes('model.bin'), 'root file list must not send the legacy basename selector');
+  assert(messages.some(m => m.message === 'Queued: model.bin'), 'root file-list toast must stay unencoded');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadSingleFile('fixture/filelist', 'nested/model.bin', false);
+  fileDownload = calls.find(c => c.path === '/api/download');
+  assert(fileDownload, 'nested file-list request missing');
+  assert.deepEqual(fileDownload.body.filters, ['nested/model.bin']);
+  assert(fileDownload.body.exactMatch);
+  assert(messages.some(m => m.message === 'Queued: nested/model.bin'), 'nested file-list toast must keep the relative path');
   // Dataset renderers must not offer inert controls, even with routes configured.
   ui.setAnalysis({ repo: 'fixture/data', type: 'gguf', is_dataset: true });
   assert(!ui.renderSelectableItems([{label: 'Data', id: 'data'}], 'items').includes('quantRouteSelect'));

@@ -5560,14 +5560,19 @@ async function loadRepositoryDetails(entry) {
       </div>`;
   }
 
-  // Download a single specific file by filter
+  // Download a single specific file by its exact repository-relative path.
   window.downloadSingleFile = async function(repo, filename, isDataset) {
     try {
       // Destination chosen in the file list's "Save to" select, when present.
       const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+      // The file list identifies files by their repository-relative path. Send
+      // root-level entries through the exact "./name" selector so a same-named
+      // nested alias is not selected by legacy basename matching; nested paths
+      // remain canonical. Display and toast keep the unencoded filename.
+      const filters = artifactRequestPaths([filename]);
       const body = {
         repo, revision: currentAnalysis?.branch || 'main',
-        dataset: isDataset, filters: [filename], exactMatch: true
+        dataset: isDataset, filters, exactMatch: true
       };
       if (routeKey) body.routeKey = routeKey;
       if (!await checkDownloadDiskSpace(body)) return;
