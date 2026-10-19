@@ -1323,7 +1323,12 @@ function openRepositoryInDetails(repo, repoType = null, revision = null, navigat
     if (sameRepo && effectiveRepoRevision(entry.revision) === effectiveRepoRevision(current.revision)) {
       // Same repository view (including a root link while the default view is
       // already shown): refine the current entry instead of adding a
-      // duplicate stop.
+      // duplicate stop. A README root link carries no revision but does carry
+      // an explicit type, so keep the current resolved revision to refresh
+      // that view instead of starting an unresolved navigation that reopens
+      // the revision picker. An untyped caller (the Analyze field) still keeps
+      // its pending auto-detect entry.
+      if (!entry.revision && entry.repoType && current.revision) entry.revision = current.revision;
       replaceRepoHistoryEntry(entry);
     } else {
       // A different revision of the same repository is a view transition.

@@ -241,6 +241,8 @@ function resetTest() {
   nodes.get('#modelsDetailHFLink').hidden = false;
   nodes.get('#modelsDetailBack').disabled = true;
   nodes.get('#modelsDetailForward').disabled = true;
+  nodes.get('#modalBackdrop').classList.remove('active');
+  nodes.get('#modalBody').innerHTML = '';
 }
 
 async function flush() {
@@ -579,6 +581,52 @@ async function testSameRepoRootKeepsRevisionStop() {
   await ui.traverseRepoHistory(-1);
   eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=dev', 'Back restores the preserved dev stop');
   eq(ui.historyIndex(), 0, 'Back returns to dev');
+}
+
+async function testSameRepoRootLinkKeepsResolvedRevision() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    return data;
+  };
+
+  // Resolve the repository view explicitly at main so this regression starts
+  // from a settled stop instead of the initial pending picker.
+  await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
+  deepEq(historyTuples(), [['owner/model', 'model', 'main']], 'resolved main view creates one stop');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'resolved main view loads revision=main');
+  eq(nodes.get('#modalBackdrop').classList.contains('active'), false, 'resolved main view shows no revision picker');
+
+  // The real README renderer emits a same-repo root link without a revision.
+  const rootHtml = ui.renderMarkdownPreview(
+    '[root](https://huggingface.co/owner/model)',
+    fixture.baseRawURL,
+    fixture.baseBlobURL
+  );
+  const rootLink = extractLinks(rootHtml).find(link => link.repo === 'owner/model');
+  ok(rootLink, 'README root link must be classified internal');
+  eq(rootLink.type, 'model', 'README root link keeps the model type');
+  eq(rootLink.revision, null, 'README root link carries no revision');
+
+  calls = [];
+  const event = clickEvent(fakeAnchor({
+    'data-hf-repo': rootLink.repo,
+    'data-hf-repo-type': rootLink.type
+  }));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'same-repo README root link must prevent external navigation');
+  await flush();
+
+  deepEq(historyTuples(), [['owner/model', 'model', 'main']], 'same-repo root link keeps the single resolved main stop');
+  eq(ui.history().length, 1, 'same-repo root link does not add or replace with an unresolved entry');
+  eq(ui.currentRepoHistoryEntry().revision, 'main', 'same-repo root link keeps the resolved revision');
+  eq(ui.historyIndex(), 0, 'same-repo root link keeps the current stop');
+  eq(analyzePaths().length, 1, 'same-repo root link makes one analyze request');
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?dataset=false&revision=main', 'same-repo root link refreshes with revision=main');
+  ok(!analyzePaths().includes('/api/analyze/owner/model?dataset=false'), 'same-repo root link never falls back to bare auto-detection');
+  eq(nodes.get('#modalBackdrop').classList.contains('active'), false, 'same-repo root link does not reopen the revision picker');
+  eq(nodes.get('#modelsDetailBack').disabled, true, 'same-repo root link leaves Back disabled');
 }
 
 async function testRefreshPendingRevisionPicker() {
@@ -921,6 +969,7 @@ async function testSearchRowAndDetailHeader() {
   await testSameRepoModelDatasetHistory();
   await testHistoryTraversalAndForwardTruncation();
   await testSameRepoRootKeepsRevisionStop();
+  await testSameRepoRootLinkKeepsResolvedRevision();
   await testRefreshPendingRevisionPicker();
   await testRevisionChangeFromRenderedAnalysis();
   await testRefreshInFlightNavigation();
