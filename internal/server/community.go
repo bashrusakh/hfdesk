@@ -412,25 +412,30 @@ func renderCommunityCommentHTML(raw, upstreamHTML, baseRaw, baseBlob, endpointHo
 }
 
 // sanitizeCommunityCommentHTML applies the README sanitizer and then removes
-// every id and name attribute. Comment HTML is injected into the application
-// document, so a retained id such as "page-jobs" would make
-// document.querySelector("#page-jobs") resolve to the comment instead of the
-// real page and blank the page content. README rendering keeps its identifiers.
-// A fragment that cannot be re-parsed for stripping is discarded rather than
-// risking an identifier escape.
+// DOM identifiers and repository-navigation attributes. Comment HTML is
+// injected into the application document, so a retained id such as "page-jobs"
+// would make document.querySelector("#page-jobs") resolve to the comment
+// instead of the real page and blank the page content. Comments are not model
+// cards, so a retained data-hf-repo* attribute would turn an external comment
+// link into internal Model Details navigation; those attributes are stripped
+// while the external href fallback remains. README rendering keeps both its
+// identifiers and its classified repository-link attributes. A fragment that
+// cannot be re-parsed for stripping is discarded rather than risking an
+// identifier or navigation-attribute escape.
 func sanitizeCommunityCommentHTML(fragment string) string {
-	stripped, ok := stripHTMLIdentifiers(readmePolicy.Sanitize(fragment))
+	stripped, ok := stripCommunityCommentAttributes(readmePolicy.Sanitize(fragment))
 	if !ok {
 		return ""
 	}
 	return stripped
 }
 
-// stripHTMLIdentifiers removes id and name attributes from every element in an
-// HTML fragment, reporting false if the fragment cannot be parsed or rendered
-// back. Keeping the attribute removal here (after sanitization) makes the
-// guarantee independent of the sanitizer's attribute policy.
-func stripHTMLIdentifiers(fragment string) (string, bool) {
+// stripCommunityCommentAttributes removes id/name and data-hf-repo* attributes
+// from every element in an HTML fragment, reporting false if the fragment
+// cannot be parsed or rendered back. Keeping the attribute removal here (after
+// sanitization) makes the guarantee independent of the sanitizer's attribute
+// policy.
+func stripCommunityCommentAttributes(fragment string) (string, bool) {
 	doc, err := xhtml.Parse(strings.NewReader("<html><body>" + fragment + "</body></html>"))
 	if err != nil || doc == nil {
 		return "", false
@@ -439,7 +444,7 @@ func stripHTMLIdentifiers(fragment string) (string, bool) {
 	if body == nil {
 		return "", false
 	}
-	stripHTMLIdentifierAttrs(body)
+	stripCommunityCommentAttrs(body)
 
 	var out bytes.Buffer
 	for c := body.FirstChild; c != nil; c = c.NextSibling {
@@ -450,11 +455,12 @@ func stripHTMLIdentifiers(fragment string) (string, bool) {
 	return out.String(), true
 }
 
-func stripHTMLIdentifierAttrs(n *xhtml.Node) {
+func stripCommunityCommentAttrs(n *xhtml.Node) {
 	if n.Type == xhtml.ElementNode {
 		attrs := n.Attr[:0]
 		for _, a := range n.Attr {
-			if a.Key == "id" || a.Key == "name" {
+			switch a.Key {
+			case "id", "name", "data-hf-repo", "data-hf-repo-type", "data-hf-repo-revision":
 				continue
 			}
 			attrs = append(attrs, a)
@@ -462,7 +468,7 @@ func stripHTMLIdentifierAttrs(n *xhtml.Node) {
 		n.Attr = attrs
 	}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		stripHTMLIdentifierAttrs(c)
+		stripCommunityCommentAttrs(c)
 	}
 }
 

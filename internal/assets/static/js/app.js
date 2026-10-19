@@ -1406,7 +1406,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 }
 
 async function loadRepositoryDetails(entry) {
-  const resultDiv = $('#analyzeResult');
+  // Render into the Overview tab panel, not the shared #analyzeResult
+  // container: the Community panel is its sibling and must survive navigation.
+  const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
   if (!resultDiv) return;
 
   const repo = entry.repo;

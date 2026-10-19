@@ -428,6 +428,24 @@ func TestCommunityCommentHTMLRemovesGlobalIdentifiers(t *testing.T) {
 	}
 }
 
+func TestCommunityCommentHTMLStripsRepositoryNavigationAttributes(t *testing.T) {
+	fragment := `<p><a href="https://huggingface.co/owner/model/tree/dev" ` +
+		`data-hf-repo="owner/model" data-hf-repo-type="model" data-hf-repo-revision="dev">model</a></p>`
+
+	body := sanitizeCommunityCommentHTML(fragment)
+	if body == "" {
+		t.Fatal("comment fragment was discarded")
+	}
+	for _, attr := range []string{"data-hf-repo=", "data-hf-repo-type=", "data-hf-repo-revision="} {
+		if strings.Contains(body, attr) {
+			t.Errorf("comment HTML retains repository navigation attribute %q in %q", attr, body)
+		}
+	}
+	if !strings.Contains(body, `href="https://huggingface.co/owner/model/tree/dev"`) {
+		t.Errorf("comment link lost its external href fallback: %q", body)
+	}
+}
+
 func TestCommunityCommentHTMLKeepsFrontmatterLikeContent(t *testing.T) {
 	body, _ := communityCommentBody(t, "---\n**Note:** see below\n---\nDetails", "")
 

@@ -4934,6 +4934,13 @@ a {
   white-space: nowrap;
 }
 
+/* .btn's display rule outranks the UA [hidden] rule, so hidden buttons in the
+   detail header need an explicit display override (e.g. the Hub link while the
+   endpoint is unknown). */
+.models-detail-header-right .btn[hidden] {
+  display: none;
+}
+
 /* Detail tabs (Overview / Community) — directly below the detail header */
 .models-detail-tabs {
   display: flex;

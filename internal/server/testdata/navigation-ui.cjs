@@ -75,7 +75,8 @@ function makeNode(extra = {}) {
 
 const nodes = new Map();
 for (const selector of [
-  '#analyzeInput', '#analyzeBtn', '#analyzeResult', '#modelsDetailHeader',
+  '#analyzeInput', '#analyzeBtn', '#analyzeResult', '#modelsOverviewPanel',
+  '#modelsCommunityPanel', '#modelsDetailHeader',
   '#modelsDetailRepo', '#modelsDetailHFLink', '#modelsDetailBack',
   '#modelsDetailForward', '#readmeSection', '#readmePreview', '#modalTitle',
   '#modalBody', '#modalBackdrop', '#modalClose', '#toastContainer', '#modelsSpinner',
@@ -85,6 +86,23 @@ for (const selector of [
 ]) {
   nodes.set(selector, makeNode());
 }
+
+// #modelsOverviewPanel and #modelsCommunityPanel are real children of
+// #analyzeResult. Writing the shared container's innerHTML replaces both tab
+// panels, so mirror that relationship: a regression that renders into
+// #analyzeResult must also destroy the Community panel in this harness.
+const analyzeResultNode = nodes.get('#analyzeResult');
+const overviewPanelNode = nodes.get('#modelsOverviewPanel');
+const communityPanelNode = nodes.get('#modelsCommunityPanel');
+let analyzeResultHtml = '';
+Object.defineProperty(analyzeResultNode, 'innerHTML', {
+  get() { return analyzeResultHtml; },
+  set(value) {
+    analyzeResultHtml = String(value);
+    overviewPanelNode.innerHTML = '';
+    communityPanelNode.innerHTML = '';
+  }
+});
 
 function makeCreatedNode() {
   const node = makeNode();
@@ -279,6 +297,9 @@ function resetTest() {
   ui.state.serverEndpoint = '';
   nodes.get('#analyzeInput').value = '';
   nodes.get('#analyzeResult').innerHTML = '';
+  nodes.get('#modelsOverviewPanel').innerHTML = '';
+  nodes.get('#modelsCommunityPanel').innerHTML = '';
+  nodes.get('#modelsCommunityPanel').hidden = true;
   nodes.get('#readmePreview').innerHTML = '';
   nodes.get('#readmeSection').hidden = true;
   nodes.get('#modelsDetailRepo').textContent = '';
@@ -485,7 +506,7 @@ async function testDualNamespaceSelection() {
   await ui.analyzeRepo();
   eq(lastAnalyzePath(), `/api/analyze/${DUAL_REPO}`, 'Analyze field on a dual repository omits type and dataset and auto-detects');
   eq(ui.history().at(-1).repoType, null, 'pending type selection keeps the history entry untyped');
-  match(nodes.get('#analyzeResult').innerHTML, /Selection Required/, 'dual repository renders the type selector');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Selection Required/, 'dual repository renders the type selector');
 
   // Clicking "Analyze as Model" resolves through the explicit model path and
   // replaces the pending stop, so the selector cannot loop.
@@ -497,7 +518,7 @@ async function testDualNamespaceSelection() {
   eq(ui.getCurrentAnalysis().type, 'gguf', 'Analyze as Model renders model analysis');
   eq(ui.history().at(-1).repoType, 'model', 'Analyze as Model replaces the pending entry with a model stop');
   eq(ui.history().length, 1, 'type selection refines the pending stop without adding history');
-  ok(!/Selection Required/.test(nodes.get('#analyzeResult').innerHTML), 'explicit model view does not loop back to type selection');
+  ok(!/Selection Required/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'explicit model view does not loop back to type selection');
   eq(analyzePaths().filter(p => p === `/api/analyze/${DUAL_REPO}`).length, 0, 'explicit model selection never re-probes auto-detection');
 
   // A model README link on the same dual repository also keeps model identity.
@@ -546,7 +567,7 @@ async function testLineageAndRelatedDownloads() {
   };
   await ui.openRepositoryInDetails('owner/tuned', 'model', null, 'push');
 
-  const resultHtml = nodes.get('#analyzeResult').innerHTML;
+  const resultHtml = nodes.get('#modelsOverviewPanel').innerHTML;
   match(resultHtml, /class="lineage-repo-link"/, 'lineage ancestor must render as a link');
   match(resultHtml, /data-repo="owner\/base"/, 'lineage ancestor must carry its repository identity');
   match(resultHtml, /data-repo="owner\/mmproj"/, 'Related Downloads must carry its repository identity');
@@ -737,14 +758,14 @@ async function testCancelInitialRevisionPickerWithCloseButton() {
   );
   eq(ui.historyIndex(), 1, 'the pending picker entry is current');
   eq(ui.getModal().active, true, 'multiple refs open the revision picker');
-  match(nodes.get('#analyzeResult').innerHTML, /Analyzing owner\/pending/, 'picker navigation leaves the pane loading before cancel');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Analyzing owner\/pending/, 'picker navigation leaves the pane loading before cancel');
 
   // The real X close path.
   click('#modalClose');
   eq(ui.getModal().active, false, 'the X button closes the picker modal');
-  ok(!/loading-state|Analyzing/.test(nodes.get('#analyzeResult').innerHTML), 'cancel replaces the indefinite loading state');
-  match(nodes.get('#analyzeResult').innerHTML, /Select a revision/, 'cancel renders an explicit pending prompt');
-  match(nodes.get('#analyzeResult').innerHTML, /reopenRevisionPicker\(\)/, 'the pending prompt can reopen the picker');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'cancel replaces the indefinite loading state');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'cancel renders an explicit pending prompt');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /reopenRevisionPicker\(\)/, 'the pending prompt can reopen the picker');
   deepEq(
     historyTuples(),
     [['owner/previous', 'model', 'main'], ['owner/pending', 'model', null]],
@@ -777,7 +798,7 @@ async function testCancelInitialRevisionPickerWithCloseButton() {
   eq(ui.historyIndex(), 1, 'selection keeps the refined stop current');
   eq(ui.currentRepoHistoryEntry().revision, 'main', 'the pending stop resolves to the selected revision');
   eq(ui.getCurrentAnalysis().branch, 'main', 'the selected revision is rendered');
-  match(nodes.get('#analyzeResult').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'the resolved view is no longer pending');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'the resolved view is no longer pending');
   eq(nodes.get('#modelsDetailBack').disabled, false, 'Back stays enabled after resolving the pending stop');
   eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward stays disabled after resolving the pending stop');
 }
@@ -800,8 +821,8 @@ async function testCancelInitialRevisionPickerWithEscape() {
 
   pressEscape();
   eq(ui.getModal().active, false, 'Escape closes the picker modal');
-  ok(!/loading-state|Analyzing/.test(nodes.get('#analyzeResult').innerHTML), 'Escape replaces the indefinite loading state');
-  match(nodes.get('#analyzeResult').innerHTML, /Select a revision/, 'Escape renders the explicit pending prompt');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'Escape replaces the indefinite loading state');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /Select a revision/, 'Escape renders the explicit pending prompt');
   deepEq(
     historyTuples(),
     [['owner/solo', 'model', null]],
@@ -839,7 +860,7 @@ async function testCancelAnalysisRevisionPickerKeepsRenderedView() {
   };
   await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
 
-  const rendered = nodes.get('#analyzeResult').innerHTML;
+  const rendered = nodes.get('#modelsOverviewPanel').innerHTML;
   const renderedHistory = historyTuples();
   const renderedHeader = ui.getDetailHeader();
   ok(rendered.includes('showRevisionPickerFromAnalysis'), 'the rendered analysis exposes the change-revision action');
@@ -853,8 +874,8 @@ async function testCancelAnalysisRevisionPickerKeepsRenderedView() {
   eq(ui.historyIndex(), 0, 'cancelling the analysis picker keeps the rendered stop current');
   eq(ui.getCurrentAnalysis().branch, 'main', 'cancelling the analysis picker keeps the rendered revision');
   eq(ui.getDetailHeader().repo, renderedHeader.repo, 'cancelling the analysis picker keeps the header unchanged');
-  eq(nodes.get('#analyzeResult').innerHTML, rendered, 'cancelling the analysis picker keeps the rendered view unchanged');
-  ok(!/Select a revision|loading-state/.test(nodes.get('#analyzeResult').innerHTML), 'cancelling the analysis picker renders neither a pending prompt nor a spinner');
+  eq(nodes.get('#modelsOverviewPanel').innerHTML, rendered, 'cancelling the analysis picker keeps the rendered view unchanged');
+  ok(!/Select a revision|loading-state/.test(nodes.get('#modelsOverviewPanel').innerHTML), 'cancelling the analysis picker renders neither a pending prompt nor a spinner');
 
   // Escape close path behaves the same way.
   window.showRevisionPickerFromAnalysis();
@@ -864,7 +885,7 @@ async function testCancelAnalysisRevisionPickerKeepsRenderedView() {
   deepEq(historyTuples(), renderedHistory, 'Escape on the analysis picker adds no history stop');
   eq(ui.historyIndex(), 0, 'Escape on the analysis picker keeps the rendered stop current');
   eq(ui.getCurrentAnalysis().branch, 'main', 'Escape on the analysis picker keeps the rendered revision');
-  eq(nodes.get('#analyzeResult').innerHTML, rendered, 'Escape on the analysis picker keeps the rendered view unchanged');
+  eq(nodes.get('#modelsOverviewPanel').innerHTML, rendered, 'Escape on the analysis picker keeps the rendered view unchanged');
 }
 
 async function testRevisionChangeFromRenderedAnalysis() {
@@ -891,7 +912,7 @@ async function testRevisionChangeFromRenderedAnalysis() {
     'initial picker selection refines the pending entry into one main stop'
   );
   eq(lastAnalyzePath(), '/api/analyze/owner/model?type=model&revision=main', 'initial picker selection loads main');
-  match(nodes.get('#analyzeResult').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'rendered analysis header exposes the change picker link');
+  match(nodes.get('#modelsOverviewPanel').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'rendered analysis header exposes the change picker link');
 
   // The rendered analysis header's change link reopens the picker for a view
   // that is already a history stop; choosing dev must preserve main.
@@ -1273,6 +1294,34 @@ async function testDetailHeaderEndpointFromHealth() {
   eq(ui.getDetailHeader().hidden, false, 'default health endpoint reveals the dataset Hub action');
 }
 
+async function testNavigationPreservesCommunityPanel() {
+  resetTest();
+
+  // Establish the Community scope for this repository first: a scope change
+  // legitimately clears Community state, so this test exercises an ordinary
+  // navigation of the same repository view.
+  await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
+
+  const overview = nodes.get('#modelsOverviewPanel');
+  const community = nodes.get('#modelsCommunityPanel');
+  const shared = nodes.get('#analyzeResult');
+  const seeded = '<div class="community-view">preserved community content</div>';
+  community.innerHTML = seeded;
+
+  const pending = ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
+  // loadRepositoryDetails writes its loading state synchronously, before the
+  // first await, so the Overview panel must already own it here.
+  match(overview.innerHTML, /Analyzing owner\/model/, 'loading state renders in the Overview panel');
+  ok(!/Analyzing|loading-state/.test(shared.innerHTML), 'navigation leaves the shared result container untouched');
+  eq(community.innerHTML, seeded, 'Community panel survives the loading state');
+
+  await pending;
+  await flush();
+  match(overview.innerHTML, /analysis-card/, 'analysis result renders in the Overview panel');
+  eq(community.innerHTML, seeded, 'Community panel is preserved across repository navigation');
+  eq(shared.innerHTML, '', 'shared result container is not the render target');
+}
+
 (async () => {
   await testAnalyzeFieldAutoDetectAndRefresh();
   await testDatasetOnlyAutoDetect();
@@ -1296,6 +1345,7 @@ async function testDetailHeaderEndpointFromHealth() {
   await testReadmeFallbackSafety();
   await testSearchRowAndDetailHeader();
   await testDetailHeaderEndpointFromHealth();
+  await testNavigationPreservesCommunityPanel();
   console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);
 })().catch(error => {
   console.error('navigation-ui FAILED:', error && error.message ? error.message : error);
