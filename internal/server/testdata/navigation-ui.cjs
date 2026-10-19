@@ -115,6 +115,7 @@ const document = {
 let calls = [];
 let analyzeImpl = defaultAnalyze;
 let readmeImpl = () => ({ html: '<p>readme</p>' });
+let healthImpl = () => ({ status: 'ok', version: 'test', endpoint: fixture.endpoint });
 
 function parseAnalyzePath(rawPath) {
   const u = new URL(rawPath, 'https://hfdesk.test');
@@ -190,6 +191,7 @@ const context = {
   confirm: () => true,
   fetch: async (rawPath) => {
     calls.push(rawPath);
+    if (rawPath === '/api/health') return okResponse(await healthImpl());
     if (rawPath.startsWith('/api/analyze/')) return okResponse(await analyzeImpl(rawPath));
     if (rawPath.startsWith('/api/readme/')) return okResponse(await readmeImpl(rawPath));
     if (rawPath.startsWith('/api/cache/')) return notFoundResponse();
@@ -217,6 +219,7 @@ const hook = `
     renderMarkdownPreview,
     loadReadmePreview,
     handleReadmePreviewClick,
+    loadAppVersion,
     renderRelatedDownloads,
     analyzeRelatedRepo: window.analyzeRelatedRepo,
     selectAnalysisType: window.selectAnalysisType,
@@ -270,7 +273,10 @@ function resetTest() {
   calls = [];
   analyzeImpl = defaultAnalyze;
   readmeImpl = () => ({ html: '<p>readme</p>' });
+  healthImpl = () => ({ status: 'ok', version: 'test', endpoint: fixture.endpoint });
   ui.state.settings = { endpoint: fixture.endpoint };
+  ui.state.settingsLoadFailed = false;
+  ui.state.serverEndpoint = '';
   nodes.get('#analyzeInput').value = '';
   nodes.get('#analyzeResult').innerHTML = '';
   nodes.get('#readmePreview').innerHTML = '';
@@ -1227,6 +1233,46 @@ async function testSearchRowAndDetailHeader() {
   eq(ui.getDetailHeader().repo, 'owner/model', 'detail header keeps the repository identity');
 }
 
+async function testDetailHeaderEndpointFromHealth() {
+  const endpoint = fixture.pathPrefixedEndpoint;
+
+  // Counterexample: a custom endpoint is configured server-side, but only
+  // /api/health reports it; /api/settings is empty or failed. Before health
+  // resolves, the Hub action must stay hidden instead of guessing the default.
+  resetTest();
+  ui.state.settings = {};
+  ui.state.settingsLoadFailed = true;
+  healthImpl = () => ({ status: 'ok', version: 'test', endpoint });
+
+  await ui.openRepositoryInDetails('owner/model', 'model', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().repo, 'owner/model', 'detail header still shows the repository without endpoint settings');
+  eq(ui.getDetailHeader().hidden, true, 'Hub action stays hidden while the endpoint is unknown');
+  eq(ui.getDetailHeader().href, '', 'Hub action keeps no guessed href while the endpoint is unknown');
+  ok(!/huggingface\.co/.test(ui.getDetailHeader().href), 'Hub action never guesses huggingface.co');
+
+  await ui.loadAppVersion();
+  await flush();
+  eq(ui.getDetailHeader().hidden, false, 'health endpoint reveals the Hub action');
+  eq(ui.getDetailHeader().href, `${endpoint}/owner/model`, 'health endpoint including its path prefix drives the Hub action');
+  ok(!/huggingface\.co/.test(ui.getDetailHeader().href), 'custom health endpoint never falls back to huggingface.co');
+
+  // Empty server config: health reports the public Hub, so the link works and
+  // the dataset namespace prefix is preserved.
+  resetTest();
+  ui.state.settings = {};
+  ui.state.settingsLoadFailed = true;
+  healthImpl = () => ({ status: 'ok', version: 'test', endpoint: 'https://huggingface.co' });
+
+  await ui.openRepositoryInDetails('owner/model', 'dataset', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().hidden, true, 'Hub action waits for the health response before using the default endpoint');
+  await ui.loadAppVersion();
+  await flush();
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/datasets/owner/model', 'default health endpoint drives the dataset Hub action');
+  eq(ui.getDetailHeader().hidden, false, 'default health endpoint reveals the dataset Hub action');
+}
+
 (async () => {
   await testAnalyzeFieldAutoDetectAndRefresh();
   await testDatasetOnlyAutoDetect();
@@ -1249,6 +1295,7 @@ async function testSearchRowAndDetailHeader() {
   await testReadmeFallbackDerivesEndpointWithoutSettings();
   await testReadmeFallbackSafety();
   await testSearchRowAndDetailHeader();
+  await testDetailHeaderEndpointFromHealth();
   console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);
 })().catch(error => {
   console.error('navigation-ui FAILED:', error && error.message ? error.message : error);

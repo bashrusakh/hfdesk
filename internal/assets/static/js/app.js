@@ -12,6 +12,11 @@
   const state = {
     jobs: new Map(),
     settings: {},
+    // serverEndpoint is the effective configured HF endpoint reported by
+    // /api/health at startup. It covers the window before /api/settings
+    // resolves (or when that fetch fails) so endpoint-dependent UI never has to
+    // guess https://huggingface.co.
+    serverEndpoint: '',
     wsConnected: false,
     ws: null,
     currentPage: 'analyze',
@@ -453,9 +458,15 @@ let repoHistoryIndex = -1;
 
 // The endpoint is server-owned configuration. The Hub header action and the
 // client-side README fallback both use it rather than assuming huggingface.co.
+// Settings are authoritative when loaded; /api/health supplies the same
+// server-normalized endpoint at startup. When neither has arrived yet, return
+// an empty string so callers can hide endpoint-dependent UI instead of
+// rendering a guessed default that may point at the wrong Hub.
 function configuredHfEndpointURL() {
-  const raw = String(state.settings?.endpoint || '').trim();
-  if (!raw) return 'https://huggingface.co';
+  const configured = String(state.settings?.endpoint || '').trim();
+  const health = String(state.serverEndpoint || '').trim();
+  const raw = configured || health;
+  if (!raw) return '';
   try {
     const u = new URL(raw);
     return `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
@@ -519,10 +530,19 @@ function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
 
   if (header) header.style.display = '';
   if (repoLabel && repoId) repoLabel.textContent = repoId;
-  if (hfLink && repoId) {
-    hfLink.href = `${configuredHfEndpointURL()}/${isDataset ? 'datasets/' : ''}${repoId}`;
-    hfLink.hidden = false;
+  if (!hfLink || !repoId) return;
+  const endpoint = configuredHfEndpointURL();
+  if (!endpoint) {
+    // The configured endpoint is not known yet (settings failed or are still
+    // loading). Hide the action and clear any stale href rather than guessing
+    // huggingface.co, which would be wrong for a custom mirror. loadAppVersion
+    // and loadStorageModeBadge re-sync once an endpoint arrives.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
   }
+  hfLink.href = `${endpoint}/${isDataset ? 'datasets/' : ''}${repoId}`;
+  hfLink.hidden = false;
 }
 
 // =========================================
@@ -4398,6 +4418,12 @@ async function loadRepositoryDetails(entry) {
     }
     state.settings = data;
     state.settingsLoadFailed = false;
+    // Settings are authoritative for the configured endpoint, so refresh the
+    // Model Details Hub action when they (re)load after a repository was
+    // already selected.
+    if (currentSelectedRepo) {
+      syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
+    }
 
     // Populating the form is separated from the fetch: a partially missing DOM
     // must not be treated as an unknown server state that blocks saving.
@@ -6216,7 +6242,9 @@ async function loadRepositoryDetails(entry) {
   // =========================================
 
   // Show the build version (from /api/health) in the sidebar, so the UI tracks
-  // the binary instead of a hardcoded number.
+  // the binary instead of a hardcoded number. The same response carries the
+  // effective configured HF endpoint, which lets the Model Details header work
+  // even when /api/settings has not resolved yet or has failed.
   async function loadAppVersion() {
     try {
       const res = await fetch('/api/health');
@@ -6224,6 +6252,12 @@ async function loadRepositoryDetails(entry) {
       const data = await res.json();
       const el = $('#appVersion');
       if (el && data.version) el.textContent = 'v' + data.version;
+      const endpoint = typeof data.endpoint === 'string' ? data.endpoint.trim() : '';
+      if (!endpoint) return;
+      state.serverEndpoint = endpoint;
+      if (currentSelectedRepo) {
+        syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
+      }
     } catch (_) { /* leave blank if unavailable */ }
   }
 

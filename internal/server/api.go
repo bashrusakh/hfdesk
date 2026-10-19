@@ -29,12 +29,28 @@ import (
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
 var Version = "dev"
 
+// effectiveEndpointURL returns the configured Hugging Face endpoint in the
+// normalized form exposed to clients: the public Hub when no custom endpoint is
+// configured, without a trailing slash, and preserving any path prefix (for
+// example a mirror served under /hf). Keeping this server-side lets surfaces
+// that cannot wait for /api/settings (such as the startup health fetch) use the
+// real configured endpoint instead of guessing huggingface.co.
+func effectiveEndpointURL(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if endpoint == "" {
+		return "https://huggingface.co"
+	}
+	return endpoint
+}
+
 // handleHealth returns server health status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"version": Version,
-		"time":    time.Now().UTC().Format(time.RFC3339),
+		"status":   "ok",
+		"version":  Version,
+		"time":     time.Now().UTC().Format(time.RFC3339),
+		"endpoint": effectiveEndpointURL(cfg.Endpoint),
 	})
 }
 

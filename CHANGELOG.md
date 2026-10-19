@@ -12,6 +12,7 @@
 
 - `GET /api/analyze` now supports an explicit `type=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). `type` takes precedence over the legacy `dataset` parameter, and `type=model` combined with `dataset=true` is rejected as a conflict. The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
 - The client README fallback now keeps server-sanitized empty HTML empty and refuses unsafe link/image schemes while escaping URL attributes exactly once (#135).
+- The Model Details `HF Hub ↗` action now uses the endpoint reported by `GET /api/health` when settings have not loaded or the settings fetch failed, and stays hidden rather than guessing `huggingface.co`; health now reports the normalized effective `endpoint` (#135).
 - Filtered plan/download scans no longer succeed when no file matches the requested filters: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
 
 ## [1.3.0-beta.1] - 2026-10-15

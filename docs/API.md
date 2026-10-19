@@ -25,7 +25,20 @@ Errors return JSON with a legacy flat `error` string and a structured `error_det
 GET /api/health
 ```
 
-Returns server status, version, and timestamp.
+Returns server status, version, timestamp, and the effective configured Hugging Face endpoint.
+
+```json
+{
+  "status": "ok",
+  "version": "1.3.0",
+  "time": "2026-10-19T00:00:00Z",
+  "endpoint": "https://huggingface.co"
+}
+```
+
+`endpoint` is normalized server-side: it defaults to `https://huggingface.co`
+when no custom endpoint is configured, never ends with a trailing slash, and
+preserves any configured path prefix (for example `https://mirror.example/hf`).
 
 ## Search
 

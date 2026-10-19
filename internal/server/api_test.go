@@ -133,6 +133,32 @@ func TestAPI_Health(t *testing.T) {
 	if v, _ := resp["version"].(string); v == "" {
 		t.Errorf("Expected non-empty version string, got %v", resp["version"])
 	}
+	if got, _ := resp["endpoint"].(string); got != "https://huggingface.co" {
+		t.Errorf("Expected default endpoint https://huggingface.co, got %q", got)
+	}
+}
+
+func TestAPI_HealthCustomEndpoint(t *testing.T) {
+	srv := newTestServerWithConfig(t, Config{
+		CacheDir: t.TempDir(),
+		Endpoint: "https://mirror.example/hf/",
+	})
+
+	req := httptest.NewRequest("GET", "/api/health", nil)
+	w := httptest.NewRecorder()
+	srv.handleHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := resp["endpoint"].(string); got != "https://mirror.example/hf" {
+		t.Errorf("Expected normalized custom endpoint https://mirror.example/hf, got %q", got)
+	}
 }
 
 func TestScanLocalCachedRepos(t *testing.T) {
