@@ -125,6 +125,10 @@ func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 					io.WriteString(w, `[{"type":"file","path":"data.parquet","size":20}]`)
 				case strings.HasSuffix(r.URL.Path, "/refs"):
 					io.WriteString(w, `{"branches":[]}`)
+				case strings.HasSuffix(r.URL.Path, "/auth-check"):
+					// The merged analyzer probes the optional gated-access
+					// endpoint; this fake mirror does not implement it.
+					http.NotFound(w, r)
 				default:
 					t.Errorf("unexpected request: %s", r.URL)
 					http.NotFound(w, r)
@@ -196,6 +200,10 @@ func TestAnalyzeLegacyDatasetFalseDatasetOnly(t *testing.T) {
 			io.WriteString(w, `[{"type":"file","path":"data.parquet","size":20}]`)
 		case strings.HasSuffix(r.URL.Path, "/refs"):
 			io.WriteString(w, `{"branches":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/auth-check"):
+			// Optional gated-access probe: this fake mirror does not
+			// implement it, so analysis stays fail-open.
+			http.NotFound(w, r)
 		default:
 			t.Errorf("unexpected request: %s", r.URL)
 			http.NotFound(w, r)

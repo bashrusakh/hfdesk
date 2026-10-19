@@ -273,7 +273,7 @@ func (s *Server) handleCommunityThread(w http.ResponseWriter, r *http.Request, c
 				// comment degrades to an empty sanitized body.
 				_ = json.Unmarshal(e.Data, &data)
 			}
-			body := renderCommunityCommentHTML(data.Latest.Raw, data.Latest.HTML, baseRaw, baseBlob, readmeEndpointHost(cfg.Endpoint))
+			body := renderCommunityCommentHTML(data.Latest.Raw, data.Latest.HTML, baseRaw, baseBlob, readmeEndpointBase(cfg.Endpoint))
 			edited, hidden := data.Edited, data.Hidden
 			event.BodyHTML = &body
 			event.Edited = &edited

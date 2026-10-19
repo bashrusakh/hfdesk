@@ -52,6 +52,11 @@ function makeNode(extra = {}) {
     style: {},
     dataset: {},
     classList: makeClassList(),
+    attributes: {},
+    tabIndex: 0,
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; },
     handlers: {},
     addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
     appendChild(child) { return child; },
@@ -926,6 +931,63 @@ async function testBaseBlobURLConsumption() {
   match(nodes.get('#readmePreview').innerHTML, /href="https:\/\/huggingface\.co\/owner\/readme\/blob\/main\/config\.json"/, 'missing baseBlobURL derives the blob base');
 }
 
+async function testReadmeFallbackDerivesEndpointWithoutSettings() {
+  resetTest();
+  ui.state.settings = {};
+
+  const endpoint = fixture.pathPrefixedEndpoint;
+  const endpointOrigin = new URL(endpoint).origin;
+
+  // Initial page load or a failed settings fetch leaves no configured endpoint.
+  // A legacy server response has markdown but no html, so the client fallback
+  // must recover the endpoint path prefix from baseBlobURL + the known repo.
+  readmeImpl = () => ({
+    markdown: `[model](${endpoint}/owner/model)\n\n[same-host](${endpointOrigin}/owner/model)`,
+    baseRawURL: fixture.pathPrefixedBaseRawURL,
+    baseBlobURL: fixture.pathPrefixedBaseBlobURL
+  });
+  await ui.loadReadmePreview({ repo: 'owner/model', branch: 'main' });
+
+  const links = extractLinks(nodes.get('#readmePreview').innerHTML);
+  const prefixed = links.find(link => link.href === `${endpoint}/owner/model`);
+  const sameHost = links.find(link => link.href === `${endpointOrigin}/owner/model`);
+  ok(prefixed, 'settings-less fallback renders the prefixed repository link');
+  eq(prefixed.repo, 'owner/model', 'settings-less fallback classifies the prefixed link as owner/model');
+  eq(prefixed.type, 'model', 'settings-less fallback keeps the model type');
+  ok(sameHost, 'settings-less fallback renders the same-host link');
+  eq(sameHost.repo, null, 'same-host link without the endpoint prefix stays external');
+
+  calls = [];
+  const event = clickEvent(fakeAnchor({
+    'data-hf-repo': prefixed.repo,
+    'data-hf-repo-type': prefixed.type
+  }));
+  ui.handleReadmePreviewClick(event);
+  eq(event.defaultPrevented, true, 'settings-less prefixed README link prevents external navigation');
+  await flush();
+  eq(lastAnalyzePath(), '/api/analyze/owner/model?repoType=model', 'settings-less prefixed README link navigates to Model Details');
+
+  // Older server responses omit baseBlobURL. The blob base derived from
+  // baseRawURL must feed the same endpoint recovery, including the dataset
+  // namespace.
+  resetTest();
+  ui.state.settings = {};
+  readmeImpl = () => ({
+    markdown: `[data](${endpoint}/datasets/owner/data)\n\n[same-host](${endpointOrigin}/datasets/owner/data)`,
+    baseRawURL: `${endpoint}/datasets/owner/data/resolve/main/`
+  });
+  await ui.loadReadmePreview({ repo: 'owner/data', branch: 'main', is_dataset: true });
+
+  const datasetLinks = extractLinks(nodes.get('#readmePreview').innerHTML);
+  const datasetLink = datasetLinks.find(link => link.href === `${endpoint}/datasets/owner/data`);
+  const externalDataset = datasetLinks.find(link => link.href === `${endpointOrigin}/datasets/owner/data`);
+  ok(datasetLink, 'derived baseBlobURL still renders the prefixed dataset link');
+  eq(datasetLink.repo, 'owner/data', 'derived baseBlobURL strips the endpoint prefix for datasets');
+  eq(datasetLink.type, 'dataset', 'derived baseBlobURL keeps the dataset type');
+  ok(externalDataset, 'derived baseBlobURL still renders the same-host dataset link');
+  eq(externalDataset.repo, null, 'same-host dataset link without the endpoint prefix stays external');
+}
+
 async function testReadmeFallbackSafety() {
   resetTest();
   const baseRaw = 'https://huggingface.co/owner/readme/resolve/main/';
@@ -1004,6 +1066,7 @@ async function testSearchRowAndDetailHeader() {
   testClassifierAndReservedRoutes();
   await testServerClientEquivalence();
   await testBaseBlobURLConsumption();
+  await testReadmeFallbackDerivesEndpointWithoutSettings();
   await testReadmeFallbackSafety();
   await testSearchRowAndDetailHeader();
   console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);

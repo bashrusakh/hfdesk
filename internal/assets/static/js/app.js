@@ -460,36 +460,52 @@ function configuredHfEndpointURL() {
   }
 }
 
-function configuredHfEndpointHost(fallbackURL = '') {
-  const candidate = String(state.settings?.endpoint || fallbackURL || 'https://huggingface.co').trim();
-  try {
-    return new URL(candidate).host.toLowerCase();
-  } catch (_) {
-    return 'huggingface.co';
-  }
-}
-
-// The configured endpoint may include a path prefix (for example
-// https://mirror.example/hf). Repository links below that prefix are still
-// internal, but a same-host link without the prefix is not. Returns decoded
-// path segments, or null when the configured path cannot be decoded safely.
-function configuredHfEndpointPathSegments() {
-  const raw = String(state.settings?.endpoint || '').trim();
-  if (!raw) return [];
+// Parse one endpoint base into the pieces README link classification needs:
+// the normalized host and the decoded path prefix (for example
+// https://mirror.example/hf). Deriving both from the same base prevents a
+// fallback host from being combined with a different source's path prefix.
+function parseHfEndpointBase(endpointBase) {
+  const raw = String(endpointBase || '').trim() || 'https://huggingface.co';
   let u;
   try {
     u = new URL(raw);
   } catch (_) {
-    return [];
+    return null;
   }
-  const segments = [];
+  const pathPrefix = [];
   for (const part of u.pathname.split('/')) {
     if (!part) continue;
     const decoded = decodeReadmePathSegment(part);
-    if (decoded === null) return null;
-    segments.push(decoded);
+    // Keep the host available so classification fails closed on an unsafe
+    // prefix instead of falling through to a different endpoint.
+    if (decoded === null) return { host: u.host.toLowerCase(), pathPrefix: null };
+    pathPrefix.push(decoded);
   }
-  return segments;
+  return { host: u.host.toLowerCase(), pathPrefix };
+}
+
+// Resolve the effective endpoint for one README render. Settings are
+// authoritative when available. Otherwise the README-derived endpointBase
+// (which preserves any path prefix) is used; direct classifier callers that
+// only provide baseBlobURL keep the host-only fallback behavior.
+function resolveHfEndpoint(endpointBase = '', baseBlobURL = '') {
+  const configured = String(state.settings?.endpoint || '').trim();
+  if (configured) {
+    return parseHfEndpointBase(configured) || parseHfEndpointBase('https://huggingface.co');
+  }
+  const explicit = String(endpointBase || '').trim();
+  if (explicit) {
+    const endpoint = parseHfEndpointBase(explicit);
+    if (endpoint) return endpoint;
+  }
+  const blob = String(baseBlobURL || '').trim();
+  if (blob) {
+    try {
+      const endpoint = parseHfEndpointBase(new URL(blob).origin);
+      if (endpoint) return endpoint;
+    } catch (_) { /* fall through to the default endpoint */ }
+  }
+  return parseHfEndpointBase('https://huggingface.co');
 }
 
 function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
@@ -2077,10 +2093,11 @@ async function loadRepositoryDetails(entry) {
       // string means sanitization removed everything and must stay empty.
       const baseRawURL = readme.baseRawURL || '';
       const baseBlobURL = readme.baseBlobURL || readmeBlobBase(baseRawURL);
+      const endpointBase = readmeEndpointBaseFromBlobURL(baseBlobURL, data.repo, data.is_dataset);
       const hasServerHtml = readme != null && readme.html !== undefined;
       preview.innerHTML = hasServerHtml
         ? readme.html
-        : renderMarkdownPreview(readme.markdown || '', baseRawURL, baseBlobURL);
+        : renderMarkdownPreview(readme.markdown || '', baseRawURL, baseBlobURL, endpointBase);
       section.hidden = !preview.innerHTML.trim();
     } catch (_) {
       if (requestId !== readmeRequestId) return;
@@ -2093,6 +2110,20 @@ async function loadRepositoryDetails(entry) {
   // images resolve against the raw/resolve view.
   function readmeBlobBase(baseRawURL) {
     return String(baseRawURL || '').replace('/resolve/', '/blob/');
+  }
+
+  // Recover the endpoint base (including any configured path prefix) from the
+  // README response's blob base. Newer servers return it directly; older
+  // servers only return baseRawURL, which loadReadmePreview converts first.
+  // The repository suffix is known from the analysis payload.
+  function readmeEndpointBaseFromBlobURL(baseBlobURL, repo, isDataset = false) {
+    const blobBase = String(baseBlobURL || '').trim();
+    if (!blobBase || !isValidReadmeRepo(repo)) return '';
+    const namespace = isDataset ? 'datasets/' : '';
+    const marker = `/${namespace}${repo}/blob/`;
+    const index = blobBase.lastIndexOf(marker);
+    if (index < 0) return '';
+    return blobBase.slice(0, index);
   }
 
   function decodeReadmePathSegment(segment) {
@@ -2134,7 +2165,7 @@ async function loadRepositoryDetails(entry) {
   // server-rendered HTML on the configured endpoint. Only repository roots and
   // a tree view with exactly one revision segment are internal; blob/resolve/raw
   // file URLs and raw multi-segment tree paths stay external.
-  function classifyHfRepoURL(rawURL, baseBlobURL = '') {
+  function classifyHfRepoURL(rawURL, baseBlobURL = '', endpointBase = '') {
     let u;
     try {
       u = new URL(rawURL);
@@ -2142,9 +2173,14 @@ async function loadRepositoryDetails(entry) {
       return null;
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-    if (u.host.toLowerCase() !== configuredHfEndpointHost(baseBlobURL)) return null;
 
-    const endpointPrefix = configuredHfEndpointPathSegments();
+    // Both the host and the path prefix come from one resolved endpoint so a
+    // settings-less fallback cannot mix baseBlobURL's host with an empty
+    // settings prefix.
+    const endpoint = resolveHfEndpoint(endpointBase, baseBlobURL);
+    if (!endpoint || u.host.toLowerCase() !== endpoint.host) return null;
+
+    const endpointPrefix = endpoint.pathPrefix;
     if (endpointPrefix === null) return null;
 
     const segments = [];
@@ -2183,8 +2219,8 @@ async function loadRepositoryDetails(entry) {
     return { repo, repoType, revision };
   }
 
-  function readmeRepoLinkAttributes(url, baseBlobURL) {
-    const link = classifyHfRepoURL(url, baseBlobURL);
+  function readmeRepoLinkAttributes(url, baseBlobURL, endpointBase = '') {
+    const link = classifyHfRepoURL(url, baseBlobURL, endpointBase);
     if (!link) return '';
     let attrs = ` data-hf-repo="${escapeHtmlAttribute(link.repo)}" data-hf-repo-type="${link.repoType}"`;
     if (link.revision) attrs += ` data-hf-repo-revision="${escapeHtmlAttribute(link.revision)}"`;
@@ -2205,7 +2241,7 @@ async function loadRepositoryDetails(entry) {
     openRepositoryInDetails(repo, repoType, revision, 'push');
   }
 
-  function renderMarkdownPreview(markdown, baseRawURL, baseBlobURL) {
+  function renderMarkdownPreview(markdown, baseRawURL, baseBlobURL, endpointBase = '') {
     if (!markdown) return '';
 
     let text = markdown
@@ -2221,7 +2257,7 @@ async function loadRepositoryDetails(entry) {
 
     const flushParagraph = () => {
       if (!paragraph.length) return;
-      html.push(`<p>${renderMarkdownInline(paragraph.join(' '), baseBlobURL)}</p>`);
+      html.push(`<p>${renderMarkdownInline(paragraph.join(' '), baseBlobURL, endpointBase)}</p>`);
       paragraph = [];
     };
 
@@ -2257,13 +2293,13 @@ async function loadRepositoryDetails(entry) {
       if (heading) {
         flushParagraph();
         const level = Math.min(heading[1].length + 3, 6);
-        html.push(`<h${level}>${renderMarkdownInline(heading[2], baseBlobURL)}</h${level}>`);
+        html.push(`<h${level}>${renderMarkdownInline(heading[2], baseBlobURL, endpointBase)}</h${level}>`);
         continue;
       }
 
       if (/^[-*]\s+/.test(line)) {
         flushParagraph();
-        html.push(`<p class="readme-bullet">${renderMarkdownInline(line.replace(/^[-*]\s+/, ''), baseBlobURL)}</p>`);
+        html.push(`<p class="readme-bullet">${renderMarkdownInline(line.replace(/^[-*]\s+/, ''), baseBlobURL, endpointBase)}</p>`);
         continue;
       }
 
@@ -2274,7 +2310,7 @@ async function loadRepositoryDetails(entry) {
     return html.join('');
   }
 
-  function renderMarkdownInline(text, baseBlobURL) {
+  function renderMarkdownInline(text, baseBlobURL, endpointBase = '') {
     let html = escapeHtml(text);
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -2284,7 +2320,7 @@ async function loadRepositoryDetails(entry) {
       // identical to the server renderer instead of double-escaping "&".
       const url = resolveReadmeURL(decodeHtmlEntities(href), baseBlobURL);
       if (!isSafeReadmeLinkURL(url)) return label;
-      const internalAttrs = readmeRepoLinkAttributes(url, baseBlobURL);
+      const internalAttrs = readmeRepoLinkAttributes(url, baseBlobURL, endpointBase);
       return `<a href="${escapeHtmlAttribute(url)}" target="_blank" rel="noopener"${internalAttrs}>${label}</a>`;
     });
     return html;
