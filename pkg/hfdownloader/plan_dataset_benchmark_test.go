@@ -90,7 +90,7 @@ func BenchmarkPlanRepoDatasetRootDefaultInventory(b *testing.B) {
 			files[0] = hfNode{Type: "file", Path: "records.parquet", Size: 10}
 			want[0] = "records.parquet"
 			for i := 1; i < len(files); i++ {
-				name := fmt.Sprintf("records-%05d.json", i-1)
+				name := fmt.Sprintf("records-%05d.parquet", i-1)
 				files[i] = hfNode{Type: "file", Path: name, Size: 10}
 				want[i] = name
 			}

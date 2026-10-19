@@ -102,15 +102,16 @@ Important response fields:
       "files": ["model-Q4_K_M.gguf"]
     }
   ],
-  "recommended_filters": ["q4_k_m"],
+  "recommended_filters": ["./model-Q4_K_M.gguf"],
   "recommended_download": {
     "repo": "owner/name",
-    "filters": ["q4_k_m"]
+    "filters": ["./model-Q4_K_M.gguf"],
+    "exactMatch": true
   }
 }
 ```
 
-`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
+`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset.
 
 ### Model/dataset selection
 
@@ -456,15 +457,17 @@ response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
 destination-prefix fields.
 
-The public Go planning contract is broader. `hfdownloader.PlanItem`, returned by
-`PlanRepo` and delivered to `Settings.OnPlanComplete`, also exposes
-`DestinationSubdir` (`destinationSubdir`) and `Subdir` (`subdir`).
-`DestinationSubdir` is the candidate relative prefix selected by the matched
-filter; it is populated independently of `appendFilterSubdir`, and the
-downloader applies it only when that job flag is enabled, so Go consumers must
-check the flag before combining it with `RelativePath`. `Subdir` is the matched
-filter attribution. `ScanPlan` preview events and the `/api/plan` response
-remain repository-relative.
+The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
+`*Plan` whose `Items` are `PlanItem`s; the same `Plan` value is passed to
+`Settings.OnPlanComplete`. A `PlanItem` also exposes `DestinationSubdir`
+(`destinationSubdir`) and `Subdir` (`subdir`). `DestinationSubdir` is the
+candidate relative prefix selected by the matched filter; it is populated
+independently of `appendFilterSubdir`, and the downloader applies it only when
+that job flag is enabled, so Go consumers must check the flag before combining
+it with `RelativePath`. `Subdir` is the matched-filter attribution where
+applicable; it can be empty for ordinary non-LFS model files whose destination
+remains repository-relative. `ScanPlan` preview events and the `/api/plan`
+response remain repository-relative.
 
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with
