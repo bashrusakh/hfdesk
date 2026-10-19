@@ -12,10 +12,10 @@
   const state = {
     jobs: new Map(),
     settings: {},
-    // serverEndpoint is the effective configured HF endpoint reported by
-    // /api/health at startup. It covers the window before /api/settings
-    // resolves (or when that fetch fails) so endpoint-dependent UI never has to
-    // guess https://huggingface.co.
+    // serverEndpoint is the effective configured HF endpoint last reported by
+    // /api/health at startup or by a successful /api/settings load. It covers
+    // the window before /api/settings resolves (or when that fetch fails), and
+    // settings overwrite it so a changed or default endpoint never goes stale.
     serverEndpoint: '',
     wsConnected: false,
     ws: null,
@@ -473,6 +473,16 @@ function configuredHfEndpointURL() {
   } catch (_) {
     return raw.replace(/\/+$/, '');
   }
+}
+
+// rememberSettingsEndpoint records the endpoint from a successful settings
+// response. Settings are authoritative: a custom endpoint replaces the startup
+// /api/health value, and the default (empty) preference records the public Hub.
+// That keeps the remembered value from going stale after a settings change and
+// makes the default endpoint known even when health failed or returned none.
+function rememberSettingsEndpoint(settings) {
+  const configured = String(settings?.endpoint || '').trim();
+  state.serverEndpoint = configured || 'https://huggingface.co';
 }
 
 // Parse one endpoint base into the pieces README link classification needs:
@@ -2714,6 +2724,7 @@ async function loadRepositoryDetails(entry) {
       // Keep the route map available to the download/quant modals, which can be
       // opened from the Models page without visiting Settings first.
       state.settings = s;
+      rememberSettingsEndpoint(s);
       if (currentSelectedRepo) {
         syncModelsDetailHeader(currentSelectedRepo, currentSelectedIsDataset, currentSelectedBranch);
       }
@@ -4420,6 +4431,7 @@ async function loadRepositoryDetails(entry) {
     }
     state.settings = data;
     state.settingsLoadFailed = false;
+    rememberSettingsEndpoint(data);
     // Settings are authoritative for the configured endpoint, so refresh the
     // Model Details Hub action when they (re)load after a repository was
     // already selected.

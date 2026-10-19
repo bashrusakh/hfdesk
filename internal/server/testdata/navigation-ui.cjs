@@ -82,7 +82,7 @@ for (const selector of [
   '#modalBody', '#modalBackdrop', '#modalClose', '#toastContainer', '#modelsSpinner',
   '#modelsResultList', '#modelsSearchClear', '#modelsSortSelect',
   '#modelsTypeSelect', '#modelsGguf', '#modelsDatasets', '#scrollArrowUp',
-  '#scrollArrowDown'
+  '#scrollArrowDown', '#storageModeBadge'
 ]) {
   nodes.set(selector, makeNode());
 }
@@ -134,6 +134,7 @@ let calls = [];
 let analyzeImpl = defaultAnalyze;
 let readmeImpl = () => ({ html: '<p>readme</p>' });
 let healthImpl = () => ({ status: 'ok', version: 'test', endpoint: fixture.endpoint });
+let settingsImpl = () => ({ endpoint: fixture.endpoint });
 
 function parseAnalyzePath(rawPath) {
   const u = new URL(rawPath, 'https://hfdesk.test');
@@ -210,6 +211,7 @@ const context = {
   fetch: async (rawPath) => {
     calls.push(rawPath);
     if (rawPath === '/api/health') return okResponse(await healthImpl());
+    if (rawPath === '/api/settings') return okResponse(await settingsImpl());
     if (rawPath.startsWith('/api/analyze/')) return okResponse(await analyzeImpl(rawPath));
     if (rawPath.startsWith('/api/readme/')) return okResponse(await readmeImpl(rawPath));
     if (rawPath.startsWith('/api/cache/')) return notFoundResponse();
@@ -238,6 +240,7 @@ const hook = `
     loadReadmePreview,
     handleReadmePreviewClick,
     loadAppVersion,
+    loadStorageModeBadge,
     renderRelatedDownloads,
     analyzeRelatedRepo: window.analyzeRelatedRepo,
     selectAnalysisType: window.selectAnalysisType,
@@ -292,6 +295,7 @@ function resetTest() {
   analyzeImpl = defaultAnalyze;
   readmeImpl = () => ({ html: '<p>readme</p>' });
   healthImpl = () => ({ status: 'ok', version: 'test', endpoint: fixture.endpoint });
+  settingsImpl = () => ({ endpoint: fixture.endpoint });
   ui.state.settings = { endpoint: fixture.endpoint };
   ui.state.settingsLoadFailed = false;
   ui.state.serverEndpoint = '';
@@ -1294,6 +1298,52 @@ async function testDetailHeaderEndpointFromHealth() {
   eq(ui.getDetailHeader().hidden, false, 'default health endpoint reveals the dataset Hub action');
 }
 
+async function testDetailHeaderEndpointFromSettings() {
+  const customEndpoint = 'https://hf.example.test';
+
+  // A custom endpoint arrived from /api/health, then a settings load reports
+  // the default (empty) endpoint. The stale health value must not keep driving
+  // the Hub action.
+  resetTest();
+  ui.state.settings = {};
+  ui.state.settingsLoadFailed = true;
+  healthImpl = () => ({ status: 'ok', version: 'test', endpoint: customEndpoint });
+  settingsImpl = () => ({ endpoint: '' });
+
+  await ui.openRepositoryInDetails('owner/model', 'model', null, 'push');
+  await ui.loadAppVersion();
+  await flush();
+  eq(ui.getDetailHeader().href, `${customEndpoint}/owner/model`, 'health endpoint drives the Hub action before settings load');
+
+  await ui.loadStorageModeBadge();
+  await flush();
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/model', 'default settings endpoint replaces the stale health endpoint');
+  eq(ui.getDetailHeader().hidden, false, 'default settings endpoint keeps the Hub action visible');
+  ok(!/hf\.example\.test/.test(ui.getDetailHeader().href), 'stale custom health endpoint no longer drives the Hub action');
+
+  // Health failed or returned no endpoint, then a settings load reports the
+  // default endpoint. The default is known, so the action must appear instead
+  // of staying hidden.
+  resetTest();
+  ui.state.settings = {};
+  ui.state.settingsLoadFailed = true;
+  healthImpl = () => ({ status: 'ok', version: 'test', endpoint: '' });
+  settingsImpl = () => ({ endpoint: '' });
+
+  await ui.openRepositoryInDetails('owner/model', 'model', null, 'push');
+  await flush();
+  eq(ui.getDetailHeader().hidden, true, 'Hub action stays hidden while the endpoint is unknown');
+
+  await ui.loadAppVersion();
+  await flush();
+  eq(ui.getDetailHeader().hidden, true, 'empty health endpoint leaves the Hub action hidden');
+
+  await ui.loadStorageModeBadge();
+  await flush();
+  eq(ui.getDetailHeader().hidden, false, 'default settings endpoint reveals the Hub action');
+  eq(ui.getDetailHeader().href, 'https://huggingface.co/owner/model', 'default settings endpoint supplies the Hub href');
+}
+
 async function testNavigationPreservesCommunityPanel() {
   resetTest();
 
@@ -1345,6 +1395,7 @@ async function testNavigationPreservesCommunityPanel() {
   await testReadmeFallbackSafety();
   await testSearchRowAndDetailHeader();
   await testDetailHeaderEndpointFromHealth();
+  await testDetailHeaderEndpointFromSettings();
   await testNavigationPreservesCommunityPanel();
   console.log(`PASS: ${assertions} navigation/history/classifier assertions against real app.js`);
 })().catch(error => {
