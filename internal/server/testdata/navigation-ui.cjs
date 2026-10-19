@@ -59,7 +59,11 @@ function makeNode(extra = {}) {
     getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; },
     handlers: {},
     addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
-    appendChild(child) { return child; },
+    appendChild(child) {
+      const html = child && (child.innerHTML || child.textContent || '');
+      if (html) this.innerHTML = String(this.innerHTML || '') + html;
+      return child;
+    },
     remove() {},
     focus() {},
     scrollTo() {},
@@ -74,7 +78,7 @@ for (const selector of [
   '#analyzeInput', '#analyzeBtn', '#analyzeResult', '#modelsDetailHeader',
   '#modelsDetailRepo', '#modelsDetailHFLink', '#modelsDetailBack',
   '#modelsDetailForward', '#readmeSection', '#readmePreview', '#modalTitle',
-  '#modalBody', '#modalBackdrop', '#toastContainer', '#modelsSpinner',
+  '#modalBody', '#modalBackdrop', '#modalClose', '#toastContainer', '#modelsSpinner',
   '#modelsResultList', '#modelsSearchClear', '#modelsSortSelect',
   '#modelsTypeSelect', '#modelsGguf', '#modelsDatasets', '#scrollArrowUp',
   '#scrollArrowDown'
@@ -100,7 +104,8 @@ function makeCreatedNode() {
 const document = {
   readyState: 'loading',
   body: makeNode(),
-  addEventListener() {},
+  handlers: {},
+  addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
   createElement() { return makeCreatedNode(); },
   querySelector(selector) { return nodes.get(selector) || null; },
   querySelectorAll() { return []; },
@@ -217,8 +222,22 @@ const hook = `
     selectAnalysisType: window.selectAnalysisType,
     modelsSelectRow: window.modelsSelectRow,
     initModelsPage,
+    initModal,
+    reopenRevisionPicker: window.reopenRevisionPicker,
+    showRevisionPickerFromAnalysis: window.showRevisionPickerFromAnalysis,
     readmeReservedRoutes: () => Array.from(README_RESERVED_MODEL_ROUTES),
     getCurrentAnalysis: () => currentAnalysis,
+    getSelectionState: () => ({
+      repo: currentSelectedRepo,
+      type: currentSelectedType,
+      isDataset: currentSelectedIsDataset,
+      branch: currentSelectedBranch
+    }),
+    getModal: () => ({
+      active: $('#modalBackdrop')?.classList.contains('active') || false,
+      title: $('#modalTitle')?.textContent || '',
+      body: $('#modalBody')?.innerHTML || ''
+    }),
     getDetailHeader: () => ({
       repo: $('#modelsDetailRepo')?.textContent || '',
       href: $('#modelsDetailHFLink')?.href || '',
@@ -233,6 +252,7 @@ const hook = `
       currentSelectedBranch = 'main';
       hasShownRevisionPicker = false;
       revisionPickerNavigationMode = 'replace';
+      revisionPickerCancelHandler = null;
       repoHistory = [];
       repoHistoryIndex = -1;
       syncRepoHistoryButtons();
@@ -243,6 +263,7 @@ source = source.replace(marker, hook + '\n' + marker);
 vm.runInNewContext(source, context);
 const ui = window.test;
 ui.initModelsPage();
+ui.initModal();
 
 function resetTest() {
   ui.resetNavigation();
@@ -261,10 +282,17 @@ function resetTest() {
   nodes.get('#modelsDetailForward').disabled = true;
   nodes.get('#modalBackdrop').classList.remove('active');
   nodes.get('#modalBody').innerHTML = '';
+  nodes.get('#modalTitle').textContent = '';
 }
 
 async function flush() {
   for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+}
+
+function pressEscape() {
+  const handlers = document.handlers.keydown || [];
+  ok(handlers.length > 0, 'Escape keydown listener must be registered');
+  handlers.forEach(handler => handler({ key: 'Escape' }));
 }
 
 function analyzePaths() {
@@ -683,6 +711,156 @@ async function testRefreshPendingRevisionPicker() {
   eq(ui.historyIndex(), 1, 'refresh keeps the pending entry current');
 }
 
+async function testCancelInitialRevisionPickerWithCloseButton() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    return data;
+  };
+
+  // A resolved view, then a pending navigation whose repository has multiple
+  // refs: the real picker opens and loadRepositoryDetails returns with the pane
+  // still showing its loading spinner.
+  await ui.openRepositoryInDetails('owner/previous', 'model', 'main', 'push');
+  await ui.openRepositoryInDetails('owner/pending', 'model', null, 'push');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', null]],
+    'pending picker navigation pushes one unresolved stop'
+  );
+  eq(ui.historyIndex(), 1, 'the pending picker entry is current');
+  eq(ui.getModal().active, true, 'multiple refs open the revision picker');
+  match(nodes.get('#analyzeResult').innerHTML, /Analyzing owner\/pending/, 'picker navigation leaves the pane loading before cancel');
+
+  // The real X close path.
+  click('#modalClose');
+  eq(ui.getModal().active, false, 'the X button closes the picker modal');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#analyzeResult').innerHTML), 'cancel replaces the indefinite loading state');
+  match(nodes.get('#analyzeResult').innerHTML, /Select a revision/, 'cancel renders an explicit pending prompt');
+  match(nodes.get('#analyzeResult').innerHTML, /reopenRevisionPicker\(\)/, 'the pending prompt can reopen the picker');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', null]],
+    'cancel keeps the previous stop and the pending stop'
+  );
+  eq(ui.historyIndex(), 1, 'cancel keeps the pending stop current');
+  eq(ui.currentRepoHistoryEntry().repo, 'owner/pending', 'the current history entry is still the pending repository');
+  eq(ui.getDetailHeader().repo, 'owner/pending', 'the header agrees with the pending history entry');
+  eq(nodes.get('#modelsDetailBack').disabled, false, 'Back stays enabled with a previous stop');
+  eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward stays disabled at the latest pending stop');
+  deepEq(
+    { ...ui.getSelectionState() },
+    { repo: 'owner/pending', type: 'model', isDataset: false, branch: null },
+    'cancel leaves no revision selected while the pending repository/type stay resolved'
+  );
+
+  // Reopen from the pending prompt and use the default action, which must resolve
+  // the pending stop rather than be mistaken for another cancel.
+  ui.reopenRevisionPicker();
+  eq(ui.getModal().active, true, 'the pending prompt reopens the picker');
+  match(ui.getModal().body, /data-revision="dev"/, 'the reopened picker lists the revisions again');
+  window.selectRevision('main', false, 'owner/pending');
+  await flush();
+  eq(ui.getModal().active, false, 'selecting a revision closes the picker');
+  deepEq(
+    historyTuples(),
+    [['owner/previous', 'model', 'main'], ['owner/pending', 'model', 'main']],
+    'the reopened default action refines the pending stop without cancelling it'
+  );
+  eq(ui.historyIndex(), 1, 'selection keeps the refined stop current');
+  eq(ui.currentRepoHistoryEntry().revision, 'main', 'the pending stop resolves to the selected revision');
+  eq(ui.getCurrentAnalysis().branch, 'main', 'the selected revision is rendered');
+  match(nodes.get('#analyzeResult').innerHTML, /onclick="showRevisionPickerFromAnalysis\(\)"/, 'the resolved view is no longer pending');
+  eq(nodes.get('#modelsDetailBack').disabled, false, 'Back stays enabled after resolving the pending stop');
+  eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward stays disabled after resolving the pending stop');
+}
+
+async function testCancelInitialRevisionPickerWithEscape() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    if (data.repo === 'owner/solo') {
+      data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    }
+    return data;
+  };
+
+  // No previous history entry: the pending state itself must stay coherent.
+  nodes.get('#analyzeInput').value = 'owner/solo';
+  await ui.analyzeRepo();
+  deepEq(historyTuples(), [['owner/solo', null, null]], 'auto-detected picker navigation starts as one untyped pending stop');
+  eq(ui.getModal().active, true, 'auto-detected multiple refs open the picker');
+
+  pressEscape();
+  eq(ui.getModal().active, false, 'Escape closes the picker modal');
+  ok(!/loading-state|Analyzing/.test(nodes.get('#analyzeResult').innerHTML), 'Escape replaces the indefinite loading state');
+  match(nodes.get('#analyzeResult').innerHTML, /Select a revision/, 'Escape renders the explicit pending prompt');
+  deepEq(
+    historyTuples(),
+    [['owner/solo', 'model', null]],
+    'cancel refines the pending stop with the namespace resolved by auto-detection'
+  );
+  eq(ui.historyIndex(), 0, 'the only pending stop stays current');
+  eq(nodes.get('#modelsDetailBack').disabled, true, 'Back is disabled without a previous stop');
+  eq(nodes.get('#modelsDetailForward').disabled, true, 'Forward is disabled without a forward branch');
+  eq(ui.getDetailHeader().repo, 'owner/solo', 'the header identifies the pending repository without a previous view');
+  deepEq(
+    { ...ui.getSelectionState() },
+    { repo: 'owner/solo', type: 'model', isDataset: false, branch: null },
+    'the pending selection state agrees with the resolved type and missing revision'
+  );
+
+  ui.reopenRevisionPicker();
+  eq(ui.getModal().active, true, 'the pending prompt reopens the picker with no previous history entry');
+  window.selectRevision('dev', false, 'owner/solo');
+  await flush();
+  deepEq(
+    historyTuples(),
+    [['owner/solo', 'model', 'dev']],
+    'selection resolves the single pending stop instead of adding a duplicate'
+  );
+  eq(ui.historyIndex(), 0, 'the resolved stop remains current');
+  eq(ui.getCurrentAnalysis().branch, 'dev', 'the selected revision is rendered');
+}
+
+async function testCancelAnalysisRevisionPickerKeepsRenderedView() {
+  resetTest();
+  analyzeImpl = (rawPath) => {
+    const data = defaultAnalyze(rawPath);
+    data.refs = [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }];
+    return data;
+  };
+  await ui.openRepositoryInDetails('owner/model', 'model', 'main', 'push');
+
+  const rendered = nodes.get('#analyzeResult').innerHTML;
+  const renderedHistory = historyTuples();
+  const renderedHeader = ui.getDetailHeader();
+  ok(rendered.includes('showRevisionPickerFromAnalysis'), 'the rendered analysis exposes the change-revision action');
+
+  // X close path of a picker opened from a rendered analysis.
+  window.showRevisionPickerFromAnalysis();
+  eq(ui.getModal().active, true, 'the rendered analysis reopens the picker');
+  click('#modalClose');
+  eq(ui.getModal().active, false, 'the X button closes the analysis picker');
+  deepEq(historyTuples(), renderedHistory, 'cancelling the analysis picker adds no history stop and rolls nothing back');
+  eq(ui.historyIndex(), 0, 'cancelling the analysis picker keeps the rendered stop current');
+  eq(ui.getCurrentAnalysis().branch, 'main', 'cancelling the analysis picker keeps the rendered revision');
+  eq(ui.getDetailHeader().repo, renderedHeader.repo, 'cancelling the analysis picker keeps the header unchanged');
+  eq(nodes.get('#analyzeResult').innerHTML, rendered, 'cancelling the analysis picker keeps the rendered view unchanged');
+  ok(!/Select a revision|loading-state/.test(nodes.get('#analyzeResult').innerHTML), 'cancelling the analysis picker renders neither a pending prompt nor a spinner');
+
+  // Escape close path behaves the same way.
+  window.showRevisionPickerFromAnalysis();
+  eq(ui.getModal().active, true, 'the rendered analysis picker reopens after cancel');
+  pressEscape();
+  eq(ui.getModal().active, false, 'Escape closes the analysis picker');
+  deepEq(historyTuples(), renderedHistory, 'Escape on the analysis picker adds no history stop');
+  eq(ui.historyIndex(), 0, 'Escape on the analysis picker keeps the rendered stop current');
+  eq(ui.getCurrentAnalysis().branch, 'main', 'Escape on the analysis picker keeps the rendered revision');
+  eq(nodes.get('#analyzeResult').innerHTML, rendered, 'Escape on the analysis picker keeps the rendered view unchanged');
+}
+
 async function testRevisionChangeFromRenderedAnalysis() {
   resetTest();
   analyzeImpl = (rawPath) => {
@@ -1060,6 +1238,9 @@ async function testSearchRowAndDetailHeader() {
   await testSameRepoRootKeepsRevisionStop();
   await testSameRepoRootLinkKeepsResolvedRevision();
   await testRefreshPendingRevisionPicker();
+  await testCancelInitialRevisionPickerWithCloseButton();
+  await testCancelInitialRevisionPickerWithEscape();
+  await testCancelAnalysisRevisionPickerKeepsRenderedView();
   await testRevisionChangeFromRenderedAnalysis();
   await testRefreshInFlightNavigation();
   testClassifierAndReservedRoutes();

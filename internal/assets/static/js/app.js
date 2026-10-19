@@ -400,6 +400,10 @@ let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
 // The initial picker refines the pending navigation entry. A picker reopened
 // from a rendered analysis is a view transition that keeps the current stop.
 let revisionPickerNavigationMode = 'replace';
+// Cancel hook for the initial (pending) revision picker only. hideModal runs
+// it, while selection and any other modal clear it, so closing an unrelated
+// dialog can never roll back or render a pending navigation.
+let revisionPickerCancelHandler = null;
 let currentSelectedRepo = null;
 // Explicit type of the selected repo. null means the type is not known yet
 // (auto-detect), so a header refresh must not force model or dataset.
@@ -1606,6 +1610,11 @@ async function loadRepositoryDetails(entry) {
   // view that must remain in history.
   function showRevisionPicker(data, navigationMode = 'replace') {
     revisionPickerNavigationMode = navigationMode;
+    // The initial picker refines the pending entry that navigation already
+    // pushed/replaced. A picker reopened from a rendered analysis is a view
+    // transition, so closing it must not touch that rendered view.
+    const requestId = analyzeRequestId;
+    const cancelOnClose = navigationMode !== 'push';
     const branches = data.refs.filter(r => r.type === 'branch');
     const tags = data.refs.filter(r => r.type === 'tag');
     const revisionAttrs = (revision) =>
@@ -1659,15 +1668,70 @@ async function loadRepositoryDetails(entry) {
       ${branchesHtml}
       ${tagsHtml}
       <div class="form-actions" style="margin-top: 20px;">
-        <button class="btn btn-ghost" ${revisionAttrs('main')} onclick="hideModal(); selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)">Use default (main)</button>
+        <button class="btn btn-ghost" ${revisionAttrs('main')} onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)">Use default (main)</button>
       </div>
     `);
+    // showModal clears this hook; arm it only for the initial pending picker.
+    revisionPickerCancelHandler = cancelOnClose
+      ? () => cancelPendingRevisionPicker(data, requestId)
+      : null;
   }
+
+  // Closing the initial picker must not leave the pane on its loading spinner.
+  // Keep the pending history stop explicit instead: the header and selection
+  // state identify the repository, the pane prompts for a revision, and the
+  // prompt can reopen the same picker under the same 'replace' navigation.
+  function cancelPendingRevisionPicker(data, requestId) {
+    if (requestId !== analyzeRequestId || !data?.repo) return;
+    const repoType = data.is_dataset ? 'dataset' : 'model';
+    const entry = currentRepoHistoryEntry();
+    if (!entry || entry.repo !== data.repo || entry.revision) return;
+    if (entry.repoType && entry.repoType !== repoType) return;
+
+    replaceRepoHistoryEntry(makeRepoHistoryEntry(data.repo, repoType, null));
+    currentAnalysis = data;
+    currentSelectedRepo = data.repo;
+    currentSelectedType = repoType;
+    currentSelectedIsDataset = !!data.is_dataset;
+    // No revision is selected while the picker is pending.
+    currentSelectedBranch = null;
+    syncModelsDetailHeader(data.repo, !!data.is_dataset, null);
+    detailActiveTab = 'overview';
+    renderDetailTabs(false);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (resultDiv) {
+      const typeLabel = data.is_dataset ? 'dataset' : 'model';
+      resultDiv.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+            </svg>
+          </div>
+          <h3 id="revisionPendingTitle" tabindex="-1">Select a revision</h3>
+          <p>${escapeHtml(data.repo)} has multiple versions. No revision is selected for this ${typeLabel} yet.</p>
+          <button type="button" class="btn btn-primary" onclick="reopenRevisionPicker()">Choose revision</button>
+        </div>
+      `;
+    }
+    updateScrollArrows();
+  }
+
+  // Reopen the initial picker from its explicit pending prompt.
+  window.reopenRevisionPicker = function() {
+    const data = currentAnalysis;
+    if (!data?.refs || data.refs.length <= 1) return;
+    revisionPickerNavigationMode = 'replace';
+    showRevisionPicker(data, 'replace');
+  };
 
   // Pending picker selections refine the entry created by the initial
   // navigation. Picker selections made from a rendered analysis push a new
   // stop so the previous revision remains reachable with Back.
   window.selectRevision = function(revision, isDataset, repoOverride = null) {
+    // Selection is not cancellation: disarm the pending-picker hook first.
+    revisionPickerCancelHandler = null;
     hideModal();
     const repo = repoOverride || currentAnalysis?.repo || currentSelectedRepo || null;
     const navigationMode = revisionPickerNavigationMode;
@@ -5236,6 +5300,8 @@ async function loadRepositoryDetails(entry) {
   // =========================================
 
   function showModal(title, content) {
+    // Opening any modal supersedes a pending revision-picker close hook.
+    revisionPickerCancelHandler = null;
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = content;
     $('#modalBackdrop').classList.add('active');
@@ -5246,7 +5312,11 @@ async function loadRepositoryDetails(entry) {
   }
 
   function hideModal() {
+    // Run the scoped cancel hook exactly once, after the dialog is closed.
+    const cancel = revisionPickerCancelHandler;
+    revisionPickerCancelHandler = null;
     $('#modalBackdrop').classList.remove('active');
+    if (cancel) cancel();
   }
 
   // Expose hideModal globally for onclick handlers
