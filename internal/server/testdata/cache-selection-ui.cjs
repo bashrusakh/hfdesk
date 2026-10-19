@@ -153,22 +153,28 @@ const paths = Array.from({ length: 25 }, (_, i) => `family/file-${i}.gguf`);
 currentSelection = {
   repo: 'org/model', type: 'model', locations: [
     { id: 'loc-1', source: 'Local', path: '/scan/one/"archive"', canDelete: true, groups: [
-      { id: 'grp-1', label: 'same-q-family-a', quant: 'Q4_K_M', canDelete: true, members: paths.map(path => ({ path, size: 4 })) },
-      { id: 'grp-2', label: 'model.gguf', canDelete: true, members: [{ path: 'model.gguf', size: 0, linkOnly: true, message: 'Only this link; weights remain' }] },
+      { id: 'grp-1', label: 'same-q-family-a', kind: 'llm', quant: 'Q4_K_M', canDelete: true, members: paths.map(path => ({ path, size: 4 })) },
+      { id: 'grp-2', label: 'model.gguf', kind: 'llm', canDelete: true, members: [{ path: 'model.gguf', size: 0, linkOnly: true, message: 'Only this link; weights remain' }] },
       ...['family-b', 'family-c', 'family-d', 'family-e'].map((name, index) => ({
-        id: `grp-${index + 3}`, label: `same Q4 family ${name}`, quant: 'Q4_K_M', canDelete: index !== 0, warning: index === 0 ? 'Could not verify this exact group' : '', members: [{ path: index === 0 ? 'bad/<img src=x onerror=alert(1)>.gguf' : `${name}/model.gguf`, size: 8 }]
+        id: `grp-${index + 3}`, label: `same Q4 family ${name}`, kind: 'llm', quant: 'Q4_K_M', canDelete: index !== 0, warning: index === 0 ? 'Could not verify this exact group' : '', members: [{ path: index === 0 ? 'bad/<img src=x onerror=alert(1)>.gguf' : `${name}/model.gguf`, size: 8 }]
       })),
-      { id: 'grp-split', label: 'split Q5 family', quant: 'Q5_K_M', canDelete: true, members: [
+      { id: 'grp-split', label: 'split Q5 family', kind: 'llm', quant: 'Q5_K_M', canDelete: true, members: [
         { path: 'parts/model-00001-of-00002.gguf', size: 9 },
         { path: 'parts/model-00002-of-00002.gguf', size: 9 }
-      ] }
+      ] },
+      { id: 'grp-mmproj-f16', label: 'mmproj-F16.gguf', kind: 'vision_encoder', canDelete: true, members: [{ path: 'mmproj-F16.gguf', size: 12 }] },
+      { id: 'grp-mmproj-bf16', label: 'mmproj-BF16.gguf', kind: 'vision_encoder', canDelete: true, members: [{ path: 'mmproj-BF16.gguf', size: 12 }] },
+      { id: 'grp-mmproj-f32', label: 'mmproj-F32.gguf', kind: 'vision_encoder', canDelete: true, members: [{ path: 'mmproj-F32.gguf', size: 12 }] }
     ] },
     { id: 'loc-2', source: 'HF cache', path: '/cache/hub/org--model', canDelete: true, groups: [
-      { id: 'grp-hf', label: 'same-q-family-b', quant: 'Q4_K_M', canDelete: true, members: [
+      { id: 'grp-hf', label: 'same-q-family-b', kind: 'llm', quant: 'Q4_K_M', canDelete: true, members: [
         { path: 'model-00001-of-00002.gguf', versions: ['commit-a'], size: 5 },
         { path: 'model-00001-of-00002.gguf', versions: ['commit-b'], size: 5 },
         { path: 'model-00002-of-00002.gguf', versions: ['commit-a'], size: 5 },
         { path: 'model-00002-of-00002.gguf', versions: ['commit-b'], size: 5 }
+      ] },
+      { id: 'grp-hf-mmproj', label: 'mmproj-F32.gguf', kind: 'vision_encoder', canDelete: true, members: [
+        { path: 'mmproj-F32.gguf', versions: ['commit-a'], size: 6 }
       ] }
     ] }
   ]
@@ -178,7 +184,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
 (async () => {
   await window.test.showCacheDetails('org/model', 'model');
   assert(calls.some(call => call.path === '/api/cache/org%2Fmodel?type=model'));
-  assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 7);
+  assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 10);
   assert(modalHTML.includes('/scan/one') && modalHTML.includes('Could not verify this exact group'));
   assert(modalHTML.includes('title="/scan/one/&quot;archive&quot;"'), 'quoted path is safe in the selector title');
   assert(modalHTML.includes('model.gguf') && modalHTML.includes('Only this link; weights remain'));
@@ -200,6 +206,8 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('commit-a') && modalHTML.includes('commit-b'));
   assert(modalHTML.includes('model-00002-of-00002.gguf'));
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 0, 'backend-advertised HF group action is enabled');
+  assert.equal((modalHTML.match(/cache-badge-vision-encoder/g) || []).length, 1, 'the HF companion group renders its own badge');
+  assert.equal((modalHTML.match(/class="cache-badge">Q4_K_M<\/span>/g) || []).length, 1, 'the HF llm group keeps its model-quant badge');
 
   // HF confirmation groups four stored entries into two distinct paths and
   // names both saved versions without turning versions into extra shards.
@@ -211,6 +219,9 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal((hfConfirmation.match(/model-00002-of-00002\.gguf/g) || []).length, 1);
   assert(hfConfirmation.includes('Saved versions (2): commit-a, commit-b'));
   assert(!/<input[^>]*commit|<select[^>]*commit/i.test(hfConfirmation), 'HF confirmation does not offer revision input');
+  assert(hfConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
+  assert(!hfConfirmation.includes('Vision encoder'), 'an llm versioned confirmation does not claim a vision-encoder role');
+  assert(hfConfirmation.includes('This removes this GGUF group from all saved versions in this selected location. Other groups and other locations remain.'), 'the llm versioned scope statement is unchanged');
   const hfDeleteCount = deletedBodies.length;
   await cancelButton(hfSequence).click();
   assert.equal(deletedBodies.length, hfDeleteCount, 'HF confirmation Cancel sends no mutation');
@@ -233,6 +244,18 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('shared payloads were retained'));
   assert(modalHTML.includes('Shared weight payloads retained because other saved entries still reference them'));
   assert(modalHTML.includes('shared-blob-abc123') && modalHTML.includes('No freed-space amount is implied'));
+
+  // A companion in the HF cache names its role for the versioned case too.
+  await window.test.showCacheDetails('org/model', 'model', 'loc-2');
+  const versionedCompanionSequence = await startGroupConfirmation(0);
+  const versionedCompanionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
+  assert(versionedCompanionConfirmation.includes('Vision encoder (mmproj companion):'), 'the versioned companion confirmation names the vision-encoder role');
+  assert(versionedCompanionConfirmation.includes('This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'), 'the versioned companion scope statement names the role');
+  assert(!versionedCompanionConfirmation.includes('This removes this GGUF group from all saved versions'), 'the versioned companion scope statement does not use the generic group wording');
+  assert(versionedCompanionConfirmation.includes('Saved versions (1): commit-a'), 'the versioned companion still lists its saved versions');
+  const beforeVersionedCompanion = deletedBodies.length;
+  await cancelButton(versionedCompanionSequence).click();
+  assert.equal(deletedBodies.length, beforeVersionedCompanion, 'cancelling the versioned companion confirmation sends no mutation');
 
   // Dataset details retain explicit typing and never request the GGUF endpoint.
   calls.length = 0;
@@ -301,6 +324,45 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Files included (2 distinct paths)'));
   await cancelButton(sequence).click();
   assert.equal(deletedBodies.length, 0);
+
+  // A vision-encoder companion is a separate artifact role: it renders its own
+  // badge instead of a model-quant badge, keeps an enabled Delete action, and
+  // sends only its own companion member composition.
+  await openLocalDetails();
+  const companionIndex = selectionFixture.locations[0].groups.findIndex(group => group.id === 'grp-mmproj-f32');
+  assert(companionIndex >= 0, 'the companion group is present in the selection fixture');
+  assert.equal((modalHTML.match(/cache-badge-vision-encoder/g) || []).length, 3, 'every companion group renders its own badge');
+  assert.equal((modalHTML.match(/class="cache-badge">Q4_K_M<\/span>/g) || []).length, 5, 'every llm quantization group keeps its own model-quant badge');
+  assert.equal((modalHTML.match(/class="cache-badge">Q5_K_M<\/span>/g) || []).length, 1, 'the llm split group keeps its own model-quant badge');
+  assert(modalHTML.includes('Vision encoder'), 'the companion badge names the artifact role');
+  assert(!modalHTML.includes('>F32<'), 'a companion never renders a model-quant badge');
+  assert(modalHTML.includes('mmproj-F32.gguf'), 'the companion keeps its own group label');
+  const companionSequence = await startGroupConfirmation(companionIndex);
+  assert(modalHTML.includes('Files included (1 distinct paths)'), 'only the companion member is confirmed');
+  const companionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
+  assert(companionConfirmation.includes('Vision encoder (mmproj companion):'), 'the companion confirmation names the vision-encoder role');
+  assert(companionConfirmation.includes('mmproj-F32.gguf'), 'the companion confirmation names the selected companion');
+  assert(!companionConfirmation.includes('Other variants, companion files, metadata, directories, and other locations remain.'), 'the companion confirmation does not claim companion files remain');
+  assert(companionConfirmation.includes('This removes only the selected vision encoder companion files.'), 'the companion scope statement is limited to the selected companion');
+  assert(companionConfirmation.includes('Other quantization groups, other companion files, metadata, directories, and other locations remain.'), 'the companion scope statement keeps the remaining scope explicit');
+  const beforeCompanion = deletedBodies.length;
+  await confirmButton(companionSequence).click();
+  assert.equal(deletedBodies.length, beforeCompanion + 1);
+  const companionBody = deletedBodies.at(-1);
+  assert.equal(companionBody.groupId, 'grp-mmproj-f32');
+  assert.deepEqual(companionBody.members.map(member => member.path), ['mmproj-F32.gguf']);
+  assert.equal(companionBody.members[0].versions.length, 0);
+  assert(!companionBody.members.some(member => member.path !== 'mmproj-F32.gguf'), 'only the companion member is sent');
+
+  // An LLM group keeps its current confirmation wording.
+  await openLocalDetails();
+  const llmSequence = await startGroupConfirmation(0);
+  const llmConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
+  assert(llmConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
+  assert(!llmConfirmation.includes('Vision encoder'), 'an llm confirmation does not claim a vision-encoder role');
+  assert(llmConfirmation.includes('This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.'), 'the llm scope statement is unchanged');
+  await cancelButton(llmSequence).click();
+  assert.equal(deletedBodies.length, beforeCompanion + 1, 'cancelling the llm confirmation sends no mutation');
 
   // Link-only local member metadata survives confirmation into the exact request.
   await openLocalDetails();

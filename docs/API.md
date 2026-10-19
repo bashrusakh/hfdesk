@@ -586,6 +586,45 @@ They are true only when the current location and its entries were completely
 enumerated and the supported mutation scope is available. A location may include
 `deleteReason` when it cannot be safely mutated.
 
+Every group carries a `kind` that names the artifact role it represents:
+`llm` for a model quantization group, and `vision_encoder` for an mmproj
+companion (a multimodal projector). A vision encoder is a different artifact
+role, not a model quantization: such a group reports no `quant` label, its
+group id is prefixed `mmproj-` instead of `gguf-`, and its precision stays
+visible in its own file name. A companion is grouped by its own file name, so
+coexisting F16/BF16/F32 companions remain separate groups, while a recognized
+numbered companion split stays one group. Deleting a companion group removes
+only that companion; it never removes an LLM quantization, and deleting an LLM
+group never removes a companion. Companion groups use the same snapshot,
+revalidation, reservation, and identity-pinning rules as LLM groups, so an
+active or planned writer for the selected companion still blocks its deletion.
+
+Example:
+
+```json
+{
+  "repo": "owner/model",
+  "type": "model",
+  "locations": [{
+    "id": "local-4e1a...",
+    "source": "Local",
+    "path": "/models/owner/model",
+    "groups": [{
+      "id": "gguf-a392...",
+      "label": "weights · Q4_K_M",
+      "kind": "llm",
+      "quant": "Q4_K_M",
+      "members": [{"path": "weights-Q4_K_M.gguf", "size": 1234}]
+    }, {
+      "id": "mmproj-b71c...",
+      "label": "mmproj-F32.gguf",
+      "kind": "vision_encoder",
+      "members": [{"path": "mmproj-F32.gguf", "size": 5678}]
+    }]
+  }]
+}
+```
+
 ```http
 DELETE /api/cache-selection
 ```
@@ -688,31 +727,6 @@ platform-specific behavior.
 The older `DELETE /api/cache/{owner}/{repo}` remains the separate
 whole-repository operation.
 
-`GET /api/cache/{owner}/{repo}?type=model|dataset` also honors an explicit
-repository type and returns only that cache type (or `404` when absent). An
-invalid supplied type returns `400`. Omitting `type` preserves the legacy
-model-first, then dataset/local lookup behavior.
-
-Example:
-
-```json
-{
-  "repo": "owner/model",
-  "type": "model",
-  "locations": [{
-    "id": "local-4e1a...",
-    "source": "Local",
-    "path": "/models/owner/model",
-    "groups": [{
-      "id": "gguf-a392...",
-      "label": "weights · Q4_K_M",
-      "quant": "Q4_K_M",
-      "members": [{"path": "weights-Q4_K_M.gguf", "size": 1234}]
-    }]
-  }]
-}
-```
-
 `locationId` is optional. When supplied, it must match a currently discovered
 location for this repo/type; unknown or stale IDs return `400` rather than
 falling back to another location. Local IDs are derived from the configured
@@ -726,7 +740,19 @@ an apparently incomplete numbered shard set; it is not proof that missing parts
 exist or may be inferred. A confirmed deletion removes only the exact currently
 enumerated member paths after a fresh complete local read; it never broadens to
 an inferred shard set. A missing quant label still produces a group by filename.
-`mmproj` companions are excluded from weight groups.
+An `mmproj` companion is never merged into a weight group: each companion is
+reported as its own `vision_encoder` group.
+
+`GET /api/cache/{owner}/{repo}?type=model|dataset` also honors an explicit
+repository type and returns only that cache type (or `404` when absent). An
+invalid supplied type returns `400`. Omitting `type` preserves the legacy
+model-first, then dataset/local lookup behavior.
+
+Its `quantizations` list contains only model quantization labels. A multimodal
+projector companion is reported separately: `hasMMProj` is `true` and the
+companion paths are listed in `mmprojFiles`. A dot-separated companion
+(`model.mmproj-f16.gguf`) is therefore reported under `mmprojFiles` instead of
+appearing as an `F16` quantization.
 
 Cache entries may come from:
 

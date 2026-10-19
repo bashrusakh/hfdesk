@@ -1185,12 +1185,14 @@ func cacheQuantLabel(name string) string {
 	return ""
 }
 
-// isCacheMMProjFile reports whether a GGUF filename looks like an
-// mmproj companion (clip/projector for multimodal models). Detected
-// by an "mmproj" prefix or a "-mmproj" substring in the basename.
+// isCacheMMProjFile reports whether a GGUF filename is an mmproj companion
+// (clip/projector for multimodal models). The artifact-role rule has a single
+// owner in pkg/smartdl, where the "vision_encoder" role and the known naming
+// conventions live; the server delegates instead of keeping a divergent copy,
+// so a companion is classified identically by the download picker, the cache
+// metadata, and the cache-selection model.
 func isCacheMMProjFile(name string) bool {
-	base := strings.ToLower(filepath.Base(name))
-	return strings.HasPrefix(base, "mmproj") || strings.Contains(base, "-mmproj")
+	return smartdl.IsMMProjFile(name)
 }
 
 // cacheGGUFMetadata summarises the GGUF content of a cached repo:

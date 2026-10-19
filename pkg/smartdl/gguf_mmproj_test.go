@@ -71,7 +71,7 @@ func mradermacherFiles() []FileInfo {
 	return files
 }
 
-// TestIsMMProjFile_Patterns verifies that isMMProjFile recognises every known
+// TestIsMMProjFile_Patterns verifies that IsMMProjFile recognises every known
 // naming convention: leading "mmproj-", dot-separated ".mmproj-", and the
 // "-mmproj" suffix forms, while not matching ordinary LLM quant files.
 func TestIsMMProjFile_Patterns(t *testing.T) {
@@ -95,8 +95,8 @@ func TestIsMMProjFile_Patterns(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isMMProjFile(c.name); got != c.want {
-				t.Errorf("isMMProjFile(%q) = %v, want %v", c.name, got, c.want)
+			if got := IsMMProjFile(c.name); got != c.want {
+				t.Errorf("IsMMProjFile(%q) = %v, want %v", c.name, got, c.want)
 			}
 		})
 	}

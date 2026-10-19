@@ -3596,10 +3596,15 @@ async function loadRepositoryDetails(entry) {
       const savedVersions = new Set((group.members || []).flatMap(member => member.versions || [])).size;
       const quantSuffix = group.quant ? ` · ${group.quant}` : '';
       const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : group.label;
+      // A vision encoder is a companion artifact, not a model quantization, so
+      // it gets its own badge instead of a quant label.
+      const kindBadge = group.kind === 'vision_encoder'
+        ? ' <span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">Vision encoder</span>'
+        : (group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : '');
       return `
       <article class="cache-selection-group">
         <div class="cache-selection-group-row">
-          <div class="cache-selection-group-info"><strong>${escapeHtml(displayLabel)}</strong>${group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : ''}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
+          <div class="cache-selection-group-info"><strong>${escapeHtml(displayLabel)}</strong>${kindBadge}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
           <button class="btn btn-danger btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeCacheDetailAttribute(disabledReason)}"` : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete</button>
         </div>
         <details><summary>Show ${group.members?.length || 0} file record${group.members?.length === 1 ? '' : 's'}</summary>
@@ -3650,6 +3655,7 @@ async function loadRepositoryDetails(entry) {
         group: {
           id: group.id,
           label: group.label,
+          kind: group.kind,
           hasSavedVersions: (group.members || []).some(member => member.versions?.length > 0),
           members: (group.members || []).map(member => ({
             path: member.path,
@@ -3712,15 +3718,26 @@ async function loadRepositoryDetails(entry) {
     const savedVersionCount = new Set(members.flatMap(member => member.versions)).size;
     const linkOnly = members.some(member => member.linkOnly);
     const files = fileEntries.map(entry => `<li><code>${escapeHtml(entry.path)}</code>${entry.versions.size ? `<span> — Saved versions (${entry.versions.size}): ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}${entry.linkOnly ? '<strong> — Link only: this removes the link; the weight file remains.</strong>' : ''}</li>`).join('');
-    const scopeStatement = versioned
+    // A vision encoder is a companion artifact, not a model quantization, so
+    // the confirmation names its role and never claims the selected artifact
+    // class remains.
+    const isVisionEncoder = group.kind === 'vision_encoder';
+    const groupLine = isVisionEncoder
+      ? `Vision encoder (mmproj companion): <strong>${escapeHtml(group.label)}</strong>`
+      : `GGUF group: <strong>${escapeHtml(group.label)}</strong>`;
+    const llmScopeStatement = versioned
       ? 'This removes this GGUF group from all saved versions in this selected location. Other groups and other locations remain.'
       : 'This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.';
+    const visionEncoderScopeStatement = versioned
+      ? 'This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'
+      : 'This removes only the selected vision encoder companion files. Other quantization groups, other companion files, metadata, directories, and other locations remain.';
+    const scopeStatement = isVisionEncoder ? visionEncoderScopeStatement : llmScopeStatement;
     showModal('Confirm GGUF group deletion', `
       <div id="${confirmationID}" class="delete-confirm cache-selection-confirmation">
         <p>Repository: <strong>${escapeHtml(repo)}</strong></p>
         <p>Type: <strong>Model</strong></p>
         <p>Storage location: <strong>${escapeHtml(location.source)}</strong><br><code>${escapeHtml(location.path)}</code></p>
-        <p>GGUF group: <strong>${escapeHtml(group.label)}</strong></p>
+        <p>${groupLine}</p>
         <p>${scopeStatement}</p>
         ${linkOnly ? '<p class="cache-selection-warning">This group includes link-only entries. Removing a link does not remove its weight target.</p>' : ''}
         <details open><summary>Files included (${fileEntries.length} distinct paths${versioned ? ` · ${savedVersionCount} saved versions` : ''})</summary><ul>${files}</ul></details>

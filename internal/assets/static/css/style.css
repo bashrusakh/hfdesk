@@ -2378,6 +2378,14 @@ a {
   font-size: 10px;
 }
 
+/* A vision-encoder companion is a separate artifact role, so it keeps its own
+   badge colour instead of the model-quantization badge. The badge only ever
+   renders inside the group row, so the colour is declared once, here. */
+.cache-selection-group-info .cache-badge.cache-badge-vision-encoder {
+  background: rgba(139, 92, 246, 0.14);
+  color: #c4b5fd;
+}
+
 .cache-selection-counts {
   color: var(--color-text-muted);
   font-size: 12px;
