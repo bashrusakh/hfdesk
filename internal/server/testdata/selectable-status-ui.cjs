@@ -60,7 +60,7 @@ const localStorage = {
   removeItem(key) { storage.delete(key); }
 };
 
-let cacheState = { status: 200, files: [], error: null };
+let cacheState = { status: 200, files: [], error: null, parseError: null };
 const fetch = async (rawPath) => {
   if (!String(rawPath).startsWith('/api/cache/')) {
     throw new Error('unexpected fetch: ' + rawPath);
@@ -69,7 +69,10 @@ const fetch = async (rawPath) => {
   return {
     status: cacheState.status,
     ok: cacheState.status >= 200 && cacheState.status < 300,
-    json: async () => ({ files: cacheState.files.map(name => ({ name })) })
+    json: async () => {
+      if (cacheState.parseError) throw cacheState.parseError;
+      return { files: cacheState.files.map(name => ({ name })) };
+    }
   };
 };
 
@@ -118,7 +121,7 @@ vm.runInNewContext(source, context);
 const ui = window.test;
 ui.state.settings = {};
 
-function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, initial = {} } = {}) {
+function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {} } = {}) {
   ui.state.jobs.clear();
   jobs.forEach((job, index) => ui.state.jobs.set(job.id || `job-${index}`, job));
   ui.state.settings = {};
@@ -127,7 +130,7 @@ function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = nul
   if (Object.keys(initial).length) {
     storage.set('dlStatus:' + REPO, JSON.stringify(initial));
   }
-  cacheState = { status: cacheStatus, files: cacheFiles, error: cacheError };
+  cacheState = { status: cacheStatus, files: cacheFiles, error: cacheError, parseError: cacheParseError };
 }
 
 async function reconcile(items) {
@@ -258,6 +261,60 @@ scenario('cache 404 clears previously cached done', async () => {
   const { map, html } = await reconcile([artifactItem(FILES)]);
   eq(map[ARTIFACT_KEY], undefined, '404 must remain authoritative');
   assertIdle(html, '', '404 artifact');
+});
+
+scenario('cache error clears a previously stored artifact done', async () => {
+  const item = artifactItem(FILES);
+
+  // A transient cache failure cannot confirm the artifact is present, so a
+  // previously stored done must not hide the Download button.
+  reset({
+    cacheError: new Error('cache lookup failed'),
+    initial: { [ARTIFACT_KEY]: 'done' }
+  });
+  let { map, html } = await reconcile([item]);
+  eq(map[ARTIFACT_KEY], undefined, 'cache error must clear a stale artifact done');
+  assertIdle(html, '', 'cache-error artifact');
+
+  // A malformed cache response reaches the same unverified-cache catch path.
+  reset({
+    cacheParseError: new SyntaxError('invalid cache response'),
+    initial: { [ARTIFACT_KEY]: 'done' }
+  });
+  ({ map, html } = await reconcile([item]));
+  eq(map[ARTIFACT_KEY], undefined, 'cache parse error must clear a stale artifact done');
+  assertIdle(html, '', 'cache-parse-error artifact');
+
+  // Cache presence is still authoritative for artifact done.
+  reset({ cacheFiles: FILES });
+  ({ map, html } = await reconcile([item]));
+  eq(map[ARTIFACT_KEY], 'done', 'cache presence still completes the artifact');
+  assertDone(html, '', 'cache-present artifact');
+
+  // A successful response missing one requested file still clears stored done.
+  reset({ cacheFiles: [SHARD1], initial: { [ARTIFACT_KEY]: 'done' } });
+  ({ map, html } = await reconcile([item]));
+  eq(map[ARTIFACT_KEY], undefined, 'missing file still clears a stored artifact done');
+  assertIdle(html, '', 'missing-file artifact');
+
+  // A 404 is still authoritative too.
+  reset({ cacheStatus: 404, initial: { [ARTIFACT_KEY]: 'done' } });
+  ({ map, html } = await reconcile([item]));
+  eq(map[ARTIFACT_KEY], undefined, '404 still clears a stored artifact done');
+  assertIdle(html, '', '404 artifact');
+
+  // Legacy non-artifact keys keep their last-known-good status on cache error.
+  const legacyFilter = { category: 'format', filter_value: 'Q4_K_M', label: 'Legacy Q4_K_M' };
+  const legacyId = { category: 'format', id: 'legacy-id', label: 'Legacy ID' };
+  reset({
+    cacheError: new Error('cache lookup failed'),
+    initial: { Q4_K_M: 'done', 'legacy-id': 'done' }
+  });
+  ({ map, html } = await reconcile([legacyFilter, legacyId]));
+  eq(map['Q4_K_M'], 'done', 'legacy filter_value status survives a cache error');
+  eq(map['legacy-id'], 'done', 'legacy id status survives a cache error');
+  assertDone(html, 'Legacy Q4_K_M', 'legacy filter_value row');
+  assertDone(html, 'Legacy ID', 'legacy id row');
 });
 
 scenario('running status is preserved', async () => {

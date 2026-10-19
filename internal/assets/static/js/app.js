@@ -1899,7 +1899,28 @@ async function loadRepositoryDetails(entry) {
         else localStorage.setItem(storageKey, JSON.stringify(map));
       }
     } catch {
-      // Cache lookup is best-effort; remote analysis should still render.
+      // Cache lookup is best-effort; remote analysis should still render. Cache
+      // presence is nevertheless the only authority for artifact 'done', so a
+      // transient lookup/parse failure must not leave a stale downloaded
+      // artifact hiding its Download button. Legacy non-artifact token statuses
+      // keep their last-known-good value.
+      const map = getDlStatus(data.repo);
+      let changed = false;
+      data.selectable_items.forEach(item => {
+        const key = selectableStatusKey(item);
+        if (!String(key).startsWith('artifact:') || map[key] !== 'done') return;
+        delete map[key];
+        changed = true;
+      });
+      if (changed) {
+        try {
+          const storageKey = 'dlStatus:' + data.repo;
+          if (Object.keys(map).length === 0) localStorage.removeItem(storageKey);
+          else localStorage.setItem(storageKey, JSON.stringify(map));
+        } catch {
+          // Status persistence is best-effort.
+        }
+      }
     }
   }
 
