@@ -956,12 +956,6 @@ a {
   border-radius: var(--radius-md);
 }
 
-.readme-bullet::before {
-  content: "•";
-  margin-right: 8px;
-  color: var(--color-primary-hover);
-}
-
 .readme-preview pre code {
   padding: 0;
   background: none;

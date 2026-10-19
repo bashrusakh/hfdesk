@@ -648,6 +648,7 @@ async function testReadmeClickDelegation() {
 async function testReadmePreviewContract() {
   const serverHtml = '<p class="server-markup">server</p>';
   const unsafeMarkdown = "[x](javascript:document.body.innerHTML='pwn')";
+  const stalePreviewHtml = '<p class="stale-readme">stale preview</p>';
 
   resetTest();
   readmeImpl = () => ({ html: serverHtml });
@@ -664,6 +665,8 @@ async function testReadmePreviewContract() {
   // Empty server HTML is valid: sanitization removed everything, so raw
   // markdown must never be rendered and the section stays hidden.
   resetTest();
+  nodes.get('#readmePreview').innerHTML = stalePreviewHtml;
+  nodes.get('#readmeSection').hidden = false;
   readmeImpl = () => ({ html: '', markdown: unsafeMarkdown });
   await ui.loadReadmePreview({ repo: 'owner/readme', branch: 'main' });
   eq(nodes.get('#readmePreview').innerHTML, '', 'empty html leaves the preview empty');
@@ -680,6 +683,8 @@ async function testReadmePreviewContract() {
     [undefined, 'missing html', false]
   ]) {
     resetTest();
+    nodes.get('#readmePreview').innerHTML = stalePreviewHtml;
+    nodes.get('#readmeSection').hidden = false;
     const payload = { markdown: fixture.markdown };
     if (present) payload.html = html;
     readmeImpl = () => payload;
