@@ -5,7 +5,6 @@ package hfdownloader
 
 import (
 	"fmt"
-	"path"
 	"sort"
 	"strings"
 
@@ -74,10 +73,9 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 		if in.Excluded {
 			continue
 		}
-		// LFS entries and model payloads are never retained by companion
-		// fallback. They are ineligible unless one actual role is directly
-		// selected, so constrain direct selection instead of searching for a
-		// companion-directory explanation the evaluator would ignore.
+		// LFS entries, payloads, and unknown paths are never retained by
+		// companion fallback. They are ineligible unless one actual role is
+		// directly selected, so constrain direct selection instead.
 		if !canRetainDatasetCompanion(in) {
 			chosen, next, ok := chooseZeroDecisionAlternative(c, i, roles[i], units, collisions)
 			if !ok {
@@ -86,18 +84,9 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			roles[i], units = []datasetDecisionRoleLabel{chosen}, next
 			continue
 		}
-		if in.Path == "" || path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." {
-			chosen, next, ok := chooseZeroDecisionAlternative(c, i, roles[i], units, collisions)
-			if !ok {
-				return datasetDecisionWorld{}, false
-			}
-			roles[i], units = []datasetDecisionRoleLabel{chosen}, next
-			continue
-		}
-		// A nested data alternative with no direct match is ineligible regardless
-		// of companion-directory scope, so prefer that explanation first.
+		// A known companion is always eligible in its companion role. It can be
+		// ineligible only through a data alternative with no direct match.
 		dataAlternatives := make([]datasetDecisionRoleLabel, 0, len(roles[i]))
-		foundIneligible := false
 		for _, alt := range roles[i] {
 			if alt.Role == datasetselection.EvidenceRoleData {
 				dataAlternatives = append(dataAlternatives, alt)
@@ -107,40 +96,7 @@ func feasibleDatasetDecisionWorld(c datasetDecisionContext, coreAssignment map[u
 			roles[i], units = []datasetDecisionRoleLabel{chosen}, next
 			continue
 		}
-		// Nested files may be retained only as companions, and only when every
-		// possible direct seed for an ancestor is absent.
-		for _, alt := range roles[i] {
-			if alt.Role != datasetselection.EvidenceRoleCompanion {
-				continue
-			}
-			trial := cloneDecisionUnits(units)
-			trialRoles := make([][]datasetDecisionRoleLabel, len(roles))
-			for j := range roles {
-				trialRoles[j] = append([]datasetDecisionRoleLabel(nil), roles[j]...)
-			}
-			ok := constrainDecisionDirect(c, i, []datasetDecisionRoleLabel{alt}, trial, collisions, false)
-			for _, seed := range validDatasetDirectorySeeds(c, in.Directory) {
-				if seed >= 0 && seed < len(c.Inputs) && seed != i && !c.Inputs[seed].Excluded {
-					chosen, next, zero := chooseZeroDecisionAlternative(c, seed, trialRoles[seed], trial, collisions)
-					if !zero {
-						ok = false
-						break
-					}
-					trialRoles[seed] = []datasetDecisionRoleLabel{chosen}
-					trial = next
-				}
-			}
-			if ok {
-				roles = trialRoles
-				roles[i] = []datasetDecisionRoleLabel{alt}
-				units = trial
-				foundIneligible = true
-				break
-			}
-		}
-		if !foundIneligible {
-			return datasetDecisionWorld{}, false
-		}
+		return datasetDecisionWorld{}, false
 	}
 	for _, i := range zeroDirect {
 		if datasetDecisionContextErr(c) != nil {
@@ -437,47 +393,23 @@ func queryDatasetDecision(c datasetDecisionContext, index int, earlierCaseInelig
 				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 			}
 		}
-		// A companion is retained at the root without a seed, or below a
-		// directory seeded by one directly selected data input. The source and
-		// target roles are pinned together so an input cannot self-seed through
-		// its mutually exclusive data/companion interpretations.
 		companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 		// Companions may themselves satisfy an ordinary explicit path filter;
-		// this is a direct witness, not root/nested fallback retention.
+		// this is a direct witness, not allowlisted fallback retention.
 		w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, &datasetDecisionPositive{Input: index, Alternative: companion})
 		if ok && queryWorldEmits(c, w, index) {
 			e, _ := evaluateDatasetDecisionWorld(c, w)
 			return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 		}
-		retainable := canRetainDatasetCompanion(c.Inputs[index])
-		definiteCompanion := retainable && c.Inputs[index].DefiniteCompanion
-		if definiteCompanion || retainable && (path.Dir(strings.ReplaceAll(c.Inputs[index].Path, "\\", "/")) == "." || c.RetainMetadata && isRecognizedDatasetMetadataPath(c.Inputs[index].Path)) {
-			w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, nil)
-			if ok && queryWorldEmits(c, w, index) {
-				e, _ := evaluateDatasetDecisionWorld(c, w)
-				return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
-			}
-		}
-		if !retainable {
+		if !canRetainDatasetCompanion(c.Inputs[index]) {
 			continue
 		}
-		for _, seed := range validDatasetDirectorySeeds(c, c.Inputs[index].Directory) {
-			if err := datasetDecisionContextErr(c); err != nil {
-				return datasetDecisionQueryResult{Err: err}
-			}
-			if seed == index || c.Inputs[seed].Excluded {
-				continue
-			}
-			for _, alt := range c.Inputs[seed].Alternatives {
-				if err := datasetDecisionContextErr(c); err != nil {
-					return datasetDecisionQueryResult{Err: err}
-				}
-				w, ok := feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion, seed: alt}, earlierCaseIneligible, []int{index}, &datasetDecisionPositive{Input: seed, Alternative: alt})
-				if ok && queryWorldEmits(c, w, index) {
-					e, _ := evaluateDatasetDecisionWorld(c, w)
-					return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
-				}
-			}
+		// A known companion is eligible wherever it appears when its companion
+		// role is chosen; no directory-seed or root condition applies.
+		w, ok = feasibleDatasetDecisionWorld(c, core, datasetDecisionPins{index: companion}, earlierCaseIneligible, nil, nil)
+		if ok && queryWorldEmits(c, w, index) {
+			e, _ := evaluateDatasetDecisionWorld(c, w)
+			return datasetDecisionQueryResult{Possible: true, World: w, Record: e.Records[index]}
 		}
 	}
 	if err := datasetDecisionContextErr(c); err != nil {
@@ -581,7 +513,6 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 	n := len(c.Inputs)
 	collisions := collisionTokenBits(c)
 	direct := make([][]int8, n) // +1 always direct, -1 never direct, 0 varies.
-	allDirect, anyDirect := make([]bool, n), make([]bool, n)
 	for i, in := range c.Inputs {
 		if datasetDecisionContextErr(c) != nil {
 			return nil
@@ -589,7 +520,6 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 		if in.Excluded || len(in.Alternatives) == 0 {
 			continue
 		}
-		allDirect[i] = true
 		direct[i] = make([]int8, len(in.Alternatives))
 		for j, alt := range in.Alternatives {
 			if datasetDecisionContextErr(c) != nil {
@@ -598,26 +528,10 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 			value, fixed := invariantDatasetDirect(c, i, alt, collisions)
 			if !fixed {
 				direct[i][j] = 0
-				allDirect[i], anyDirect[i] = false, true
 			} else if value {
-				direct[i][j], anyDirect[i] = 1, true
+				direct[i][j] = 1
 			} else {
-				direct[i][j], allDirect[i] = -1, false
-			}
-		}
-	}
-	guaranteedDirs, possibleDirs := map[string]bool{}, map[string]bool{}
-	for i, in := range c.Inputs {
-		if datasetDecisionContextErr(c) != nil {
-			return nil
-		}
-		if in.Excluded || len(in.Alternatives) == 0 || !anyDirect[i] {
-			continue
-		}
-		for _, dir := range datasetDecisionSeedDirectories(in) {
-			possibleDirs[dir] = true
-			if allDirect[i] {
-				guaranteedDirs[dir] = true
+				direct[i][j] = -1
 			}
 		}
 	}
@@ -641,11 +555,7 @@ func fixedDatasetDecisionOutcomes(c datasetDecisionContext) []int8 {
 				directAlways, directPossible := direct[i][j] == 1, direct[i][j] >= 0
 				eligible, possible := directAlways, directPossible
 				if alt.Role == datasetselection.EvidenceRoleCompanion && canRetainDatasetCompanion(in) {
-					dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-					metadata := c.RetainMetadata && isRecognizedDatasetMetadataPath(in.Path)
-					fallback := in.DefiniteCompanion || metadata || dir == "." || guaranteedDirs[dir]
-					maybeFallback := in.DefiniteCompanion || metadata || dir == "." || possibleDirs[dir]
-					eligible, possible = eligible || fallback, possible || maybeFallback
+					eligible, possible = true, true
 				}
 				if ggufRejected {
 					eligible, possible = false, false
@@ -802,22 +712,6 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			}
 		}
 	}
-	seedCounts := make(map[string]int)
-	for i, in := range c.Inputs {
-		if in.Excluded || !direct[i] {
-			continue
-		}
-		for _, dir := range datasetDecisionSeedDirectories(in) {
-			if datasetDecisionContextErr(c) != nil {
-				return false
-			}
-			seedCounts[dir]++
-		}
-	}
-	dirs := make(map[string]bool, len(seedCounts))
-	for dir := range seedCounts {
-		dirs[dir] = true
-	}
 	for i, in := range c.Inputs {
 		if datasetDecisionContextErr(c) != nil {
 			return false
@@ -832,8 +726,7 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 			}
 			selected := direct[i]
 			if !selected && alt.Role == datasetselection.EvidenceRoleCompanion && canRetainDatasetCompanion(in) {
-				dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-				selected = in.DefiniteCompanion || c.RetainMetadata && isRecognizedDatasetMetadataPath(in.Path) || dir == "." || dirs[dir]
+				selected = true
 			}
 			if altIndex > 0 && selected != eligible {
 				return false
@@ -844,14 +737,6 @@ func stableDatasetDecisionEvaluation(c datasetDecisionContext) bool {
 		}
 	}
 	return true
-}
-
-func datasetDecisionSeedDirectories(in datasetDecisionInput) []string {
-	var dirs []string
-	for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
-		dirs = append(dirs, d)
-	}
-	return dirs
 }
 
 // invariantDatasetDirect computes one role's direct selection; membership and
@@ -866,22 +751,6 @@ func invariantDatasetDirect(c datasetDecisionContext, i int, alt datasetDecision
 		}
 	}
 	return false, true
-}
-
-// A directly selected file seeds its containing directory and ancestors. A
-// companion in D therefore may be seeded by a source in D or below D.
-func validDatasetDirectorySeeds(c datasetDecisionContext, directory string) []int {
-	var indexes []int
-	for seedDir, seeds := range c.DirectSeedsByDirectory {
-		if datasetDecisionContextErr(c) != nil {
-			return nil
-		}
-		if seedDir == directory || strings.HasPrefix(seedDir, strings.TrimSuffix(directory, "/")+"/") {
-			indexes = append(indexes, seeds...)
-		}
-	}
-	sort.Ints(indexes)
-	return indexes
 }
 
 func datasetCoreAssignments(c datasetDecisionContext) []map[uint]bool {
@@ -1150,7 +1019,6 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 		return datasetDecisionEvaluation{}, err
 	}
 	out := datasetDecisionEvaluation{Records: make([]datasetDecisionRecord, len(c.Inputs))}
-	dirs := make(map[string]bool)
 	direct := make([]bool, len(c.Inputs))
 	labels := make([]string, len(c.Inputs))
 	companions := make([]bool, len(c.Inputs))
@@ -1171,11 +1039,6 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 				direct[i] = true
 			}
 		}
-		if direct[i] {
-			for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
-				dirs[d] = true
-			}
-		}
 	}
 	seenExact, seenFold := make(map[string]bool), make(map[string]bool)
 	for i, in := range c.Inputs {
@@ -1183,7 +1046,7 @@ func evaluateDatasetDecisionWorld(c datasetDecisionContext, world datasetDecisio
 			return datasetDecisionEvaluation{}, err
 		}
 		r := &out.Records[i]
-		eligible := !in.Excluded && (direct[i] || (companions[i] && canRetainDatasetCompanion(in) && (in.DefiniteCompanion || c.RetainMetadata && isRecognizedDatasetMetadataPath(in.Path) || path.Dir(strings.ReplaceAll(in.Path, "\\", "/")) == "." || dirs[path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))])))
+		eligible := !in.Excluded && (direct[i] || (companions[i] && canRetainDatasetCompanion(in)))
 		if strings.HasSuffix(strings.ToLower(in.Path), ".gguf") && !datasetGGUFSelected(c, in.Path) {
 			eligible = false
 		}

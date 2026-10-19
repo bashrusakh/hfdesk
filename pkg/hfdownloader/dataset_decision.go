@@ -49,42 +49,28 @@ type datasetDecisionInput struct {
 	DirectResidualConditions         []string
 	GroupCoreConditions              uint64
 	GroupResidualConditions          []string
-	Directory                        string
-	// DirectSeedCandidate is an unexcluded inventory source that a direct
-	// filter can select in at least one admissible membership interpretation.
-	// A membership selection is also a directory seed even when its group
-	// token is not an ordinary path match (for example, "train" selecting
-	// train.csv).
-	DirectSeedCandidate    bool
-	ExactDuplicateOf       int
-	CaseDuplicateOf        int
-	ExactDuplicateEligible bool
-	CaseDuplicateEligible  bool
-	// DefiniteCompanion is evidence-backed: every finite role alternative is a
-	// companion, or the resolver recorded a definite companion role. Unlike a
-	// recognized metadata/root/directory fallback, this signal identifies files
-	// that are companions by their own evidence rather than by placement.
-	DefiniteCompanion bool
-	LFS               bool
+	ExactDuplicateOf                 int
+	CaseDuplicateOf                  int
+	ExactDuplicateEligible           bool
+	CaseDuplicateEligible            bool
+	LFS                              bool
 }
 
 // datasetDecisionContext is an immutable, deterministic snapshot of inputs
 // needed for finite dataset-selection reasoning.
 type datasetDecisionContext struct {
-	ctx                    context.Context
-	Inputs                 []datasetDecisionInput
-	Filters                []datasetDecisionFilter
-	FilterBits             map[string]uint
-	RecognizedLabels       []string
-	CoreLabels             []string
-	ResidualLabels         []string
-	ExactMatch             bool
-	IsDataset              bool
-	GGUFMode               bool
-	RetainMetadata         bool
-	DirectSeedsByDirectory map[string][]int
-	CaseIndexesByPath      map[string][]int
-	uniqueEvaluation       *datasetDecisionUniqueEvaluation
+	ctx               context.Context
+	Inputs            []datasetDecisionInput
+	Filters           []datasetDecisionFilter
+	FilterBits        map[string]uint
+	RecognizedLabels  []string
+	CoreLabels        []string
+	ResidualLabels    []string
+	ExactMatch        bool
+	IsDataset         bool
+	GGUFMode          bool
+	CaseIndexesByPath map[string][]int
+	uniqueEvaluation  *datasetDecisionUniqueEvaluation
 }
 
 // The compiled input is immutable. The mutex shares only fully completed proof
@@ -178,7 +164,6 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 		in := datasetDecisionInput{Path: n.Path, LFS: n.LFS != nil, ExactDuplicateOf: -1, CaseDuplicateOf: -1}
 		e, hasEvidence := evidence[i]
 		if hasEvidence {
-			in.DefiniteCompanion = isDefiniteCompanionEvidence(e)
 			for _, role := range e.PossibleRoles {
 				if role == datasetselection.EvidenceRoleCompanion {
 					in.Alternatives = append(in.Alternatives, datasetDecisionRoleLabel{Role: role})
@@ -288,61 +273,24 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 		}
 		c.Inputs[i] = in
 	}
-	for i := range c.Inputs {
-		if ctx.Err() != nil {
-			return c
-		}
-		in := &c.Inputs[i]
-		hasPossibleDataRole := in.PossibleCore != 0 || len(in.PossibleResidual) != 0
-		// Any ordinary explicit path match is a direct selection under every
-		// actual role, including companion interpretations. Membership-only
-		// selection remains limited to actual data alternatives.
-		in.DirectSeedCandidate = !in.Excluded && (len(in.DirectFilterIndexes) != 0 || hasPossibleDataRole && (in.GroupCoreConditions != 0 || len(in.GroupResidualConditions) != 0))
-	}
-	// Index actual, non-excluded direct matches by containing directory. Keep
-	// one shared index rather than copying each seed list onto every file.
-	c.DirectSeedsByDirectory = make(map[string][]int)
 	c.CaseIndexesByPath = make(map[string][]int)
 	for i, input := range c.Inputs {
 		if ctx.Err() != nil {
 			return c
 		}
-		c.Inputs[i].Directory = path.Dir(strings.ReplaceAll(input.Path, "\\", "/"))
 		fold := strings.ToLower(input.Path)
 		c.CaseIndexesByPath[fold] = append(c.CaseIndexesByPath[fold], i)
-		if !input.DirectSeedCandidate {
-			continue
-		}
-		c.DirectSeedsByDirectory[c.Inputs[i].Directory] = append(c.DirectSeedsByDirectory[c.Inputs[i].Directory], i)
 	}
 	c.uniqueEvaluation = &datasetDecisionUniqueEvaluation{}
 	return c
 }
 
-// isDefiniteCompanionEvidence reports that membership evidence leaves no data
-// interpretation for the input. Ambiguous data/companion alternatives therefore
-// remain non-definite and keep their established selection behavior.
-func isDefiniteCompanionEvidence(e datasetselection.Evidence) bool {
-	if e.DefiniteRole == datasetselection.EvidenceRoleCompanion {
-		return true
-	}
-	if len(e.PossibleRoles) == 0 {
-		return false
-	}
-	for _, role := range e.PossibleRoles {
-		if role != datasetselection.EvidenceRoleCompanion {
-			return false
-		}
-	}
-	return true
-}
-
 // isDatasetPayloadPath reports positive evidence that an unmatched file is a
-// model/checkpoint payload rather than a small companion. Definite companion
-// role evidence only proves the file is not dataset data; it does not make
-// unrelated weights safe to retain. Established payload names reuse
-// isModelPayloadPath, while datasets also carry ambiguous weight/checkpoint
-// extensions that are not dataset data formats.
+// model/checkpoint payload rather than a small companion. Role evidence only
+// proves the file is not dataset data; it does not make unrelated weights safe
+// to retain. Established payload names reuse isModelPayloadPath, while datasets
+// also carry ambiguous weight/checkpoint extensions that are not dataset data
+// formats.
 func isDatasetPayloadPath(filePath string) bool {
 	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
 	// isModelPayloadPath deliberately treats optimizer/trainer state as
@@ -363,10 +311,11 @@ func isDatasetPayloadPath(filePath string) bool {
 }
 
 // canRetainDatasetCompanion reports whether an unmatched input is safe to
-// retain as a dataset companion. Payload paths are excluded regardless of role
-// evidence or placement; only an actual direct match selects them.
+// retain as a dataset companion. Only known companion/metadata paths qualify;
+// payload and unknown paths are skipped regardless of role evidence or
+// placement. Direct matches remain selected independently.
 func canRetainDatasetCompanion(in datasetDecisionInput) bool {
-	return !in.LFS && !isDatasetPayloadPath(in.Path)
+	return !in.LFS && !isDatasetPayloadPath(in.Path) && isKnownDatasetCompanionPath(in.Path)
 }
 
 func stableSortedKeys(set map[string]struct{}) []string {

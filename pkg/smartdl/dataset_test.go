@@ -326,7 +326,7 @@ func TestDatasetAnalyzerRoundTripsFlatAndCustomDataGroups(t *testing.T) {
 	}
 }
 
-func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
+func TestDatasetRecommendedFilterSkipsUnknownMetadata(t *testing.T) {
 	paths := []string{"train.csv", "unknown.json", "elsewhere/notes.txt", "train/test_data.parquet"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -357,13 +357,17 @@ func TestDatasetRecommendedFilterRefusesRelevantAmbiguity(t *testing.T) {
 		t.Fatalf("recommended request = %+v", request)
 	}
 	job := hfdownloader.Job{Repo: request.Repo, Revision: "rev1", IsDataset: request.Dataset, Filters: request.Filters, ExactMatch: request.ExactMatch}
-	if plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL}); err == nil || plan != nil {
-		t.Fatalf("ambiguous public plan = %+v, err=%v; want refusal", plan, err)
-	}
-	job.Excludes = []string{"unknown.json", "train/test_data.parquet"}
 	plan, err := hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
 	if err != nil {
-		t.Fatalf("excluded ambiguity plan: %v", err)
+		t.Fatalf("unknown root metadata should be skipped, not refused: %v", err)
+	}
+	if len(plan.Items) != 2 || plan.Items[0].RelativePath != "train.csv" || plan.Items[1].RelativePath != "train/test_data.parquet" {
+		t.Fatalf("selected plan paths = %+v", plan.Items)
+	}
+	job.Excludes = []string{"unknown.json", "train/test_data.parquet"}
+	plan, err = hfdownloader.PlanRepo(context.Background(), job, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("excluded plan: %v", err)
 	}
 	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "train.csv" {
 		t.Fatalf("excluded plan paths = %+v", plan.Items)

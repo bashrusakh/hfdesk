@@ -340,10 +340,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		recognizedDatasetGroup = datasetGroupRequest
 		// Even ordinary filename/path filters use the shared dataset evidence
-		// evaluator so recognized metadata with data/companion alternatives can
-		// be retained or refused based on its actual final emitted-set outcomes.
+		// evaluator so allowlisted companions with data/companion alternatives
+		// are retained or refused based on their actual final emitted-set outcomes.
 		if datasetGroupRequest || job.IsDataset && len(job.Filters) > 0 {
-			context.RetainMetadata = true
 			// Ordinary non-GGUF dataset selectors also use the shared evaluator,
 			// but retain their distinct path-filter semantics and ambiguity scope.
 			datasetGroupRequest = true
@@ -786,13 +785,28 @@ func isRecognizedMetadataPath(relativePath string) bool {
 	return isRecognizedModelMetadata(relativePath) || isDatasetServiceMetadata(relativePath)
 }
 
-func hasDatasetRoleUncertainty(input datasetDecisionInput) bool {
-	data, companion := false, false
-	for _, alternative := range input.Alternatives {
-		data = data || alternative.Role == datasetselection.EvidenceRoleData
-		companion = companion || alternative.Role == datasetselection.EvidenceRoleCompanion
+// isKnownDatasetCompanionPath is the positive allowlist for unmatched dataset
+// companions. Unknown extensions are skipped by default; only recognized
+// metadata plus documented docs/config/script/tokenizer assets are retained.
+func isKnownDatasetCompanionPath(relativePath string) bool {
+	if isRecognizedDatasetMetadataPath(relativePath) {
+		return true
 	}
-	return data && companion
+	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	switch base {
+	case "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+		"environment.yml", "environment.yaml", "dockerfile", "makefile",
+		".gitattributes", ".gitignore", "tokenizer.bin":
+		return true
+	}
+	switch path.Ext(base) {
+	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
+		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".model", ".spm",
+		".tiktoken", ".vocab", ".merges", ".jinja", ".j2":
+		return true
+	}
+	return false
 }
 
 func isDatasetServiceMetadata(relativePath string) bool {

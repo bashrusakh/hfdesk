@@ -97,12 +97,19 @@ func TestDatasetAnalyzeSelectionAndPlanAPI(t *testing.T) {
 		t.Fatalf("unfiltered plan has %d entries; want all %d: %+v", len(unfiltered.Files), len(files), unfiltered.Files)
 	}
 	response = postPlan(analyzed.RecommendedDownload.Filters, nil)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("ambiguous plan status=%d body=%s; want client error", response.Code, response.Body.String())
+	if response.Code != http.StatusOK {
+		t.Fatalf("plan status=%d body=%s; unknown root JSON must be skipped, not refused", response.Code, response.Body.String())
 	}
-	var refusal ErrorResponse
-	if err := json.Unmarshal(response.Body.Bytes(), &refusal); err != nil || refusal.ErrorDetail == nil || refusal.ErrorDetail.Code != "ambiguous_selection" || !strings.Contains(strings.ToLower(response.Body.String()), "ambiguous") {
-		t.Fatalf("ambiguous plan error payload=%s err=%v", response.Body.String(), err)
+	var trainPlan PlanResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &trainPlan); err != nil {
+		t.Fatal(err)
+	}
+	var trainPaths []string
+	for _, file := range trainPlan.Files {
+		trainPaths = append(trainPaths, file.Path)
+	}
+	if want := []string{"train.csv", "config.json", "dataset_info.json", "README.md"}; !reflect.DeepEqual(trainPaths, want) {
+		t.Fatalf("train plan paths=%v, want %v", trainPaths, want)
 	}
 	response = postPlan([]string{"customdata", "default"}, []string{"unknown.json"})
 	if response.Code != http.StatusOK {

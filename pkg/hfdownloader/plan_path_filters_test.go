@@ -576,7 +576,7 @@ func TestPlanRepoDatasetKnownRootMetadataResolvesAsCompanion(t *testing.T) {
 	}
 }
 
-func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
+func TestPlanRepoDatasetRetainsKnownCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "docs/guide.md", Size: 4},
@@ -592,6 +592,10 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 		{Type: "file", Path: "weights/custom.msgpack", Size: 104},
 		{Type: "file", Path: "weights/checkpoint.h5", Size: 105},
 		{Type: "file", Path: "weights/weights.ggml", Size: 106},
+		{Type: "file", Path: "weights/model.npy", Size: 107},
+		{Type: "file", Path: "weights/model.pkl", Size: 108},
+		{Type: "file", Path: "weights/custom.dat", Size: 109},
+		{Type: "file", Path: "weights/custom.foo", Size: 110},
 	}
 	rejected := []string{
 		"weights/model.safetensors",
@@ -601,6 +605,10 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 		"weights/custom.msgpack",
 		"weights/checkpoint.h5",
 		"weights/weights.ggml",
+		"weights/model.npy",
+		"weights/model.pkl",
+		"weights/custom.dat",
+		"weights/custom.foo",
 	}
 	want := []string{"train.csv", "docs/guide.md", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"}
 	for _, tc := range []struct {
@@ -617,11 +625,10 @@ func TestPlanRepoDatasetRetainsDefiniteCompanions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
 			}
-			// Definite non-data companions are retained, while the ambiguous
-			// nested .txt file keeps its established unselected behavior.
+			// Allowlisted companions are retained, while unknown nested
+			// .txt/.json and payload paths keep their unselected behavior.
 			assertPaths(t, planPaths(plan), want)
-			// Unmatched model payload paths are not safe companions: the role
-			// evidence only proves they are not dataset data.
+			// Unmatched model payload/unknown paths are not safe companions.
 			for _, path := range planPaths(plan) {
 				for _, reject := range rejected {
 					if path == reject {
@@ -695,6 +702,10 @@ func TestPlanRepoDatasetSkipsUnmatchedModelPayloads(t *testing.T) {
 		"weights/optimizer.bin",
 		"weights/training_state.bin",
 		"weights/training_args.bin",
+		"weights/model.npy",
+		"weights/model.pkl",
+		"weights/custom.dat",
+		"weights/custom.foo",
 	}
 	want := []string{"train.csv", "docs/guide.md", "utils/tool.py", "config.json", "README.md", "tokenizer/tokenizer.bin"}
 	for _, payload := range payloads {
@@ -805,6 +816,12 @@ func TestPlanRepoDatasetExplicitPayloadSelectionRemainsSelected(t *testing.T) {
 			filters: []string{"train", "weights/training_state.bin"},
 			want:    []string{"train.csv", "weights/training_state.bin", "config.json", "tokenizer/tokenizer.bin"},
 		},
+		{
+			name:    "unknown extension direct selection",
+			payload: "weights/model.npy",
+			filters: []string{"train", "weights/model.npy"},
+			want:    []string{"train.csv", "weights/model.npy", "config.json", "tokenizer/tokenizer.bin"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := []hfNode{
@@ -824,7 +841,7 @@ func TestPlanRepoDatasetExplicitPayloadSelectionRemainsSelected(t *testing.T) {
 	}
 }
 
-func TestPlanRepoDatasetUnknownRootMetadataStaysAmbiguousOrUnselected(t *testing.T) {
+func TestPlanRepoDatasetUnknownRootMetadataIsNotRetained(t *testing.T) {
 	for _, metadata := range []string{"notes.txt", "data.json"} {
 		t.Run("group/"+metadata, func(t *testing.T) {
 			srv := mockHFServerForPlan(t, []hfNode{
@@ -833,9 +850,10 @@ func TestPlanRepoDatasetUnknownRootMetadataStaysAmbiguousOrUnselected(t *testing
 			})
 			defer srv.Close()
 			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-			if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
-				t.Fatalf("unknown root metadata %q group plan = (%+v, %v), want nil plan and ErrAmbiguousSelection", metadata, plan, err)
+			if err != nil {
+				t.Fatalf("unknown root metadata %q group filter: %v", metadata, err)
 			}
+			assertPaths(t, planPaths(plan), []string{"train.csv"})
 		})
 		t.Run("ordinary/"+metadata, func(t *testing.T) {
 			srv := mockHFServerForPlan(t, []hfNode{
@@ -979,24 +997,22 @@ func TestPlanRepoDatasetGroupFiltersSelectMembership(t *testing.T) {
 	assertPaths(t, planPaths(plan), []string{"data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"})
 }
 
-func TestPlanRepoDatasetRootDefaultRecordsDoNotRefuseForRoleOnlyVariance(t *testing.T) {
+func TestPlanRepoDatasetRootDefaultRoleVarianceRefuses(t *testing.T) {
 	files := make([]hfNode, 1001)
-	want := make([]string, len(files))
 	files[0] = hfNode{Type: "file", Path: "records.parquet", Size: 10}
-	want[0] = "records.parquet"
 	for i := 1; i < len(files); i++ {
-		name := fmt.Sprintf("records-%04d.json", i-1)
-		files[i] = hfNode{Type: "file", Path: name, Size: 10}
-		want[i] = name
+		files[i] = hfNode{Type: "file", Path: fmt.Sprintf("records-%04d.json", i-1), Size: 10}
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 
+	// Unnamed root JSON keeps its data/companion ambiguity. The data role is
+	// selected by "default" while the companion role is skipped, so the final
+	// emitted set is not invariant and the plan must refuse.
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"default"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
-	if err != nil {
-		t.Fatalf("PlanRepo: %v", err)
+	if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+		t.Fatalf("PlanRepo = (%+v, %v), want nil plan and ErrAmbiguousSelection", plan, err)
 	}
-	assertPaths(t, planPaths(plan), want)
 }
 
 func TestPlanRepoDatasetCancellationDuringDecisionReturnsNoPlan(t *testing.T) {
@@ -1021,7 +1037,7 @@ func TestPlanRepoDatasetCancellationDuringDecisionReturnsNoPlan(t *testing.T) {
 	}
 }
 
-func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.T) {
+func TestPlanRepoDatasetUnknownRootMetadataSkippedAndExplicitSelectionWorks(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
 		{Type: "file", Path: "unknown.json", Size: 10},
@@ -1031,13 +1047,15 @@ func TestPlanRepoDatasetGroupAmbiguityIsRelevantAndExcludesResolveIt(t *testing.
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	job := Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}
-	if plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL}); err == nil || plan != nil {
-		t.Fatalf("ambiguous root companion plan = %+v, err=%v; want whole-plan refusal", plan, err)
-	}
-	job.Excludes = []string{"unknown.json"}
 	plan, err := PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
 	if err != nil {
-		t.Fatalf("excluded ambiguity: %v", err)
+		t.Fatalf("unknown root metadata should be skipped, not refused: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"train.csv"})
+	job.Excludes = []string{"unknown.json"}
+	plan, err = PlanRepo(context.Background(), job, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("excluded unknown metadata: %v", err)
 	}
 	assertPaths(t, planPaths(plan), []string{"train.csv"})
 	job.Excludes = nil
@@ -1146,15 +1164,19 @@ func TestPlanRepoDatasetGroupsUseCompleteMembershipAndCompanionWorld(t *testing.
 			}
 		})
 	}
-	if plan, err := planFor([]string{"train"}, nil); err == nil || plan != nil {
-		t.Fatalf("ambiguous root JSON should refuse whole plan: plan=%+v err=%v", plan, err)
-	}
-	plan, err := planFor([]string{"train"}, []string{"unknown.json"})
+	plan, err := planFor([]string{"train"}, nil)
 	if err != nil {
-		t.Fatalf("exclude resolves relevant root ambiguity: %v", err)
+		t.Fatalf("unknown root JSON should be skipped, not refused: %v", err)
 	}
 	if got, want := planPaths(plan), []string{"train.csv", "data/train_data/README.md", "README.md"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("excluded ambiguity paths=%v, want %v", got, want)
+		t.Fatalf("skip unknown root JSON paths=%v, want %v", got, want)
+	}
+	plan, err = planFor([]string{"train"}, []string{"unknown.json"})
+	if err != nil {
+		t.Fatalf("exclude unknown root JSON: %v", err)
+	}
+	if got, want := planPaths(plan), []string{"train.csv", "data/train_data/README.md", "README.md"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("excluded unknown paths=%v, want %v", got, want)
 	}
 	plan, err = planFor(nil, nil)
 	if err != nil {

@@ -87,7 +87,6 @@ func TestDatasetGGUFMetadataRoleRefusalHasCachedAndUncachedWitnesses(t *testing.
 		{Path: "weights/model.gguf"},
 		{Path: "nested/config.json"},
 	}, []string{"weights/model.gguf"}, nil)
-	c.RetainMetadata = true
 	target := 1
 	if len(c.Inputs[target].Alternatives) < 2 {
 		t.Fatalf("fixture lacks data/companion alternatives: %+v", c.Inputs[target].Alternatives)
@@ -591,38 +590,67 @@ func oracleDatasetPayloadPath(filePath string) bool {
 	return false
 }
 
-// concreteOracleSkipped is a deliberately small independent reference for
-// the evaluator's direct-selection, directory-seed, and input-order retention
-// rules. It does not call the production world evaluator or validate helper.
-func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
-	n := len(c.Inputs)
-	direct := make([]bool, n)
-	dirs := map[string]bool{}
-	for i, in := range c.Inputs {
-		if in.Excluded {
-			continue
+// oracleKnownDatasetCompanionPath independently reimplements the positive
+// dataset companion allowlist for the oracle. It must not call the production
+// allowlist/predicate helpers.
+func oracleKnownDatasetCompanionPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	switch base {
+	case "config.json", "tokenizer.json", "tokenizer_config.json",
+		"special_tokens_map.json", "added_tokens.json", "vocab.json",
+		"merges.txt", "dataset_info.json", "dataset_infos.json",
+		"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+		"environment.yml", "environment.yaml", "dockerfile", "makefile",
+		".gitattributes", ".gitignore", "tokenizer.bin":
+		return true
+	}
+	if strings.HasPrefix(base, "readme") {
+		if base == "readme" {
+			return true
 		}
-		direct[i] = concreteOracleDirect(c, w, i, collisions)
-		if direct[i] {
-			for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
-				dirs[d] = true
-			}
+		switch path.Ext(base) {
+		case ".md", ".markdown", ".rst", ".txt":
+			return true
 		}
 	}
+	if strings.HasPrefix(base, "license") {
+		rest := strings.TrimPrefix(base, "license")
+		if rest == "" || strings.HasPrefix(rest, "-") && len(rest) > 1 {
+			return true
+		}
+		switch rest {
+		case ".md", ".markdown", ".rst", ".txt":
+			return true
+		}
+	}
+	switch path.Ext(base) {
+	case ".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
+		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".model", ".spm",
+		".tiktoken", ".vocab", ".merges", ".jinja", ".j2":
+		return true
+	}
+	return false
+}
+
+// concreteOracleSkipped is a deliberately small independent reference for
+// the evaluator's direct-selection and input-order retention rules. It does
+// not call the production world evaluator or validate helper.
+func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
+	n := len(c.Inputs)
 	eligible := make([]bool, n)
 	for i, in := range c.Inputs {
 		if in.Excluded {
 			continue
 		}
-		if direct[i] {
+		if concreteOracleDirect(c, w, i, collisions) {
 			eligible[i] = true
 			continue
 		}
-		if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) {
+		if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) || !oracleKnownDatasetCompanionPath(in.Path) {
 			continue
 		}
-		dir := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-		eligible[i] = in.DefiniteCompanion || dir == "." || dirs[dir]
+		eligible[i] = true
 	}
 	return eligible
 }
@@ -759,7 +787,7 @@ func TestCompileDatasetDecisionContextRecognizedPathMatchDoesNotReclassifyData(t
 	}
 }
 
-func TestCompileDatasetDecisionContextPathPredicatesSeedsAndDuplicates(t *testing.T) {
+func TestCompileDatasetDecisionContextPathPredicatesAndDuplicates(t *testing.T) {
 	nodes := []hfNode{
 		{Path: "root.csv"}, {Path: "folder/train.csv"}, {Path: "folder/sub/companion.json"},
 		{Path: "other/companion.json"}, {Path: "folder/train.csv"}, {Path: "FOLDER/train.csv"},
@@ -767,12 +795,6 @@ func TestCompileDatasetDecisionContextPathPredicatesSeedsAndDuplicates(t *testin
 	c := compileDecisionFixture(nodes, []string{"train.csv"}, []string{"other/"})
 	if !reflect.DeepEqual(c.Inputs[1].DirectFilterIndexes, []int{0}) {
 		t.Fatalf("full-path direct match=%v", c.Inputs[1].DirectFilterIndexes)
-	}
-	if got := validDatasetDirectorySeeds(c, c.Inputs[2].Directory); len(got) != 0 {
-		t.Fatalf("parent-directory source incorrectly seeded its child: %v", got)
-	}
-	if len(validDatasetDirectorySeeds(c, c.Inputs[3].Directory)) != 0 {
-		t.Fatalf("unrelated directory inherited seeds: %v", validDatasetDirectorySeeds(c, c.Inputs[3].Directory))
 	}
 	if !c.Inputs[3].Excluded {
 		t.Fatal("exclude predicate missing")
@@ -785,28 +807,6 @@ func TestCompileDatasetDecisionContextPathPredicatesSeedsAndDuplicates(t *testin
 	}
 	if !c.Inputs[1].ExactDuplicateEligible || !c.Inputs[1].CaseDuplicateEligible {
 		t.Fatal("first path should be eligible for both dedup emissions")
-	}
-}
-
-func TestCompileDatasetDecisionContextMembershipSelectionsCanSeedDirectories(t *testing.T) {
-	// The filter "train" selects train.csv by membership even though the
-	// ordinary complete-path matcher does not match that filename. It must
-	// still seed companion scope for siblings beneath the selected directory.
-	c := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, nil)
-	if !c.Inputs[0].DirectSeedCandidate {
-		t.Fatal("membership-selected file was not indexed as a possible seed")
-	}
-	if got := validDatasetDirectorySeeds(c, c.Inputs[1].Directory); !reflect.DeepEqual(got, []int{0}) {
-		t.Fatalf("membership-selected directory seeds=%v want [0]", got)
-	}
-	// Exclusion is prior to selection and must prevent a seed.
-	excluded := compileDecisionFixture([]hfNode{{Path: "partition/train.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, []string{"train.csv"})
-	if excluded.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(excluded, excluded.Inputs[1].Directory)) != 0 {
-		t.Fatalf("excluded membership source seeded directory: %+v", excluded.Inputs)
-	}
-	companionOnly := compileDecisionFixture([]hfNode{{Path: "train/README.md"}, {Path: "other/metadata.json"}}, []string{"train"}, nil)
-	if !companionOnly.Inputs[0].DirectSeedCandidate || len(validDatasetDirectorySeeds(companionOnly, companionOnly.Inputs[1].Directory)) != 0 {
-		t.Fatalf("directly selected companion seed candidate or unrelated scope is wrong: %+v", companionOnly.Inputs)
 	}
 }
 
@@ -863,8 +863,8 @@ func TestEvaluateDatasetDecisionWorldHonorsFirstLongestAttributionAndLFS(t *test
 	if got.Records[1].Selected || !got.Records[1].Skipped {
 		t.Fatalf("unmatched LFS payload must not inherit companion scope: %+v", got.Records[1])
 	}
-	if !got.Records[2].Selected {
-		t.Fatalf("nested non-LFS companion in selected directory should remain: %+v", got.Records[2])
+	if got.Records[2].Selected || !got.Records[2].Skipped {
+		t.Fatalf("unknown nested non-LFS companion must be skipped: %+v", got.Records[2])
 	}
 }
 
@@ -931,19 +931,19 @@ func TestConcreteWorldDefaultDataDoesNotSelfSeedCompanionAlternative(t *testing.
 	}
 }
 
-func TestConcreteWorldMembershipSelectionSeedsNestedCompanionDirectory(t *testing.T) {
+func TestConcreteWorldMembershipSelectionDoesNotRetainUnknownNestedCompanion(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{{Path: "partition/train_dataset.csv"}, {Path: "partition/metadata.json"}}, []string{"train"}, nil)
 	w := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{1: {Role: datasetselection.EvidenceRoleCompanion}}, nil)
 	got, err := evaluateDatasetDecisionWorld(c, w)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Records[0].Selected || !got.Records[1].Selected {
-		t.Fatalf("membership-selected underscore path did not seed companion scope: %+v", got.Records)
+	if !got.Records[0].Selected || got.Records[1].Selected || !got.Records[1].Skipped {
+		t.Fatalf("unknown nested companion must not inherit membership scope: %+v", got.Records)
 	}
 }
 
-func TestConcreteWorldDirectCompanionSeedsNestedScope(t *testing.T) {
+func TestConcreteWorldKnownCompanionDoesNotBroadenToUnknownNested(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "other/README.md"},
@@ -957,8 +957,8 @@ func TestConcreteWorldDirectCompanionSeedsNestedScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Records[1].Selected || !got.Records[2].Selected {
-		t.Fatalf("directly selected companion did not seed nested scope: %+v", got.Records)
+	if !got.Records[1].Selected || got.Records[2].Selected || !got.Records[2].Skipped {
+		t.Fatalf("known companion must not retain an unknown sibling: %+v", got.Records)
 	}
 }
 
@@ -970,12 +970,12 @@ func TestStableEvaluationWithMultipleDirectRoleAlternatives(t *testing.T) {
 		{Path: "folder/README.md"},
 	}, []string{"train", ".json"}, nil)
 	for i := 1; i <= 2; i++ {
-		if len(c.Inputs[i].Alternatives) < 2 || !c.Inputs[i].DirectSeedCandidate {
-			t.Fatalf("fixture lacks a directly matched multi-role seed at %d: %+v", i, c.Inputs[i])
+		if len(c.Inputs[i].Alternatives) < 2 || len(c.Inputs[i].DirectFilterIndexes) == 0 {
+			t.Fatalf("fixture lacks a directly matched multi-role input at %d: %+v", i, c.Inputs[i])
 		}
 	}
 	if !stableDatasetDecisionEvaluation(c) {
-		t.Fatal("role-invariant direct matches and directory seeds should admit a reusable evaluation")
+		t.Fatal("role-invariant direct matches should admit a reusable evaluation")
 	}
 	for _, roles := range []map[int]datasetDecisionRoleLabel{
 		{1: {Role: datasetselection.EvidenceRoleData, Label: "default"}, 2: {Role: datasetselection.EvidenceRoleData, Label: "default"}},
@@ -1079,11 +1079,11 @@ func TestConcreteWorldCaseInsensitiveFirstEligibleEmission(t *testing.T) {
 	}
 }
 
-func TestSuppressedDirectCaseDuplicateStillSeedsCompanionDirectory(t *testing.T) {
+func TestSuppressedDirectCaseDuplicateKeepsKnownCompanionIndependent(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "Fold/train.csv"},
 		{Path: "fold/TRAIN.CSV"},
-		{Path: "fold/metadata.json"},
+		{Path: "fold/README.md"},
 	}, []string{"train"}, nil)
 	train := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleData, Label: "train"}
 	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
@@ -1093,7 +1093,7 @@ func TestSuppressedDirectCaseDuplicateStillSeedsCompanionDirectory(t *testing.T)
 		t.Fatal(err)
 	}
 	if !got.Records[1].Eligible || got.Records[1].Selected || !got.Records[2].Selected {
-		t.Fatalf("suppressed direct source failed to seed its directory: %+v", got.Records)
+		t.Fatalf("known companion must remain selected independent of duplicate scope: %+v", got.Records)
 	}
 	want := concreteOracleRecords(c, w)
 	if got.Records[1] != want[1] || got.Records[2] != want[2] {
@@ -1497,22 +1497,21 @@ func TestStableEvaluationWithLiteralCollisionAndSeededCompanionSet(t *testing.T)
 	}
 }
 
-func TestStableEvaluationRejectsConditionallySeededAmbiguousRole(t *testing.T) {
+func TestStableEvaluationRejectsAmbiguousDataCompanionRole(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
-		{Path: "folder/train.csv"},
-		{Path: "folder/metadata.json"},
-	}, []string{"train"}, nil)
-	if len(c.Inputs[1].Alternatives) < 2 {
-		t.Fatalf("fixture needs data/companion alternatives: %+v", c.Inputs[1].Alternatives)
+		{Path: "folder/data.json"},
+	}, []string{"default"}, nil)
+	if len(c.Inputs[0].Alternatives) < 2 {
+		t.Fatalf("fixture needs data/companion alternatives: %+v", c.Inputs[0].Alternatives)
 	}
 	if stableDatasetDecisionEvaluation(c) {
-		t.Fatal("companion fallback role changes selection inside a fixed seeded directory")
+		t.Fatal("data/companion role changes selection for an unmatched default record")
 	}
-	can, cannot, _ := oracleQueryOutcomes(c, 1)
+	can, cannot, _ := oracleQueryOutcomes(c, 0)
 	if !can || !cannot {
-		t.Fatalf("fixture must show selected companion vs unselected data worlds, can/cannot=%t/%t", can, cannot)
+		t.Fatalf("fixture must show selected data vs skipped companion worlds, can/cannot=%t/%t", can, cannot)
 	}
-	gotCan, gotCannot := datasetDecisionRefusal(c, 1)
+	gotCan, gotCannot := datasetDecisionRefusal(c, 0)
 	if gotCan.Possible != can || gotCannot.Possible != cannot {
 		t.Fatalf("refusal=%t/%t oracle=%t/%t", gotCan.Possible, gotCannot.Possible, can, cannot)
 	}
@@ -1818,15 +1817,9 @@ func oracleQueryOutcomes(c datasetDecisionContext, target int) (can, cannot bool
 
 func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
 	direct := make([]bool, len(c.Inputs))
-	dirs := map[string]bool{}
 	for i, in := range c.Inputs {
 		if !in.Excluded {
 			direct[i] = concreteOracleDirect(c, w, i, collisions)
-			if direct[i] {
-				for d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/")); d != "." && d != "/"; d = path.Dir(d) {
-					dirs[d] = true
-				}
-			}
 		}
 	}
 	selected := make([]bool, len(c.Inputs))
@@ -1844,11 +1837,7 @@ func concreteOracleSelected(c datasetDecisionContext, w datasetDecisionWorld, co
 			continue
 		}
 		if !direct[i] {
-			if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) {
-				continue
-			}
-			d := path.Dir(strings.ReplaceAll(in.Path, "\\", "/"))
-			if !in.DefiniteCompanion && d != "." && !dirs[d] {
+			if !w.Companion[i] || in.LFS || oracleDatasetPayloadPath(in.Path) || !oracleKnownDatasetCompanionPath(in.Path) {
 				continue
 			}
 		}
