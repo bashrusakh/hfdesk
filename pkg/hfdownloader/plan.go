@@ -290,6 +290,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
+		if len(job.Filters) > 0 && !isExcludedPath(n.Path, job.Excludes) {
+			for _, filter := range job.Filters {
+				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+					directFilterMatch = true
+					break
+				}
+			}
+		}
 	}
 	datasetMembership := datasetselection.Recognize(datasetFiles)
 	// Evidence is input-indexed; project definite data roles once instead of
@@ -481,28 +489,8 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			continue
 		}
 
-		// Direct selection match: proof that a requested filter actually
-		// matched this file. Computed for every non-excluded file before any
-		// GGUF/LFS inclusion decision and regardless of whether the file later
-		// enters the plan, so an excluded file never confirms selection while
-		// a valid direct match of e.g. a plain non-LFS config.json is not
-		// missed. Prefer the longest matching filter (same rule as the
-		// inclusion branches below, which reuse this value). Filters match
-		// against the complete repository-relative path.
-		directMatchedFilter := ""
-		for _, f := range job.Filters {
-			if filterMatchesPath(rel, f, job.ExactMatch) {
-				if len(f) > len(directMatchedFilter) {
-					directMatchedFilter = f
-				}
-			}
-		}
-		if directMatchedFilter != "" {
-			directFilterMatch = true
-		}
-
-		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
-		// branches below; it is not the selection proof (see directMatchedFilter).
+		// matchedFilter feeds PlanItem.Subdir and is set only by the established
+		// inclusion branches below; direct selection proof is tracked separately.
 		matchedFilter := ""
 		matchedFilterLength := 0
 		if datasetGroupRequest {
@@ -531,7 +519,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					}
 				}
 			}
-			matchedFilter = directMatchedFilter
 			if matchedFilter == "" {
 				metadata := job.IsDataset && isRecognizedDatasetMetadataPath(rel)
 				if isLFS || !metadata || datasetDataRoles[nodeIndex] {
@@ -550,7 +537,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 					}
 				}
 			}
-			matchedFilter = directMatchedFilter
 			// Filters select payloads by their full repo-relative path. An unmatched
 			// LFS entry is payload for planning purposes, regardless of extension:
 			// mirrors may store configs and other metadata as LFS pointers too.
@@ -660,11 +646,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// A non-empty filter set must have produced at least one direct selection
-	// match across the scanned tree (excludes applied). Companion/metadata
-	// files alone never make a filtered request succeed. An empty repo
-	// without filters still returns a successful empty plan.
-	if len(job.Filters) > 0 && !directFilterMatch {
+	// A non-empty filter set must directly match a non-excluded path, or
+	// select data through the recognized dataset-membership contract. Merely
+	// retaining companions/metadata cannot make an otherwise empty selection
+	// succeed. An unfiltered empty repository remains valid.
+	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil

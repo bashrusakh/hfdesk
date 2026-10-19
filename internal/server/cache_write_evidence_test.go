@@ -187,11 +187,11 @@ func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{MaxActive: 2}, nil, filepath.Join(t.TempDir(), "state"))
 	j := &Job{ID: "j", Repo: "o/r", Status: JobStatusQueued, Filters: []string{"one"}, Excludes: []string{"skip"}}
 	m.jobs[j.ID] = j
-	m.runActivities[1] = &jobWriteActivity{job: j, planKnown: true, planned: map[string]frozenMutationPath{"/tmp/a": {physical: "/tmp/a", key: "/tmp/a"}}}
+	m.runActivities[1] = &jobWriteActivity{job: j, planKnown: true, planned: map[string]frozenMutationPath{"/tmp/a": {physical: "/tmp/a", key: "/tmp/a", raw: "/tmp/a"}}}
 	s := m.captureWriteDecision()
 	j.Filters[0] = "changed"
 	j.Status = JobStatusRunning
-	m.runActivities[1].planned["/tmp/b"] = frozenMutationPath{physical: "/tmp/b", key: "/tmp/b"}
+	m.runActivities[1].planned["/tmp/b"] = frozenMutationPath{physical: "/tmp/b", key: "/tmp/b", raw: "/tmp/b"}
 	if s.jobs[0].filters[0] != "one" || s.activities[0].planned[0].physical != "/tmp/a" {
 		t.Fatal("snapshot shares live slices or maps")
 	}
@@ -697,7 +697,7 @@ func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
 	}{
 		{"selected GGUF", func(m *JobManager, p string) (func(), bool) { return m.reserveSelectedGGUF([]string{p}) }},
 		{"selected HF", func(m *JobManager, p string) (func(), bool) {
-			return m.reserveSelectedHF(p, filepath.Join(filepath.Dir(p), "friendly"))
+			return m.reserveSelectedHF(filepath.Dir(p), filepath.Join(filepath.Dir(p), "friendly"))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
