@@ -49,6 +49,45 @@ func TestRenderReadmeHTML(t *testing.T) {
 	}
 }
 
+func TestRenderReadmeHTML_UnsafeSchemesStripped(t *testing.T) {
+	md := "[js](javascript:alert(1))\n\n" +
+		"![jsimg](javascript:alert(1))\n\n" +
+		"[html](data:text/html,alert(1))\n\n" +
+		"![htmlimg](data:text/html,alert(1))\n"
+	html := renderReadmeHTML(md,
+		"https://huggingface.co/owner/model/resolve/main/",
+		"https://huggingface.co/owner/model/blob/main/",
+		"https://huggingface.co")
+
+	// The unsafe anchors and images are sanitized down to harmless content:
+	// link labels survive as text, and images keep their alt text while the
+	// unsafe attribute is removed.
+	for _, sub := range []string{
+		"<p>js</p>",
+		"<p>html</p>",
+		`alt="jsimg"`,
+		`alt="htmlimg"`,
+		`loading="lazy"`,
+	} {
+		if !strings.Contains(html, sub) {
+			t.Errorf("missing safe sanitized content %q in:\n%s", sub, html)
+		}
+	}
+
+	for _, sub := range []string{
+		"javascript:",
+		"data:text/html",
+		`href="javascript:`,
+		`src="javascript:`,
+		`href="data:text/html`,
+		`src="data:text/html`,
+	} {
+		if strings.Contains(html, sub) {
+			t.Errorf("rendered HTML retained unsafe value %q:\n%s", sub, html)
+		}
+	}
+}
+
 func TestClassifyReadmeRepoURL(t *testing.T) {
 	tests := []struct {
 		name        string
