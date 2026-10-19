@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,12 +29,28 @@ import (
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
 var Version = "dev"
 
+// effectiveEndpointURL returns the configured Hugging Face endpoint in the
+// normalized form exposed to clients: the public Hub when no custom endpoint is
+// configured, without a trailing slash, and preserving any path prefix (for
+// example a mirror served under /hf). Keeping this server-side lets surfaces
+// that cannot wait for /api/settings (such as the startup health fetch) use the
+// real configured endpoint instead of guessing huggingface.co.
+func effectiveEndpointURL(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if endpoint == "" {
+		return "https://huggingface.co"
+	}
+	return endpoint
+}
+
 // handleHealth returns server health status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"version": Version,
-		"time":    time.Now().UTC().Format(time.RFC3339),
+		"status":   "ok",
+		"version":  Version,
+		"time":     time.Now().UTC().Format(time.RFC3339),
+		"endpoint": effectiveEndpointURL(cfg.Endpoint),
 	})
 }
 
@@ -665,25 +682,28 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 
-	// Check if it's a dataset (explicit selection)
-	isDataset := query.Get("dataset") == "true"
-
-	// type=model lets callers resolve a dual-type repository after the user
-	// chose the model namespace. A forced model analyze must not fall back to
-	// dataset auto-detection, which would return needsSelection again.
-	forceModel := false
+	// The one explicit namespace selector is type=model|dataset. Values are
+	// matched exactly (no trimming or case folding): an unknown or repeated
+	// type is rejected instead of silently falling back to auto-detection, so a
+	// client always knows which namespace it selected.
+	selectedType := ""
 	if typeValues, ok := query["type"]; ok {
-		if len(typeValues) != 1 || typeValues[0] != "model" {
+		if len(typeValues) != 1 || (typeValues[0] != "model" && typeValues[0] != "dataset") {
 			writeError(w, http.StatusBadRequest, "Invalid repository type",
-				"Expected type=model; use dataset=true to analyze a dataset, or omit both for automatic detection")
+				"Expected type=model or type=dataset; omit type for automatic detection")
 			return
 		}
-		if isDataset {
-			writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
-				"type=model cannot be combined with dataset=true; choose one repository type")
-			return
-		}
-		forceModel = true
+		selectedType = typeValues[0]
+	}
+
+	// type takes precedence over the legacy dataset parameter, but a
+	// contradictory pair is rejected rather than silently choosing one.
+	// dataset=true is consistent with type=dataset.
+	datasetTrue := query.Get("dataset") == "true"
+	if selectedType == "model" && datasetTrue {
+		writeError(w, http.StatusBadRequest, "Conflicting repository type selection",
+			"type=model cannot be combined with dataset=true; choose one repository type")
+		return
 	}
 
 	// Get revision (defaults to "main")
@@ -711,14 +731,22 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var info *smartdl.RepoInfo
-	if forceModel {
+	switch {
+	case selectedType == "model":
 		info, err = analyzer.AnalyzeModelWithRevision(ctx, repo, revision)
-	} else {
-		info, err = analyzer.AnalyzeWithRevision(ctx, repo, isDataset, revision)
+	case selectedType == "dataset":
+		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
+	case datasetTrue:
+		// Legacy dataset=true forces the dataset namespace even though every
+		// other dataset value (including false and an empty value) still
+		// auto-detects.
+		info, err = analyzer.AnalyzeExplicitWithRevision(ctx, repo, true, revision)
+	default:
+		info, err = analyzer.AnalyzeWithRevision(ctx, repo, false, revision)
 	}
 	if err != nil {
-		// Check if both model and dataset exist (the analyzer wraps the
-		// sentinel with the failing operation, so compare with errors.Is).
+		// Check if both model and dataset exist. AnalyzeWithRevision wraps
+		// ErrBothExist with fetch context, so compare with errors.Is.
 		if errors.Is(err, smartdl.ErrBothExist) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"needsSelection": true,
@@ -807,8 +835,9 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	client.Timeout = 20 * time.Second
 
 	candidates := []string{"README.md", "readme.md", "Readme.md"}
+	escapedRevision := url.PathEscape(revision)
 	for _, name := range candidates {
-		rawURL := fmt.Sprintf("%s/%s%s/raw/%s/%s", endpoint, prefix, repo, revision, name)
+		rawURL := fmt.Sprintf("%s/%s%s/raw/%s/%s", endpoint, prefix, repo, escapedRevision, name)
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
 		if err != nil {
 			continue
@@ -825,15 +854,16 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 768<<10))
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && readErr == nil && len(body) > 0 {
-			baseRaw := fmt.Sprintf("%s/%s%s/resolve/%s/", endpoint, prefix, repo, revision)
-			baseBlob := fmt.Sprintf("%s/%s%s/blob/%s/", endpoint, prefix, repo, revision)
+			baseRaw := fmt.Sprintf("%s/%s%s/resolve/%s/", endpoint, prefix, repo, escapedRevision)
+			baseBlob := fmt.Sprintf("%s/%s%s/blob/%s/", endpoint, prefix, repo, escapedRevision)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"repo":       repo,
-				"revision":   revision,
-				"path":       name,
-				"markdown":   string(body),
-				"baseRawURL": baseRaw,
-				"html":       renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointHost(cfg.Endpoint)),
+				"repo":        repo,
+				"revision":    revision,
+				"path":        name,
+				"markdown":    string(body),
+				"baseRawURL":  baseRaw,
+				"baseBlobURL": baseBlob,
+				"html":        renderReadmeHTML(string(body), baseRaw, baseBlob, readmeEndpointBase(cfg.Endpoint)),
 			})
 			return
 		}

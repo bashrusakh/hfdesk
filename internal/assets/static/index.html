@@ -142,6 +142,18 @@
             <!-- Detail header (shown when model selected) -->
             <div id="modelsDetailHeader" class="models-detail-header" style="display:none">
               <div class="models-detail-title-wrap">
+                <div class="models-history-controls">
+                  <button id="modelsDetailBack" class="btn btn-ghost btn-xs models-history-btn" title="Back" aria-label="Back in Model Details history" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true">
+                      <path d="M19 12H5"/><polyline points="12 19 5 12 12 5"/>
+                    </svg>
+                  </button>
+                  <button id="modelsDetailForward" class="btn btn-ghost btn-xs models-history-btn" title="Forward" aria-label="Forward in Model Details history" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true">
+                      <path d="M5 12h14"/><polyline points="12 5 19 12 12 19"/>
+                    </svg>
+                  </button>
+                </div>
                 <span class="models-detail-repo" id="modelsDetailRepo"></span>
               </div>
               <div class="models-detail-header-right">

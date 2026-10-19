@@ -12,6 +12,16 @@
   const state = {
     jobs: new Map(),
     settings: {},
+    // serverEndpoint is the effective configured HF endpoint last reported by
+    // /api/health at startup or by a successful /api/settings load. It covers
+    // the window before /api/settings resolves (or when that fetch fails), and
+    // settings overwrite it so a changed or default endpoint never goes stale.
+    serverEndpoint: '',
+    // settingsEndpointResolved records that a successful /api/settings load
+    // supplied the endpoint preference, including the empty default. Once set,
+    // settings remain authoritative and a late /api/health response must not
+    // replace the remembered endpoint with its stale startup snapshot.
+    settingsEndpointResolved: false,
     wsConnected: false,
     ws: null,
     currentPage: 'analyze',
@@ -397,6 +407,19 @@
 let currentAnalysis = null;
 let currentGatedState = null;
 let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
+// The initial picker refines the pending navigation entry. A picker reopened
+// from a rendered analysis is a view transition that keeps the current stop.
+let revisionPickerNavigationMode = 'replace';
+// Cancel hook for the initial (pending) revision picker only. hideModal runs
+// it, while selection and any other modal clear it, so closing an unrelated
+// dialog can never roll back or render a pending navigation.
+let revisionPickerCancelHandler = null;
+// The navigation request (and repository) that owns the open revision picker.
+// A selection only applies while this identity is still current; a newer
+// repository transition dismisses and disarms the picker so stale buttons
+// cannot save the old repository or navigation mode over the new stop.
+let revisionPickerRequestId = null;
+let revisionPickerRepo = null;
 let currentSelectedRepo = null;
 // Explicit type of the selected repo. null means the type is not known yet
 // (auto-detect), so a header refresh must not force model or dataset.
@@ -441,17 +464,131 @@ const communityState = {
 // Retry button), then consumed by renderCommunityPanel() once the request ends.
 let communityFocusIntent = null;
 
-function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main') {
+let repoHistory = [];
+let repoHistoryIndex = -1;
+
+// The endpoint is server-owned configuration. The Hub header action and the
+// client-side README fallback both use it rather than assuming huggingface.co.
+// Settings are authoritative when loaded; /api/health supplies the same
+// server-normalized endpoint at startup. When neither has arrived yet, return
+// an empty string so callers can hide endpoint-dependent UI instead of
+// rendering a guessed default that may point at the wrong Hub.
+function configuredHfEndpointURL() {
+  const configured = String(state.settings?.endpoint || '').trim();
+  const health = String(state.serverEndpoint || '').trim();
+  const raw = configured || health;
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
+  } catch (_) {
+    return raw.replace(/\/+$/, '');
+  }
+}
+
+// rememberSettingsEndpoint records the endpoint from a successful settings
+// response. Settings are authoritative: a custom endpoint replaces the startup
+// /api/health value, and the default (empty) preference records the public Hub.
+// That keeps the remembered value from going stale after a settings change and
+// makes the default endpoint known even when health failed or returned none.
+// The resolved flag also stops a late health response from restoring a startup
+// custom endpoint after settings have already supplied the default.
+function rememberSettingsEndpoint(settings) {
+  const configured = String(settings?.endpoint || '').trim();
+  state.serverEndpoint = configured || 'https://huggingface.co';
+  state.settingsEndpointResolved = true;
+}
+
+// Parse one endpoint base into the pieces README link classification needs:
+// the normalized host and the decoded path prefix (for example
+// https://mirror.example/hf). Deriving both from the same base prevents a
+// fallback host from being combined with a different source's path prefix.
+function parseHfEndpointBase(endpointBase) {
+  const raw = String(endpointBase || '').trim() || 'https://huggingface.co';
+  let u;
+  try {
+    u = new URL(raw);
+  } catch (_) {
+    return null;
+  }
+  const pathPrefix = [];
+  for (const part of u.pathname.split('/')) {
+    if (!part) continue;
+    const decoded = decodeReadmePathSegment(part);
+    // Keep the host available so classification fails closed on an unsafe
+    // prefix instead of falling through to a different endpoint.
+    if (decoded === null) return { host: u.host.toLowerCase(), pathPrefix: null };
+    pathPrefix.push(decoded);
+  }
+  return { host: u.host.toLowerCase(), pathPrefix };
+}
+
+// Resolve the effective endpoint for one README render. Settings are
+// authoritative when available. Otherwise the README-derived endpointBase
+// (which preserves any path prefix) is used; direct classifier callers that
+// only provide baseBlobURL keep the host-only fallback behavior.
+function resolveHfEndpoint(endpointBase = '', baseBlobURL = '') {
+  const configured = String(state.settings?.endpoint || '').trim();
+  if (configured) {
+    return parseHfEndpointBase(configured) || parseHfEndpointBase('https://huggingface.co');
+  }
+  const explicit = String(endpointBase || '').trim();
+  if (explicit) {
+    const endpoint = parseHfEndpointBase(explicit);
+    if (endpoint) return endpoint;
+  }
+  const blob = String(baseBlobURL || '').trim();
+  if (blob) {
+    try {
+      const endpoint = parseHfEndpointBase(new URL(blob).origin);
+      if (endpoint) return endpoint;
+    } catch (_) { /* fall through to the default endpoint */ }
+  }
+  return parseHfEndpointBase('https://huggingface.co');
+}
+
+function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main', typeKnown = true) {
   const header = $('#modelsDetailHeader');
   const repoLabel = $('#modelsDetailRepo');
   const hfLink = $('#modelsDetailHFLink');
 
   if (header) header.style.display = '';
   if (repoLabel && repoId) repoLabel.textContent = repoId;
-  if (hfLink && repoId) {
-    hfLink.href = `https://huggingface.co/${isDataset ? 'datasets/' : ''}${repoId}`;
-    hfLink.hidden = false;
+  if (!hfLink || !repoId) return;
+  if (!typeKnown) {
+    // An auto-detect transition knows the repository but not yet whether it is
+    // a model or dataset. Hide the action instead of guessing a model URL or
+    // leaving the previous view's link on screen.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
   }
+  const endpoint = configuredHfEndpointURL();
+  if (!endpoint) {
+    // The configured endpoint is not known yet (settings failed or are still
+    // loading). Hide the action and clear any stale href rather than guessing
+    // huggingface.co, which would be wrong for a custom mirror. loadAppVersion
+    // and loadStorageModeBadge re-sync once an endpoint arrives.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
+  }
+  hfLink.href = `${endpoint}/${isDataset ? 'datasets/' : ''}${repoId}`;
+  hfLink.hidden = false;
+}
+
+// Re-sync the Model Details header from the current selection state. Endpoint
+// loads (settings/health) and other late callbacks must use this instead of
+// reading the view they were started for, so an in-flight navigation to a new
+// repository never reverts the header to the previous one.
+function syncSelectedModelHeader() {
+  if (!currentSelectedRepo) return;
+  syncModelsDetailHeader(
+    currentSelectedRepo,
+    currentSelectedIsDataset,
+    currentSelectedBranch,
+    currentSelectedType !== null
+  );
 }
 
 // =========================================
@@ -1197,21 +1334,148 @@ window.openCommunityThread = openCommunityThread;
 window.closeCommunityThread = closeCommunityThread;
 window.retryCommunityThread = retryCommunityThread;
 
+function normalizeRepoType(repoType) {
+  return repoType === 'dataset' ? 'dataset' : repoType === 'model' ? 'model' : null;
+}
+
+function makeRepoHistoryEntry(repo, repoType, revision) {
+  return {
+    repo: String(repo || '').trim(),
+    repoType: normalizeRepoType(repoType),
+    revision: revision ? String(revision) : null
+  };
+}
+
+function effectiveRepoRevision(revision) {
+  return revision || 'main';
+}
+
+function sameRepoHistoryEntry(a, b) {
+  return !!a && !!b && a.repo === b.repo && a.repoType === b.repoType
+    && effectiveRepoRevision(a.revision) === effectiveRepoRevision(b.revision);
+}
+
+function currentRepoHistoryEntry() {
+  return repoHistoryIndex >= 0 ? repoHistory[repoHistoryIndex] : null;
+}
+
+function syncRepoHistoryButtons() {
+  const back = $('#modelsDetailBack');
+  const forward = $('#modelsDetailForward');
+  if (back) back.disabled = repoHistoryIndex <= 0;
+  if (forward) forward.disabled = repoHistoryIndex < 0 || repoHistoryIndex >= repoHistory.length - 1;
+}
+
+function pushRepoHistoryEntry(entry) {
+  if (repoHistoryIndex >= 0 && sameRepoHistoryEntry(repoHistory[repoHistoryIndex], entry)) {
+    syncRepoHistoryButtons();
+    return;
+  }
+  repoHistory = repoHistory.slice(0, repoHistoryIndex + 1);
+  repoHistory.push(entry);
+  repoHistoryIndex = repoHistory.length - 1;
+  syncRepoHistoryButtons();
+}
+
+function replaceRepoHistoryEntry(entry) {
+  if (repoHistoryIndex < 0) {
+    repoHistory = [entry];
+    repoHistoryIndex = 0;
+  } else {
+    repoHistory[repoHistoryIndex] = entry;
+  }
+  syncRepoHistoryButtons();
+}
+
+// The single Model Details repository transition. All internal entry points
+// (README/lineage links, Related Downloads, search rows, jobs, examples, the
+// analyze field, refresh, type/revision resolution, and back/forward) converge
+// here for both loading and history semantics.
+function openRepositoryInDetails(repo, repoType = null, revision = null, navigationMode = 'push') {
+  const entry = makeRepoHistoryEntry(repo, repoType, revision);
+  if (!entry.repo) {
+    showToast('Please enter a repository', 'error');
+    return;
+  }
+
+  if (navigationMode === 'push') {
+    const current = currentRepoHistoryEntry();
+    const sameRepo = current && current.repo === entry.repo
+      && (!entry.repoType || !current.repoType || entry.repoType === current.repoType);
+    // Dedupe may compare against the current view, but a caller that omitted
+    // the type (the Analyze field) must keep auto-detection. Copying the
+    // current view's type here would send an explicit type parameter for a
+    // same-name repo and skip the server's model/dataset selection flow.
+    if (sameRepo && effectiveRepoRevision(entry.revision) === effectiveRepoRevision(current.revision)) {
+      // Same repository view (including a root link while the default view is
+      // already shown): refine the current entry instead of adding a
+      // duplicate stop. A README root link carries no revision but does carry
+      // an explicit type, so keep the current resolved revision to refresh
+      // that view instead of starting an unresolved navigation that reopens
+      // the revision picker. An untyped caller (the Analyze field) still keeps
+      // its pending auto-detect entry.
+      if (!entry.revision && entry.repoType && current.revision) entry.revision = current.revision;
+      replaceRepoHistoryEntry(entry);
+    } else {
+      // A different revision of the same repository is a view transition.
+      // Pushing keeps the previous stop, so navigating from a non-default
+      // revision back to the repository root cannot erase that revision.
+      pushRepoHistoryEntry(entry);
+    }
+  } else if (navigationMode === 'replace') {
+    replaceRepoHistoryEntry(entry);
+  }
+
+  return loadRepositoryDetails(entry);
+}
+
+function traverseRepoHistory(delta) {
+  const next = repoHistoryIndex + delta;
+  if (next < 0 || next >= repoHistory.length) return;
+  repoHistoryIndex = next;
+  syncRepoHistoryButtons();
+  const entry = repoHistory[next];
+  return openRepositoryInDetails(entry.repo, entry.repoType, entry.revision, 'traverse');
+}
+
+// Backward-compatible direct analysis entry point. It still goes through the
+// same history/navigation owner, but callers that have a precise transition
+// (refresh, type/revision resolution) use openRepositoryInDetails directly.
 async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
   const input = $('#analyzeInput');
-  const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
-  const isDataset = forceType === 'dataset'; // Only set if user explicitly selected dataset
-
   const repo = (repoOverride || input?.value || '').trim();
   if (!repo) {
     showToast('Please enter a repository', 'error');
     return;
   }
+  return openRepositoryInDetails(repo, forceType, revision, 'push');
+}
 
-  // Only an explicit caller choice is a known type. Auto-detect entry points
-  // (typed search, row click, legacy navigation) clear it so refresh can let
-  // the server detect the type again instead of forcing a stale model choice.
-  currentSelectedType = forceType === 'dataset' || forceType === 'model' ? forceType : null;
+async function loadRepositoryDetails(entry) {
+  // Render into the Overview tab panel, not the shared #analyzeResult
+  // container: the Community panel is its sibling and must survive navigation.
+  const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+  if (!resultDiv) return;
+
+  // A new repository transition supersedes a revision picker opened by the
+  // previous navigation. Close it and disarm its handlers without running the
+  // pending-picker cancel hook; the new navigation owns the view now.
+  dismissRevisionPickerForNavigation();
+
+  const repo = entry.repo;
+  const revision = entry.revision;
+  const isDataset = entry.repoType === 'dataset';
+  // The history entry is the explicit type chosen for this navigation. An
+  // auto-detect entry has no type, so refresh must not force a stale choice.
+  currentSelectedType = entry.repoType || null;
+  // Selection state belongs to the transition, not to its result. Point it at
+  // the target before the request so an in-flight or failed navigation never
+  // leaves the previous repository's identity on screen. An untyped entry
+  // keeps its Hub action hidden until analysis resolves the namespace.
+  currentSelectedRepo = repo;
+  currentSelectedIsDataset = isDataset;
+  currentSelectedBranch = revision || 'main';
+  syncSelectedModelHeader();
 
   const focusAfterRetry = retryFocusPending;
   retryFocusPending = false;
@@ -1251,9 +1515,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   try {
+    // Explicit history entries select the namespace with type. An
+    // auto-detect entry (the Analyze field or an unresolved navigation) sends
+    // neither type nor the legacy dataset parameter.
     let queryParams = [];
-    if (forceType === 'dataset') queryParams.push('dataset=true');
-    else if (forceType === 'model') queryParams.push('type=model');
+    if (entry.repoType) queryParams.push(`type=${entry.repoType === 'dataset' ? 'dataset' : 'model'}`);
     if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
     const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
 
@@ -1273,7 +1539,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       currentSelectedIsDataset = false;
       currentSelectedBranch = revision || 'main';
       currentAnalysis = null;
-      if (selectionRepo) syncModelsDetailHeader(selectionRepo, false, currentSelectedBranch);
+      syncSelectedModelHeader();
       renderTypeSelection(data);
       if (focusAfterRetry) resultDiv.querySelector('button')?.focus();
       return;
@@ -1296,13 +1562,21 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       return;
     }
 
+    await syncLocalAnalysisStatus(data);
+    if (requestId !== analyzeRequestId) return;
+
     currentAnalysis = data;
     currentSelectedRepo = data.repo;
     currentSelectedType = data.is_dataset ? 'dataset' : 'model';
     currentSelectedIsDataset = !!data.is_dataset;
-    currentSelectedBranch = data.branch || 'main';
+    currentSelectedBranch = data.branch || revision || 'main';
+    const resolvedEntry = makeRepoHistoryEntry(
+      data.repo,
+      data.is_dataset ? 'dataset' : 'model',
+      currentSelectedBranch
+    );
+    replaceRepoHistoryEntry(resolvedEntry);
     syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
-    await syncLocalAnalysisStatus(data);
     renderAnalysisResult(data);
     if (focusAfterRetry) {
       const tabs = $('#modelsDetailTabs');
@@ -1412,10 +1686,34 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
   }
 
-  // Show revision picker when multiple refs exist
-  function showRevisionPicker(data) {
+  // A new navigation supersedes any picker from the previous one. Dismiss it
+  // without invoking its cancel hook: the old pending stop must not be rendered
+  // or rolled back while the new transition is taking over.
+  function dismissRevisionPickerForNavigation() {
+    if (revisionPickerRequestId === null) return;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
+    revisionPickerNavigationMode = 'replace';
+    revisionPickerCancelHandler = null;
+    const backdrop = $('#modalBackdrop');
+    if (backdrop?.classList.contains('active')) backdrop.classList.remove('active');
+  }
+
+  // Show revision picker when multiple refs exist. Initial navigation shows the
+  // picker for a pending entry; the analysis header reopens it for a rendered
+  // view that must remain in history.
+  function showRevisionPicker(data, navigationMode = 'replace') {
+    revisionPickerNavigationMode = navigationMode;
+    // The initial picker refines the pending entry that navigation already
+    // pushed/replaced. A picker reopened from a rendered analysis is a view
+    // transition, so closing it must not touch that rendered view.
+    const requestId = analyzeRequestId;
+    const cancelOnClose = navigationMode !== 'push';
     const branches = data.refs.filter(r => r.type === 'branch');
     const tags = data.refs.filter(r => r.type === 'tag');
+    const revisionAttrs = (revision) =>
+      `data-revision="${escapeHtmlAttribute(revision)}" data-dataset="${data.is_dataset}" data-repo="${escapeHtmlAttribute(data.repo)}"`;
+    const revisionClick = `onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)"`;
 
     let branchesHtml = '';
     if (branches.length > 0) {
@@ -1424,7 +1722,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           <h5>Branches</h5>
           <div class="ref-list">
             ${branches.map(b => `
-              <button class="ref-btn ${b.name === 'main' ? 'ref-default' : ''}" onclick="selectRevision('${escapeHtml(b.name)}', ${data.is_dataset}, '${escapeHtml(data.repo)}')">
+              <button class="ref-btn ${b.name === 'main' ? 'ref-default' : ''}" ${revisionAttrs(b.name)} ${revisionClick}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                   <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
                 </svg>
@@ -1444,7 +1742,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           <h5>Tags</h5>
           <div class="ref-list">
             ${tags.slice(0, 10).map(t => `
-              <button class="ref-btn" onclick="selectRevision('${escapeHtml(t.name)}', ${data.is_dataset}, '${escapeHtml(data.repo)}')">
+              <button class="ref-btn" ${revisionAttrs(t.name)} ${revisionClick}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                   <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>
                 </svg>
@@ -1464,23 +1762,98 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       ${branchesHtml}
       ${tagsHtml}
       <div class="form-actions" style="margin-top: 20px;">
-        <button class="btn btn-ghost" onclick="hideModal(); selectRevision('main', ${data.is_dataset}, '${escapeHtml(data.repo)}')">Use default (main)</button>
+        <button class="btn btn-ghost" ${revisionAttrs('main')} onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)">Use default (main)</button>
       </div>
     `);
+    // showModal clears picker identity; bind this picker to the navigation
+    // request that opened it so a stale button cannot act after a new one.
+    revisionPickerRequestId = requestId;
+    revisionPickerRepo = String(data.repo || '');
+    // Arm the cancel hook only for the initial pending picker.
+    revisionPickerCancelHandler = cancelOnClose
+      ? () => cancelPendingRevisionPicker(data, requestId)
+      : null;
   }
 
-  // Handle revision selection
+  // Closing the initial picker must not leave the pane on its loading spinner.
+  // Keep the pending history stop explicit instead: the header and selection
+  // state identify the repository, the pane prompts for a revision, and the
+  // prompt can reopen the same picker under the same 'replace' navigation.
+  function cancelPendingRevisionPicker(data, requestId) {
+    if (requestId !== analyzeRequestId || !data?.repo) return;
+    const repoType = data.is_dataset ? 'dataset' : 'model';
+    const entry = currentRepoHistoryEntry();
+    if (!entry || entry.repo !== data.repo || entry.revision) return;
+    if (entry.repoType && entry.repoType !== repoType) return;
+
+    replaceRepoHistoryEntry(makeRepoHistoryEntry(data.repo, repoType, null));
+    currentAnalysis = data;
+    currentSelectedRepo = data.repo;
+    currentSelectedType = repoType;
+    currentSelectedIsDataset = !!data.is_dataset;
+    // No revision is selected while the picker is pending.
+    currentSelectedBranch = null;
+    syncModelsDetailHeader(data.repo, !!data.is_dataset, null);
+    detailActiveTab = 'overview';
+    renderDetailTabs(false);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (resultDiv) {
+      const typeLabel = data.is_dataset ? 'dataset' : 'model';
+      resultDiv.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+            </svg>
+          </div>
+          <h3 id="revisionPendingTitle" tabindex="-1">Select a revision</h3>
+          <p>${escapeHtml(data.repo)} has multiple versions. No revision is selected for this ${typeLabel} yet.</p>
+          <button type="button" class="btn btn-primary" onclick="reopenRevisionPicker()">Choose revision</button>
+        </div>
+      `;
+    }
+    updateScrollArrows();
+  }
+
+  // Reopen the initial picker from its explicit pending prompt.
+  window.reopenRevisionPicker = function() {
+    const data = currentAnalysis;
+    if (!data?.refs || data.refs.length <= 1) return;
+    revisionPickerNavigationMode = 'replace';
+    showRevisionPicker(data, 'replace');
+  };
+
+  // Pending picker selections refine the entry created by the initial
+  // navigation. Picker selections made from a rendered analysis push a new
+  // stop so the previous revision remains reachable with Back.
   window.selectRevision = function(revision, isDataset, repoOverride = null) {
+    // A picker button belongs to the navigation that opened it. Ignore it once
+    // another navigation superseded that identity or the picker was closed, so
+    // the old repository/revision cannot overwrite the newer history stop.
+    if (revisionPickerRequestId === null || revisionPickerRequestId !== analyzeRequestId) return;
+    if (revisionPickerRepo && repoOverride && repoOverride !== revisionPickerRepo) return;
+    // Selection is not cancellation: disarm the pending-picker hook first.
+    const navigationMode = revisionPickerNavigationMode;
+    const pickerRepo = revisionPickerRepo;
+    revisionPickerCancelHandler = null;
     hideModal();
-    const forceType = isDataset ? 'dataset' : 'model';
-    analyzeRepo(forceType, revision, repoOverride || currentAnalysis?.repo || null);
+    const repo = repoOverride || pickerRepo || currentAnalysis?.repo || currentSelectedRepo || null;
+    revisionPickerNavigationMode = 'replace';
+    openRepositoryInDetails(repo, isDataset === true || isDataset === 'true' ? 'dataset' : 'model', revision, navigationMode);
+  };
+
+  window.selectAnalysisType = function(repoType, repoOverride = null) {
+    const repo = repoOverride || currentAnalysis?.repo || currentSelectedRepo || null;
+    const revision = repoHistoryIndex >= 0 ? repoHistory[repoHistoryIndex]?.revision || null : null;
+    openRepositoryInDetails(repo, repoType, revision, 'replace');
   };
 
   // Show revision picker from analysis result (user clicked "change")
   window.showRevisionPickerFromAnalysis = function() {
     if (currentAnalysis && currentAnalysis.refs) {
       hasShownRevisionPicker = false; // Allow showing picker again
-      showRevisionPicker(currentAnalysis);
+      showRevisionPicker(currentAnalysis, 'push');
     }
   };
 
@@ -1497,13 +1870,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
           <div class="analysis-section">
             <h4>${escapeHtml(data.message)}</h4>
             <div style="display: flex; gap: 16px; margin-top: 20px;">
-              <button class="btn btn-primary" onclick="analyzeRepo('model', null, '${escapeHtml(data.repo)}')">
+              <button class="btn btn-primary" data-repo="${escapeHtmlAttribute(data.repo)}" onclick="selectAnalysisType('model', this.dataset.repo)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
                   <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
                 </svg>
                 Analyze as Model
               </button>
-              <button class="btn btn-secondary" onclick="analyzeRepo('dataset', null, '${escapeHtml(data.repo)}')">
+              <button class="btn btn-secondary" data-repo="${escapeHtmlAttribute(data.repo)}" onclick="selectAnalysisType('dataset', this.dataset.repo)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
                   <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
                 </svg>
@@ -1516,7 +1889,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     `;
   }
 
-  // Make analyzeRepo available globally for type selection buttons
+  // Make analyzeRepo available globally for legacy/direct entry points.
   window.analyzeRepo = analyzeRepo;
 
   async function syncLocalAnalysisStatus(data) {
@@ -1631,15 +2004,19 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
               ? 'base model'
               : (node.relation || '');
           const nameStyle = isCurrent
-            ? 'font-size:11px;font-family:var(--font-mono);color:var(--color-text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0'
-            : 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0';
+            ? 'font-size:11px;font-family:var(--font-mono);color:var(--color-text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%'
+            : 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%';
+          const linkNameStyle = nameStyle + ';background:none;border:0;padding:0;color:var(--color-primary);cursor:pointer;text-align:left';
           const tagStyle = isCurrent
             ? 'font-size:10px;color:var(--color-info);flex-shrink:0;margin-left:2px'
             : 'font-size:10px;color:var(--color-text-muted);flex-shrink:0;margin-left:2px';
+          const nameHtml = isCurrent
+            ? `<span style="${nameStyle}">${escapeHtml(node.repo)}</span>`
+            : `<button type="button" class="lineage-repo-link" style="${linkNameStyle}" data-repo="${escapeHtmlAttribute(node.repo)}" title="${escapeHtmlAttribute(node.repo)}" onclick="analyzeRelatedRepo(this.dataset.repo)">${escapeHtml(node.repo)}</button>`;
           return `<div style="display:flex;align-items:center;gap:5px;padding:2px 0;padding-left:${indent}px">
             ${connector}
             <span style="font-size:11px;opacity:.7;flex-shrink:0">${icon}</span>
-            <span style="${nameStyle}">${escapeHtml(node.repo)}</span>
+            ${nameHtml}
             ${relLabel ? `<span style="${tagStyle}">${escapeHtml(relLabel)}</span>` : ''}
           </div>`;
         }).join('');
@@ -1781,7 +2158,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     // Build branch/revision display
     const branchDisplay = data.branch && data.branch !== 'main'
-      ? `<span class="analysis-branch" title="Revision: ${escapeHtml(data.branch)}">
+      ? `<span class="analysis-branch" title="Revision: ${escapeHtmlAttribute(data.branch)}">
            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
              <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
            </svg>
@@ -1864,30 +2241,175 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     setScrollArrowVisibility(_scrollArrowDown, !atBottom);
   }
 
+  let readmeRequestId = 0;
+
   async function loadReadmePreview(data) {
     const section = $('#readmeSection');
     const preview = $('#readmePreview');
     if (!section || !preview || !data?.repo) return;
 
+    const requestId = ++readmeRequestId;
     const params = new URLSearchParams();
     params.set('revision', data.branch || 'main');
     if (data.is_dataset) params.set('dataset', 'true');
 
     try {
       const readme = await api('GET', `/readme/${encodeURI(data.repo)}?${params.toString()}`);
+      if (requestId !== readmeRequestId) return;
       // The server returns sanitized HTML; fall back to the lightweight client
-      // renderer only when it's missing (older server build).
-      preview.innerHTML = readme.html
+      // renderer only when it's missing (older server build). An empty html
+      // string means sanitization removed everything and must stay empty.
+      const baseRawURL = readme.baseRawURL || '';
+      const baseBlobURL = readme.baseBlobURL || readmeBlobBase(baseRawURL);
+      const endpointBase = readmeEndpointBaseFromBlobURL(baseBlobURL, data.repo, data.is_dataset);
+      const hasServerHtml = readme != null && readme.html !== undefined;
+      preview.innerHTML = hasServerHtml
         ? readme.html
-        : renderMarkdownPreview(readme.markdown || '', readme.baseRawURL || '');
+        : renderMarkdownPreview(readme.markdown || '', baseRawURL, baseBlobURL, endpointBase);
       section.hidden = !preview.innerHTML.trim();
     } catch (_) {
+      if (requestId !== readmeRequestId) return;
       section.hidden = true;
     }
     updateScrollArrows();
   }
 
-  function renderMarkdownPreview(markdown, baseRawURL) {
+  // Relative README links resolve against the blob view (same as the server);
+  // images resolve against the raw/resolve view.
+  function readmeBlobBase(baseRawURL) {
+    return String(baseRawURL || '').replace('/resolve/', '/blob/');
+  }
+
+  // Recover the endpoint base (including any configured path prefix) from the
+  // README response's blob base. Newer servers return it directly; older
+  // servers only return baseRawURL, which loadReadmePreview converts first.
+  // The repository suffix is known from the analysis payload.
+  function readmeEndpointBaseFromBlobURL(baseBlobURL, repo, isDataset = false) {
+    const blobBase = String(baseBlobURL || '').trim();
+    if (!blobBase || !isValidReadmeRepo(repo)) return '';
+    const namespace = isDataset ? 'datasets/' : '';
+    const marker = `/${namespace}${repo}/blob/`;
+    const index = blobBase.lastIndexOf(marker);
+    if (index < 0) return '';
+    return blobBase.slice(0, index);
+  }
+
+  function decodeReadmePathSegment(segment) {
+    try {
+      return decodeURIComponent(segment);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isValidReadmeRepo(repo) {
+    const parts = String(repo || '').split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return false;
+    return parts.every(part => part !== '.' && part !== '..' && !part.includes('\\') && !part.includes('\x00'));
+  }
+
+  function isValidReadmeRevision(revision) {
+    if (!revision || revision === '.' || revision === '..') return false;
+    if (revision.includes('\\') || revision.includes('\x00')) return false;
+    for (const ch of revision) {
+      if (ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f) return false;
+    }
+    return true;
+  }
+
+  // Hugging Face top-level paths that are Hub features rather than repository
+  // owners. Keep in sync with readmeReservedModelRoutes in internal/server/readme.go.
+  const README_RESERVED_MODEL_ROUTES = new Set([
+    'about', 'api', 'assets', 'blog', 'brand', 'billing', 'careers', 'changelog',
+    'chat', 'collections', 'contact', 'course', 'courses', 'docs', 'duplicate',
+    'following', 'hardware', 'inference', 'join', 'learn', 'login', 'logout',
+    'models', 'new', 'notifications', 'oauth', 'organizations', 'papers', 'posts',
+    'pricing', 'privacy', 'search', 'security', 'settings', 'signup', 'solutions',
+    'spaces', 'static', 'support', 'tasks', 'terms'
+  ]);
+
+  // Mirror of the server's README repository-link classification. Keeping the
+  // same accepted forms here makes the fallback renderer behave like the
+  // server-rendered HTML on the configured endpoint. Only repository roots and
+  // a tree view with exactly one revision segment are internal; blob/resolve/raw
+  // file URLs and raw multi-segment tree paths stay external.
+  function classifyHfRepoURL(rawURL, baseBlobURL = '', endpointBase = '') {
+    let u;
+    try {
+      u = new URL(rawURL);
+    } catch (_) {
+      return null;
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+
+    // Both the host and the path prefix come from one resolved endpoint so a
+    // settings-less fallback cannot mix baseBlobURL's host with an empty
+    // settings prefix.
+    const endpoint = resolveHfEndpoint(endpointBase, baseBlobURL);
+    if (!endpoint || u.host.toLowerCase() !== endpoint.host) return null;
+
+    const endpointPrefix = endpoint.pathPrefix;
+    if (endpointPrefix === null) return null;
+
+    const segments = [];
+    for (const part of u.pathname.split('/')) {
+      if (!part) continue;
+      const decoded = decodeReadmePathSegment(part);
+      if (decoded === null) return null;
+      segments.push(decoded);
+    }
+    if (endpointPrefix.length) {
+      if (segments.length < endpointPrefix.length) return null;
+      for (let i = 0; i < endpointPrefix.length; i++) {
+        if (segments[i] !== endpointPrefix[i]) return null;
+      }
+      segments.splice(0, endpointPrefix.length);
+    }
+    if (!segments.length) return null;
+
+    let repoType = 'model';
+    if (segments[0] === 'datasets') {
+      repoType = 'dataset';
+      segments.shift();
+    } else if (README_RESERVED_MODEL_ROUTES.has(segments[0])) {
+      return null;
+    }
+    if (segments.length < 2) return null;
+    const repo = `${segments[0]}/${segments[1]}`;
+    if (!isValidReadmeRepo(repo)) return null;
+
+    let revision = null;
+    if (segments.length > 2) {
+      if (segments.length !== 4 || segments[2] !== 'tree') return null;
+      revision = segments[3];
+      if (!isValidReadmeRevision(revision)) return null;
+    }
+    return { repo, repoType, revision };
+  }
+
+  function readmeRepoLinkAttributes(url, baseBlobURL, endpointBase = '') {
+    const link = classifyHfRepoURL(url, baseBlobURL, endpointBase);
+    if (!link) return '';
+    let attrs = ` data-hf-repo="${escapeHtmlAttribute(link.repo)}" data-hf-repo-type="${link.repoType}"`;
+    if (link.revision) attrs += ` data-hf-repo-revision="${escapeHtmlAttribute(link.revision)}"`;
+    return attrs;
+  }
+
+  function handleReadmePreviewClick(e) {
+    const target = e.target;
+    const link = target && target.closest ? target.closest('a[data-hf-repo]') : null;
+    if (!link) return;
+    if (e.defaultPrevented || (e.button && e.button !== 0) || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+
+    const repo = link.getAttribute('data-hf-repo');
+    const revision = link.getAttribute('data-hf-repo-revision') || null;
+    if (!isValidReadmeRepo(repo) || (revision && !isValidReadmeRevision(revision))) return;
+    e.preventDefault();
+    const repoType = link.getAttribute('data-hf-repo-type') === 'dataset' ? 'dataset' : 'model';
+    openRepositoryInDetails(repo, repoType, revision, 'push');
+  }
+
+  function renderMarkdownPreview(markdown, baseRawURL, baseBlobURL, endpointBase = '') {
     if (!markdown) return '';
 
     let text = markdown
@@ -1903,7 +2425,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
 
     const flushParagraph = () => {
       if (!paragraph.length) return;
-      html.push(`<p>${renderMarkdownInline(paragraph.join(' '), baseRawURL)}</p>`);
+      html.push(`<p>${renderMarkdownInline(paragraph.join(' '), baseBlobURL, endpointBase)}</p>`);
       paragraph = [];
     };
 
@@ -1929,7 +2451,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (imageMatch) {
         flushParagraph();
         const src = resolveReadmeURL(imageMatch[2], baseRawURL);
-        html.push(`<img src="${escapeHtml(src)}" alt="${escapeHtml(imageMatch[1])}" loading="lazy">`);
+        if (isSafeReadmeImageURL(src)) {
+          html.push(`<img src="${escapeHtmlAttribute(src)}" alt="${escapeHtmlAttribute(imageMatch[1])}" loading="lazy">`);
+        }
         continue;
       }
 
@@ -1937,13 +2461,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       if (heading) {
         flushParagraph();
         const level = Math.min(heading[1].length + 3, 6);
-        html.push(`<h${level}>${renderMarkdownInline(heading[2], baseRawURL)}</h${level}>`);
+        html.push(`<h${level}>${renderMarkdownInline(heading[2], baseBlobURL, endpointBase)}</h${level}>`);
         continue;
       }
 
       if (/^[-*]\s+/.test(line)) {
         flushParagraph();
-        html.push(`<p class="readme-bullet">${renderMarkdownInline(line.replace(/^[-*]\s+/, ''), baseRawURL)}</p>`);
+        html.push(`<p class="readme-bullet">${renderMarkdownInline(line.replace(/^[-*]\s+/, ''), baseBlobURL, endpointBase)}</p>`);
         continue;
       }
 
@@ -1954,34 +2478,80 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return html.join('');
   }
 
-  function renderMarkdownInline(text, baseRawURL) {
+  function renderMarkdownInline(text, baseBlobURL, endpointBase = '') {
     let html = escapeHtml(text);
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
-      const url = resolveReadmeURL(href, baseRawURL);
-      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>`;
+      // The line was escaped as a whole, so undo that escaping exactly once
+      // before resolving/escaping the attribute. This keeps URL query strings
+      // identical to the server renderer instead of double-escaping "&".
+      const url = resolveReadmeURL(decodeHtmlEntities(href), baseBlobURL);
+      if (!isSafeReadmeLinkURL(url)) return label;
+      const internalAttrs = readmeRepoLinkAttributes(url, baseBlobURL, endpointBase);
+      return `<a href="${escapeHtmlAttribute(url)}" target="_blank" rel="noopener"${internalAttrs}>${label}</a>`;
     });
     return html;
   }
 
-  function resolveReadmeURL(url, baseRawURL) {
+  function decodeHtmlEntities(value) {
+    return String(value)
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#0*39;/g, "'")
+      .replace(/&amp;/g, '&');
+  }
+
+  function resolveReadmeURL(url, baseBlobURL) {
     const clean = String(url || '').trim();
-    if (/^(https?:|data:)/i.test(clean)) return clean;
+    if (/^(https?:|data:|mailto:)/i.test(clean) || clean.startsWith('#')) return clean;
     try {
-      return new URL(clean.replace(/^\.\//, ''), baseRawURL).toString();
+      return new URL(clean.replace(/^\.\//, ''), baseBlobURL).toString();
     } catch (_) {
       return clean;
     }
   }
 
+  // Anchors in the fallback renderer may only keep a safe scheme. The URL
+  // parser also strips embedded tabs/newlines, so "java\tscript:" cannot slip
+  // through as a relative URL.
+  function isSafeReadmeLinkURL(url) {
+    const clean = String(url || '').trim();
+    if (!clean) return false;
+    if (clean.startsWith('#')) return true;
+    try {
+      const parsed = new URL(clean, 'https://hfdesk.invalid/');
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'mailto:';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isSafeReadmeImageURL(url) {
+    const clean = String(url || '').trim();
+    if (!clean) return false;
+    try {
+      const parsed = new URL(clean, 'https://hfdesk.invalid/');
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return true;
+      return parsed.protocol === 'data:' && /^data:image\//i.test(clean);
+    } catch (_) {
+      return false;
+    }
+  }
+
   // Clear analysis and reset to initial state
   window.clearAnalysis = function() {
+    analyzeRequestId++;
+    readmeRequestId++;
     currentAnalysis = null;
     currentGatedState = null;
     currentSelectedRepo = null;
     currentSelectedType = null;
     currentSelectedIsDataset = false;
+    repoHistory = [];
+    repoHistoryIndex = -1;
+    syncRepoHistoryButtons();
     setScrollArrowVisibility(_scrollArrowUp, false);
     setScrollArrowVisibility(_scrollArrowDown, false);
     currentSelectedBranch = 'main';
@@ -2226,6 +2796,8 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       // Keep the route map available to the download/quant modals, which can be
       // opened from the Models page without visiting Settings first.
       state.settings = s;
+      rememberSettingsEndpoint(s);
+      syncSelectedModelHeader();
       if (s.storageMode === 'local') {
         badge.textContent = `Storage: local files → ${s.localDir}`;
         badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
@@ -2480,7 +3052,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     if (job.repo) {
       repoEl.title = 'View model details';
       repoEl.classList.add('job-repo-clickable');
-      repoEl.onclick = () => navigateToAnalyze(job.repo);
+      repoEl.onclick = () => navigateToAnalyze(
+        job.repo,
+        job.isDataset ? 'dataset' : 'model',
+        job.revision || null
+      );
     }
     // Only show the revision when it isn't the default "main" branch —
     // every download is from main, so labelling it adds noise and height.
@@ -3925,6 +4501,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     }
     state.settings = data;
     state.settingsLoadFailed = false;
+    rememberSettingsEndpoint(data);
+    // Settings are authoritative for the configured endpoint, so refresh the
+    // Model Details Hub action when they (re)load after a repository was
+    // already selected.
+    syncSelectedModelHeader();
 
     // Populating the form is separated from the fetch: a partially missing DOM
     // must not be treated as an unknown server state that blocks saving.
@@ -4827,6 +5408,18 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // =========================================
 
   function showModal(title, content) {
+    // Opening any modal supersedes a revision picker. If an initial (pending)
+    // picker is open, settle its pending navigation first with the same explicit
+    // prompt the close hook renders, so an unrelated dialog that replaces the
+    // picker can never leave the pane on its indefinite loading spinner.
+    // Selection is not involved. A repository transition disarms this hook in
+    // dismissRevisionPickerForNavigation before it opens anything, so the old
+    // pending stop is never rolled back while a new navigation takes over.
+    const cancel = revisionPickerCancelHandler;
+    if (cancel) cancel();
+    revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = content;
     $('#modalBackdrop').classList.add('active');
@@ -4837,7 +5430,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   function hideModal() {
+    // Run the scoped cancel hook exactly once, after the dialog is closed.
+    const cancel = revisionPickerCancelHandler;
+    revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
     $('#modalBackdrop').classList.remove('active');
+    if (cancel) cancel();
   }
 
   // Expose hideModal globally for onclick handlers
@@ -5184,7 +5783,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
             ${dl.description ? `<span class="related-download-desc">${escapeHtml(dl.description)}</span>` : ''}
             ${dl.size_human ? `<span class="related-download-size">${escapeHtml(dl.size_human)}</span>` : ''}
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="analyzeRelatedRepo('${escapeHtml(dl.repo)}')">
+          <button class="btn btn-secondary btn-sm" data-repo="${escapeHtmlAttribute(dl.repo)}" onclick="analyzeRelatedRepo(this.dataset.repo)">
             Analyze
           </button>
         </div>`;
@@ -5195,10 +5794,10 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   }
 
   /**
-   * Analyze a related repo (from LoRA base model link).
+   * Analyze a related repo (from LoRA base model / lineage link).
    */
   window.analyzeRelatedRepo = function(repo) {
-    analyzeRepo(null, null, repo);
+    openRepositoryInDetails(repo, 'model', null, 'push');
   };
 
   // =========================================
@@ -5267,25 +5866,27 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     });
 
     // Analyze/refresh button. On the unified Models page this refreshes the
-    // selected repo, not whatever text happens to be in the search field.
+    // current view, not whatever text happens to be in the search field. The
+    // current history entry is authoritative while a navigation is pending
+    // (revision picker, type selection, failure, or an in-flight request), so
+    // refresh cannot target the previously resolved repository. It refines
+    // that entry instead of creating a duplicate.
     btn?.addEventListener('click', () => {
-      const selectedRepo = currentSelectedRepo || currentAnalysis?.repo || '';
-      if (selectedRepo) {
-        // Refresh a known type explicitly. When the type is unknown (a dual
-        // type selection, a search-result row, or a failed generic analysis),
-        // pass null so the server auto-detects instead of forcing model.
-        const selectedType = currentSelectedType === 'dataset'
-          ? 'dataset'
-          : currentSelectedType === 'model' ? 'model' : null;
-        analyzeRepo(
-          selectedType,
-          currentSelectedBranch || currentAnalysis?.branch || 'main',
-          selectedRepo
-        );
+      const entry = currentRepoHistoryEntry();
+      const repo = entry?.repo || currentSelectedRepo || currentAnalysis?.repo || input?.value?.trim();
+      if (!repo) {
+        analyzeRepo();
         return;
       }
-      // A typed-in repo with no selection is a new search, so auto-detect it.
-      analyzeRepo();
+      // The history entry is authoritative for an explicit type. Without one,
+      // preserve auto-detection instead of forcing a stale model selection.
+      const repoType = entry
+        ? entry.repoType
+        : (currentSelectedType || (currentSelectedIsDataset || currentAnalysis?.is_dataset ? 'dataset' : null));
+      const revision = entry
+        ? entry.revision
+        : currentSelectedBranch || currentAnalysis?.branch || 'main';
+      openRepositoryInDetails(repo, repoType, revision, 'replace');
     });
 
     // Example buttons
@@ -5293,9 +5894,17 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       b.addEventListener('click', () => {
         if (input) input.value = b.dataset.repo;
         _syncModelsSearchClear();
-        analyzeRepo(b.dataset.type || null);
+        openRepositoryInDetails(b.dataset.repo, b.dataset.type === 'dataset' ? 'dataset' : null, null, 'push');
       });
     });
+
+    // README links are rendered/replaced inside the analysis pane. Delegate
+    // here rather than binding to #readmePreview, which does not exist yet.
+    $('#analyzeResult')?.addEventListener('click', handleReadmePreviewClick);
+
+    $('#modelsDetailBack')?.addEventListener('click', () => traverseRepoHistory(-1));
+    $('#modelsDetailForward')?.addEventListener('click', () => traverseRepoHistory(1));
+    syncRepoHistoryButtons();
 
     // Filter controls trigger new search
     ['modelsSortSelect','modelsTypeSelect','modelsGguf','modelsDatasets'].forEach(id => {
@@ -5341,7 +5950,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     try {
       const res  = await fetch('/api/search?' + params);
       const data = await res.json();
-      renderModelsResultList(data.results || [], q);
+      renderModelsResultList(data.results || [], q, isDs);
     } catch (e) {
       list.innerHTML = `<div class="models-list-hint" style="color:var(--color-error)">Search error: ${escapeHtml(e.message)}</div>`;
     } finally {
@@ -5356,16 +5965,16 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return parts.join(',');
   }
 
-  function renderModelsResultList(items, q) {
+  function renderModelsResultList(items, q, isDataset = false) {
     const list = $('#modelsResultList');
     if (!items.length) {
       list.innerHTML = `<div class="models-list-hint">${q ? 'No results for "' + escapeHtml(q) + '"' : 'No results'}</div>`;
       return;
     }
-    list.innerHTML = items.map(renderModelRow).join('');
+    list.innerHTML = items.map(r => renderModelRow(r, isDataset)).join('');
   }
 
-  function renderModelRow(r) {
+  function renderModelRow(r, isDataset = false) {
     const parts  = (r.id || '').split('/');
     const author = parts.length > 1 ? parts[0] : '';
     const name   = parts.length > 1 ? parts.slice(1).join('/') : r.id;
@@ -5385,7 +5994,7 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     const capabilityIcons = renderCapabilityIcons(caps.capabilities, caps.titles);
 
     return `
-      <div class="model-row" data-repo="${escapeHtml(r.id)}" onclick="modelsSelectRow(this,'${escapeHtml(r.id)}')">
+      <div class="model-row" data-repo="${escapeHtmlAttribute(r.id)}" data-repo-type="${isDataset ? 'dataset' : 'model'}" onclick="modelsSelectRow(this, this.dataset.repo)">
         <div class="model-row-avatar">${escapeHtml((author || name).substring(0,2).toUpperCase())}</div>
         <div class="model-row-info">
           <div class="model-row-name">${escapeHtml(name)}</div>
@@ -5439,16 +6048,12 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     el.classList.add('model-row-active');
     _currentSelectedRow = el;
 
-    // Update detail header. The row does not tell us whether the repo is a
-    // model or dataset, so leave the type unknown until analysis resolves it.
-    currentSelectedRepo = repoId;
-    currentSelectedType = null;
-    currentSelectedIsDataset = false;
-    currentSelectedBranch = 'main';
-    syncModelsDetailHeader(repoId, false, currentSelectedBranch);
-
     // Keep the search field user-owned; analyze the clicked repo separately.
-    analyzeRepo(null, null, repoId);
+    // Search result rows know whether they came from the model or dataset API,
+    // so the common transition owner sets the header and selection identity
+    // (including the dataset Hub URL) from that type.
+    const repoType = el?.dataset?.repoType === 'dataset' ? 'dataset' : 'model';
+    openRepositoryInDetails(repoId, repoType, null, 'push');
   };
 
   // (legacy compat — old Search page rendered cards with Analyze button)
@@ -5472,9 +6077,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return result.slice(0, 6);
   }
 
-  function navigateToAnalyze(repoId) {
+  function navigateToAnalyze(repoId, repoType = null, revision = null) {
     navigateTo('models');
-    analyzeRepo(null, null, repoId);
+    openRepositoryInDetails(repoId, repoType, revision, 'push');
   }
 
   function formatNumber(n) {
@@ -5604,6 +6209,11 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
     return div.innerHTML;
   }
 
+  // Text escaping alone does not protect quoted HTML attributes.
+  function escapeHtmlAttribute(value) {
+    return escapeHtml(String(value ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
   function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 B';
     const k = 1024;
@@ -5720,7 +6330,9 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
   // =========================================
 
   // Show the build version (from /api/health) in the sidebar, so the UI tracks
-  // the binary instead of a hardcoded number.
+  // the binary instead of a hardcoded number. The same response carries the
+  // effective configured HF endpoint, which lets the Model Details header work
+  // even when /api/settings has not resolved yet or has failed.
   async function loadAppVersion() {
     try {
       const res = await fetch('/api/health');
@@ -5728,6 +6340,13 @@ async function analyzeRepo(forceType = null, revision = null, repoOverride = nul
       const data = await res.json();
       const el = $('#appVersion');
       if (el && data.version) el.textContent = 'v' + data.version;
+      const endpoint = typeof data.endpoint === 'string' ? data.endpoint.trim() : '';
+      if (!endpoint) return;
+      // Settings are authoritative once they have successfully supplied the
+      // endpoint (including the default). A health response that resolves late
+      // must not overwrite that remembered value with its stale startup state.
+      if (!state.settingsEndpointResolved) state.serverEndpoint = endpoint;
+      syncSelectedModelHeader();
     } catch (_) { /* leave blank if unavailable */ }
   }
 

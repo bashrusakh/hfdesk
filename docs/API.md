@@ -25,7 +25,20 @@ Errors return JSON with a legacy flat `error` string and a structured `error_det
 GET /api/health
 ```
 
-Returns server status, version, and timestamp.
+Returns server status, version, timestamp, and the effective configured Hugging Face endpoint.
+
+```json
+{
+  "status": "ok",
+  "version": "1.3.0",
+  "time": "2026-10-19T00:00:00Z",
+  "endpoint": "https://huggingface.co"
+}
+```
+
+`endpoint` is normalized server-side: it defaults to `https://huggingface.co`
+when no custom endpoint is configured, never ends with a trailing slash, and
+preserves any configured path prefix (for example `https://mirror.example/hf`).
 
 ## Search
 
@@ -41,7 +54,9 @@ Searches Hugging Face models or datasets through the configured endpoint/proxy.
 ```http
 GET /api/analyze/{owner}/{repo}?revision=main
 GET /api/analyze/{owner}/{repo}?revision=main&type=model
+GET /api/analyze/{owner}/{repo}?revision=main&type=dataset
 GET /api/analyze/{owner}/{repo}?revision=main&dataset=true
+GET /api/analyze/{owner}/{repo}?revision=main&dataset=false
 ```
 
 With no `type` or `dataset` parameter, analyze auto-detects whether the
@@ -49,6 +64,26 @@ repository is a model or a dataset. `dataset=false` keeps the same
 auto-detection behavior for backwards compatibility.
 
 Returns repository metadata, files, type-specific analysis, selectable download items, and recommended download defaults.
+
+`type` is the explicit namespace selector and takes precedence over the legacy
+`dataset` parameter:
+
+- `model`: force model analysis. The dataset namespace is not probed.
+- `dataset`: force dataset analysis. The model namespace is not probed.
+
+`type` values are matched exactly (no trimming or case folding); any other
+value, including a repeated parameter, returns `400` with an
+`Invalid repository type` error that lists the accepted values.
+`type=model&dataset=true` is contradictory and returns `400`, while
+`type=dataset&dataset=true` is consistent and selects the dataset namespace.
+When `type` is present, `dataset=false` does not override it.
+
+The legacy `dataset` parameter keeps its pre-#135 semantics when `type` is
+absent:
+
+- absent: auto-detect the repository namespace (model first, then dataset). If the same name exists as both, the response is `{"needsSelection": true, "options": ["model", "dataset"]}` instead of repository analysis.
+- `true`: force dataset analysis. The model namespace is not probed.
+- `false`, any other present value, or an empty value: auto-detect. In particular, `dataset=false` does not force the model namespace; use `type=model` for an explicit model selection.
 
 Important response fields:
 
@@ -95,13 +130,16 @@ Select the namespace explicitly:
 
 - `type=model` forces a model-only analysis. The dataset namespace is not
   probed, so a dual-type repository does not return `needsSelection` again.
-- `dataset=true` forces a dataset analysis.
+- `type=dataset` forces a dataset analysis. The model namespace is not probed.
+- `dataset=true` without `type` forces a dataset analysis.
 - Omitting both parameters keeps auto-detection (including the
   `needsSelection` response above).
 
-`type=model` and `dataset=true` are mutually exclusive and return HTTP 400 with
-error code `bad_request` when combined. Any `type` value other than `model`
-also returns HTTP 400.
+`type` accepts only the exact values `model` and `dataset`. A contradictory
+legacy selector (`type=model&dataset=true`) returns HTTP 400 with error code
+`bad_request`, while `type=dataset&dataset=true` is consistent and selects the
+dataset namespace. Any other `type` value, including an unknown, repeated, or
+case-mismatched value, returns HTTP 400.
 
 The selected model or dataset path then runs the same gated-access auth-check
 described in [Gated repositories](#gated-repositories), so a gated dual-type
@@ -301,6 +339,34 @@ event types carry a human-readable `summary`. Event order matches upstream.
 Upstream `400`, `401`, `403`, `404`, and `429` responses keep their status;
 network failures, other upstream statuses, and malformed upstream JSON return
 `502`.
+
+## README
+
+```http
+GET /api/readme/{owner}/{repo}?revision=main&dataset=false
+```
+
+Returns the repository README for a revision. `dataset=true` selects the dataset
+namespace; `revision` defaults to `main`.
+
+Important response fields:
+
+```json
+{
+  "repo": "owner/name",
+  "revision": "main",
+  "path": "README.md",
+  "markdown": "# Name\n...",
+  "baseRawURL": "https://huggingface.co/owner/name/resolve/main/",
+  "baseBlobURL": "https://huggingface.co/owner/name/blob/main/",
+  "html": "<h1>Name</h1>"
+}
+```
+
+`html` is sanitized README HTML and must be preferred whenever present,
+including an empty string (sanitization removed all content). `markdown`,
+`baseRawURL`, and `baseBlobURL` support the older-server client fallback:
+`baseRawURL` resolves images and `baseBlobURL` resolves relative links.
 
 ## Plan
 

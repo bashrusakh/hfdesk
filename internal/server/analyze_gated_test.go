@@ -435,8 +435,67 @@ func TestAnalyzeDatasetSelectionStaysDataset(t *testing.T) {
 	}
 }
 
+// TestAnalyzeExplicitDatasetTypeStaysDataset verifies that type=dataset now
+// selects the dataset namespace directly instead of being rejected as an
+// unknown type.
+func TestAnalyzeExplicitDatasetTypeStaysDataset(t *testing.T) {
+	const repo = "owner/repo"
+	var modelReqs, datasetReqs, datasetAuthReqs, refsReqs atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/models/"+repo+"/tree/main":
+			modelReqs.Add(1)
+			_, _ = w.Write([]byte(`[{"type":"file","path":"data.txt","size":1}]`))
+		case r.URL.Path == "/api/datasets/"+repo+"/tree/main":
+			datasetReqs.Add(1)
+			_, _ = w.Write([]byte(`[{"type":"file","path":"data.txt","size":1}]`))
+		case r.URL.Path == "/api/datasets/"+repo+"/auth-check":
+			datasetAuthReqs.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/datasets/"+repo+"/refs":
+			refsReqs.Add(1)
+			_, _ = w.Write([]byte(`{"branches":[],"tags":[]}`))
+		default:
+			t.Errorf("unexpected analysis request: %s", r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	s := newTestServerWithConfig(t, Config{
+		Endpoint: hub.URL,
+		CacheDir: t.TempDir(),
+		Proxy:    &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/api/analyze/"+repo+"?type=dataset", nil)
+	r.SetPathValue("repo", repo)
+	w := httptest.NewRecorder()
+	s.handleAnalyze(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Repo      string `json:"repo"`
+		IsDataset bool   `json:"is_dataset"`
+		FileCount int    `json:"file_count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Repo != repo || !resp.IsDataset || resp.FileCount != 1 {
+		t.Errorf("response = %+v, want dataset analysis of %q with one file", resp, repo)
+	}
+	if modelReqs.Load() != 0 || datasetReqs.Load() != 1 || datasetAuthReqs.Load() != 1 || refsReqs.Load() != 1 {
+		t.Errorf("model/dataset/auth/refs requests = %d/%d/%d/%d, want 0/1/1/1",
+			modelReqs.Load(), datasetReqs.Load(), datasetAuthReqs.Load(), refsReqs.Load())
+	}
+}
+
 // TestAnalyzeRejectsInvalidTypeSelection pins the 400 contract for an invalid
-// type value and for conflicting type/dataset selections.
+// type value and for conflicting type/dataset selections. type=dataset is a
+// valid selector and is covered by TestAnalyzeExplicitDatasetType.
 func TestAnalyzeRejectsInvalidTypeSelection(t *testing.T) {
 	const repo = "owner/repo"
 	for _, tc := range []struct {
@@ -445,8 +504,7 @@ func TestAnalyzeRejectsInvalidTypeSelection(t *testing.T) {
 		wantDetails string
 	}{
 		{name: "conflicting model and dataset", query: "type=model&dataset=true", wantDetails: "cannot be combined"},
-		{name: "dataset type value", query: "type=dataset", wantDetails: "Expected type=model"},
-		{name: "unknown type value", query: "type=invalid", wantDetails: "Expected type=model"},
+		{name: "unknown type value", query: "type=invalid", wantDetails: "Expected type=model or type=dataset"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)

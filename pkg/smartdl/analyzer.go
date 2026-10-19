@@ -89,6 +89,22 @@ func (a *Analyzer) AnalyzeModelWithRevision(ctx context.Context, repo, revision 
 	return a.analyzeWithRevision(ctx, repo, false, true, revision)
 }
 
+// AnalyzeExplicitWithRevision fetches and analyzes a repository in the
+// explicitly selected namespace at a specific revision. Unlike
+// AnalyzeWithRevision it never falls back to the other namespace and never
+// returns ErrBothExist.
+func (a *Analyzer) AnalyzeExplicitWithRevision(ctx context.Context, repo string, isDataset bool, revision string) (*RepoInfo, error) {
+	if isDataset {
+		return a.analyzeWithRevision(ctx, repo, true, false, revision)
+	}
+	return a.analyzeWithRevision(ctx, repo, false, true, revision)
+}
+
+// analyzeWithRevision is the shared analysis pipeline. isDataset selects the
+// dataset namespace up front; when it is false and forceModel is false, the
+// model namespace is tried first and the dataset namespace is probed only when
+// the model does not exist. forceModel disables that fallback so a dual-type
+// repository resolves as a model instead of ErrBothExist.
 func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDataset, forceModel bool, revision string) (*RepoInfo, error) {
 	if revision == "" {
 		revision = "main"

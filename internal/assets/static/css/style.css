@@ -4898,6 +4898,17 @@ a {
   min-width: 0;
 }
 
+.models-history-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.models-history-btn {
+  padding: 3px 6px !important;
+}
+
 .models-detail-repo {
   font-size: 14px;
   font-weight: 600;
@@ -4921,6 +4932,13 @@ a {
 
 .models-detail-header-right .btn {
   white-space: nowrap;
+}
+
+/* .btn's display rule outranks the UA [hidden] rule, so hidden buttons in the
+   detail header need an explicit display override (e.g. the Hub link while the
+   endpoint is unknown). */
+.models-detail-header-right .btn[hidden] {
+  display: none;
 }
 
 /* Detail tabs (Overview / Community) — directly below the detail header */
