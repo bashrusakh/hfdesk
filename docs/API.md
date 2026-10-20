@@ -482,7 +482,11 @@ the filter becomes a destination directory name. `PlanRepo` and `Download`
 reject a path-shaped filter (one containing `/` or `\`, including a `./` prefix
 or trailing separator, or the `.`/`..` components) with
 `ErrAppendFilterSubdirPathFilter` before any network or plan work. Such filters
-remain valid when `AppendFilterSubdir` is disabled.
+remain valid when `AppendFilterSubdir` is disabled. `POST /api/plan` and a
+dry-run `POST /api/download` request report this combination as HTTP 400 with
+error code `invalid_append_filter_subdir`; a normal non-dry-run download remains
+admitted and runs without filter subdirectories, matching the existing download
+pipeline.
 
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with

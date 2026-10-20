@@ -230,6 +230,11 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 				"Dataset selection is ambiguous", err.Error())
 			return
 		}
+		if errors.Is(err, hfdownloader.ErrAppendFilterSubdirPathFilter) {
+			writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
+				"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to scan repository", err.Error())
 		return
 	}
