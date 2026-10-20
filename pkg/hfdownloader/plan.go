@@ -11,16 +11,24 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
-// would escape the repository root if joined onto a local directory. The path
-// list is remote-controlled (and the endpoint is operator-configurable via
-// --endpoint, so a malicious or MITM'd mirror can return anything), and the
-// path flows unchecked into file writes (filepath.Join(base, rel)) and symlink
-// creation. Anything absolute, containing a "\\" (Windows separator / drive
-// escape), or normalising to "" / "." / ".." / a "../" prefix is rejected to
-// prevent arbitrary-file-write.
+// would escape the repository root if joined onto a local directory, or is not
+// in canonical form. The path list is remote-controlled (and the endpoint is
+// operator-configurable via --endpoint, so a malicious or MITM'd mirror can
+// return anything), and the path flows unchecked into file writes
+// (filepath.Join(base, rel)) and symlink creation. Anything absolute,
+// containing a "\\" (Windows separator / drive escape), or normalising to ""
+// / "." / ".." / a "../" prefix is rejected to prevent arbitrary-file-write.
+// Beyond escape safety, the accepted domain is canonical spellings only: a
+// path whose raw spelling differs from its path.Clean form ("." segment,
+// empty "//" segment, in-root ".." segment, or trailing "/") would be silently
+// rewritten by the downstream SafeJoin/Join into a different physical
+// spelling, so two raw tree paths could plan duplicate writes of one cache
+// entry. Callers fail the plan loudly on the dirty spelling instead.
 func unsafeRepoPath(rel string) bool {
 	if rel == "" {
 		return true
@@ -32,7 +40,8 @@ func unsafeRepoPath(rel string) bool {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return true
 	}
-	return false
+	// Canonical-form check: rel must already be its own cleaned spelling.
+	return cleaned != rel
 }
 
 // unsafeBlobName reports whether a SHA256 value taken from the remote tree
@@ -183,8 +192,14 @@ type PlanItem struct {
 	SHA256       string `json:"sha256,omitempty"`
 	Size         int64  `json:"size"`
 	AcceptRanges bool   `json:"acceptRanges"`
-	// Subdir holds the matched filter (if any) used when --append-filter-subdir is set.
+	// Subdir holds the matched filter attribution (if any).
 	Subdir string `json:"subdir,omitempty"`
+	// DestinationSubdir is the candidate relative prefix selected for this
+	// file. The downloader applies it only when the job enables
+	// AppendFilterSubdir; consumers must check that flag before combining it
+	// with RelativePath. The field is populated independently of that flag and
+	// is distinct from Subdir filter attribution.
+	DestinationSubdir string `json:"destinationSubdir,omitempty"`
 }
 
 // Plan contains the list of files to download.
@@ -222,6 +237,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// files that enter the plan below can never make a filtered request
 	// succeed on their own.
 	directFilterMatch := false
+	datasetMembershipMatch := false
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
@@ -239,11 +255,23 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
 	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if n.Type == "file" || n.Type == "blob" {
 			// Reject path-traversal entries before they reach any filesystem
 			// operation downstream. Fail the whole plan rather than silently
-			// skipping so a tampered tree is loud, not partial.
+			// skipping so a tampered tree is loud, not partial. A non-canonical
+			// but in-root spelling (".", "//", an in-root "..", or a trailing
+			// "/") is reported as such, naming the canonical form the caller
+			// would have rewritten it to: SafeJoin cleans before joining, so
+			// two spellings of one remote file would both be planned and the
+			// two transfers would race to write a single cache entry. The
+			// plan's accepted domain is exactly the canonical spelling.
 			if unsafeRepoPath(n.Path) {
+				if cleaned := path.Clean(n.Path); cleaned != n.Path && cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") {
+					return fmt.Errorf("refusing non-canonical path from repo tree: %q: want %q", n.Path, cleaned)
+				}
 				return fmt.Errorf("refusing unsafe path from repo tree: %q", n.Path)
 			}
 			fileNodes = append(fileNodes, n)
@@ -253,13 +281,164 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if err != nil {
 		return nil, err
 	}
-	baseNames := make([]string, 0, len(fileNodes))
-	for _, node := range fileNodes {
-		baseNames = append(baseNames, strings.ToLower(filepath.Base(node.Path)))
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	ggufMode := isGGUFFilterDownload(baseNames, job.Filters, job.ExactMatch)
-
+	baseNames := make([]string, 0, len(fileNodes))
+	datasetFiles := make([]datasetselection.File, len(fileNodes))
 	for _, n := range fileNodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		baseNames = append(baseNames, strings.ToLower(n.Path))
+		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
+		if len(job.Filters) > 0 && !isExcludedPath(n.Path, job.Excludes) {
+			for _, filter := range job.Filters {
+				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+					directFilterMatch = true
+					break
+				}
+			}
+		}
+	}
+	datasetMembership := datasetselection.Recognize(datasetFiles)
+	// Evidence is input-indexed; project definite data roles once instead of
+	// rescanning the complete evidence slice for every planned file.
+	datasetDataRoles := make([]bool, len(fileNodes))
+	for _, evidence := range datasetMembership.Evidence {
+		if evidence.InputIndex >= 0 && evidence.InputIndex < len(datasetDataRoles) && evidence.DefiniteRole == datasetselection.EvidenceRoleData {
+			datasetDataRoles[evidence.InputIndex] = true
+		}
+	}
+	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
+	var datasetEvaluation datasetDecisionEvaluation
+	// A recognized dataset group remains the governing selection when its files
+	// coexist with GGUFs that happen to match the same filter. GGUF mode is the
+	// fallback only when no dataset group is recognized (e.g. a dataset repo
+	// containing a GGUF-only quant selection).
+	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
+	var recognizedDatasetGroup bool
+	if datasetGroupRequest {
+		membership := datasetMembership
+		// The group evaluator is reached only when a filter is recognized as a
+		// dataset label; do not let unrelated GGUF matches disable its membership
+		// and attribution model.
+		context := compileDatasetDecisionContextWithContext(ctx, fileNodes, membership, job.Filters, job.Excludes, job.ExactMatch, job.IsDataset, false)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// A recognized group label is a membership selector, so a literal path
+		// match on that label cannot satisfy the no-match guard for an otherwise
+		// empty selection. Explicit path forms have different normalized values
+		// and retain their ordinary direct-match semantics.
+		directFilterMatch = datasetDirectPathMatch(fileNodes, job, context.RecognizedLabels)
+		datasetGroupRequest = false
+		for _, filter := range job.Filters {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+			if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
+				datasetGroupRequest = true
+				break
+			}
+		}
+		recognizedDatasetGroup = datasetGroupRequest
+		// Even ordinary filename/path filters use the shared dataset evidence
+		// evaluator so allowlisted companions with data/companion alternatives
+		// are retained or refused based on their actual final emitted-set outcomes.
+		if datasetGroupRequest || job.IsDataset && len(job.Filters) > 0 {
+			// Ordinary non-GGUF dataset selectors also use the shared evaluator,
+			// but retain their distinct path-filter semantics and ambiguity scope.
+			datasetGroupRequest = true
+			// Whole-inventory refusal proofs run after a concrete selection is
+			// established and only for paths whose uncertainty can trigger refusal.
+			world := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+			for bit := range collisionTokenBits(context) {
+				world.SharedToken[bit] = false
+			}
+			for i, input := range context.Inputs {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if len(input.Alternatives) == 0 {
+					return nil, fmt.Errorf("dataset selection has no membership evidence for %q", input.Path)
+				}
+				alternative := input.Alternatives[0]
+				if alternative.Role == datasetselection.EvidenceRoleCompanion {
+					world.Companion[i] = true
+				} else {
+					world.DataLabels[i] = alternative.Label
+				}
+			}
+			var evalErr error
+			datasetEvaluation, evalErr = evaluateDatasetDecisionWorld(context, world)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if evalErr != nil {
+				return nil, fmt.Errorf("evaluate dataset selection: %w", evalErr)
+			}
+			if recognizedDatasetGroup {
+				for i, record := range datasetEvaluation.Records {
+					if record.Selected && world.DataLabels[i] != "" && !world.Companion[i] {
+						datasetMembershipMatch = true
+						break
+					}
+				}
+				if !datasetMembershipMatch {
+					witness := queryDatasetGroupSelection(context)
+					if witness.Err != nil {
+						return nil, witness.Err
+					}
+					if witness.Possible {
+						datasetMembershipMatch = true
+						datasetEvaluation, evalErr = evaluateDatasetDecisionWorld(context, witness.World)
+						if evalErr != nil {
+							return nil, fmt.Errorf("evaluate dataset selection witness: %w", evalErr)
+						}
+						world = witness.World
+					}
+				}
+			}
+			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
+				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
+			}
+			groupSelectionAmbiguous := false
+			for _, filter := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+				if containsString(context.RecognizedLabels, normalized) || !job.ExactMatch && datasetFilterMatchesMembership(context, filter) {
+					groupSelectionAmbiguous = true
+					break
+				}
+			}
+			for i, n := range fileNodes {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if !groupSelectionAmbiguous {
+					continue
+				}
+				can, cannot := datasetDecisionRefusal(context, i)
+				if can.Err != nil {
+					return nil, can.Err
+				}
+				if cannot.Err != nil {
+					return nil, cannot.Err
+				}
+				if can.Possible && cannot.Possible {
+					return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q: %w", n.Path, ErrAmbiguousSelection)
+				}
+			}
+		}
+	}
+	for nodeIndex, n := range fileNodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rel := n.Path
 
 		// Deduplicate by relative path
@@ -272,11 +451,40 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		nameLower := strings.ToLower(name)
 		relLower := strings.ToLower(rel)
 		isLFS := n.LFS != nil
-
+		var datasetRecord datasetDecisionRecord
+		if datasetGroupRequest {
+			datasetRecord = datasetEvaluation.Records[nodeIndex]
+			if !datasetRecord.Selected {
+				_, caseWinner := seenLower[relLower]
+				caseWinner = caseWinner && datasetRecord.Eligible
+				if !caseWinner {
+					continue
+				}
+			}
+			// Ordinary dataset selectors can share the evaluator with dataset
+			// groups, but its companion-role result must not broaden a GGUF-only
+			// quant selection to unrelated model weights. Group selections retain
+			// their established role-aware membership; the filtered GGUF route
+			// is matched-only, while directly requested metadata remains eligible.
+			directDatasetMatch := false
+			for _, filter := range job.Filters {
+				if filterMatchesPath(rel, filter, job.ExactMatch) {
+					directDatasetMatch = true
+					break
+				}
+			}
+			if !recognizedDatasetGroup && ggufMode && !isGGUFFilePath(relLower) &&
+				!directDatasetMatch {
+				continue
+			}
+		}
 		// Check excludes first - if file matches any exclude pattern, skip it
 		// Credits: Exclude feature suggested by jeroenkroese (#41)
 		excluded := false
 		for _, ex := range job.Excludes {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			exLower := strings.ToLower(ex)
 			if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
 				excluded = true
@@ -287,56 +495,83 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 			continue
 		}
 
-		// Direct selection match: proof that a requested filter actually
-		// matched this file. Computed for every non-excluded file before any
-		// GGUF/LFS inclusion decision and regardless of whether the file later
-		// enters the plan, so an excluded file never confirms selection while
-		// a valid direct match of e.g. a plain non-LFS config.json is not
-		// missed. Prefer the longest matching filter (same rule as the
-		// inclusion branches below, which reuse this value).
-		directMatchedFilter := ""
-		for _, f := range job.Filters {
-			if filterMatches(nameLower, strings.ToLower(f), job.ExactMatch) {
-				if len(f) > len(directMatchedFilter) {
-					directMatchedFilter = f
-				}
-			}
-		}
-		if directMatchedFilter != "" {
-			directFilterMatch = true
-		}
-
-		// matchedFilter feeds PlanItem.Subdir and is only set by the inclusion
-		// branches below; it is not the selection proof (see directMatchedFilter).
+		// matchedFilter feeds PlanItem.Subdir and is set only by the established
+		// inclusion branches below; direct selection proof is tracked separately.
 		matchedFilter := ""
+		matchedFilterLength := 0
+		if datasetGroupRequest {
+			matchedFilter = datasetRecord.Subdir
+		}
 		// This shared rule narrows only GGUF entries. In GGUF mode, retain the
 		// original filter behavior for non-GGUF files, including explicitly
 		// requested companions.
-		if strings.HasSuffix(nameLower, ".gguf") && len(job.Filters) > 0 &&
+		if !datasetGroupRequest && ggufMode && isGGUFFilePath(nameLower) && len(job.Filters) > 0 &&
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
-		if ggufMode {
-			// Keep only files that match a filter: the selected quant's shards
-			// and any mmproj companion. Everything else is skipped. The loop
-			// this replaced computed exactly directMatchedFilter (same name,
-			// filters, exact mode, longest-match rule).
-			matchedFilter = directMatchedFilter
-			if matchedFilter == "" {
-				continue
+		if datasetGroupRequest {
+			// Inclusion and attribution come from one concrete dataset world.
+		} else if ggufMode {
+			// GGUF-only selection is matched-only: keep selected GGUF/mmproj and
+			// directly matched files, but do not infer metadata companions.
+			for _, f := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if filterMatchesPath(rel, f, job.ExactMatch) {
+					if len(f) > matchedFilterLength {
+						matchedFilter = f
+						matchedFilterLength = len(f)
+					}
+				}
 			}
-		} else if isLFS && len(job.Filters) > 0 {
-			// Same computation as the ggufMode branch above: directMatchedFilter.
-			matchedFilter = directMatchedFilter
-			// If filters provided and none matched, skip typical large LFS blobs
 			if matchedFilter == "" {
-				ln := strings.ToLower(name)
-				ext := strings.ToLower(filepath.Ext(name))
-				if ext == ".bin" || ext == ".act" || ext == ".safetensors" || ext == ".zip" || strings.HasSuffix(ln, ".gguf") || strings.HasSuffix(ln, ".ggml") {
+				metadata := job.IsDataset && isRecognizedDatasetMetadataPath(rel)
+				if isLFS || !metadata || datasetDataRoles[nodeIndex] {
 					continue
 				}
 			}
+		} else if len(job.Filters) > 0 {
+			for _, f := range job.Filters {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if filterMatchesPath(rel, f, job.ExactMatch) {
+					if len(f) > matchedFilterLength {
+						matchedFilter = f
+						matchedFilterLength = len(f)
+					}
+				}
+			}
+			// Filters select payloads by their full repo-relative path. An unmatched
+			// LFS entry is payload for planning purposes, regardless of extension:
+			// mirrors may store configs and other metadata as LFS pointers too.
+			if matchedFilter == "" {
+				if isLFS {
+					continue
+				}
+				// Ordinary model selection follows the established upstream
+				// companion policy: retain every non-LFS file, regardless of
+				// basename or directory. Preserve dataset service-metadata rules.
+				if job.IsDataset {
+					if !isRecognizedDatasetMetadataPath(rel) {
+						continue
+					}
+				}
+			}
 		}
+		// Ordinary non-LFS model files keep their repo-relative destination.
+		// matchedFilter is used by AppendFilterSubdir to alter that destination;
+		// only dataset membership attribution and the established GGUF/LFS
+		// branches provide a destination subdirectory.
+		if !job.IsDataset && !isLFS && !isGGUFFilePath(nameLower) {
+			matchedFilter = ""
+		}
+		// Normalize attribution once after the inclusion branch has chosen its
+		// winning filter. Dataset feasibility retains the original selector for
+		// matching/precedence, but its public Subdir must not expose the identity
+		// marker any more than the direct model-selection branches do.
+		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
 		// Build URL and file size
 		var urlStr string
@@ -398,51 +633,291 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		seenLower[relLower] = struct{}{}
 
+		destinationSubdir := matchedFilter
+		if job.IsDataset && !isLFS && !isGGUFFilePath(nameLower) &&
+			(!ggufMode || datasetDataRoles[nodeIndex]) {
+			destinationSubdir = ""
+		}
 		items = append(items, PlanItem{
-			RelativePath: rel,
-			URL:          urlStr,
-			LFS:          isLFS,
-			SHA256:       sha,
-			Size:         size,
-			AcceptRanges: acceptRanges,
-			Subdir:       matchedFilter, // empty when no filter matched
+			RelativePath:      rel,
+			URL:               urlStr,
+			LFS:               isLFS,
+			SHA256:            sha,
+			Size:              size,
+			AcceptRanges:      acceptRanges,
+			Subdir:            matchedFilter, // empty when no filter matched
+			DestinationSubdir: destinationSubdir,
 		})
 	}
-	// A non-empty filter set must have produced at least one direct selection
-	// match across the scanned tree (excludes applied). Companion/metadata
-	// files alone never make a filtered request succeed. An empty repo
-	// without filters still returns a successful empty plan.
-	if len(job.Filters) > 0 && !directFilterMatch {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A non-empty filter set must directly match a non-excluded path, or
+	// select data through the recognized dataset-membership contract. Merely
+	// retaining companions/metadata cannot make an otherwise empty selection
+	// succeed. An unfiltered empty repository remains valid.
+	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	return &Plan{Items: items, Commit: commitSHA}, nil
 }
 
-// GGUFPathSelected reports whether a known relative GGUF filename survives the
-// same excludes and filter predicate used by PlanRepo. It is also used by the
-// job manager to prove that a queued filtered job cannot write a selected
-// local GGUF path before that job has been dispatched and planned.
+// isGGUFFilePath reports whether a path names a GGUF artifact, including the
+// legacy ".gguf-split" shard extension. It is intentionally a suffix check:
+// callers use it to classify known paths, not to infer file types.
+func isGGUFFilePath(relativePath string) bool {
+	lower := strings.ToLower(relativePath)
+	return strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".gguf-split")
+}
+
+// GGUFPathSelected is the direct per-path predicate for a known relative GGUF
+// filename in matched-only contexts, including GGUF-only planning and the
+// dataset GGUF projection. It does not describe the complete ordinary-model
+// emission policy: an unmatched non-LFS file can still be emitted by an
+// ordinary model plan.
 func GGUFPathSelected(relativePath string, filters, excludes []string, exact bool) bool {
 	name := strings.ToLower(filepath.Base(relativePath))
-	if !strings.HasSuffix(name, ".gguf") {
+	if !isGGUFFilePath(name) {
 		return false
 	}
-	rel := strings.ToLower(relativePath)
-	for _, ex := range excludes {
-		exLower := strings.ToLower(ex)
-		if strings.Contains(name, exLower) || strings.Contains(rel, exLower) {
-			return false
-		}
+	if isExcludedPath(relativePath, excludes) {
+		return false
 	}
 	if len(filters) == 0 {
 		return true
 	}
 	for _, filter := range filters {
-		if filterMatches(name, strings.ToLower(filter), exact) {
+		if filterMatchesPath(relativePath, filter, exact) {
 			return true
 		}
 	}
 	return false
+}
+
+func datasetFilterMatchesMembership(c datasetDecisionContext, filter string) bool {
+	for _, label := range c.RecognizedLabels {
+		if filterMatchesPath(label, filter, false) {
+			return true
+		}
+	}
+	return false
+}
+
+// datasetDirectPathMatch reports whether any non-excluded inventory path is
+// selected by a filter that is not itself a recognized dataset group label.
+// Group labels select through membership evidence instead, so their path
+// spellings must not keep an otherwise empty filtered selection alive.
+func datasetDirectPathMatch(nodes []hfNode, job Job, recognizedLabels []string) bool {
+	for _, n := range nodes {
+		if isExcludedPath(n.Path, job.Excludes) {
+			continue
+		}
+		for _, filter := range job.Filters {
+			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+			if containsString(recognizedLabels, normalized) {
+				continue
+			}
+			if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsPath(dirs map[string]struct{}, dir string) bool {
+	for current := dir; current != "." && current != "/"; current = path.Dir(current) {
+		if _, ok := dirs[current]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// matchedFilterDirectories returns the directories that contain a matched file
+// or an ancestor of one. They define the companion scope for active non-GGUF
+// filters: root files remain shared companions, while unrelated component
+// metadata does not leak into the plan. GGUF mode intentionally has no
+// companion scope because it is matched-only.
+func matchedFilterDirectories(fileNodes []hfNode, job Job, ggufMode bool) map[string]struct{} {
+	dirs := make(map[string]struct{})
+	if len(job.Filters) == 0 || ggufMode {
+		return dirs
+	}
+	for _, n := range fileNodes {
+		if isExcludedPath(n.Path, job.Excludes) {
+			continue
+		}
+		matched := false
+		for _, filter := range job.Filters {
+			if filterMatchesPath(n.Path, filter, job.ExactMatch) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			dirs[dir] = struct{}{}
+		}
+	}
+	return dirs
+}
+
+func isExcludedPath(rel string, excludes []string) bool {
+	nameLower := strings.ToLower(filepath.Base(rel))
+	relLower := strings.ToLower(rel)
+	for _, ex := range excludes {
+		exLower := strings.ToLower(ex)
+		if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
+			return true
+		}
+	}
+	return false
+}
+
+// GGUFPathMayBeEmitted is a conservative per-path projection for use when a
+// complete plan is not yet available; it is not a substitute for PlanRepo or
+// its completed destinations. Ordinary model selection retains every non-LFS
+// file, so without the remote tree the storage type and selection mode are
+// unknown and any non-excluded path may be emitted. Dataset selection retains
+// its narrower role-aware policy. Server admission scopes this projection to
+// reachable writable namespaces and prefers complete frozen destinations
+// when available; the projection does not imply a global conflict.
+func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
+	for _, exclude := range job.Excludes {
+		if strings.Contains(strings.ToLower(relativePath), strings.ToLower(exclude)) {
+			return false
+		}
+	}
+	if !job.IsDataset {
+		return true
+	}
+	return GGUFPathSelected(relativePath, job.Filters, job.Excludes, job.ExactMatch)
+}
+
+// isRecognizedModelMetadata uses narrow, established model-context names. It
+// does not classify arbitrary JSON/TXT files or claim that every such name is
+// metadata in every repository.
+func isRecognizedModelMetadata(relativePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	switch base {
+	case "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt", "vocab.txt":
+		return true
+	}
+	return isREADMEPath(relativePath)
+}
+
+// Dataset metadata keeps its established recognition domain. A basename that
+// is a model tokenizer asset (notably vocab.txt) is not thereby dataset metadata.
+func isRecognizedDatasetMetadataPath(relativePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(relativePath, "\\", "/")))
+	return base != "vocab.txt" && (isRecognizedMetadataPath(relativePath) || datasetselection.IsMetadata(relativePath))
+}
+
+func isRecognizedMetadataPath(relativePath string) bool {
+	return isRecognizedModelMetadata(relativePath) || isDatasetServiceMetadata(relativePath)
+}
+
+// isKnownDatasetCompanionPath is the positive allowlist for unmatched dataset
+// companions. README/LICENSE variants are recognized metadata and allowed
+// anywhere; every other known name or extension is scoped to the repository
+// root or a conventional non-data directory. Unknown names remain unknown.
+func isKnownDatasetCompanionPath(relativePath string) bool {
+	p := normalizeDatasetCompanionPath(relativePath)
+	if isDatasetReadmeOrLicensePath(p) || isDatasetInfoCompanionPath(p) {
+		return true
+	}
+	if !isConventionalCompanionDirectory(p) {
+		return false
+	}
+	return isKnownScopedDatasetCompanionBase(strings.ToLower(path.Base(p)))
+}
+
+func isDatasetInfoCompanionPath(relativePath string) bool {
+	switch strings.ToLower(path.Base(normalizeDatasetCompanionPath(relativePath))) {
+	case "dataset_info.json", "dataset_infos.json":
+		return true
+	}
+	return false
+}
+
+func normalizeDatasetCompanionPath(relativePath string) string {
+	return strings.TrimPrefix(strings.ReplaceAll(relativePath, "\\", "/"), "./")
+}
+
+func isDatasetReadmeOrLicensePath(relativePath string) bool {
+	base := strings.ToLower(path.Base(normalizeDatasetCompanionPath(relativePath)))
+	if isREADMEPath(relativePath) {
+		return true
+	}
+	if base == "license" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(base, "license")
+	if !ok {
+		return false
+	}
+	if strings.HasPrefix(rest, "-") {
+		return len(rest) > 1
+	}
+	switch rest {
+	case ".md", ".markdown", ".rst", ".txt":
+		return true
+	}
+	return false
+}
+
+func isKnownScopedDatasetCompanionBase(base string) bool {
+	switch base {
+	case "config.json", "generation_config.json", "preprocessor_config.json",
+		"processor_config.json", "quantization_config.json", "adapter_config.json",
+		"tokenizer.json", "tokenizer_config.json",
+		"special_tokens_map.json", "added_tokens.json", "vocab.json",
+		"merges.txt", "vocab.txt",
+		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
+		"environment.yaml", "dockerfile", "makefile", ".gitattributes",
+		".gitignore", "tokenizer.bin", "copying", "notice":
+		return true
+	}
+	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
+		return true
+	}
+	if strings.HasPrefix(base, "environment") &&
+		(strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml")) {
+		return true
+	}
+	switch path.Ext(base) {
+	case ".model", ".spm", ".tiktoken", ".vocab", ".merges", ".jinja", ".j2",
+		".md", ".markdown", ".rst", ".yaml", ".yml", ".toml", ".ini",
+		".cfg", ".conf", ".py", ".sh", ".bash", ".zsh", ".bat", ".ps1",
+		".sql", ".html", ".css", ".js", ".ts", ".ipynb", ".cff":
+		return true
+	}
+	return false
+}
+
+// isConventionalCompanionDirectory reports whether a path is at the repository
+// root or below a top-level docs/config/script/tokenizer directory. Directory
+// matching is case-insensitive; split-like directories and arbitrary nested
+// paths are excluded.
+func isConventionalCompanionDirectory(relativePath string) bool {
+	p := normalizeDatasetCompanionPath(relativePath)
+	dir := path.Dir(p)
+	if dir == "." || dir == "" {
+		return true
+	}
+	first, _, _ := strings.Cut(dir, "/")
+	switch strings.ToLower(first) {
+	case "docs", "doc", "notebooks", "scripts", "tools", "utils", "examples", "configs", "config", "tokenizer":
+		return true
+	}
+	return false
+}
+
+func isDatasetServiceMetadata(relativePath string) bool {
+	return strings.EqualFold(path.Base(strings.ReplaceAll(relativePath, "\\", "/")), "dataset_info.json")
 }
 
 // filterMatches reports whether filter fLower matches the file name nameLower
@@ -479,6 +954,68 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 	return false
 }
 
+// filterMatchesPath matches a filter against the complete repository-relative
+// path. Substring mode intentionally retains the historical broad matching,
+// while exact mode treats directory components, filename segments, extensions,
+// and explicit directory prefixes as separate forms.
+func filterMatchesPath(rel, filter string, exact bool) bool {
+	rel = strings.ToLower(strings.ReplaceAll(rel, "\\", "/"))
+	filter = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+	if rel == "" || filter == "" {
+		return false
+	}
+	if !exact {
+		return strings.Contains(rel, filter)
+	}
+
+	// A trailing slash is an explicit directory selection. It must start at a
+	// path component boundary, so "unet/" does not select "myunet/".
+	if strings.HasSuffix(filter, "/") {
+		dir := strings.TrimSuffix(filter, "/")
+		return strings.HasPrefix(rel, dir+"/") || strings.Contains(rel, "/"+dir+"/")
+	}
+	// Extension filters are written as ".safetensors" and select that exact
+	// extension without making the leading dot a filename delimiter.
+	if strings.HasPrefix(filter, ".") && !strings.Contains(filter[1:], "/") {
+		return strings.HasSuffix(rel, filter)
+	}
+	// "./name" is the additive exact-only spelling for a literal root basename.
+	// Canonical repository paths cannot contain a dot segment, so this spelling
+	// is distinct from every pre-existing path or basename filter.
+	if strings.HasPrefix(filter, "./") {
+		name := strings.TrimPrefix(filter, "./")
+		return name != "" && name != "." && name != ".." && !strings.Contains(name, "/") && rel == name
+	}
+	// A slash-containing filter is a complete relative path form.
+	if strings.Contains(filter, "/") {
+		return rel == filter
+	}
+	parts := strings.Split(rel, "/")
+	for _, part := range parts[:len(parts)-1] {
+		if filterMatches(part, filter, true) {
+			return true
+		}
+	}
+	return filterMatches(parts[len(parts)-1], filter, true)
+}
+
+// filterAttribution removes the root-selector marker before a matched filter
+// becomes a public Subdir or DestinationSubdir. Selection identity and output
+// attribution are separate: the marker must never become part of a destination.
+func filterAttribution(filter string, exact bool) string {
+	if !exact {
+		return filter
+	}
+	filter = strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/")
+	if strings.HasPrefix(filter, "./") {
+		name := strings.TrimPrefix(filter, "./")
+		if name != "" && name != "." && name != ".." && !strings.Contains(name, "/") {
+			return name
+		}
+	}
+	return filter
+}
+
 // isFilterDelimiter reports whether r separates segments for exact-match
 // filtering. Underscores are intentionally NOT delimiters because quantization
 // names contain them (e.g. Q6_K, Q4_K_M).
@@ -486,28 +1023,144 @@ func isFilterDelimiter(r rune) bool {
 	return r == '-' || r == '.' || r == ' '
 }
 
-// isGGUFFilterDownload reports whether the given filters target a .gguf file in
-// the supplied set of file base names (all expected lowercased). When true the
+// isGGUFFilterDownload reports whether the given filters select only GGUF files
+// (`.gguf` or legacy `.gguf-split` shards) in the supplied set of file paths
+// (all expected lowercased). When true the
 // download is treated as GGUF-only: because a GGUF file is self-contained, the
 // plan keeps just the filter-matched files (the chosen quant's shards plus any
 // mmproj companion) and drops config/tokenizer JSON, README, .gitattributes and
-// fp16/ transformers metadata. For non-GGUF filters (e.g. "safetensors") this
-// returns false so those companion files are still downloaded.
+// fp16/ transformers metadata. A filter can match both GGUF and non-GGUF files
+// (for example, a selected directory), so mixed selections retain the normal
+// companion scope instead.
 func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
+	return isGGUFFilterDownloadWithExcludes(baseNames, filters, nil, exact)
+}
+
+func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exact bool) bool {
 	if len(filters) == 0 {
 		return false
 	}
-	for _, base := range baseNames {
-		if !strings.HasSuffix(base, ".gguf") {
+	matchedGGUF := false
+	matchedNonGGUF := false
+	for _, filePath := range baseNames {
+		if isExcludedPath(filePath, excludes) {
 			continue
 		}
 		for _, f := range filters {
-			if filterMatches(base, strings.ToLower(f), exact) {
+			if !filterMatchesPath(filePath, f, exact) {
+				continue
+			}
+			if isGGUFFilePath(filePath) {
+				matchedGGUF = true
+			} else if isModelPayloadPath(filePath) {
+				matchedNonGGUF = true
+			}
+			break
+		}
+	}
+	return matchedGGUF && !matchedNonGGUF
+}
+
+// isModelPayloadPath is positive evidence that a directly matched non-GGUF
+// entry is another model payload. Unknown files and recognized companions do
+// not change GGUF selection mode; they remain downloadable only when directly
+// selected. Keep this deliberately separate from storage/LFS status.
+func isModelPayloadPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	// Exclude recognized optimizer/trainer artifact names, not every basename
+	// that happens to contain those words. A model weight such as
+	// training-model.safetensors is still another payload.
+	if isTrainingArtifactBase(base) {
+		return false
+	}
+	switch path.Ext(base) {
+	case ".safetensors", ".onnx", ".pt", ".pth", ".ckpt", ".gguf-split", ".ggml":
+		return true
+	case ".bin":
+		return !strings.Contains(base, "tokenizer")
+	}
+	// These exact Hugging Face/framework filenames are documented parameter
+	// artifacts. Extension alone is not sufficient: arbitrary files such as
+	// custom.msgpack or checkpoint.h5 remain unknown and do not activate mixed
+	// model fallback. Numbered shard forms are accepted only for the established
+	// Transformers Flax and TensorFlow names.
+	if base == "flax_model.msgpack" || base == "diffusion_flax_model.msgpack" ||
+		isNumberedArtifactShard(base, "flax_model", ".msgpack") ||
+		base == "tf_model.h5" || isNumberedArtifactShard(base, "tf_model", ".h5") ||
+		base == "model.tflite" || base == "rust_model.ot" {
+		return true
+	}
+	return false
+}
+
+// isTrainingArtifactBase recognizes delimiter-bounded optimizer/trainer state
+// names. It deliberately does not match arbitrary substrings: model weights may
+// legitimately carry a "training" token (training-model.safetensors,
+// model-training.pt) without being training artifacts.
+func isTrainingArtifactBase(base string) bool {
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	tokens := strings.FieldsFunc(stem, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	})
+	if len(tokens) == 0 {
+		return false
+	}
+	for i, token := range tokens {
+		if token == "optimizer" {
+			return true
+		}
+		if i+1 >= len(tokens) {
+			continue
+		}
+		switch token {
+		case "training", "trainer":
+			next := tokens[i+1]
+			if next == "args" || next == "state" || next == "states" {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func isNumberedArtifactShard(base, stem, extension string) bool {
+	prefix := stem + "-"
+	if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, extension) {
+		return false
+	}
+	shard := strings.TrimSuffix(strings.TrimPrefix(base, prefix), extension)
+	parts := strings.Split(shard, "-of-")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	for _, part := range parts {
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isREADMEPath identifies README documents (bare README or a recognized text
+// extension) that may carry a selected GGUF quant token in their filename.
+// They are descriptive companions, not evidence that a filter also selected a
+// non-GGUF payload.
+func isREADMEPath(filePath string) bool {
+	base := strings.ToLower(path.Base(strings.ReplaceAll(filePath, "\\", "/")))
+	if base == "readme" {
+		return true
+	}
+	if !strings.HasPrefix(base, "readme") {
+		return false
+	}
+	switch path.Ext(base) {
+	case ".md", ".markdown", ".rst", ".txt":
+		return true
+	default:
+		return false
+	}
 }
 
 // destinationBase returns the base output directory for a job.

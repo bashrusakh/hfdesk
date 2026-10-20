@@ -301,6 +301,12 @@
       if (state.currentPage === 'jobs') {
         renderJobs();
       }
+      // Reconnects and re-renders can arrive while an analysis is open. Re-read
+      // cache presence once on the initial snapshot so a job that finished
+      // while the socket was down cannot leave a stale queued/running chip.
+      if (currentAnalysis?.repo) {
+        scheduleLiveAnalysisReconcile({ syncCache: true });
+      }
     } else if (msg.type === 'job_update') {
       // Job update - data contains the full job object
       const job = msg.data;
@@ -311,6 +317,9 @@
           renderJobs();
         }
         scheduleCompletedRemoval(job);
+        if (jobMatchesAnalysis(job, currentAnalysis)) {
+          scheduleLiveAnalysisReconcile({ syncCache: job.status === 'completed' });
+        }
       }
     }
   }
@@ -1514,8 +1523,18 @@ async function loadRepositoryDetails(entry) {
       return;
     }
 
+    // Reconcile live job state before the cache check. Job state contributes
+    // running/queued for artifacts; cache presence (and a 404) is the final
+    // authority for artifact 'done' status. Job completion does not prove the
+    // artifact is cached: a file can be skipped while another process is still
+    // downloading it.
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
     await syncLocalAnalysisStatus(data);
     if (requestId !== analyzeRequestId) return;
+    // Restore completed legacy token statuses after the cache check, matching
+    // the previous behavior for non-artifact rows. Artifact keys stay owned by
+    // cache presence, so a 404 or missing file still clears their done state.
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
 
     currentAnalysis = data;
     currentSelectedRepo = data.repo;
@@ -1530,6 +1549,11 @@ async function loadRepositoryDetails(entry) {
     replaceRepoHistoryEntry(resolvedEntry);
     syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
     renderAnalysisResult(data);
+    // A job event can arrive after the cache fetch above but before
+    // currentAnalysis points at this repository. handleWSMessage compares
+    // against the previous analysis and cannot schedule it, so reconcile once
+    // now that the new analysis is committed and rendered.
+    reconcileAnalysisAfterLoad();
     if (focusAfterRetry) {
       const tabs = $('#modelsDetailTabs');
       if (tabs && !tabs.hidden) $('#modelsTabOverview')?.focus();
@@ -1846,14 +1870,19 @@ async function loadRepositoryDetails(entry) {
 
   async function syncLocalAnalysisStatus(data) {
     if (!data?.repo || !data.selectable_items?.length) return;
+    const isDataset = !!data.is_dataset;
     try {
-      const map = getDlStatus(data.repo);
-      const resp = await fetch(`/api/cache/${data.repo}`);
+      const map = getDlStatus(data.repo, isDataset);
+      // /api/cache/<repo> without a type prefers the model namespace. A repo
+      // that exists as both model and dataset must be looked up in the
+      // namespace the open analysis actually represents.
+      const repoType = isDataset ? 'dataset' : 'model';
+      const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
       let changed = false;
 
       if (resp.status === 404) {
         data.selectable_items.forEach(item => {
-          const key = item.filter_value || item.id || '';
+          const key = selectableStatusKey(item);
           if (!key || map[key] !== 'done') return;
           delete map[key];
           changed = true;
@@ -1865,7 +1894,7 @@ async function loadRepositoryDetails(entry) {
         const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
 
         data.selectable_items.forEach(item => {
-          const key = item.filter_value || item.id || '';
+          const key = selectableStatusKey(item);
           const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
           if (!key || !files.length) return;
 
@@ -1883,18 +1912,54 @@ async function loadRepositoryDetails(entry) {
         });
       }
 
-      if (changed) {
-        const storageKey = 'dlStatus:' + data.repo;
-        if (Object.keys(map).length === 0) localStorage.removeItem(storageKey);
-        else localStorage.setItem(storageKey, JSON.stringify(map));
-      }
+      if (changed) saveDlStatus(data.repo, isDataset, map);
     } catch {
-      // Cache lookup is best-effort; remote analysis should still render.
+      // Cache lookup is best-effort; remote analysis should still render. Cache
+      // presence is nevertheless the only authority for artifact 'done', so a
+      // transient lookup/parse failure must not leave a stale downloaded
+      // artifact hiding its Download button. Legacy non-artifact token statuses
+      // keep their last-known-good value.
+      const map = getDlStatus(data.repo, isDataset);
+      let changed = false;
+      data.selectable_items.forEach(item => {
+        const key = selectableStatusKey(item);
+        if (!String(key).startsWith('artifact:') || map[key] !== 'done') return;
+        delete map[key];
+        changed = true;
+      });
+      if (changed) saveDlStatus(data.repo, isDataset, map);
     }
   }
 
   function normalizeRepoPath(path) {
     return String(path || '').replace(/\\/g, '/').toLowerCase();
+  }
+
+  function selectableStatusKey(item) {
+    const files = Array.isArray(item?.files) ? item.files : [];
+    if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
+      return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
+    }
+    return item?.filter_value || item?.id || '';
+  }
+
+  function artifactRequestPaths(files) {
+    return files.map(path => {
+      const normalized = String(path || '').replace(/\\/g, '/');
+      return normalized && !normalized.includes('/') ? `./${normalized}` : normalized;
+    });
+  }
+
+  // Jobs normalize root-level selectors to "./name" while selectable items
+  // carry repository-relative paths. Strip that root prefix on both sides so
+  // a filter and the file it selects compare in the same path space.
+  function normalizeArtifactPath(path) {
+    return normalizeRepoPath(String(path || '').replace(/^\.\//, ''));
+  }
+
+  function artifactJobPaths(filters) {
+    if (!Array.isArray(filters) || !filters.length) return [];
+    return filters.map(normalizeArtifactPath);
   }
 
   function renderAnalysisResult(data) {
@@ -5248,24 +5313,91 @@ async function loadRepositoryDetails(entry) {
    * Works for all model types: GGUF quantizations, Diffusers components, etc.
    */
   // ── Quant/selectable row download status ──────────────────────────
-  // localStorage key: "dlStatus:<repo>" → { "<filter_value>": "queued"|"running"|"done" }
-  function getDlStatus(repo) {
-    try { return JSON.parse(localStorage.getItem('dlStatus:' + repo) || '{}'); } catch { return {}; }
+  // localStorage key: "dlStatus:<repo>:<model|dataset>" →
+  // { "<filter_value or artifact key>": "queued"|"running"|"done" }
+  // The type-scoped key is the only source of status. The pre-namespace
+  // untyped key ("dlStatus:<repo>") is intentionally ignored and left
+  // untouched: it has no repository type, so migrating it would assign one
+  // namespace's statuses to whichever type reads first. Cache synchronization
+  // reconstructs current artifact status for the open analysis instead.
+  function dlStatusStorageKey(repo, isDataset) {
+    return 'dlStatus:' + repo + ':' + (isDataset ? 'dataset' : 'model');
   }
-  function setDlStatus(repo, filterValue, status) {
-    const map = getDlStatus(repo);
+  function parseDlStatus(raw) {
+    try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
+  }
+  function getDlStatus(repo, isDataset) {
+    try {
+      return parseDlStatus(localStorage.getItem(dlStatusStorageKey(repo, isDataset)));
+    } catch {
+      return {};
+    }
+  }
+  function saveDlStatus(repo, isDataset, map) {
+    const storageKey = dlStatusStorageKey(repo, isDataset);
+    try {
+      if (Object.keys(map).length === 0) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, JSON.stringify(map));
+    } catch {
+      // Status persistence is best-effort.
+    }
+  }
+  function setDlStatus(repo, isDataset, filterValue, status) {
+    const map = getDlStatus(repo, isDataset);
     map[filterValue] = status;
-    localStorage.setItem('dlStatus:' + repo, JSON.stringify(map));
+    saveDlStatus(repo, isDataset, map);
   }
-  function refreshDlStatusFromJobs(repo) {
-    // Reconcile per-quant status with the live job list. Active jobs set
-    // running/queued/done; stale running/queued entries (job gone, cancelled or
-    // failed) are cleared so the Download button reappears. 'done' is kept.
-    const map = getDlStatus(repo);
+
+  // Job identity for the open analysis includes the visible destination
+  // (LocalRepo for upstream companions) and the repository namespace.
+  function jobVisibleRepo(job) {
+    return job?.localRepo || job?.repo || '';
+  }
+  function jobMatchesAnalysis(job, analysis) {
+    return !!job && !!analysis?.repo &&
+      jobVisibleRepo(job) === analysis.repo &&
+      !!job.isDataset === !!analysis.is_dataset;
+  }
+
+  // A combined recommended download can carry several artifacts' files in one
+  // filter set. Attribute an artifact's running/queued chip from containment:
+  // every file the item needs must be selected by the job. A job that selects
+  // only the quant shards therefore never marks the mmproj companion, and a
+  // companion-only job never marks the quant.
+  function artifactActiveKeys(items, jobs) {
+    const artifactItems = (items || []).map(item => {
+      const key = selectableStatusKey(item);
+      if (!String(key).startsWith('artifact:')) return null;
+      const files = (item.files || []).map(normalizeArtifactPath).filter(Boolean);
+      return files.length ? { key, files } : null;
+    }).filter(Boolean);
     const active = {};
-    Array.from(state.jobs.values()).forEach(j => {
-      const visibleRepo = j.localRepo || j.repo;
-      if (visibleRepo !== repo) return;
+    if (!artifactItems.length) return active;
+    jobs.forEach(job => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
+      const jobPaths = new Set(artifactJobPaths(job.filters));
+      artifactItems.forEach(({ key, files }) => {
+        if (!files.every(file => jobPaths.has(file))) return;
+        const status = job.status === 'running' ? 'running' : 'queued';
+        // Running outranks queued regardless of job iteration order.
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
+  function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
+    // Reconcile per-quant status with the live job list. Active jobs set
+    // running/queued; artifact completion is never inferred from job status,
+    // because a completed job can include a shard skipped as "downloading by
+    // another process". Cache synchronization is the authority for artifact
+    // 'done'. Stale running/queued entries (job gone, cancelled or failed) are
+    // cleared so the Download button reappears. 'done' is kept.
+    const map = getDlStatus(repo, isDataset);
+    const jobs = Array.from(state.jobs.values())
+      .filter(job => jobMatchesAnalysis(job, { repo, is_dataset: isDataset }));
+    const active = artifactActiveKeys(items, jobs);
+    jobs.forEach(j => {
       const f = (j.filters || []).join(',') || '__all__';
       if (j.status === 'completed') active[f] = 'done';
       else if (j.status === 'running') active[f] = 'running';
@@ -5284,15 +5416,138 @@ async function loadRepositoryDetails(entry) {
         changed = true;
       }
     });
-    if (changed) localStorage.setItem('dlStatus:' + repo, JSON.stringify(map));
+    if (changed) saveDlStatus(repo, isDataset, map);
+  }
+
+  // Live job events arrive far more often than row status can meaningfully
+  // change. Coalesce them into one throttled reconciliation; only a matching
+  // completion re-reads cache presence, because cache presence is the sole
+  // authority for artifact 'done'.
+  const LIVE_STATUS_RECONCILE_DELAY_MS = 200;
+  let liveStatusReconcileTimer = null;
+  let liveStatusReconcileRunning = false;
+  let liveStatusReconcilePending = false;
+  let liveStatusReconcileNeedsCache = false;
+
+  function scheduleLiveAnalysisReconcile({ syncCache = false } = {}) {
+    if (!currentAnalysis?.repo) return;
+    liveStatusReconcilePending = true;
+    if (syncCache) liveStatusReconcileNeedsCache = true;
+    if (liveStatusReconcileTimer !== null || liveStatusReconcileRunning) return;
+    liveStatusReconcileTimer = setTimeout(runLiveAnalysisReconcile, LIVE_STATUS_RECONCILE_DELAY_MS);
+  }
+
+  // Called by loadRepositoryDetails once the new analysis is committed and
+  // rendered. A job event that arrived during the load was compared against
+  // the previous analysis and could not be scheduled, so run one coalesced
+  // reconciliation (including cache presence) for the committed analysis.
+  function reconcileAnalysisAfterLoad() {
+    scheduleLiveAnalysisReconcile({ syncCache: true });
+  }
+
+  async function runLiveAnalysisReconcile() {
+    liveStatusReconcileTimer = null;
+    const analysis = currentAnalysis;
+    if (!analysis?.repo) {
+      liveStatusReconcilePending = false;
+      liveStatusReconcileNeedsCache = false;
+      return;
+    }
+    liveStatusReconcilePending = false;
+    const syncCache = liveStatusReconcileNeedsCache;
+    liveStatusReconcileNeedsCache = false;
+    liveStatusReconcileRunning = true;
+    try {
+      refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
+      updateSelectableRowStatuses(analysis.selectable_items);
+      if (syncCache) {
+        await syncLocalAnalysisStatus(analysis);
+        if (currentAnalysis !== analysis) return;
+        // Reapply live running/queued after the async lookup so a job event
+        // that arrived during the fetch is not overwritten by stale cache.
+        refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
+        updateSelectableRowStatuses(analysis.selectable_items);
+      }
+    } finally {
+      liveStatusReconcileRunning = false;
+      if (liveStatusReconcilePending) {
+        liveStatusReconcilePending = false;
+        if (liveStatusReconcileTimer === null) {
+          liveStatusReconcileTimer = setTimeout(runLiveAnalysisReconcile, 0);
+        }
+      }
+    }
+  }
+
+  function selectableStatusChip(status) {
+    if (status === 'done') {
+      return `<span class="quant-dl-btn quant-dl-btn-done" title="Already downloaded">✓</span>`;
+    }
+    if (status === 'queued') {
+      return `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;
+    }
+    if (status === 'running') {
+      return `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`;
+    }
+    return '';
+  }
+
+  function selectableDownloadControl(item, status) {
+    const repo = currentAnalysis?.repo || '';
+    const fv = item.filter_value || item.id || '';
+    const files = Array.isArray(item.files) ? item.files : [];
+    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+    const statusKey = exactArtifact ? selectableStatusKey(item) : fv;
+    const dlRepo = item.upstream_repo || repo;
+    const statusRepo = repo;
+    const chip = selectableStatusChip(status);
+    if (chip) return { statusKey, html: chip };
+    const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
+                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                 <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+               </svg>`;
+    return {
+      statusKey,
+      html: `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
+               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null}))}">${dlIcon}</button>`
+    };
+  }
+
+  // Update the rendered rows for the open analysis without re-rendering the
+  // analysis or resetting scroll/focus. Rows carry their exact status key so
+  // distinct artifacts that share a filter_value stay independent.
+  function updateSelectableRowStatuses(items) {
+    const analysis = currentAnalysis;
+    const repo = analysis?.repo || '';
+    if (!repo || !Array.isArray(items) || !items.length) return;
+    const container = $('#selectableItems');
+    if (!container || typeof container.querySelectorAll !== 'function') return;
+    const itemByKey = new Map();
+    items.forEach(item => itemByKey.set(selectableStatusKey(item), item));
+    const map = getDlStatus(repo, !!analysis.is_dataset);
+    const rows = container.querySelectorAll('.quant-row[data-status-key]');
+    for (const row of rows) {
+      let statusKey = '';
+      try { statusKey = decodeURIComponent(row.dataset?.statusKey || ''); } catch { continue; }
+      const item = itemByKey.get(statusKey);
+      if (!item) continue;
+      const status = map[statusKey] || '';
+      if ((row.dataset?.dlStatus || '') === status) continue;
+      const control = selectableDownloadControl(item, status);
+      const controlNode = row.querySelector?.('.quant-dl-btn');
+      if (controlNode) controlNode.outerHTML = control.html;
+      if (row.dataset) row.dataset.dlStatus = status;
+    }
   }
 
   function renderSelectableItems(items, containerId) {
     if (!items || items.length === 0) return '';
 
     const repo = currentAnalysis?.repo || '';
-    refreshDlStatusFromJobs(repo);
-    const dlMap = getDlStatus(repo);
+    // loadRepositoryDetails reconciles live jobs and cache presence before this
+    // render. Artifact 'done' status comes only from that cache check; do not
+    // infer it from job state here.
+    const dlMap = getDlStatus(repo, !!currentAnalysis?.is_dataset);
 
     const categories = {};
     items.forEach(item => {
@@ -5345,31 +5600,18 @@ async function loadRepositoryDetails(entry) {
         const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
 
         const fv = item.filter_value || item.id || '';
-        const dlStatus = dlMap[fv] || '';
-        // upstream_repo is set for vision_encoder items sourced from a base-model
-        // repo; in that case the download must target that repo, not the current one.
-        const dlRepo = item.upstream_repo || repo;
-        const statusRepo = repo;
-
+        const statusKey = selectableStatusKey(item);
+        const dlStatus = dlMap[statusKey] || '';
         // Left control: a Download button when idle; otherwise it is REPLACED by
         // a status chip reflecting the quant's state in the download queue
         // (done / downloading / queued) so it can't be started twice.
-        const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
-                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                 <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-               </svg>`;
-        const dlBtn = dlStatus === 'done'
-          ? `<span class="quant-dl-btn quant-dl-btn-done" title="Already downloaded">✓</span>`
-          : dlStatus === 'queued'
-            ? `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`
-          : dlStatus === 'running'
-            ? `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`
-          : `<button class="quant-dl-btn" title="Download this quantization"
-               onclick="downloadQuant('${escapeHtml(dlRepo)}','${escapeHtml(fv)}',${currentAnalysis?.is_dataset||false},'${escapeHtml(item.label)}','${item.upstream_repo ? escapeHtml(repo) : ''}','${escapeHtml(statusRepo)}')">${dlIcon}</button>`;
+        const control = selectableDownloadControl(item, dlStatus);
 
         html += `
-          <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}">
-            ${dlBtn}
+          <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}"
+               data-status-key="${escapeHtmlAttribute(encodeURIComponent(control.statusKey))}"
+               data-dl-status="${escapeHtmlAttribute(dlStatus)}">
+            ${control.html}
             <span class="quant-label">${escapeHtml(item.label)}</span>
             ${recBadge}
             ${size}
@@ -5386,8 +5628,15 @@ async function loadRepositoryDetails(entry) {
     return html;
   }
 
+  window.downloadQuantFromButton = function(button) {
+    try {
+      const args = JSON.parse(decodeURIComponent(button.dataset.download));
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey);
+    } catch (e) { console.error('Invalid selectable download data', e); }
+  };
+
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey) {
     try {
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
@@ -5399,8 +5648,8 @@ async function loadRepositoryDetails(entry) {
         repo,
         revision,
         dataset: isDataset,
-        filters: filterValue ? [filterValue] : [],
-        exactMatch: !!filterValue
+        filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
+        exactMatch: files ? true : !!filterValue
       };
       // Send the labeled destination choice when type folders are configured.
       // For an upstream companion (mmproj) this still resolves to the analyzed
@@ -5419,12 +5668,13 @@ async function loadRepositoryDetails(entry) {
       }
 
       state.jobs.set(data.id, data);
-      setDlStatus(statusRepo || repo, filterValue, 'queued');
+      setDlStatus(statusRepo || repo, isDataset, statusKey || filterValue, 'queued');
       // Replace the download button with the queued chip immediately.
-      const row = document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
+      const row = sourceRow || document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
       if (row) {
         const btn = row.querySelector('.quant-dl-btn');
-        if (btn) btn.outerHTML = `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;
+        if (btn) btn.outerHTML = selectableStatusChip('queued');
+        if (row.dataset) row.dataset.dlStatus = 'queued';
       }
 
       showToast(`Queued: ${label || repo}`, 'success');
@@ -5488,14 +5738,19 @@ async function loadRepositoryDetails(entry) {
       </div>`;
   }
 
-  // Download a single specific file by filter
+  // Download a single specific file by its exact repository-relative path.
   window.downloadSingleFile = async function(repo, filename, isDataset) {
     try {
       // Destination chosen in the file list's "Save to" select, when present.
       const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+      // The file list identifies files by their repository-relative path. Send
+      // root-level entries through the exact "./name" selector so a same-named
+      // nested alias is not selected by legacy basename matching; nested paths
+      // remain canonical. Display and toast keep the unencoded filename.
+      const filters = artifactRequestPaths([filename]);
       const body = {
         repo, revision: currentAnalysis?.branch || 'main',
-        dataset: isDataset, filters: [filename], exactMatch: true
+        dataset: isDataset, filters, exactMatch: true
       };
       if (routeKey) body.routeKey = routeKey;
       if (!await checkDownloadDiskSpace(body)) return;

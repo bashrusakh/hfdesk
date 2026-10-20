@@ -10,12 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
 
 type cacheSelectionMember struct {
@@ -69,24 +68,22 @@ type selectedEntryIdentity struct {
 	pin  *os.File
 }
 
-var cacheShardSuffix = regexp.MustCompile(`(?i)([-_])(\d+)([-_]of[-_])(\d+)(\.gguf)$`)
-
 func selectionHash(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:12])
 }
 
 func selectionFamily(relative string) (family, quant string, splitIndex, splitTotal int) {
-	dir, base := filepath.Split(filepath.ToSlash(relative))
-	quant = cacheQuantLabel(strings.TrimSuffix(base, filepath.Ext(base)))
+	slashed := filepath.ToSlash(relative)
+	dir, base := filepath.Split(slashed)
+	quant = smartdl.GGUFQuantType(base, slashed)
 	identityBase := base
-	if loc := cacheShardSuffix.FindStringSubmatchIndex(base); len(loc) == 12 {
-		splitIndex, _ = strconv.Atoi(base[loc[4]:loc[5]])
-		splitTotal, _ = strconv.Atoi(base[loc[8]:loc[9]])
+	if shard, ok := smartdl.ParseGGUFSplitShard(base); ok {
+		splitIndex, splitTotal = shard.Index, shard.Total
 		if splitIndex == 0 && splitTotal == 0 {
 			splitTotal = -1
 		}
-		identityBase = base[:loc[4]] + "{part}" + base[loc[5]:]
+		identityBase = base[:shard.Start] + "{part}" + base[shard.End:]
 	}
 	return filepath.ToSlash(filepath.Join(dir, identityBase)), quant, splitIndex, splitTotal
 }
@@ -104,7 +101,7 @@ func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheS
 	}
 	aggs := map[string]*aggregate{}
 	for _, file := range files {
-		if !strings.EqualFold(filepath.Ext(file.path), ".gguf") {
+		if !smartdl.IsGGUFFileName(file.path) {
 			continue
 		}
 		family, quant, index, total := selectionFamily(file.path)
@@ -117,7 +114,8 @@ func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheS
 			kind = cacheSelectionKindVisionEncoder
 			quant = ""
 		} else if quant == "" {
-			parentQuant := cacheQuantLabel(filepath.Base(filepath.Dir(file.path)))
+			parentDir := filepath.Dir(file.path)
+			parentQuant := smartdl.GGUFQuantType(filepath.Base(parentDir), filepath.ToSlash(parentDir))
 			quant = parentQuant
 		}
 		shape := "single"
@@ -212,7 +210,7 @@ func localSelectionFiles(repoDir string, excluded []string) ([]cacheSelectionFil
 		if err != nil {
 			return err
 		}
-		if info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
+		if info.IsDir() || !smartdl.IsGGUFFileName(info.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(repoDir, path)
@@ -271,7 +269,7 @@ func hfSelectionFiles(rd *hfdownloader.RepoDir, protectedRoots []string) ([]cach
 					return nil
 				}
 			}
-			if info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
+			if info.IsDir() || !smartdl.IsGGUFFileName(info.Name()) {
 				return nil
 			}
 			rel, err := filepath.Rel(dir, path)
@@ -498,6 +496,9 @@ func isRegisteredLocalSelectionRoot(cfg Config, candidate string) bool {
 }
 
 func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
+	if !filepath.IsLocal(repo) {
+		return nil
+	}
 	cache := cfg.cache()
 	roots := localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes)
 	locations := []cacheSelectionLocation{}
@@ -589,7 +590,7 @@ func cacheSelectionLocations(cfg Config, repo string) []cacheSelectionLocation {
 
 func (s *Server) handleCacheSelection(w http.ResponseWriter, r *http.Request) {
 	repo, repoType := r.URL.Query().Get("repo"), r.URL.Query().Get("type")
-	if !hfdownloader.IsValidModelName(repo) {
+	if !hfdownloader.IsValidModelName(repo) || !filepath.IsLocal(repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected repo=owner/name")
 		return
 	}

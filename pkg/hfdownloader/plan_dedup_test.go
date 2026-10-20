@@ -9,7 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -170,7 +170,7 @@ func TestPlanRepo_FilteredGGUFDoesNotIncludeUnmatchedNonLFSQuant(t *testing.T) {
 	}
 }
 
-func TestPlanRepo_GGUFOnlyFilterPreservesNonGGUFCompanionExclusion(t *testing.T) {
+func TestPlanRepo_GGUFOnlyFilterExcludesUnmatchedNonGGUFCompanions(t *testing.T) {
 	files := []hfNode{
 		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100},
 		{Type: "file", Path: "config.json", Size: 20},
@@ -183,8 +183,8 @@ func TestPlanRepo_GGUFOnlyFilterPreservesNonGGUFCompanionExclusion(t *testing.T)
 	if err != nil {
 		t.Fatalf("PlanRepo: %v", err)
 	}
-	if len(plan.Items) != 1 || plan.Items[0].RelativePath != "model-Q4_K_M.gguf" {
-		t.Fatalf("GGUF-only selection included companions: %+v", plan.Items)
+	if got, want := planPaths(plan), []string{"model-Q4_K_M.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GGUF-only selection paths=%v want matched-only result %v", got, want)
 	}
 }
 
@@ -208,7 +208,7 @@ func TestPlanRepo_GGUFModePreservesExplicitNonGGUFFilterMatches(t *testing.T) {
 			want:    []string{"model-Q4_K_M.gguf", "README-Q4_K_M.md"},
 		},
 		{
-			name:    "unmatched companions remain excluded",
+			name:    "unmatched metadata companions are excluded",
 			files:   []hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: 100}, {Type: "file", Path: "config.json", Size: 20}, {Type: "file", Path: "README.md", Size: 30}},
 			filters: []string{"Q4_K_M"},
 			want:    []string{"model-Q4_K_M.gguf"},
@@ -235,8 +235,14 @@ func TestPlanRepo_GGUFModePreservesExplicitNonGGUFFilterMatches(t *testing.T) {
 
 func TestGGUFPathSelectedMatchesFilteredGGUFPlanDecision(t *testing.T) {
 	filters, excludes := []string{"Q4_K_M"}, []string{"draft"}
-	for _, path := range []string{"model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "draft-Q4_K_M.gguf", "config.json"} {
-		want := strings.Contains(strings.ToLower(path), "q4_k_m") && !strings.Contains(strings.ToLower(path), "draft") && strings.EqualFold(filepath.Ext(path), ".gguf")
+	for _, path := range []string{
+		"model-Q4_K_M.gguf",
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q5_K_M.gguf",
+		"draft-Q4_K_M.gguf",
+		"config.json",
+	} {
+		want := strings.Contains(strings.ToLower(path), "q4_k_m") && !strings.Contains(strings.ToLower(path), "draft") && isGGUFFilePath(path)
 		if got := GGUFPathSelected(path, filters, excludes, false); got != want {
 			t.Errorf("GGUFPathSelected(%q)=%v want %v", path, got, want)
 		}

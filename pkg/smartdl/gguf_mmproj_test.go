@@ -274,11 +274,11 @@ func TestRepoInfo_MultimodalRecommendedDownloadBundlesMMProj(t *testing.T) {
 	}
 	filters := strings.Join(info.RecommendedDownload.Filters, ",")
 	// The recommended LLM default is Q4_K_M.
-	if !strings.Contains(filters, "q4_k_m") {
+	if !strings.Contains(filters, "gemma-3-4b-it-Q4_K_M.gguf") {
 		t.Errorf("recommended download missing q4_k_m filter: %v", info.RecommendedDownload.Filters)
 	}
 	// The recommended mmproj must also be present and narrow (f16, not bf16/f32).
-	if !strings.Contains(filters, "mmproj-f16") {
+	if !strings.Contains(filters, "mmproj-F16.gguf") {
 		t.Errorf("recommended download missing mmproj-f16 filter: %v", info.RecommendedDownload.Filters)
 	}
 }

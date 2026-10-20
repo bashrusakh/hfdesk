@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -224,6 +223,16 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		if errors.Is(err, hfdownloader.ErrNoFilterMatch) {
 			writeAPIError(w, http.StatusBadRequest, "no_filter_match",
 				"No files match the requested filters", err.Error())
+			return
+		}
+		if errors.Is(err, hfdownloader.ErrAmbiguousSelection) {
+			writeAPIError(w, http.StatusBadRequest, "ambiguous_selection",
+				"Dataset selection is ambiguous", err.Error())
+			return
+		}
+		if errors.Is(err, hfdownloader.ErrAppendFilterSubdirPathFilter) {
+			writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
+				"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "Failed to scan repository", err.Error())
@@ -1145,17 +1154,17 @@ func walkLocalCacheRepo(dir string, excluded []string, walkFn filepath.WalkFunc)
 }
 
 // hasLocalWeightFile reports whether dir (or any subdirectory) contains
-// at least one .gguf or .safetensors file. Used to decide whether an
-// owner/name folder under a cache root is a real repo worth listing
-// vs. an unrelated directory, without crossing configured subroots.
+// at least one recognized GGUF weight (including legacy ".gguf-split"
+// shards) or .safetensors file. Used to decide whether an owner/name
+// folder under a cache root is a real repo worth listing vs. an
+// unrelated directory, without crossing configured subroots.
 func hasLocalWeightFile(dir string, excluded []string) bool {
 	found := false
 	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		switch strings.ToLower(filepath.Ext(info.Name())) {
-		case ".gguf", ".safetensors":
+		if smartdl.IsGGUFFileName(info.Name()) || strings.EqualFold(filepath.Ext(info.Name()), ".safetensors") {
 			found = true
 		}
 		return nil
@@ -1163,26 +1172,14 @@ func hasLocalWeightFile(dir string, excluded []string) bool {
 	return found
 }
 
-// cacheQuantPattern matches a GGUF quantisation token inside a filename
-// (e.g. "Q4_K_M", "UD_Q6_K", "BF16", "APEX-BALANCED"). The optional
-// "UD[-_]" prefix is captured separately so the result can be
-// returned as "UD_Q4_K" rather than "UD_ Q4_K" or similar. The
-// pattern is case-insensitive.
-var cacheQuantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|F(?:16|32)|BF16)`)
-
 // cacheQuantLabel extracts the quantisation token from a GGUF filename
 // (e.g. "Q4_K_M" from "model-Q4_K_M.gguf") and returns it in a
 // canonical, dash-free uppercase form ("Q4_K_M", or "UD_Q4_K_M" for
-// un-distilled variants). Returns "" if no quant token is present.
+// un-distilled variants). Returns "" if no complete quant token is
+// present. The classifier is owned by pkg/smartdl so cache metadata,
+// selection, and download planning cannot diverge.
 func cacheQuantLabel(name string) string {
-	if m := cacheQuantPattern.FindStringSubmatch(strings.ToUpper(name)); len(m) >= 3 {
-		quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
-		if m[1] != "" {
-			return "UD_" + quant
-		}
-		return quant
-	}
-	return ""
+	return smartdl.GGUFQuantType(name, name)
 }
 
 // isCacheMMProjFile reports whether a GGUF filename is an mmproj companion
@@ -1215,7 +1212,7 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []st
 	seen := make(map[string]bool)
 	meta := cacheGGUFMetadata{}
 	walkLocalCacheRepo(dir, excluded, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".gguf") {
+		if err != nil || info.IsDir() || !smartdl.IsGGUFFileName(info.Name()) {
 			return nil
 		}
 		relPath, relErr := filepath.Rel(dir, path)
@@ -1229,7 +1226,7 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []st
 			}
 			return nil
 		}
-		if q := cacheQuantLabel(info.Name()); q != "" && !seen[q] {
+		if q := smartdl.GGUFQuantType(info.Name(), filepath.ToSlash(relPath)); q != "" && !seen[q] {
 			seen[q] = true
 			meta.Quantizations = append(meta.Quantizations, q)
 		}

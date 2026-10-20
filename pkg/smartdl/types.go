@@ -29,7 +29,10 @@
 //	}
 package smartdl
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // RepoType identifies the type of HuggingFace repository.
 type RepoType string
@@ -205,7 +208,11 @@ type RepoInfo struct {
 	RecommendedFilters []string `json:"recommended_filters,omitempty"`
 
 	// RecommendedDownload is a ready-to-send request body for /api/download
-	// using the default/recommended items.
+	// using the default/recommended items from this repository. A selection
+	// targets exactly one repository, so recommended items whose files live in
+	// a different repository (UpstreamRepo != "") are excluded. Those items
+	// remain individually selectable through SelectableItems, where UpstreamRepo
+	// identifies the repository their Files paths belong to.
 	RecommendedDownload *DownloadSelection `json:"recommended_download,omitempty"`
 
 	// RelatedDownloads lists related repositories (e.g., base model for LoRA).
@@ -599,7 +606,9 @@ type SelectableItem struct {
 	// Category groups items (e.g., "quantization", "variant", "component", "split", "format").
 	Category string `json:"category,omitempty"`
 
-	// FilterValue is the value to pass to -F flag for downloading.
+	// FilterValue is the legacy filter/display token. For GGUF selections, use
+	// Files as the exact artifact identity; the token may be shared by distinct
+	// artifacts and remains for compatibility with existing consumers.
 	FilterValue string `json:"filter_value"`
 
 	// Files is the list of files included in this selection.
@@ -653,23 +662,54 @@ type DownloadSelection struct {
 }
 
 // RecommendedFilterValues returns filters for recommended selectable items.
+//
+// The result is intended for one DownloadSelection targeting r.Repo. Items
+// sourced from another repository (UpstreamRepo != "") are omitted: their
+// Files paths are relative to that upstream repository and cannot be fetched
+// by a request for r.Repo. Those items stay individually selectable with their
+// UpstreamRepo and exact Files intact. If no recommended item belongs to the
+// analyzed repository, the result is empty.
 func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
-		if item.Recommended {
+		if !item.Recommended {
+			continue
+		}
+		if item.UpstreamRepo != "" {
+			continue
+		}
+		if item.Category == "quantization" || item.Category == "vision_encoder" {
+			for _, file := range item.Files {
+				recommended = append(recommended, exactArtifactFilter(file))
+			}
+			if len(item.Files) == 0 {
+				recommended = append(recommended, item.FilterValue)
+			}
+		} else {
 			recommended = append(recommended, item.FilterValue)
 		}
 	}
 	return recommended
 }
 
+// exactArtifactFilter encodes a raw repository path for ExactMatch filters.
+// Slash-containing paths already have literal path semantics; a leading ./ is
+// the additive, unambiguous spelling for a literal root basename.
+func exactArtifactFilter(repoPath string) string {
+	if repoPath != "" && !strings.Contains(repoPath, "/") {
+		return "./" + repoPath
+	}
+	return repoPath
+}
+
 // PopulateDownloadSelection sets recommended download fields for the web UI.
 func (r *RepoInfo) PopulateDownloadSelection() {
 	r.RecommendedFilters = r.RecommendedFilterValues()
 	r.RecommendedDownload = &DownloadSelection{
-		Repo:    r.Repo,
-		Dataset: r.IsDataset,
-		Filters: r.RecommendedFilters,
+		Repo:       r.Repo,
+		Dataset:    r.IsDataset,
+		Filters:    r.RecommendedFilters,
+		ExactMatch: r.IsDataset || r.Type == TypeGGUF,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch

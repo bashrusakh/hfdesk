@@ -24,6 +24,23 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		"config.json",
 		"tokenizer.json",
 	}
+	trainingNamedRepo := []string{
+		"model-q4_k_m.gguf",
+		"training-model.safetensors",
+	}
+	legacySplitRepo := []string{
+		"model-Q4_K_M-00001-of-00002.gguf-split",
+		"model-Q4_K_M-00002-of-00002.gguf-split",
+		"config.json",
+	}
+	ckptRepo := []string{
+		"model-q4_k_m.gguf",
+		"checkpoint.ckpt",
+	}
+	ggmlRepo := []string{
+		"model-q4_k_m.gguf",
+		"weights.ggml",
+	}
 
 	cases := []struct {
 		name    string
@@ -38,6 +55,10 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		{"filter matches no gguf in repo", ggufRepo, []string{"q4_k_m"}, false, false},
 		{"mmproj filter targets a gguf", multimodalRepo, []string{"q4_k_m", "mmproj"}, false, true},
 		{"safetensors filter is not gguf", transformersRepo, []string{"safetensors"}, false, false},
+		{"training-named payload keeps mixed mode", trainingNamedRepo, []string{"q4_k_m", "training-model"}, false, false},
+		{"legacy .gguf-split quant selected", legacySplitRepo, []string{"Q4_K_M"}, false, true},
+		{"ckpt payload keeps mixed mode", ckptRepo, []string{"q4_k_m", "checkpoint"}, false, false},
+		{"ggml payload keeps mixed mode", ggmlRepo, []string{"q4_k_m", "weights"}, false, false},
 		{"non-gguf filter in gguf repo", ggufRepo, []string{"config.json"}, false, false},
 	}
 
@@ -45,6 +66,54 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isGGUFFilterDownload(tc.files, tc.filters, tc.exact); got != tc.want {
 				t.Errorf("isGGUFFilterDownload(%v, %v) = %v, want %v", tc.files, tc.filters, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"weights/model.safetensors", true},
+		{"weights/model.onnx", true},
+		{"weights/pytorch_model.bin", true},
+		{"weights/model.pt", true},
+		{"weights/model.pth", true},
+		{"weights/model.ckpt", true},
+		{"weights/model.ggml", true},
+		{"weights/model.gguf-split", true},
+		{"weights/flax_model.msgpack", true},
+		{"weights/flax_model-00001-of-00002.msgpack", true},
+		{"weights/diffusion_flax_model.msgpack", true},
+		{"weights/tf_model.h5", true},
+		{"weights/tf_model-00001-of-00002.h5", true},
+		{"weights/model.tflite", true},
+		{"weights/rust_model.ot", true},
+		{"weights/custom.msgpack", false},
+		{"weights/checkpoint.h5", false},
+		{"weights/arbitrary.tflite", false},
+		{"weights/model.ot", false},
+		{"weights/pytorch_model.bin.index.json", false},
+		{"weights/tokenizer.bin", false},
+		{"weights/training-model.safetensors", true},
+		{"weights/model-training.pt", true},
+		{"weights/optimizer.pt", false},
+		{"weights/optimizer.ckpt", false},
+		{"weights/adam_optimizer.pt", false},
+		{"weights/training_optimizer.pt", false},
+		{"weights/my_optimizer.pt", false},
+		{"weights/optimizer-state.pt", false},
+		{"weights/training-state.pth", false},
+		{"weights/training_args.bin", false},
+		{"weights/optimizer.bin", false},
+		{"config.json", false},
+		{"notes.unknown", false},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := isModelPayloadPath(tc.path); got != tc.want {
+				t.Errorf("isModelPayloadPath(%q) = %t, want %t", tc.path, got, tc.want)
 			}
 		})
 	}

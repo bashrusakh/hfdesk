@@ -4,11 +4,14 @@
 package smartdl
 
 import (
+	"encoding/base64"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 // GGUF quantization quality ratings (1-5 stars).
@@ -169,11 +172,12 @@ var quantDescriptions = map[string]string{
 //     S/M/L/XL/XXL suffixes (XL/XXL are unsloth "Unsloth Dynamic" quants)
 //   - F16/F32/BF16 float precisions
 //   - MXFP4_MOE and APEX profile-style GGUF quantizations
+//   - space-delimited quant names as well as path/underscore delimiters
 //
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32))`)
+	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./\s])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32)))(?:\s|[-./]|$)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -181,14 +185,49 @@ var (
 	// Match model name from filename (before quant type).
 	modelNamePattern = regexp.MustCompile(`^(.+?)[-._](?:IQ|Q|BF|F)\d`)
 
-	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003" optionally
-	// followed by ".gguf". HuggingFace/llama.cpp use 5-digit indices; allow 4-5
-	// digits to be safe. Used to group shards of the same quantization together.
-	splitSuffixPattern = regexp.MustCompile(`(?i)-\d{4,5}-of-\d{4,5}(?:\.gguf)?$`)
+	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003"
+	// optionally followed by ".gguf" or the legacy ".gguf-split" extension.
+	// Hyphen, underscore, and space delimiters are accepted around both the
+	// shard index and "of" so names such as "model Q5_K_M 00001-of-00002" and
+	// "model-Q4_K_M_00001_of_00002" share the same grouping/quant rules.
+	// Shard indices accept one or more digits: HuggingFace/llama.cpp commonly
+	// use 5-digit zero-padded indices, while other producers emit short indices
+	// such as "model-Q4_K_M-1-of-2.gguf".
+	// Used to group shards of the same quantization together.
+	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ](\d+)[-_ ]of[-_ ](\d+)(?:\.gguf(?:-split)?)?$`)
 )
 
-// stripSplitSuffix removes the "-NNNNN-of-MMMMM[.gguf]" shard suffix from a
-// filename, returning the base used to group shards of one quantization.
+// isGGUFFileName reports whether name carries a recognized GGUF suffix,
+// including the legacy ".gguf-split" shard extension.
+func isGGUFFileName(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".gguf-split")
+}
+
+// IsGGUFFileName reports whether name carries a recognized GGUF suffix,
+// including the legacy ".gguf-split" shard extension. It is the shared
+// classifier for callers outside this package; callers must not maintain a
+// separate suffix list.
+func IsGGUFFileName(name string) bool {
+	return isGGUFFileName(name)
+}
+
+// trimGGUFSuffix removes a recognized GGUF extension, including the legacy
+// ".gguf-split" spelling, for legacy basename/filter derivation.
+func trimGGUFSuffix(name string) string {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".gguf-split") {
+		return name[:len(name)-len(".gguf-split")]
+	}
+	if strings.HasSuffix(lower, ".gguf") {
+		return name[:len(name)-len(".gguf")]
+	}
+	return name
+}
+
+// stripSplitSuffix removes the "-NNNNN-of-MMMMM[.gguf|.gguf-split]" shard
+// suffix from a filename, returning the base used to group shards of one
+// quantization.
 func stripSplitSuffix(name string) string {
 	return splitSuffixPattern.ReplaceAllString(name, "")
 }
@@ -198,25 +237,74 @@ func isSplitShard(name string) bool {
 	return splitSuffixPattern.MatchString(name)
 }
 
+// GGUFSplitShard describes the recognized shard suffix of a split-GGUF
+// filename. Start and End delimit the decimal shard index within the original
+// name, so callers that group shards can replace only the variable part while
+// retaining the shard total and extension spelling.
+type GGUFSplitShard struct {
+	Index int
+	Total int
+	Start int
+	End   int
+}
+
+// ParseGGUFSplitShard reports whether name carries the recognized split-GGUF
+// shard suffix and, when it does, returns its index/total plus the byte range
+// of the index within name. The suffix grammar is the same one used by
+// stripSplitSuffix.
+func ParseGGUFSplitShard(name string) (GGUFSplitShard, bool) {
+	loc := splitSuffixPattern.FindStringSubmatchIndex(name)
+	if len(loc) != 6 {
+		return GGUFSplitShard{}, false
+	}
+	index, err := strconv.Atoi(name[loc[2]:loc[3]])
+	if err != nil {
+		return GGUFSplitShard{}, false
+	}
+	total, err := strconv.Atoi(name[loc[4]:loc[5]])
+	if err != nil {
+		return GGUFSplitShard{}, false
+	}
+	return GGUFSplitShard{Index: index, Total: total, Start: loc[2], End: loc[3]}, true
+}
+
 // ggufQuantType extracts a quantization token from either the filename or its
 // repo-relative path. Some GGUF repos put split shards under a quantized
 // directory such as "UD-Q4_K_XL/" while the individual shard names omit the
 // quant token, so checking only FileInfo.Name is not enough.
+//
+// A recognized split suffix is stripped before matching. Underscore-delimited
+// shard names such as "model-Q4_K_M_00001-of-00002.gguf" (including the legacy
+// ".gguf-split" spelling) otherwise hide the quant token behind the shard
+// separator. Extended tokens without a recognized split suffix, such as
+// "Q4_K_M_EXTRA", remain unclassified.
 func ggufQuantType(f FileInfo) string {
 	candidates := []string{f.Name, f.Path}
 	for _, candidate := range candidates {
 		if candidate == "" {
 			continue
 		}
+		candidate = stripSplitSuffix(candidate)
 		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
-			quant := strings.ReplaceAll(strings.ToUpper(m[2]), "-", "_")
-			if m[1] != "" {
+			quant := strings.ReplaceAll(strings.ToUpper(m[3]), "-", "_")
+			if m[2] != "" {
 				return "UD_" + quant
 			}
 			return quant
 		}
 	}
 	return ""
+}
+
+// GGUFQuantType extracts the canonical quantization label for a GGUF artifact.
+// name is the basename and relativePath is the repository-relative path; the
+// latter lets directory-qualified quants be recognized when split shard names
+// omit the token. A recognized split suffix is stripped before matching, and
+// tokens that extend a known quant label without a recognized split suffix
+// (for example "Q4_K_M_EXTRA") remain unclassified. It is the shared
+// classifier for callers outside this package.
+func GGUFQuantType(name, relativePath string) string {
+	return ggufQuantType(FileInfo{Name: name, Path: relativePath})
 }
 
 // IsMMProjFile reports whether a GGUF filename is a multimodal projector
@@ -256,12 +344,13 @@ func isGGUFMTPFile(name string) bool {
 // files are full models that carry a recognized quantization token and must
 // appear as their own quantization options — separate from the non-MTP twin
 // that shares the same token. The marker is matched as a delimiter-bounded
-// segment so it never trips on substrings inside other tokens.
+// segment (hyphen, underscore, dot, or whitespace) so it never trips on
+// substrings inside other tokens.
 func hasMTPMarker(name string) bool {
 	base := strings.ToLower(filepath.Base(name))
-	base = strings.TrimSuffix(base, ".gguf")
+	base = trimGGUFSuffix(base)
 	for _, seg := range strings.FieldsFunc(base, func(r rune) bool {
-		return r == '-' || r == '_' || r == '.'
+		return r == '-' || r == '_' || r == '.' || unicode.IsSpace(r)
 	}) {
 		if seg == "mtp" {
 			return true
@@ -279,10 +368,11 @@ func hasMTPMarker(name string) bool {
 func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	info := &GGUFInfo{}
 
-	// Partition .gguf files into LLM quants vs mmproj vision encoders.
+	// Partition GGUF files (including legacy ".gguf-split" shards) into LLM
+	// quants vs mmproj vision encoders.
 	var llmFiles []FileInfo
 	for _, f := range files {
-		if !strings.HasSuffix(strings.ToLower(f.Name), ".gguf") {
+		if !isGGUFFileName(f.Name) {
 			continue
 		}
 		if IsMMProjFile(f.Name) {
@@ -330,23 +420,19 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	groups := make(map[string]*quantGroup)
 
 	for _, f := range llmFiles {
-		quantType := ggufQuantType(f)
-
-		// Grouping key: shards of the same quant share a key. When the quant type
-		// is recognized, group by it (all shards of Q4_K_M merge). When it is not,
-		// group by the filename with its shard suffix removed, so multi-shard
-		// "unknown" files still merge while genuinely different files stay apart.
+		// Artifact identity is the shard-normalized repository path, not the
+		// human-readable quant label. Distinct artifacts may share a quant token
+		// (for example a QAD variant and an ordinary Q4_0); splitting is based
+		// only on the existing explicit shard-name convention.
 		//
 		// MTP (Multi-Token Prediction) variants carry the same quant token as
 		// their non-MTP twin (model-MTP-Q4_K_M.gguf vs model-Q4_K_M.gguf) but are
 		// distinct downloadable models, so they get a separate key — otherwise
 		// the two would merge into one row with a bogus summed size. MTP-ness is
 		// uniform across a quant's shards, so this still merges shards correctly.
-		var key string
-		if quantType != "" {
-			key = quantType
-		} else {
-			key = "unknown:" + strings.ToLower(stripSplitSuffix(filepath.Base(f.Name)))
+		key := strings.ToLower(stripSplitSuffix(f.Path))
+		if key == "" {
+			key = strings.ToLower(stripSplitSuffix(f.Name))
 		}
 		if hasMTPMarker(f.Name) {
 			key += "|MTP"
@@ -368,12 +454,19 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	}
 
 	// Sort with the least-compressed / largest variants first so the list reads
-	// from full precision and heavier quants down toward smaller files.
-	sort.Slice(info.Quantizations, func(i, j int) bool {
-		if info.Quantizations[i].File.Size != info.Quantizations[j].File.Size {
-			return info.Quantizations[i].File.Size > info.Quantizations[j].File.Size
+	// from full precision and heavier quants down toward smaller files. The
+	// repository path is the final tie-breaker so artifacts with the same size
+	// and quant label keep a deterministic order; that order also decides the
+	// single default selection in recommendedQuantIndex.
+	sort.SliceStable(info.Quantizations, func(i, j int) bool {
+		a, b := info.Quantizations[i], info.Quantizations[j]
+		if a.File.Size != b.File.Size {
+			return a.File.Size > b.File.Size
 		}
-		return info.Quantizations[i].Name < info.Quantizations[j].Name
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.File.Path < b.File.Path
 	})
 
 	return info
@@ -515,24 +608,72 @@ func preferredMMProj(files []FileInfo) (FileInfo, string) {
 		for i := range files {
 			name := strings.ToLower(filepath.Base(files[i].Name))
 			if strings.Contains(name, p) {
-				return files[i], strings.TrimSuffix(name, ".gguf")
+				return files[i], trimGGUFSuffix(name)
 			}
 		}
 	}
 	// Fallback: pick the first file and build a filter from its full basename
 	// so the filter still matches exactly one file.
 	name := strings.ToLower(filepath.Base(files[0].Name))
-	return files[0], strings.TrimSuffix(name, ".gguf")
+	return files[0], trimGGUFSuffix(name)
+}
+
+// artifactPath returns the repository-relative path used as an artifact's
+// identity, falling back to the filename for callers that do not populate Path.
+func artifactPath(f FileInfo) string {
+	if f.Path != "" {
+		return f.Path
+	}
+	return f.Name
+}
+
+// mmprojArtifactID returns the legacy deterministic basename ID for an mmproj
+// artifact. Same-basename files in different directories are distinguished by
+// disambiguateGGUFSelectableItems, which appends a path discriminator only when
+// IDs actually collide.
+func mmprojArtifactID(f FileInfo) string {
+	filter := strings.ToLower(trimGGUFSuffix(filepath.Base(f.Name)))
+	if filter == "" {
+		filter = "mmproj"
+	}
+	return "mmproj-" + filter
+}
+
+// recommendedQuantIndex returns the index of the single quantization artifact
+// that the default/recommended GGUF selection should include. Quantizations are
+// ordered by descending size, then name, then path (see analyzeGGUF). The rule
+// is deterministic:
+//
+//  1. the first non-MTP Q4_K_M/UD_Q4_K_M artifact (the conventional default);
+//  2. otherwise the first non-MTP artifact with quality >= 4 and size < 10 GiB.
+//
+// Exactly one index is returned, so a repository containing several artifacts
+// with the same quant token cannot put all of them in one recommended request.
+func recommendedQuantIndex(quants []GGUFQuantization) int {
+	for i := range quants {
+		q := &quants[i]
+		if !q.IsMTP && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+			return i
+		}
+	}
+	for i := range quants {
+		q := &quants[i]
+		if !q.IsMTP && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
+			return i
+		}
+	}
+	return -1
 }
 
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
 // This provides a unified interface for the web UI.
 //
-// When the repo contains mmproj vision-encoder files (multimodal models),
-// an additional SelectableItem with Category="vision_encoder" is emitted
-// for the preferred mmproj file. It is Recommended=true by default so that
-// the recommended download selection auto-bundles the vision encoder
-// alongside any selected LLM quant.
+// Exactly one non-MTP quantization artifact is Recommended, following the
+// deterministic rule in recommendedQuantIndex. When the repo contains mmproj
+// vision-encoder files (multimodal models), an additional SelectableItem with
+// Category="vision_encoder" is emitted for the preferred mmproj file. It is
+// Recommended=true by default so that the recommended download selection
+// auto-bundles the vision encoder alongside the chosen LLM quant.
 func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	if info == nil {
 		return nil
@@ -543,34 +684,22 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	items := make([]SelectableItem, 0, len(info.Quantizations)+1)
 
-	// Track if we have a (non-MTP) Q4_K_M (common recommended default).
-	hasQ4KM := false
-	// Track whether any MTP variant is present. When it is, the bare quant token
-	// is no longer a unique download filter (model-Q4_K_M.gguf and
-	// model-MTP-Q4_K_M.gguf both contain "q4_k_m"), so every quant row falls back
-	// to its full base filename as the filter to keep selections unambiguous.
+	recommendedIndex := recommendedQuantIndex(info.Quantizations)
+
+	// Keep FilterValue compatible as a legacy label, but derive row uniqueness
+	// from artifact paths below; a quant token or basename is not identity.
 	repoHasMTP := false
 	for _, q := range info.Quantizations {
-		if (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") && !q.IsMTP {
-			hasQ4KM = true
-		}
 		if q.IsMTP {
 			repoHasMTP = true
 		}
 	}
 
-	for _, q := range info.Quantizations {
-		// Determine if this should be recommended. Q4_K_M is a good default,
-		// otherwise highest quality in 4-bit range. MTP variants are a
-		// specialist option (speculative decoding) and are never auto-recommended.
-		recommended := false
-		if q.IsMTP {
-			recommended = false
-		} else if hasQ4KM && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
-			recommended = true
-		} else if !hasQ4KM && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
-			recommended = true
-		}
+	for i, q := range info.Quantizations {
+		// Only the deterministic default artifact is recommended. MTP variants
+		// are a specialist option (speculative decoding) and are never
+		// auto-recommended; recommendedQuantIndex already excludes them.
+		recommended := i == recommendedIndex
 
 		// Files to download for this quant: all shards when split, else the one
 		// file. Fall back to the representative path if Files wasn't populated.
@@ -579,10 +708,8 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			files = []string{q.File.Path}
 		}
 
-		// Filter value used by the downloader's substring match. For recognized
-		// quants the quant token appears in every shard name, so the lowercased
-		// name matches the whole set. For "Unknown" groups the name won't match
-		// any filename, so use the shared base of the files instead.
+		// FilterValue remains a legacy human/filter label. Smart GGUF request
+		// builders should use Files as the exact artifact identity instead.
 		filterValue := strings.ToLower(strings.TrimPrefix(q.Name, "UD_"))
 		if strings.HasPrefix(q.Name, "APEX_") {
 			filterValue = strings.ToLower(strings.ReplaceAll(q.Name, "_", "-"))
@@ -604,14 +731,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 			desc = fmt.Sprintf("%s · %d files", desc, q.Parts)
 		}
 
-		// MTP variants share a quant token with their non-MTP twin, so give them
-		// a distinct label and ID; otherwise the picker shows two identical rows.
-		label := q.Name
-		id := strings.ToLower(q.Name)
-		if q.IsMTP {
-			label = q.Name + " (MTP)"
-			id = strings.ToLower(q.Name) + "-mtp"
-		}
+		label, id := ggufSelectableIdentity(q)
 
 		item := SelectableItem{
 			ID:           id,
@@ -633,19 +753,22 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	// Append a vision-encoder companion item for EVERY mmproj file present, so
 	// the user can pick the precision they want (f16 / bf16 / f32 / …) instead
-	// of being limited to one. The preferred file (preferredMMProj precedence)
-	// is marked Recommended so the recommended selection still auto-bundles a
-	// sensible mmproj alongside the chosen quant (github issue #76). Each item
-	// gets a filter derived from its own filename so it matches exactly one
-	// file via the comma-separated -F filter list.
+	// of being limited to one. Files are compared by repository path, not
+	// basename: two directories may each contain "mmproj-F16.gguf", and those
+	// are distinct artifacts. The preferred file (preferredMMProj precedence)
+	// is the only one marked Recommended so the recommended selection still
+	// auto-bundles a sensible mmproj alongside the chosen quant (issue #76).
+	// FilterValue stays a legacy basename token; Files carries the exact
+	// artifact identity (including the directory).
 	if len(info.MMProjFiles) > 0 {
 		preferred, _ := preferredMMProj(info.MMProjFiles)
+		preferredPath := artifactPath(preferred)
 		// Emit the preferred file first (default/recommended pick), then the
 		// rest, so the recommended mmproj appears at the top of the list.
 		ordered := make([]FileInfo, 0, len(info.MMProjFiles))
 		ordered = append(ordered, preferred)
 		for _, f := range info.MMProjFiles {
-			if f.Name != preferred.Name {
+			if artifactPath(f) != preferredPath {
 				ordered = append(ordered, f)
 			}
 		}
@@ -658,21 +781,56 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 		for _, f := range ordered {
 			base := filepath.Base(f.Name)
-			filter := strings.ToLower(strings.TrimSuffix(base, ".gguf"))
+			filter := strings.ToLower(trimGGUFSuffix(base))
 			items = append(items, SelectableItem{
-				ID:           "mmproj-" + filter,
+				ID:           mmprojArtifactID(f),
 				Label:        base,
 				Description:  mmDesc,
 				Size:         f.Size,
 				SizeHuman:    f.SizeHuman,
-				Recommended:  f.Name == preferred.Name,
+				Recommended:  artifactPath(f) == preferredPath,
 				Category:     "vision_encoder",
 				FilterValue:  filter,
-				Files:        []string{f.Path},
+				Files:        []string{artifactPath(f)},
 				UpstreamRepo: info.MMProjUpstreamRepo,
 			})
 		}
 	}
 
+	return disambiguateGGUFSelectableItems(items)
+}
+
+// disambiguateGGUFSelectableItems appends a reversible, collision-free path
+// identity only when existing labels or IDs collide. This applies uniformly to
+// quantizations, MTP variants, and vision-encoder files.
+func disambiguateGGUFSelectableItems(items []SelectableItem) []SelectableItem {
+	idCounts, labelCounts := make(map[string]int), make(map[string]int)
+	for _, item := range items {
+		idCounts[item.ID]++
+		labelCounts[item.Label]++
+	}
+	for i := range items {
+		files := append([]string(nil), items[i].Files...)
+		sort.Strings(files)
+		identity := strings.Join(files, "\x00")
+		if idCounts[items[i].ID] > 1 {
+			items[i].ID += "-artifact-" + base64.RawURLEncoding.EncodeToString([]byte(identity))
+		}
+		if labelCounts[items[i].Label] > 1 {
+			items[i].Label += " · " + strings.Join(files, ", ")
+		}
+	}
 	return items
+}
+
+// ggufSelectableIdentity returns stable display and UI identities derived from
+// the quant label plus the existing MTP distinction. Callers add a path
+// discriminator only when multiple artifacts would otherwise collide.
+func ggufSelectableIdentity(q GGUFQuantization) (label, id string) {
+	label, id = q.Name, strings.ToLower(q.Name)
+	if q.IsMTP {
+		label += " (MTP)"
+		id += "-mtp"
+	}
+	return label, id
 }

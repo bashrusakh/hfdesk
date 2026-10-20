@@ -25,11 +25,24 @@ var (
 	// ErrRateLimited is returned when the API rate limit is exceeded.
 	ErrRateLimited = errors.New("rate limited: too many requests")
 
-	// ErrNoFilterMatch is returned when a filtered scan finds no file that
-	// directly matches the requested filters after excludes are applied, so a
-	// "successful" plan would consist only of companion/metadata files the
-	// user never selected. Distinguishable via errors.Is.
+	// ErrNoFilterMatch is returned when a filtered scan finds neither a
+	// non-excluded direct path match nor a selected dataset-membership match, so
+	// a successful plan would consist only of companion/metadata files the user
+	// never selected. Distinguishable via errors.Is.
 	ErrNoFilterMatch = errors.New("no files matched requested filters")
+
+	// ErrAmbiguousSelection is returned when dataset membership ambiguity could
+	// change the emitted files for a recognized dataset-group selection.
+	ErrAmbiguousSelection = errors.New("dataset selection is ambiguous")
+
+	// ErrAppendFilterSubdirPathFilter is returned when AppendFilterSubdir is
+	// enabled together with a path-shaped filter (one containing "/" or "\",
+	// including a "./" prefix or trailing separator, or the exact components
+	// "."/".."). AppendFilterSubdir names the destination directory after the
+	// filter, which is only meaningful for single-component group/token
+	// filters; path filters must use AppendFilterSubdir=false. Distinguishable
+	// via errors.Is.
+	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
 )
 
 // DownloadError wraps an error with file context.

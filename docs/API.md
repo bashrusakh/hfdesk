@@ -102,15 +102,18 @@ Important response fields:
       "files": ["model-Q4_K_M.gguf"]
     }
   ],
-  "recommended_filters": ["q4_k_m"],
+  "recommended_filters": ["./model-Q4_K_M.gguf"],
   "recommended_download": {
     "repo": "owner/name",
-    "filters": ["q4_k_m"]
+    "filters": ["./model-Q4_K_M.gguf"],
+    "exactMatch": true
   }
 }
 ```
 
-`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract.
+`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request.
+
+`recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
 ### Model/dataset selection
 
@@ -184,6 +187,62 @@ after resolving or explicitly selecting the repository type. Mirrors that do
 not implement the endpoint (404), transient/server failures, network errors, and
 non-gated responses do not block analysis; the existing tree/metadata analysis
 is used instead.
+
+For model repositories, filtered selection retains every non-LFS file as a
+companion, including tokenizer assets and files outside the selected directory;
+this is not a size-limited or filename-whitelist policy. Unmatched LFS files
+remain excluded, and explicit excludes take precedence. A GGUF-only
+quantization selection is the exception: it keeps only matching GGUF/mmproj
+files and directly matched files such as a matching README, with no automatic
+config, tokenizer, vocabulary, or unmatched README fallback. Explicitly
+selecting one of those files remains supported without changing GGUF-only mode;
+only positive evidence of another model payload (for example a matched
+Safetensors/ONNX/weight-BIN file) selects the ordinary mixed-format behavior.
+Unknown file roles do not broaden selection. Unfiltered downloads are
+unchanged. Existing path, directory, and extension filters keep their usual
+matching rules. In exact mode, a filter ending in `/` selects descendants of
+that directory, not a file whose path is the directory name itself.
+
+Exact filters also support an explicit literal root-basename selector:
+`./model-Q4_0.gguf` selects only that root-level repository path. Nested files
+must use their complete repository-relative path, such as
+`weights/model-Q4_0.gguf`. The `./` form is reserved for exact mode; without
+`exactMatch: true`, filters retain their existing substring behavior. This
+additive selector does not change legacy unqualified basename/token matching.
+
+For GGUF `selectable_items`, `files` contains raw repository-relative paths for
+the complete artifact (including every shard). Use those paths as exact
+selection identities: prefix root-level entries with `./` in `filters`, and
+send nested entries unchanged. `filter_value` is a legacy human/filter token,
+not a unique artifact identity when multiple artifacts share a quant label.
+The analyzer's `recommended_download` already contains encoded exact selectors.
+
+For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
+membership can be inferred from conventional split paths/names or
+`data/<group>/` paths. Send a group's `filter_value` with `exactMatch: true` to
+`/api/plan` or `/api/download`; the planner selects that group's data files and
+keeps applicable repository companions. A filter whose complete normalized value
+is a recognized group label is a membership selector, not a literal path term:
+`train` selects files inferred to belong to `train` (and applicable companions)
+even when another path merely contains the spelling `train`. Literal files or
+directories with that spelling remain selectable through an explicit path form
+such as `./train.csv`, `train/`, `train.csv`, or an extension filter. Default
+substring filters still retain literal substring matching for filters that are
+not themselves a recognized group label, including when a substring occurs
+within a recognized split name. Ambiguous files that could affect a
+selected group cause planning to fail with the standard JSON error response,
+rather than silently broadening or narrowing the selection. `POST /api/plan`
+returns HTTP 400 with error code `ambiguous_selection` for this expected
+selection refusal. For normal queued (`dryRun: false`) `POST /api/download`
+requests, work is admitted asynchronously; ambiguity is discovered by the job's
+later planning step and reported as a failed job, not as an immediate HTTP 400.
+With `dryRun: true`, `POST /api/download` returns the planning response, and
+the same ambiguity returns HTTP 400 with error code `ambiguous_selection`, as
+it does for `POST /api/plan`. Excluding the
+ambiguous file resolves that ambiguity. This selection behavior does not claim
+to identify every possible dataset file layout; use explicit path/extension
+filters where appropriate. A README-only filter does not activate GGUF-only
+selection.
 
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
@@ -401,12 +460,38 @@ Request:
 }
 ```
 
-Returns the files that would be downloaded without starting a job.
+Returns the files that would be downloaded without starting a job. Each HTTP
+response item exposes only `path`, `size`, and `lfs`; `path` is
+repository-relative. The response does not include filter-attribution or
+destination-prefix fields.
 
-When `filters` is non-empty and no file in the repository matches after
-`excludes` are applied, the request fails with `400` and error code
-`no_filter_match`; a plan that contains only companion/metadata files is never
-returned as a success.
+The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
+`*Plan` whose `Items` are `PlanItem`s; the same `Plan` value is passed to
+`Settings.OnPlanComplete`. A `PlanItem` also exposes `DestinationSubdir`
+(`destinationSubdir`) and `Subdir` (`subdir`). `DestinationSubdir` is the
+candidate relative prefix selected by the matched filter; it is populated
+independently of `appendFilterSubdir`, and the downloader applies it only when
+that job flag is enabled, so Go consumers must check the flag before combining
+it with `RelativePath`. `Subdir` is the matched-filter attribution where
+applicable; it can be empty for ordinary non-LFS model files whose destination
+remains repository-relative. `ScanPlan` preview events and the `/api/plan`
+response remain repository-relative.
+
+`AppendFilterSubdir` is limited to single-component group/token filters because
+the filter becomes a destination directory name. `PlanRepo` and `Download`
+reject a path-shaped filter (one containing `/` or `\`, including a `./` prefix
+or trailing separator, or the `.`/`..` components) with
+`ErrAppendFilterSubdirPathFilter` before any network or plan work. Such filters
+remain valid when `AppendFilterSubdir` is disabled. `POST /api/plan` and a
+dry-run `POST /api/download` request report this combination as HTTP 400 with
+error code `invalid_append_filter_subdir`; a normal non-dry-run download remains
+admitted and runs without filter subdirectories, matching the existing download
+pipeline.
+
+When `filters` is non-empty and no non-excluded repository-relative path matches
+or recognized dataset-group membership selects data, the request fails with
+`400` and error code `no_filter_match`; retained companion/metadata files alone
+never make a filtered request succeed.
 
 ## Download
 
@@ -692,9 +777,22 @@ prevent deleting a completed selection; ordinary opaque keys and `.part` /
 `.parts.json` names outside these producer-shaped namespaces remain eligible.
 The server does not cancel jobs. HF mutation excludes writers to the
 selected repository reference namespace and associated friendly view. Local
-queued-job checks use the downloader's GGUF filter/exclude predicate. Partial
-unlink results use `207` and identify removed, remaining, and failed paths
-(`errors`). On the supported platforms above, a local symlink member is unlinked
+selected-delete admission uses complete frozen plan destinations when
+available. A matching run activity with a known and complete plan is
+authoritative: if none of its frozen destinations overlaps the selected entry
+(including revalidated raw alias spellings), that activity cannot write the
+entry and is skipped; any overlapping or unresolved destination remains
+conservative. For queued or incomplete/unknown model plans, it conservatively
+considers non-excluded candidate paths within the job's inventoried writable
+namespace potentially writable: ordinary model plans may retain unmatched
+non-LFS files, including GGUFs and mmproj companions, and a raw quant-filter
+mismatch alone is not generally proof that the job is in GGUF-only mode. This
+is scoped to reachable writable namespaces, not a global conflict; dataset GGUF
+selection keeps its existing narrower direct filter/exclude policy, and unknown
+or outward namespace mappings remain fail-closed. Matching, path-scoped, and
+aliased writers remain conservative. Partial unlink results use `207` and
+identify removed,
+remaining, and failed paths (`errors`). On the supported platforms above, a local symlink member is unlinked
 without following or deleting its target. The authoritative delete-time
 enumeration and filesystem operations
 use one opened repository root and recheck each selected entry immediately

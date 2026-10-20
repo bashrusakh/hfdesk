@@ -64,6 +64,37 @@ func TestCleanHFRelativeUsesSlashNormalizedWirePaths(t *testing.T) {
 	}
 }
 
+func TestDeleteSelectedGGUFSupportsLegacySplitSuffix(t *testing.T) {
+	repo, blob, _, _ := selectedDeleteFixture(t)
+	const name = "model-Q4_K_M-00001-of-00002.gguf-split"
+	snapshot := filepath.Join(repo.SnapshotsDir(), "version-split", name)
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", "blob-a"), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	friendly := filepath.Join(repo.FriendlyPath(), name)
+	if err := os.MkdirAll(filepath.Dir(friendly), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(snapshot, friendly); err != nil {
+		t.Fatal(err)
+	}
+	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: name, Versions: []string{"version-split"}}})
+	if len(result.Errors) != 0 {
+		t.Fatalf("delete errors: %v", result.Errors)
+	}
+	for _, path := range []string{snapshot, friendly} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("selected .gguf-split entry remains: %s (%v)", path, err)
+		}
+	}
+	if _, err := os.Lstat(blob); err != nil {
+		t.Fatalf("shared blob changed by .gguf-split deletion: %v", err)
+	}
+}
+
 func TestDeleteSelectedGGUFRetainsDirectFriendlyBlobDependency(t *testing.T) {
 	repo, blob, snapshot, friendly := selectedDeleteFixture(t)
 	unrelatedPartial := repo.IncompletePath("unrelated")
