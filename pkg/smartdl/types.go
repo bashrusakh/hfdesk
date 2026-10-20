@@ -240,8 +240,11 @@ type GGUFInfo struct {
 
 	// MMProjFiles is the list of multimodal projector (vision-encoder) files
 	// that must accompany an LLM quantization download for vision-language
-	// models. Populated when .gguf files whose basename starts with "mmproj"
-	// are present in the repo (e.g. gemma-3, llava, qwen2.5-vl in GGUF form).
+	// models. Populated when .gguf files whose basename contains "mmproj"
+	// are present in the repo (e.g. gemma-3, llava, qwen2.5-vl in GGUF form),
+	// in any of the known naming conventions: a leading "mmproj-", the
+	// dot-separated ".mmproj-", and the "-mmproj" suffix forms. See
+	// IsMMProjFile, which owns that rule.
 	// For repos without local mmproj, this may be populated from an upstream
 	// base-model repo discovered via the HF model card metadata.
 	MMProjFiles []FileInfo `json:"mmproj_files,omitempty"`

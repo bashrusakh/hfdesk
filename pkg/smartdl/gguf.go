@@ -219,11 +219,18 @@ func ggufQuantType(f FileInfo) string {
 	return ""
 }
 
-// isMMProjFile reports whether a GGUF filename is a multimodal projector
+// IsMMProjFile reports whether a GGUF filename is a multimodal projector
 // (vision encoder) file. These files live alongside LLM quantizations in
 // multimodal GGUF repos and must be downloaded as a companion to the chosen
 // LLM quant — they are not user-selectable quantizations themselves.
-func isMMProjFile(name string) bool {
+//
+// This predicate owns the artifact-role rule for vision-encoder companions:
+// it recognises every known naming convention (a leading "mmproj-", the
+// mradermacher dot-separated ".mmproj-", and the "-mmproj" suffix forms) by
+// matching "mmproj" in the lowercased basename. Other packages that must
+// classify the same artifact (for example the server's cache-selection and
+// cache-metadata models) delegate here instead of keeping a divergent copy.
+func IsMMProjFile(name string) bool {
 	return strings.Contains(strings.ToLower(filepath.Base(name)), "mmproj")
 }
 
@@ -278,7 +285,7 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 		if !strings.HasSuffix(strings.ToLower(f.Name), ".gguf") {
 			continue
 		}
-		if isMMProjFile(f.Name) {
+		if IsMMProjFile(f.Name) {
 			info.MMProjFiles = append(info.MMProjFiles, f)
 			continue
 		}

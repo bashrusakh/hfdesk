@@ -71,7 +71,7 @@ func mradermacherFiles() []FileInfo {
 	return files
 }
 
-// TestIsMMProjFile_Patterns verifies that isMMProjFile recognises every known
+// TestIsMMProjFile_Patterns verifies that IsMMProjFile recognises every known
 // naming convention: leading "mmproj-", dot-separated ".mmproj-", and the
 // "-mmproj" suffix forms, while not matching ordinary LLM quant files.
 func TestIsMMProjFile_Patterns(t *testing.T) {
@@ -88,15 +88,24 @@ func TestIsMMProjFile_Patterns(t *testing.T) {
 		{"Qwopus3.5-9B-v3.5.mmproj-Q8_0.gguf", true},
 		// Hypothetical infix form
 		{"model-mmproj-f16.gguf", true},
+		// The rule is a bare substring match, so a name that merely starts
+		// with "mmproj" is a companion too.
+		{"mmprojector-f16.gguf", true},
 		// Plain LLM quants — must NOT match
 		{"gemma-3-4b-it-Q4_K_M.gguf", false},
 		{"Qwopus3.5-9B-v3.5.Q8_0.gguf", false},
 		{"model.gguf", false},
+		// Projector-like names that do not contain "mmproj" are ordinary
+		// weights, not companions.
+		{"projector-F16.gguf", false},
+		{"clip-Q4_K_M.gguf", false},
+		{"vision-encoder-F16.gguf", false},
+		{"multimodal-projector-Q8_0.gguf", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isMMProjFile(c.name); got != c.want {
-				t.Errorf("isMMProjFile(%q) = %v, want %v", c.name, got, c.want)
+			if got := IsMMProjFile(c.name); got != c.want {
+				t.Errorf("IsMMProjFile(%q) = %v, want %v", c.name, got, c.want)
 			}
 		})
 	}

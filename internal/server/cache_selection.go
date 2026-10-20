@@ -27,9 +27,19 @@ type cacheSelectionMember struct {
 	identity *selectedEntryIdentity `json:"-"`
 }
 
+// Group kinds distinguish the artifact role a selectable group represents.
+// "llm" is a model quantization group; "vision_encoder" is an mmproj
+// companion, which is a separate artifact role and is never presented as a
+// model quantization.
+const (
+	cacheSelectionKindLLM           = "llm"
+	cacheSelectionKindVisionEncoder = "vision_encoder"
+)
+
 type cacheSelectionGroup struct {
 	ID        string                 `json:"id"`
 	Label     string                 `json:"label"`
+	Kind      string                 `json:"kind"`
 	Quant     string                 `json:"quant,omitempty"`
 	Members   []cacheSelectionMember `json:"members"`
 	Warning   string                 `json:"warning,omitempty"`
@@ -83,18 +93,30 @@ func selectionFamily(relative string) (family, quant string, splitIndex, splitTo
 
 func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheSelectionGroup {
 	type aggregate struct {
-		family, quant string
-		members       map[string]*cacheSelectionMember
-		indices       map[string]map[int]bool
-		expected      map[string]int
+		family, quant, kind string
+		// hashKey is the group identity input shared with the existing LLM
+		// group IDs (locationID + family + shape). The kind prefix is applied
+		// outside the hash so LLM group IDs stay unchanged.
+		hashKey  string
+		members  map[string]*cacheSelectionMember
+		indices  map[string]map[int]bool
+		expected map[string]int
 	}
 	aggs := map[string]*aggregate{}
 	for _, file := range files {
-		if !strings.EqualFold(filepath.Ext(file.path), ".gguf") || isCacheMMProjFile(file.path) {
+		if !strings.EqualFold(filepath.Ext(file.path), ".gguf") {
 			continue
 		}
 		family, quant, index, total := selectionFamily(file.path)
-		if quant == "" {
+		kind := cacheSelectionKindLLM
+		if isCacheMMProjFile(file.path) {
+			// A vision encoder companion is a different artifact role, not a
+			// model quantization: it gets its own group class, no quant label,
+			// and no parent-directory quant fallback (that fallback exists for
+			// LLM groups whose quantization lives in the directory name).
+			kind = cacheSelectionKindVisionEncoder
+			quant = ""
+		} else if quant == "" {
 			parentQuant := cacheQuantLabel(filepath.Base(filepath.Dir(file.path)))
 			quant = parentQuant
 		}
@@ -103,10 +125,13 @@ func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheS
 		if isShard {
 			shape = "split"
 		}
-		key := family + "\x00" + shape
+		hashKey := family + "\x00" + shape
+		// The kind is part of the aggregation key so a companion and an LLM
+		// group can never merge, even if they ever shared a family.
+		key := hashKey + "\x00" + kind
 		a := aggs[key]
 		if a == nil {
-			a = &aggregate{family: family, quant: quant, members: map[string]*cacheSelectionMember{}, indices: map[string]map[int]bool{}, expected: map[string]int{}}
+			a = &aggregate{family: family, quant: quant, kind: kind, hashKey: hashKey, members: map[string]*cacheSelectionMember{}, indices: map[string]map[int]bool{}, expected: map[string]int{}}
 			aggs[key] = a
 		}
 		memberKey := file.path + "\x00" + file.version
@@ -151,7 +176,11 @@ func makeSelectionGroups(locationID string, files []cacheSelectionFile) []cacheS
 		if a.quant != "" {
 			label += " · " + a.quant
 		}
-		g := cacheSelectionGroup{ID: "gguf-" + selectionHash(locationID, key), Label: label, Quant: a.quant, Members: members}
+		id := "gguf-" + selectionHash(locationID, a.hashKey)
+		if a.kind == cacheSelectionKindVisionEncoder {
+			id = "mmproj-" + selectionHash(locationID, a.hashKey)
+		}
+		g := cacheSelectionGroup{ID: id, Label: label, Kind: a.kind, Quant: a.quant, Members: members}
 		versions := make([]string, 0, len(a.expected))
 		for version := range a.expected {
 			versions = append(versions, version)

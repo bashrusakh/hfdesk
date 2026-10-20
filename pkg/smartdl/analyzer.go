@@ -1179,7 +1179,7 @@ func (a *Analyzer) fetchMMProjFromRepo(ctx context.Context, repo string) []FileI
 	}
 	var out []FileInfo
 	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f.Name), ".gguf") && isMMProjFile(f.Name) {
+		if strings.HasSuffix(strings.ToLower(f.Name), ".gguf") && IsMMProjFile(f.Name) {
 			out = append(out, f)
 		}
 	}
