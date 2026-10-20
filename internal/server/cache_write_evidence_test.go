@@ -1044,3 +1044,22 @@ func TestFailedInventoryIsMemoizedPerDescriptor(t *testing.T) {
 		t.Fatal("failed descriptor did not remain fail-closed")
 	}
 }
+
+func TestBroadMutationFailsClosedForFailedDescriptor(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	a := testCacheWriteAttempt(m)
+	job := &Job{ID: "unknown", Repo: "owner/repo", OutputDir: root}
+	a.inventory = func(string) (writableNamespaceInventory, bool) { return writableNamespaceInventory{}, false }
+	a.Collect(job)
+	descriptor := decisionJob(job)
+	if !a.failed[decisionDescriptorKey(descriptor)] {
+		t.Fatal("fixture did not produce a failed descriptor")
+	}
+	if !a.HasActiveBroadMutationFor(descriptor, nil) {
+		t.Fatal("failed descriptor was treated as scope-free by broad-mutation admission")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

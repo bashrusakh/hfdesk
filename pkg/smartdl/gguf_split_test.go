@@ -129,3 +129,63 @@ func TestDetectTypeRecognizesLegacyGGUFSplit(t *testing.T) {
 		t.Fatalf("detectType(.gguf-split) = %q, want %q", got, TypeGGUF)
 	}
 }
+
+// TestParseGGUFSplitShardDelimitersAndExtensions pins the shared shard grammar
+// used by both smartdl grouping and the server cache-selection model.
+func TestParseGGUFSplitShardDelimitersAndExtensions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		wantIndex  int
+		wantTotal  int
+		wantOK     bool
+		wantFamily string
+	}{
+		{"model-Q4_K_M-00001-of-00002.gguf", 1, 2, true, "model-Q4_K_M-{part}-of-00002.gguf"},
+		{"model Q5_K_M 00002-of-00002.gguf-split", 2, 2, true, "model Q5_K_M {part}-of-00002.gguf-split"},
+		{"model-Q6_K_00001-of-00002.gguf", 1, 2, true, "model-Q6_K_{part}-of-00002.gguf"},
+		{"model-Q8_0_00001_of_00002.gguf-split", 1, 2, true, "model-Q8_0_{part}_of_00002.gguf-split"},
+		{"invalid-00000-of-00000.gguf", 0, 0, true, "invalid-{part}-of-00000.gguf"},
+		{"plain-Q4_K_M.gguf", 0, 0, false, ""},
+		{"model-Q4_K_M_EXTRA.gguf", 0, 0, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shard, ok := ParseGGUFSplitShard(tc.name)
+			if ok != tc.wantOK || shard.Index != tc.wantIndex || shard.Total != tc.wantTotal {
+				t.Fatalf("ParseGGUFSplitShard(%q) = %+v/%t, want index=%d total=%d ok=%t", tc.name, shard, ok, tc.wantIndex, tc.wantTotal, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			family := tc.name[:shard.Start] + "{part}" + tc.name[shard.End:]
+			if family != tc.wantFamily {
+				t.Fatalf("family for %q = %q, want %q", tc.name, family, tc.wantFamily)
+			}
+		})
+	}
+}
+
+// TestExportedGGUFClassifier pins the classifier surface consumed by the
+// server cache metadata/selection/delete paths.
+func TestExportedGGUFClassifier(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, wantQuant string
+		wantGGUF              bool
+	}{
+		{"model-Q4_K_M.gguf", "model-Q4_K_M.gguf", "Q4_K_M", true},
+		{"model-Q4_K_M-00001-of-00002.gguf-split", "model-Q4_K_M-00001-of-00002.gguf-split", "Q4_K_M", true},
+		{"model Q5_K_M 00002-of-00002.gguf-split", "model Q5_K_M 00002-of-00002.gguf-split", "Q5_K_M", true},
+		{"shard-00001-of-00002.gguf", "variants/UD-Q4_K_XL/shard-00001-of-00002.gguf", "UD_Q4_K_XL", true},
+		{"PQ2_0.gguf", "PQ2_0.gguf", "", true},
+		{"model-Q4_K_M_EXTRA.gguf", "model-Q4_K_M_EXTRA.gguf", "", true},
+		{"config.json", "config.json", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsGGUFFileName(tc.name); got != tc.wantGGUF {
+				t.Errorf("IsGGUFFileName(%q) = %t, want %t", tc.name, got, tc.wantGGUF)
+			}
+			if got := GGUFQuantType(tc.name, tc.path); got != tc.wantQuant {
+				t.Errorf("GGUFQuantType(%q, %q) = %q, want %q", tc.name, tc.path, got, tc.wantQuant)
+			}
+		})
+	}
+}

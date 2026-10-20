@@ -871,7 +871,9 @@ func isDatasetReadmeOrLicensePath(relativePath string) bool {
 
 func isKnownScopedDatasetCompanionBase(base string) bool {
 	switch base {
-	case "config.json", "tokenizer.json", "tokenizer_config.json",
+	case "config.json", "generation_config.json", "preprocessor_config.json",
+		"processor_config.json", "quantization_config.json", "adapter_config.json",
+		"tokenizer.json", "tokenizer_config.json",
 		"special_tokens_map.json", "added_tokens.json", "vocab.json",
 		"merges.txt", "vocab.txt",
 		"pyproject.toml", "setup.py", "setup.cfg", "environment.yml",
@@ -1072,7 +1074,7 @@ func isModelPayloadPath(filePath string) bool {
 		return false
 	}
 	switch path.Ext(base) {
-	case ".safetensors", ".onnx", ".pt", ".pth", ".gguf-split":
+	case ".safetensors", ".onnx", ".pt", ".pth", ".ckpt", ".gguf-split", ".ggml":
 		return true
 	case ".bin":
 		return !strings.Contains(base, "tokenizer")

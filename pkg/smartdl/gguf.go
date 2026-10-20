@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -184,11 +185,13 @@ var (
 	modelNamePattern = regexp.MustCompile(`^(.+?)[-._](?:IQ|Q|BF|F)\d`)
 
 	// Match the shard suffix of a split GGUF, e.g. "-00001-of-00003"
-	// optionally followed by ".gguf" or the legacy ".gguf-split" extension,
-	// or delimited by a space (space-delimited shard names). HuggingFace/
-	// llama.cpp use 5-digit indices; allow 4-5 digits to be safe. Used to group
-	// shards of the same quantization together.
-	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ]\d{4,5}-of-\d{4,5}(?:\.gguf(?:-split)?)?$`)
+	// optionally followed by ".gguf" or the legacy ".gguf-split" extension.
+	// Hyphen, underscore, and space delimiters are accepted around both the
+	// shard index and "of" so names such as "model Q5_K_M 00001-of-00002" and
+	// "model-Q4_K_M_00001_of_00002" share the same grouping/quant rules.
+	// HuggingFace/llama.cpp use 5-digit indices; allow 4-5 digits to be safe.
+	// Used to group shards of the same quantization together.
+	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ](\d{4,5})[-_ ]of[-_ ](\d{4,5})(?:\.gguf(?:-split)?)?$`)
 )
 
 // isGGUFFileName reports whether name carries a recognized GGUF suffix,
@@ -196,6 +199,14 @@ var (
 func isGGUFFileName(name string) bool {
 	lower := strings.ToLower(name)
 	return strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".gguf-split")
+}
+
+// IsGGUFFileName reports whether name carries a recognized GGUF suffix,
+// including the legacy ".gguf-split" shard extension. It is the shared
+// classifier for callers outside this package; callers must not maintain a
+// separate suffix list.
+func IsGGUFFileName(name string) bool {
+	return isGGUFFileName(name)
 }
 
 // trimGGUFSuffix removes a recognized GGUF extension, including the legacy
@@ -221,6 +232,37 @@ func stripSplitSuffix(name string) string {
 // isSplitShard reports whether a filename carries a split-GGUF shard suffix.
 func isSplitShard(name string) bool {
 	return splitSuffixPattern.MatchString(name)
+}
+
+// GGUFSplitShard describes the recognized shard suffix of a split-GGUF
+// filename. Start and End delimit the decimal shard index within the original
+// name, so callers that group shards can replace only the variable part while
+// retaining the shard total and extension spelling.
+type GGUFSplitShard struct {
+	Index int
+	Total int
+	Start int
+	End   int
+}
+
+// ParseGGUFSplitShard reports whether name carries the recognized split-GGUF
+// shard suffix and, when it does, returns its index/total plus the byte range
+// of the index within name. The suffix grammar is the same one used by
+// stripSplitSuffix.
+func ParseGGUFSplitShard(name string) (GGUFSplitShard, bool) {
+	loc := splitSuffixPattern.FindStringSubmatchIndex(name)
+	if len(loc) != 6 {
+		return GGUFSplitShard{}, false
+	}
+	index, err := strconv.Atoi(name[loc[2]:loc[3]])
+	if err != nil {
+		return GGUFSplitShard{}, false
+	}
+	total, err := strconv.Atoi(name[loc[4]:loc[5]])
+	if err != nil {
+		return GGUFSplitShard{}, false
+	}
+	return GGUFSplitShard{Index: index, Total: total, Start: loc[2], End: loc[3]}, true
 }
 
 // ggufQuantType extracts a quantization token from either the filename or its
@@ -249,6 +291,17 @@ func ggufQuantType(f FileInfo) string {
 		}
 	}
 	return ""
+}
+
+// GGUFQuantType extracts the canonical quantization label for a GGUF artifact.
+// name is the basename and relativePath is the repository-relative path; the
+// latter lets directory-qualified quants be recognized when split shard names
+// omit the token. A recognized split suffix is stripped before matching, and
+// tokens that extend a known quant label without a recognized split suffix
+// (for example "Q4_K_M_EXTRA") remain unclassified. It is the shared
+// classifier for callers outside this package.
+func GGUFQuantType(name, relativePath string) string {
+	return ggufQuantType(FileInfo{Name: name, Path: relativePath})
 }
 
 // IsMMProjFile reports whether a GGUF filename is a multimodal projector

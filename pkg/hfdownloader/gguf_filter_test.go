@@ -33,6 +33,14 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		"model-Q4_K_M-00002-of-00002.gguf-split",
 		"config.json",
 	}
+	ckptRepo := []string{
+		"model-q4_k_m.gguf",
+		"checkpoint.ckpt",
+	}
+	ggmlRepo := []string{
+		"model-q4_k_m.gguf",
+		"weights.ggml",
+	}
 
 	cases := []struct {
 		name    string
@@ -49,6 +57,8 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 		{"safetensors filter is not gguf", transformersRepo, []string{"safetensors"}, false, false},
 		{"training-named payload keeps mixed mode", trainingNamedRepo, []string{"q4_k_m", "training-model"}, false, false},
 		{"legacy .gguf-split quant selected", legacySplitRepo, []string{"Q4_K_M"}, false, true},
+		{"ckpt payload keeps mixed mode", ckptRepo, []string{"q4_k_m", "checkpoint"}, false, false},
+		{"ggml payload keeps mixed mode", ggmlRepo, []string{"q4_k_m", "weights"}, false, false},
 		{"non-gguf filter in gguf repo", ggufRepo, []string{"config.json"}, false, false},
 	}
 
@@ -71,6 +81,8 @@ func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T)
 		{"weights/pytorch_model.bin", true},
 		{"weights/model.pt", true},
 		{"weights/model.pth", true},
+		{"weights/model.ckpt", true},
+		{"weights/model.ggml", true},
 		{"weights/model.gguf-split", true},
 		{"weights/flax_model.msgpack", true},
 		{"weights/flax_model-00001-of-00002.msgpack", true},
@@ -88,6 +100,7 @@ func TestIsModelPayloadPathUsesSupportedWeightFormatsAndExclusions(t *testing.T)
 		{"weights/training-model.safetensors", true},
 		{"weights/model-training.pt", true},
 		{"weights/optimizer.pt", false},
+		{"weights/optimizer.ckpt", false},
 		{"weights/adam_optimizer.pt", false},
 		{"weights/training_optimizer.pt", false},
 		{"weights/my_optimizer.pt", false},

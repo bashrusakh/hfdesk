@@ -243,7 +243,7 @@ func (r *RepoDir) DeleteSelectedGGUF(entries []SelectedGGUFEntry, protectedRoots
 		cleanProtectedRoots = append(cleanProtectedRoots, root)
 	}
 	for _, item := range entries {
-		if !cleanHFRelative(item.Path) || !strings.EqualFold(path.Ext(item.Path), ".gguf") {
+		if !cleanHFRelative(item.Path) || !isGGUFFilePath(item.Path) {
 			result.Errors = append(result.Errors, "unsafe or non-GGUF selected path")
 			return result
 		}

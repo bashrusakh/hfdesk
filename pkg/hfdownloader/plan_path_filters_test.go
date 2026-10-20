@@ -756,12 +756,18 @@ func TestPlanRepoDatasetKnownConfigAndTokenizerCompanions(t *testing.T) {
 		"dataset_infos.json",
 		"CITATION.cff",
 		"config.json",
+		"generation_config.json",
+		"preprocessor_config.json",
+		"processor_config.json",
+		"quantization_config.json",
+		"adapter_config.json",
 		"README.md",
 		"LICENSE.md",
 		"docs/guide.md",
 		"Docs/guide.md",
 		"notebooks/run.ipynb",
 		"docs/config.json",
+		"docs/generation_config.json",
 		"tokenizer/vocab.txt",
 		"COPYING",
 		"NOTICE",
@@ -819,6 +825,11 @@ func TestPlanRepoDatasetCompanionPathScope(t *testing.T) {
 		"test/run.ipynb",
 		"test/config.yaml",
 		"test/config.json",
+		"test/generation_config.json",
+		"test/preprocessor_config.json",
+		"test/processor_config.json",
+		"test/quantization_config.json",
+		"test/adapter_config.json",
 		"test/tokenizer.json",
 		"test/vocab.txt",
 		"test/requirements.txt",
@@ -857,6 +868,52 @@ func TestPlanRepoDatasetCompanionPathScope(t *testing.T) {
 				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
 			}
 			assertPaths(t, planPaths(plan), want)
+		})
+	}
+}
+
+// TestPlanRepoDatasetDirectlySelectsScopedConfigCompanions preserves direct
+// selection for recognized config names even when their directory would not
+// otherwise make them dataset companions.
+func TestPlanRepoDatasetDirectlySelectsScopedConfigCompanions(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train.csv", Size: 10},
+		{Type: "file", Path: "generation_config.json", Size: 11},
+		{Type: "file", Path: "test/generation_config.json", Size: 12},
+		{Type: "file", Path: "configs/processor_config.json", Size: 13},
+	}
+	for _, tc := range []struct {
+		name    string
+		filters []string
+		want    []string
+	}{
+		{
+			name:    "root",
+			filters: []string{"generation_config.json"},
+			// The root filter selects both generation_config paths directly;
+			// the conventional-directory companion is retained as before.
+			want: []string{"generation_config.json", "test/generation_config.json", "configs/processor_config.json"},
+		},
+		{
+			name:    "split-like nested",
+			filters: []string{"test/generation_config.json"},
+			want:    []string{"generation_config.json", "test/generation_config.json", "configs/processor_config.json"},
+		},
+		{
+			name:    "conventional directory",
+			filters: []string{"configs/processor_config.json"},
+			// The root companion is retained; the split-like nested file is not.
+			want: []string{"generation_config.json", "configs/processor_config.json"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := mockHFServerForPlan(t, files)
+			defer srv.Close()
+			plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: tc.filters, ExactMatch: true}, Settings{Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("PlanRepo filters=%v: %v", tc.filters, err)
+			}
+			assertPaths(t, planPaths(plan), tc.want)
 		})
 	}
 }

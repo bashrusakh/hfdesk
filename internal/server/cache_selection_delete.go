@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
 
 type jobWriteActivity struct {
@@ -1956,7 +1957,7 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 			}
 			return nil
 		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".gguf") {
+		if entry.IsDir() || !smartdl.IsGGUFFileName(entry.Name()) {
 			return nil
 		}
 		info, err := root.Lstat(name)

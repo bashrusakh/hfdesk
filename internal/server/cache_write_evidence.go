@@ -370,6 +370,28 @@ func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
 	return a.MayWriteDescriptor(decisionJob(job), targets)
 }
 
+// descriptorFailed reports whether the collected evidence for the semantic
+// descriptor failed. Matching mirrors MayWriteDescriptor: activity identity is
+// not part of the job-level key, and a starting job descriptor is advanced once
+// to match its claimed activity.
+func (a *cacheWriteAttempt) descriptorFailed(descriptor writeDecisionJob) bool {
+	base := descriptor
+	wasActivity := base.activityID != 0
+	base.activityID = 0
+	if base.starting && !wasActivity {
+		base.generation++
+	}
+	baseKey := decisionDescriptorKey(base)
+	for key, stored := range a.descriptors {
+		candidate := stored
+		candidate.activityID = 0
+		if decisionDescriptorKey(candidate) == baseKey && a.failed[key] {
+			return true
+		}
+	}
+	return a.failed[decisionDescriptorKey(descriptor)]
+}
+
 func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targets []string) bool {
 	if a == nil {
 		return true
@@ -467,6 +489,13 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 			evidence = append(evidence, ev)
 		}
 	} else {
+		// A descriptor whose namespace evidence could not be collected has an
+		// unknown writable scope. MayWriteDescriptor already fails closed for
+		// that descriptor; broad-mutation admission must not treat it as
+		// scope-free.
+		if a.descriptorFailed(*descriptor) {
+			return true
+		}
 		key := decisionDescriptorKey(*descriptor)
 		if ev, ok := a.evidence[key]; ok {
 			evidence = append(evidence, ev)
