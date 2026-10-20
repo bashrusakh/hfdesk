@@ -206,12 +206,13 @@ type Settings struct {
 	//     validated and written, and the single path requires an exact 206
 	//     Content-Range/body-length match and checks the on-disk size before
 	//     the rename. On the normal transfer path no full-file SHA-256 reread
-	//     is performed for LFS files. Three deliberate exceptions may still
+	//     is performed for LFS files. Four deliberate exceptions may still
 	//     hash: the pre-download skip check over an already-present
-	//     destination, the one-time legacy-migration content proof, and the
-	//     content proof of inherited single-path .part bytes (see below). A
-	//     resumed ProofPending record can also force the proof after a crash or
-	//     mode change (see the durable proof gate below).
+	//     destination, the one-time legacy-migration content proof, the
+	//     content proof of inherited single-path .part bytes, and a
+	//     single-request transfer with a known digest but no known expected
+	//     size (see below). A resumed ProofPending record can also force the
+	//     proof after a crash or mode change (see the durable proof gate below).
 	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
 	//     At most one full-file read is performed per file, always before
 	//     publication when the item carries a known digest: a fresh sequential
@@ -235,10 +236,12 @@ type Settings struct {
 	// resumed single-request .part contributed before this run: a moved commit
 	// or a corrupt file can produce a size-correct prefix, so inherited .part
 	// bytes are content-proven once before the rename. A fresh single-request
-	// transfer in "sha256"/"etag" mode is likewise proven before the rename. A
-	// mismatch discards the partial/staging data and never publishes. With
-	// Verify "none" both inherit the mode's no-hash semantics; without a known
-	// digest only size and complete transfer coverage can be checked.
+	// transfer in "sha256"/"etag" mode is likewise proven before the rename,
+	// and a known digest with no known expected size is proven too (only the
+	// digest can validate an unconstrained stream). A mismatch discards the
+	// partial/staging data and never publishes. With Verify "none" both inherit
+	// the mode's no-hash semantics; without a known digest only size and
+	// complete transfer coverage can be checked.
 	//
 	// Durable proof gate: a staging (multipart) record carries a persisted
 	// ProofPending flag that is set and flushed before any known-digest proof
@@ -247,13 +250,17 @@ type Settings struct {
 	// "none" (including "size") whenever the item has a known digest, so a
 	// crash mid-proof, a mismatch whose cleanup cannot take the transition lock,
 	// or a later Verify-mode change cannot publish unproven all-Done ranges. On
-	// a mismatch the flag stays set, the payload is truncated to zero
-	// (poisoned), and the owned discard is attempted; if that discard fails the
-	// next run re-proves or discards. Publish refuses while the flag is still
-	// set for a known digest. Verify "none" is the explicit no-hash opt-out.
-	// The single-request .part needs no separate flag: it is renamed only after
-	// the proof, so any restart treats its bytes as inherited and re-proves them
-	// in every non-"none" mode.
+	// a mismatch the flag stays set, poison is attempted only while the claim is
+	// still owned under the transition lock (a fallback writer that lost a
+	// takeover must not truncate the successor's payload), and the owned discard
+	// is attempted; if either cannot verify ownership, the durable flag remains
+	// the guard and the next run re-proves or discards. Publish refuses while the
+	// flag is still set for a known digest. Verify "none" is the explicit
+	// no-hash opt-out. The single-request .part has no separate flag: when a
+	// proof is required (sha256/etag, inherited bytes, or a known digest with
+	// unknown size) it is renamed only after that proof, so every restart
+	// re-proves it; a fresh size transfer with a known size follows the size
+	// contract and may rename without a hash.
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.

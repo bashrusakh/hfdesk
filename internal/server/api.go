@@ -30,12 +30,14 @@ var Version = "dev"
 
 // isBlobStagingArtifactName reports whether a blobs/ directory entry belongs to
 // the download staging family rather than to stored content:
-// blobs/<sha>.incomplete (payload), .incomplete.meta (resume record) and the
-// persistent .incomplete.lock/.incomplete.meta.lock ownership files. Cache
-// statistics and listings must not count them as cached blobs.
+// blobs/<sha>.incomplete (payload), .incomplete.meta (resume record),
+// .incomplete.meta.tmp (atomic record temp) and the persistent
+// .incomplete.lock/.incomplete.meta.lock ownership files. Cache statistics,
+// listings and mirrors must not count them as cached blobs.
 func isBlobStagingArtifactName(name string) bool {
 	return strings.HasSuffix(name, ".incomplete") ||
 		strings.HasSuffix(name, ".meta") ||
+		strings.HasSuffix(name, ".meta.tmp") ||
 		strings.HasSuffix(name, ".lock")
 }
 

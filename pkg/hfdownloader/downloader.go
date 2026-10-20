@@ -169,6 +169,17 @@ func removeLegacySinglePart(dst string) error {
 	return nil
 }
 
+// skippedBlobLink records an HF-cache item that was skipped while another
+// writer owned or completed the shared blob. A later writer may have created
+// snapshot/friendly entries only for its own repository path, so Download
+// reconciles every skipped path once all files have finished.
+type skippedBlobLink struct {
+	commit       string
+	relativePath string
+	filterSubdir string
+	sha256       string
+}
+
 // Download scans and downloads files from a HuggingFace repo.
 //
 // v3.0+: Files are stored in HuggingFace Hub cache structure by default:
@@ -339,6 +350,32 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// To print "skip" only once per final path per run
 	var skipOnce sync.Map
 
+	// Skipped HF-cache items with a known blob SHA. Their snapshot/friendly
+	// entries are reconciled after every file finishes, because a shared blob
+	// winner only creates entries for its own path.
+	var (
+		skippedLinksMu  sync.Mutex
+		skippedLinks    []skippedBlobLink
+		skippedLinkSeen = map[string]bool{}
+	)
+	recordSkippedBlobLink := func(it PlanItem, finalRel, filterSubdir string) {
+		if !useHFCache || it.SHA256 == "" {
+			return
+		}
+		key := plan.Commit + "\x00" + finalRel + "\x00" + filterSubdir
+		skippedLinksMu.Lock()
+		if !skippedLinkSeen[key] {
+			skippedLinkSeen[key] = true
+			skippedLinks = append(skippedLinks, skippedBlobLink{
+				commit:       plan.Commit,
+				relativePath: it.RelativePath,
+				filterSubdir: filterSubdir,
+				sha256:       it.SHA256,
+			})
+		}
+		skippedLinksMu.Unlock()
+	}
+
 	var skippedCount int64
 	var downloadedCount int64
 
@@ -499,6 +536,7 @@ LOOP:
 				return
 			}
 			if alreadyOK {
+				recordSkippedBlobLink(it, finalRel, filterSubdir)
 				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
 					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
 					atomic.AddInt64(&skippedCount, 1)
@@ -571,6 +609,7 @@ LOOP:
 			// published by one — is not a failure: finish this item as a
 			// skip, exactly like the pre-download skip check does.
 			if errors.Is(dlErr, errBlobIncompleteOwned) || errors.Is(dlErr, errBlobAlreadyComplete) {
+				recordSkippedBlobLink(it, finalRel, filterSubdir)
 				reason := "downloading by another process"
 				if errors.Is(dlErr, errBlobAlreadyComplete) {
 					reason = "blob exists"
@@ -691,7 +730,7 @@ LOOP:
 					}
 				}
 			} else if cfg.Verify == "size" && it.Size > 0 {
-				fi, err := os.Stat(dst)
+				fi, err := os.Stat(verifyPath)
 				if err != nil || fi.Size() != it.Size {
 					select {
 					case errCh <- fmt.Errorf("size mismatch for %s", finalRel):
@@ -720,7 +759,7 @@ LOOP:
 					return
 				}
 				if remoteSha != "" {
-					if err := verifySHA256Ctx(fileCtx, dst, remoteSha); err != nil {
+					if err := verifySHA256Ctx(fileCtx, verifyPath, remoteSha); err != nil {
 						select {
 						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 						default:
@@ -794,6 +833,35 @@ LOOP:
 	}
 
 	wg.Wait()
+
+	// Reconcile skipped shared-blob paths once every writer has finished. A
+	// same-SHA/different-path item that skipped via BlobDownloading or a lost
+	// staging claim only becomes linkable after the winning writer publishes;
+	// create its own snapshot and friendly entries now so a shared blob does
+	// not leave later plan paths without cache entries.
+	if useHFCache && repoDir != nil {
+		skippedLinksMu.Lock()
+		links := append([]skippedBlobLink(nil), skippedLinks...)
+		skippedLinksMu.Unlock()
+		for _, link := range links {
+			status, _, cerr := repoDir.CheckBlob(link.sha256)
+			if cerr != nil || status != BlobComplete {
+				continue
+			}
+			if cerr := repoDir.createSnapshotSymlink(jobCtx, link.commit, link.relativePath, link.sha256); cerr != nil {
+				emit(ProgressEvent{Level: "warn", Event: "warning",
+					Message: fmt.Sprintf("create snapshot entry %s: %v", link.relativePath, cerr)})
+				continue
+			}
+			if !cfg.NoFriendlyView {
+				if ferr := repoDir.createFriendlySymlinkCtx(jobCtx, link.commit, link.relativePath, link.filterSubdir); ferr != nil {
+					emit(ProgressEvent{Level: "warn", Event: "warning",
+						Message: fmt.Sprintf("create friendly entry %s: %v", link.relativePath, ferr)})
+				}
+			}
+		}
+	}
+
 	close(errCh)
 
 	// Drain errors, but remember every error so the job-fatal error (if any)
@@ -1251,9 +1319,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 
 	// If the partial already holds exactly the expected number of bytes, its
 	// bytes are still unproven: publish only after the exact-size check and,
-	// for inherited bytes, the content proof.
+	// for inherited bytes, the content proof. Emit the full-progress reading
+	// before the finalization event so the UI does not sit below 100% through
+	// the proof/rename.
 	if it.Size > 0 && pos == it.Size {
-		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited)
+		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
+		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
@@ -1434,7 +1505,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						attemptCancel()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size})
-						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited)
+						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
 					}
 					attemptCancel()
 					lastErr = classifyStall(ctx, body, cerr)
@@ -1448,6 +1519,15 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						// resumes from the durable offset instead of
 						// duplicating them. Overflow writes are excluded above.
 						pos = base + w.written
+						// A transport/stall error after the final requested byte
+						// already reached disk must not plan bytes=size-(size-1)
+						// (a 416). Finalize the exact-size file instead. A genuine
+						// caller cancellation still takes the ctx path below.
+						if it.Size > 0 && pos >= it.Size && ctx.Err() == nil {
+							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
+								Downloaded: it.Size, Total: it.Size})
+							return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
+						}
 					}
 				}
 			}
@@ -1501,11 +1581,15 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 // expected number of bytes. It is the single path's publication gate: the
 // exact-size check runs first, then a known digest is proven with one
 // full-file SHA-256 pass before the rename whenever Verify is "sha256" or
-// "etag" (fresh or resumed) or whenever the partial contains inherited bytes
-// and Verify is not "none" (the one-time migration exception for size mode). A
-// mismatch removes the partial and never renames it onto dst. The returned bool
-// reports whether that proof ran, so the caller does not repeat it.
-func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool) (bool, error) {
+// "etag" (fresh or resumed), whenever the partial contains inherited bytes and
+// Verify is not "none" (the one-time migration exception for size mode), or
+// whenever the expected size is unknown but the item carries a known digest
+// (only the digest can prove an unconstrained stream). A mismatch removes the
+// partial and never renames it onto dst. The returned bool reports whether that
+// proof ran, so the caller does not repeat it. file_finalizing is emitted
+// before the slow proof so the UI sees the local-finalization window.
+func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool, emit func(ProgressEvent)) (bool, error) {
+	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "verifying"})
 	if it.Size > 0 {
 		fi, err := out.Stat()
 		if err != nil {
@@ -1517,10 +1601,11 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	}
 	verified := false
 	// Known-digest modes always prove before publication (fresh or resumed);
-	// size mode proves only inherited bytes, which have no validated provenance
-	// (a moved commit or a corrupt file can produce a size-correct prefix).
+	// size mode proves inherited bytes or an unknown-size stream, neither of
+	// which can be trusted from size alone. Verify="none" is the opt-out.
 	proveKnownDigest := it.SHA256 != "" &&
-		(cfg.Verify == "sha256" || cfg.Verify == "etag" || (inherited && cfg.Verify != "none"))
+		(cfg.Verify == "sha256" || cfg.Verify == "etag" ||
+			(cfg.Verify != "none" && (it.Size <= 0 || inherited)))
 	if proveKnownDigest {
 		sum, err := computeSHA256Ctx(ctx, tmp)
 		if err != nil {
@@ -1546,6 +1631,12 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		return false, err
+	}
+	// Obsolete pre-#140 multipart artifacts for this destination must not
+	// survive a successful single-path finalization. Finalization already
+	// succeeded, so a cleanup failure is logged and does not unpublish the file.
+	if err := removeMultipartResumeFiles(dst); err != nil {
+		log.Printf("warning: cleanup legacy multipart artifacts for %s after single-path publish: %v", dst, err)
 	}
 	return verified, nil
 }

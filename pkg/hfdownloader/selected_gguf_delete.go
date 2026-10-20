@@ -129,6 +129,10 @@ func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 		}
 		pathEqual = strings.EqualFold
 	}
+	if sha := trimSuffix(base, ".incomplete.meta.tmp"); sha != base &&
+		pathEqual(name, r.IncompleteMetaPath(sha)+".tmp") {
+		return true
+	}
 	if sha := trimSuffix(base, ".incomplete.meta"); sha != base && pathEqual(name, r.IncompleteMetaPath(sha)) {
 		return true
 	}

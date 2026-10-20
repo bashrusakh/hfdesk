@@ -133,8 +133,9 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   post-download content hash; `size` (default) checks exact size plus complete
   validated transfer coverage on both the ranged and single-request paths and
   performs no full-file SHA-256 pass on the normal path (the pre-download skip
-  check, the one-time legacy-migration content proof, and the inherited
-  single-path `.part` proof may still hash); `sha256` performs at most one
+  check, the one-time legacy-migration content proof, the inherited
+  single-path `.part` proof, and a single-request known digest with no known
+  expected size may still hash); `sha256` performs at most one
   full-file pass, always before the rename/publication when a known digest
   exists, and never publishes a mismatch; `etag` proves a known digest with
   that same single pre-publication pass and keeps the historical non-LFS ETag
@@ -156,11 +157,15 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   (including `size`) whenever a known digest exists, so a crash mid-proof, a
   mismatch whose cleanup could not take the transition lock, or a later mode
   change cannot publish unproven all-Done ranges. A mismatch keeps the flag set,
-  truncates the payload to zero (poison), and attempts the owned discard; if that
-  fails, the next run re-proves or discards. Publish refuses while a known
-  digest's proof is pending; `none` is the explicit opt-out. The single-path
-  `.part` is its own marker: it is renamed only after proof, so every restart
-  re-proves it.
+  attempts poison (truncate to zero) only while the claim is still owned under
+  the transition lock, and attempts the owned discard; if ownership cannot be
+  verified the poison is skipped and the durable flag remains the guard, so the
+  next run re-proves or discards. Publish refuses while a known digest's proof
+  is pending; `none` is the explicit opt-out. The single-path `.part` is its own
+  marker when a proof is required (sha256/etag, inherited bytes, or a known
+  digest with unknown size): it is renamed only after proof, so every restart
+  re-proves it. A fresh size transfer with a known size follows the size
+  contract and may rename without a hash.
 - Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
   them LegacyMigrated, keep the marker durable across resume, and content-prove
   them with one full-file SHA-256 pass before publication whenever a known

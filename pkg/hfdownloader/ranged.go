@@ -449,8 +449,11 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit)
 		// A fresh known-digest mode claim persists the durable proof gate in
-		// its very first record write, before any transfer can start.
+		// its very first record write, before any transfer can start. The
+		// ownership mode is persisted too, so CheckBlob can use a free OS lock
+		// as the authoritative no-writer signal on supported platforms.
 		meta.ProofPending = proofMode
+		meta.LockFenced = osExclusive
 		return createStagingClaim(metaPath, meta)
 	}
 	if rerr != nil {
@@ -502,6 +505,9 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// Preserve the durable gate, add it for the current known-digest mode or
 	// for an older record whose legacy-migrated bytes still need the proof.
 	take.ProofPending = meta.ProofPending || proofMode || (meta.LegacyMigrated && proofForKnownDigest)
+	// Record the ownership mode of THIS claim, not the predecessor's: the
+	// current process either holds the OS lock or is on the lease fallback.
+	take.LockFenced = osExclusive
 	state, retry, err := createStagingClaim(metaPath, take)
 	if err != nil || retry {
 		return nil, retry, err
@@ -595,6 +601,9 @@ func stagingArtifactsAbsent(staging, metaPath string) bool {
 		return false
 	}
 	if _, err := os.Stat(metaPath); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if _, err := os.Stat(metaPath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	return true
@@ -716,6 +725,13 @@ func parseStaleTimeoutSetting(cfg Settings) (time.Duration, error) {
 // payload no longer exists. The publish path is the deliberate exception: it
 // renames the payload into place first, then removes the now-obsolete record.
 func removeStagingArtifactsLocked(staging, metaPath string) {
+	// The atomic record rewrite stages its JSON in metaPath+".tmp"; a crash
+	// between create and rename leaves that transient artifact behind. It is
+	// never a blob and must not survive cleanup.
+	// lgtm[go/path-injection]
+	if err := os.Remove(metaPath + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("warning: cleanup staging meta temp %s: %v", metaPath+".tmp", err)
+	}
 	// lgtm[go/path-injection]
 	if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		// Keep the payload if the record could not be removed: deleting the
@@ -1155,6 +1171,12 @@ type stagingDownload struct {
 	own         *stagingOwnershipLock
 	osExclusive bool
 
+	// contentAddressed marks pub as blobs/<known-sha>, whose existence alone
+	// proves completion. Publish must not overwrite it if another writer
+	// (single path, legacy tmp-<sha>+store, another staging family) published
+	// the blob while this transfer was in flight.
+	contentAddressed bool
+
 	// partCtx is the part-scoped cancellable context, stored so every
 	// post-claim phase (migration, transfer, hash, publish) can apply the same
 	// cancel-cleanup semantics.
@@ -1222,6 +1244,7 @@ func (d *stagingDownload) flushMetaLocked() error {
 	meta.StartedAt = d.startedAt
 	meta.LegacyMigrated = d.legacyMigrated
 	meta.ProofPending = d.proofPending
+	meta.LockFenced = d.osExclusive
 	if d.ranges != nil {
 		if !normalizeRangesInPlace(d.ranges, d.it.Size) {
 			return fmt.Errorf("staging metadata flush: invalid range layout for %s", d.it.RelativePath)
@@ -1302,11 +1325,17 @@ func (d *stagingDownload) heartbeatError() error {
 
 // closeOut closes the staging handle exactly once so Windows can unlink the
 // file before cancel cleanup or the publish rename.
-func (d *stagingDownload) closeOut() {
+// closeOut closes the staging handle exactly once so Windows can unlink the
+// file before cancel cleanup or the publish rename. The returned error is a
+// real finalization signal on the success path (a buffered write or close
+// failure can lose bytes); best-effort cleanup paths discard it.
+func (d *stagingDownload) closeOut() error {
 	if d.out != nil {
-		_ = d.out.Close()
+		err := d.out.Close()
 		d.out = nil
+		return err
 	}
+	return nil
 }
 
 // requiresPrePublicationProof reports whether the current item, Verify mode
@@ -1330,16 +1359,38 @@ func (d *stagingDownload) requiresPrePublicationProof() bool {
 	return d.cfg.Verify == "sha256" || d.cfg.Verify == "etag" || d.legacyMigrated || d.proofPending
 }
 
-// poisonStaging truncates the staging payload to zero so a later claim cannot
-// trust the record's all-Done ranges even if the durable ProofPending flag is
-// missing (for example when the record flush could not take the transition
-// lock). The caller holds the OS ownership lock. It is best-effort: failures
-// are logged and the durable flag remains the primary guard.
-func (d *stagingDownload) poisonStaging() {
-	d.closeOut()
+// poisonStagingLocked truncates the staging payload to zero so a later claim
+// cannot trust the record's all-Done ranges even if the durable ProofPending
+// flag is missing. The caller must hold the transition lock AND have re-read
+// the record as owned by this process; on the lease fallback this prevents an
+// old writer that lost a take-over from truncating the successor's payload.
+// It is best-effort: failures are logged and the durable flag remains the
+// primary guard.
+func (d *stagingDownload) poisonStagingLocked() {
+	_ = d.closeOut()
 	if err := os.Truncate(d.stg, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("warning: could not poison staging file %s after an unproven or failed known-digest proof: %v", d.stg, err)
 	}
+}
+
+// poisonStagingIfOwned poisons the payload only while the claim is still owned
+// under the transition lock. On supported platforms the caller already holds
+// the OS ownership lock, so no successor can exist; on the lease fallback the
+// ownership re-read prevents a writer whose claim was taken over from
+// truncating the successor's staging. If the transition lock is unavailable,
+// the poison is skipped: the durable ProofPending flag already prevents the
+// unproven bytes from being published.
+func (d *stagingDownload) poisonStagingIfOwned() {
+	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
+	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
+		log.Printf("warning: skip poisoning staging file %s: claim transition lock unavailable: %v", d.stg, err)
+		return
+	}
+	defer lock.release()
+	if !claimRecordOwnedLocked(d.meta) {
+		return
+	}
+	d.poisonStagingLocked()
 }
 
 // clearProofPending clears the durable proof gate after a successful proof and
@@ -1378,7 +1429,7 @@ func (d *stagingDownload) applyCancelCleanup() {
 		return
 	}
 	d.stopHeartbeat()
-	d.closeOut()
+	_ = d.closeOut()
 	if d.cfg.CleanupPartialsOnCancel == nil || !d.cfg.CleanupPartialsOnCancel() {
 		return
 	}
@@ -1417,7 +1468,9 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	if err := os.Remove(d.meta); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if _, retry, err := createStagingClaim(d.meta, newClaimMeta(d.it, d.job, d.commit)); err != nil {
+	fresh := newClaimMeta(d.it, d.job, d.commit)
+	fresh.LockFenced = d.osExclusive
+	if _, retry, err := createStagingClaim(d.meta, fresh); err != nil {
 		return nil, err
 	} else if retry {
 		return nil, fmt.Errorf("could not re-claim staging file %s", d.stg)
@@ -1569,23 +1622,24 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	defer state.release()
 
 	d := &stagingDownload{
-		ctx:            ctx,
-		httpc:          httpc,
-		token:          token,
-		job:            job,
-		cfg:            cfg,
-		it:             it,
-		dst:            dst,
-		stg:            stg,
-		pub:            pub,
-		meta:           metaPath,
-		emit:           emit,
-		commit:         opts.Commit,
-		startedAt:      time.Now().UTC(),
-		legacyMigrated: state.legacyMigrated,
-		proofPending:   state.proofPending,
-		own:            state.own,
-		osExclusive:    state.osExclusive,
+		ctx:              ctx,
+		httpc:            httpc,
+		token:            token,
+		job:              job,
+		cfg:              cfg,
+		it:               it,
+		dst:              dst,
+		stg:              stg,
+		pub:              pub,
+		meta:             metaPath,
+		emit:             emit,
+		commit:           opts.Commit,
+		startedAt:        time.Now().UTC(),
+		legacyMigrated:   state.legacyMigrated,
+		proofPending:     state.proofPending,
+		own:              state.own,
+		osExclusive:      state.osExclusive,
+		contentAddressed: opts.ContentAddressed,
 	}
 
 	// Part-scoped cancellable context: a permanent (fail-fast) error on any
@@ -1729,7 +1783,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		if proofPendingForFlush {
 			// The flag may not be durable; the zero-length payload is then the
 			// durable marker that forces a discard/re-download next run.
-			d.poisonStaging()
+			d.poisonStagingIfOwned()
 		}
 		if cerr := partCtx.Err(); cerr != nil {
 			if herr := d.heartbeatError(); herr != nil {
@@ -2032,7 +2086,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			// The explicit redownload policy remains this actionable error plus
 			// a fresh transfer on retry.
 			d.stopHeartbeat()
-			d.poisonStaging()
+			d.poisonStagingIfOwned()
 			if !removeStagingArtifactsOwned(stg, metaPath) {
 				log.Printf("warning: staging data for %s survived a known-digest mismatch; "+
 					"its durable ProofPending flag and zero-length payload force the next run to re-prove or discard it",
@@ -2097,7 +2151,9 @@ func (d *stagingDownload) publish() error {
 	// record after publication. Close before renaming so the unlink-on-rename
 	// also works on Windows.
 	d.stopHeartbeat()
-	d.closeOut()
+	if err := d.closeOut(); err != nil {
+		return fmt.Errorf("close staging file %s before publish: %w", d.stg, err)
+	}
 
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
@@ -2113,6 +2169,19 @@ func (d *stagingDownload) publish() error {
 	}
 	if !claimRecordOwnedLocked(d.meta) {
 		return errStagingClaimLost
+	}
+	// A content-addressed target may have been completed by another writer
+	// while this download was in flight (single path, legacy tmp-<sha>+store,
+	// another staging family). Its existence proves completion; never rename
+	// over it. Discard this process's own staging pair and report completion so
+	// the caller treats the item as a skip and creates its own links.
+	if d.contentAddressed {
+		if _, err := os.Stat(d.pub); err == nil {
+			removeStagingArtifactsLocked(d.stg, d.meta)
+			return errBlobAlreadyComplete
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat publish target %s: %w", d.pub, err)
+		}
 	}
 	if err := os.Rename(d.stg, d.pub); err != nil {
 		return err

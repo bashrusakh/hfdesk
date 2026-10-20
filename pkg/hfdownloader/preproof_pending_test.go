@@ -154,12 +154,13 @@ func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 	if !proofPendingRaw(t, metaPath) {
 		t.Error("the durable ProofPending flag did not survive the failed cleanup")
 	}
-	fi, serr := os.Stat(staging)
-	if serr != nil {
+	// The poison itself is skipped when the transition lock cannot be
+	// re-acquired (poisonStagingIfOwned): an old fallback writer must never
+	// truncate a possible successor's payload after losing its claim. The
+	// durable ProofPending flag is the primary guard that makes the failed
+	// cleanup safe; the record and its payload may remain intact here.
+	if _, serr := os.Stat(staging); serr != nil {
 		t.Fatalf("staging payload: %v", serr)
-	}
-	if fi.Size() != 0 {
-		t.Errorf("staging payload was not poisoned after the mismatch: size=%d, want 0", fi.Size())
 	}
 	if _, serr := os.Stat(filepath.Join(blobsDir, sha)); !os.IsNotExist(serr) {
 		t.Errorf("a corrupt blob was published despite the mismatch, stat err=%v", serr)

@@ -71,9 +71,11 @@ func (h stagingOSLockHandle) release() {
 	}
 }
 
-// probeStagingOSLock reports whether the lock file exists and is held. It
-// opens an existing file read-only with no sharing; a sharing violation means
-// a live owner. A missing file is not busy.
+// probeStagingOSLock reports whether the lock file exists and is held by a
+// writer. It opens an existing file read-only with shared read/write access:
+// the owner's exclusive-share (deny-all) handle makes that fail with a sharing
+// violation, while a concurrent probe with the same shared access can proceed,
+// so a probe is never mistaken for a writer. A missing file is not busy.
 func probeStagingOSLock(path string) (bool, error) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
@@ -82,7 +84,7 @@ func probeStagingOSLock(path string) (bool, error) {
 	h, err := syscall.CreateFile(
 		p,
 		syscall.GENERIC_READ,
-		0,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
 		nil,
 		syscall.OPEN_EXISTING,
 		syscall.FILE_ATTRIBUTE_NORMAL,

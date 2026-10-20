@@ -270,6 +270,15 @@ type IncompleteMeta struct {
 	// liveness check of PID; an empty or different host leaves heartbeat
 	// freshness as the only ownership signal.
 	Host string `json:"host,omitempty"`
+	// LockFenced records that this claim was made while holding the OS-level
+	// staging ownership lock (the persistent <staging>.lock). On a platform
+	// that supports the lock, its state is then authoritative for CheckBlob:
+	// busy means a live writer, and a free lock means the owner crashed or
+	// released the claim, so the record is stale and take-over-able regardless
+	// of PID reuse or heartbeat freshness. Records written on a fallback
+	// platform (or by an older version) carry false and keep the lease
+	// heuristic.
+	LockFenced bool `json:"lock_fenced,omitempty"`
 	// Version is 0 for legacy records (no range state) and 2 for ranged
 	// staging records written by the issue #140 downloader.
 	Version int `json:"version,omitempty"`
@@ -397,6 +406,17 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	if err != nil {
 		// If we can't read meta, treat as stale
 		return BlobStale, nil, nil
+	}
+
+	// A record created while holding the OS ownership lock is authoritative on
+	// a platform that supports the lock: the probe above already established
+	// that no live writer holds it, so a free lock means the owner crashed,
+	// released, or the claim was taken over. Do not let a reused/live PID or a
+	// fresh heartbeat turn this into a false "downloading" that makes Download
+	// skip a resumable crash state. Fallback records (LockFenced=false) keep the
+	// lease heuristic below.
+	if meta.LockFenced && stagingOSLockAvailable {
+		return BlobStale, meta, nil
 	}
 
 	// Check ownership/liveness. A record whose instance token matches this

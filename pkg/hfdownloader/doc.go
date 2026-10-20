@@ -135,7 +135,15 @@ That pre-download decision is authoritative for an arbitrary destination. A
 staging claim treats an existing publish target as completion proof only when
 the target is content-addressed (blobs/<known-sha>); a legacy/output file or a
 tmp-<sha> staging name that the skip check declined is downloaded again and
-atomically renamed over the old bytes.
+atomically renamed over the old bytes. Publish re-stats a content-addressed
+target under the ownership locks and never overwrites one that appeared while
+the transfer was in flight: it discards its own staging pair and reports the
+item as complete.
+
+Staging identity includes the resolved commit from the plan. If the endpoint
+omits a resolved commit, plan.Commit is empty and the record uses that empty
+value, so resume is not revision-pinned; the downloader does not substitute the
+requested branch name.
 
 Exactly one live writer may own a staging file. The exclusion fence is an
 OS-level exclusive lock on the persistent sibling file `<staging>.lock`,
@@ -146,7 +154,12 @@ kernel when the process exits, so a crashed owner is recoverable immediately; a
 suspended (but alive) process keeps ownership, and there is deliberately no
 take-over while it is alive — terminate it to recover. Unix uses
 flock(LOCK_EX|LOCK_NB); Windows uses an exclusive-share CreateFile handle
-(dwShareMode=0) held on the file handle.
+(dwShareMode=0) held on the file handle. The record persists whether its claim
+was OS-lock fenced (`LockFenced`); on a supported platform a free lock is then
+authoritative for CheckBlob and reports the record stale even when its stored
+PID is still live, so a reused PID cannot hide a resumable crash state. The
+ownership probe itself is non-owning (a shared lock on Unix, a shared-access
+open on Windows), so concurrent probes are never mistaken for a writer.
 
 The claim record remains the identity/resume state and is heartbeated through
 transfers, retry waits, strict verification and finalization. Every record
@@ -198,13 +211,16 @@ immediately before publication. On resume the flag forces the proof in every
 mode except "none" — including "size" — whenever the item carries a known
 digest, so a crash mid-proof, a mismatch whose cleanup cannot take the
 transition lock, or a later Verify-mode change cannot publish unproven all-Done
-ranges. On a mismatch the flag stays set, the payload is truncated to zero
-(poisoned), and the owned discard is attempted; if the discard cannot acquire
-the transition lock, the next run re-proves or discards. Publication itself is
-refused while a known digest's proof is still pending. Verify "none" is the
-explicit no-hash opt-out. The single-request `.part` needs no separate flag: it
-is renamed only after the proof, so any restart treats its bytes as inherited
-and re-proves them in every non-"none" mode.
+ranges. On a mismatch the flag stays set, poison (a zero-length payload) is
+attempted only while the claim is still owned under the transition lock, and
+the owned discard is attempted; if ownership cannot be verified the poison is
+skipped and the durable flag remains the guard, so the next run re-proves or
+discards. Publication itself is refused while a known digest's proof is still
+pending. Verify "none" is the explicit no-hash opt-out. The single-request
+`.part` has no separate flag: when a proof is required (sha256/etag, inherited
+bytes, or a known digest with unknown size) it is renamed only after that proof,
+so every restart re-proves it; a fresh size transfer with a known size follows
+the size contract and may rename without a hash.
 
 # Verification Options
 
@@ -216,10 +232,10 @@ files included:
   - "size": Verify expected size and complete validated transfer coverage on
     both transfer paths (default); no full-file SHA-256 reread on the normal
     transfer path. The pre-download skip check over an existing file, the
-    one-time legacy migration proof, and the inherited single-path `.part`
-    proof may still hash. A resumed ProofPending record forces the known-digest
-    proof even in size mode after a crash, a failed mismatch cleanup, or a mode
-    change
+    one-time legacy migration proof, the inherited single-path `.part` proof,
+    and a known digest with no known expected size may still hash. A resumed
+    ProofPending record forces the known-digest proof even in size mode after a
+    crash, a failed mismatch cleanup, or a mode change
   - "etag": Historical compatibility: a known SHA-256 digest is proven before
     publication with at most one pass (the same pre-publish engine proof used
     by "sha256"); non-LFS ETag-only files keep their historical no-post-check

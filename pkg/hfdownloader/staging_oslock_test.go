@@ -77,15 +77,16 @@ func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      100,
-		Version:   stagingMetaVersion,
-		Repo:      "o/r",
-		Path:      "x.bin",
-		Ranges:    buildRangeLayout(100, 2),
+		PID:        os.Getpid(),
+		Instance:   processInstanceToken,
+		Host:       processHostname,
+		StartedAt:  time.Now().UTC(),
+		Size:       100,
+		Version:    stagingMetaVersion,
+		Repo:       "o/r",
+		Path:       "x.bin",
+		Ranges:     buildRangeLayout(100, 2),
+		LockFenced: true,
 	}
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)

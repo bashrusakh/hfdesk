@@ -62,8 +62,12 @@ func (h stagingOSLockHandle) release() {
 	_ = h.f.Close()
 }
 
-// probeStagingOSLock reports whether the lock file exists and is held. It
-// opens read-only without creating anything and releases immediately.
+// probeStagingOSLock reports whether the lock file exists and is held by a
+// writer. It takes a NON-OWNING shared lock (LOCK_SH|LOCK_NB): shared locks
+// coexist with each other, so concurrent probes never see each other as an
+// owner, while an exclusive writer's LOCK_EX makes the shared acquisition fail.
+// The lock is released immediately. It opens read-only without creating
+// anything and never acts as a writer itself.
 func probeStagingOSLock(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -73,7 +77,7 @@ func probeStagingOSLock(path string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
 		switch {
 		case errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
 			return true, nil

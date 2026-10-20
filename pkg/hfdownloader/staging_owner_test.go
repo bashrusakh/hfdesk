@@ -190,10 +190,12 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 	})
 }
 
-// TestCheckBlob_OwnershipIdentity pins the CheckBlob consumer of the same
-// ownership classification: an earlier run of this instance is stale/
-// take-over-able, while a foreign instance that happens to report our PID with
-// a fresh heartbeat is still "downloading".
+// TestCheckBlob_OwnershipIdentity pins the CheckBlob consumer of the ownership
+// classification. A lock-fenced record on a platform with the OS lock is
+// authoritative: a free lock means the owner is gone (stale/take-over-able),
+// even when the record carries our live PID and a fresh heartbeat. Fallback
+// records keep the lease heuristic, where a fresh foreign record with our PID
+// is still "downloading".
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir, time.Minute)
@@ -210,15 +212,16 @@ func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      100,
-		Version:   stagingMetaVersion,
-		Repo:      "o/r",
-		Path:      "x.bin",
-		Ranges:    buildRangeLayout(100, 2),
+		PID:        os.Getpid(),
+		Instance:   processInstanceToken,
+		Host:       processHostname,
+		StartedAt:  time.Now().UTC(),
+		Size:       100,
+		Version:    stagingMetaVersion,
+		Repo:       "o/r",
+		Path:       "x.bin",
+		Ranges:     buildRangeLayout(100, 2),
+		LockFenced: true,
 	}
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &base); err != nil {
 		t.Fatal(err)
@@ -232,8 +235,19 @@ func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &foreign); err != nil {
 		t.Fatal(err)
 	}
+	if status, _, err := repo.CheckBlob(sha); err != nil || status != BlobStale {
+		t.Fatalf("lock-fenced foreign instance with our PID and a free lock = %v (err=%v), want BlobStale", status, err)
+	}
+
+	// A fallback record (no OS lock) keeps the lease heuristic: a fresh foreign
+	// record with our live PID is still "downloading".
+	fallback := foreign
+	fallback.LockFenced = false
+	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &fallback); err != nil {
+		t.Fatal(err)
+	}
 	if status, _, err := repo.CheckBlob(sha); err != nil || status != BlobDownloading {
-		t.Fatalf("foreign instance with our PID status = %v (err=%v), want BlobDownloading", status, err)
+		t.Fatalf("fallback foreign instance with our PID status = %v (err=%v), want BlobDownloading", status, err)
 	}
 
 	dead := foreign

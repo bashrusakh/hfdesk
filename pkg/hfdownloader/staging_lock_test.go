@@ -275,6 +275,7 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	const total = 8000
 	const concurrency = 4
 	const contenders = 4
+	const staleTakeoverSeedInstance = "dead-takeover-owner"
 	full := rangedTestPayload(total)
 	dir := filepath.Join(t.TempDir(), "race")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -292,7 +293,7 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	}
 	meta := IncompleteMeta{
 		PID:       99999999,
-		Instance:  "dead-takeover-owner",
+		Instance:  staleTakeoverSeedInstance,
 		Host:      processHostname,
 		StartedAt: time.Now().UTC(),
 		Size:      total,
@@ -390,7 +391,10 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	}
 
 	// Losers exit promptly. The winner is parked in a blocked range body, so
-	// wait for all but one result, then release the server.
+	// wait for all but one result, then observe the winner's takeover before
+	// releasing the server. A loser can report before the winner's claim is
+	// durable, so reading the record immediately would still show the stale
+	// seed and look like a loser replaced the winner.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		done := 0
@@ -399,18 +403,46 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 				done++
 			}
 		}
-		if done >= contenders-1 || time.Now().After(deadline) {
+		if done >= contenders-1 {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for early contenders: %d of %d results present", done, contenders)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	claimRaw, rerr := os.ReadFile(metaPath)
-	if rerr != nil {
-		t.Fatalf("winner's claim record is missing while it is still downloading: %v", rerr)
-	}
+
+	// Poll the record until the takeover replaces the stale seed. The winner
+	// is blocked in a range body, so the claimed record is stable here; the
+	// remove/recreate window and a partially written claim are expected states.
 	var claimMeta IncompleteMeta
-	if err := json.Unmarshal(claimRaw, &claimMeta); err != nil {
-		t.Fatalf("winner's claim record is unreadable: %v", err)
+	lastObserved := "record was never read"
+	claimDeadline := time.Now().Add(10 * time.Second)
+	for {
+		raw, rerr := os.ReadFile(metaPath)
+		switch {
+		case rerr != nil:
+			lastObserved = fmt.Sprintf("read error: %v", rerr)
+		default:
+			var recorded IncompleteMeta
+			switch uerr := json.Unmarshal(raw, &recorded); {
+			case uerr != nil:
+				lastObserved = fmt.Sprintf("unreadable claim record: %v", uerr)
+			case recorded.Instance == "":
+				lastObserved = "claim record has an empty instance"
+			case recorded.Instance == staleTakeoverSeedInstance:
+				lastObserved = fmt.Sprintf("stale seed instance %q is still recorded", recorded.Instance)
+			default:
+				claimMeta = recorded
+			}
+		}
+		if claimMeta.Instance != "" {
+			break
+		}
+		if time.Now().After(claimDeadline) {
+			t.Fatalf("winner never replaced the stale claim record: %s", lastObserved)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if _, serr := os.Stat(staging); serr != nil {
 		t.Fatalf("winner's staging payload is missing while it is still downloading: %v", serr)
