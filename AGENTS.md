@@ -131,23 +131,64 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   and restart that file rather than guessing.
 - `Settings.Verify` governs LFS verification too: `none` performs no
   post-download content hash; `size` (default) checks exact size plus complete
-  validated range coverage and performs no full-file SHA-256 pass on the normal
-  path (the pre-download skip check and the one-time legacy-migration content
-  proof may still hash); `sha256` performs at most one full-file pass and never
-  publishes a mismatch; `etag` keeps the historical known-SHA LFS hash.
+  validated transfer coverage on both the ranged and single-request paths and
+  performs no full-file SHA-256 pass on the normal path (the pre-download skip
+  check, the one-time legacy-migration content proof, and the inherited
+  single-path `.part` proof may still hash); `sha256` performs at most one
+  full-file pass, always before the rename/publication when a known digest
+  exists, and never publishes a mismatch; `etag` proves a known digest with
+  that same single pre-publication pass and keeps the historical non-LFS ETag
+  behavior. A known digest is never hashed only after publication; HEAD-ETag-only
+  verification (no known digest) remains a post-publication check and can
+  report a mismatch then.
+- The single-request path is not exempt from the trust model: every 206 must
+  match the exact requested Content-Range, expected total and body length, its
+  writer is bounded to the requested range, and the file must have exactly the
+  expected size before the rename. `.part` bytes inherited from an earlier run
+  have no validated provenance: content-prove them with one full-file SHA-256
+  pass before publication when a known digest exists and `Verify != "none"`,
+  and never publish on a mismatch. A fresh transfer in `sha256`/`etag` mode is
+  likewise proven before the rename. Without a known expected size, discard the
+  partial rather than guessing a resume layout.
+- Durable proof gate: a multipart staging record carries `ProofPending`, set and
+  flushed before any known-digest proof starts and cleared and flushed only
+  after it succeeds. On resume it forces the proof in every mode except `none`
+  (including `size`) whenever a known digest exists, so a crash mid-proof, a
+  mismatch whose cleanup could not take the transition lock, or a later mode
+  change cannot publish unproven all-Done ranges. A mismatch keeps the flag set,
+  truncates the payload to zero (poison), and attempts the owned discard; if that
+  fails, the next run re-proves or discards. Publish refuses while a known
+  digest's proof is pending; `none` is the explicit opt-out. The single-path
+  `.part` is its own marker: it is renamed only after proof, so every restart
+  re-proves it.
 - Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
   them LegacyMigrated, keep the marker durable across resume, and content-prove
   them with one full-file SHA-256 pass before publication whenever a known
   digest exists and `Verify != "none"`. An oversized single `.part` is invalid:
-  discard it, never clamp it.
+  discard it, never clamp it. A multipart layout whose parts are all
+  missing/empty/oversized contributes no bytes and is not a migrated layout:
+  fall back to a valid single `.part`; set LegacyMigrated only when bytes were
+  actually copied.
 - A publish target's existence proves completion only when it is
   content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
   authoritative pre-download skip decision and are redownloaded and atomically
   replaced when it declined them.
+- Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
+  (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
+  before the claim transition and held through transfer, hashing and
+  publish/cleanup. A busy lock is a live owner (claim skips, cleanup skips,
+  `CheckBlob` reports downloading); a crashed process releases it at death, and
+  a suspended owner keeps it — there is deliberately no takeover while it is
+  alive. On platforms/filesystems without the lock, the transition-lock/heartbeat
+  lease is the documented weaker fallback. Keep the lock file: never unlink it
+  (that would let two processes own different inodes).
 - Serialize every staging-record transition (claim, takeover, checkpoint,
   heartbeat, removal) with the sibling O_EXCL lock and re-read ownership under
   it; a heartbeat must never recreate or replace another writer's claim. Cleanup
   must re-check the claim under the same lock and keep a live owner's state.
+  Publish must re-read the record under that lock and verify the OS ownership
+  lock is still held before the rename; a missing or foreign record is refused,
+  never renamed.
 - Size checks are only a fallback for files without a trusted hash.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to

@@ -237,6 +237,19 @@ func localSelectionFiles(repoDir string, excluded []string) ([]cacheSelectionFil
 	return files, warning
 }
 
+// hasStoredBlobEntries reports whether a blobs/ directory contains at least one
+// entry that is not a downloader staging artifact (payload, resume record or
+// persistent ownership lock file).
+func hasStoredBlobEntries(entries []os.DirEntry) bool {
+	for _, entry := range entries {
+		if entry.IsDir() || isBlobStagingArtifactName(entry.Name()) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func hfSelectionFiles(rd *hfdownloader.RepoDir, protectedRoots []string) ([]cacheSelectionFile, string) {
 	snapshots, err := rd.ListSnapshots()
 	if err != nil {
@@ -245,7 +258,10 @@ func hfSelectionFiles(rd *hfdownloader.RepoDir, protectedRoots []string) ([]cach
 	var files []cacheSelectionFile
 	warnings := []string{}
 	if len(snapshots) == 0 {
-		if entries, readErr := os.ReadDir(rd.BlobsDir()); readErr == nil && len(entries) > 0 {
+		// Only count stored content: the downloader's persistent staging
+		// artifacts (payload, resume record, ownership lock files) must not
+		// make an otherwise empty blobs directory look populated.
+		if entries, readErr := os.ReadDir(rd.BlobsDir()); readErr == nil && hasStoredBlobEntries(entries) {
 			warnings = append(warnings, "No named snapshot entries are available to identify GGUF files")
 		} else if readErr != nil && !os.IsNotExist(readErr) {
 			warnings = append(warnings, "Could not inspect HF blobs: "+readErr.Error())

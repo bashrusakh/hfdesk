@@ -33,10 +33,14 @@ import (
 	"time"
 )
 
-// TestDownload_OwnedClaimCountsAsSkipped verifies that the post-claim skip
-// path (a live owner or an already-published blob discovered after the
-// pre-download check) participates in skipOnce/skippedCount bookkeeping, so
-// the final "skipped N" summary includes it.
+// TestDownload_OwnedClaimCountsAsSkipped verifies that the live-owner skip
+// path (a staging file held by another writer, or an already-published blob
+// discovered after the pre-download check) participates in
+// skipOnce/skippedCount bookkeeping, so the final "skipped N" summary includes
+// it. The live owner is simulated by holding the OS ownership lock, which is
+// what a real writer holds for its whole interval; the pre-download lock probe
+// (or, on the lease fallback, the claim refusal) turns it into a skip rather
+// than a failure.
 func TestDownload_OwnedClaimCountsAsSkipped(t *testing.T) {
 	tmpDir := t.TempDir()
 	const size = 64 * 1024
@@ -48,15 +52,18 @@ func TestDownload_OwnedClaimCountsAsSkipped(t *testing.T) {
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A fresh empty claim record is unreadable (mid-claim) but its payload
-	// exists, so CheckBlob reports stale and the downloader proceeds to the
-	// claim, which refuses with errBlobIncompleteOwned.
+	// A live writer's staging file: payload preallocated and an unreadable
+	// (mid-claim) record, with the ownership lock held for the interval.
 	staging := filepath.Join(blobsDir, sha+".incomplete")
 	if err := os.WriteFile(staging, make([]byte, size), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(staging+".meta", nil, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	hold, _ := acquireStagingOwnershipLock(staging)
+	if hold != nil {
+		defer hold.release()
 	}
 
 	cfg := Settings{
@@ -434,9 +441,10 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 
 // TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf reproduces blocker
 // 3b's namespace/PID-reuse half: our PID with a different instance token is a
-// foreign live owner while its heartbeat is fresh, and only becomes
-// take-over-able when the same-host owner is provably dead and the heartbeat
-// is stale.
+// foreign live owner while it holds the OS ownership lock (the fence a real
+// writer keeps for its whole interval), and only becomes take-over-able when
+// that lock is gone and the same-host owner is provably dead with a stale
+// heartbeat.
 func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -457,6 +465,10 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	hold, _ := acquireStagingOwnershipLock(staging)
+	if hold != nil {
+		defer hold.release()
+	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -472,11 +484,15 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 0}
 	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
 	if !errors.Is(err, errBlobIncompleteOwned) {
-		t.Fatalf("error = %v, want errBlobIncompleteOwned: a different instance token with our PID must not be treated as self", err)
+		t.Fatalf("error = %v, want errBlobIncompleteOwned: a live foreign owner (or a different instance token with our PID) must not be taken over", err)
+	}
+	if hold != nil {
+		hold.release()
 	}
 
-	// Stale heartbeat + provably dead same-host owner: take-over must still
-	// recover the committed bytes rather than locking the file forever.
+	// Stale heartbeat + provably dead same-host owner and no ownership lock:
+	// take-over must still recover the committed bytes rather than locking the
+	// file forever.
 	staleMeta := fmt.Sprintf(
 		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
 		host, total, total-1)

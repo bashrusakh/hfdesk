@@ -53,7 +53,7 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 							}
 							select {
 							case <-releaseTree:
-								_, _ = fmt.Fprint(w, `[{"type":"file","path":"train.csv","size":1},{"type":"file","path":"model-test.gguf","size":5},{"type":"file","path":"model-train.gguf","size":5}]`)
+								_, _ = fmt.Fprint(w, `[{"type":"file","path":"train.csv","size":5},{"type":"file","path":"model-test.gguf","size":5},{"type":"file","path":"model-train.gguf","size":5}]`)
 							case <-r.Context().Done():
 							}
 						case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):

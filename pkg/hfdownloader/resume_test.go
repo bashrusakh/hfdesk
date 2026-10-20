@@ -17,6 +17,13 @@ import (
 	"time"
 )
 
+// downloadSingleErr adapts downloadSingle's (contentVerified, error) result to
+// the error-only shape used by goroutine result channels.
+func downloadSingleErr(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+	_, err := downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
+	return err
+}
+
 // TestDownloadSingle_ResumesFromExistingPartial verifies that when a .part file
 // already exists on disk with partial bytes (e.g. left over from a Ctrl+C'd run),
 // downloadSingle issues a Range request for the remaining bytes instead of
@@ -68,7 +75,7 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	}
 	cfg := Settings{Retries: 0}
 
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -124,7 +131,7 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 		URL:          srv.URL + "/test.bin",
 		Size:         int64(len(full)),
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -170,7 +177,7 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 		URL:          srv.URL + "/test.bin",
 		Size:         int64(len(full)),
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -747,5 +754,73 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 	}
 	if finalizingAt < fullProgressAt {
 		t.Errorf("file_finalizing (index %d) emitted before the 100%% progress reading (index %d)", finalizingAt, fullProgressAt)
+	}
+}
+
+// TestDownloadMultipart_UnusablePartLayoutFallsBackToSinglePart covers M1: a
+// pre-#140 .parts.json layout whose every part is missing/empty/oversized
+// contributes no bytes and is not a usable migrated state. The layout family
+// must be discarded and a valid dst.part prefix migrated instead — with
+// LegacyMigrated set only because bytes were actually copied.
+func TestDownloadMultipart_UnusablePartLayoutFallsBackToSinglePart(t *testing.T) {
+	const total = 8_000
+	const prefix = 3_000
+	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "unusable-layout.bin")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A syntactically valid two-part layout that tiles [0,total)...
+	layout := buildMultipartResumeLayout(total, 2, total/2)
+	if err := writeMultipartResumeLayout(dst, layout); err != nil {
+		t.Fatal(err)
+	}
+	// ...whose parts are useless: part 0 is oversized, part 1 is empty.
+	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 0), make([]byte, total/2+64), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 1), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The valid sequential prefix that must survive the upgrade.
+	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, gotRanges := rangedTestServer(t, full)
+	it := PlanItem{RelativePath: "unusable-layout.bin", URL: srv.URL + "/unusable-layout.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "size"}
+
+	hashPassCount.Store(0)
+	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	if err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	// The migrated prefix was content-proven (one pass) and reported as
+	// already verified.
+	if !verified {
+		t.Error("migrated .part bytes were not content-proven")
+	}
+	if got := hashPassCount.Load(); got != 1 {
+		t.Errorf("migration proof performed %d full-file passes; want exactly 1", got)
+	}
+	// The valid .part prefix was resumed instead of being deleted and
+	// re-downloaded from zero.
+	if len(*gotRanges) != 1 || (*gotRanges)[0] != fmt.Sprintf("bytes=%d-%d", prefix, total-1) {
+		t.Errorf("fetched %v, want exactly the suffix bytes=%d-%d (the layout had no usable bytes)", *gotRanges, prefix, total-1)
+	}
+	assertExactFile(t, dst, full)
+	for _, p := range []string{
+		multipartLayoutMetaPath(dst),
+		fmt.Sprintf("%s.part-%02d", dst, 0),
+		fmt.Sprintf("%s.part-%02d", dst, 1),
+		dst + ".part",
+	} {
+		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
+			t.Errorf("legacy artifact %s survived finalization, stat err=%v", filepath.Base(p), serr)
+		}
 	}
 }

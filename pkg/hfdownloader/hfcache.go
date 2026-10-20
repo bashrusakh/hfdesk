@@ -295,6 +295,21 @@ type IncompleteMeta struct {
 	// is persisted so a crash and resume repeat the proof instead of publishing
 	// unproven bytes.
 	LegacyMigrated bool `json:"legacy_migrated,omitempty"`
+	// ProofPending is the durable publication gate for known-digest
+	// verification. It is set (and flushed) before any pre-publication
+	// SHA-256 proof starts — a fresh sha256/etag multipart transfer or bytes
+	// migrated from a pre-#140 partial — and cleared (and flushed) only after
+	// that proof succeeds, immediately before the publish rename. A record that
+	// still carries the flag forces the proof on the next claim regardless of
+	// the current Verify mode (including "size") whenever the item has a known
+	// digest and Verify is not "none", so a crash mid-proof, a mismatch whose
+	// cleanup could not take the transition lock, or a later mode change cannot
+	// turn unproven all-Done ranges into a publishable blob. "none" is the
+	// explicit no-hash opt-out. On a mismatch the flag stays set and the
+	// payload is poisoned (truncated) in addition. The single-request path has
+	// no staging record: its .part is only renamed after the proof, so the
+	// .part itself is the durable pending marker.
+	ProofPending bool `json:"proof_pending,omitempty"`
 }
 
 // RangeProgress is the durable state of one persisted download range.
@@ -343,6 +358,12 @@ func (s BlobStatus) String() string {
 
 // CheckBlob checks the status of a blob in the cache.
 // Returns the status and any existing incomplete metadata.
+//
+// A held OS-level staging ownership lock (the persistent <staging>.lock) means
+// a live writer owns the staging file and is reported as BlobDownloading before
+// any record heuristic: a suspended owner can stop heartbeating and still
+// resume writing through an open handle, so the lock, not the lease, decides
+// liveness wherever it is supported.
 func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) {
 	blobPath := r.BlobPath(sha256)
 	incompletePath := r.IncompletePath(sha256)
@@ -360,6 +381,15 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	}
 	if err != nil {
 		return BlobMissing, nil, fmt.Errorf("stat incomplete file: %w", err)
+	}
+
+	// A busy OS ownership lock is the authoritative "a live writer owns this
+	// staging file" signal. It covers a suspended owner whose heartbeat went
+	// stale (and which could still resume writing through an open handle) and
+	// an in-process download whose record looks take-over-able. The probe never
+	// blocks, never creates the lock file, and releases immediately.
+	if busy, probeErr := stagingOwnershipBusy(incompletePath); probeErr == nil && busy {
+		return BlobDownloading, nil, nil
 	}
 
 	// Read metadata

@@ -28,6 +28,17 @@ import (
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
 var Version = "dev"
 
+// isBlobStagingArtifactName reports whether a blobs/ directory entry belongs to
+// the download staging family rather than to stored content:
+// blobs/<sha>.incomplete (payload), .incomplete.meta (resume record) and the
+// persistent .incomplete.lock/.incomplete.meta.lock ownership files. Cache
+// statistics and listings must not count them as cached blobs.
+func isBlobStagingArtifactName(name string) bool {
+	return strings.HasSuffix(name, ".incomplete") ||
+		strings.HasSuffix(name, ".meta") ||
+		strings.HasSuffix(name, ".lock")
+}
+
 // effectiveEndpointURL returns the configured Hugging Face endpoint in the
 // normalized form exposed to clients: the public Hub when no custom endpoint is
 // configured, without a trailing slash, and preserving any path prefix (for
@@ -1444,7 +1455,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		var totalSize int64
 		var fileCount int
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				fileCount++
 			}
@@ -1681,7 +1692,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// No snapshots, just count blobs
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				files = append(files, CachedFileInfo{
 					Name:      filepath.Base(path),

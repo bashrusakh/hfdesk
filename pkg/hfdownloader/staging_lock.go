@@ -6,7 +6,7 @@ package hfdownloader
 // Cross-process serialization of staging-record transitions (issue #140).
 //
 // The staging record (the .meta file) is both the resume state and the
-// ownership claim. Deciding to take over a stale record, creating a claim,
+// ownership identity. Deciding to take over a stale record, creating a claim,
 // rewriting a checkpoint, heartbeating, and removing the record are all
 // read-modify-write transitions over that one file. Without serialization the
 // take-over window is a race: two contenders can both read the same stale
@@ -15,13 +15,20 @@ package hfdownloader
 // payload and both write into it.
 //
 // A sibling lock file (metaPath + ".lock") created with O_CREATE|O_EXCL is the
-// portable single-winner primitive: the filesystem guarantees exactly one
-// creator succeeds on every platform Go supports, with no new dependency.
-// Every transition above runs inside that lock. The lock is only a mutex — the
-// meta record remains the ownership identity (instance token, PID, host) —
-// and every mutation re-reads the record after acquiring the lock, so a
-// contender that lost cannot delete or replace a live owner's claim, and a
-// heartbeat cannot resurrect ownership after a takeover.
+// portable single-winner primitive for those transitions: the filesystem
+// guarantees exactly one creator succeeds on every platform Go supports, with
+// no new dependency. Every transition above runs inside that lock, and every
+// mutation re-reads the record after acquiring the lock, so a contender that
+// lost cannot delete or replace a live owner's claim, and a heartbeat cannot
+// resurrect ownership after a takeover.
+//
+// This file is a mutex over record transitions, not the ownership fence. The
+// fence is the OS-level ownership lock held for the whole ownership interval
+// (staging_oslock.go): a writer that keeps an open payload handle cannot be
+// excluded by a record lease, so a claimant only takes over after acquiring
+// that lock. On platforms/filesystems without the OS lock, this mutex plus the
+// heartbeat/instance-token lease is the fallback and the weaker guarantee is
+// documented on the package.
 //
 // Critical sections are tiny (read, compare and rewrite a small JSON record),
 // acquisition is bounded, and an abandoned lock (crashed holder) is broken
@@ -178,7 +185,8 @@ func claimRecordOwnedLocked(metaPath string) bool {
 
 // removeOwnedStagingLocked removes the record and its payload only while the
 // record still names this process instance. The caller holds the transition
-// lock. It returns false (removing nothing) when the claim moved elsewhere.
+// lock and the staging ownership lock for the pair. It returns false (removing
+// nothing) when the claim moved elsewhere.
 func removeOwnedStagingLocked(staging, metaPath string) bool {
 	if !claimRecordOwnedLocked(metaPath) {
 		return false
@@ -189,8 +197,10 @@ func removeOwnedStagingLocked(staging, metaPath string) bool {
 
 // removeStagingArtifactsOwned acquires the transition lock and removes the
 // pair only if the record still names this process instance. Owner-side
-// discard paths (hash mismatch, explicit cancel) use it so a writer that lost
-// a stale claim cannot delete the new owner's data.
+// discard paths (hash mismatch) use it so a writer that lost a stale claim
+// cannot delete the new owner's data. The caller must already hold the staging
+// ownership lock for the pair; re-acquiring a lock this process already holds
+// on the same file would self-conflict, so this helper never takes it.
 func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {

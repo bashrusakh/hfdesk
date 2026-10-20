@@ -170,7 +170,7 @@ func TestDownload_RetainedModelVocabKeepsRepoRelativeDestination(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_ = json.NewEncoder(w).Encode([]hfNode{
 				{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 6}},
-				{Type: "file", Path: "arbitrary/assets/vocab.txt", Size: 4},
+				{Type: "file", Path: "arbitrary/assets/vocab.txt", Size: 5},
 			})
 		case r.URL.Path == "/owner/model/resolve/main/weights/model.safetensors":
 			_, _ = w.Write([]byte("weight"))
@@ -424,7 +424,7 @@ func TestDownload_DatasetGroupDestinationIndependentOfExplicitGGUFFilter(t *test
 			files := []hfNode{{Type: "file", Path: "train_records.csv", Size: 4}}
 			filters := []string{"train"}
 			if withGGUF {
-				files = append(files, hfNode{Type: "file", Path: "model-train.gguf", Size: 4})
+				files = append(files, hfNode{Type: "file", Path: "model-train.gguf", Size: 5})
 				filters = append(filters, "model-train.gguf")
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

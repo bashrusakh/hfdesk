@@ -192,18 +192,30 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 
 	assertExactFile(t, dst, full)
 
-	// No payload-artifact residue: exactly one file (the destination)
-	// remains in the directory.
+	// No payload-artifact residue: the destination plus the persistent
+	// ownership lock file (never unlinked, by design) remain in the directory.
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.Name())
+	allowed := map[string]bool{
+		filepath.Base(dst): true,
+		filepath.Base(stagingOwnershipLockPath(dst + ".incomplete")): true,
 	}
-	if len(names) != 1 || names[0] != filepath.Base(dst) {
+	for _, e := range entries {
+		if !allowed[e.Name()] {
+			t.Errorf("unexpected artifact after publish: %s", e.Name())
+		}
+	}
+	if len(entries) != len(allowed) {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
 		t.Errorf("unexpected artifacts after publish: %v", names)
+	}
+	if _, err := os.Stat(stagingOwnershipLockPath(dst + ".incomplete")); err != nil {
+		t.Errorf("the persistent ownership lock file was removed: %v", err)
 	}
 	if files, _ := multipartPartFiles(dst); len(files) != 0 {
 		t.Errorf("no .part-NN payload files may be created, got %v", files)
@@ -1010,8 +1022,8 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 }
 
 // Cross-process half of the claim exclusion: a staging record owned by a
-// live FOREIGN process with a fresh payload means "owned" — the claimant
-// must not touch the staging.
+// live FOREIGN process that holds the OS ownership lock means "owned" — the
+// claimant must not touch the staging.
 func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8_000
@@ -1042,6 +1054,11 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	}
 	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
 		t.Fatal(err)
+	}
+	// The live owner holds the OS ownership lock for its whole interval.
+	hold, _ := acquireStagingOwnershipLock(staging)
+	if hold != nil {
+		defer hold.release()
 	}
 
 	// The size HEAD must succeed for the download to reach the claim; the
@@ -1268,6 +1285,12 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The live owner holds the OS ownership lock; the fresh record is its
+		// diagnostic identity, not the fence.
+		hold, _ := acquireStagingOwnershipLock(staging)
+		if hold != nil {
+			defer hold.release()
+		}
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodHead {
@@ -1287,7 +1310,7 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		assertExactFile(t, staging, before)
 	})
 
-	t.Run("stale record and payload still lose the claim", func(t *testing.T) {
+	t.Run("stale record and payload with no ownership lock is taken over", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		full := rangedTestPayload(total)
 		dst := filepath.Join(tmpDir, "hb-stale.bin")
@@ -1298,6 +1321,9 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		seedForeignOwned(t, staging, full, 4000)
 		staleMtime(t, staging)
 		staleMtime(t, staging+".meta")
+		// No ownership lock is held: the previous owner is gone, so the
+		// committed prefix is recoverable immediately (a live but hung owner
+		// would still hold the lock and is deliberately not taken over).
 
 		srv, gotRanges := rangedTestServer(t, full)
 		it := PlanItem{RelativePath: "hb.bin", URL: srv.URL + "/hb.bin", Size: total, AcceptRanges: true}
@@ -1351,5 +1377,117 @@ func TestParseContentRange(t *testing.T) {
 			t.Errorf("parseContentRange(%q) = (%d,%d,%d,%v); want (%d,%d,%d,%v)",
 				tc.in, s, e, tot, hasTot, tc.start, tc.end, tc.total, tc.hasTotal)
 		}
+	}
+}
+
+// TestRangedMultipart_StrictHashSurvivesOverflowRetry covers M2: an oversized
+// chunked body on the first attempt is a protocol violation that does not
+// advance the durable offset, so the retry re-requests the same range. The
+// sequential hash-on-write state from the first attempt must be invalidated —
+// otherwise the retry feeds the same bytes into the hash a second time and no
+// valid retry can ever verify. The fallback is exactly one final full-file pass,
+// and progress must not count the overflowing attempt's bytes twice.
+func TestRangedMultipart_StrictHashSurvivesOverflowRetry(t *testing.T) {
+	const total = 8_000
+	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "strict-overflow.bin")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var gets atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(total))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		n := gets.Add(1)
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start != 0 || end != total-1 {
+			http.Error(w, "unexpected range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+		if n == 1 {
+			// First attempt: exact Content-Range, no Content-Length (chunked),
+			// every requested byte, then extra bytes past the assigned range.
+			w.WriteHeader(http.StatusPartialContent)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			for i := 0; i < len(full); i += 512 {
+				j := i + 512
+				if j > len(full) {
+					j = len(full)
+				}
+				_, _ = w.Write(full[i:j])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
+			time.Sleep(20 * time.Millisecond)
+			_, _ = w.Write(bytes.Repeat([]byte{0xEE}, 1024))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			return
+		}
+		// Valid retry: the same exact range, served slowly enough that the
+		// progress ticker observes the bytes during the attempt.
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		w.WriteHeader(http.StatusPartialContent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		for i := 0; i < len(full); i += 32 {
+			j := i + 32
+			if j > len(full) {
+				j = len(full)
+			}
+			_, _ = w.Write(full[i:j])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(3 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "strict-overflow.bin", URL: srv.URL + "/strict-overflow.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
+	cfg := Settings{Concurrency: 1, Retries: 2, StallTimeout: "0", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "sha256"}
+
+	var maxProgress atomic.Int64
+	hashPassCount.Store(0)
+	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ev ProgressEvent) {
+		if ev.Event != "file_progress" {
+			return
+		}
+		for {
+			cur := maxProgress.Load()
+			if ev.Downloaded <= cur || maxProgress.CompareAndSwap(cur, ev.Downloaded) {
+				break
+			}
+		}
+	})
+	if err != nil {
+		t.Fatalf("downloadMultipart: %v (a valid retry after an overflow must verify and publish)", err)
+	}
+	if !verified {
+		t.Error("the final full-file verification pass was not reported as completed")
+	}
+	if got := hashPassCount.Load(); got != 1 {
+		t.Errorf("strict mode after an overflow retry performed %d full-file passes; want exactly 1 (poisoned hash-on-write must be dropped)", got)
+	}
+	assertExactFile(t, dst, full)
+	if got := gets.Load(); got != 2 {
+		t.Errorf("ranged body fetched %d times; want 2 (overflow attempt + valid retry)", got)
+	}
+	if got := maxProgress.Load(); got > total {
+		t.Errorf("progress reported %d bytes for a %d-byte file; overflow-attempt bytes were counted twice", got, total)
 	}
 }

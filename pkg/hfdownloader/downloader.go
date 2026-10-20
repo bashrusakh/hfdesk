@@ -551,14 +551,20 @@ LOOP:
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
 
 			var dlErr error
-			// contentVerified reports that the ranged downloader already
-			// proved the payload against it.SHA256 inside this call (one pass
-			// at most), so the caller must not repeat the hash.
+			// contentVerified reports that the downloader already proved the
+			// payload against it.SHA256 inside this call, before the publish
+			// rename (one pass at most): the ranged path's hash-on-write/final/
+			// legacy proof, or the single path's pre-publication proof. For a
+			// known digest this is always true on success in Verify=sha256 and
+			// Verify=etag modes, so the caller must not repeat the hash (a
+			// post-publication hash could only observe corrupt published
+			// bytes). HEAD-ETag-only verification with no known digest remains
+			// the documented post-publication exception.
 			var contentVerified bool
 			if multipartRan {
 				contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
 			} else {
-				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
 
 			// A staging file owned by another live writer — or already
@@ -619,21 +625,27 @@ LOOP:
 			//   none   — no post-download content hash; HTTP/range
 			//            protocol correctness still applied during transfer.
 			//   size   — (default) the exact expected-size invariant, plus
-			//            the complete validated range coverage the
-			//            multipart path already enforced; NO full-file SHA
-			//            reread for LFS on this path. Two pre-existing,
-			//            documented exceptions may still hash: the
-			//            pre-download skip check of an already-present file,
-			//            and the one-time legacy-migration content proof the
-			//            ranged downloader performs before publication.
+			//            the complete validated transfer coverage both paths
+			//            already enforced; NO full-file SHA reread on the
+			//            normal path. Three pre-existing, documented
+			//            exceptions may still hash: the pre-download skip
+			//            check of an already-present file, the one-time
+			//            legacy-migration content proof, and the proof of
+			//            inherited single-path .part bytes — all before
+			//            publication.
 			//   sha256 — strict full-file SHA-256 against the known digest,
-			//            at most one pass: the ranged path verified either
-			//            hash-on-write (fresh sequential) or with one
-			//            sequential pass before publication.
-			//   etag   — historical compatibility: LFS files with a known
-			//            digest were always hashed before the ETag branch, so
-			//            they still are here; non-LFS etag keeps its historical
-			//            no-post-check behavior (the branch below is unchanged).
+			//            at most one pass, always before publication for a
+			//            known digest: the engine verified hash-on-write
+			//            (fresh sequential) or with one pass before the
+			//            rename. A mismatch never reaches dst/blobs/<sha>.
+			//   etag   — historical compatibility: a known SHA-256 digest is
+			//            proven with one pass before publication (the engine
+			//            reports contentVerified, so it is not repeated here).
+			//            Non-LFS ETag-only files have no known digest and keep
+			//            their historical no-post-check behavior. (The
+			//            HEAD-ETag fallback exists only in "sha256" mode; with
+			//            no known digest it remains a post-publication check
+			//            and can report a mismatch then.)
 			//
 			// Other values keep their historical compatible behavior for
 			// non-LFS files below.
@@ -646,10 +658,12 @@ LOOP:
 				case "none":
 					// No post-download content hash.
 				case "sha256", "etag":
-					// contentVerified means the ranged downloader already
-					// proved the bytes against this digest (hash-on-write, a
-					// single final pass, or the one-time legacy migration
-					// proof), so at most one pass happens per file.
+					// Known-digest proof is a pre-publication engine gate.
+					// contentVerified should therefore be true on success;
+					// the fallback stays for direct callers of unusual legacy
+					// configurations, but it must never be the normal path for
+					// a known digest (a post-publication hash cannot undo a
+					// published mismatch).
 					if !contentVerified {
 						if err := verifySHA256Ctx(fileCtx, verifyPath, it.SHA256); err != nil {
 							select {
@@ -685,7 +699,7 @@ LOOP:
 					}
 					return
 				}
-			} else if cfg.Verify == "sha256" {
+			} else if cfg.Verify == "sha256" && !contentVerified {
 				_, remoteSha, herr := headForETag(fileCtx, httpc, cfg.Token, itForIO)
 				if herr != nil {
 					// headForETag maps every non-2xx status (401/403
@@ -1179,39 +1193,67 @@ func absoluteAttemptCeiling(retries int) int {
 
 // downloadSingle downloads a file in a single request.
 //
-// Resume behavior: if a .part file already exists from a previous interrupted
-// run, its bytes are preserved and the HTTP request uses a Range header to
-// fetch only the remaining bytes. If the server ignores the Range header and
-// responds with 200 (full body), the .part file is truncated and the download
-// restarts from zero.
-func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+// Resume behavior: if a .part file already exists from a previous run, its
+// bytes are preserved and the HTTP request uses a Range header to fetch only
+// the remaining bytes. Every ranged (206) response is validated exactly like
+// the multipart worker path: the status must be 206, Content-Range must name
+// the requested [pos, size-1] start/end (and the expected total), Content-Length
+// must match the requested length, and a bounded writer refuses any byte
+// outside that range. A short body is rejected after the copy. If the server
+// ignores the Range header and responds with 200 (full body), the .part file is
+// truncated and the download restarts from zero. No resume is attempted when
+// the expected size is unknown (the range layout cannot be validated).
+//
+// The path inherits the same trust model as the ranged path. Before the rename,
+// the file must have exactly the expected size, and a known digest is proven
+// before publication: in Verify=sha256 and Verify=etag modes every single-path
+// transfer (fresh or resumed) gets one full-file SHA-256 pass, and in Verify=size
+// mode inherited .part bytes are proven once (the same one-time migration
+// exception the legacy import gets). A mismatch removes the partial and never
+// renames it onto the destination. Verify="none" inherits that mode's no-hash
+// semantics, and bytes written entirely by this run in Verify="size" mode need
+// no reread. Verification with no known digest, where the caller falls back to a
+// HEAD ETag, remains a post-publication check (historical behavior).
+//
+// The returned bool reports whether this call already proved the payload
+// against it.SHA256 before the rename, so the caller does not repeat the
+// full-file pass.
+func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (bool, error) {
+	const unboundedBody = int64(^uint64(0) >> 1)
+
 	tmp := dst + ".part"
 	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer out.Close()
 
 	fi, err := out.Stat()
 	if err != nil {
-		return err
+		return false, err
 	}
 	pos := fi.Size()
+	// inherited marks bytes this run did not write. A .part is a sequential
+	// prefix with no resume record, so those bytes have no validated
+	// provenance and need the content proof below before publication.
+	inherited := pos > 0
 
-	// If the partial is already exactly the right size, finalize without network.
-	if it.Size > 0 && pos == it.Size {
-		out.Close()
-		return os.Rename(tmp, dst)
-	}
-	// If the partial is larger than expected (stale/corrupt), start over.
-	if it.Size > 0 && pos > it.Size {
+	// An oversized partial is stale/corrupt. A partial with no known expected
+	// size cannot be range-validated at all, so it is discarded rather than
+	// guessed at (downloader correctness rule: never resume unknown layout).
+	if (it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0) {
 		if err := out.Truncate(0); err != nil {
-			return err
+			return false, err
 		}
 		pos = 0
+		inherited = false
 	}
-	if _, err := out.Seek(pos, io.SeekStart); err != nil {
-		return err
+
+	// If the partial already holds exactly the expected number of bytes, its
+	// bytes are still unproven: publish only after the exact-size check and,
+	// for inherited bytes, the content proof.
+	if it.Size > 0 && pos == it.Size {
+		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited)
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
@@ -1235,6 +1277,13 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// hwm is the highest offset ever reached for this file, seeded with the
 	// initial on-disk offset.
 	hwm := pos
+	// countedUpTo is the absolute end of the bytes already reported as
+	// progress, seeded with the inherited prefix. Progress therefore counts
+	// durable unique bytes: a failed attempt's written prefix is not counted
+	// again when the retry resumes from it, and an overflowing attempt's
+	// accepted bytes are not counted twice when the range is re-requested.
+	countedUpTo := pos
+	var lastEmit time.Time
 
 	for {
 		select {
@@ -1244,7 +1293,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			if !abortPartAttempt(ctx) {
 				cleanupPartialsOnCancel(cfg, dst, "")
 			}
-			return ctx.Err()
+			return false, ctx.Err()
 		default:
 		}
 
@@ -1255,12 +1304,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 
 		req, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 		addAuth(req, token)
-		if pos > 0 {
-			if it.Size > 0 {
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, it.Size-1))
-			} else {
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-", pos))
-			}
+		if pos > 0 && it.Size > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, it.Size-1))
 		}
 
 		// waitResp carries a throttling response (429/503) whose Retry-After /
@@ -1281,22 +1326,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if err != nil {
 			lastErr = err
 		} else {
-			// If we asked for a range but the server returned the whole body,
-			// throw away any existing partial bytes and start fresh.
-			if pos > 0 && resp.StatusCode == http.StatusOK {
-				truncatedRestart = true
-				if err := out.Truncate(0); err != nil {
-					resp.Body.Close()
-					attemptCancel()
-					return err
-				}
-				if _, err := out.Seek(0, io.SeekStart); err != nil {
-					resp.Body.Close()
-					attemptCancel()
-					return err
-				}
-				pos = 0
-			}
+			status := resp.StatusCode
 			if apiErr := classifyFileResponse(resp, it.URL); apiErr != nil {
 				lastErr = apiErr
 				resp.Body.Close()
@@ -1307,36 +1337,118 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					attemptCancel()
 					out.Close()
 					removeEmptyPartialFile(tmp)
-					return lastErr
+					return false, lastErr
 				}
 				if !apiErr.IsRetryable() {
 					attemptCancel()
 					out.Close()
-					return lastErr
+					return false, lastErr
 				}
 				waitResp = resp
-			} else {
-				// The stall watchdog wraps the raw network body BEFORE the
-				// speed limiter's pacing, so deliberate throttling is not
-				// mistaken for a stalled peer.
-				body := newStallReader(resp.Body, stall, attemptCancel)
-				pr := newProgressReader(cfg.SpeedLimiter.Reader(attemptCtx, body), it.Size, it.RelativePath, emit)
-				pr.downloaded = pos // emitted progress reflects cumulative bytes
-				_, cerr := io.Copy(out, pr)
+			} else if status != http.StatusOK && status != http.StatusPartialContent {
+				// A 2xx other than 200/206 is a protocol violation, not a
+				// valid body.
+				lastErr = fmt.Errorf("unexpected status %s for file request", resp.Status)
 				resp.Body.Close()
-				attemptCancel()
-				if cerr == nil {
-					out.Close()
-					return os.Rename(tmp, dst)
+			} else {
+				base := int64(0)
+				limit := unboundedBody
+				valid := true
+				if status == http.StatusPartialContent {
+					// A ranged response is accepted only with an exact
+					// Content-Range for the requested interval. This path
+					// never resumes without a known size, so an unvalidatable
+					// 206 is a protocol violation.
+					if it.Size <= 0 {
+						lastErr = fmt.Errorf("ranged response without an expected size (bytes %d-)", pos)
+						valid = false
+					} else if verr := validateRangeResponse(resp, pos, it.Size-1, it.Size); verr != nil {
+						lastErr = verr
+						valid = false
+					} else {
+						base = pos
+						limit = it.Size - pos
+					}
+					if !valid {
+						resp.Body.Close()
+					}
+				} else {
+					// Full body: if we asked for a range and got 200, existing
+					// partial bytes are thrown away and the download restarts
+					// from zero. It is a destructive restart, not progress.
+					if pos > 0 {
+						truncatedRestart = true
+						if err := out.Truncate(0); err != nil {
+							resp.Body.Close()
+							attemptCancel()
+							return false, err
+						}
+						pos = 0
+						countedUpTo = 0
+						lastEmit = time.Time{}
+					}
+					base = 0
+					if it.Size > 0 {
+						limit = it.Size
+					}
 				}
-				// If this attempt's stall watchdog fired, the failure is a
-				// stall, not a caller cancellation — classifyStall keeps a
-				// done parent context (genuine cancel) unchanged.
-				lastErr = classifyStall(ctx, body, cerr)
-				// Update pos to current file position so the next retry issues
-				// a Range request for the remaining bytes instead of duplicating.
-				if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
-					pos = cur
+
+				if valid {
+					// The stall watchdog wraps the raw network body BEFORE the
+					// speed limiter's pacing, so deliberate throttling is not
+					// mistaken for a stalled peer.
+					body := newStallReader(resp.Body, stall, attemptCancel)
+					paced := cfg.SpeedLimiter.Reader(attemptCtx, body)
+					w := newBoundedAtWriter(out, base, limit)
+					w.onWrite = func([]byte) {
+						end := base + w.written
+						if end <= countedUpTo {
+							return
+						}
+						countedUpTo = end
+						if now := time.Now(); now.Sub(lastEmit) >= 200*time.Millisecond {
+							lastEmit = now
+							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
+								Downloaded: end, Total: it.Size})
+						}
+					}
+					_, cerr := io.Copy(w, paced)
+					resp.Body.Close()
+					if cerr == nil {
+						// Exact body length: the bounded writer refuses an
+						// overlong body; a short body is rejected here.
+						switch {
+						case status == http.StatusPartialContent && w.written != limit:
+							cerr = fmt.Errorf("ranged body short: got %d of %d bytes for bytes %d-%d",
+								w.written, limit, base, it.Size-1)
+						case status == http.StatusOK && it.Size > 0 && w.written != it.Size:
+							cerr = fmt.Errorf("single body short: got %d of %d bytes for %s",
+								w.written, it.Size, it.RelativePath)
+						}
+					}
+					if cerr == nil {
+						// The file now has exactly the expected bytes (a ranged
+						// body covers [pos, size) and a full body covers
+						// [0, size)); finalizeSinglePartial re-checks the size
+						// and runs the inherited-bytes content proof.
+						attemptCancel()
+						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
+							Downloaded: countedUpTo, Total: it.Size})
+						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited)
+					}
+					attemptCancel()
+					lastErr = classifyStall(ctx, body, cerr)
+					if errors.Is(cerr, errRangedBodyOverflow) {
+						// Protocol violation: never advance the durable offset
+						// for an overlong body. The retry re-requests the same
+						// suffix (rather than planning bytes=size-size) and
+						// the retry budget decides the file's fate.
+					} else {
+						// Advance by bytes actually written so the next retry
+						// resumes from the durable offset instead of
+						// duplicating them. Overflow writes are excluded above.
+						pos = base + w.written
+					}
 				}
 			}
 		}
@@ -1367,7 +1479,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				if !abortPartAttempt(ctx) {
 					cleanupPartialsOnCancel(cfg, dst, "")
 				}
-				return ctx.Err()
+				return false, ctx.Err()
 			}
 			break
 		}
@@ -1379,10 +1491,63 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			if !abortPartAttempt(ctx) {
 				cleanupPartialsOnCancel(cfg, dst, "")
 			}
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 	}
-	return lastErr
+	return false, lastErr
+}
+
+// finalizeSinglePartial publishes a .part that already holds exactly the
+// expected number of bytes. It is the single path's publication gate: the
+// exact-size check runs first, then a known digest is proven with one
+// full-file SHA-256 pass before the rename whenever Verify is "sha256" or
+// "etag" (fresh or resumed) or whenever the partial contains inherited bytes
+// and Verify is not "none" (the one-time migration exception for size mode). A
+// mismatch removes the partial and never renames it onto dst. The returned bool
+// reports whether that proof ran, so the caller does not repeat it.
+func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool) (bool, error) {
+	if it.Size > 0 {
+		fi, err := out.Stat()
+		if err != nil {
+			return false, err
+		}
+		if fi.Size() != it.Size {
+			return false, fmt.Errorf("single download %s: got %d bytes on disk, want %d", it.RelativePath, fi.Size(), it.Size)
+		}
+	}
+	verified := false
+	// Known-digest modes always prove before publication (fresh or resumed);
+	// size mode proves only inherited bytes, which have no validated provenance
+	// (a moved commit or a corrupt file can produce a size-correct prefix).
+	proveKnownDigest := it.SHA256 != "" &&
+		(cfg.Verify == "sha256" || cfg.Verify == "etag" || (inherited && cfg.Verify != "none"))
+	if proveKnownDigest {
+		sum, err := computeSHA256Ctx(ctx, tmp)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				if !abortPartAttempt(ctx) {
+					cleanupPartialsOnCancel(cfg, dst, "")
+				}
+				return false, cerr
+			}
+			return false, err
+		}
+		if !strings.EqualFold(sum, it.SHA256) {
+			// Unproven bytes must never be published: the partial is removed so
+			// a retry starts from a clean prefix, and dst is left untouched.
+			_ = out.Close()
+			_ = os.Remove(tmp)
+			return false, fmt.Errorf("sha256 verify failed: %s: expected %s got %s", it.RelativePath, it.SHA256, sum)
+		}
+		verified = true
+	}
+	if err := out.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return false, err
+	}
+	return verified, nil
 }
 
 // removeEmptyPartialFile removes path when it exists and is empty. It is used

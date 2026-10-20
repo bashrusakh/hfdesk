@@ -105,11 +105,13 @@ func (r *benchPatternReader) Read(p []byte) (int, error) {
 //     copies would show up here; the rename-only path is ≈0×S);
 //   - hashReadBytes×S: full-file SHA-256 bytes read (Verify=size ≈0×S,
 //     Verify=sha256 ≈1×S);
-//   - finalizeMs: network-complete → file-done wall time: from the last
+//   - finalizeMs: network-complete → file-published wall time: from the last
 //     transferred byte (the file_finalizing signal) through the optional
-//     strict hash and the publish rename. This is the issue #140 finalization
-//     metric; it is reported alongside the byte counters so a slow local step
-//     is attributable rather than hidden in totalUs;
+//     strict hash to the publish rename, stopping at that rename. It excludes
+//     caller-level work after downloadMultipart returns (cache snapshot/friendly
+//     link creation, the manifest, and other job finalization). This is the
+//     issue #140 finalization metric; it is reported alongside the byte counters
+//     so a slow local step is attributable rather than hidden in totalUs;
 //   - totalUs: the whole download's wall time (network + finalization on a
 //     loopback server, so the local I/O share dominates for large S).
 func BenchmarkRangedFinalization(b *testing.B) {

@@ -111,7 +111,7 @@ func TestDownloadSingle_StalledTransferAbortsAndResumes(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
@@ -210,7 +210,7 @@ func TestDownloadSingle_MultiStallProgressResetsBudget(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -373,7 +373,7 @@ func TestDownloadSingle_StallExhaustedSurfacesStallError(t *testing.T) {
 	}
 
 	var retryMsgs []string
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
 		func(ev ProgressEvent) {
 			if ev.Event == "retry" {
 				retryMsgs = append(retryMsgs, ev.Message)
@@ -483,7 +483,7 @@ func TestDownloadSingle_GenuineCancelNotRelabelledAsStall(t *testing.T) {
 		cancel()
 	}()
 
-	err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("genuine cancellation must keep context.Canceled, got %v", err)
 	}
@@ -532,7 +532,7 @@ func TestDownloadSingle_RetryAfterHonored(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -865,7 +865,7 @@ func TestDownloadSingleStatusRetryPolicy(t *testing.T) {
 				w.WriteHeader(status)
 			}))
 			defer srv.Close()
-			err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || apiErr.StatusCode != status {
 				t.Fatalf("error = %v, want APIError status %d", err, status)
@@ -883,7 +883,7 @@ func TestDownloadSingleStatusRetryPolicy(t *testing.T) {
 				w.WriteHeader(status)
 			}))
 			defer srv.Close()
-			_ = downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			_, _ = downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
 			if requests != 3 {
 				t.Errorf("made %d requests; retryable 5xx should make initial attempt plus two retries", requests)
 			}
@@ -1018,7 +1018,7 @@ func TestDownloadSingle_IgnoredRangeRestartIsNotProgress(t *testing.T) {
 		BackoffMax:     "10ms",
 		StallTimeout:   "0",
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected failure; ignored-Range restarts must not loop forever")
 	}
@@ -1047,7 +1047,7 @@ func TestDownloadSingle_FailFastRemovesEmptyPartial(t *testing.T) {
 	defer srv.Close()
 
 	it := PlanItem{RelativePath: "f.bin", URL: srv.URL + "/f.bin", Size: int64(len(full))}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3}, it, dst, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected fail-fast error")
 	}
@@ -1088,7 +1088,7 @@ func TestDownloadSingle_CancelDuringBackoffReturnsPromptly(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected cancellation error")
@@ -1423,7 +1423,7 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	}()
 
 	// Bound the test: a regression that refunds the budget forever would hang.
@@ -1717,7 +1717,7 @@ func TestDownloadSingle_InternalAbortPreservesResumablePartial(t *testing.T) {
 		done := make(chan error, 1)
 		go func() {
 			it := PlanItem{RelativePath: "keep.bin", URL: "http://127.0.0.1:1/keep.bin", Size: 100_000}
-			done <- downloadSingle(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 		}()
 
 		// Give the goroutine time to fail its first attempt and enter the
@@ -1865,7 +1865,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 		}()
 
 		var err error
@@ -1921,7 +1921,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
-			w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(total-start, 10))
 			w.WriteHeader(http.StatusPartialContent)
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
@@ -1942,7 +1942,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 		}()
 
 		select {
@@ -2001,7 +2001,7 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 			}
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
-		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		w.Header().Set("Content-Length", strconv.FormatInt(total-start, 10))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -2026,7 +2026,7 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	}()
 
 	select {
@@ -2224,7 +2224,7 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	}()
 
 	select {

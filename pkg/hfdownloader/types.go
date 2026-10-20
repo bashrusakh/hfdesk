@@ -200,32 +200,60 @@ type Settings struct {
 	//
 	//   - "none": No post-download content hash (fastest). HTTP and ranged
 	//     response validation still apply during the transfer.
-	//   - "size": (default, fast) Verify the exact expected size and — for
-	//     multipart transfers — that every expected byte range was
-	//     successfully validated and written. On the normal transfer path no
-	//     full-file SHA-256 reread is performed for LFS files. Two deliberate
-	//     exceptions may still hash: the pre-download skip check over an
-	//     already-present destination, and the one-time legacy-migration
-	//     content proof (see below).
+	//   - "size": (default, fast) Verify the exact expected size and complete
+	//     validated transfer coverage on both the single-request and ranged
+	//     paths: the ranged path requires every expected byte range to be
+	//     validated and written, and the single path requires an exact 206
+	//     Content-Range/body-length match and checks the on-disk size before
+	//     the rename. On the normal transfer path no full-file SHA-256 reread
+	//     is performed for LFS files. Three deliberate exceptions may still
+	//     hash: the pre-download skip check over an already-present
+	//     destination, the one-time legacy-migration content proof, and the
+	//     content proof of inherited single-path .part bytes (see below). A
+	//     resumed ProofPending record can also force the proof after a crash or
+	//     mode change (see the durable proof gate below).
 	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
-	//     At most one full-file read is performed per file: a fresh
-	//     sequential multipart transfer hashes while writing; every other
-	//     transfer performs one sequential pass before publication, so a
-	//     mismatch never publishes corrupt bytes.
-	//   - "etag": Historical compatibility mode. LFS files with a known
-	//     SHA-256 were always hashed before the ETag branch in earlier
-	//     versions, so they still receive that hash here (at most one pass,
-	//     reusing a ranged proof when one ran); non-LFS files keep their
-	//     historical behavior (no post-download ETag check).
+	//     At most one full-file read is performed per file, always before
+	//     publication when the item carries a known digest: a fresh sequential
+	//     multipart transfer hashes while writing; every other transfer
+	//     (including the single-request path, fresh or resumed) performs one
+	//     sequential pass before the destination/blob is renamed into place, so
+	//     a mismatch never publishes corrupt bytes.
+	//   - "etag": Historical compatibility mode. A known SHA-256 digest is
+	//     proven with one full-file pass before publication, reusing the same
+	//     engine proof as "sha256" (a ranged or single-path proof is never
+	//     repeated). Files without a known digest keep the historical
+	//     behavior: non-LFS ETag files perform no post-download content check.
+	//     (The HEAD-ETag fallback exists only in "sha256" mode; with no known
+	//     digest it remains a post-publication check.)
 	//
 	// Bytes migrated from a pre-#140 .part-NN/.parts.json partial or a single
 	// .part have layout/prefix structure but no validated provenance. When the
 	// item carries a known SHA-256 and Verify is not "none", they receive one
 	// full-file SHA-256 pass before publication even in "size" mode — the
-	// explicit one-time migration exception. A mismatch discards the staging
-	// data and never publishes. With Verify "none" migrated bytes inherit the
-	// mode's no-hash semantics; without a known digest only size and complete
-	// range coverage can be checked.
+	// explicit one-time migration exception. The same rule applies to bytes a
+	// resumed single-request .part contributed before this run: a moved commit
+	// or a corrupt file can produce a size-correct prefix, so inherited .part
+	// bytes are content-proven once before the rename. A fresh single-request
+	// transfer in "sha256"/"etag" mode is likewise proven before the rename. A
+	// mismatch discards the partial/staging data and never publishes. With
+	// Verify "none" both inherit the mode's no-hash semantics; without a known
+	// digest only size and complete transfer coverage can be checked.
+	//
+	// Durable proof gate: a staging (multipart) record carries a persisted
+	// ProofPending flag that is set and flushed before any known-digest proof
+	// starts and cleared and flushed only after the proof succeeds, immediately
+	// before publication. On resume it forces the proof in every mode except
+	// "none" (including "size") whenever the item has a known digest, so a
+	// crash mid-proof, a mismatch whose cleanup cannot take the transition lock,
+	// or a later Verify-mode change cannot publish unproven all-Done ranges. On
+	// a mismatch the flag stays set, the payload is truncated to zero
+	// (poisoned), and the owned discard is attempted; if that discard fails the
+	// next run re-proves or discards. Publish refuses while the flag is still
+	// set for a known digest. Verify "none" is the explicit no-hash opt-out.
+	// The single-request .part needs no separate flag: it is renamed only after
+	// the proof, so any restart treats its bytes as inherited and re-proves them
+	// in every non-"none" mode.
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.
@@ -316,8 +344,10 @@ type Settings struct {
 	// path), the legacy dst+".part-NN"/dst+".parts.json" family, and the
 	// ranged staging file with its resume metadata
 	// (dst+".incomplete"/".incomplete.meta", or blobs/<sha>.incomplete in
-	// HF cache mode). When nil (default), partial files are preserved for
-	// resume (useful for pause/resume workflows).
+	// HF cache mode). The persistent `<staging>.lock` ownership file is not
+	// removed: it carries no payload and is reused by later claims. When nil
+	// (default), partial files are preserved for resume (useful for
+	// pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
 
 	// OnPartialFile, when non-nil, is called for every per-file

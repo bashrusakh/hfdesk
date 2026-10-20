@@ -136,6 +136,18 @@ func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 	if sha != base && pathEqual(name, r.IncompletePath(sha)) {
 		return true
 	}
+	// The downloader's persistent ownership/transition lock files sit beside
+	// the staging pair (<sha>.incomplete.lock, <sha>.incomplete.meta.lock).
+	// They are staging artifacts, never blobs, so cache deletion must leave
+	// them alone even though they are zero-byte and content-free.
+	if sha := trimSuffix(base, ".incomplete.meta"+stagingLockSuffix); sha != base &&
+		pathEqual(name, r.IncompleteMetaPath(sha)+stagingLockSuffix) {
+		return true
+	}
+	if sha := trimSuffix(base, ".incomplete"+stagingLockSuffix); sha != base &&
+		pathEqual(name, r.IncompletePath(sha)+stagingLockSuffix) {
+		return true
+	}
 	// The downloader's verification/transfer destination is blobs/tmp-<sha-or-
 	// path>, with single-part and multipart artifacts appended to that name.
 	// Separately, StoreDownloadedFile's atomic-copy fallback stages beside the
