@@ -102,15 +102,44 @@ func TestLocalCacheSplitGGUFDiscoveryAndMetadata(t *testing.T) {
 	}
 }
 
+// TestCacheMetadataDirectoryQualifiedQuantControls verifies cache metadata uses
+// the repository-relative path when a basename omits the quant token (for
+// example directory-qualified split shards), while a companion remains
+// filename-only and a basename token still wins over its directory.
+func TestCacheMetadataDirectoryQualifiedQuantControls(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	for _, name := range []string{
+		"Q4_K_M/model-00001-of-00002.gguf",
+		"Q4_K_M/model-00002-of-00002.gguf",
+		"UD-Q5_K_XL/shard-00001-of-00002.gguf",
+		"UD-Q5_K_XL/shard-00002-of-00002.gguf",
+		"Q8_0/mmproj-F16.gguf",
+		"model-Q6_K.gguf",
+	} {
+		writeSelectionFile(t, repoDir, name)
+	}
+	meta := collectCacheGGUFMetadata(repoDir, true, nil)
+	wantQuantizations := []string{"Q4_K_M", "Q6_K", "UD_Q5_K_XL"}
+	if !reflect.DeepEqual(meta.Quantizations, wantQuantizations) {
+		t.Fatalf("cache quantizations = %v, want %v", meta.Quantizations, wantQuantizations)
+	}
+	if !meta.HasMMProj || !reflect.DeepEqual(meta.MMProjFiles, []string{"Q8_0/mmproj-F16.gguf"}) {
+		t.Fatalf("mmproj metadata = %v/%v, want only the filename-classified companion", meta.HasMMProj, meta.MMProjFiles)
+	}
+}
+
 // TestCacheSelectionGroupsSplitSuffixDelimiters covers hyphen, space, and
-// underscore shard delimiters across .gguf and .gguf-split, complete shard
-// totals, and unclassified extended quant tokens.
+// underscore shard delimiters across .gguf and .gguf-split, short and padded
+// shard indices, complete shard totals, and unclassified extended quant tokens.
 func TestCacheSelectionGroupsSplitSuffixDelimiters(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
 	for _, name := range []string{
 		"hyphen/model-Q4_K_M-00001-of-00002.gguf",
 		"hyphen/model-Q4_K_M-00002-of-00002.gguf",
+		"short/model-Q4_K_M-1-of-2.gguf",
+		"short/model-Q4_K_M-2-of-2.gguf",
 		"space/model Q6_K 00001-of-00002.gguf-split",
 		"space/model Q6_K 00002-of-00002.gguf-split",
 		"underscore/model-Q8_0_00001-of-00002.gguf-split",
@@ -133,6 +162,7 @@ func TestCacheSelectionGroupsSplitSuffixDelimiters(t *testing.T) {
 		quant   string
 	}{
 		{[]string{"hyphen/model-Q4_K_M-00001-of-00002.gguf", "hyphen/model-Q4_K_M-00002-of-00002.gguf"}, "Q4_K_M"},
+		{[]string{"short/model-Q4_K_M-1-of-2.gguf", "short/model-Q4_K_M-2-of-2.gguf"}, "Q4_K_M"},
 		{[]string{"space/model Q6_K 00001-of-00002.gguf-split", "space/model Q6_K 00002-of-00002.gguf-split"}, "Q6_K"},
 		{[]string{"underscore/model-Q8_0_00001-of-00002.gguf-split", "underscore/model-Q8_0_00002-of-00002.gguf-split"}, "Q8_0"},
 		{[]string{"underscore_of/model-Q5_K_M_00001_of_00002.gguf", "underscore_of/model-Q5_K_M_00002_of_00002.gguf"}, "Q5_K_M"},

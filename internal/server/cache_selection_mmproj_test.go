@@ -733,13 +733,15 @@ func TestCacheSelectionHFMMProjCompanionGroup(t *testing.T) {
 }
 
 // A companion does not inherit the parent-directory quantization fallback that
-// LLM groups use, while an ordinary weight file in the same directory does.
+// LLM groups use, while an ordinary weight file in a quant directory does and
+// cache metadata follows the same directory-qualified rules.
 func TestCacheSelectionMMProjDoesNotInheritDirectoryQuant(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
 	quantDir := filepath.Join(repoDir, "Q4_K_M")
+	companionDir := filepath.Join(repoDir, "BF16")
 	// The companion's own name carries no quantization token.
-	writeSelectionFile(t, quantDir, "mmproj.gguf")
+	writeSelectionFile(t, companionDir, "mmproj.gguf")
 	// An ordinary weight file takes the directory's quantization label.
 	writeSelectionFile(t, quantDir, "model.gguf")
 	// A file with its own token keeps that token.
@@ -750,7 +752,7 @@ func TestCacheSelectionMMProjDoesNotInheritDirectoryQuant(t *testing.T) {
 		t.Fatalf("selection status=%d", code)
 	}
 	location := mmprojLocalLocation(t, selection, root)
-	companion := mmprojSelectionGroup(t, location, "Q4_K_M/mmproj.gguf")
+	companion := mmprojSelectionGroup(t, location, "BF16/mmproj.gguf")
 	if companion.Kind != cacheSelectionKindVisionEncoder {
 		t.Fatalf("companion kind=%q, want %q", companion.Kind, cacheSelectionKindVisionEncoder)
 	}
@@ -773,12 +775,13 @@ func TestCacheSelectionMMProjDoesNotInheritDirectoryQuant(t *testing.T) {
 		t.Fatalf("cache info did not report the companion: %+v", info)
 	}
 	for _, quantization := range info.Quantizations {
-		if quantization == "Q4_K_M" {
+		if quantization == "BF16" {
 			t.Fatalf("cache info listed the companion's directory quantisation: %v", info.Quantizations)
 		}
 	}
-	if !reflect.DeepEqual(info.Quantizations, []string{"Q8_0"}) {
-		t.Fatalf("cache info quantizations=%v, want only the file's own token", info.Quantizations)
+	wantQuantizations := []string{"Q4_K_M", "Q8_0"}
+	if !reflect.DeepEqual(info.Quantizations, wantQuantizations) {
+		t.Fatalf("cache info quantizations=%v, want the directory-qualified ordinary weight plus the file's own token %v", info.Quantizations, wantQuantizations)
 	}
 }
 

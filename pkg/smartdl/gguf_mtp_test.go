@@ -4,6 +4,7 @@
 package smartdl
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -46,16 +47,141 @@ func TestHasMTPMarker(t *testing.T) {
 		{"Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16.gguf", true},
 		{"model-Q4_K_M-MTP.gguf", true},
 		{"model_mtp_Q4_K_M.gguf", true},
+		{"model MTP Q4_K_M.gguf", true},
+		{"model\tMTP\tQ4_K_M.gguf", true},
+		{"model\u00a0MTP\u00a0Q4_K_M.gguf", true},
 		{"Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf", false},
 		{"Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf", false},
 		// "mtp" must be a whole delimiter-bounded segment, not a substring.
 		{"some-mtproj-Q4_K_M.gguf", false},
 		{"emptmp-Q4_K_M.gguf", false},
+		{"model MTPQ4_K_M.gguf", false},
+		{"some mtproj Q4_K_M.gguf", false},
 	}
 	for _, tt := range tests {
 		if got := hasMTPMarker(tt.name); got != tt.want {
 			t.Errorf("hasMTPMarker(%q) = %v, want %v", tt.name, got, tt.want)
 		}
+	}
+}
+
+// TestAnalyzeGGUFWhitespaceDelimitedMTPMarker covers a repo where the MTP
+// marker is separated by whitespace instead of the usual hyphens. The larger
+// MTP artifact must remain a distinct non-recommended option, while the plain
+// twin is the sole recommendation.
+func TestAnalyzeGGUFWhitespaceDelimitedMTPMarker(t *testing.T) {
+	const (
+		mtpPath   = "model MTP Q4_K_M.gguf"
+		plainPath = "model Q4_K_M.gguf"
+	)
+	info := analyzeGGUF([]FileInfo{
+		{Name: mtpPath, Path: mtpPath, Size: 5_000_000_000},
+		{Name: plainPath, Path: plainPath, Size: 4_000_000_000},
+	})
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	if got := len(info.Quantizations); got != 2 {
+		t.Fatalf("got %d quantizations, want 2: %+v", got, info.Quantizations)
+	}
+
+	var mtp, plain *GGUFQuantization
+	for i := range info.Quantizations {
+		q := &info.Quantizations[i]
+		switch {
+		case q.IsMTP:
+			mtp = q
+		case q.Name == "Q4_K_M":
+			plain = q
+		}
+	}
+	if mtp == nil {
+		t.Fatalf("whitespace-delimited MTP artifact was not classified IsMTP: %+v", info.Quantizations)
+	}
+	if got, want := mtp.Files, []string{mtpPath}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("MTP files = %v, want %v", got, want)
+	}
+	if mtp.File.Size != 5_000_000_000 {
+		t.Fatalf("MTP size = %d, want its own 5000000000 bytes", mtp.File.Size)
+	}
+	if plain == nil {
+		t.Fatalf("plain Q4_K_M artifact missing: %+v", info.Quantizations)
+	}
+	if plain.IsMTP {
+		t.Fatalf("plain artifact was classified IsMTP: %+v", plain)
+	}
+	if got, want := plain.Files, []string{plainPath}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("plain files = %v, want %v", got, want)
+	}
+
+	items := selectableItemsByCategory(GGUFToSelectableItems(info), "quantization")
+	if len(items) != 2 {
+		t.Fatalf("got %d quantization items, want 2: %+v", len(items), items)
+	}
+	var recommended []SelectableItem
+	for _, item := range items {
+		if strings.Contains(item.Label, "MTP") && item.Recommended {
+			t.Errorf("MTP item %q must not be auto-recommended", item.Label)
+		}
+		if item.Recommended {
+			recommended = append(recommended, item)
+		}
+	}
+	if len(recommended) != 1 {
+		t.Fatalf("got %d recommended quantizations, want exactly 1: %+v", len(recommended), recommended)
+	}
+	if got, want := recommended[0].Files, []string{plainPath}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended files = %v, want the non-MTP twin %v", got, want)
+	}
+}
+
+// TestAnalyzeGGUFWhitespaceMTPShardsKeepCompleteFiles covers the interaction
+// between whitespace-delimited MTP markers and split grouping: the shards must
+// merge into one MTP artifact with every part in Files, and the non-MTP twin
+// must remain the sole recommendation.
+func TestAnalyzeGGUFWhitespaceMTPShardsKeepCompleteFiles(t *testing.T) {
+	mtpShards := []string{
+		"model MTP Q4_K_M 00001-of-00002.gguf",
+		"model MTP Q4_K_M 00002-of-00002.gguf",
+	}
+	const plainPath = "model Q4_K_M.gguf"
+	info := analyzeGGUF([]FileInfo{
+		{Name: mtpShards[0], Path: mtpShards[0], Size: 2_500_000_000},
+		{Name: mtpShards[1], Path: mtpShards[1], Size: 2_500_000_000},
+		{Name: plainPath, Path: plainPath, Size: 4_000_000_000},
+	})
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	if got := len(info.Quantizations); got != 2 {
+		t.Fatalf("got %d quantizations, want 2: %+v", got, info.Quantizations)
+	}
+	var mtp *GGUFQuantization
+	for i := range info.Quantizations {
+		if info.Quantizations[i].IsMTP {
+			mtp = &info.Quantizations[i]
+		}
+	}
+	if mtp == nil {
+		t.Fatalf("whitespace-delimited MTP shards were not classified IsMTP: %+v", info.Quantizations)
+	}
+	if got, want := mtp.Files, mtpShards; !reflect.DeepEqual(got, want) {
+		t.Fatalf("MTP shard Files = %v, want complete group %v", got, want)
+	}
+	if mtp.Parts != 2 || mtp.File.Size != 5_000_000_000 {
+		t.Fatalf("MTP parts/size = %d/%d, want 2/5000000000", mtp.Parts, mtp.File.Size)
+	}
+	var recommended []SelectableItem
+	for _, item := range selectableItemsByCategory(GGUFToSelectableItems(info), "quantization") {
+		if item.Recommended {
+			recommended = append(recommended, item)
+		}
+	}
+	if len(recommended) != 1 {
+		t.Fatalf("got %d recommended quantizations, want exactly 1: %+v", len(recommended), recommended)
+	}
+	if got, want := recommended[0].Files, []string{plainPath}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended files = %v, want the non-MTP twin %v", got, want)
 	}
 }
 

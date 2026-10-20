@@ -1221,7 +1221,7 @@ func collectCacheGGUFMetadata(dir string, includeMMProjFiles bool, excluded []st
 			}
 			return nil
 		}
-		if q := smartdl.GGUFQuantType(info.Name(), ""); q != "" && !seen[q] {
+		if q := smartdl.GGUFQuantType(info.Name(), filepath.ToSlash(relPath)); q != "" && !seen[q] {
 			seen[q] = true
 			meta.Quantizations = append(meta.Quantizations, q)
 		}

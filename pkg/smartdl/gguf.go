@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // GGUF quantization quality ratings (1-5 stars).
@@ -189,9 +190,11 @@ var (
 	// Hyphen, underscore, and space delimiters are accepted around both the
 	// shard index and "of" so names such as "model Q5_K_M 00001-of-00002" and
 	// "model-Q4_K_M_00001_of_00002" share the same grouping/quant rules.
-	// HuggingFace/llama.cpp use 5-digit indices; allow 4-5 digits to be safe.
+	// Shard indices accept one or more digits: HuggingFace/llama.cpp commonly
+	// use 5-digit zero-padded indices, while other producers emit short indices
+	// such as "model-Q4_K_M-1-of-2.gguf".
 	// Used to group shards of the same quantization together.
-	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ](\d{4,5})[-_ ]of[-_ ](\d{4,5})(?:\.gguf(?:-split)?)?$`)
+	splitSuffixPattern = regexp.MustCompile(`(?i)[-_ ](\d+)[-_ ]of[-_ ](\d+)(?:\.gguf(?:-split)?)?$`)
 )
 
 // isGGUFFileName reports whether name carries a recognized GGUF suffix,
@@ -341,12 +344,13 @@ func isGGUFMTPFile(name string) bool {
 // files are full models that carry a recognized quantization token and must
 // appear as their own quantization options — separate from the non-MTP twin
 // that shares the same token. The marker is matched as a delimiter-bounded
-// segment so it never trips on substrings inside other tokens.
+// segment (hyphen, underscore, dot, or whitespace) so it never trips on
+// substrings inside other tokens.
 func hasMTPMarker(name string) bool {
 	base := strings.ToLower(filepath.Base(name))
 	base = trimGGUFSuffix(base)
 	for _, seg := range strings.FieldsFunc(base, func(r rune) bool {
-		return r == '-' || r == '_' || r == '.'
+		return r == '-' || r == '_' || r == '.' || unicode.IsSpace(r)
 	}) {
 		if seg == "mtp" {
 			return true

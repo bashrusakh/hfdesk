@@ -85,6 +85,58 @@ func TestStripSplitSuffixLegacyGGUFSplit(t *testing.T) {
 	}
 }
 
+// TestAnalyzeGGUFSingleDigitShardIndices pins the shared split grammar's
+// acceptance of short shard indices while retaining 4-5 digit controls and a
+// longer-index case.
+func TestAnalyzeGGUFSingleDigitShardIndices(t *testing.T) {
+	q4Shards := []string{"model-Q4_K_M-1-of-2.gguf", "model-Q4_K_M-2-of-2.gguf"}
+	q6Shards := []string{"model-Q6_K-00001-of-00002.gguf", "model-Q6_K-00002-of-00002.gguf"}
+	files := []FileInfo{
+		{Name: q4Shards[0], Path: q4Shards[0], Size: 100},
+		{Name: q4Shards[1], Path: q4Shards[1], Size: 150},
+		{Name: q6Shards[0], Path: q6Shards[0], Size: 90},
+		{Name: q6Shards[1], Path: q6Shards[1], Size: 95},
+	}
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil")
+	}
+	if got := len(info.Quantizations); got != 2 {
+		t.Fatalf("got %d quantizations, want 2: %+v", got, info.Quantizations)
+	}
+	byName := make(map[string]GGUFQuantization, len(info.Quantizations))
+	for _, q := range info.Quantizations {
+		byName[q.Name] = q
+	}
+	q4, ok := byName["Q4_K_M"]
+	if !ok {
+		t.Fatalf("single-digit Q4_K_M shards were not grouped: %+v", info.Quantizations)
+	}
+	if got, want := q4.Files, q4Shards; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Q4_K_M Files = %v, want %v", got, want)
+	}
+	if q4.Parts != 2 || q4.File.Size != 250 {
+		t.Fatalf("Q4_K_M parts/size = %d/%d, want 2/250", q4.Parts, q4.File.Size)
+	}
+	q6, ok := byName["Q6_K"]
+	if !ok || q6.Parts != 2 || q6.File.Size != 185 {
+		t.Fatalf("Q6_K control group = %+v, want two shards totaling 185 bytes", q6)
+	}
+
+	var recommended []SelectableItem
+	for _, item := range GGUFToSelectableItems(info) {
+		if item.Category == "quantization" && item.Recommended {
+			recommended = append(recommended, item)
+		}
+	}
+	if len(recommended) != 1 {
+		t.Fatalf("got %d recommended quantizations, want exactly 1: %+v", len(recommended), recommended)
+	}
+	if got, want := recommended[0].Files, q4Shards; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended Files = %v, want complete Q4 shard group %v", got, want)
+	}
+}
+
 // TestAnalyzeGGUF_SpaceDelimitedQuantNames verifies that quantization tokens
 // delimited by spaces are still recognized and grouped.
 func TestAnalyzeGGUF_SpaceDelimitedQuantNames(t *testing.T) {
@@ -141,6 +193,8 @@ func TestParseGGUFSplitShardDelimitersAndExtensions(t *testing.T) {
 		wantFamily string
 	}{
 		{"model-Q4_K_M-00001-of-00002.gguf", 1, 2, true, "model-Q4_K_M-{part}-of-00002.gguf"},
+		{"model-Q4_K_M-1-of-2.gguf", 1, 2, true, "model-Q4_K_M-{part}-of-2.gguf"},
+		{"model-Q4_K_M-123456-of-654321.gguf", 123456, 654321, true, "model-Q4_K_M-{part}-of-654321.gguf"},
 		{"model Q5_K_M 00002-of-00002.gguf-split", 2, 2, true, "model Q5_K_M {part}-of-00002.gguf-split"},
 		{"model-Q6_K_00001-of-00002.gguf", 1, 2, true, "model-Q6_K_{part}-of-00002.gguf"},
 		{"model-Q8_0_00001_of_00002.gguf-split", 1, 2, true, "model-Q8_0_{part}_of_00002.gguf-split"},
