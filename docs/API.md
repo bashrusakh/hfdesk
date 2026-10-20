@@ -774,7 +774,11 @@ including GGUFs, and a raw quant-filter mismatch alone is not generally proof
 that the job is in GGUF-only mode. This is scoped to reachable writable
 namespaces, not a global conflict; dataset GGUF selection keeps its existing
 narrower direct filter/exclude policy, and unknown or outward namespace mappings
-remain fail-closed. Partial unlink results use `207` and identify removed,
+remain fail-closed. A vision-encoder companion is its own artifact role: a
+writer whose complete filter set is bare quantization tokens is treated as
+non-overlapping with that companion unless a quant token appears in the
+companion's path. Matching, path-scoped, and aliased writers remain
+conservative. Partial unlink results use `207` and identify removed,
 remaining, and failed paths (`errors`). On the supported platforms above, a local symlink member is unlinked
 without following or deleting its target. The authoritative delete-time
 enumeration and filesystem operations

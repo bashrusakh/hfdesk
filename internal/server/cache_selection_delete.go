@@ -657,8 +657,47 @@ func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamesp
 	return evidence, true
 }
 
+// isQuantOnlyFilter reports whether a job filter is a bare quantization token
+// rather than a filename or repository path. The comparison uses the same
+// canonical quant-label owner as cache metadata, so "q4_k_m" and
+// "UD-Q4_K_M" qualify while "model-Q4_K_M.gguf" and path filters do not.
+func isQuantOnlyFilter(filter string) bool {
+	filter = strings.TrimSpace(filter)
+	if filter == "" || strings.ContainsAny(filter, "/\\") {
+		return false
+	}
+	quant := cacheQuantLabel(filter)
+	if quant == "" {
+		return false
+	}
+	return strings.ToUpper(strings.ReplaceAll(filter, "-", "_")) == quant
+}
+
+func quantOnlyWriterFilters(filters []string) bool {
+	if len(filters) == 0 {
+		return false
+	}
+	for _, filter := range filters {
+		if !isQuantOnlyFilter(filter) {
+			return false
+		}
+	}
+	return true
+}
+
 func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentities []string) bool {
+	// A vision-encoder companion is its own artifact role (#138), so a writer
+	// whose complete filter set is bare quantization tokens is not selecting
+	// that companion as a quantization. This stays deliberately narrow: no
+	// aliases and no path/exclude ambiguity, and a quant token that appears in
+	// the companion's own path still blocks. LLM target paths continue to use
+	// the conservative ordinary-model projection below.
+	quantOnlyMMProjWriter := !evidence.isDataset && !evidence.aliases && quantOnlyWriterFilters(evidence.filters)
 	for _, targetIdentity := range targetIdentities {
+		if quantOnlyMMProjWriter && isCacheMMProjFile(targetIdentity) &&
+			!hfdownloader.GGUFPathSelected(targetIdentity, evidence.filters, evidence.excludes, evidence.exactMatch) {
+			continue
+		}
 		targetReachedNamespace := false
 		for _, inv := range evidence.inventories {
 			candidates, ok := inv.selectedPathCandidates(targetIdentity)

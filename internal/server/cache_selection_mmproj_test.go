@@ -262,10 +262,14 @@ func TestSelectedDeleteBlockedByMMProjWriter(t *testing.T) {
 	writer := &Job{ID: "mmproj-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"mmproj-f32"}, Status: JobStatusQueued, starting: true}
 	s.jobs.mu.Lock()
 	s.jobs.jobs[writer.ID] = writer
+	// A production starting job registers its run activity under the same lock;
+	// keep the fixture in that state so the evidence path is exercised.
+	activityID := s.jobs.registerRunActivityLocked(writer)
 	s.jobs.mu.Unlock()
 	t.Cleanup(func() {
 		s.jobs.mu.Lock()
 		delete(s.jobs.jobs, writer.ID)
+		delete(s.jobs.runActivities, activityID)
 		s.jobs.mu.Unlock()
 	})
 	body := selectedGroupRequest(t, s, "owner/model", root, "mmproj-F32.gguf")
@@ -292,10 +296,14 @@ func TestSelectedDeleteAllowsUnrelatedQuantWriterForMMProj(t *testing.T) {
 	writer := &Job{ID: "quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
 	s.jobs.mu.Lock()
 	s.jobs.jobs[writer.ID] = writer
+	// A production starting job registers its run activity under the same lock;
+	// keep the fixture in that state so the evidence path is exercised.
+	activityID := s.jobs.registerRunActivityLocked(writer)
 	s.jobs.mu.Unlock()
 	t.Cleanup(func() {
 		s.jobs.mu.Lock()
 		delete(s.jobs.jobs, writer.ID)
+		delete(s.jobs.runActivities, activityID)
 		s.jobs.mu.Unlock()
 	})
 	body := selectedGroupRequest(t, s, "owner/model", root, "mmproj-F32.gguf")
@@ -308,6 +316,31 @@ func TestSelectedDeleteAllowsUnrelatedQuantWriterForMMProj(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(repoDir, "model-Q4_K_M.gguf")); err != nil {
 		t.Fatalf("the unrelated writer's own file was removed: %v", err)
+	}
+}
+
+// The quant-only writer exception is narrow: a path-scoped writer or an
+// aliased quant writer can still reach unmatched non-LFS companions and must
+// remain conservative.
+func TestSelectedDeleteMMProjQuantWriterExceptionStaysNarrow(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
+	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	target := filepath.Join(repoDir, "mmproj-F32.gguf")
+	job := &Job{ID: "quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
+	if jobMayWriteSelectedPath(job, target) {
+		t.Fatal("quant-only writer blocked a companion deletion")
+	}
+	job.Filters = []string{"model-Q4_K_M.gguf"}
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("path-scoped writer was not kept conservative")
+	}
+	alias := filepath.Join(repoDir, "alias")
+	symlinkOrSkip(t, repoDir, alias)
+	job.Filters = []string{"q4_k_m"}
+	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "mmproj-F32.gguf")) {
+		t.Fatal("aliased quant writer was not kept conservative")
 	}
 }
 
