@@ -582,11 +582,90 @@ func TestRestartReservationGenerationChangeForcesFreshInventory(t *testing.T) {
 		t.Fatalf("inventory calls=%d, want two writable bases inventoried again after generation change", calls)
 	}
 	got, ok := m.GetJob(job.ID)
-	if !ok || got.Status != JobStatusQueued || got.generation != 1 || got.Progress.DownloadedBytes != 0 || len(got.Files) != 0 {
+	// Reset/requeue retires the finished run generation, so the admitted retry
+	// starts at the generation after the concurrent advance (1) observed above.
+	if !ok || got.Status != JobStatusQueued || got.generation != 2 || got.Progress.DownloadedBytes != 0 || len(got.Files) != 0 {
 		t.Fatalf("freshly admitted retry state = %#v", got)
 	}
 	if err := m.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A retry/resume admitted while the finished run's activity is still retained
+// must be evaluated as the upcoming generation, not the historical one. A
+// selected-delete lease on a destination absent from the old complete plan but
+// possible for the restart must still block admission.
+func TestRestartDoesNotAdmitThroughHistoricalCompletePlan(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status JobStatus
+		act    func(*JobManager, string) bool
+	}{
+		{"resume", JobStatusPaused, (*JobManager).ResumeJob},
+		{"retry", JobStatusFailed, (*JobManager).RetryJob},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+			job := addRestartCandidate(m, root, "historical-"+tc.name, tc.status)
+			base := jobDestinationBase(job)
+			if base == "" {
+				t.Fatal("writer destination base unavailable")
+			}
+			q4 := filepath.Join(base, "model-Q4_K_M.gguf")
+			q5 := filepath.Join(base, "model-Q5_K_M.gguf")
+			for _, path := range []string{q4, q5} {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			planned, complete := plannedDestinationSet([]string{q4})
+			if !complete {
+				t.Fatal("could not freeze the historical plan")
+			}
+			m.mu.Lock()
+			activityID := m.registerRunActivityLocked(job)
+			m.runActivities[activityID].planned = planned
+			m.runActivities[activityID].planKnown = true
+			m.runActivities[activityID].planComplete = true
+			job.generation = 1 // the finished run claimed the registered generation.
+			m.deleteReservations[1] = freezeTestEntries(t, q5)
+			m.bumpWriteDecisionLocked()
+			m.mu.Unlock()
+
+			if tc.act(m, job.ID) {
+				t.Fatal("restart crossed a selected-delete lease through the historical complete plan")
+			}
+			got, ok := m.GetJob(job.ID)
+			if !ok || got.Status != tc.status || got.Progress.DownloadedBytes != 17 || len(got.Files) != 1 {
+				t.Fatalf("rejected restart changed job state: %#v", got)
+			}
+			m.mu.RLock()
+			retained := len(m.runActivities)
+			m.mu.RUnlock()
+			if retained != 1 {
+				t.Fatalf("rejected restart retired the historical activity: %d", retained)
+			}
+
+			m.mu.Lock()
+			delete(m.deleteReservations, 1)
+			m.bumpWriteDecisionLocked()
+			m.mu.Unlock()
+			if !tc.act(m, job.ID) {
+				t.Fatal("restart stayed blocked after the selected-delete lease was released")
+			}
+			got, ok = m.GetJob(job.ID)
+			if !ok || got.Status != JobStatusQueued || got.generation != 2 || len(got.Files) != 0 {
+				t.Fatalf("admitted restart state = %#v", got)
+			}
+			if err := m.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -453,15 +453,22 @@ func TestCacheWriteAttemptCollectsSnapshotJobsAndActivitiesOnce(t *testing.T) {
 func TestCollectSnapshotKeepsHistoricalActivityDistinctFromQueuedRetry(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-	old := &Job{ID: "retry", Repo: "owner/repo", OutputDir: root, Status: JobStatusRunning}
+	m.fenced = true
+	old := &Job{ID: "retry", Repo: "owner/repo", OutputDir: root, Status: JobStatusFailed, CreatedAt: time.Now()}
+	m.jobs[old.ID] = old
 	m.mu.Lock()
 	m.registerRunActivityLocked(old)
 	m.mu.Unlock()
 	old.generation = 1 // the registered run has now started and claimed generation 1.
-	queued := *old
-	queued.Status = JobStatusQueued
-	queued.starting = false
-	m.jobs[queued.ID] = &queued
+	// A reset/requeue retires the finished run's generation before the retry can
+	// be dispatched again; model that production transition instead of a
+	// queued copy that still shares the historical run identity.
+	m.mu.Lock()
+	resetAndQueueRestartLocked(m, old, true)
+	m.mu.Unlock()
+	if old.generation == 1 {
+		t.Fatal("reset did not retire the historical activity generation")
+	}
 	s := m.captureWriteDecision()
 	count := 0
 	a := testCacheWriteAttempt(m)
@@ -476,6 +483,106 @@ func TestCollectSnapshotKeepsHistoricalActivityDistinctFromQueuedRetry(t *testin
 	a.CollectSnapshot(s)
 	if len(a.evidence) != 2 || count != 4 {
 		t.Fatalf("historical + retry evidence=%d inventories=%d, want distinct descriptors", len(a.evidence), count)
+	}
+}
+
+// A reset/requeue retires the previous run's generation. The finished run's
+// activity can remain retained until its downloader call returns, so its
+// complete plan must not prove a negative for a destination the queued retry
+// can still write.
+func TestQueuedRetryDoesNotReuseHistoricalCompletePlan(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	m.fenced = true
+	job := &Job{ID: "retry", Repo: "owner/repo", LocalDir: root, Flat: true, Status: JobStatusFailed, CreatedAt: time.Now()}
+	m.jobs[job.ID] = job
+	base := jobDestinationBase(job)
+	if base == "" {
+		t.Fatal("writer destination base unavailable")
+	}
+	q4 := filepath.Join(base, "model-Q4_K_M.gguf")
+	q5 := filepath.Join(base, "model-Q5_K_M.gguf")
+	for _, path := range []string{q4, q5} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	planned, complete := plannedDestinationSet([]string{q4})
+	if !complete {
+		t.Fatal("could not freeze the historical plan")
+	}
+	m.mu.Lock()
+	activityID := m.registerRunActivityLocked(job)
+	m.runActivities[activityID].planned = planned
+	m.runActivities[activityID].planKnown = true
+	m.runActivities[activityID].planComplete = true
+	job.generation = 1 // the historical run claimed the registered generation.
+	resetAndQueueRestartLocked(m, job, true)
+	m.mu.Unlock()
+
+	s := m.captureWriteDecision()
+	if len(s.activities) != 1 || !s.activities[0].planComplete {
+		t.Fatalf("fixture lost the historical complete activity: %#v", s.activities)
+	}
+	if s.jobs[0].generation == s.activities[0].job.generation {
+		t.Fatalf("reset kept the historical run identity: job=%+v activity=%+v", s.jobs[0], s.activities[0].job)
+	}
+	a := testCacheWriteAttempt(m)
+	a.CollectSnapshot(s)
+	if !a.MayWriteDescriptor(decisionJob(job), []string{q5}) {
+		t.Fatal("historical complete plan proved a negative for a queued retry destination")
+	}
+	if !a.MayWriteDescriptor(decisionJob(job), []string{q4}) {
+		t.Fatal("queued retry lost conservative coverage for its overlapping destination")
+	}
+}
+
+// A complete plan for the current run stays authoritative: a destination in
+// the plan is a possible write while a disjoint destination is a proven
+// negative.
+func TestCurrentRunCompletePlanRemainsAuthoritative(t *testing.T) {
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	m.fenced = true
+	job := &Job{ID: "current", Repo: "owner/repo", LocalDir: root, Flat: true, Status: JobStatusRunning, CreatedAt: time.Now()}
+	m.jobs[job.ID] = job
+	base := jobDestinationBase(job)
+	if base == "" {
+		t.Fatal("writer destination base unavailable")
+	}
+	q4 := filepath.Join(base, "model-Q4_K_M.gguf")
+	q5 := filepath.Join(base, "model-Q5_K_M.gguf")
+	for _, path := range []string{q4, q5} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	planned, complete := plannedDestinationSet([]string{q4})
+	if !complete {
+		t.Fatal("could not freeze the current plan")
+	}
+	m.mu.Lock()
+	activityID := m.registerRunActivityLocked(job)
+	activity := m.runActivities[activityID]
+	activity.planned = planned
+	activity.planKnown = true
+	activity.planComplete = true
+	job.generation = 1 // the registered run claimed generation 1.
+	m.mu.Unlock()
+
+	a := testCacheWriteAttempt(m)
+	a.CollectSnapshot(a.start)
+	if !a.MayWriteDescriptor(decisionJob(job), []string{q4}) {
+		t.Fatal("current complete plan lost its overlapping destination")
+	}
+	if a.MayWriteDescriptor(decisionJob(job), []string{q5}) {
+		t.Fatal("current complete plan no longer proves a disjoint negative")
 	}
 }
 

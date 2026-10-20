@@ -874,6 +874,12 @@ func (m *JobManager) restartJob(id string, retry bool) bool {
 		}
 		cfg := m.config
 		candidate := decisionJob(job)
+		// resetAndQueueRestartLocked retires the current generation, so the
+		// admitted retry will be queued under the next generation. Evaluate
+		// admission against that upcoming identity; otherwise a complete plan
+		// retained by the finished run could prove a negative for a destination
+		// this restart may write.
+		candidate.generation++
 		candidate.status = JobStatusQueued
 		candidate.starting = false
 		inventorySnapshot := start
@@ -952,6 +958,13 @@ func restartStatusAllowed(status JobStatus, retry bool) bool {
 }
 
 func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
+	// Retire the finished run's identity before the job can be dispatched
+	// again. A run activity retains the generation claimed by the run it
+	// describes; leaving a retry/resume on that generation would let the
+	// finished run's known complete plan prove a negative for destinations
+	// the new run may still write. runJob advances again when it actually
+	// claims the new generation.
+	job.generation++
 	job.Status = JobStatusQueued
 	m.signalWriteDecisionLocked()
 	if retry {

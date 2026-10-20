@@ -399,7 +399,10 @@ func (a *cacheWriteAttempt) descriptorFailed(descriptor writeDecisionJob) bool {
 }
 
 // completePlanDecision matches a descriptor against the snapshot's run
-// activities. A matching activity with a known complete plan proves exactly
+// activities. The descriptor key includes the run generation, so only the
+// current run's activity matches: reset/requeue retires the previous
+// generation, and the retained activity of a finished run keeps its own
+// generation. A matching activity with a known complete plan proves exactly
 // which destinations it may write: complete=true with mayWrite=false is a
 // proven negative for every target, and mayWrite=true stays conservative.
 // complete=false means no matching activity, or a matching activity still has
