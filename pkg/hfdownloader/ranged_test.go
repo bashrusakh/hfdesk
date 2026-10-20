@@ -423,6 +423,100 @@ func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 	})
 }
 
+// TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes pins the
+// protocol hole where a 206 carries the exact Content-Range but no
+// Content-Length, delivers every requested byte, and then continues with extra
+// chunked bytes. The requested prefix is valid, so the former normalization
+// treated the range as complete and published the destination; the oversize is
+// a bounded-writer protocol violation and must instead fail the range, stay
+// not-Done in the record, and leave the staging state resumable.
+func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testing.T) {
+	const total = 8_000
+	full := rangedTestPayload(total)
+
+	for _, retries := range []int{0, 1} {
+		t.Run(fmt.Sprintf("retries=%d", retries), func(t *testing.T) {
+			tmpDir := t.TempDir()
+			dst := filepath.Join(tmpDir, "chunked-over.bin")
+			staging := dst + ".incomplete"
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			var gets atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.Header().Set("Content-Length", strconv.Itoa(total))
+					w.Header().Set("Accept-Ranges", "bytes")
+					return
+				}
+				gets.Add(1)
+				var start, end int64
+				if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start != 0 || end != total-1 {
+					http.Error(w, "unexpected range", http.StatusBadRequest)
+					return
+				}
+				// No Content-Length: flushing the headers forces a chunked body.
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+				w.WriteHeader(http.StatusPartialContent)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				// Deliver every requested byte, flushed in small pieces so the
+				// bounded writer accepts exactly wantLen bytes...
+				for i := 0; i < len(full); i += 512 {
+					j := i + 512
+					if j > len(full) {
+						j = len(full)
+					}
+					if _, err := w.Write(full[i:j]); err != nil {
+						return
+					}
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					time.Sleep(200 * time.Microsecond)
+				}
+				// ...and then send bytes past the assigned range.
+				time.Sleep(20 * time.Millisecond)
+				_, _ = w.Write(bytes.Repeat([]byte{0xEE}, 4096))
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}))
+			defer srv.Close()
+
+			it := PlanItem{RelativePath: "chunked-over.bin", URL: srv.URL + "/chunked-over.bin", Size: total, AcceptRanges: true}
+			cfg := Settings{Concurrency: 1, Retries: retries, StallTimeout: "0", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "size"}
+			_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+			if err == nil {
+				t.Fatal("oversized chunked ranged body was accepted and published")
+			}
+			if !strings.Contains(err.Error(), "exceeds assigned range") {
+				t.Errorf("error = %v, want the bounded-writer protocol violation", err)
+			}
+			if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+				t.Errorf("destination was published after an oversized body, stat err=%v", serr)
+			}
+			if _, serr := os.Stat(staging); serr != nil {
+				t.Errorf("staging payload was not preserved for resume: %v", serr)
+			}
+			meta, merr := readStagingMeta(staging + ".meta")
+			if merr != nil {
+				t.Fatalf("staging record was not preserved: %v", merr)
+			}
+			for _, rp := range meta.Ranges {
+				if rp.Done {
+					t.Errorf("oversized-body range was persisted as Done: %+v", rp)
+				}
+			}
+			if want := int32(retries + 1); gets.Load() != want {
+				t.Errorf("ranged body fetched %d times, want %d (existing retry budget)", gets.Load(), want)
+			}
+		})
+	}
+}
+
 // 5. A restart resumes only the missing/uncommitted bytes: no committed
 // interval is ever re-requested.
 func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
@@ -834,11 +928,18 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 12_000
 	full := rangedTestPayload(total)
-
-	dst := filepath.Join(tmpDir, "claim.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	sum := sha256.Sum256(full)
+	// A content-addressed publish target is the one destination whose
+	// existence proves completion, so the loser of the claim can back off as
+	// errBlobAlreadyComplete when the winner publishes. An arbitrary
+	// destination is deliberately not completion proof (the caller's
+	// pre-download skip decision is authoritative there); that behavior is
+	// covered by TestDownload_LegacyExistingDestinationIsNotCompletion.
+	blob := filepath.Join(tmpDir, "blobs", hex.EncodeToString(sum[:]))
+	if err := os.MkdirAll(filepath.Dir(blob), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	opts := multipartOpts{Staging: blob + ".incomplete", Publish: blob, ContentAddressed: true}
 
 	var mu sync.Mutex
 	rangeGets := map[string]int{}
@@ -880,7 +981,7 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 1, StallTimeout: "0"}
 
 	run := func() (bool, error) {
-		return downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		return downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, blob, opts, func(ProgressEvent) {})
 	}
 	done := make(chan struct{})
 	results := make([]error, 2)
@@ -898,7 +999,7 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 		t.Errorf("second claimant error = %v, want errBlobAlreadyComplete (the winner owns the staging)", results[1])
 	}
 
-	assertExactFile(t, dst, full)
+	assertExactFile(t, blob, full)
 	mu.Lock()
 	defer mu.Unlock()
 	for rh, n := range rangeGets {

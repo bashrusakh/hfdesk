@@ -129,7 +129,25 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   to match the current file size and connection count.
 - If resume metadata is missing, invalid, or mismatched, discard stale part files
   and restart that file rather than guessing.
-- LFS files with known SHA-256 must be verified after download.
+- `Settings.Verify` governs LFS verification too: `none` performs no
+  post-download content hash; `size` (default) checks exact size plus complete
+  validated range coverage and performs no full-file SHA-256 pass on the normal
+  path (the pre-download skip check and the one-time legacy-migration content
+  proof may still hash); `sha256` performs at most one full-file pass and never
+  publishes a mismatch; `etag` keeps the historical known-SHA LFS hash.
+- Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
+  them LegacyMigrated, keep the marker durable across resume, and content-prove
+  them with one full-file SHA-256 pass before publication whenever a known
+  digest exists and `Verify != "none"`. An oversized single `.part` is invalid:
+  discard it, never clamp it.
+- A publish target's existence proves completion only when it is
+  content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
+  authoritative pre-download skip decision and are redownloaded and atomically
+  replaced when it declined them.
+- Serialize every staging-record transition (claim, takeover, checkpoint,
+  heartbeat, removal) with the sibling O_EXCL lock and re-read ownership under
+  it; a heartbeat must never recreate or replace another writer's claim. Cleanup
+  must re-check the claim under the same lock and keep a live owner's state.
 - Size checks are only a fallback for files without a trusted hash.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to

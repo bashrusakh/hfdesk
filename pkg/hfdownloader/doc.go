@@ -131,6 +131,32 @@ decisions are filesystem-based:
   - LFS files: Compared by SHA-256 hash (if available in metadata)
   - Non-LFS files: Compared by file size
 
+That pre-download decision is authoritative for an arbitrary destination. A
+staging claim treats an existing publish target as completion proof only when
+the target is content-addressed (blobs/<known-sha>); a legacy/output file or a
+tmp-<sha> staging name that the skip check declined is downloaded again and
+atomically renamed over the old bytes.
+
+Exactly one live writer may own a staging file. Every record transition (claim,
+take-over, checkpoint, heartbeat, removal) is serialized across processes by a
+sibling O_EXCL lock file, and every mutation re-reads the record under that
+lock: a heartbeat can never race a take-over or resurrect ownership. The claim
+carries a per-process instance token plus PID/host diagnostics and heartbeat
+freshness, so PID reuse and containers sharing PID 1 are not treated as the
+same writer; a dead or stale owner remains recoverable. Cleanup removes a
+staged pair only while no live claim remains.
+
+Legacy migration: a valid pre-#140 `.part-NN`/`.parts.json` family, or a leftover
+single `.part` sequential prefix, is copied into the staging file once and the
+obsolete artifacts are removed only after the migrated range layout is durable.
+An oversized single `.part` is invalid and is discarded rather than clamped.
+Migrated bytes are tagged LegacyMigrated: they have layout/prefix structure but
+no validated provenance, so when the item carries a known SHA-256 and Verify is
+not "none" they receive one full-file SHA-256 proof before publication, even in
+"size" mode (the documented one-time migration exception). A mismatch discards
+the staging data and never publishes. With Verify "none" they inherit that
+mode's no-hash semantics.
+
 # Verification Options
 
 The Settings.Verify field controls post-download verification, for LFS
@@ -138,9 +164,12 @@ files included:
 
   - "none": No post-download content hash (fastest)
   - "size": Verify expected size and complete transfer coverage (default);
-    no full-file SHA-256 reread for LFS files
-  - "etag": Compare ETag header from server (historical; not currently
-    enforced post-download)
+    no full-file SHA-256 reread on the normal transfer path. The
+    pre-download skip check over an existing file and the one-time legacy
+    migration proof may still hash
+  - "etag": Historical compatibility: LFS files with a known SHA-256 still
+    receive the hash they always received (at most one pass); non-LFS
+    files keep their historical no-post-check behavior
   - "sha256": Full SHA-256 hash verification (most secure, slower); at
     most one full-file read per file
 

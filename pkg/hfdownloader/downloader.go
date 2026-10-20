@@ -543,13 +543,20 @@ LOOP:
 			if blobDirect {
 				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
 				mpOpts.Publish = repoDir.BlobPath(it.SHA256)
+				// Only a blob-keyed target proves completion by existence; an
+				// arbitrary destination keeps the caller's pre-download skip
+				// decision authoritative.
+				mpOpts.ContentAddressed = true
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
 
 			var dlErr error
-			var hashVerified bool
+			// contentVerified reports that the ranged downloader already
+			// proved the payload against it.SHA256 inside this call (one pass
+			// at most), so the caller must not repeat the hash.
+			var contentVerified bool
 			if multipartRan {
-				hashVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
+				contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
 			} else {
 				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
@@ -606,18 +613,27 @@ LOOP:
 			emit(ProgressEvent{Event: "file_finalizing", Path: finalRel, Message: "verifying"})
 
 			// Post-download verification. Settings.Verify controls LFS
-			// verification too (issue #140 — deliberate semantics change):
+			// verification too (issue #140 — deliberate semantics change),
+			// scoped to the normal transfer/finalization path:
 			//
 			//   none   — no post-download content hash; HTTP/range
 			//            protocol correctness still applied during transfer.
 			//   size   — (default) the exact expected-size invariant, plus
 			//            the complete validated range coverage the
-			//            multipart path already enforced; NO unconditional
-			//            full-file SHA reread for LFS.
+			//            multipart path already enforced; NO full-file SHA
+			//            reread for LFS on this path. Two pre-existing,
+			//            documented exceptions may still hash: the
+			//            pre-download skip check of an already-present file,
+			//            and the one-time legacy-migration content proof the
+			//            ranged downloader performs before publication.
 			//   sha256 — strict full-file SHA-256 against the known digest,
 			//            at most one pass: the ranged path verified either
 			//            hash-on-write (fresh sequential) or with one
 			//            sequential pass before publication.
+			//   etag   — historical compatibility: LFS files with a known
+			//            digest were always hashed before the ETag branch, so
+			//            they still are here; non-LFS etag keeps its historical
+			//            no-post-check behavior (the branch below is unchanged).
 			//
 			// Other values keep their historical compatible behavior for
 			// non-LFS files below.
@@ -629,8 +645,12 @@ LOOP:
 				switch cfg.Verify {
 				case "none":
 					// No post-download content hash.
-				case "sha256":
-					if !hashVerified {
+				case "sha256", "etag":
+					// contentVerified means the ranged downloader already
+					// proved the bytes against this digest (hash-on-write, a
+					// single final pass, or the one-time legacy migration
+					// proof), so at most one pass happens per file.
+					if !contentVerified {
 						if err := verifySHA256Ctx(fileCtx, verifyPath, it.SHA256); err != nil {
 							select {
 							case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
@@ -845,7 +865,9 @@ LOOP:
 // the single-file path (staging == "") that is dst+".part" plus any legacy
 // multipart artifacts; for the ranged path it also removes the staging
 // file and its resume metadata, so an explicitly-cancelled job leaves no
-// resumable bytes behind.
+// resumable bytes behind. The ranged path uses applyCancelCleanup instead so
+// the staging pair is removed only while the claim record still names this
+// process instance.
 func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
@@ -857,15 +879,21 @@ func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 	// with PathInside, so dst cannot name a file outside those roots. The
 	// staging path is either dst+".incomplete" or a RepoDir blob path
 	// derived from the canonical SHA the plan validated.
+	cleanupLegacyPartials(dst)
+	if staging != "" {
+		removeStagingArtifacts(staging, staging+".meta")
+	}
+}
+
+// cleanupLegacyPartials removes the pre-#140 multipart family and the single
+// dst+".part" prefix for dst. It never touches the ranged staging pair.
+func cleanupLegacyPartials(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
 	}
 	if err := removeMultipartResumeFiles(dst); err != nil {
 		log.Printf("warning: cleanup multipart resume files for %s: %v", dst, err)
-	}
-	if staging != "" {
-		removeStagingArtifacts(staging, staging+".meta")
 	}
 }
 

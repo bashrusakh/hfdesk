@@ -202,16 +202,30 @@ type Settings struct {
 	//     response validation still apply during the transfer.
 	//   - "size": (default, fast) Verify the exact expected size and — for
 	//     multipart transfers — that every expected byte range was
-	//     successfully validated and written. No full-file SHA-256 reread
-	//     is performed for LFS files in this mode.
+	//     successfully validated and written. On the normal transfer path no
+	//     full-file SHA-256 reread is performed for LFS files. Two deliberate
+	//     exceptions may still hash: the pre-download skip check over an
+	//     already-present destination, and the one-time legacy-migration
+	//     content proof (see below).
 	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
 	//     At most one full-file read is performed per file: a fresh
 	//     sequential multipart transfer hashes while writing; every other
 	//     transfer performs one sequential pass before publication, so a
 	//     mismatch never publishes corrupt bytes.
-	//   - "etag": Compare ETag header from server (historical; the
-	//     downloader currently performs no post-download ETag check for
-	//     this value).
+	//   - "etag": Historical compatibility mode. LFS files with a known
+	//     SHA-256 were always hashed before the ETag branch in earlier
+	//     versions, so they still receive that hash here (at most one pass,
+	//     reusing a ranged proof when one ran); non-LFS files keep their
+	//     historical behavior (no post-download ETag check).
+	//
+	// Bytes migrated from a pre-#140 .part-NN/.parts.json partial or a single
+	// .part have layout/prefix structure but no validated provenance. When the
+	// item carries a known SHA-256 and Verify is not "none", they receive one
+	// full-file SHA-256 pass before publication even in "size" mode — the
+	// explicit one-time migration exception. A mismatch discards the staging
+	// data and never publishes. With Verify "none" migrated bytes inherit the
+	// mode's no-hash semantics; without a known digest only size and complete
+	// range coverage can be checked.
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.

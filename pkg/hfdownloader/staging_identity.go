@@ -44,6 +44,12 @@ var processHostname = func() string {
 }()
 
 func newProcessInstanceToken() string {
+	return newRandomToken()
+}
+
+// newRandomToken returns 128 random bits as hex. It seeds the process instance
+// identity and the per-acquisition staging transition-lock nonce.
+func newRandomToken() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err == nil {
 		return hex.EncodeToString(b[:])

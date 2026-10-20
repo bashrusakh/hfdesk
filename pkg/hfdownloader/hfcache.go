@@ -286,6 +286,15 @@ type IncompleteMeta struct {
 	// Ranges lists the persisted range layout and per-range committed
 	// progress; see RangeProgress. Empty for legacy records.
 	Ranges []RangeProgress `json:"ranges,omitempty"`
+	// LegacyMigrated marks bytes imported from a pre-#140 partial
+	// (.part-NN/.parts.json family or a single .part). Such bytes have
+	// layout/prefix structure but no validated provenance, so the downloader
+	// performs one full-file SHA-256 content proof before publication whenever
+	// the item carries a known digest and Verify is not "none" — the explicit
+	// one-time migration exception to the size-mode "no reread" rule. The flag
+	// is persisted so a crash and resume repeat the proof instead of publishing
+	// unproven bytes.
+	LegacyMigrated bool `json:"legacy_migrated,omitempty"`
 }
 
 // RangeProgress is the durable state of one persisted download range.
