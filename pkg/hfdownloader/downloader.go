@@ -262,6 +262,10 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if err != nil {
 		return fmt.Errorf("invalid multipart-threshold: %w", err)
 	}
+	staleTimeout := DefaultStaleTimeout
+	if d, err := parseStaleTimeoutSetting(cfg); err == nil {
+		staleTimeout = d
+	}
 
 	httpc := buildHTTPClientWithProxy(cfg.Proxy)
 
@@ -578,6 +582,7 @@ LOOP:
 			// identity. The requested branch name is not enough: a moved
 			// branch could otherwise resume old bytes in Verify=size mode.
 			mpOpts.Commit = plan.Commit
+			v2Staging := dst + ".incomplete"
 			if blobDirect {
 				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
 				mpOpts.Publish = repoDir.BlobPath(it.SHA256)
@@ -585,8 +590,37 @@ LOOP:
 				// arbitrary destination keeps the caller's pre-download skip
 				// decision authoritative.
 				mpOpts.ContentAddressed = true
+				v2Staging = mpOpts.Staging
+			}
+			// Existing multipart resume state must not be ignored (and later
+			// deleted) just because the current threshold routes a small item to
+			// the single-request path. Detect it before choosing the route; a
+			// ranged-capable item keeps the multipart route so migration/resume
+			// consumes it. A fresh download with no state is unchanged.
+			resumeState := multipartResumeState{
+				legacy: hasUsableLegacyMultipartState(dst, it.Size),
+			}
+			if hasResumableStagingState(v2Staging, v2Staging+".meta", it, job, plan.Commit) {
+				resumeState.v2Staging = v2Staging
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
+			if !multipartRan && it.AcceptRanges && (resumeState.legacy || resumeState.v2Staging != "") {
+				multipartRan = true
+			}
+			// A server/plan without range support cannot consume multipart
+			// state. Do not silently delete it: warn, download the full file
+			// through the single path, and remove the obsolete v2 pair only
+			// after the final state is durable (claim-checked). The legacy
+			// family is removed by the single-path success cleanup.
+			obsoleteV2Staging := ""
+			if !it.AcceptRanges && resumeState.v2Staging != "" {
+				obsoleteV2Staging = resumeState.v2Staging
+			}
+			if !it.AcceptRanges && (resumeState.legacy || resumeState.v2Staging != "") {
+				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf(
+					"resume state for %s cannot be used without HTTP range support; downloading the full file and attempting to discard the obsolete state after success",
+					finalRel)})
+			}
 
 			var dlErr error
 			// contentVerified reports that the downloader already proved the
@@ -809,6 +843,15 @@ LOOP:
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			default:
 				finalSHA256 = it.SHA256
+			}
+
+			// The single path may have been chosen because the server/plan has
+			// no range support while usable v2 state existed. The final file is
+			// now durable (and, for cache mode, stored); remove the obsolete pair
+			// claim-checked so a live owner's state is never deleted and no stale
+			// pair survives a successful download.
+			if obsoleteV2Staging != "" {
+				removeStagingArtifactsIfUnclaimed(obsoleteV2Staging, obsoleteV2Staging+".meta", staleTimeout)
 			}
 
 			// File is now at its final location; the partial (dst in HF
@@ -1455,6 +1498,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 							return false, err
 						}
 						pos = 0
+						// The inherited bytes were just discarded: this run will
+						// write every byte from zero, so Verify=size must not
+						// perform the one-time inherited-bytes proof on the
+						// restarted transfer.
+						inherited = false
 						countedUpTo = 0
 						lastEmit = time.Time{}
 					}

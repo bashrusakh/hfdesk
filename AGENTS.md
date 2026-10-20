@@ -184,9 +184,22 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   publish/cleanup. A busy lock is a live owner (claim skips, cleanup skips,
   `CheckBlob` reports downloading); a crashed process releases it at death, and
   a suspended owner keeps it — there is deliberately no takeover while it is
-  alive. On platforms/filesystems without the lock, the transition-lock/heartbeat
-  lease is the documented weaker fallback. Keep the lock file: never unlink it
-  (that would let two processes own different inodes).
+  alive. A free lock is authoritative only for a record written under it
+  (`LockFenced`): a fallback/legacy record keeps the lease heuristic even when a
+  lock-capable process acquires the free lock, so a live fallback owner is never
+  displaced in a claim or deleted by cleanup. On platforms/filesystems without
+  the lock, the transition-lock/heartbeat lease is the documented weaker
+  fallback. Keep the lock file: never unlink it (that would let two processes
+  own different inodes).
+- Before routing an item to the single-request path, detect usable multipart
+  resume state: a valid v2 `<staging>.incomplete`/`.meta` pair (including the
+  blob-keyed LFS pair) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
+  ranged-capable item keeps the multipart route even below the configured
+  threshold so migration/resume consumes the state; a fresh item with no state
+  keeps the configured routing. Without range support, warn, download the full
+  file through the single path, and remove the obsolete v2 pair only after the
+  final file is durable and claim-checked; the legacy family is removed by the
+  single-path success cleanup.
 - Serialize every staging-record transition (claim, takeover, checkpoint,
   heartbeat, removal) with the sibling O_EXCL lock and re-read ownership under
   it; a heartbeat must never recreate or replace another writer's claim. Cleanup

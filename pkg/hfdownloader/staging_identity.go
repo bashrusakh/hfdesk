@@ -15,9 +15,12 @@ package hfdownloader
 //
 // The token is the record's identity, not the exclusion fence: on platforms
 // with the OS ownership lock (staging_oslock.go) the lock proves that no live
-// writer owns the staging payload, and the token/PID/heartbeat checks below are
-// the documented fallback for platforms/filesystems without that lock. Publish
-// still verifies the token under the transition lock as a claim check.
+// writer owns the staging payload only when the record was written under that
+// lock (LockFenced). A fallback/legacy record belongs to a writer that did not
+// hold the OS lock, so a lock-capable process acquiring the free lock must
+// still apply the lease checks below rather than displace a live fallback
+// owner. Publish still verifies the token under the transition lock as a claim
+// check.
 //
 // PID, hostname and StartedAt remain diagnostic hints. They are never treated
 // as proof of identity: a record with our PID but a different instance token is

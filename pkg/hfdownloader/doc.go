@@ -145,6 +145,18 @@ omits a resolved commit, plan.Commit is empty and the record uses that empty
 value, so resume is not revision-pinned; the downloader does not substitute the
 requested branch name.
 
+Existing multipart resume state survives a threshold change. Before routing an
+item to the single-request path, the downloader detects a usable pre-#140
+`.part-NN`/`.parts.json` layout and a valid v2 `<staging>.incomplete`/`.meta`
+pair (including the blob-keyed staging pair for LFS cache items). A ranged-
+capable item keeps the multipart route regardless of `MultipartThreshold`, so
+the state is consumed through the existing migration/resume and content-proof
+rules; a fresh item with no state keeps the configured routing. If the server or
+plan does not support ranges, the downloader emits an explicit warning,
+downloads the full file through the single path, and removes the obsolete v2
+pair only after the final file is durable (claim-checked); the legacy family is
+removed by the single-path success cleanup.
+
 Exactly one live writer may own a staging file. The exclusion fence is an
 OS-level exclusive lock on the persistent sibling file `<staging>.lock`,
 acquired before the claim transition and held for the whole ownership interval
@@ -157,9 +169,14 @@ flock(LOCK_EX|LOCK_NB); Windows uses an exclusive-share CreateFile handle
 (dwShareMode=0) held on the file handle. The record persists whether its claim
 was OS-lock fenced (`LockFenced`); on a supported platform a free lock is then
 authoritative for CheckBlob and reports the record stale even when its stored
-PID is still live, so a reused PID cannot hide a resumable crash state. The
-ownership probe itself is non-owning (a shared lock on Unix, a shared-access
-open on Windows), so concurrent probes are never mistaken for a writer.
+PID is still live, so a reused PID cannot hide a resumable crash state. The same
+distinction applies to claims and cleanup: a free lock is authoritative only
+for a LockFenced record. A fallback/legacy record belongs to a writer that did
+not hold the OS lock, so a lock-capable process acquiring the free lock must
+still apply the lease heuristic rather than displace or delete a live fallback
+owner. The ownership probe itself is non-owning (a shared lock on Unix, a
+shared-access open on Windows), so concurrent probes are never mistaken for a
+writer.
 
 The claim record remains the identity/resume state and is heartbeated through
 transfers, retry waits, strict verification and finalization. Every record

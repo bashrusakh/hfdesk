@@ -210,10 +210,12 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string, staleTimeout ti
 	meta, err := readStagingMeta(metaPath)
 	switch {
 	case err == nil:
-		// With the OS lock held, only the lease fallback needs the freshness
-		// heuristic: a format-2 owner holding the lock would have made the
-		// acquisition above fail.
-		if own == nil && stagingOwnerMayBeLive(meta, metaPath, staging, staleTimeout) {
+		// A free OS lock is authoritative only for a lock-fenced record. A
+		// fallback/legacy record's owner does not hold that lock, so acquiring
+		// it says nothing about liveness; apply the lease heuristic for it even
+		// when this process holds the lock. Removing such a pair would delete a
+		// live fallback owner's staging.
+		if (own == nil || !meta.LockFenced) && stagingOwnerMayBeLive(meta, metaPath, staging, staleTimeout) {
 			log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
 			return
 		}
@@ -473,11 +475,14 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		return nil, true, nil
 	}
 
-	// With the OS lock held, the owner is provably not writing: skip the
-	// heartbeat/PID liveness heuristic, which cannot fence an in-flight
-	// handle, and evaluate only the record's resume identity. On the fallback
-	// path the lease checks remain the ownership decision.
-	if !osExclusive && stagingOwnerMayBeLive(&meta, metaPath, staging, staleTimeout) {
+	// The OS ownership lock is authoritative only for a record written while
+	// holding it (LockFenced). A fallback/legacy record (LockFenced=false,
+	// including records from older versions) may belong to a live writer on a
+	// platform or filesystem without the OS lock: this process acquiring a free
+	// lock says nothing about that writer, so the lease heuristic still decides.
+	// Skipping it based only on osExclusive would displace a live fallback owner
+	// and create two writers.
+	if !(osExclusive && meta.LockFenced) && stagingOwnerMayBeLive(&meta, metaPath, staging, staleTimeout) {
 		return nil, false, errBlobIncompleteOwned
 	}
 
@@ -882,6 +887,90 @@ func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size 
 	return migrateLegacySinglePart(ctx, dst, out, size, workers)
 }
 
+// validateLegacyPartsLayout parses a legacy .parts.json record and checks that
+// it tiles [0, size) exactly with contiguous, indexed ranges. It is shared by
+// the one-time migration and by the pre-routing resume-state detection so both
+// accept exactly the same layouts.
+func validateLegacyPartsLayout(data []byte, size int64) ([]multipartPartRange, bool) {
+	var layout multipartResumeLayout
+	if err := json.Unmarshal(data, &layout); err != nil {
+		return nil, false
+	}
+	if layout.Size != size || len(layout.Parts) == 0 {
+		return nil, false
+	}
+	var off int64
+	for i, p := range layout.Parts {
+		if p.Index != i || p.Start != off || p.End < p.Start || p.End >= size {
+			return nil, false
+		}
+		off = p.End + 1
+	}
+	if off != size {
+		return nil, false
+	}
+	return layout.Parts, true
+}
+
+// multipartResumeState describes usable pre-existing multipart state detected
+// before an item is routed to the single-request path.
+type multipartResumeState struct {
+	// legacy reports a valid pre-#140 .part-NN/.parts.json layout with at
+	// least one part contributing usable bytes.
+	legacy bool
+	// v2Staging is the staging payload path of a valid, identity-matching v2
+	// pair, or empty when no such pair exists.
+	v2Staging string
+}
+
+// hasUsableLegacyMultipartState reports whether dst has a valid pre-#140
+// .part-NN/.parts.json layout with at least one part that contributes usable
+// bytes. It is used before routing an item to the single-request path: routing
+// a ranged-capable item with valid legacy state to a full single GET would
+// ignore the partial and (after success) delete it, violating the upgrade
+// contract. A layout whose every part is missing/empty/oversized is not
+// "usable" and is left to the normal migration/discard path.
+func hasUsableLegacyMultipartState(dst string, size int64) bool {
+	if size <= 0 {
+		return false
+	}
+	data, err := os.ReadFile(multipartLayoutMetaPath(dst))
+	if err != nil {
+		return false
+	}
+	parts, ok := validateLegacyPartsLayout(data, size)
+	if !ok {
+		return false
+	}
+	for i, p := range parts {
+		fi, err := os.Stat(fmt.Sprintf("%s.part-%02d", dst, i))
+		if err != nil {
+			continue
+		}
+		want := p.End - p.Start + 1
+		if fi.Size() > 0 && fi.Size() <= want {
+			return true
+		}
+	}
+	return false
+}
+
+// hasResumableStagingState reports whether a v2 staging pair carries a valid,
+// identity-matching range layout and a payload at the expected logical size.
+// Ownership/liveness is deliberately not part of this check: the multipart
+// claim applies it and either resumes or backs off as owned. The detection only
+// decides whether existing state should keep the multipart route.
+func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, commit string) bool {
+	meta, err := readStagingMeta(metaPath)
+	if err != nil || meta == nil {
+		return false
+	}
+	if _, ok := stagingMetaResumable(*meta, it, job, commit); !ok {
+		return false
+	}
+	return stagingPayloadSizeOK(staging, it.Size)
+}
+
 // migrateLegacyParts validates a .parts.json layout and copies each part's
 // valid prefix into the staging file. ok=false means the layout is absent,
 // unvalidatable, or contributes no bytes at all (every part missing, empty or
@@ -890,26 +979,13 @@ func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size 
 // a usable migrated state, because the caller would delete a valid dst.part on
 // the strength of an empty migration.
 func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int64, data []byte) ([]RangeProgress, bool, error) {
-	var layout multipartResumeLayout
-	if err := json.Unmarshal(data, &layout); err != nil {
+	parts, ok := validateLegacyPartsLayout(data, size)
+	if !ok {
 		return nil, false, nil
 	}
-	if layout.Size != size || len(layout.Parts) == 0 {
-		return nil, false, nil
-	}
-	// The legacy layout must tile [0, size) exactly; anything else is
-	// corrupt and unvalidatable.
-	var off int64
-	ranges := make([]RangeProgress, len(layout.Parts))
-	for i, p := range layout.Parts {
-		if p.Index != i || p.Start != off || p.End < p.Start || p.End >= size {
-			return nil, false, nil
-		}
-		off = p.End + 1
+	ranges := make([]RangeProgress, len(parts))
+	for i, p := range parts {
 		ranges[i] = RangeProgress{Start: p.Start, End: p.End}
-	}
-	if off != size {
-		return nil, false, nil
 	}
 
 	copiedAny := false
