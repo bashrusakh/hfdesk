@@ -398,6 +398,65 @@ func (a *cacheWriteAttempt) descriptorFailed(descriptor writeDecisionJob) bool {
 	return a.failed[decisionDescriptorKey(descriptor)]
 }
 
+// completePlanDecision matches a descriptor against the snapshot's run
+// activities. A matching activity with a known complete plan proves exactly
+// which destinations it may write: complete=true with mayWrite=false is a
+// proven negative for every target, and mayWrite=true stays conservative.
+// complete=false means no matching activity, or a matching activity still has
+// an unknown/incomplete plan, so callers must use the conservative evidence
+// path instead.
+func (a *cacheWriteAttempt) completePlanDecision(baseKey string, targetIdentities []string) (complete, mayWrite bool) {
+	complete = true
+	matched := false
+	for _, activity := range a.start.activities {
+		candidate := activity.job
+		candidate.activityID = 0
+		if decisionDescriptorKey(candidate) != baseKey {
+			continue
+		}
+		matched = true
+		if !activity.planKnown || !activity.planComplete {
+			complete = false
+			continue
+		}
+		if completePlanMayWrite(activity.planned, targetIdentities) {
+			mayWrite = true
+		}
+	}
+	return matched && complete, mayWrite
+}
+
+// completePlanMayWrite reports whether a known complete plan still covers any
+// target identity. Frozen identities are authoritative; a planned raw spelling
+// is revalidated because its alias may have moved since the plan was admitted.
+// An unresolved identity or frozen destination remains conservative.
+func completePlanMayWrite(planned []frozenMutationPath, targetIdentities []string) bool {
+	for _, destination := range planned {
+		if destination.key == "" {
+			return true
+		}
+		current := destination
+		if destination.raw != "" {
+			revalidated, err := freezeMutationEntry(destination.raw)
+			if err != nil {
+				return true
+			}
+			current = revalidated
+		}
+		for _, target := range targetIdentities {
+			if pathKeysOverlap(destination.key, target) || pathKeysOverlap(current.key, target) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// MayWriteDescriptor reports whether the descriptor can still write any target.
+// A matching known complete plan is authoritative for that activity's exact
+// destinations; otherwise the pre-plan filter/namespace evidence stays
+// conservative. descriptorFailed, normalized descriptor matching, and raw
+// revalidation remain in force.
 func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targets []string) bool {
 	if a == nil {
 		return true
@@ -415,6 +474,13 @@ func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targ
 		}
 		identities[i] = probe.identity
 		a.targets[filepath.Clean(p)] = probe
+	}
+	complete, planMayWrite := a.completePlanDecision(baseKey, identities)
+	if planMayWrite {
+		return true
+	}
+	if complete {
+		return false
 	}
 	found := false
 	for key, descriptor := range a.descriptors {

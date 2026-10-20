@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -282,23 +283,32 @@ func TestSelectedDeleteBlockedByMMProjWriter(t *testing.T) {
 	}
 }
 
-// Acceptance case 5: an unrelated quant writer does not block a
-// non-overlapping companion deletion.
+// Acceptance case 5: a writer whose known complete plan contains only the Q4
+// quantization does not block a non-overlapping companion deletion.
 func TestSelectedDeleteAllowsUnrelatedQuantWriterForMMProj(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
 	writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
 	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	planned, complete := plannedDestinationSet([]string{filepath.Join(repoDir, "model-Q4_K_M.gguf")})
+	if !complete {
+		t.Fatal("could not freeze the quant-only writer plan")
+	}
 	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root})
 	registerJobManagerCleanup(t, s)
-	// The writer only claims the Q4 quantization, so it does not overlap the
-	// selected companion.
+	// The frozen complete plan proves this writer emits only the Q4
+	// quantization, so it cannot write the selected companion.
 	writer := &Job{ID: "quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
 	s.jobs.mu.Lock()
 	s.jobs.jobs[writer.ID] = writer
 	// A production starting job registers its run activity under the same lock;
-	// keep the fixture in that state so the evidence path is exercised.
+	// keep the fixture in that state so the plan-aware path is exercised.
 	activityID := s.jobs.registerRunActivityLocked(writer)
+	if activity := s.jobs.runActivities[activityID]; activity != nil {
+		activity.planned = planned
+		activity.planKnown = true
+		activity.planComplete = true
+	}
 	s.jobs.mu.Unlock()
 	t.Cleanup(func() {
 		s.jobs.mu.Lock()
@@ -309,7 +319,7 @@ func TestSelectedDeleteAllowsUnrelatedQuantWriterForMMProj(t *testing.T) {
 	body := selectedGroupRequest(t, s, "owner/model", root, "mmproj-F32.gguf")
 	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
 	if w.Code != http.StatusOK {
-		t.Fatalf("delete with an unrelated quant writer status=%d body=%s", w.Code, w.Body.String())
+		t.Fatalf("delete with an unrelated planned quant writer status=%d body=%s", w.Code, w.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(repoDir, "mmproj-F32.gguf")); !os.IsNotExist(err) {
 		t.Fatalf("selected companion remains: %v", err)
@@ -319,18 +329,115 @@ func TestSelectedDeleteAllowsUnrelatedQuantWriterForMMProj(t *testing.T) {
 	}
 }
 
-// The quant-only writer exception is narrow: a path-scoped writer or an
-// aliased quant writer can still reach unmatched non-LFS companions and must
-// remain conservative.
-func TestSelectedDeleteMMProjQuantWriterExceptionStaysNarrow(t *testing.T) {
+// A bare quantization filter is not a known plan: it can match a non-GGUF path
+// such as Q4_K_M/model.safetensors, putting the planner in ordinary mixed-format
+// mode, which retains unmatched non-LFS companions. Without a complete plan the
+// writer must stay conservative for the selected mmproj target.
+func TestSelectedDeleteBlocksUnknownQuantWriterForMMProj(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
+	writeSelectionFile(t, repoDir, "Q4_K_M/model.safetensors")
+	s := newTestServerWithConfig(t, Config{CacheDir: filepath.Join(t.TempDir(), "cache"), LocalDir: root})
+	registerJobManagerCleanup(t, s)
+	writer := &Job{ID: "unknown-quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"Q4_K_M"}, Status: JobStatusQueued, starting: true}
+	s.jobs.mu.Lock()
+	s.jobs.jobs[writer.ID] = writer
+	// The run activity exists but the planner has not completed, so the writer's
+	// destinations are unknown.
+	activityID := s.jobs.registerRunActivityLocked(writer)
+	s.jobs.mu.Unlock()
+	t.Cleanup(func() {
+		s.jobs.mu.Lock()
+		delete(s.jobs.jobs, writer.ID)
+		delete(s.jobs.runActivities, activityID)
+		s.jobs.mu.Unlock()
+	})
+	body := selectedGroupRequest(t, s, "owner/model", root, "mmproj-F32.gguf")
+	w := cacheRequest(t, s, "DELETE", "/api/cache-selection", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete with an unknown-plan quant writer status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "mmproj-F32.gguf")); err != nil {
+		t.Fatalf("unknown-plan writer delete removed the selected companion: %v", err)
+	}
+}
+
+// A matching writer activity with a known complete plan is authoritative about
+// what it will write: a disjoint plan cannot write the selected companion,
+// while a plan that contains the companion remains conservative.
+func TestMayWriteDescriptorUsesCompletePlanForMMProjTarget(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "owner", "model")
+	writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
+	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
+	quantPath := filepath.Join(repoDir, "model-Q4_K_M.gguf")
+	companion := filepath.Join(repoDir, "mmproj-F32.gguf")
+	writer := &Job{ID: "planned-quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
+	plannedQuant, complete := plannedDestinationSet([]string{quantPath})
+	if !complete {
+		t.Fatal("could not freeze the quant-only writer plan")
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
+	t.Cleanup(func() {
+		if err := m.Close(context.Background()); err != nil {
+			t.Errorf("close job manager: %v", err)
+		}
+	})
+	m.mu.Lock()
+	m.jobs[writer.ID] = writer
+	activityID := m.registerRunActivityLocked(writer)
+	activity := m.runActivities[activityID]
+	activity.planned = plannedQuant
+	activity.planKnown = true
+	activity.planComplete = true
+	m.mu.Unlock()
+
+	attempt := testCacheWriteAttempt(m)
+	attempt.CollectSnapshot(attempt.start)
+	if attempt.MayWriteDescriptor(decisionJob(writer), []string{companion}) {
+		t.Fatal("known complete quant-only plan was treated as a possible companion writer")
+	}
+
+	plannedBoth, complete := plannedDestinationSet([]string{quantPath, companion})
+	if !complete {
+		t.Fatal("could not freeze the plan containing the companion")
+	}
+	m.mu.Lock()
+	m.runActivities[activityID].planned = plannedBoth
+	m.mu.Unlock()
+	attempt = testCacheWriteAttempt(m)
+	attempt.CollectSnapshot(attempt.start)
+	if !attempt.MayWriteDescriptor(decisionJob(writer), []string{companion}) {
+		t.Fatal("known complete plan containing the companion was not kept conservative")
+	}
+
+	// A known but incomplete plan does not prove its full destination set, so
+	// the pre-plan conservative projection must still refuse the companion.
+	m.mu.Lock()
+	activity = m.runActivities[activityID]
+	activity.planned = plannedQuant
+	activity.planComplete = false
+	m.mu.Unlock()
+	attempt = testCacheWriteAttempt(m)
+	attempt.CollectSnapshot(attempt.start)
+	if !attempt.MayWriteDescriptor(decisionJob(writer), []string{companion}) {
+		t.Fatal("known incomplete quant-only plan was not kept conservative")
+	}
+}
+
+// Without a complete plan, a bare quantization filter is not proof that the
+// writer cannot emit an unmatched non-LFS companion. Matching, path-scoped, and
+// aliased writers therefore stay conservative.
+func TestSelectedDeleteMMProjWriterAdmissionStaysConservative(t *testing.T) {
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "owner", "model")
 	writeSelectionFile(t, repoDir, "mmproj-F32.gguf")
 	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
 	target := filepath.Join(repoDir, "mmproj-F32.gguf")
 	job := &Job{ID: "quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
-	if jobMayWriteSelectedPath(job, target) {
-		t.Fatal("quant-only writer blocked a companion deletion")
+	if !jobMayWriteSelectedPath(job, target) {
+		t.Fatal("unknown-plan quant-only writer was not kept conservative for a companion")
 	}
 	job.Filters = []string{"model-Q4_K_M.gguf"}
 	if !jobMayWriteSelectedPath(job, target) {
