@@ -183,10 +183,12 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_ResumesPartialPart verifies that when a part file has
-// been partially written (not fully complete, not empty), downloadMultipart
-// resumes from the existing offset via a Range request rather than truncating
-// and restarting. Also verifies that fully-complete parts are skipped.
+// TestDownloadMultipart_ResumesPartialPart seeds a legacy pre-#140
+// .part-NN/.parts.json state and verifies the one-time upgrade migration:
+// fully-complete part 0 is never re-requested, the half-done part 1 resumes
+// from its exact durable offset, and the final bytes are exact — with no
+// new .part-NN payload files created and the legacy artifacts removed
+// after the successful finalization.
 func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Build a deterministic payload where each byte is its index mod 251.
@@ -242,7 +244,7 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 0}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
@@ -341,7 +343,7 @@ func TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: 4, Retries: 0}
 
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -361,6 +363,124 @@ func TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts(t *testing.T) {
 	}
 	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
 		t.Errorf("multipart layout metadata should be removed after success, stat err: %v", err)
+	}
+}
+
+// TestDownloadMultipart_LegacyMigrationSurvivesFlushFailure pins the
+// failure window of the one-time legacy upgrade migration (issue #140,
+// criterion 11): the legacy .part-NN/.parts.json artifacts are the only
+// finishable copy of a valid partial until the migrated range layout is
+// durably persisted in the staging record, so they must survive a
+// staging-metadata flush failure. The first flushMeta is forced to fail
+// deterministically by pre-creating its atomic-write staging path
+// (staging+".meta.tmp") as a directory, which makes the write inside
+// writeStagingMeta fail; the legacy bytes must still be on disk so a
+// later run can migrate again, and that recovery run must finish the
+// download and then remove the obsolete artifacts.
+func TestDownloadMultipart_LegacyMigrationSurvivesFlushFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	const totalSize = 10000
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+	const nParts = 4
+	const partSize = totalSize / nParts
+
+	dst := filepath.Join(tmpDir, "blobs", "tmp-migrate")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy pre-#140 state: part 0 fully complete, part 1 half done.
+	part0 := full[0:partSize]
+	const part1Have = partSize / 2
+	if err := os.WriteFile(dst+".part-00", part0, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	it := PlanItem{
+		RelativePath: "test.bin",
+		URL:          srv.URL + "/test.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: true,
+	}
+	cfg := Settings{Concurrency: nParts, Retries: 0}
+
+	// Force the first staging-metadata flush to fail: writeStagingMeta
+	// stages through staging+".meta.tmp", and a directory at that path
+	// cannot be opened for writing.
+	if err := os.Mkdir(dst+".incomplete.meta.tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 1: the migration copies the part bytes into the staging file,
+	// then the first flush of the migrated layout fails.
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	if err == nil {
+		t.Fatal("download succeeded despite the forced metadata flush failure")
+	}
+
+	// The legacy artifacts — and their bytes — must survive the failure
+	// so a later run can still finish the partial (criterion 11: never
+	// silently discard a valid partial after upgrade).
+	assertPartBytes := func(path string, want []byte) {
+		t.Helper()
+		got, rerr := os.ReadFile(path)
+		if rerr != nil {
+			t.Errorf("legacy artifact %s was discarded before the migrated state was durable: %v", filepath.Base(path), rerr)
+			return
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("legacy artifact %s changed: got %d bytes, want %d", filepath.Base(path), len(got), len(want))
+		}
+	}
+	assertPartBytes(dst+".part-00", part0)
+	assertPartBytes(dst+".part-01", full[partSize:partSize+part1Have])
+	if _, lerr := os.Stat(multipartLayoutMetaPath(dst)); lerr != nil {
+		t.Errorf("legacy layout metadata must survive the flush failure: %v", lerr)
+	}
+
+	// Recovery: with the flush failure cleared, the next run re-migrates
+	// the legacy partial, finishes it, and removes the obsolete artifacts
+	// once the migrated layout is durable.
+	if err := os.Remove(dst + ".incomplete.meta.tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("recovery downloadMultipart: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Errorf("final content mismatch: got len=%d want len=%d", len(got), len(full))
+	}
+	parts, err := multipartPartFiles(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 0 {
+		t.Errorf("legacy part files must be removed after the migrated state is durable: %v", parts)
+	}
+	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
+		t.Errorf("legacy layout metadata must be removed after successful migration, stat err: %v", err)
 	}
 }
 
@@ -405,7 +525,7 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 		mu.Unlock()
 	}
 
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, emit); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, multipartOpts{}, emit); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 

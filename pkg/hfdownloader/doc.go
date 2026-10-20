@@ -80,7 +80,7 @@ The ProgressFunc callback receives events throughout the download:
   - plan_item: A file has been added to the download plan
   - file_start: Download of a file has started
   - file_progress: Periodic progress update during download
-  - file_finalizing: Transfer finished; local post-processing (part assembly, hash verification, cache store) is running
+  - file_finalizing: Transfer finished; local finalization (strict hash verification, publish rename, cache entries) is running
   - file_done: File download complete (or skipped)
   - retry: A retry attempt is being made
   - error: An error occurred
@@ -121,21 +121,28 @@ destination. `ScanPlan` preview event paths remain repository-relative.
 
 # Resume Behavior
 
-Resume is always enabled. Skip decisions are filesystem-based:
+Resume is always enabled. Multipart downloads write directly into one
+staging file (blobs/<sha>.incomplete in HF cache mode) and persist their
+committed byte ranges in versioned metadata next to it, so an interrupted
+transfer resumes from its durable high-water marks without re-downloading
+valid bytes — even when the connection count changes between runs. Skip
+decisions are filesystem-based:
 
   - LFS files: Compared by SHA-256 hash (if available in metadata)
   - Non-LFS files: Compared by file size
 
-No external metadata files are created or required.
-
 # Verification Options
 
-The Settings.Verify field controls post-download verification:
+The Settings.Verify field controls post-download verification, for LFS
+files included:
 
-  - "none": No verification (fastest)
-  - "size": Verify file size matches expected (default)
-  - "etag": Compare ETag header from server
-  - "sha256": Full SHA-256 hash verification (most secure, slower)
+  - "none": No post-download content hash (fastest)
+  - "size": Verify expected size and complete transfer coverage (default);
+    no full-file SHA-256 reread for LFS files
+  - "etag": Compare ETag header from server (historical; not currently
+    enforced post-download)
+  - "sha256": Full SHA-256 hash verification (most secure, slower); at
+    most one full-file read per file
 
 # Concurrency
 

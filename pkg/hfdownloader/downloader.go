@@ -76,6 +76,10 @@ func multipartLayoutMetaPath(dst string) string {
 	return dst + ".parts.json"
 }
 
+// buildMultipartResumeLayout is the legacy .parts.json layout builder. The
+// ranged downloader no longer writes it, but the one-time upgrade migration
+// (migrateLegacyMultipart) reads layouts in exactly this shape, and the
+// legacy cleanup family still enumerates its artifacts.
 func buildMultipartResumeLayout(size int64, n int, chunk int64) multipartResumeLayout {
 	layout := multipartResumeLayout{
 		Size:        size,
@@ -91,6 +95,23 @@ func buildMultipartResumeLayout(size int64, n int, chunk int64) multipartResumeL
 		layout.Parts[i] = multipartPartRange{Index: i, Start: start, End: end}
 	}
 	return layout
+}
+
+// writeMultipartResumeLayout persists a legacy .parts.json layout. The
+// ranged downloader no longer writes these records; this helper remains so
+// the one-time upgrade migration and the legacy-state tests share the exact
+// on-disk shape a pre-#140 version produced.
+func writeMultipartResumeLayout(dst string, layout multipartResumeLayout) error {
+	data, err := json.Marshal(layout)
+	if err != nil {
+		return err
+	}
+	metaPath := multipartLayoutMetaPath(dst)
+	tmpPath := metaPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, metaPath)
 }
 
 func multipartPartFiles(dst string) ([]string, error) {
@@ -127,83 +148,6 @@ func removeMultipartResumeFiles(dst string) error {
 		return err
 	}
 	return nil
-}
-
-func removeUnexpectedMultipartPartFiles(dst string, layout multipartResumeLayout) error {
-	files, err := multipartPartFiles(dst)
-	if err != nil {
-		return err
-	}
-	expected := make(map[string]struct{}, len(layout.Parts))
-	for _, part := range layout.Parts {
-		expected[fmt.Sprintf("%s.part-%02d", dst, part.Index)] = struct{}{}
-	}
-	for _, p := range files {
-		if _, ok := expected[p]; ok {
-			continue
-		}
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeMultipartResumeLayout(dst string, layout multipartResumeLayout) error {
-	data, err := json.Marshal(layout)
-	if err != nil {
-		return err
-	}
-	metaPath := multipartLayoutMetaPath(dst)
-	tmpPath := metaPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, metaPath)
-}
-
-func prepareMultipartResume(dst string, layout multipartResumeLayout) error {
-	files, err := multipartPartFiles(dst)
-	if err != nil {
-		return err
-	}
-	if len(files) > 0 {
-		data, err := os.ReadFile(multipartLayoutMetaPath(dst))
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			if err := removeMultipartResumeFiles(dst); err != nil {
-				return err
-			}
-			return writeMultipartResumeLayout(dst, layout)
-		}
-
-		var existing multipartResumeLayout
-		if err := json.Unmarshal(data, &existing); err != nil || !multipartLayoutsEqual(existing, layout) {
-			if err := removeMultipartResumeFiles(dst); err != nil {
-				return err
-			}
-			return writeMultipartResumeLayout(dst, layout)
-		}
-		if err := removeUnexpectedMultipartPartFiles(dst, layout); err != nil {
-			return err
-		}
-	}
-
-	return writeMultipartResumeLayout(dst, layout)
-}
-
-func multipartLayoutsEqual(a, b multipartResumeLayout) bool {
-	if a.Size != b.Size || a.Concurrency != b.Concurrency || len(a.Parts) != len(b.Parts) {
-		return false
-	}
-	for i := range a.Parts {
-		if a.Parts[i] != b.Parts[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // Download scans and downloads files from a HuggingFace repo.
@@ -457,8 +401,16 @@ LOOP:
 					}
 					return false, "", nil
 				}
-				// Download to temp location, will be moved to blob later
-				// Use SHA256 as temp name to avoid collisions (e.g., multiple config.json files)
+				// Download to temp location, will be moved to blob later.
+				// Use SHA256 as temp name to avoid collisions (e.g., multiple
+				// config.json files). Note: for an LFS blob with a canonical
+				// SHA the ranged multipart path does NOT use this dst as its
+				// staging location — it writes directly into
+				// blobs/<sha>.incomplete (the future blob) and publishes
+				// with a rename, so no tmp-<sha> restage ever runs for it.
+				// The dst below remains the caller-visible destination key
+				// (OnPartialFile registration, cleanup) and the staging
+				// target for the single-request path and non-LFS files.
 				tmpName := "tmp-" + it.SHA256
 				if it.SHA256 == "" {
 					// Fallback: sanitize path to avoid collisions
@@ -556,12 +508,56 @@ LOOP:
 			itForIO := it
 			itForIO.RelativePath = finalRel
 
-			// Choose single/multipart path
+			// Choose single/multipart path. In HF cache mode an LFS file
+			// with a canonical blob SHA stages its ranged download directly
+			// in blobs/<sha>.incomplete — the future blob itself — so
+			// finalization is a rename into blobs/<sha> plus link work,
+			// never a tmp-<sha> restage or an assembly copy. Non-LFS files
+			// and files without a canonical SHA keep the tmp-<sha> staging
+			// and the store path.
+			blobDirect := useHFCache && canonicalSHA256(it.SHA256)
+			var mpOpts multipartOpts
+			if blobDirect {
+				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
+				mpOpts.Publish = repoDir.BlobPath(it.SHA256)
+			}
+			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
+
 			var dlErr error
-			if it.Size >= thresholdBytes && it.AcceptRanges {
-				dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			var hashVerified bool
+			if multipartRan {
+				hashVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
 			} else {
 				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			}
+
+			// A staging file owned by another live writer — or already
+			// published by one — is not a failure: finish this item as a
+			// skip, exactly like the pre-download skip check does.
+			if errors.Is(dlErr, errBlobIncompleteOwned) || errors.Is(dlErr, errBlobAlreadyComplete) {
+				reason := "downloading by another process"
+				if errors.Is(dlErr, errBlobAlreadyComplete) {
+					reason = "blob exists"
+					if useHFCache && it.SHA256 != "" {
+						// The blob is complete; make sure this file's
+						// snapshot and friendly entries exist for its own
+						// path (a cross-repo dedup winner may have created
+						// entries only for its path).
+						if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil && !cfg.NoFriendlyView {
+							repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
+						}
+					}
+				}
+				if cfg.OnPartialFile != nil {
+					cfg.OnPartialFile(dst, true)
+				}
+				emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
+				if manifestBuilder != nil {
+					manifestMu.Lock()
+					manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+					manifestMu.Unlock()
+				}
+				return
 			}
 			if dlErr != nil {
 				fatal := fmt.Errorf("download %s: %w", finalRel, dlErr)
@@ -575,22 +571,64 @@ LOOP:
 				return
 			}
 
-			// The bytes are on disk, but SHA-256 verification rereads the
-			// whole file and storing it into the cache may copy it again —
-			// minutes of local I/O for a large model, during which no
-			// file_progress arrives. Mark the file as finalizing so the job
-			// doesn't look stuck at 100% (the post-loop "finalizing" event
-			// only covers work after every file is done).
+			// The bytes are on disk. A strict verification or storing into
+			// the cache can still take local I/O time for a large file,
+			// during which no file_progress arrives. Mark the file as
+			// finalizing so the job doesn't look stuck at 100% (the
+			// post-loop "finalizing" event only covers work after every
+			// file is done).
 			emit(ProgressEvent{Event: "file_finalizing", Path: finalRel, Message: "verifying"})
 
-			// Verify after download
+			// Post-download verification. Settings.Verify controls LFS
+			// verification too (issue #140 — deliberate semantics change):
+			//
+			//   none   — no post-download content hash; HTTP/range
+			//            protocol correctness still applied during transfer.
+			//   size   — (default) the exact expected-size invariant, plus
+			//            the complete validated range coverage the
+			//            multipart path already enforced; NO unconditional
+			//            full-file SHA reread for LFS.
+			//   sha256 — strict full-file SHA-256 against the known digest,
+			//            at most one pass: the ranged path verified either
+			//            hash-on-write (fresh sequential) or with one
+			//            sequential pass before publication.
+			//
+			// Other values keep their historical compatible behavior for
+			// non-LFS files below.
+			verifyPath := dst
+			if multipartRan && blobDirect {
+				verifyPath = mpOpts.Publish
+			}
 			if it.LFS && it.SHA256 != "" {
-				if err := verifySHA256Ctx(fileCtx, dst, it.SHA256); err != nil {
-					select {
-					case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
-					default:
+				switch cfg.Verify {
+				case "none":
+					// No post-download content hash.
+				case "sha256":
+					if !hashVerified {
+						if err := verifySHA256Ctx(fileCtx, verifyPath, it.SHA256); err != nil {
+							select {
+							case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
+							default:
+							}
+							return
+						}
 					}
-					return
+				default:
+					// "size" (the default) and any other legacy value: the
+					// exact-size invariant. A preallocated staging file can
+					// never satisfy this by size alone — the multipart path
+					// only reaches here with every range committed, and the
+					// single path wrote the file sequentially.
+					if it.Size > 0 {
+						fi, err := os.Stat(verifyPath)
+						if err != nil || fi.Size() != it.Size {
+							select {
+							case errCh <- fmt.Errorf("size mismatch for %s", finalRel):
+							default:
+							}
+							return
+						}
+					}
 				}
 			} else if cfg.Verify == "size" && it.Size > 0 {
 				fi, err := os.Stat(dst)
@@ -632,11 +670,34 @@ LOOP:
 				}
 			}
 
-			// For HF Cache mode: move to blob and create symlinks. The store
-			// re-hashes/copies a large file, so pass the per-file context: a
-			// sibling's fail-fast abort must not wait for it to finish.
+			// Move the completed bytes into the cache and create the
+			// snapshot/friendly entries. The store may hash a large file,
+			// so pass the per-file context: a sibling's fail-fast abort must
+			// not wait for it to finish.
 			var finalSHA256 string
-			if useHFCache {
+			switch {
+			case blobDirect && multipartRan:
+				// The ranged downloader already renamed blobs/<sha>.incomplete
+				// onto blobs/<sha> (rename-only publish). Only the entries
+				// remain — metadata work, no payload copy.
+				if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err != nil {
+					select {
+					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
+					default:
+					}
+					return
+				}
+				if !cfg.NoFriendlyView {
+					if err := repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir); err != nil {
+						select {
+						case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
+				finalSHA256 = it.SHA256
+			case useHFCache:
 				sha := it.SHA256
 				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
@@ -647,7 +708,7 @@ LOOP:
 					return
 				}
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
-			} else {
+			default:
 				finalSHA256 = it.SHA256
 			}
 
@@ -752,11 +813,14 @@ LOOP:
 	return nil
 }
 
-// cleanupPartialsOnCancel removes partial download artifacts (.part,
-// .part-NN, .parts.json) for dst when the caller's cancel-cleanup
-// callback reports that the context was cancelled for a non-resumable
-// reason (explicit cancel, not pause).
-func cleanupPartialsOnCancel(cfg Settings, dst string) {
+// cleanupPartialsOnCancel removes the partial download artifacts for dst
+// when the caller's cancel-cleanup callback reports that the context was
+// cancelled for a non-resumable reason (explicit cancel, not pause). For
+// the single-file path (staging == "") that is dst+".part" plus any legacy
+// multipart artifacts; for the ranged path it also removes the staging
+// file and its resume metadata, so an explicitly-cancelled job leaves no
+// resumable bytes behind.
+func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
 	}
@@ -764,13 +828,18 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 	// legacy mode joins the remote file path to the output directory, and HF
 	// cache mode joins the tmp-<sha> name to the blobs directory. SafeJoin
 	// rejects non-local values via filepath.IsLocal and proves containment
-	// with PathInside, so dst cannot name a file outside those roots.
+	// with PathInside, so dst cannot name a file outside those roots. The
+	// staging path is either dst+".incomplete" or a RepoDir blob path
+	// derived from the canonical SHA the plan validated.
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
 	}
 	if err := removeMultipartResumeFiles(dst); err != nil {
 		log.Printf("warning: cleanup multipart resume files for %s: %v", dst, err)
+	}
+	if staging != "" {
+		removeStagingArtifacts(staging, staging+".meta")
 	}
 }
 
@@ -783,12 +852,21 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 // output subtree is not disturbed.
 //
 // For each dst, the helper removes the partial files the downloader
-// would have produced for that dst: dst+".part", dst+".part-NN"
-// (any digit run), and dst+".parts.json". In HF cache mode, dst is
-// the temporary tmp-<sha> path under blobs/, so the helper also removes
-// dst itself for the window after the single/multipart downloader has
-// renamed the completed bytes to tmp-<sha> but before StoreDownloadedFile
-// has moved them into the final blob.
+// would have produced for that dst, covering both artifact families:
+//
+//   - single path: dst+".part";
+//   - legacy multipart (pre-#140): dst+".part-NN" (any digit run) and
+//     dst+".parts.json";
+//   - ranged path (issue #140): dst+".incomplete" and
+//     dst+".incomplete.meta" — and, in HF cache mode where the ranged
+//     path stages an LFS blob under its blob key instead of the dst
+//     name, the derived blobs/<sha>.incomplete and .meta for a
+//     tmp-<sha> dst.
+//
+// In HF cache mode, dst is the temporary tmp-<sha> path under blobs/, so
+// the helper also removes dst itself for the window after the single
+// downloader has renamed the completed bytes to tmp-<sha> but before
+// StoreDownloadedFile has moved them into the final blob.
 //
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor
@@ -809,9 +887,30 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 		}
 		if useHFCache {
 			removeHFCacheTemp(dst)
+			removeBlobStagingForTemp(dst)
 		}
 	}
 	return nil
+}
+
+// removeBlobStagingForTemp removes the blob-keyed staging artifacts the
+// ranged downloader creates for an LFS item whose HF-cache dst is the
+// tmp-<sha> temporary: blobs/<sha>.incomplete and its .meta. The staging
+// file lives under the blob key (so it IS the future blob), while the
+// caller-tracked dst keeps the tmp-<sha> name; this derivation bridges the
+// two without widening the OnPartialFile protocol. Dsts that are not
+// tmp-<canonical-sha> temporaries are left alone — a coincidentally named
+// file cannot contribute a canonical SHA, so nothing outside the
+// downloader's own naming scheme is ever touched.
+func removeBlobStagingForTemp(dst string) {
+	base := filepath.Base(dst)
+	sha, ok := strings.CutPrefix(base, "tmp-")
+	if !ok || sha == "" || !canonicalSHA256(sha) {
+		return
+	}
+	// lgtm[go/path-injection]
+	staging := filepath.Join(filepath.Dir(dst), sha+".incomplete")
+	removeStagingArtifacts(staging, staging+".meta")
 }
 
 func cleanupRoot(settings Settings, useHFCache bool) string {
@@ -866,10 +965,19 @@ func removeHFCacheTemp(dst string) {
 }
 
 // removePartialArtifacts removes all partial-file artifacts associated
-// with a single downloader dst: the single-part partial (dst+".part"),
-// any multipart parts (dst+".part-NN" for N being any non-empty run of
-// digits, to match the downloader's %02d / %d format), and the
-// multipart layout metadata (dst+".parts.json").
+// with a single downloader dst, covering every artifact family the
+// downloader produces:
+//
+//   - the single-path partial (dst+".part");
+//   - legacy multipart parts (dst+".part-NN" for N any non-empty run of
+//     digits, matching the pre-#140 downloader's %02d/%d format) and the
+//     legacy layout metadata (dst+".parts.json");
+//   - the ranged staging file (dst+".incomplete") and its resume metadata
+//     (dst+".incomplete.meta").
+//
+// The blob-keyed staging an LFS ranged download uses in HF cache mode
+// (blobs/<sha>.incomplete) is derived separately by
+// removeBlobStagingForTemp, which CleanupJobPartFiles invokes.
 //
 // dst is already validated as residing inside the output subtree at
 // allocation time in Download() (via SafeJoin), so removing the
@@ -883,8 +991,17 @@ func removePartialArtifacts(dst string) error {
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
 	}
+	// Ranged staging file and resume metadata (issue #140).
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".incomplete"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".incomplete", err)
+	}
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".incomplete.meta"); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: cleanup partial file %s: %v", dst+".incomplete.meta", err)
+	}
 	// Multipart parts: glob the dst's directory for files matching
-	// dst+".part-NNN" pattern. This matches what downloadMultipart
+	// dst+".part-NNN" pattern. This matches what the legacy downloader
 	// produced (the parts have indices 0..n-1).
 	dir := filepath.Dir(dst)
 	base := filepath.Base(dst)
@@ -913,7 +1030,7 @@ func removePartialArtifacts(dst string) error {
 			log.Printf("warning: cleanup partial file %s: %v", full, err)
 		}
 	}
-	// Multipart layout metadata.
+	// Legacy multipart layout metadata.
 	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".parts.json", err)
 	}
@@ -967,7 +1084,7 @@ func abortError(err error) error { return &abortCause{err: err} }
 // abortPartAttempt reports whether ctx was canceled by an internal fail-fast
 // abort (see abortCause) rather than a user cancel/pause/shutdown. Returning
 // without calling cleanupPartialsOnCancel preserves the resumable
-// .part/.part-NN/.parts.json bytes for a later retry.
+// .part/.incomplete bytes (and their resume metadata) for a later retry.
 func abortPartAttempt(ctx context.Context) bool {
 	var a *abortCause
 	return errors.As(context.Cause(ctx), &a)
@@ -1067,7 +1184,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			out.Close()
 			// An internal fail-fast abort must not delete resumable bytes.
 			if !abortPartAttempt(ctx) {
-				cleanupPartialsOnCancel(cfg, dst)
+				cleanupPartialsOnCancel(cfg, dst, "")
 			}
 			return ctx.Err()
 		default:
@@ -1190,7 +1307,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			if ctx.Err() != nil {
 				out.Close()
 				if !abortPartAttempt(ctx) {
-					cleanupPartialsOnCancel(cfg, dst)
+					cleanupPartialsOnCancel(cfg, dst, "")
 				}
 				return ctx.Err()
 			}
@@ -1202,7 +1319,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
 			out.Close()
 			if !abortPartAttempt(ctx) {
-				cleanupPartialsOnCancel(cfg, dst)
+				cleanupPartialsOnCancel(cfg, dst, "")
 			}
 			return ctx.Err()
 		}
@@ -1225,484 +1342,4 @@ func removeEmptyPartialFile(path string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup empty partial file %s: %v", path, err)
 	}
-}
-
-// downloadMultipart downloads a file using multiple parallel range requests.
-func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
-	// HEAD to resolve size, reissued only when the server throttles (429/503)
-	// and bounded by the same attempt/backoff conventions as the transfer
-	// loops: wait the larger of the server-requested Retry-After and the
-	// local backoff (capped at DefaultMaxRetryAfter) with a context-aware
-	// sleep so pause/cancel/shutdown stays prompt, then reissue the HEAD
-	// within the configured retry budget.
-	retry := newRetry(cfg)
-	remaining := cfg.Retries
-	if remaining < 0 {
-		remaining = 0
-	}
-	attempt := 0
-	for {
-		req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
-		addAuth(req, token)
-		resp, err := httpc.Do(req)
-		if err != nil {
-			return err
-		}
-		// A HEAD response carries headers only, so its body is closed
-		// immediately instead of being held open (via defer) for the whole
-		// parallel transfer. Status and headers stay readable after Close
-		// for the classification and size resolution below.
-		resp.Body.Close()
-
-		apiErr := classifyFileResponse(resp, it.URL)
-
-		// A permanent gated/private/missing response on HEAD fails the whole
-		// job immediately with the actionable message, before any part
-		// requests are issued.
-		if apiErr != nil && apiErr.IsFailFast() {
-			removeEmptyPartialFile(dst + ".part")
-			return apiErr
-		}
-
-		// A throttling 429/503 must not be accepted as the resolved HEAD.
-		// Every other status keeps the previous behavior (proceed and let
-		// the part loop classify it).
-		if resp.StatusCode != http.StatusTooManyRequests &&
-			resp.StatusCode != http.StatusServiceUnavailable {
-			if it.Size == 0 {
-				if clen := resp.Header.Get("Content-Length"); clen != "" {
-					var n int64
-					fmt.Sscan(clen, &n)
-					it.Size = n
-				}
-			}
-			break
-		}
-
-		// Throttled: wait out the server-requested Retry-After (or the local
-		// backoff, whichever is larger) and reissue the HEAD. When the retry
-		// budget is exhausted, surface the transient error like an exhausted
-		// transfer retry instead of silently proceeding with a throttled
-		// response.
-		if remaining == 0 {
-			return apiErr
-		}
-		remaining--
-		attempt++
-		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: apiErr.Error()})
-		if d := NextRetryWait(resp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
-			return ctx.Err()
-		}
-	}
-	if it.Size == 0 {
-		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
-	}
-
-	// Plan parts
-	n := cfg.Concurrency
-	chunk := it.Size / int64(n)
-	if chunk <= 0 {
-		chunk = it.Size
-		n = 1
-	}
-	layout := buildMultipartResumeLayout(it.Size, n, chunk)
-	if err := prepareMultipartResume(dst, layout); err != nil {
-		return err
-	}
-
-	tmpParts := make([]string, n)
-	for i := 0; i < n; i++ {
-		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
-	}
-
-	// Download parts in parallel
-	var wg sync.WaitGroup
-	errCh := make(chan error, n)
-
-	// Part-scoped cancellable context: a permanent (fail-fast) error on any one
-	// part cancels the whole file so sibling parts stop promptly instead of
-	// downloading/retrying/waiting until wg.Wait() returns. The cancel cause is
-	// an abortCause wrapping the original error (see abortError), which lets a
-	// sibling part that exits via its ctx path distinguish an internal abort
-	// from a user cancel/pause.
-	partCtx, partCancel := context.WithCancelCause(ctx)
-	defer partCancel(nil)
-
-	// partErr records the first permanent part error so the caller surfaces the
-	// original error rather than a sibling's "context canceled" from errCh.
-	var (
-		partErrMu sync.Mutex
-		partErr   error
-	)
-
-	for i := 0; i < n; i++ {
-		i := i
-		start := int64(i) * chunk
-		end := start + chunk - 1
-		if i == n-1 {
-			end = it.Size - 1
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tmp := tmpParts[i]
-			expected := end - start + 1
-
-			// Open or create the part file without truncating; we may be
-			// resuming from a previous interrupted run.
-			out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			defer out.Close()
-
-			fi, err := out.Stat()
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			pos := fi.Size()
-			// Already fully downloaded.
-			if pos == expected {
-				return
-			}
-			// Oversize (stale/corrupt) — reset.
-			if pos > expected {
-				if err := out.Truncate(0); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				pos = 0
-			}
-			if _, err := out.Seek(pos, io.SeekStart); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-
-			retry := newRetry(cfg)
-			stall := stallTimeout(cfg)
-			attempts := cfg.Retries
-			if attempts < 0 {
-				attempts = 0
-			}
-			remaining := attempts
-			attempt := 0
-			ceiling := absoluteAttemptCeiling(attempts)
-			var lastErr error
-			// hwm is the highest offset ever reached for this part, seeded with
-			// the initial on-disk offset. The retry budget is refunded only when
-			// an attempt moves STRICTLY above it, so an ignored-Range restart or
-			// oscillation never refills the budget; the absolute ceiling then
-			// bounds a server that streams a strictly growing prefix (see
-			// downloadSingle for the two-term rationale).
-			hwm := pos
-
-			for {
-				select {
-				case <-partCtx.Done():
-					return
-				default:
-				}
-
-				// Per-attempt context: the stall watchdog cancels only this
-				// part's attempt, leaving sibling parts and the job untouched.
-				attemptCtx, attemptCancel := context.WithCancel(partCtx)
-
-				rq, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
-				addAuth(rq, token)
-				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
-
-				preHwm := hwm
-				var waitResp *http.Response
-
-				rs, err := httpc.Do(rq)
-				if err != nil {
-					lastErr = err
-				} else if rs.StatusCode == http.StatusPartialContent {
-					// The stall watchdog wraps the raw network body before the
-					// speed limiter's pacing.
-					body := newStallReader(rs.Body, stall, attemptCancel)
-					_, cerr := io.Copy(out, cfg.SpeedLimiter.Reader(attemptCtx, body))
-					rs.Body.Close()
-					attemptCancel()
-					if cerr == nil {
-						return
-					}
-					// A fired stall watchdog marks this attempt's failure as
-					// a stall; a done partCtx keeps the genuine-cancel error
-					// (see classifyStall precedence).
-					lastErr = classifyStall(partCtx, body, cerr)
-					// Advance pos by what we actually wrote so the next retry
-					// Range request picks up from the correct offset.
-					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
-						pos = cur
-					}
-				} else {
-					// Any non-206 is a failure. A permanent 401/403/404 fails
-					// the whole job immediately; a throttling 429/503 shapes
-					// the next wait; a 200 means the server ignored Range (a
-					// multipart protocol violation) and is retried as before.
-					rs.Body.Close()
-					if apiErr := classifyFileResponse(rs, it.URL); apiErr != nil {
-						lastErr = apiErr
-						if apiErr.IsFailFast() {
-							// Permanent for the whole file/job: cancel sibling
-							// parts with the original error as the cause, record
-							// it for the caller, and return. Close out BEFORE
-							// removing the (possibly empty) partial so Windows
-							// can unlink the still-open file — mirroring the
-							// single-file ordering.
-							attemptCancel()
-							partErrMu.Lock()
-							if partErr == nil {
-								partErr = lastErr
-							}
-							partErrMu.Unlock()
-							partCancel(abortError(lastErr))
-							out.Close()
-							removeEmptyPartialFile(tmp)
-							select {
-							case errCh <- lastErr:
-							default:
-							}
-							return
-						}
-						if !apiErr.IsRetryable() {
-							attemptCancel()
-							partErrMu.Lock()
-							if partErr == nil {
-								partErr = lastErr
-							}
-							partErrMu.Unlock()
-							partCancel(abortError(lastErr))
-							out.Close()
-							select {
-							case errCh <- lastErr:
-							default:
-							}
-							return
-						}
-						waitResp = rs
-					} else {
-						lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
-					}
-				}
-				attemptCancel()
-
-				// Refund the retry budget only when this attempt moved STRICTLY
-				// above the high-water mark captured BEFORE the attempt.
-				// preHwm is read first because hwm is updated unconditionally
-				// below, so a restart's higher offset is recorded and can never
-				// later earn a free refund from a bodyless failure. Multipart
-				// has no truncation path.
-				advanced := pos > preHwm
-				if pos > hwm {
-					hwm = pos
-				}
-				if advanced {
-					retry.reset()
-					remaining = attempts
-				}
-
-				if remaining == 0 || attempt >= ceiling {
-					break
-				}
-				remaining--
-				attempt++
-				emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
-				if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(partCtx, d) {
-					return
-				}
-			}
-
-			select {
-			case errCh <- lastErr:
-			default:
-			}
-		}()
-	}
-
-	// Emit periodic progress while parts download. The ticker is stopped
-	// cleanly after wg.Wait() so it cannot observe mid-assembly state (parts
-	// being deleted) and emit a bogus 0-byte progress event — the bug behind
-	// the "progress jumps 2.4% ↔ 2.5% for hours" symptom in github #75.
-	tickerDone := make(chan struct{})
-	var tickerWG sync.WaitGroup
-	tickerWG.Add(1)
-	go func() {
-		defer tickerWG.Done()
-		t := time.NewTicker(200 * time.Millisecond) // More frequent updates for responsive UI
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tickerDone:
-				return
-			case <-t.C:
-				var downloaded int64
-				for _, p := range tmpParts {
-					if fi, err := os.Stat(p); err == nil {
-						downloaded += fi.Size()
-					}
-				}
-				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: downloaded, Total: it.Size})
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	// Stop the progress ticker and wait for it to exit before touching the
-	// part files. Any in-flight tick will finish and emit one final event
-	// while parts are still on disk at their real sizes.
-	close(tickerDone)
-	tickerWG.Wait()
-
-	// A permanent (fail-fast) part error cancels partCtx and is the error the
-	// caller must see; return it in preference to the sibling "context
-	// canceled" that the ctx check below would surface. An internal abort
-	// must NOT run cancel-cleanup (T3): only genuinely empty partials are
-	// removed, by the failing part itself, and resumable bytes are preserved.
-	partErrMu.Lock()
-	permanentErr := partErr
-	partErrMu.Unlock()
-	if permanentErr != nil {
-		return permanentErr
-	}
-
-	// If the context was cancelled while parts were running (pause / abort /
-	// timeout), return the cancellation error immediately. Part goroutines
-	// that exit via their ctx-aware retry/sleep path do NOT push to errCh,
-	// so we cannot rely on the errCh drain to catch this — we must check
-	// ctx.Err() explicitly. Returning here is critical: it prevents the
-	// bogus "downloaded == total" progress emit below AND stops the
-	// assembly loop from stitching an incomplete part set into a corrupt
-	// final file and deleting the partial bytes the next resume needs.
-	//
-	// The guard keys off partCtx — the context a part fail-fast actually
-	// cancels (via abortCause) — not the file ctx, so it stays correct even
-	// if the cancel wiring changes. (A file fail-fast is already returned
-	// above via partErr, so this branch handles user cancel/pause and any
-	// internal abort of partCtx.)
-	if ctx.Err() != nil || partCtx.Err() != nil {
-		if !abortPartAttempt(partCtx) {
-			cleanupPartialsOnCancel(cfg, dst)
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return partCtx.Err()
-	}
-
-	select {
-	case e := <-errCh:
-		return e
-	default:
-	}
-
-	// Emit one explicit full-progress reading so the caller's last observed
-	// file_progress value is the full byte count, regardless of when the
-	// ticker happened to last fire.
-	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
-
-	// Everything past this point is local disk I/O: stitching the part files
-	// back into one rewrites the entire payload, which takes real time for
-	// multi-GB files. Signal it so the UI doesn't sit silently at 100%.
-	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "assembling parts"})
-
-	// Abort before touching the part files if the job/part context was
-	// cancelled between the guard above and here. Preserve the resumable
-	// .part-NN part files (they are the resumable data); an internal fail-fast
-	// abort must NOT run the user-cancel cleanup. Remove any incomplete
-	// intermediate dst.part this call may have created — none yet at this
-	// point, so just return the cancellation cause.
-	if cerr := partCtx.Err(); cerr != nil {
-		if !abortPartAttempt(partCtx) {
-			cleanupPartialsOnCancel(cfg, dst)
-		}
-		return cerr
-	}
-
-	// Assemble parts. The context-checking reader and the per-part check make
-	// the local copy stop promptly once a sibling's permanent error (or a user
-	// cancel) has cancelled partCtx, instead of hashing/stitching a multi-GB
-	// sibling to completion. An internal abort preserves the .part-NN files
-	// (resumable data) and removes the incomplete intermediate dst.part.
-	out, err := os.Create(dst + ".part")
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < n; i++ {
-		if cerr := partCtx.Err(); cerr != nil {
-			out.Close()
-			removeIncompleteAssembly(cfg, dst, partCtx)
-			return cerr
-		}
-		p := tmpParts[i]
-		in, err := os.Open(p)
-		if err != nil {
-			out.Close()
-			removeIncompleteAssembly(cfg, dst, partCtx)
-			return err
-		}
-		if _, err := io.Copy(out, contextReader{ctx: partCtx, r: in}); err != nil {
-			in.Close()
-			out.Close()
-			if cerr := partCtx.Err(); cerr != nil {
-				removeIncompleteAssembly(cfg, dst, partCtx)
-				return cerr
-			}
-			return err
-		}
-		in.Close()
-	}
-	out.Close()
-
-	if cerr := partCtx.Err(); cerr != nil {
-		removeIncompleteAssembly(cfg, dst, partCtx)
-		return cerr
-	}
-
-	if err := os.Rename(dst+".part", dst); err != nil {
-		return err
-	}
-
-	for _, p := range tmpParts {
-		_ = os.Remove(p)
-	}
-	_ = os.Remove(multipartLayoutMetaPath(dst))
-
-	return nil
-}
-
-// removeIncompleteAssembly handles a cancellation that landed during part
-// assembly. On an internal fail-fast abort it preserves the resumable .part-NN
-// part files and removes only the incomplete intermediate dst.part (which is
-// not resumable and would otherwise be a corrupt leftover). On a user cancel
-// it keeps the existing cleanupPartialsOnCancel semantics unchanged.
-func removeIncompleteAssembly(cfg Settings, dst string, ctx context.Context) {
-	if abortPartAttempt(ctx) {
-		// lgtm[go/path-injection]
-		if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-			log.Printf("warning: cleanup incomplete assembly %s: %v", dst+".part", err)
-		}
-		return
-	}
-	cleanupPartialsOnCancel(cfg, dst)
 }

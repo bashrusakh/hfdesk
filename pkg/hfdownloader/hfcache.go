@@ -240,11 +240,48 @@ func (r *RepoDir) EnsureDirs() error {
 }
 
 // IncompleteMeta contains metadata about an incomplete download.
+//
+// The base fields (PID, StartedAt, Size, SHA256) carry the cross-process
+// ownership and staleness state CheckBlob and the stale-takeover logic use.
+// The Version/Ranges fields extend the record into the ranged-download
+// resume state (issue #140): a Version 2 meta describes a direct-write
+// staging file whose valid bytes are exactly the committed prefixes of the
+// listed ranges. Ranges is the authoritative byte contract for an existing
+// incomplete download, deliberately decoupled from the worker count so a
+// changed Settings.Concurrency re-fetches only missing bytes instead of
+// invalidating valid ones. Crash-safety contract: payload data is written
+// before Committed is advanced, the metadata file may lag the payload, and
+// Committed must never claim bytes that were not successfully written. The
+// staging file is preallocated, so its on-disk length is never evidence of
+// completion — only Ranges is.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
+	// Version is 0 for legacy records (no range state) and 2 for ranged
+	// staging records written by the issue #140 downloader.
+	Version int `json:"version,omitempty"`
+	// Repo, Revision and Path identify the remote object the staging file
+	// belongs to, so a reused destination cannot silently resume another
+	// file's bytes.
+	Repo     string `json:"repo,omitempty"`
+	Revision string `json:"revision,omitempty"`
+	Path     string `json:"path,omitempty"`
+	// Ranges lists the persisted range layout and per-range committed
+	// progress; see RangeProgress. Empty for legacy records.
+	Ranges []RangeProgress `json:"ranges,omitempty"`
+}
+
+// RangeProgress is the durable state of one persisted download range.
+// Bytes [Start, Start+Committed) are valid; Done marks the whole range
+// [Start, End] as committed. Committed is always a prefix of the range, so
+// an interrupted transfer resumes from its durable high-water point.
+type RangeProgress struct {
+	Start     int64 `json:"start"`
+	End       int64 `json:"end"`
+	Committed int64 `json:"committed"`
+	Done      bool  `json:"done"`
 }
 
 // BlobStatus represents the status of a blob in the cache.
@@ -308,8 +345,14 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobStale, nil, nil
 	}
 
-	// Check if the process is still alive
-	if isProcessAlive(meta.PID) {
+	// Check if the process is still alive. Our own PID is excluded: a
+	// staging record from an earlier run of THIS process (a paused job
+	// resumed in-process, or a retry) has no concurrently-running writer,
+	// so it must fall through to the take-over path instead of being
+	// reported as "downloading", which would permanently block resume
+	// inside a single server process. Genuine same-process concurrency is
+	// excluded separately by the downloader's in-process staging registry.
+	if meta.PID != 0 && meta.PID != os.Getpid() && isProcessAlive(meta.PID) {
 		// Check if file was recently modified
 		if time.Since(incompleteStat.ModTime()) < r.cache.StaleTimeout {
 			return BlobDownloading, meta, nil

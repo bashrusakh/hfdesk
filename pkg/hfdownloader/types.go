@@ -195,14 +195,23 @@ type Settings struct {
 	// If empty, defaults to "256MiB".
 	MultipartThreshold string
 
-	// Verify specifies how to verify non-LFS files after download.
-	// LFS files are always verified by SHA-256 when the hash is available.
+	// Verify specifies how to verify files after download. It controls LFS
+	// files too (issue #140):
 	//
-	// Options:
-	//   - "none": No verification (fastest)
-	//   - "size": Verify file size matches expected (default, fast)
-	//   - "etag": Compare ETag header from server
-	//   - "sha256": Full SHA-256 hash verification (most secure, slower)
+	//   - "none": No post-download content hash (fastest). HTTP and ranged
+	//     response validation still apply during the transfer.
+	//   - "size": (default, fast) Verify the exact expected size and — for
+	//     multipart transfers — that every expected byte range was
+	//     successfully validated and written. No full-file SHA-256 reread
+	//     is performed for LFS files in this mode.
+	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
+	//     At most one full-file read is performed per file: a fresh
+	//     sequential multipart transfer hashes while writing; every other
+	//     transfer performs one sequential pass before publication, so a
+	//     mismatch never publishes corrupt bytes.
+	//   - "etag": Compare ETag header from server (historical; the
+	//     downloader currently performs no post-download ETag check for
+	//     this value).
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.
@@ -288,10 +297,13 @@ type Settings struct {
 	SpeedLimiter *RateLimiter
 
 	// CleanupPartialsOnCancel, when non-nil, is called when the download
-	// context is cancelled. If it returns true, the downloader deletes any
-	// partial .part files (.part, .part-NN, .parts.json) before returning.
-	// When nil (default), partial files are preserved for resume (useful
-	// for pause/resume workflows).
+	// context is cancelled. If it returns true, the downloader deletes the
+	// partial files it produced before returning: dst+".part" (single
+	// path), the legacy dst+".part-NN"/dst+".parts.json" family, and the
+	// ranged staging file with its resume metadata
+	// (dst+".incomplete"/".incomplete.meta", or blobs/<sha>.incomplete in
+	// HF cache mode). When nil (default), partial files are preserved for
+	// resume (useful for pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
 
 	// OnPartialFile, when non-nil, is called for every per-file

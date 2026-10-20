@@ -1867,7 +1867,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	}
 }
 
-// cleanupPausedJobPartFiles removes partial .part files for a job whose
+// cleanupPausedJobPartFiles removes partial download files for a job whose
 // runJob goroutine has already exited (paused jobs whose downloader
 // goroutine returned without doing cleanup). The downloader's in-flight
 // cleanup callback cannot reach these files because the goroutine is

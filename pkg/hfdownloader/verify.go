@@ -37,12 +37,23 @@ func computeSHA256(path string) (string, error) {
 // computeSHA256Ctx is computeSHA256 bounded by ctx: it aborts promptly with the
 // context error if ctx is cancelled while hashing. Existing ctx-free callers
 // keep using computeSHA256 (context.Background()).
+//
+// Every invocation is a full-file read, so it is counted in the
+// hashPassCount/hashPassBytes observability counters: the issue #140
+// verification contract allows at most ONE such pass per downloaded file in
+// strict Verify=sha256 mode, and none at all in Verify=size mode.
 func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	size := int64(0)
+	if fi, serr := f.Stat(); serr == nil {
+		size = fi.Size()
+	}
+	hashPassCount.Add(1)
+	hashPassBytes.Add(size)
 
 	h := sha256.New()
 	if _, err := io.Copy(h, contextReader{ctx: ctx, r: f}); err != nil {

@@ -1749,8 +1749,19 @@ func TestCreateJob_DedupDestinationIdentity_LocalDirOverride(t *testing.T) {
 // OutputDir points at rootDir and seeds real downloader partial artifacts
 // plus the per-job in-flight dst tracker under that same root, mirroring the
 // state cleanupPausedJobPartFiles sees for a paused job after its runJob
-// goroutine has already exited. Each dst contributes the artifact family
-// CleanupJobPartFiles removes (dst+".part", dst+".part-NN", dst+".parts.json").
+// goroutine has already exited. The dsts together cover every artifact
+// family CleanupJobPartFiles removes:
+//   - dst1: the legacy single-path partial (dst+".part") plus the ranged
+//     staging family staged next to the dst itself (dst+".incomplete" and
+//     dst+".incomplete.meta");
+//   - dst2: the legacy multipart family (dst+".part-NN" and
+//     dst+".parts.json");
+//   - dst3: a tmp-<canonical-sha> LFS temporary — the completed-but-not-
+//     yet-stored tmp file itself, plus the blob-keyed staging the ranged
+//     downloader derives for it (blobs/<sha>.incomplete and .meta). The
+//     non-canonical tmp- names of dst1/dst2 deliberately contribute no
+//     derived blob staging: removeBlobStagingForTemp skips names that are
+//     not tmp-<64-hex>, which is exactly why dst3 carries that family.
 func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir string) (*Job, string, []string) {
 	t.Helper()
 	blobsDir := filepath.Join(cacheHubLayoutDir(rootDir, repo), "blobs")
@@ -1759,7 +1770,25 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 	}
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
 	dst2 := filepath.Join(blobsDir, "tmp-cafebabe00000000")
-	artifacts := []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"}
+	// A canonical SHA-256 digest: tmp-<sha> is the shape the HF cache mode
+	// downloader uses for LFS temporaries, from which the blob-keyed
+	// staging family is derived.
+	const blobSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	dst3 := filepath.Join(blobsDir, "tmp-"+blobSHA)
+	artifacts := []string{
+		// Legacy families.
+		dst1 + ".part",
+		dst2 + ".part-00",
+		dst2 + ".parts.json",
+		// Ranged staging family next to the dst itself.
+		dst1 + ".incomplete",
+		dst1 + ".incomplete.meta",
+		// tmp-<sha> family: the temporary itself plus its derived
+		// blob-keyed staging files.
+		dst3,
+		filepath.Join(blobsDir, blobSHA+".incomplete"),
+		filepath.Join(blobsDir, blobSHA+".incomplete.meta"),
+	}
 	for _, path := range artifacts {
 		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
 			t.Fatal(err)
@@ -1769,7 +1798,7 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 	if err := os.WriteFile(filepath.Join(blobsDir, "completed-blob"), []byte("done"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tracker := map[string]struct{}{dst1: {}, dst2: {}}
+	tracker := map[string]struct{}{dst1: {}, dst2: {}, dst3: {}}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	job := &Job{
