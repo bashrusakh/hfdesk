@@ -650,15 +650,71 @@ scenario('model and dataset cache namespaces stay isolated', async () => {
   eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model status remains its own value');
 });
 
-scenario('legacy repo-only storage migrates into the current namespace', async () => {
-  reset({ cacheFiles: [] });
+scenario('untyped legacy storage is ignored for both namespaces', async () => {
+  const artifact = artifactItem(FILES);
+  const modelToken = { category: 'format', filter_value: 'Q4_K_M', label: 'Model Legacy' };
+  const datasetToken = { category: 'format', filter_value: 'train', label: 'Dataset Legacy' };
+  reset({});
   storage.clear();
-  storage.set(LEGACY_STORAGE, JSON.stringify({ Q4_K_M: 'done' }));
-  const item = { category: 'format', filter_value: 'Q4_K_M', label: 'Legacy Q4_K_M' };
-  eq(ui.getDlStatus(REPO, false)['Q4_K_M'], 'done', 'legacy token status survives migration');
-  eq(storage.has(MODEL_STORAGE), true, 'legacy status is written to the model namespace');
-  eq(storage.has(LEGACY_STORAGE), false, 'legacy untyped key is consumed once');
-  assertDone(ui.renderSelectableItems([item], 'selectableItems'), '', 'migrated legacy token row');
+  const legacyRaw = JSON.stringify({ Q4_K_M: 'done', train: 'done' });
+  storage.set(LEGACY_STORAGE, legacyRaw);
+
+  // The old untyped key has no namespace, so neither lookup may claim it.
+  eq(ui.getDlStatus(REPO, false)['Q4_K_M'], undefined, 'legacy status is ignored for model lookup');
+  eq(ui.getDlStatus(REPO, true)['train'], undefined, 'legacy status is ignored for dataset lookup');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy untyped key is left untouched');
+  eq(storage.has(MODEL_STORAGE), false, 'model namespace is not populated from legacy');
+  eq(storage.has(DATASET_STORAGE), false, 'dataset namespace is not populated from legacy');
+
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: false, selectable_items: [modelToken] });
+  assertIdle(ui.renderSelectableItems([modelToken], 'selectableItems'), 'Model Legacy', 'legacy model token row');
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: true, selectable_items: [datasetToken] });
+  assertIdle(ui.renderSelectableItems([datasetToken], 'selectableItems'), 'Dataset Legacy', 'legacy dataset token row');
+
+  // Type-scoped keys remain the only source and stay isolated.
+  storage.set(MODEL_STORAGE, JSON.stringify({ Q4_K_M: 'done', [ARTIFACT_KEY]: 'done' }));
+  storage.set(DATASET_STORAGE, JSON.stringify({ train: 'done', [ARTIFACT_KEY]: 'done' }));
+  eq(ui.getDlStatus(REPO, false)['Q4_K_M'], 'done', 'model namespace keeps its own token');
+  eq(ui.getDlStatus(REPO, false)['train'], undefined, 'dataset token does not cross into model');
+  eq(ui.getDlStatus(REPO, true)['train'], 'done', 'dataset namespace keeps its own token');
+  eq(ui.getDlStatus(REPO, true)['Q4_K_M'], undefined, 'model token does not cross into dataset');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key remains untouched after typed reads');
+
+  // Cache presence still finalizes model done; a dataset 404 clears only the
+  // dataset namespace and leaves the model namespace intact.
+  cacheState = { status: 200, files: FILES, error: null, parseError: null };
+  let result = await reconcile([artifact]);
+  eq(result.map[ARTIFACT_KEY], 'done', 'model cache presence finalizes done');
+  cacheState = { status: 404, files: [], error: null, parseError: null };
+  result = await reconcile([artifact], { dataset: true });
+  eq(result.map[ARTIFACT_KEY], undefined, 'dataset 404 clears its artifact done');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model artifact done survives dataset 404');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key is untouched after 404');
+
+  // A cache error clears only the dataset artifact's stale done; the typed
+  // dataset token keeps its last-known-good value.
+  storage.set(DATASET_STORAGE, JSON.stringify({ train: 'done', [ARTIFACT_KEY]: 'done' }));
+  cacheState = { status: 200, files: [], error: new Error('cache lookup failed'), parseError: null };
+  result = await reconcile([artifact], { dataset: true });
+  eq(result.map[ARTIFACT_KEY], undefined, 'dataset cache error clears stale artifact done');
+  eq(result.map['train'], 'done', 'dataset cache error preserves typed token status');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model artifact done survives dataset cache error');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key is untouched after cache error');
+
+  // A successful response missing one file clears the dataset done as before.
+  storage.set(DATASET_STORAGE, JSON.stringify({ train: 'done', [ARTIFACT_KEY]: 'done' }));
+  cacheState = { status: 200, files: [SHARD1], error: null, parseError: null };
+  result = await reconcile([artifact], { dataset: true });
+  eq(result.map[ARTIFACT_KEY], undefined, 'dataset missing file clears artifact done');
+  eq(result.map['train'], 'done', 'missing-file sync leaves typed token status');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key is untouched after missing file');
+
+  // Cache presence still finalizes done after the clearing paths.
+  cacheState = { status: 200, files: FILES, error: null, parseError: null };
+  result = await reconcile([artifact], { dataset: true });
+  eq(result.map[ARTIFACT_KEY], 'done', 'dataset cache presence finalizes done');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model artifact done remains isolated');
+  eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key is untouched after cache presence');
 });
 
 (async () => {

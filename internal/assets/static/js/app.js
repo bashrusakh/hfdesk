@@ -5310,9 +5310,11 @@ async function loadRepositoryDetails(entry) {
   // ── Quant/selectable row download status ──────────────────────────
   // localStorage key: "dlStatus:<repo>:<model|dataset>" →
   // { "<filter_value or artifact key>": "queued"|"running"|"done" }
-  // The namespace suffix keeps a repository that exists as both model and
-  // dataset from sharing statuses. The old repo-only key is migrated on first
-  // read so single-namespace and legacy token statuses survive the change.
+  // The type-scoped key is the only source of status. The pre-namespace
+  // untyped key ("dlStatus:<repo>") is intentionally ignored and left
+  // untouched: it has no repository type, so migrating it would assign one
+  // namespace's statuses to whichever type reads first. Cache synchronization
+  // reconstructs current artifact status for the open analysis instead.
   function dlStatusStorageKey(repo, isDataset) {
     return 'dlStatus:' + repo + ':' + (isDataset ? 'dataset' : 'model');
   }
@@ -5320,20 +5322,11 @@ async function loadRepositoryDetails(entry) {
     try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
   }
   function getDlStatus(repo, isDataset) {
-    const storageKey = dlStatusStorageKey(repo, isDataset);
-    const stored = localStorage.getItem(storageKey);
-    if (stored !== null) return parseDlStatus(stored);
-    const legacyKey = 'dlStatus:' + repo;
-    const legacy = localStorage.getItem(legacyKey);
-    if (legacy === null) return {};
-    const map = parseDlStatus(legacy);
     try {
-      localStorage.setItem(storageKey, JSON.stringify(map));
-      localStorage.removeItem(legacyKey);
+      return parseDlStatus(localStorage.getItem(dlStatusStorageKey(repo, isDataset)));
     } catch {
-      // Status persistence is best-effort.
+      return {};
     }
-    return map;
   }
   function saveDlStatus(repo, isDataset, map) {
     const storageKey = dlStatusStorageKey(repo, isDataset);
