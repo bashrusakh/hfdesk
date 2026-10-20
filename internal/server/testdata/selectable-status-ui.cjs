@@ -4,6 +4,8 @@
 // and cache-fetch stubs. It drives the production sequence in
 // loadRepositoryDetails/renderAnalysisResult: refreshDlStatusFromJobs runs
 // before syncLocalAnalysisStatus, then renderSelectableItems reads the result.
+// It also feeds real job_update/init WebSocket messages through
+// handleWSMessage and flushes the coalesced live reconciliation.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -12,11 +14,15 @@ const vm = require('node:vm');
 const REPO = 'owner/model';
 const SHARD1 = 'model-Q4_0-00001-of-00002.gguf';
 const SHARD2 = 'model-Q4_0-00002-of-00002.gguf';
+const MMPROJ = 'mmproj-model-f16.gguf';
 const FILES = [SHARD1, SHARD2];
 // downloadQuant sends root-level artifact files through artifactRequestPaths,
 // which prefixes bare names with "./".
 const JOB_FILTERS = FILES.map(name => './' + name);
 const ARTIFACT_KEY = `artifact:${JSON.stringify(FILES.map(name => name.toLowerCase()))}`;
+const MODEL_STORAGE = `dlStatus:${REPO}:model`;
+const DATASET_STORAGE = `dlStatus:${REPO}:dataset`;
+const LEGACY_STORAGE = `dlStatus:${REPO}`;
 
 let assertions = 0;
 function eq(actual, expected, message) { assertions++; assert.equal(actual, expected, message); }
@@ -42,13 +48,14 @@ function makeNode() {
   };
 }
 
+const domNodes = new Map();
 const document = {
   readyState: 'loading',
   body: makeNode(),
   handlers: {},
   addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
   createElement() { return makeNode(); },
-  querySelector() { return null; },
+  querySelector(selector) { return domNodes.get(selector) || null; },
   querySelectorAll() { return []; },
   getElementById() { return null; }
 };
@@ -60,11 +67,16 @@ const localStorage = {
   removeItem(key) { storage.delete(key); }
 };
 
+const cacheRequests = [];
+function lastCacheRequest() { return cacheRequests[cacheRequests.length - 1] || ''; }
+
 let cacheState = { status: 200, files: [], error: null, parseError: null };
 const fetch = async (rawPath) => {
-  if (!String(rawPath).startsWith('/api/cache/')) {
+  const requestPath = String(rawPath);
+  if (!requestPath.startsWith('/api/cache/')) {
     throw new Error('unexpected fetch: ' + rawPath);
   }
+  cacheRequests.push(requestPath);
   if (cacheState.error) throw cacheState.error;
   return {
     status: cacheState.status,
@@ -81,14 +93,26 @@ const window = {
   addEventListener() {}
 };
 
+// Timers are coalescing details here; the harness flushes reconciliation
+// directly instead of sleeping. Pending auto-dismiss timers never run.
+const timers = [];
+function fakeSetTimeout(fn, ms) {
+  const timer = { fn, ms, cleared: false };
+  timers.push(timer);
+  return timer;
+}
+function fakeClearTimeout(timer) {
+  if (timer) timer.cleared = true;
+}
+
 const context = {
   window,
   document,
   console,
   URL,
   URLSearchParams,
-  setTimeout,
-  clearTimeout,
+  setTimeout: fakeSetTimeout,
+  clearTimeout: fakeClearTimeout,
   localStorage,
   CSS: { escape: value => String(value) },
   confirm: () => true,
@@ -110,10 +134,24 @@ const hook = `
     refreshDlStatusFromJobs,
     syncLocalAnalysisStatus,
     renderSelectableItems,
+    updateSelectableRowStatuses,
+    handleWSMessage,
     getDlStatus,
     selectableStatusKey,
-    artifactJobStatusKey,
-    setCurrentAnalysis(value) { currentAnalysis = value; }
+    setCurrentAnalysis(value) { currentAnalysis = value; },
+    async flushLiveReconcile() {
+      if (liveStatusReconcileTimer !== null) {
+        clearTimeout(liveStatusReconcileTimer);
+        liveStatusReconcileTimer = null;
+      }
+      await runLiveAnalysisReconcile();
+    },
+    resetLiveReconcile() {
+      if (liveStatusReconcileTimer !== null) clearTimeout(liveStatusReconcileTimer);
+      liveStatusReconcileTimer = null;
+      liveStatusReconcilePending = false;
+      liveStatusReconcileNeedsCache = false;
+    }
   };
 `;
 source = source.replace(marker, hook + '\n' + marker);
@@ -121,25 +159,55 @@ vm.runInNewContext(source, context);
 const ui = window.test;
 ui.state.settings = {};
 
-function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {} } = {}) {
+function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {}, dataset = false, items = [] } = {}) {
   ui.state.jobs.clear();
   jobs.forEach((job, index) => ui.state.jobs.set(job.id || `job-${index}`, job));
   ui.state.settings = {};
-  ui.setCurrentAnalysis({ repo: REPO, is_dataset: false });
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: dataset, selectable_items: items });
+  ui.resetLiveReconcile();
+  domNodes.delete('#selectableItems');
+  cacheRequests.length = 0;
   storage.clear();
   if (Object.keys(initial).length) {
-    storage.set('dlStatus:' + REPO, JSON.stringify(initial));
+    storage.set(dataset ? DATASET_STORAGE : MODEL_STORAGE, JSON.stringify(initial));
   }
   cacheState = { status: cacheStatus, files: cacheFiles, error: cacheError, parseError: cacheParseError };
 }
 
-async function reconcile(items) {
-  const data = { repo: REPO, selectable_items: items };
-  ui.refreshDlStatusFromJobs(REPO);
+async function reconcile(items, { dataset = false } = {}) {
+  const isDataset = !!dataset;
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: isDataset, selectable_items: items });
+  const data = { repo: REPO, is_dataset: isDataset, selectable_items: items };
+  ui.refreshDlStatusFromJobs(REPO, items, isDataset);
   await ui.syncLocalAnalysisStatus(data);
-  ui.refreshDlStatusFromJobs(REPO);
+  ui.refreshDlStatusFromJobs(REPO, items, isDataset);
   const html = ui.renderSelectableItems(items, 'selectableItems');
-  return { map: ui.getDlStatus(REPO), html };
+  return { map: ui.getDlStatus(REPO, isDataset), html };
+}
+
+// The live WebSocket path updates the already-rendered rows instead of
+// re-rendering the analysis. These row stubs expose the same dataset/query
+// surface updateSelectableRowStatuses uses.
+function installRows(items, initialStatuses = {}) {
+  const rows = items.map(item => {
+    const statusKey = ui.selectableStatusKey(item);
+    let chipHtml = '';
+    const chip = {};
+    Object.defineProperty(chip, 'outerHTML', {
+      get() { return chipHtml; },
+      set(value) { chipHtml = String(value); }
+    });
+    return {
+      dataset: {
+        statusKey: encodeURIComponent(statusKey),
+        dlStatus: initialStatuses[statusKey] || ''
+      },
+      chip,
+      querySelector(selector) { return selector === '.quant-dl-btn' ? this.chip : null; }
+    };
+  });
+  domNodes.set('#selectableItems', { querySelectorAll() { return rows; } });
+  return rows;
 }
 
 function completedJob(overrides = {}) {
@@ -163,6 +231,28 @@ function artifactItem(files, label = 'Q4_0', filterValue = 'q4_0') {
     filter_value: filterValue,
     label,
     files
+  };
+}
+
+function visionItem(files, label = 'MMProj', filterValue = 'mmproj') {
+  return {
+    category: 'vision_encoder',
+    filter_value: filterValue,
+    label,
+    files
+  };
+}
+
+function liveJob(overrides = {}) {
+  return {
+    id: 'live',
+    repo: REPO,
+    status: 'running',
+    isDataset: false,
+    filters: JOB_FILTERS,
+    excludes: [],
+    files: [],
+    ...overrides
   };
 }
 
@@ -383,6 +473,192 @@ scenario('distinct artifacts sharing a quant/filter stay independent', async () 
   eq(map[ui.selectableStatusKey(itemB)], undefined, 'artifact B stays idle');
   assertDone(html, 'Artifact A', 'artifact A');
   assertIdle(html, 'Artifact B', 'artifact B');
+});
+
+scenario('live progress and completion reconcile open analysis rows', async () => {
+  const item = artifactItem(FILES);
+  reset({ cacheFiles: FILES, initial: { [ARTIFACT_KEY]: 'queued' }, items: [item] });
+  const rows = installRows([item], { [ARTIFACT_KEY]: 'queued' });
+  assertQueued(ui.renderSelectableItems([item], 'selectableItems'), 'staged queued row');
+
+  // Progress updates move the chip without paying for another cache lookup,
+  // and a burst of them coalesces into one scheduled reconciliation.
+  const timersBefore = timers.length;
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'running' }) });
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'running' }) });
+  eq(timers.length, timersBefore + 1, 'progress burst coalesces into one reconcile timer');
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'running', 'live running status reaches storage');
+  eq(lastCacheRequest(), '', 'running progress must not re-read cache presence');
+  eq(rows[0].dataset.dlStatus, 'running', 'live running status updates the rendered row');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-running/, 'running chip replaces queued');
+  doesNotMatch(rows[0].chip.outerHTML, /quant-dl-btn-queued/, 'no stale queued chip while running');
+
+  // Completion reconciles again; cache presence is what finalizes done.
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({
+      status: 'completed',
+      files: [
+        { path: SHARD1, status: 'complete' },
+        { path: SHARD2, status: 'complete' }
+      ]
+    })
+  });
+  await ui.flushLiveReconcile();
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=model$/, 'completion re-reads the model namespace');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'cache presence finalizes done after completion');
+  eq(rows[0].dataset.dlStatus, 'done', 'completed row leaves running/queued state');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-done/, 'done chip after cache presence');
+  doesNotMatch(rows[0].chip.outerHTML, /quant-dl-btn-queued|quant-dl-btn-running/, 'no stale active chip after completion');
+});
+
+scenario('initial socket snapshot reconciles a job that finished while disconnected', async () => {
+  const item = artifactItem(FILES);
+  reset({ cacheFiles: FILES, initial: { [ARTIFACT_KEY]: 'queued' }, items: [item] });
+  const rows = installRows([item], { [ARTIFACT_KEY]: 'queued' });
+  ui.handleWSMessage({ type: 'init', data: { jobs: [completedJob({ id: 'offline' })] } });
+  await ui.flushLiveReconcile();
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=model$/, 'initial snapshot re-reads cache presence');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'initial snapshot completes from cache');
+  eq(rows[0].dataset.dlStatus, 'done', 'initial snapshot updates the open rows');
+});
+
+scenario('live completion with 404 clears the active chip', async () => {
+  const item = artifactItem(FILES);
+  reset({ cacheStatus: 404, initial: { [ARTIFACT_KEY]: 'queued' }, items: [item] });
+  const rows = installRows([item], { [ARTIFACT_KEY]: 'queued' });
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'completed', files: [] }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], undefined, '404 leaves the artifact not-done');
+  eq(rows[0].dataset.dlStatus, '', 'completed job with 404 leaves no active chip');
+  match(rows[0].chip.outerHTML, /data-download=/, '404 restores the Download button');
+  doesNotMatch(rows[0].chip.outerHTML, /quant-dl-btn-queued|quant-dl-btn-running/, 'no stale queued chip');
+});
+
+scenario('live completion with a cache error clears a stale artifact done', async () => {
+  const item = artifactItem(FILES);
+  reset({ cacheError: new Error('cache lookup failed'), initial: { [ARTIFACT_KEY]: 'done' }, items: [item] });
+  const rows = installRows([item], { [ARTIFACT_KEY]: 'done' });
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'completed', files: [] }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], undefined, 'cache error clears stale artifact done');
+  eq(rows[0].dataset.dlStatus, '', 'cache error restores the Download control');
+  match(rows[0].chip.outerHTML, /data-download=/, 'cache-error row is downloadable');
+});
+
+scenario('combined quant and mmproj job marks both artifact rows active', async () => {
+  const quant = artifactItem(FILES, 'Quant', 'q4_0');
+  const mmproj = visionItem([MMPROJ]);
+  reset({ items: [quant, mmproj] });
+  const rows = installRows([quant, mmproj]);
+  const combined = [...JOB_FILTERS, './' + MMPROJ];
+
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'queued', filters: combined }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(quant)], 'queued', 'quant queued by combined job');
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(mmproj)], 'queued', 'mmproj queued by combined job');
+  eq(rows[0].dataset.dlStatus, 'queued', 'quant row shows queued');
+  eq(rows[1].dataset.dlStatus, 'queued', 'mmproj row shows queued');
+
+  const queuedHtml = ui.renderSelectableItems([quant, mmproj], 'selectableItems');
+  assertQueued(rowFor(queuedHtml, 'Quant'), 'combined queued quant');
+  assertQueued(rowFor(queuedHtml, 'MMProj'), 'combined queued mmproj');
+
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'running', filters: combined }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(quant)], 'running', 'combined job moves quant to running');
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(mmproj)], 'running', 'combined job moves mmproj to running');
+  eq(rows[0].dataset.dlStatus, 'running', 'quant row shows running');
+  eq(rows[1].dataset.dlStatus, 'running', 'mmproj row shows running');
+});
+
+scenario('completed combined job does not finalize artifacts without cache presence', async () => {
+  const quant = artifactItem(FILES, 'Quant', 'q4_0');
+  const mmproj = visionItem([MMPROJ]);
+  reset({ cacheStatus: 404, items: [quant, mmproj] });
+  const rows = installRows([quant, mmproj]);
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ status: 'completed', filters: [...JOB_FILTERS, './' + MMPROJ] })
+  });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(quant)], undefined, 'completed job never makes quant done');
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(mmproj)], undefined, 'completed job never makes mmproj done');
+  eq(rows[0].dataset.dlStatus, '', 'quant row remains downloadable');
+  eq(rows[1].dataset.dlStatus, '', 'mmproj row remains downloadable');
+});
+
+scenario('quant-only job does not mark the mmproj artifact', async () => {
+  const quant = artifactItem(FILES, 'Quant', 'q4_0');
+  const mmproj = visionItem([MMPROJ]);
+  reset({ items: [quant, mmproj] });
+  const rows = installRows([quant, mmproj]);
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ status: 'running', filters: JOB_FILTERS }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(quant)], 'running', 'quant-only job marks quant');
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(mmproj)], undefined, 'quant-only job must not mark mmproj');
+  eq(rows[0].dataset.dlStatus, 'running', 'quant row active');
+  eq(rows[1].dataset.dlStatus, '', 'mmproj row stays idle');
+});
+
+scenario('mmproj-only upstream job does not mark the quant artifact', async () => {
+  const quant = artifactItem(FILES, 'Quant', 'q4_0');
+  const mmproj = visionItem([MMPROJ]);
+  reset({ items: [quant, mmproj] });
+  const rows = installRows([quant, mmproj]);
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ repo: 'upstream/base', localRepo: REPO, status: 'running', filters: ['./' + MMPROJ] })
+  });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(mmproj)], 'running', 'upstream mmproj job marks mmproj');
+  eq(ui.getDlStatus(REPO, false)[ui.selectableStatusKey(quant)], undefined, 'mmproj-only job must not mark quant');
+  eq(rows[0].dataset.dlStatus, '', 'quant row stays idle');
+  eq(rows[1].dataset.dlStatus, 'running', 'mmproj row active');
+});
+
+scenario('model and dataset cache namespaces stay isolated', async () => {
+  const item = artifactItem(FILES);
+  reset({ cacheFiles: FILES });
+  let result = await reconcile([item]);
+  eq(result.map[ARTIFACT_KEY], 'done', 'model cache presence is done');
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=model$/, 'model analysis requests type=model');
+  eq(storage.has(MODEL_STORAGE), true, 'model status is stored under the model namespace');
+  eq(storage.has(DATASET_STORAGE), false, 'dataset namespace is untouched');
+
+  // Switch the open analysis to the dataset namespace without clearing storage.
+  ui.state.jobs.clear();
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: true, selectable_items: [item] });
+  ui.resetLiveReconcile();
+  cacheRequests.length = 0;
+  cacheState = { status: 404, files: [], error: null, parseError: null };
+  result = await reconcile([item], { dataset: true });
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=dataset$/, 'dataset analysis requests type=dataset');
+  eq(result.map[ARTIFACT_KEY], undefined, 'dataset 404 is not done');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'dataset sync leaves the model namespace intact');
+  eq(storage.has(DATASET_STORAGE), false, 'empty dataset status is removed from its own key');
+
+  // A model job must not populate the dataset namespace, and vice versa.
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ id: 'model-job', status: 'running' }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, true)[ARTIFACT_KEY], undefined, 'model job does not cross into dataset status');
+
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ id: 'dataset-job', isDataset: true, status: 'running' }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, true)[ARTIFACT_KEY], 'running', 'dataset job updates the dataset namespace');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model status remains its own value');
+});
+
+scenario('legacy repo-only storage migrates into the current namespace', async () => {
+  reset({ cacheFiles: [] });
+  storage.clear();
+  storage.set(LEGACY_STORAGE, JSON.stringify({ Q4_K_M: 'done' }));
+  const item = { category: 'format', filter_value: 'Q4_K_M', label: 'Legacy Q4_K_M' };
+  eq(ui.getDlStatus(REPO, false)['Q4_K_M'], 'done', 'legacy token status survives migration');
+  eq(storage.has(MODEL_STORAGE), true, 'legacy status is written to the model namespace');
+  eq(storage.has(LEGACY_STORAGE), false, 'legacy untyped key is consumed once');
+  assertDone(ui.renderSelectableItems([item], 'selectableItems'), '', 'migrated legacy token row');
 });
 
 (async () => {
