@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestIsAllDigits covers the small helper that the legacy
@@ -384,6 +385,18 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The .meta payloads are deliberately unreadable fixtures. Age them past
+	// the claim grace window so cleanup classifies them as stale/corrupt
+	// records rather than a live mid-claim writer (the fresh-claim protection
+	// is covered by TestCleanupJobPartFiles_RespectsLiveClaim).
+	stale := time.Now().Add(-2 * claimGracePeriod)
+	for name := range tracked {
+		if strings.HasSuffix(name, ".meta") {
+			if err := os.Chtimes(filepath.Join(blobsDir, name), stale, stale); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 
 	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -418,6 +431,13 @@ func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Unreadable fixture record: age it past the claim grace window so cleanup
+	// treats it as stale/corrupt, not as a live mid-claim writer.
+	modelMeta := filepath.Join(repoDir, "model.bin.incomplete.meta")
+	stale := time.Now().Add(-2 * claimGracePeriod)
+	if err := os.Chtimes(modelMeta, stale, stale); err != nil {
+		t.Fatal(err)
 	}
 	if err := CleanupJobPartFiles(Settings{OutputDir: tmpDir}, []string{filepath.Join(repoDir, "model.bin")}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)

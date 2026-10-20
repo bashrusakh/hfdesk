@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -241,32 +240,48 @@ func (r *RepoDir) EnsureDirs() error {
 
 // IncompleteMeta contains metadata about an incomplete download.
 //
-// The base fields (PID, StartedAt, Size, SHA256) carry the cross-process
-// ownership and staleness state CheckBlob and the stale-takeover logic use.
-// The Version/Ranges fields extend the record into the ranged-download
-// resume state (issue #140): a Version 2 meta describes a direct-write
-// staging file whose valid bytes are exactly the committed prefixes of the
-// listed ranges. Ranges is the authoritative byte contract for an existing
-// incomplete download, deliberately decoupled from the worker count so a
-// changed Settings.Concurrency re-fetches only missing bytes instead of
-// invalidating valid ones. Crash-safety contract: payload data is written
+// The base fields (PID, StartedAt, Size, SHA256) describe the transfer, while
+// Instance and Host carry the cross-process ownership identity and staleness
+// state used by CheckBlob and the claim/take-over logic. PID alone is only a
+// hint: a reused PID or two containers reporting PID 1 must not be treated as
+// the same owner. The Version/Ranges fields extend the record into the
+// ranged-download resume state (issue #140): a Version 2 meta describes a
+// direct-write staging file whose valid bytes are exactly the committed
+// prefixes of the listed ranges. Ranges is the authoritative byte contract for
+// an existing incomplete download, deliberately decoupled from the worker
+// count so a changed Settings.Concurrency re-fetches only missing bytes instead
+// of invalidating valid ones. Crash-safety contract: payload data is written
 // before Committed is advanced, the metadata file may lag the payload, and
 // Committed must never claim bytes that were not successfully written. The
 // staging file is preallocated, so its on-disk length is never evidence of
-// completion — only Ranges is.
+// completion — only Ranges is, and only after the payload's existence and
+// logical size have been checked and completion has been normalized.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
+	// Instance is a random per-process identity token. It distinguishes an
+	// earlier run of this process instance from a different process that
+	// happens to report the same PID (PID reuse, containers sharing PID 1).
+	// PID and Host are hints; Instance is never inferred from them.
+	Instance string `json:"instance,omitempty"`
+	// Host is the hostname that wrote the record. It allows a same-host
+	// liveness check of PID; an empty or different host leaves heartbeat
+	// freshness as the only ownership signal.
+	Host string `json:"host,omitempty"`
 	// Version is 0 for legacy records (no range state) and 2 for ranged
 	// staging records written by the issue #140 downloader.
 	Version int `json:"version,omitempty"`
-	// Repo, Revision and Path identify the remote object the staging file
-	// belongs to, so a reused destination cannot silently resume another
-	// file's bytes.
-	Repo     string `json:"repo,omitempty"`
+	// Repo, Path and Commit identify the resolved remote object the staging
+	// file belongs to, so a reused destination or moved branch cannot
+	// silently resume another revision's bytes. The commit is the resolved
+	// SHA from the plan, not the requested branch name.
+	Repo string `json:"repo,omitempty"`
+	// Revision is a legacy advisory field written by earlier records. It is
+	// not part of the resume identity (the resolved Commit is).
 	Revision string `json:"revision,omitempty"`
+	Commit   string `json:"commit,omitempty"`
 	Path     string `json:"path,omitempty"`
 	// Ranges lists the persisted range layout and per-range committed
 	// progress; see RangeProgress. Empty for legacy records.
@@ -345,21 +360,21 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobStale, nil, nil
 	}
 
-	// Check if the process is still alive. Our own PID is excluded: a
-	// staging record from an earlier run of THIS process (a paused job
-	// resumed in-process, or a retry) has no concurrently-running writer,
-	// so it must fall through to the take-over path instead of being
-	// reported as "downloading", which would permanently block resume
-	// inside a single server process. Genuine same-process concurrency is
-	// excluded separately by the downloader's in-process staging registry.
-	if meta.PID != 0 && meta.PID != os.Getpid() && isProcessAlive(meta.PID) {
-		// Check if file was recently modified
-		if time.Since(incompleteStat.ModTime()) < r.cache.StaleTimeout {
-			return BlobDownloading, meta, nil
-		}
+	// Check ownership/liveness. A record whose instance token matches this
+	// process is an earlier run of this process, not a live writer: the
+	// downloader's in-process registry distinguishes a currently running
+	// goroutine. A foreign record is downloading while its heartbeat record
+	// or its payload is fresh, unless its same-host owner is provably dead.
+	if stagingOwnerIsSelf(meta) || stagingOwnerProvablyDead(meta) {
+		return BlobStale, meta, nil
+	}
+	if metaFreshWithin(metaPath, claimGracePeriod) ||
+		time.Since(incompleteStat.ModTime()) < r.cache.StaleTimeout {
+		return BlobDownloading, meta, nil
 	}
 
-	// Process is dead or file is stale
+	// Process is dead, foreign on an unknown host with a stale heartbeat, or
+	// the file is stale.
 	return BlobStale, meta, nil
 }
 
@@ -380,6 +395,8 @@ func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
 	meta := IncompleteMeta{
 		PID:       os.Getpid(),
+		Instance:  processInstanceToken,
+		Host:      processHostname,
 		StartedAt: time.Now().UTC(),
 		Size:      size,
 		SHA256:    sha256,
@@ -391,13 +408,16 @@ func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
 	return os.WriteFile(r.IncompleteMetaPath(sha256), data, 0644)
 }
 
-// CleanupIncomplete removes the .incomplete and .incomplete.meta files.
+// CleanupIncomplete removes the .incomplete.meta and .incomplete files. The
+// metadata is removed first so a crash cannot leave a record claiming bytes
+// whose payload no longer exists.
 func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 	var errs []error
-	if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, err)
-	}
 	if err := os.Remove(r.IncompleteMetaPath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Do not delete the payload if its record could not be removed:
+		// that would leave a record claiming bytes that no longer exist.
+		errs = append(errs, err)
+	} else if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -420,20 +440,6 @@ func (r *RepoDir) FinalizeBlob(sha256 string) error {
 	_ = os.Remove(r.IncompleteMetaPath(sha256))
 
 	return nil
-}
-
-// isProcessAlive checks if a process with the given PID is still running.
-func isProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix, FindProcess always succeeds. We need to send signal 0 to check.
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
 }
 
 // FriendlyPath returns the path in the friendly view for this repo.

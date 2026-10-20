@@ -1794,6 +1794,18 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 			t.Fatal(err)
 		}
 	}
+	// These are the artifacts of a paused job whose downloader goroutine has
+	// already exited. The .meta fixtures are unreadable placeholders; age them
+	// past the claim grace window so claim-aware cleanup classifies them as
+	// stale (rather than a live foreign mid-claim writer) and removes them.
+	old := time.Now().Add(-time.Hour)
+	for _, path := range artifacts {
+		if strings.HasSuffix(path, ".meta") {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	// A "completed" blob that must survive any cleanup.
 	if err := os.WriteFile(filepath.Join(blobsDir, "completed-blob"), []byte("done"), 0o644); err != nil {
 		t.Fatal(err)

@@ -7,18 +7,17 @@ package hfdownloader
 // `go test -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`). It is
 // deliberately NOT part of the ordinary CI test run: it streams a large
 // synthetic payload through a local httptest server and records the
-// network-complete → file-done wall time plus the local bytes written and
-// read, via the stagingWriteBytes / hashPassBytes observability counters.
+// network-complete → file-done wall time plus the staging bytes written
+// (including the transfer landing on disk) and full-file hash bytes read,
+// via the stagingWriteBytes / hashPassBytes observability counters.
 //
 // Expected shapes (S = file size):
 //
 //   - pre-#140 path: ≈3×S post-network local I/O (assembly copy writes S,
 //     the unconditional SHA reread reads S, on top of the transfer);
-//   - new path, Verify=size: the staging writes are exactly the transfer
-//     (1×S total); ≈0×S EXTRA post-network local I/O — finalization is
-//     metadata plus one rename;
-//   - new path, Verify=sha256: ≈1×S post-network read (the single hash
-//     pass), no assembly write.
+//   - new path, Verify=size: stagingWriteBytes is ≈1×S (the transfer itself),
+//     extraLocalWrites is ≈0×S (no assembly copy), hashReadBytes is 0;
+//   - new path, Verify=sha256: ≈1×S hash read, no assembly write.
 //
 // The synthetic file size defaults to 1 GiB; set BENCHSIZE (bytes) to scale
 // it down on slow disks — the ratios are linear in S.
@@ -63,10 +62,13 @@ func benchFileSize() int64 {
 }
 
 // benchPatternReader serves a deterministic repeating pattern without
-// materializing the whole payload in memory.
+// materializing the whole payload in memory. off is the pattern offset of the
+// first byte, so a ranged response starts at the correct position within the
+// repeated block instead of restarting the block at every range.
 type benchPatternReader struct {
 	remain int64
 	block  []byte
+	off    int64
 }
 
 func (r *benchPatternReader) Read(p []byte) (int, error) {
@@ -77,12 +79,15 @@ func (r *benchPatternReader) Read(p []byte) (int, error) {
 	if n > r.remain {
 		n = r.remain
 	}
-	for off := int64(0); off < n; off += int64(len(r.block)) {
-		end := n - off
-		if end > int64(len(r.block)) {
-			end = int64(len(r.block))
+	blockLen := int64(len(r.block))
+	for written := int64(0); written < n; {
+		chunk := n - written
+		if avail := blockLen - r.off; chunk > avail {
+			chunk = avail
 		}
-		copy(p[off:off+end], r.block[:end])
+		copy(p[written:written+chunk], r.block[r.off:r.off+chunk])
+		written += chunk
+		r.off = (r.off + chunk) % blockLen
 	}
 	r.remain -= n
 	return int(n), nil
@@ -92,11 +97,14 @@ func (r *benchPatternReader) Read(p []byte) (int, error) {
 // the network transfer completes, for the two verification modes that
 // matter. Reported metrics per iteration:
 //
-//   - localWrites×S / localReads×S: total staging-file writes and
-//     full-file hash reads, as multiples of the file size (a fresh
-//     download's transfer writes are exactly 1×S, so reads beyond that
-//     are the post-network hash pass; writes beyond it would be assembly,
-//     which no longer exists);
+//   - stagingWriteBytes×S: total payload bytes written into the staging file,
+//     including the transfer itself landing on disk (a fresh transfer is
+//     ≈1×S, so this metric alone is not "extra" local I/O);
+//   - extraLocalWrites×S: stagingWriteBytes minus one file size, i.e. the
+//     extra local payload writes after the network transfer (assembly-style
+//     copies would show up here; the rename-only path is ≈0×S);
+//   - hashReadBytes×S: full-file SHA-256 bytes read (Verify=size ≈0×S,
+//     Verify=sha256 ≈1×S);
 //   - totalUs: the whole download's wall time (network + finalization on a
 //     loopback server, so the local I/O share dominates for large S).
 func BenchmarkRangedFinalization(b *testing.B) {
@@ -123,7 +131,7 @@ func BenchmarkRangedFinalization(b *testing.B) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
-			pr := &benchPatternReader{remain: end - start + 1, block: block}
+			pr := &benchPatternReader{remain: end - start + 1, block: block, off: start % int64(len(block))}
 			buf := make([]byte, 512<<10)
 			for {
 				n, err := pr.Read(buf)
@@ -182,8 +190,13 @@ func BenchmarkRangedFinalization(b *testing.B) {
 
 				written := stagingWriteBytes.Load()
 				read := hashPassBytes.Load()
-				b.ReportMetric(float64(written)/float64(size), "localWrites×S")
-				b.ReportMetric(float64(read)/float64(size), "localReads×S")
+				extraWrites := written - size
+				if extraWrites < 0 {
+					extraWrites = 0
+				}
+				b.ReportMetric(float64(written)/float64(size), "stagingWriteBytes×S")
+				b.ReportMetric(float64(extraWrites)/float64(size), "extraLocalWrites×S")
+				b.ReportMetric(float64(read)/float64(size), "hashReadBytes×S")
 				b.ReportMetric(float64(elapsed.Microseconds()), "totalUs")
 
 				fi, err := os.Stat(dst)

@@ -114,6 +114,10 @@ func writeMultipartResumeLayout(dst string, layout multipartResumeLayout) error 
 	return os.Rename(tmpPath, metaPath)
 }
 
+// multipartPartFiles lists the legacy per-connection payload files for dst:
+// dst.part-NN for a non-empty run of digits, matching the pre-#140 %02d/%d
+// part naming. Non-digit suffixes are not download artifacts and are left
+// alone.
 func multipartPartFiles(dst string) ([]string, error) {
 	dir := filepath.Dir(dst)
 	entries, err := os.ReadDir(dir)
@@ -127,6 +131,11 @@ func multipartPartFiles(dst string) ([]string, error) {
 	files := make([]string, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		// Only the legacy %02d/%d part index family; a user file such as
+		// "model.bin.part-notes" must not be swept up as a download artifact.
+		if !isAllDigits(strings.TrimPrefix(entry.Name(), prefix)) {
 			continue
 		}
 		files = append(files, filepath.Join(dir, entry.Name()))
@@ -145,6 +154,16 @@ func removeMultipartResumeFiles(dst string) error {
 		}
 	}
 	if err := os.Remove(multipartLayoutMetaPath(dst)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// removeLegacySinglePart removes the pre-#140 single-download prefix
+// (dst+".part") once it has either been migrated into the staging record or
+// become obsolete because a valid .part-NN layout won the migration.
+func removeLegacySinglePart(dst string) error {
+	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -517,6 +536,10 @@ LOOP:
 			// and the store path.
 			blobDirect := useHFCache && canonicalSHA256(it.SHA256)
 			var mpOpts multipartOpts
+			// The resolved plan commit is part of the staging record's resume
+			// identity. The requested branch name is not enough: a moved
+			// branch could otherwise resume old bytes in Verify=size mode.
+			mpOpts.Commit = plan.Commit
 			if blobDirect {
 				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
 				mpOpts.Publish = repoDir.BlobPath(it.SHA256)
@@ -551,11 +574,14 @@ LOOP:
 				if cfg.OnPartialFile != nil {
 					cfg.OnPartialFile(dst, true)
 				}
-				emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
-				if manifestBuilder != nil {
-					manifestMu.Lock()
-					manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
-					manifestMu.Unlock()
+				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
+					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
+					atomic.AddInt64(&skippedCount, 1)
+					if manifestBuilder != nil {
+						manifestMu.Lock()
+						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+						manifestMu.Unlock()
+					}
 				}
 				return
 			}
@@ -877,17 +903,21 @@ func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
 	root := cleanupRoot(settings, useHFCache)
+	staleTimeout := DefaultStaleTimeout
+	if d, err := parseStaleTimeoutSetting(settings); err == nil {
+		staleTimeout = d
+	}
 	for _, dst := range dsts {
 		if !pathWithinRoot(root, dst) {
 			log.Printf("warning: skip cleanup for out-of-root partial dst %s", dst)
 			continue
 		}
-		if err := removePartialArtifacts(dst); err != nil {
+		if err := removePartialArtifacts(dst, staleTimeout); err != nil {
 			log.Printf("warning: cleanup partials for %s: %v", dst, err)
 		}
 		if useHFCache {
 			removeHFCacheTemp(dst)
-			removeBlobStagingForTemp(dst)
+			removeBlobStagingForTemp(dst, staleTimeout)
 		}
 	}
 	return nil
@@ -902,7 +932,11 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 // tmp-<canonical-sha> temporaries are left alone — a coincidentally named
 // file cannot contribute a canonical SHA, so nothing outside the
 // downloader's own naming scheme is ever touched.
-func removeBlobStagingForTemp(dst string) {
+//
+// The pair is removed only when no live claim remains (in-process registry,
+// then record owner/freshness), so cancelling one job can never delete
+// another live job's staging file.
+func removeBlobStagingForTemp(dst string, staleTimeout time.Duration) {
 	base := filepath.Base(dst)
 	sha, ok := strings.CutPrefix(base, "tmp-")
 	if !ok || sha == "" || !canonicalSHA256(sha) {
@@ -910,7 +944,7 @@ func removeBlobStagingForTemp(dst string) {
 	}
 	// lgtm[go/path-injection]
 	staging := filepath.Join(filepath.Dir(dst), sha+".incomplete")
-	removeStagingArtifacts(staging, staging+".meta")
+	removeStagingArtifactsIfUnclaimed(staging, staging+".meta", staleTimeout)
 }
 
 func cleanupRoot(settings Settings, useHFCache bool) string {
@@ -986,20 +1020,16 @@ func removeHFCacheTemp(dst string) {
 // recognized suffix family and a digit run, so a coincidentally
 // named "weights.part" or similar user file with a different base
 // (which would not appear in dsts) is not touched.
-func removePartialArtifacts(dst string) error {
+func removePartialArtifacts(dst string, staleTimeout time.Duration) error {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
 	}
-	// Ranged staging file and resume metadata (issue #140).
-	// lgtm[go/path-injection]
-	if err := os.Remove(dst + ".incomplete"); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst+".incomplete", err)
-	}
-	// lgtm[go/path-injection]
-	if err := os.Remove(dst + ".incomplete.meta"); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst+".incomplete.meta", err)
-	}
+	// Ranged staging file and resume metadata (issue #140). The pair is
+	// removed only when no live claim remains; the metadata goes first inside
+	// removeStagingArtifacts so a crash cannot leave a record claiming a
+	// deleted payload.
+	removeStagingArtifactsIfUnclaimed(dst+".incomplete", dst+".incomplete.meta", staleTimeout)
 	// Multipart parts: glob the dst's directory for files matching
 	// dst+".part-NNN" pattern. This matches what the legacy downloader
 	// produced (the parts have indices 0..n-1).

@@ -26,8 +26,8 @@ package hfdownloader
 //     pass); a resumed sequential transfer falls back to one final pass;
 //  11. legacy .part-NN/.parts.json upgrade path
 //     (TestDownloadMultipart_ResumesPartialPart and
-//     TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts in
-//     resume_test.go);
+//     TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded in
+//     resume_test.go), plus single .part prefix migration;
 //  12. two concurrent claims for the same staging file → only one writer;
 //  13. stall/retry/cancel/fail-fast behavior (robustness_test.go suite).
 
@@ -109,7 +109,9 @@ func seedRangedState(t *testing.T, staging, repo, path string, size int64, range
 	}
 	out.Close()
 	meta := IncompleteMeta{
-		PID:       os.Getpid(), // our own PID: claim treats it as take-over-able
+		PID:       os.Getpid(),
+		Instance:  processInstanceToken, // same process instance: earlier run, no live writer
+		Host:      processHostname,
 		StartedAt: time.Now().UTC(),
 		Size:      size,
 		Version:   stagingMetaVersion,
@@ -793,6 +795,16 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 		// run.
 		ranges := []RangeProgress{{Start: 0, End: total - 1, Committed: total / 2}}
 		seedRangedState(t, staging, "o/r", "seq-resume.bin", total, ranges, full)
+		// The item is an LFS blob with a digest, so the record must carry the
+		// same digest: a one-sided SHA is no longer resumable (S5).
+		seeded, err := readStagingMeta(staging + ".meta")
+		if err != nil {
+			t.Fatal(err)
+		}
+		seeded.SHA256 = sha
+		if err := writeStagingMeta(staging+".meta", seeded); err != nil {
+			t.Fatal(err)
+		}
 
 		srv, _ := rangedTestServer(t, full)
 
@@ -969,9 +981,10 @@ func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 		{Start: 4000, End: 7999},
 	}
 	seedRangedState(t, staging, "o/r", "dead.bin", total, ranges, full)
-	// seedRangedState writes our own PID — the take-over case this test
-	// wants: a record from an earlier run of this process has no live
-	// writer, so the claim takes it over and resumes the committed range.
+	// seedRangedState writes our own PID and process instance token — the
+	// take-over case this test wants: a record from an earlier run of this
+	// process has no live writer, so the claim takes it over and resumes the
+	// committed range.
 
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "dead.bin", URL: srv.URL + "/dead.bin", Size: total, AcceptRanges: true}
