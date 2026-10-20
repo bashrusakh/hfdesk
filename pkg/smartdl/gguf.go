@@ -227,12 +227,19 @@ func isSplitShard(name string) bool {
 // repo-relative path. Some GGUF repos put split shards under a quantized
 // directory such as "UD-Q4_K_XL/" while the individual shard names omit the
 // quant token, so checking only FileInfo.Name is not enough.
+//
+// A recognized split suffix is stripped before matching. Underscore-delimited
+// shard names such as "model-Q4_K_M_00001-of-00002.gguf" (including the legacy
+// ".gguf-split" spelling) otherwise hide the quant token behind the shard
+// separator. Extended tokens without a recognized split suffix, such as
+// "Q4_K_M_EXTRA", remain unclassified.
 func ggufQuantType(f FileInfo) string {
 	candidates := []string{f.Name, f.Path}
 	for _, candidate := range candidates {
 		if candidate == "" {
 			continue
 		}
+		candidate = stripSplitSuffix(candidate)
 		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
 			quant := strings.ReplaceAll(strings.ToUpper(m[3]), "-", "_")
 			if m[2] != "" {

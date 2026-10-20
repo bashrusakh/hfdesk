@@ -1729,6 +1729,61 @@ func TestPlanRepoLegacyGGUFSplitFilterSelectsCompleteQuant(t *testing.T) {
 	})
 }
 
+// TestPlanRepoDatasetSplitConfigAndTokenizerAreNotData regresses the case
+// where a known config/tokenizer basename inside a split or data/<group>
+// directory was treated as definite data by directory grouping. The group
+// label still selects real data plus root companions, while same-split
+// metadata is neither retained nor advertised; unknown text keeps its
+// established split-data role, and a direct path still selects the metadata.
+func TestPlanRepoDatasetSplitConfigAndTokenizerAreNotData(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "config.json", Size: 1},
+		{Type: "file", Path: "notes.txt", Size: 2},
+		{Type: "file", Path: "train/train.parquet", Size: 10},
+		{Type: "file", Path: "train/notes.txt", Size: 11},
+		{Type: "file", Path: "train/config.json", Size: 12},
+		{Type: "file", Path: "train/tokenizer.json", Size: 13},
+		{Type: "file", Path: "test/config.json", Size: 14},
+		{Type: "file", Path: "data/custom/config.json", Size: 15},
+		{Type: "file", Path: "data/custom/part.parquet", Size: 16},
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo group selection: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"config.json", "train/train.parquet", "train/notes.txt"})
+
+	plan, err = PlanRepo(context.Background(), Job{
+		Repo: "owner/data", IsDataset: true, Filters: []string{"custom"}, ExactMatch: true,
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo custom group selection: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"config.json", "data/custom/part.parquet"})
+
+	directFiles := []hfNode{
+		{Type: "file", Path: "train/train.parquet", Size: 10},
+		{Type: "file", Path: "train/config.json", Size: 12},
+		{Type: "file", Path: "train/tokenizer.json", Size: 13},
+	}
+	directSrv := mockHFServerForPlan(t, directFiles)
+	defer directSrv.Close()
+	for _, selected := range []string{"train/config.json", "train/tokenizer.json"} {
+		plan, err = PlanRepo(context.Background(), Job{
+			Repo: "owner/data", IsDataset: true, Filters: []string{selected}, ExactMatch: true,
+		}, Settings{Endpoint: directSrv.URL})
+		if err != nil {
+			t.Fatalf("PlanRepo direct metadata selection %q: %v", selected, err)
+		}
+		assertPaths(t, planPaths(plan), []string{selected})
+	}
+}
+
 func planPaths(plan *Plan) []string {
 	paths := make([]string, 0, len(plan.Items))
 	for _, item := range plan.Items {

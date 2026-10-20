@@ -63,7 +63,7 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
-func TestDatasetKnownMetadataNamesAreCompanionOnlyInScope(t *testing.T) {
+func TestDatasetKnownMetadataNamesAreCompanionOnlyAtAnyDepth(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
 		{Path: "tokenizer.json"},
@@ -72,26 +72,19 @@ func TestDatasetKnownMetadataNamesAreCompanionOnlyInScope(t *testing.T) {
 		{Path: "data/dataset_infos.json"},
 		{Path: "test/config.json"},
 		{Path: "nested/config.json"},
+		{Path: "train/tokenizer.json"},
+		{Path: "data/custom/config.json"},
 	}, []string{"train"}, nil)
-	for i := 1; i <= 4; i++ {
+	for i := 1; i < len(c.Inputs); i++ {
 		got := c.Inputs[i].Alternatives
 		if len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
-			t.Fatalf("in-scope known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
+			t.Fatalf("known metadata %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
 		}
-	}
-	for i := 5; i <= 6; i++ {
-		got := c.Inputs[i].Alternatives
-		if len(got) == 1 && got[0].Role == datasetselection.EvidenceRoleCompanion {
-			t.Fatalf("out-of-scope known metadata %q was forced companion-only: %+v", c.Inputs[i].Path, got)
-		}
-	}
-	if got := c.Inputs[6].Alternatives; len(got) < 2 || got[0].Role != datasetselection.EvidenceRoleData || got[1].Role != datasetselection.EvidenceRoleCompanion {
-		t.Fatalf("arbitrary nested config alternatives = %+v; want data/companion ambiguity", got)
 	}
 
 	excluded := compileDecisionFixture([]hfNode{{Path: "train.csv"}, {Path: "docs/dataset_info.json"}}, []string{"train"}, []string{"dataset_info.json"})
 	if !excluded.Inputs[1].Excluded {
-		t.Fatal("explicit exclude did not dominate scoped dataset metadata evidence")
+		t.Fatal("explicit exclude did not dominate dataset metadata evidence")
 	}
 }
 
@@ -102,8 +95,10 @@ func TestDatasetKnownConfigRoleScope(t *testing.T) {
 		{Path: "test/config.json"},
 	}, []string{"weights/model.gguf"}, nil)
 	target := 1
-	if got := c.Inputs[target].Alternatives; len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
-		t.Fatalf("root config alternatives = %+v; want companion-only", got)
+	for i := 1; i <= 2; i++ {
+		if got := c.Inputs[i].Alternatives; len(got) != 1 || got[0].Role != datasetselection.EvidenceRoleCompanion {
+			t.Fatalf("config %q alternatives = %+v; want companion-only", c.Inputs[i].Path, got)
+		}
 	}
 	companion := datasetDecisionRoleLabel{Role: datasetselection.EvidenceRoleCompanion}
 	world := mustDecisionWorld(t, c, map[int]datasetDecisionRoleLabel{target: companion}, nil)
@@ -114,9 +109,8 @@ func TestDatasetKnownConfigRoleScope(t *testing.T) {
 	if !evaluation.Records[target].Selected {
 		t.Fatalf("root config companion was not selected: %+v", evaluation.Records)
 	}
-	nested := c.Inputs[2].Alternatives
-	if len(nested) == 1 && nested[0].Role == datasetselection.EvidenceRoleCompanion {
-		t.Fatalf("test/config.json was forced companion-only: %+v", nested)
+	if evaluation.Records[2].Selected {
+		t.Fatalf("out-of-scope nested config was retained: %+v", evaluation.Records)
 	}
 	for _, cached := range []bool{true, false} {
 		q := c
@@ -867,7 +861,7 @@ func TestCompileDatasetDecisionContextPathPredicatesAndDuplicates(t *testing.T) 
 func TestKnownCompanionRoleOverrideClearsDirectDataConditions(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
 		{Path: "docs/train/config.json"},
-		{Path: "test/train/config.json"},
+		{Path: "elsewhere/train-notes.json"},
 	}, []string{"train"}, nil)
 	inScope := c.Inputs[0]
 	if len(inScope.Alternatives) != 1 || inScope.Alternatives[0].Role != datasetselection.EvidenceRoleCompanion {
@@ -877,7 +871,7 @@ func TestKnownCompanionRoleOverrideClearsDirectDataConditions(t *testing.T) {
 		t.Fatalf("in-scope companion retained stale direct data state: %+v", inScope)
 	}
 	if c.Inputs[1].DirectCoreConditions == 0 {
-		t.Fatalf("out-of-scope config unexpectedly lost direct data state: %+v", c.Inputs[1])
+		t.Fatalf("out-of-scope unknown json unexpectedly lost direct data state: %+v", c.Inputs[1])
 	}
 }
 

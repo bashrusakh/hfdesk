@@ -213,6 +213,94 @@ func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
 	}
 }
 
+// TestDatasetAnalyzerKeepsSplitDirectoryConfigAndTokenizerAsCompanions
+// regresses the config-only split advertisement: known config/tokenizer names
+// inside train/test/data/<custom> directories are metadata companions, not
+// split data, while unknown text inside a split directory keeps its data role.
+func TestDatasetAnalyzerKeepsSplitDirectoryConfigAndTokenizerAsCompanions(t *testing.T) {
+	paths := []string{
+		"config.json",
+		"notes.txt",
+		"train/train.parquet",
+		"train/notes.txt",
+		"train/config.json",
+		"train/tokenizer.json",
+		"test/config.json",
+		"data/custom/config.json",
+		"data/custom/part.parquet",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/splitmeta/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/splitmeta/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(paths))
+			for _, p := range paths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/splitmeta", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make(map[string][]string)
+	for _, item := range DatasetToSelectableItems(info.Dataset) {
+		groups[item.ID] = item.Files
+	}
+	if got, want := strings.Join(groups["train"], ","), "train/train.parquet,train/notes.txt"; got != want {
+		t.Fatalf("train split files = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(groups["custom"], ","), "data/custom/part.parquet"; got != want {
+		t.Fatalf("custom split files = %q, want %q", got, want)
+	}
+	if _, ok := groups["test"]; ok {
+		t.Fatalf("config-only test split was advertised: %+v", groups)
+	}
+	if len(info.Dataset.Splits) != 2 {
+		t.Fatalf("splits = %+v, want only train and custom", info.Dataset.Splits)
+	}
+
+	configOnlyPaths := []string{
+		"config.json",
+		"train/config.json",
+		"train/tokenizer_config.json",
+		"test/tokenizer.json",
+		"data/custom/config.json",
+	}
+	configOnly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/configonly/revision/rev1"):
+			_, _ = w.Write([]byte(`{"sha":"rev1"}`))
+		case strings.Contains(r.URL.Path, "/api/datasets/owner/configonly/tree/rev1"):
+			nodes := make([]map[string]any, 0, len(configOnlyPaths))
+			for _, p := range configOnlyPaths {
+				nodes = append(nodes, map[string]any{"type": "file", "path": p, "size": 10})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer configOnly.Close()
+
+	info, err = NewAnalyzer(AnalyzerOptions{Endpoint: configOnly.URL, HTTPClient: configOnly.Client()}).AnalyzeWithRevision(context.Background(), "owner/configonly", true, "rev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Dataset.Splits) != 0 {
+		t.Fatalf("config-only repository advertised splits: %+v", info.Dataset.Splits)
+	}
+	if items := DatasetToSelectableItems(info.Dataset); len(items) != 0 {
+		t.Fatalf("config-only repository advertised selectable splits: %+v", items)
+	}
+}
+
 func TestDatasetRecommendedFilterPlansSameRevisionMembership(t *testing.T) {
 	paths := []string{"train.csv", "corpus_train_000.parquet", "corpus_test_000.parquet", "pretrain_000.parquet", "test_data.csv", "data/customdata/chunk.arrow", "default.parquet", "config.json", "dataset_info.json", "README.md"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

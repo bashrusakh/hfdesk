@@ -137,32 +137,66 @@ var dataExtension = map[string]bool{
 }
 
 // IsMetadata reports whether p is a recognized metadata or companion file.
-// README and LICENSE variants and dataset_info(s).json are recognized by
-// basename at any depth. config.json is recognized only at the repository root,
-// so a nested config.json keeps its established data/ambiguous classification.
-// Other .json/.jsonl/.txt files remain data/companion ambiguous.
+// README and LICENSE variants, dataset_info(s).json, and known model/config/
+// tokenizer basenames are recognized at any depth, so directory grouping cannot
+// turn metadata under train/, test/, or data/<group>/ into definite dataset
+// data. Other .json/.jsonl/.txt files remain data/companion ambiguous.
 func IsMetadata(p string) bool {
 	p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
 	if p == "" {
 		return false
 	}
 	base := strings.ToLower(path.Base(p))
-	if isReadmeVariant(base) || isLicenseVariant(base) {
+	return isReadmeVariant(base) || isLicenseVariant(base) || isKnownMetadataBasename(base)
+}
+
+// knownMetadataBasenames are established non-data names that appear alongside
+// datasets and models. They are exact basenames (or the narrow patterns in
+// isKnownMetadataBasename), never a general .json/.txt classification.
+var knownMetadataBasenames = map[string]bool{
+	// Dataset service metadata.
+	"dataset_info.json":  true,
+	"dataset_infos.json": true,
+
+	// Model and tokenizer configuration.
+	"config.json":              true,
+	"generation_config.json":   true,
+	"preprocessor_config.json": true,
+	"processor_config.json":    true,
+	"quantization_config.json": true,
+	"adapter_config.json":      true,
+	"tokenizer.json":           true,
+	"tokenizer_config.json":    true,
+	"special_tokens_map.json":  true,
+	"added_tokens.json":        true,
+	"vocab.json":               true,
+	"merges.txt":               true,
+	"vocab.txt":                true,
+	"tokenizer.model":          true,
+	"sentencepiece.bpe.model":  true,
+	"spiece.model":             true,
+	"tokenizer.bin":            true,
+
+	// Packaging and environment manifests.
+	"pyproject.toml": true,
+	"setup.py":       true,
+	"setup.cfg":      true,
+}
+
+func isKnownMetadataBasename(base string) bool {
+	if knownMetadataBasenames[base] {
 		return true
 	}
-	switch base {
-	case "dataset_info.json", "dataset_infos.json":
+	if strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt") {
 		return true
-	case "config.json":
-		return !strings.Contains(p, "/")
-	default:
-		return false
 	}
+	return strings.HasPrefix(base, "environment") &&
+		(strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml"))
 }
 
 // IsRootMetadata reports whether p is a known repository-root metadata or
-// companion name. It is the root-only view of IsMetadata and keeps config.json
-// recognition scoped to the repository root.
+// companion name. It is the root-only view of IsMetadata and keeps the root
+// evidence reason distinct from nested metadata.
 func IsRootMetadata(p string) bool {
 	p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
 	return p != "" && !strings.Contains(p, "/") && IsMetadata(p)

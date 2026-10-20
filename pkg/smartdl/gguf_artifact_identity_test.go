@@ -33,12 +33,161 @@ func TestGGUFQuantClassificationUsesWholeTokensAndPathSeparators(t *testing.T) {
 		{"model Q4_K_MX.gguf", ""},
 		{"model Q4_K_M_EXTRA.gguf", ""},
 		{"Mistral 7B Q4_K_M_EXTRA.gguf", ""},
+		{"model-Q4_K_M_00001-of-00002.gguf", "Q4_K_M"},
+		{"model-Q4_K_M_00002-of-00002.gguf", "Q4_K_M"},
+		{"model-Q6_K_00001-of-00002.gguf", "Q6_K"},
+		{"UD-Q4_K_XL_00001-of-00002.gguf", "UD_Q4_K_XL"},
+		{"MODEL-Q4_K_M_00001-OF-00002.GGUF-SPLIT", "Q4_K_M"},
+		{"model-Q4_K_M_00001-of-00002.gguf-split", "Q4_K_M"},
+		{"model-Q4_K_M_EXTRA_00001-of-00002.gguf", ""},
+		{"model-Q4_K_M_EXTRA_00001-of-00002.gguf-split", ""},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			if got := ggufQuantType(FileInfo{Name: filepath.Base(tc.path), Path: tc.path}); got != tc.want {
 				t.Fatalf("ggufQuantType(%q) = %q, want %q", tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGGUFUnderscoreDelimitedSplitArtifactsKeepQuantIdentity covers split
+// shards whose quant token is separated from the shard suffix by an
+// underscore. Both ".gguf" and legacy ".gguf-split" shards must keep their
+// quant identity, stay grouped with every shard in Files, expose exactly one
+// recommended Q4 artifact, leave Q6/unknown artifacts unselected, and remain
+// directly selectable by the public planner through the recommended request.
+func TestGGUFUnderscoreDelimitedSplitArtifactsKeepQuantIdentity(t *testing.T) {
+	files := []FileInfo{
+		{Name: "model-Q4_K_M_00001-of-00002.gguf", Path: "model-Q4_K_M_00001-of-00002.gguf", Size: 3_000_000_000},
+		{Name: "model-Q4_K_M_00002-of-00002.gguf", Path: "model-Q4_K_M_00002-of-00002.gguf", Size: 2_500_000_000},
+		{Name: "legacy-Q4_K_M_00001-of-00002.gguf-split", Path: "legacy-Q4_K_M_00001-of-00002.gguf-split", Size: 2_000_000_000},
+		{Name: "legacy-Q4_K_M_00002-of-00002.gguf-split", Path: "legacy-Q4_K_M_00002-of-00002.gguf-split", Size: 1_900_000_000},
+		{Name: "model-Q6_K_00001-of-00002.gguf", Path: "model-Q6_K_00001-of-00002.gguf", Size: 1_500_000_000},
+		{Name: "model-Q6_K_00002-of-00002.gguf", Path: "model-Q6_K_00002-of-00002.gguf", Size: 1_400_000_000},
+		{Name: "model-Q4_K_M_EXTRA.gguf", Path: "model-Q4_K_M_EXTRA.gguf", Size: 1_000_000_000},
+	}
+	info := analyzeGGUF(files)
+	if info == nil {
+		t.Fatal("analyzeGGUF returned nil for underscore-delimited split shards")
+	}
+	if got := len(info.Quantizations); got != 4 {
+		t.Fatalf("got %d independent artifacts, want 4: %+v", got, info.Quantizations)
+	}
+	byFirstShard := make(map[string]GGUFQuantization, len(info.Quantizations))
+	for _, quantization := range info.Quantizations {
+		if len(quantization.Files) == 0 {
+			t.Fatalf("artifact %+v has no Files", quantization)
+		}
+		byFirstShard[quantization.Files[0]] = quantization
+	}
+	for first, want := range map[string]struct {
+		name  string
+		files []string
+	}{
+		"model-Q4_K_M_00001-of-00002.gguf": {
+			name: "Q4_K_M",
+			files: []string{
+				"model-Q4_K_M_00001-of-00002.gguf",
+				"model-Q4_K_M_00002-of-00002.gguf",
+			},
+		},
+		"legacy-Q4_K_M_00001-of-00002.gguf-split": {
+			name: "Q4_K_M",
+			files: []string{
+				"legacy-Q4_K_M_00001-of-00002.gguf-split",
+				"legacy-Q4_K_M_00002-of-00002.gguf-split",
+			},
+		},
+		"model-Q6_K_00001-of-00002.gguf": {
+			name: "Q6_K",
+			files: []string{
+				"model-Q6_K_00001-of-00002.gguf",
+				"model-Q6_K_00002-of-00002.gguf",
+			},
+		},
+		"model-Q4_K_M_EXTRA.gguf": {
+			name:  "Unknown",
+			files: []string{"model-Q4_K_M_EXTRA.gguf"},
+		},
+	} {
+		got, ok := byFirstShard[first]
+		if !ok {
+			t.Fatalf("missing artifact beginning with %q: %+v", first, info.Quantizations)
+		}
+		if got.Name != want.name || !reflect.DeepEqual(got.Files, want.files) {
+			t.Errorf("artifact %q = name %q files %v, want name %q files %v", first, got.Name, got.Files, want.name, want.files)
+		}
+	}
+
+	items := GGUFToSelectableItems(info)
+	var recommended []SelectableItem
+	for _, item := range items {
+		if item.Category == "quantization" && item.Recommended {
+			recommended = append(recommended, item)
+		}
+	}
+	if len(recommended) != 1 {
+		t.Fatalf("got %d recommended quantizations, want exactly 1: %+v", len(recommended), recommended)
+	}
+	wantRecommendedFiles := []string{
+		"model-Q4_K_M_00001-of-00002.gguf",
+		"model-Q4_K_M_00002-of-00002.gguf",
+	}
+	if !strings.Contains(recommended[0].Label, "Q4_K_M") || !reflect.DeepEqual(recommended[0].Files, wantRecommendedFiles) {
+		t.Fatalf("recommended item label/files = %q/%v, want Q4_K_M %v", recommended[0].Label, recommended[0].Files, wantRecommendedFiles)
+	}
+
+	// Exercise the same recommendation through the public analyzer and plan
+	// the exact artifact paths it emits. The underscore shard spelling must not
+	// lose the analyzer's quant identity or the planner's complete group.
+	var tree []map[string]any
+	for _, file := range files {
+		tree = append(tree, map[string]any{"type": "file", "path": file.Path, "size": file.Size, "lfs": map[string]any{"size": file.Size}})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/datasets/") {
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/revision/main") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": strings.Repeat("a", 40)})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/tree/") {
+			_ = json.NewEncoder(w).Encode(tree)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	analyzed, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/repo", false)
+	if err != nil {
+		t.Fatalf("public analyzer: %v", err)
+	}
+	selection := analyzed.RecommendedDownload
+	if selection == nil || !selection.ExactMatch {
+		t.Fatalf("recommended download = %+v, want an exact request", selection)
+	}
+	var recommendedPaths []string
+	for _, filter := range selection.Filters {
+		recommendedPaths = append(recommendedPaths, strings.TrimPrefix(filter, "./"))
+	}
+	if !reflect.DeepEqual(recommendedPaths, wantRecommendedFiles) {
+		t.Fatalf("recommended filters = %v, want complete underscore Q4 group %v", selection.Filters, wantRecommendedFiles)
+	}
+	plan, err := hfdownloader.PlanRepo(context.Background(), hfdownloader.Job{
+		Repo: selection.Repo, Filters: selection.Filters, ExactMatch: selection.ExactMatch,
+	}, hfdownloader.Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo recommended selection: %v", err)
+	}
+	var planned []string
+	for _, item := range plan.Items {
+		planned = append(planned, item.RelativePath)
+	}
+	if !reflect.DeepEqual(planned, wantRecommendedFiles) {
+		t.Fatalf("planned paths = %v, want complete underscore Q4 group %v", planned, wantRecommendedFiles)
 	}
 }
 
