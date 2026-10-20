@@ -136,8 +136,10 @@ const hook = `
     renderSelectableItems,
     updateSelectableRowStatuses,
     handleWSMessage,
+    reconcileAnalysisAfterLoad,
     getDlStatus,
     selectableStatusKey,
+    hasLiveReconcileTimer() { return liveStatusReconcileTimer !== null; },
     setCurrentAnalysis(value) { currentAnalysis = value; },
     async flushLiveReconcile() {
       if (liveStatusReconcileTimer !== null) {
@@ -522,6 +524,38 @@ scenario('initial socket snapshot reconciles a job that finished while disconnec
   match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=model$/, 'initial snapshot re-reads cache presence');
   eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'initial snapshot completes from cache');
   eq(rows[0].dataset.dlStatus, 'done', 'initial snapshot updates the open rows');
+});
+
+scenario('post-load reconciliation catches a completion from the load window', async () => {
+  const item = artifactItem(FILES);
+  const previousItem = artifactItem(['previous-Q4_0.gguf'], 'Previous', 'previous');
+  ui.state.jobs.clear();
+  ui.state.settings = {};
+  ui.setCurrentAnalysis({ repo: 'owner/previous', is_dataset: false, selectable_items: [previousItem] });
+  ui.resetLiveReconcile();
+  domNodes.delete('#selectableItems');
+  cacheRequests.length = 0;
+  storage.clear();
+  cacheState = { status: 200, files: FILES, error: null, parseError: null };
+  const rows = installRows([item], { [ARTIFACT_KEY]: 'queued' });
+
+  // The new analysis has not been committed yet, so handleWSMessage compares
+  // this completion against the previous analysis and cannot schedule it.
+  ui.handleWSMessage({ type: 'job_update', data: liveJob({ id: 'load-race', status: 'completed', files: [] }) });
+  eq(ui.hasLiveReconcileTimer(), false, 'completion during load is not scheduled against the previous analysis');
+
+  // The successful load commits currentAnalysis and renders, then schedules
+  // the post-load reconciliation used by loadRepositoryDetails.
+  ui.setCurrentAnalysis({ repo: REPO, is_dataset: false, selectable_items: [item] });
+  ui.reconcileAnalysisAfterLoad();
+  eq(ui.hasLiveReconcileTimer(), true, 'post-load reconciliation is scheduled');
+  await ui.flushLiveReconcile();
+
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?type=model$/, 'post-load reconciliation reads the committed namespace');
+  eq(cacheRequests.length, 1, 'post-load reconciliation uses one coalesced cache read');
+  eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'completion from the load window is finalized from cache');
+  eq(rows[0].dataset.dlStatus, 'done', 'post-load reconciliation updates the rendered row');
+  eq(storage.has(MODEL_STORAGE), true, 'post-load status is stored in the model namespace');
 });
 
 scenario('live completion with 404 clears the active chip', async () => {

@@ -1549,6 +1549,11 @@ async function loadRepositoryDetails(entry) {
     replaceRepoHistoryEntry(resolvedEntry);
     syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
     renderAnalysisResult(data);
+    // A job event can arrive after the cache fetch above but before
+    // currentAnalysis points at this repository. handleWSMessage compares
+    // against the previous analysis and cannot schedule it, so reconcile once
+    // now that the new analysis is committed and rendered.
+    reconcileAnalysisAfterLoad();
     if (focusAfterRetry) {
       const tabs = $('#modelsDetailTabs');
       if (tabs && !tabs.hidden) $('#modelsTabOverview')?.focus();
@@ -5430,6 +5435,14 @@ async function loadRepositoryDetails(entry) {
     if (syncCache) liveStatusReconcileNeedsCache = true;
     if (liveStatusReconcileTimer !== null || liveStatusReconcileRunning) return;
     liveStatusReconcileTimer = setTimeout(runLiveAnalysisReconcile, LIVE_STATUS_RECONCILE_DELAY_MS);
+  }
+
+  // Called by loadRepositoryDetails once the new analysis is committed and
+  // rendered. A job event that arrived during the load was compared against
+  // the previous analysis and could not be scheduled, so run one coalesced
+  // reconciliation (including cache presence) for the committed analysis.
+  function reconcileAnalysisAfterLoad() {
+    scheduleLiveAnalysisReconcile({ syncCache: true });
   }
 
   async function runLiveAnalysisReconcile() {
