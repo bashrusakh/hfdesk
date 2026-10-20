@@ -172,14 +172,16 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 			case <-r.Context().Done():
 				return
 			}
-		} else if servedOthers.Add(1) == nRanges-1 {
-			releaseOnce.Do(func() { close(releaseFirst) })
 		}
 		content := full[start : end+1]
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(full)))
 		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 		w.WriteHeader(http.StatusPartialContent)
-		w.Write(content)
+		if _, err := w.Write(content); err == nil && start != 0 {
+			if servedOthers.Add(1) == nRanges-1 {
+				releaseOnce.Do(func() { close(releaseFirst) })
+			}
+		}
 	}))
 	defer srv.Close()
 
@@ -1310,7 +1312,7 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		assertExactFile(t, staging, before)
 	})
 
-	t.Run("stale record and payload with no ownership lock is taken over", func(t *testing.T) {
+	t.Run("stale unfenced record remains protected", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		full := rangedTestPayload(total)
 		dst := filepath.Join(tmpDir, "hb-stale.bin")
@@ -1321,20 +1323,26 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		seedForeignOwned(t, staging, full, 4000)
 		staleMtime(t, staging)
 		staleMtime(t, staging+".meta")
-		// No ownership lock is held: the previous owner is gone, so the
-		// committed prefix is recoverable immediately (a live but hung owner
-		// would still hold the lock and is deliberately not taken over).
+		before, err := os.ReadFile(staging)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A free current-version lock cannot prove that a legacy/unfenced
+		// predecessor is unable to resume writing.
 
 		srv, gotRanges := rangedTestServer(t, full)
 		it := PlanItem{RelativePath: "hb.bin", URL: srv.URL + "/hb.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-			t.Fatalf("a hung live owner must eventually lose its claim: %v", err)
+		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); !errors.Is(err, errBlobIncompleteOwned) {
+			t.Fatalf("unfenced predecessor error = %v, want owned/busy", err)
 		}
-		assertExactFile(t, dst, full)
-		if len(*gotRanges) != 1 || (*gotRanges)[0] != "bytes=4000-7999" {
-			t.Errorf("take-over must resume the committed prefix, got %v", *gotRanges)
+		after, readErr := os.ReadFile(staging)
+		if readErr != nil || !bytes.Equal(after, before) {
+			t.Errorf("unfenced staging payload changed (read err=%v)", readErr)
+		}
+		if len(*gotRanges) != 0 {
+			t.Errorf("unfenced predecessor triggered network writes: %v", *gotRanges)
 		}
 	})
 }

@@ -262,11 +262,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if err != nil {
 		return fmt.Errorf("invalid multipart-threshold: %w", err)
 	}
-	staleTimeout := DefaultStaleTimeout
-	if d, err := parseStaleTimeoutSetting(cfg); err == nil {
-		staleTimeout = d
-	}
-
 	httpc := buildHTTPClientWithProxy(cfg.Proxy)
 
 	emit := func(ev ProgressEvent) {
@@ -600,7 +595,7 @@ LOOP:
 			resumeState := multipartResumeState{
 				legacy: hasUsableLegacyMultipartState(dst, it.Size),
 			}
-			if hasResumableStagingState(v2Staging, v2Staging+".meta", it, job, plan.Commit) {
+			if hasResumableStagingState(v2Staging, v2Staging+".meta", itForIO, job, plan.Commit) {
 				resumeState.v2Staging = v2Staging
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
@@ -851,7 +846,7 @@ LOOP:
 			// claim-checked so a live owner's state is never deleted and no stale
 			// pair survives a successful download.
 			if obsoleteV2Staging != "" {
-				removeStagingArtifactsIfUnclaimed(obsoleteV2Staging, obsoleteV2Staging+".meta", staleTimeout)
+				removeStagingArtifactsIfUnclaimed(obsoleteV2Staging, obsoleteV2Staging+".meta")
 			}
 
 			// File is now at its final location; the partial (dst in HF
@@ -1097,7 +1092,7 @@ func removeBlobStagingForTemp(dst string, staleTimeout time.Duration) {
 	}
 	// lgtm[go/path-injection]
 	staging := filepath.Join(filepath.Dir(dst), sha+".incomplete")
-	removeStagingArtifactsIfUnclaimed(staging, staging+".meta", staleTimeout)
+	removeStagingArtifactsIfUnclaimed(staging, staging+".meta")
 }
 
 func cleanupRoot(settings Settings, useHFCache bool) string {
@@ -1182,7 +1177,7 @@ func removePartialArtifacts(dst string, staleTimeout time.Duration) error {
 	// removed only when no live claim remains; the metadata goes first inside
 	// removeStagingArtifacts so a crash cannot leave a record claiming a
 	// deleted payload.
-	removeStagingArtifactsIfUnclaimed(dst+".incomplete", dst+".incomplete.meta", staleTimeout)
+	removeStagingArtifactsIfUnclaimed(dst+".incomplete", dst+".incomplete.meta")
 	// Multipart parts: glob the dst's directory for files matching
 	// dst+".part-NNN" pattern. This matches what the legacy downloader
 	// produced (the parts have indices 0..n-1).
@@ -1559,9 +1554,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					lastErr = classifyStall(ctx, body, cerr)
 					if errors.Is(cerr, errRangedBodyOverflow) {
 						// Protocol violation: never advance the durable offset
-						// for an overlong body. The retry re-requests the same
-						// suffix (rather than planning bytes=size-size) and
-						// the retry budget decides the file's fate.
+						// for an overlong body. Remove every byte from this
+						// invalid attempt before a later invocation can mistake
+						// the exact-sized partial for valid transport progress.
+						if terr := out.Truncate(base); terr != nil {
+							return false, fmt.Errorf("discard invalid ranged response: %w", terr)
+						}
+						pos = base
+						if countedUpTo > base {
+							countedUpTo = base
+						}
 					} else {
 						// Advance by bytes actually written so the next retry
 						// resumes from the durable offset instead of

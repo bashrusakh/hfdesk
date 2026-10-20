@@ -178,9 +178,9 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	}
 }
 
-// TestPoisonStagingSkipsLostFallbackClaim covers B3: on the lease fallback an
-// old writer that lost its claim must not truncate the successor's payload.
-func TestPoisonStagingSkipsLostFallbackClaim(t *testing.T) {
+// TestPoisonStagingSkipsLostUnfencedClaim covers B3: an old writer that no
+// longer owns the record must not truncate another owner's payload.
+func TestPoisonStagingSkipsLostUnfencedClaim(t *testing.T) {
 	const size = 128
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "x.incomplete")

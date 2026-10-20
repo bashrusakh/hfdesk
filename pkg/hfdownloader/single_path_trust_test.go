@@ -293,3 +293,44 @@ func TestDownloadSingle_RejectsInvalidRangedResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestDownloadSingle_OversizedSuffixIsNotTrustedOnRestart(t *testing.T) {
+	const size, prefix = 4096, 2048
+	full := rangedTestPayload(size)
+	dst := filepath.Join(t.TempDir(), "overflow-restart.bin")
+	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", prefix, size-1, size))
+		w.WriteHeader(http.StatusPartialContent)
+		if requests.Load() == 1 {
+			_, _ = w.Write(full[prefix:])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("extra"))
+			return
+		}
+		_, _ = w.Write(full[prefix:])
+	}))
+	defer srv.Close()
+	it := PlanItem{RelativePath: "overflow-restart.bin", URL: srv.URL, Size: size}
+	cfg := Settings{Verify: "size", Retries: 0, StallTimeout: "0"}
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err == nil {
+		t.Fatal("oversized response unexpectedly succeeded")
+	}
+	fi, err := os.Stat(dst + ".part")
+	if err != nil || fi.Size() != prefix {
+		t.Fatalf("invalid suffix was retained: stat err=%v, want committed prefix %d", err, prefix)
+	}
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("valid restart failed: %v", err)
+	}
+	assertExactFile(t, dst, full)
+	if got := requests.Load(); got != 2 {
+		t.Errorf("GET count=%d, want first rejection plus suffix refetch", got)
+	}
+}

@@ -6,7 +6,7 @@ package hfdownloader
 // Regression coverage for the durable pre-publication proof gate (issue #140,
 // PR #151 follow-up). A known-digest proof must be recorded as pending before it
 // starts and cleared only after it succeeds, so a crash mid-proof, a mismatch
-// whose cleanup cannot take the transition lock, or a later Verify-mode change
+// whose cleanup cannot take the metadata gate, or a later Verify-mode change
 // (including "size") can never publish unproven all-Done ranges.
 //
 // The flag is read/written as raw JSON so the same test binary can also run
@@ -22,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,7 +94,7 @@ func proofRecoveryHub(t *testing.T, content []byte) (*httptest.Server, *atomic.I
 }
 
 // TestStagingProofPendingSurvivesCleanupFailure reproduces the fail-safe gap:
-// a known-digest mismatch whose owned discard cannot take the transition lock
+// a known-digest mismatch whose owned discard cannot take the metadata gate
 // must not leave an all-Done record that a later Verify=size run can publish
 // with zero ranged GETs. The durable flag and the poisoned (zero-length)
 // payload must force a discard/re-download (or a re-proof failure).
@@ -110,10 +109,10 @@ func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--model", "blobs")
 	staging := filepath.Join(blobsDir, sha+".incomplete")
 	metaPath := staging + ".meta"
-	lockPath := stagingLockPath(metaPath)
 
-	// Keep the heartbeat out of the deterministic finalization window; the
-	// lock intentionally held below must only block the mismatch cleanup.
+	// Keep the heartbeat out of the deterministic finalization window; a real
+	// local metadata gate held across proof finalization blocks only owned
+	// mismatch cleanup, exercising the durable ProofPending fallback.
 	oldHeartbeat := stagingHeartbeatEvery
 	stagingHeartbeatEvery = time.Hour
 	defer func() { stagingHeartbeatEvery = oldHeartbeat }()
@@ -129,49 +128,39 @@ func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 		StallTimeout:       "0",
 	}
 
-	var holdOnce sync.Once
+	var gate *stagingStateLock
 	err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ev ProgressEvent) {
-		if ev.Event != "file_finalizing" {
+		if ev.Event != "file_finalizing" || gate != nil {
 			return
 		}
-		holdOnce.Do(func() {
-			// A fresh transition lock that the mismatch cleanup cannot take.
-			rec := fmt.Sprintf(`{"instance":"test-holder","nonce":"held","pid":%d,"host":"test"}`, os.Getpid())
-			if werr := os.WriteFile(lockPath, []byte(rec), 0o644); werr != nil {
-				t.Errorf("write test transition lock: %v", werr)
-			}
-		})
+		gate = &stagingStateLock{path: stagingLockPath(metaPath)}
+		if lockErr := gate.acquire(context.Background(), time.Second); lockErr != nil {
+			t.Errorf("hold metadata gate during finalization: %v", lockErr)
+			gate = nil
+		}
 	})
+	if gate == nil {
+		t.Fatal("finalization did not hold the metadata gate")
+	}
+	gate.release()
 	if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
 		t.Fatalf("Download error = %v, want a sha256 verification failure", err)
 	}
-	if _, serr := os.Stat(lockPath); serr != nil {
-		t.Fatalf("the test transition lock was not in place at finalization: %v", serr)
-	}
 	if _, serr := os.Stat(metaPath); serr != nil {
-		t.Fatalf("the record must survive a cleanup that cannot take the transition lock: %v", serr)
+		t.Fatalf("record should survive blocked owned cleanup: %v", serr)
 	}
 	if !proofPendingRaw(t, metaPath) {
-		t.Error("the durable ProofPending flag did not survive the failed cleanup")
+		t.Error("durable ProofPending flag did not survive blocked cleanup")
 	}
-	// The poison itself is skipped when the transition lock cannot be
-	// re-acquired (poisonStagingIfOwned): an old fallback writer must never
-	// truncate a possible successor's payload after losing its claim. The
-	// durable ProofPending flag is the primary guard that makes the failed
-	// cleanup safe; the record and its payload may remain intact here.
 	if _, serr := os.Stat(staging); serr != nil {
-		t.Fatalf("staging payload: %v", serr)
+		t.Fatalf("staging payload should survive blocked cleanup: %v", serr)
 	}
 	if _, serr := os.Stat(filepath.Join(blobsDir, sha)); !os.IsNotExist(serr) {
 		t.Errorf("a corrupt blob was published despite the mismatch, stat err=%v", serr)
 	}
 
-	// Release the transition lock and run the SAME job with Verify=size. It
-	// must not publish the surviving corrupt bytes with zero GETs. The server
-	// now serves the correct content, so a correct re-download publishes it.
-	if rerr := os.Remove(lockPath); rerr != nil && !os.IsNotExist(rerr) {
-		t.Fatalf("release test transition lock: %v", rerr)
-	}
+	// With the gate released, a later Verify=size run must not publish surviving
+	// corrupt bytes with zero GETs. The correct source permits safe retry.
 	srv2, payloadGets := proofRecoveryHub(t, good)
 	sizeCfg := cfg
 	sizeCfg.Endpoint = srv2.URL

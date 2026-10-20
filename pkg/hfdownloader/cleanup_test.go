@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // TestIsAllDigits covers the small helper that the legacy
@@ -376,6 +375,9 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 		"tmp-" + strings.Repeat("x", 64): "non-canonical tmp- name (no blob staging derived)",
 	}
 	for name, body := range tracked {
+		if strings.HasSuffix(name, ".meta") {
+			body = `{"lock_fenced":true}`
+		}
 		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -385,18 +387,8 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The .meta payloads are deliberately unreadable fixtures. Age them past
-	// the claim grace window so cleanup classifies them as stale/corrupt
-	// records rather than a live mid-claim writer (the fresh-claim protection
-	// is covered by TestCleanupJobPartFiles_RespectsLiveClaim).
-	stale := time.Now().Add(-2 * claimGracePeriod)
-	for name := range tracked {
-		if strings.HasSuffix(name, ".meta") {
-			if err := os.Chtimes(filepath.Join(blobsDir, name), stale, stale); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
+	// The .meta payloads identify current-version, lock-fenced records. A free
+	// OS lock therefore proves the prior writer is gone and permits cleanup.
 
 	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -428,17 +420,14 @@ func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
 		"weights.bin.incomplete":    "B/weights.bin staging (concurrent job)",
 	}
 	for name, body := range files {
+		if strings.HasSuffix(name, ".meta") {
+			body = `{"lock_fenced":true}`
+		}
 		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Unreadable fixture record: age it past the claim grace window so cleanup
-	// treats it as stale/corrupt, not as a live mid-claim writer.
-	modelMeta := filepath.Join(repoDir, "model.bin.incomplete.meta")
-	stale := time.Now().Add(-2 * claimGracePeriod)
-	if err := os.Chtimes(modelMeta, stale, stale); err != nil {
-		t.Fatal(err)
-	}
+	// A lock-fenced record with a free lifetime lock is safely reclaimable.
 	if err := CleanupJobPartFiles(Settings{OutputDir: tmpDir}, []string{filepath.Join(repoDir, "model.bin")}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}

@@ -4,7 +4,7 @@
 package hfdownloader
 
 // Cross-process ownership coverage for the issue #140 trust model (T4):
-//   - the sibling O_EXCL transition lock admits exactly one holder at a time,
+//   - the local per-path metadata gate admits exactly one holder at a time,
 //     is bounded, and recovers an abandoned lock;
 //   - a real multi-process take-over race on one stale staging record produces
 //     exactly one writer, every range fetched once, and no loser deleting or
@@ -88,14 +88,10 @@ func TestStagingStateLockBoundedWait(t *testing.T) {
 	}
 }
 
-func TestStagingStateLockBreaksStaleLock(t *testing.T) {
-	old := stagingLockStaleAfter
-	stagingLockStaleAfter = 50 * time.Millisecond
-	defer func() { stagingLockStaleAfter = old }()
-
+func TestStagingStateLockIgnoresAbandonedTransitionFile(t *testing.T) {
 	metaPath := filepath.Join(t.TempDir(), "x.incomplete.meta")
 	lockPath := stagingLockPath(metaPath)
-	if err := os.WriteFile(lockPath, []byte(`{"instance":"crashed","nonce":"dead"}`), 0o644); err != nil {
+	if err := os.WriteFile(lockPath, []byte(`{"historical":"ignored"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	past := time.Now().Add(-time.Second)
@@ -108,8 +104,8 @@ func TestStagingStateLockBreaksStaleLock(t *testing.T) {
 		t.Fatalf("an abandoned lock must remain recoverable: %v", err)
 	}
 	lock.release()
-	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-		t.Errorf("released lock file survived, stat err=%v", err)
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Errorf("transition file should not be mutated as an authority: stat err=%v", err)
 	}
 }
 

@@ -43,14 +43,13 @@ package hfdownloader
 // suspended process that stopped heartbeating but could still resume writing
 // through an open handle; a crashed process releases the lock at death, so
 // takeover/resume is immediate. Every record transition — claim, take-over,
-// checkpoint, heartbeat, removal — is additionally serialized across processes
-// by a sibling O_EXCL lock file (see staging_lock.go), and every mutation
-// re-reads the record under that lock so a contender that lost cannot delete or
-// replace the live owner's claim. On platforms/filesystems without the OS lock
-// the transition-lock/heartbeat lease is the fallback, with the weaker
-// guarantee documented on the package. Publish re-checks both the record
-// (under the transition lock) and the OS lock before the rename; a missing or
-// foreign record returns errStagingClaimLost and leaves the staging alone.
+// checkpoint, heartbeat, removal — use the per-path in-process metadata gate;
+// the lifetime OS lock excludes every current-version foreign mutator. There
+// is no lease-only mutation fallback: unsupported or failed lock acquisition
+// returns an operation error before claim/payload mutation. A legacy record
+// without LockFenced remains protected unless same-host owner death is proven.
+// Publish re-checks the record under the metadata gate and verifies the held OS
+// lock before rename; a missing or foreign record returns errStagingClaimLost.
 //
 // Completion is content-addressed: only a publish target whose name IS the
 // known blob digest proves the transfer is complete. An arbitrary destination
@@ -166,12 +165,12 @@ func stagingClaimActive(staging string) bool {
 
 // removeStagingArtifactsIfUnclaimed removes a staging payload/meta pair only
 // when no live claim remains. The liveness decision is re-made under the OS
-// ownership lock and the transition lock, so a writer that claimed (or was
+// ownership lock and local metadata gate, so a writer that claimed (or was
 // taken over) between the pre-check and the removal is not disturbed. A busy
 // OS lock is a live owner (even a suspended one whose heartbeat went stale)
 // and skips the removal. Best-effort: a skipped or failed removal is logged
 // and never turns into a hard cleanup error.
-func removeStagingArtifactsIfUnclaimed(staging, metaPath string, staleTimeout time.Duration) {
+func removeStagingArtifactsIfUnclaimed(staging, metaPath string) {
 	// Cheap pre-check: an active in-process claim cannot be removed.
 	if stagingClaimActive(staging) {
 		log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
@@ -184,12 +183,12 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string, staleTimeout ti
 	if stagingArtifactsAbsent(staging, metaPath) {
 		return
 	}
-	own, oerr := acquireStagingOwnershipLock(staging)
+	own, oerr := stagingOwnershipAcquire(staging)
 	if errors.Is(oerr, errStagingOwnershipBusy) {
 		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
 		return
 	}
-	if oerr != nil && !errors.Is(oerr, errStagingOSLockUnsupported) {
+	if oerr != nil {
 		log.Printf("warning: skip cleanup of staging file %s: staging ownership lock unavailable: %v", staging, oerr)
 		return
 	}
@@ -197,7 +196,7 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string, staleTimeout ti
 
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
-		log.Printf("warning: skip cleanup of staging file %s: claim transition lock unavailable: %v", staging, err)
+		log.Printf("warning: skip cleanup of staging file %s: local metadata gate unavailable: %v", staging, err)
 		return
 	}
 	defer lock.release()
@@ -210,24 +209,19 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string, staleTimeout ti
 	meta, err := readStagingMeta(metaPath)
 	switch {
 	case err == nil:
-		// A free OS lock is authoritative only for a lock-fenced record. A
-		// fallback/legacy record's owner does not hold that lock, so acquiring
-		// it says nothing about liveness; apply the lease heuristic for it even
-		// when this process holds the lock. Removing such a pair would delete a
-		// live fallback owner's staging.
-		if (own == nil || !meta.LockFenced) && stagingOwnerMayBeLive(meta, metaPath, staging, staleTimeout) {
+		// A free OS lock proves termination only for writers that used this
+		// lock. Legacy/unfenced records remain protected unless same-host PID
+		// evidence proves their owner dead.
+		if !meta.LockFenced && !stagingOwnerProvablyDead(meta) && !stagingOwnerIsSelf(meta) {
 			log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
 			return
 		}
 	case errors.Is(err, os.ErrNotExist):
 		// No record: remove an orphaned payload if one exists.
 	default:
-		// An unreadable record is mid-claim while it is fresh; after the
-		// grace window it is corrupt and may be discarded.
-		if metaFreshWithin(metaPath, claimGracePeriod) {
-			log.Printf("warning: skip cleanup of staging file %s: a fresh unreadable claim remains", staging)
-			return
-		}
+		// An unreadable record cannot establish that its writer is dead.
+		log.Printf("warning: skip cleanup of staging file %s: ownership record is unreadable", staging)
+		return
 	}
 	removeStagingArtifactsLocked(staging, metaPath)
 }
@@ -301,7 +295,7 @@ type stagingClaimState struct {
 	// ownership lock; the caller must invoke it exactly once when the
 	// download returns.
 	release func()
-	// own is the held OS-level ownership lock, nil on the lease-only fallback.
+	// own is the required held OS-level lifetime ownership lock.
 	own *stagingOwnershipLock
 	// osExclusive reports that own fences the whole interval, so a fresh
 	// foreign record is a crash remnant rather than a live writer.
@@ -310,7 +304,8 @@ type stagingClaimState struct {
 
 // claimStaging establishes exclusive ownership of the staging file.
 //
-// Exclusion is three-level:
+// Exclusion combines local reservation/metadata serialization with the
+// cross-process lifetime OS fence:
 //
 //   - in-process: the stagingOwners registry serializes downloads inside
 //     this process (including two plan items that share one blob SHA);
@@ -318,28 +313,21 @@ type stagingClaimState struct {
 //     for the whole ownership interval. A busy lock is a live owner (even one
 //     that stopped heartbeating while suspended), so the caller skips with
 //     errBlobIncompleteOwned. A crashed owner's lock is released by the kernel
-//     at death, so takeover is immediate; on platforms/filesystems without
-//     the lock the lease fallback below applies;
-//   - record transitions: the sibling transition lock (staging_lock.go)
-//     serializes every record read-modify-write, and the record itself is
-//     created with O_CREATE|O_EXCL. With the OS lock held, a foreign record is
-//     a crash remnant and is evaluated by its v2 identity alone. On the
-//     fallback path, heartbeat freshness and (only for a same-host record)
-//     real PID liveness decide whether the owner may still be live.
+//     at death, so takeover is safe only after the old process is gone. If the
+//     platform/filesystem cannot supply the lock, the operation fails closed;
+//   - record transitions: the per-path in-process metadata gate serializes
+//     local read-modify-write operations. Current-version foreign processes
+//     cannot reach them without first acquiring the lifetime OS lock. A
+//     non-fenced legacy record is retained unless its same-host owner is proven
+//     dead.
 //
 // A take-over preserves the record's committed ranges only when the record is
 // a fully normalized, identity-matching v2 record AND its staging payload
-// exists at the expected logical size. The whole evaluate/remove/create
-// sequence runs under the transition lock, so two contenders cannot both pass
-// the stale check, and one cannot delete the other's fresh claim. contentAddressed
+// exists at the expected logical size. The evaluate/remove/create sequence
+// runs under both gates, so one claimant cannot displace another. contentAddressed
 // marks the publish target as a known blob digest, the only destination whose
 // existence proves completion.
 func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, cfg Settings, contentAddressed bool) (*stagingClaimState, error) {
-	staleTimeout := DefaultStaleTimeout
-	if d, err := parseStaleTimeoutSetting(cfg); err == nil {
-		staleTimeout = d
-	}
-
 	// Durable proof gate: a fresh claim for a known-digest mode starts with
 	// ProofPending set, and a take-over preserves the record's flag (or adds it
 	// when the current mode/item still needs the proof). The claim write is
@@ -381,9 +369,9 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		// fence the record lease cannot provide; it must be acquired before
 		// the record is evaluated so a suspended predecessor can never resume
 		// writing after we take its record over. A busy lock is a live owner.
-		own, oerr := acquireStagingOwnershipLock(staging)
+		own, oerr := stagingOwnershipAcquire(staging)
 		osExclusive := oerr == nil
-		if oerr != nil && !errors.Is(oerr, errStagingOSLockUnsupported) {
+		if oerr != nil {
 			stagingOwnersMu.Lock()
 			delete(stagingOwners, staging)
 			stagingOwnersMu.Unlock()
@@ -391,13 +379,8 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			if errors.Is(oerr, errStagingOwnershipBusy) {
 				return nil, errBlobIncompleteOwned
 			}
-			return nil, oerr
+			return nil, fmt.Errorf("cannot safely claim ranged staging %s: lifetime ownership lock acquisition failed: %w", staging, oerr)
 		}
-		if oerr != nil {
-			logStagingOwnershipFallback(staging)
-			own = nil
-		}
-
 		release := func() {
 			// Release the OS lock before waking an in-process waiter: the
 			// waiter re-evaluates from scratch (and would otherwise observe
@@ -409,7 +392,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			close(entry.done)
 		}
 
-		// Cross-process exclusion for the record transition.
+		// Local record-transition serialization; the lifetime OS lock already excludes other current-version processes.
 		lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 		if lerr := lock.acquire(ctx, stagingLockWait); lerr != nil {
 			release()
@@ -423,7 +406,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			}
 			return nil, lerr
 		}
-		state, retry, cerr := claimStagingLocked(staging, metaPath, it, job, commit, staleTimeout, osExclusive, proofMode, proofForKnownDigest)
+		state, retry, cerr := claimStagingLocked(staging, metaPath, it, job, commit, osExclusive, proofMode, proofForKnownDigest)
 		lock.release()
 		if cerr != nil {
 			release()
@@ -442,11 +425,11 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 }
 
 // claimStagingLocked performs one evaluate/transition pass while the caller
-// holds the staging transition lock and (when osExclusive) the OS ownership
+// holds the staging metadata gate and (when osExclusive) the OS ownership
 // lock. retry=true asks the caller to re-evaluate after discarding unusable
 // state or after losing an exclusive create to an older writer that does not
 // participate in the lock.
-func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, staleTimeout time.Duration, osExclusive, proofMode, proofForKnownDigest bool) (*stagingClaimState, bool, error) {
+func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, osExclusive, proofMode, proofForKnownDigest bool) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit)
@@ -464,25 +447,15 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	var meta IncompleteMeta
 	if json.Unmarshal(raw, &meta) != nil {
 		// Unreadable record. With the OS ownership lock held, no live
-		// format-2 writer can be mid-claim: every new-format writer creates
-		// this record while holding that same lock, so a fresh unreadable
-		// record is a crash remnant. On the lease fallback a fresh record can
-		// only come from an older writer mid-claim; an old one is corrupt.
-		if !osExclusive && metaFreshWithin(metaPath, claimGracePeriod) {
-			return nil, false, errBlobIncompleteOwned
-		}
-		removeStagingArtifactsLocked(staging, metaPath)
-		return nil, true, nil
+		// format-2 writer can be mid-claim: every current writer creates
+		// this record while holding the lifetime lock. An unreadable legacy
+		// record cannot establish that its owner is dead, regardless of age.
+		return nil, false, errBlobIncompleteOwned
 	}
 
-	// The OS ownership lock is authoritative only for a record written while
-	// holding it (LockFenced). A fallback/legacy record (LockFenced=false,
-	// including records from older versions) may belong to a live writer on a
-	// platform or filesystem without the OS lock: this process acquiring a free
-	// lock says nothing about that writer, so the lease heuristic still decides.
-	// Skipping it based only on osExclusive would displace a live fallback owner
-	// and create two writers.
-	if !(osExclusive && meta.LockFenced) && stagingOwnerMayBeLive(&meta, metaPath, staging, staleTimeout) {
+	// A LockFenced record belongs to the current lifetime-lock protocol. A
+	// legacy/unfenced record is not proven dead by a free new lock.
+	if !meta.LockFenced && !stagingOwnerProvablyDead(&meta) && !stagingOwnerIsSelf(&meta) {
 		return nil, false, errBlobIncompleteOwned
 	}
 
@@ -490,7 +463,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// record for this exact resolved object with a payload present at the
 	// expected logical size preserves its committed ranges (resume). Anything
 	// else is unvalidated data and is discarded per the downloader correctness
-	// rules (never guess at unknown resume state). The transition lock is
+	// rules (never guess at unknown resume state). The metadata gate is
 	// held, so the record is still the one evaluated above: a racer cannot
 	// have replaced it, and removing it cannot displace a live claim.
 	ranges, resumable := stagingMetaResumable(meta, it, job, commit)
@@ -511,7 +484,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// for an older record whose legacy-migrated bytes still need the proof.
 	take.ProofPending = meta.ProofPending || proofMode || (meta.LegacyMigrated && proofForKnownDigest)
 	// Record the ownership mode of THIS claim, not the predecessor's: the
-	// current process either holds the OS lock or is on the lease fallback.
+	// current process holds the required OS lifetime lock.
 	take.LockFenced = osExclusive
 	state, retry, err := createStagingClaim(metaPath, take)
 	if err != nil || retry {
@@ -702,17 +675,6 @@ func metaFreshWithin(path string, d time.Duration) bool {
 	return time.Since(fi.ModTime()) < d
 }
 
-// payloadMtimeFresh reports whether the staging payload received writes
-// recently. A missing payload is never fresh (mirrors CheckBlob's
-// BlobMissing for a vanished staging file).
-func payloadMtimeFresh(staging string, staleTimeout time.Duration) bool {
-	fi, err := os.Stat(staging)
-	if err != nil {
-		return false
-	}
-	return time.Since(fi.ModTime()) < staleTimeout
-}
-
 // parseStaleTimeoutSetting resolves the configured stale timeout with the
 // same defaults as Settings.BuildHFCache.
 func parseStaleTimeoutSetting(cfg Settings) (time.Duration, error) {
@@ -724,7 +686,7 @@ func parseStaleTimeoutSetting(cfg Settings) (time.Duration, error) {
 
 // removeStagingArtifactsLocked removes the staging meta record and then the
 // staging payload (best-effort; missing files are not an error). The caller
-// holds the staging transition lock, so no concurrent transition can recreate
+// holds the staging metadata gate, so no concurrent transition can recreate
 // or replace the record between the two removals. Metadata is removed first so
 // a crash between the two removals cannot leave a record claiming bytes whose
 // payload no longer exists. The publish path is the deliberate exception: it
@@ -753,18 +715,18 @@ func removeStagingArtifactsLocked(staging, metaPath string) {
 }
 
 // removeStagingArtifacts acquires the OS ownership lock (non-blocking) and
-// the transition lock and removes a staging pair unconditionally. It is used
+// the local metadata gate and removes a staging pair unconditionally. It is used
 // only by the explicit-cancel cleanup helper after the caller has established
 // that the claim is not (or is no longer) a live owner's; a busy ownership lock
 // skips the removal. A cancel/hash-discard of our own claim uses
 // removeStagingArtifactsOwned instead.
 func removeStagingArtifacts(staging, metaPath string) {
-	own, oerr := acquireStagingOwnershipLock(staging)
+	own, oerr := stagingOwnershipAcquire(staging)
 	if errors.Is(oerr, errStagingOwnershipBusy) {
 		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
 		return
 	}
-	if oerr != nil && !errors.Is(oerr, errStagingOSLockUnsupported) {
+	if oerr != nil {
 		log.Printf("warning: skip cleanup of staging file %s: staging ownership lock unavailable: %v", staging, oerr)
 		return
 	}
@@ -772,7 +734,7 @@ func removeStagingArtifacts(staging, metaPath string) {
 
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
-		log.Printf("warning: skip cleanup of staging file %s: claim transition lock unavailable: %v", staging, err)
+		log.Printf("warning: skip cleanup of staging file %s: local metadata gate unavailable: %v", staging, err)
 		return
 	}
 	defer lock.release()
@@ -795,7 +757,7 @@ func readStagingMeta(metaPath string) (*IncompleteMeta, error) {
 
 // writeStagingMetaFile atomically rewrites the staging record (stage in the
 // same directory, then rename) so a crash never leaves a partial record. The
-// caller must hold the staging transition lock (see staging_lock.go).
+// caller must hold the staging metadata gate (see staging_lock.go).
 func writeStagingMetaFile(metaPath string, meta *IncompleteMeta) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -1242,7 +1204,7 @@ type stagingDownload struct {
 	startedAt time.Time
 
 	// own is the OS-level ownership lock held for the whole download
-	// interval (nil on the lease-only fallback). osExclusive reports that own
+	// interval. osExclusive reports that own
 	// fences the interval, so publish requires it to still be held.
 	own         *stagingOwnershipLock
 	osExclusive bool
@@ -1309,7 +1271,7 @@ func (d *stagingDownload) flushMeta() error {
 }
 
 // flushMetaLocked persists the current range state; caller holds metaMu. The
-// cross-process transition lock is acquired inside, and the record is re-read
+// local per-path metadata gate is acquired inside, and the record is re-read
 // and must still name this process instance before it is replaced: a flush or
 // heartbeat can never race a take-over, overwrite the new owner's claim, or
 // resurrect ownership this process has lost. A nil range layout (the window
@@ -1437,9 +1399,9 @@ func (d *stagingDownload) requiresPrePublicationProof() bool {
 
 // poisonStagingLocked truncates the staging payload to zero so a later claim
 // cannot trust the record's all-Done ranges even if the durable ProofPending
-// flag is missing. The caller must hold the transition lock AND have re-read
-// the record as owned by this process; on the lease fallback this prevents an
-// old writer that lost a take-over from truncating the successor's payload.
+// flag is missing. The caller must hold the metadata gate AND have re-read
+// the record as owned by this process; this prevents an
+// stale writer from truncating another owner's payload.
 // It is best-effort: failures are logged and the durable flag remains the
 // primary guard.
 func (d *stagingDownload) poisonStagingLocked() {
@@ -1450,16 +1412,14 @@ func (d *stagingDownload) poisonStagingLocked() {
 }
 
 // poisonStagingIfOwned poisons the payload only while the claim is still owned
-// under the transition lock. On supported platforms the caller already holds
-// the OS ownership lock, so no successor can exist; on the lease fallback the
-// ownership re-read prevents a writer whose claim was taken over from
-// truncating the successor's staging. If the transition lock is unavailable,
+// under the metadata gate. The caller already holds the OS ownership lock, so no current-version
+// successor can exist. If the metadata gate is unavailable,
 // the poison is skipped: the durable ProofPending flag already prevents the
 // unproven bytes from being published.
 func (d *stagingDownload) poisonStagingIfOwned() {
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
-		log.Printf("warning: skip poisoning staging file %s: claim transition lock unavailable: %v", d.stg, err)
+		log.Printf("warning: skip poisoning staging file %s: local metadata gate unavailable: %v", d.stg, err)
 		return
 	}
 	defer lock.release()
@@ -1511,7 +1471,7 @@ func (d *stagingDownload) applyCancelCleanup() {
 	}
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
-		log.Printf("warning: skip cancel cleanup of staging file %s: claim transition lock unavailable: %v", d.stg, err)
+		log.Printf("warning: skip cancel cleanup of staging file %s: local metadata gate unavailable: %v", d.stg, err)
 		return
 	}
 	defer lock.release()
@@ -1524,7 +1484,7 @@ func (d *stagingDownload) applyCancelCleanup() {
 
 // resetClaim discards a claim whose validated payload no longer matched at
 // open time and installs a fresh, layout-less claim for the same object under
-// the transition lock. It exists because the claim's payload check and the
+// the metadata gate. It exists because the claim's payload check and the
 // open are separate filesystem operations: if the payload vanished or changed
 // size in between, every committed range in the record is untrustworthy and
 // must not be truncated in place under the old record.
@@ -1736,7 +1696,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// a cleanup race: if the payload vanished or changed size, the record's
 	// ranges are no longer trustworthy, so discard the record first (meta
 	// before payload semantics; the payload is then truncated, not trusted) and
-	// re-establish a fresh claim under the transition lock.
+	// re-establish a fresh claim under the metadata gate.
 	openFlags := os.O_RDWR
 	if state.fresh {
 		openFlags |= os.O_CREATE
@@ -1793,7 +1753,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// One heartbeat for every post-claim phase: the one-time legacy migration
 	// copy, transfers, retry/Retry-After waits, the strict SHA pass, and
 	// finalization. It shares metaMu with range flushes (so the temp+rename
-	// record write stays atomic) and the transition lock with every other
+	// record write stays atomic) and the metadata gate with every other
 	// record mutation. It is started BEFORE the migration so a long local copy
 	// cannot let the claim go stale. Stops before any meta removal.
 	d.startHeartbeat(stagingHeartbeatEvery, partCancel)
@@ -2097,7 +2057,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// transfer (and again after a legacy migration); it forces the proof here
 	// regardless of the current mode, including size, whenever the item has a
 	// known digest and Verify is not "none". This is why a crash mid-proof, a
-	// mismatch whose cleanup could not take the transition lock, or a later
+	// mismatch whose cleanup failed, or a later
 	// mode change cannot publish an all-Done but unproven record.
 	//
 	//   - Verify=sha256 or Verify=etag with a known digest: at most one full
@@ -2202,7 +2162,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 // overwrite stale/incomplete ones in one step.
 //
 // Publication is claim-checked. The rename happens only while this process
-// still owns the staging pair: the record is re-read under the transition lock
+// still owns the staging pair: the record is re-read under the metadata gate
 // (the take-over serialization point) and the OS ownership lock must still be
 // held for the same interval. A missing or foreign record returns
 // errStagingClaimLost and leaves the staging payload untouched for its actual
@@ -2222,8 +2182,8 @@ func (d *stagingDownload) publish() error {
 	if d.proofPending && d.it.SHA256 != "" && d.cfg.Verify != "none" {
 		return fmt.Errorf("refusing to publish %s: durable known-digest proof is still pending", d.it.RelativePath)
 	}
-	// Stop the heartbeat before taking the transition lock: the heartbeat
-	// needs that same lock for every record flush, and it must not rewrite the
+	// Stop the heartbeat before taking the metadata gate: the heartbeat
+	// needs that same gate for every record flush, and it must not rewrite the
 	// record after publication. Close before renaming so the unlink-on-rename
 	// also works on Windows.
 	d.stopHeartbeat()
@@ -2232,12 +2192,12 @@ func (d *stagingDownload) publish() error {
 	}
 
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
-	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
+	if err := lock.acquire(d.ctx, stagingLockWait); err != nil {
 		return err
 	}
 	defer lock.release()
 
-	// Ownership re-read under the transition lock. On an OS-lock platform the
+	// Ownership re-read under the metadata gate. On an OS-lock platform the
 	// lock itself must still be held: losing it would mean the interval this
 	// process believed it owned was already handed to a successor.
 	if d.osExclusive && !d.own.held() {
@@ -2245,6 +2205,9 @@ func (d *stagingDownload) publish() error {
 	}
 	if !claimRecordOwnedLocked(d.meta) {
 		return errStagingClaimLost
+	}
+	if err := d.ctx.Err(); err != nil {
+		return err
 	}
 	// A content-addressed target may have been completed by another writer
 	// while this download was in flight (single path, legacy tmp-<sha>+store,

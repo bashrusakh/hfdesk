@@ -39,7 +39,7 @@ import (
 // skipOnce/skippedCount bookkeeping, so the final "skipped N" summary includes
 // it. The live owner is simulated by holding the OS ownership lock, which is
 // what a real writer holds for its whole interval; the pre-download lock probe
-// (or, on the lease fallback, the claim refusal) turns it into a skip rather
+// (or, when lifetime ownership is unavailable, the claim refusal) turns it into a skip rather
 // than a failure.
 func TestDownload_OwnedClaimCountsAsSkipped(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -689,5 +689,115 @@ func TestRangedMultipart_HeartbeatFailureIsFatal(t *testing.T) {
 	}
 	if _, serr := os.Stat(dst); serr == nil {
 		t.Error("payload was published after the claim heartbeat failed")
+	}
+}
+
+func TestRangedMultipart_CancelWhilePublicationGateHeld(t *testing.T) {
+	const total = 32_000
+	full := rangedTestPayload(total)
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "cancel-gate.bin")
+	staging := dst + ".incomplete"
+	metaPath := staging + ".meta"
+	srv, _ := rangedTestServer(t, full)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	held := make(chan struct{})
+	var gate *stagingStateLock
+	result := make(chan error, 1)
+	go func() {
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"},
+			Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "none"},
+			PlanItem{RelativePath: "cancel-gate.bin", URL: srv.URL + "/cancel-gate.bin", Size: total, AcceptRanges: true}, dst, multipartOpts{},
+			func(ev ProgressEvent) {
+				if ev.Event != "file_finalizing" || gate != nil {
+					return
+				}
+				gate = &stagingStateLock{path: stagingLockPath(metaPath)}
+				if err := gate.acquire(context.Background(), time.Second); err != nil {
+					result <- err
+					return
+				}
+				close(held)
+			})
+		result <- err
+	}()
+	select {
+	case <-held:
+	case err := <-result:
+		t.Fatalf("download returned before finalization gate was held: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("download did not reach finalization")
+	}
+	// Wait until publish has registered as a waiter behind the held gate. This
+	// observes the publication serialization attempt, rather than relying on a
+	// timing delay after file_finalizing.
+	deadline := time.Now().Add(time.Second)
+	for {
+		stagingStateGates.Lock()
+		refs := stagingStateGates.m[gate.path].refs
+		stagingStateGates.Unlock()
+		if refs >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			gate.release()
+			t.Fatal("publish never queued behind the held metadata gate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Cancellation must interrupt that acquisition even though the gate stays
+	// held.
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("download error=%v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		gate.release()
+		t.Fatal("publication wait did not observe cancellation while gate remained held")
+	}
+	gate.release()
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("destination published after cancellation: %v", err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("pause/cancel should preserve resumable staging: %v", err)
+	}
+}
+
+func TestStagingPublishAlreadyCanceledContextCannotPublish(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "already-canceled.incomplete")
+	dst := filepath.Join(dir, "already-canceled.bin")
+	metaPath := staging + ".meta"
+	if err := os.WriteFile(staging, []byte("complete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	it := PlanItem{RelativePath: "already-canceled.bin", Size: 8}
+	meta := newClaimMeta(it, Job{Repo: "o/r"}, "commit")
+	meta.LockFenced = true
+	meta.Ranges = buildRangeLayout(8, 1)
+	meta.Ranges[0].Committed, meta.Ranges[0].Done = 8, true
+	if err := writeStagingMeta(metaPath, &meta); err != nil {
+		t.Fatal(err)
+	}
+	own, err := acquireStagingOwnershipLock(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d := &stagingDownload{ctx: ctx, stg: staging, dst: dst, pub: dst, meta: metaPath, it: it, job: Job{Repo: "o/r"}, own: own, osExclusive: true}
+	if err := d.publish(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish error=%v, want context canceled", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("already-canceled publish created destination: %v", err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("staging was not preserved: %v", err)
 	}
 }

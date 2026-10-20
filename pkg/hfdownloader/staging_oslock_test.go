@@ -56,9 +56,8 @@ func TestStagingOwnershipLockProbe(t *testing.T) {
 }
 
 // TestCheckBlobHeldOwnershipLockReportsDownloading pins the status consumer: a
-// held OS ownership lock overrides the lease heuristic, including for a record
-// that carries this process's own instance token (a suspended/active owner is
-// still a live writer).
+// held OS ownership lock reports an active writer even if the record carries
+// this process's own instance token (a suspended/active owner is still live).
 func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -125,7 +124,7 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 		own, oerr := acquireStagingOwnershipLock(staging)
-		if oerr != nil && !errors.Is(oerr, errStagingOSLockUnsupported) {
+		if oerr != nil {
 			t.Fatalf("acquire ownership lock: %v", oerr)
 		}
 		d := &stagingDownload{
@@ -289,7 +288,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
 		return
 	}
-	out.Close()
+	defer out.Close()
 	meta, err := readStagingMeta(metaPath)
 	if err != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
@@ -333,15 +332,13 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	fin, err := os.OpenFile(cfg.Staging, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
-		return
-	}
-	_, werr := fin.WriteAt(full[cfg.Prefix:], cfg.Prefix)
-	fin.Close()
+	_, werr := out.WriteAt(full[cfg.Prefix:], cfg.Prefix)
 	if werr != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: werr.Error()})
+		return
+	}
+	if err := out.Close(); err != nil {
+		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
 		return
 	}
 	if err := os.Rename(cfg.Staging, cfg.Publish); err != nil {
@@ -385,7 +382,7 @@ func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.
 
 // TestStagingOSLockHeldByLiveProcessBlocksTakeover is the real-process form of
 // B3(i)/(iii): a helper holds the OS ownership lock while its record looks
-// stale (aged mtime), so the lease heuristic alone would take the file over.
+// stale-looking (aged mtime), so only lifetime ownership can refuse takeover.
 // The second claimant must back off as errBlobIncompleteOwned and leave the
 // staging untouched; once the helper is released it completes and publishes.
 func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
@@ -441,8 +438,8 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Pre-condition of the discriminator: the record is already older than the
-	// claim grace period, so the lease heuristic cannot be what refuses us.
+	// Pre-condition: the record is already older than the former grace threshold;
+	// its timestamp is diagnostic and cannot grant another process ownership.
 	metaBefore, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("helper record: %v", err)
@@ -471,6 +468,9 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("second claimant error = %v, want errBlobIncompleteOwned while the OS lock is held", claimErr)
 	}
+	// Cleanup must observe the same held lifetime fence; stale diagnostics do
+	// not authorize deleting a suspended owner's payload or metadata.
+	removeStagingArtifactsIfUnclaimed(staging, metaPath)
 	// The claimant must not have touched the owner's staging or record.
 	stagingAfter, err := os.ReadFile(staging)
 	if err != nil {

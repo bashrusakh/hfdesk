@@ -140,10 +140,10 @@ func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 	if sha != base && pathEqual(name, r.IncompletePath(sha)) {
 		return true
 	}
-	// The downloader's persistent ownership/transition lock files sit beside
-	// the staging pair (<sha>.incomplete.lock, <sha>.incomplete.meta.lock).
-	// They are staging artifacts, never blobs, so cache deletion must leave
-	// them alone even though they are zero-byte and content-free.
+	// The persistent lifetime ownership lock and any transition-lock artifact
+	// left by an older version sit beside the staging pair. They are staging
+	// artifacts, never blobs, so cache deletion must leave them alone even
+	// though they are zero-byte and content-free.
 	if sha := trimSuffix(base, ".incomplete.meta"+stagingLockSuffix); sha != base &&
 		pathEqual(name, r.IncompleteMetaPath(sha)+stagingLockSuffix) {
 		return true

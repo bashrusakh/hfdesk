@@ -472,7 +472,7 @@ func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
 			t.Errorf("producer staging path %q was not classified", name)
 		}
 	}
-	// The persistent ownership/transition lock files and the atomic record temp
+	// The persistent ownership lock, any legacy transition-lock file, and atomic record temp
 	// are staging artifacts, never deletable blobs.
 	for _, name := range []string{
 		strings.Repeat("c", 64) + ".incomplete.meta.tmp",

@@ -5,13 +5,9 @@ package hfdownloader
 
 // OS-level staging ownership lock (issue #140).
 //
-// The sibling O_EXCL transition lock in staging_lock.go serializes short
-// record read-modify-write transitions. It is a mutex, not an ownership fence:
-// a writer that already holds the claim record keeps writing through its open
-// payload handle while the record is fresh, and a suspended writer that stops
-// heartbeating can resume through that same handle after another process takes
-// the record over. A lease alone therefore cannot exclude in-flight payload
-// writes.
+// The per-path in-process metadata gate serializes local record updates. The
+// lifetime lock is the cross-process fence: a suspended owner keeps it for as
+// long as its process and open handle live, regardless of heartbeat age.
 //
 // This file adds the long-lived exclusivity primitive: an OS-level exclusive
 // lock on the persistent sibling file "<staging>.lock", acquired before the
@@ -21,8 +17,9 @@ package hfdownloader
 // suspended (but alive) process keeps ownership — the documented tradeoff:
 // there is no takeover while the owner is alive; terminate it to recover.
 //
-// The record and heartbeat remain for identity, diagnostics and the fallback
-// platforms, and every record mutation still runs under the transition lock.
+// The record and heartbeat remain for identity and diagnostics. Unsupported or
+// failed lock acquisition is an operation error; no lease-only mutation path is
+// used. Existing partial data remains untouched on that error.
 //
 // The lock file is never unlinked. Removing it while one process holds the old
 // inode and another is about to open the path would let the second process
@@ -34,15 +31,12 @@ package hfdownloader
 //   - Unix with flock: syscall.Flock(LOCK_EX|LOCK_NB).
 //   - Windows: syscall.CreateFile with dwShareMode=0 (exclusive share mode),
 //     released by closing the handle.
-//   - Other platforms, and filesystems that cannot represent the lock: the
-//     platform probe reports "unsupported" and that file keeps the original
-//     transition-lock/heartbeat lease model — a weaker guarantee documented on
-//     the package.
+//   - Other platforms and filesystems unable to represent the lock: mutating
+//     operations fail safely at runtime, preserving any existing partial. This
+//     does not declare permanent platform support policy.
 
 import (
 	"errors"
-	"log"
-	"sync"
 )
 
 // stagingOwnershipLockPath is the persistent sibling lock file for a staging
@@ -57,11 +51,8 @@ var (
 	errStagingOwnershipBusy = errors.New("staging ownership lock is held by another live writer")
 
 	// errStagingOSLockUnsupported reports that this platform or filesystem
-	// cannot provide the OS lock, so the caller must degrade to the
-	// transition-lock/heartbeat lease for this file.
+	// cannot provide the required OS-level lifetime exclusion.
 	errStagingOSLockUnsupported = errors.New("OS staging ownership lock is unsupported here")
-
-	stagingOwnershipFallbackOnce sync.Once
 )
 
 // stagingOwnershipLock is one held OS-level ownership lock.
@@ -85,6 +76,11 @@ func acquireStagingOwnershipLock(staging string) (*stagingOwnershipLock, error) 
 	return &stagingOwnershipLock{path: path, handle: h}, nil
 }
 
+// stagingOwnershipAcquire is the single mutation-side capability provider.
+// Keeping it replaceable lets package tests exercise lock-open failures without
+// relying on root-sensitive filesystem permissions.
+var stagingOwnershipAcquire = acquireStagingOwnershipLock
+
 // release closes the platform handle, which drops the OS lock. It never
 // unlinks the lock file (see the package comment in this file).
 func (l *stagingOwnershipLock) release() {
@@ -106,11 +102,6 @@ func stagingOwnershipBusy(staging string) (bool, error) {
 	return probeStagingOSLock(stagingOwnershipLockPath(staging))
 }
 
-// logStagingOwnershipFallback records once that a file is running with the
-// weaker lease-only guarantee (unsupported platform or filesystem).
-func logStagingOwnershipFallback(staging string) {
-	stagingOwnershipFallbackOnce.Do(func() {
-		log.Printf("warning: OS staging ownership lock unavailable for %s; "+
-			"falling back to the transition-lock/heartbeat lease (no fencing of in-flight writes)", staging)
-	})
-}
+// stagingOwnershipStatusProbe is injectable so CheckBlob's fail-closed status
+// behavior can be tested independently of host filesystem capabilities.
+var stagingOwnershipStatusProbe = stagingOwnershipBusy

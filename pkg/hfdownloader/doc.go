@@ -140,10 +140,9 @@ target under the ownership locks and never overwrites one that appeared while
 the transfer was in flight: it discards its own staging pair and reports the
 item as complete.
 
-Staging identity includes the resolved commit from the plan. If the endpoint
-omits a resolved commit, plan.Commit is empty and the record uses that empty
-value, so resume is not revision-pinned; the downloader does not substitute the
-requested branch name.
+Staging identity includes the resolved commit from the plan. When the endpoint
+does not provide one, the planner resolves the requested revision before
+building the plan; resume is pinned to that resolved commit.
 
 Existing multipart resume state survives a threshold change. Before routing an
 item to the single-request path, the downloader detects a usable pre-#140
@@ -171,28 +170,26 @@ was OS-lock fenced (`LockFenced`); on a supported platform a free lock is then
 authoritative for CheckBlob and reports the record stale even when its stored
 PID is still live, so a reused PID cannot hide a resumable crash state. The same
 distinction applies to claims and cleanup: a free lock is authoritative only
-for a LockFenced record. A fallback/legacy record belongs to a writer that did
-not hold the OS lock, so a lock-capable process acquiring the free lock must
-still apply the lease heuristic rather than displace or delete a live fallback
-owner. The ownership probe itself is non-owning (a shared lock on Unix, a
+for a LockFenced record. A legacy/unfenced record belongs to a writer that did
+not hold the OS lock, so a new process preserves it unless same-host process
+evidence proves the owner dead; age or ambiguous identity is not sufficient.
+The ownership probe itself is non-owning (a shared lock on Unix, a
 shared-access open on Windows), so concurrent probes are never mistaken for a
 writer.
 
 The claim record remains the identity/resume state and is heartbeated through
-transfers, retry waits, strict verification and finalization. Every record
-transition (claim, take-over, checkpoint, heartbeat, removal) is additionally
-serialized across processes by a sibling `O_CREATE|O_EXCL` lock file, and every
-mutation re-reads the record under that lock: a heartbeat can never race a
-take-over or resurrect ownership. The claim carries a per-process instance
-token plus PID/host diagnostics, so PID reuse and containers sharing PID 1 are
-not treated as the same writer. Publish re-checks the record under the
-transition lock and re-checks the OS lock before the rename; a missing or
-foreign record is refused with errStagingClaimLost and the staging file is left
-alone for its actual owner. On platforms or filesystems without an OS lock
-primitive (for example plan9, js/wasm, Solaris/AIX, or a share that cannot
-represent the lock), the transition-lock/heartbeat lease remains the fallback:
-identity and heartbeat freshness decide ownership, with the weaker guarantee
-that an in-flight handle cannot be fenced from a claimant.
+transfers, retry waits, strict verification and finalization. Per-path in-process
+metadata gates serialize record transitions while the lifetime OS lock excludes
+current-version foreign mutators. Every mutation re-reads claim identity; a
+heartbeat cannot resurrect a replaced claim. The claim carries a per-process
+instance token plus PID/host diagnostics, so PID reuse and containers sharing
+PID 1 are not treated as the same writer. Publish checks the record and held OS
+lock before rename; a missing or foreign record is refused with
+`errStagingClaimLost`. If the OS lock is unsupported or cannot be acquired,
+mutations fail before changing a claim or payload and preserve existing partial
+data; this runtime error does not declare permanent platform support policy.
+Age never authorizes transition recovery. An unfenced legacy record is
+protected unless its same-host owner is provably dead.
 
 The single-request path follows the same validation model. A resumed `.part` is
 a sequential prefix with no record, so it is never assumed complete: every

@@ -14,6 +14,7 @@ package hfdownloader
 
 import (
 	"errors"
+	"fmt"
 	"syscall"
 )
 
@@ -27,7 +28,9 @@ const (
 	errorSharingViolation = syscall.Errno(32)
 	// errorLockViolation is Windows ERROR_LOCK_VIOLATION, returned by some
 	// filesystems instead of a sharing violation.
-	errorLockViolation = syscall.Errno(33)
+	errorLockViolation   = syscall.Errno(33)
+	errorNotSupported    = syscall.Errno(50)
+	errorInvalidFunction = syscall.Errno(1)
 )
 
 // stagingOSLockHandle is one held exclusive-share file handle.
@@ -56,10 +59,12 @@ func openStagingOSLock(path string) (stagingOSLockHandle, error) {
 		case errors.Is(err, errorSharingViolation), errors.Is(err, errorLockViolation):
 			return stagingOSLockHandle{}, errStagingOwnershipBusy
 		}
-		// Access denied, a read-only lock file or an unsupported network
-		// share: keep the download working with the lease fallback rather
-		// than failing the file.
-		return stagingOSLockHandle{}, errStagingOSLockUnsupported
+		switch {
+		case errors.Is(err, errorNotSupported), errors.Is(err, errorInvalidFunction):
+			return stagingOSLockHandle{}, fmt.Errorf("%w: %v", errStagingOSLockUnsupported, err)
+		default:
+			return stagingOSLockHandle{}, err
+		}
 	}
 	return stagingOSLockHandle{h: h}, nil
 }
@@ -79,7 +84,7 @@ func (h stagingOSLockHandle) release() {
 func probeStagingOSLock(path string) (bool, error) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("%w: %v", errStagingOSLockUnsupported, err)
 	}
 	h, err := syscall.CreateFile(
 		p,
@@ -97,7 +102,7 @@ func probeStagingOSLock(path string) (bool, error) {
 		case errors.Is(err, errorSharingViolation), errors.Is(err, errorLockViolation):
 			return true, nil
 		}
-		return false, nil
+		return false, err
 	}
 	_ = syscall.CloseHandle(h)
 	return false, nil

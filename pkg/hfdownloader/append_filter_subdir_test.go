@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -67,6 +68,93 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 				t.Errorf("config.json = %q, want downloaded content", got)
 			}
 		})
+	}
+}
+
+func TestDownload_AppendFilterResumesV2AfterThresholdIncrease(t *testing.T) {
+	const size = 8192
+	const prefix = size / 2
+	full := rangedTestPayload(size)
+	sha := singleTestSHA(full)
+	var ranges atomic.Int32
+	var requested atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "model-Q4_K_M.gguf", Size: size, LFS: &hfLfsInfo{Oid: sha, Size: size, Sha256: sha}}})
+		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/model-Q4_K_M.gguf"):
+			w.Header().Set("Content-Length", fmt.Sprint(size))
+			w.Header().Set("Accept-Ranges", "bytes")
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/model-Q4_K_M.gguf"):
+			ranges.Add(1)
+			requested.Store(r.Header.Get("Range"))
+			var start, end int
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "range required", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(full[start : end+1])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out := t.TempDir()
+	job := Job{Repo: "owner/model", Revision: "main", Filters: []string{"Q4_K_M"}, ExactMatch: true, AppendFilterSubdir: true}
+	settings := Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 2, MaxActiveDownloads: 1, MultipartThreshold: "1MB", Verify: "size", Retries: 0}
+	plan, err := PlanRepo(t.Context(), job, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("plan items=%d, want 1", len(plan.Items))
+	}
+	item := plan.Items[0]
+	finalRel := filepath.ToSlash(filepath.Join(item.DestinationSubdir, item.RelativePath))
+	base, err := DestinationBase(out, job.Repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(base, filepath.FromSlash(finalRel))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staging := dst + ".incomplete"
+	payload := make([]byte, size)
+	copy(payload, full[:prefix])
+	if err := os.WriteFile(staging, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ioItem := item
+	ioItem.RelativePath = finalRel
+	meta := newClaimMeta(ioItem, job, plan.Commit)
+	meta.LockFenced = true
+	meta.Ranges = buildRangeLayout(size, 2)
+	meta.Ranges[0].Committed, meta.Ranges[0].Done = prefix, true
+	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Download(t.Context(), job, settings, nil); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if got, _ := requested.Load().(string); got != fmt.Sprintf("bytes=%d-%d", prefix, size-1) {
+		t.Fatalf("requested range=%q, want missing suffix only", got)
+	}
+	if ranges.Load() != 1 {
+		t.Fatalf("GET count=%d, want 1", ranges.Load())
+	}
+	assertExactFile(t, dst, full)
+	for _, path := range []string{staging, staging + ".meta"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("resume artifact %s remains (err=%v)", path, err)
+		}
 	}
 }
 

@@ -384,7 +384,7 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	}
 
 	// Check if incomplete download exists
-	incompleteStat, err := os.Stat(incompletePath)
+	_, err := os.Stat(incompletePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return BlobMissing, nil, nil
 	}
@@ -397,8 +397,15 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	// stale (and which could still resume writing through an open handle) and
 	// an in-process download whose record looks take-over-able. The probe never
 	// blocks, never creates the lock file, and releases immediately.
-	if busy, probeErr := stagingOwnershipBusy(incompletePath); probeErr == nil && busy {
+	busy, probeErr := stagingOwnershipStatusProbe(incompletePath)
+	if probeErr == nil && busy {
 		return BlobDownloading, nil, nil
+	}
+	if probeErr != nil || !stagingOSLockAvailable {
+		// Probe failure cannot establish absence of an owner. Preserve the
+		// conservative status even when metadata is absent or unreadable.
+		meta, _ := r.readIncompleteMeta(metaPath)
+		return BlobDownloading, meta, nil
 	}
 
 	// Read metadata
@@ -408,33 +415,16 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobStale, nil, nil
 	}
 
-	// A record created while holding the OS ownership lock is authoritative on
-	// a platform that supports the lock: the probe above already established
-	// that no live writer holds it, so a free lock means the owner crashed,
-	// released, or the claim was taken over. Do not let a reused/live PID or a
-	// fresh heartbeat turn this into a false "downloading" that makes Download
-	// skip a resumable crash state. Fallback records (LockFenced=false) keep the
-	// lease heuristic below.
-	if meta.LockFenced && stagingOSLockAvailable {
+	// A current-version record plus a free lifetime lock proves the owner is
+	// gone. A legacy/unfenced record is resumable only when same-host process
+	// evidence proves owner death; age or remote/ambiguous identity is not proof.
+	if meta.LockFenced {
 		return BlobStale, meta, nil
 	}
-
-	// Check ownership/liveness. A record whose instance token matches this
-	// process is an earlier run of this process, not a live writer: the
-	// downloader's in-process registry distinguishes a currently running
-	// goroutine. A foreign record is downloading while its heartbeat record
-	// or its payload is fresh, unless its same-host owner is provably dead.
-	if stagingOwnerIsSelf(meta) || stagingOwnerProvablyDead(meta) {
+	if stagingOwnerProvablyDead(meta) {
 		return BlobStale, meta, nil
 	}
-	if metaFreshWithin(metaPath, claimGracePeriod) ||
-		time.Since(incompleteStat.ModTime()) < r.cache.StaleTimeout {
-		return BlobDownloading, meta, nil
-	}
-
-	// Process is dead, foreign on an unknown host with a stale heartbeat, or
-	// the file is stale.
-	return BlobStale, meta, nil
+	return BlobDownloading, meta, nil
 }
 
 // readIncompleteMeta reads the metadata file for an incomplete download.

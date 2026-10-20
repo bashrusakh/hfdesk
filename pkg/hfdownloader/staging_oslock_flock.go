@@ -22,6 +22,11 @@ import (
 // ownership lock (used by tests and documentation).
 const stagingOSLockAvailable = true
 
+// stagingOwnershipProbeFlock is the status probe's flock operation. It is a
+// narrow seam for exercising unsupported-kernel/filesystem errors without
+// depending on a particular mounted filesystem in tests.
+var stagingOwnershipProbeFlock = syscall.Flock
+
 // stagingOSLockHandle is one held flock descriptor.
 type stagingOSLockHandle struct {
 	f *os.File
@@ -32,11 +37,6 @@ type stagingOSLockHandle struct {
 func openStagingOSLock(path string) (stagingOSLockHandle, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			// A lock file we cannot open must not fail the download; the
-			// caller degrades to the lease model for this file.
-			return stagingOSLockHandle{}, errStagingOSLockUnsupported
-		}
 		return stagingOSLockHandle{}, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
@@ -77,15 +77,13 @@ func probeStagingOSLock(path string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+	if err := stagingOwnershipProbeFlock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
 		switch {
 		case errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
 			return true, nil
-		case errors.Is(err, syscall.ENOLCK), errors.Is(err, syscall.EOPNOTSUPP), errors.Is(err, syscall.ENOSYS):
-			return false, nil
 		}
 		return false, err
 	}
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = stagingOwnershipProbeFlock(int(f.Fd()), syscall.LOCK_UN)
 	return false, nil
 }

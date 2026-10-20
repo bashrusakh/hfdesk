@@ -13,14 +13,11 @@ package hfdownloader
 // process that happens to report the same PID" (foreign; only heartbeat
 // freshness and a same-host liveness check may decide).
 //
-// The token is the record's identity, not the exclusion fence: on platforms
-// with the OS ownership lock (staging_oslock.go) the lock proves that no live
-// writer owns the staging payload only when the record was written under that
-// lock (LockFenced). A fallback/legacy record belongs to a writer that did not
-// hold the OS lock, so a lock-capable process acquiring the free lock must
-// still apply the lease checks below rather than displace a live fallback
-// owner. Publish still verifies the token under the transition lock as a claim
-// check.
+// The token is the record's identity, not the exclusion fence. The lifetime OS
+// lock excludes current-version writers; a free lock is sufficient only for a
+// LockFenced record. A legacy/unfenced record is protected unless same-host
+// process evidence proves its owner dead. Publish also verifies the token under
+// the local metadata gate as a claim check.
 //
 // PID, hostname and StartedAt remain diagnostic hints. They are never treated
 // as proof of identity: a record with our PID but a different instance token is
@@ -57,7 +54,7 @@ func newProcessInstanceToken() string {
 }
 
 // newRandomToken returns 128 random bits as hex. It seeds the process instance
-// identity and the per-acquisition staging transition-lock nonce.
+// identity and other per-operation identifiers.
 func newRandomToken() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err == nil {
@@ -87,20 +84,4 @@ func stagingOwnerProvablyDead(meta *IncompleteMeta) bool {
 		return false
 	}
 	return !isProcessAlive(meta.PID)
-}
-
-// stagingOwnerMayBeLive reports whether a foreign record may still belong to a
-// running writer. Same-instance records are never live here: the in-process
-// registry is the authority for a currently running goroutine. A foreign owner
-// is live while its heartbeat record or its payload was touched within the
-// grace/stale windows; a provably dead same-host owner is not live even if the
-// record is fresh (the process may have crashed immediately after writing it).
-func stagingOwnerMayBeLive(meta *IncompleteMeta, metaPath, staging string, staleTimeout time.Duration) bool {
-	if meta == nil || stagingOwnerIsSelf(meta) || stagingOwnerProvablyDead(meta) {
-		return false
-	}
-	if metaFreshWithin(metaPath, claimGracePeriod) {
-		return true
-	}
-	return payloadMtimeFresh(staging, staleTimeout)
 }

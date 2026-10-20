@@ -12,8 +12,10 @@ package hfdownloader
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
@@ -60,5 +62,47 @@ func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
 	owner.release()
 	if busy, err := stagingOwnershipBusy(staging); err != nil || busy {
 		t.Fatalf("probe after release = (%v, %v), want (false, nil)", busy, err)
+	}
+}
+
+func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	oldFlock := stagingOwnershipProbeFlock
+	defer func() { stagingOwnershipProbeFlock = oldFlock }()
+	stagingOwnershipProbeFlock = func(fd int, how int) error {
+		if how == syscall.LOCK_SH|syscall.LOCK_NB {
+			return syscall.ENOLCK
+		}
+		return syscall.Flock(fd, how)
+	}
+
+	cache := NewHFCache(t.TempDir(), time.Minute)
+	repo, err := cache.Repo("owner/repo", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("d", 64)
+	staging := repo.IncompletePath(sha)
+	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := IncompleteMeta{Version: stagingMetaVersion, Repo: "owner/repo", Path: "model.bin", Size: 100, LockFenced: true, Ranges: buildRangeLayout(100, 1)}
+	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if own, err := acquireStagingOwnershipLock(staging); err != nil {
+		t.Fatal(err)
+	} else {
+		own.release()
+	}
+
+	status, _, err := repo.CheckBlob(sha)
+	if err != nil || status != BlobDownloading {
+		t.Fatalf("CheckBlob with ENOLCK probe = %v, %v; want downloading, not stale/free", status, err)
 	}
 }

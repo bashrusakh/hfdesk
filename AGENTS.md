@@ -155,12 +155,12 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   flushed before any known-digest proof starts and cleared and flushed only
   after it succeeds. On resume it forces the proof in every mode except `none`
   (including `size`) whenever a known digest exists, so a crash mid-proof, a
-  mismatch whose cleanup could not take the transition lock, or a later mode
+  mismatch whose cleanup failed, or a later mode
   change cannot publish unproven all-Done ranges. A mismatch keeps the flag set,
   attempts poison (truncate to zero) only while the claim is still owned under
-  the transition lock, and attempts the owned discard; if ownership cannot be
-  verified the poison is skipped and the durable flag remains the guard, so the
-  next run re-proves or discards. Publish refuses while a known digest's proof
+  lifetime ownership and local metadata serialization, and attempts the owned
+  discard; if ownership cannot be verified, poison is skipped and the durable
+  flag remains the guard, so the next run re-proves or discards. Publish refuses while a known digest's proof
   is pending; `none` is the explicit opt-out. The single-path `.part` is its own
   marker when a proof is required (sha256/etag, inherited bytes, or a known
   digest with unknown size): it is renamed only after proof, so every restart
@@ -185,12 +185,14 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   `CheckBlob` reports downloading); a crashed process releases it at death, and
   a suspended owner keeps it — there is deliberately no takeover while it is
   alive. A free lock is authoritative only for a record written under it
-  (`LockFenced`): a fallback/legacy record keeps the lease heuristic even when a
-  lock-capable process acquires the free lock, so a live fallback owner is never
-  displaced in a claim or deleted by cleanup. On platforms/filesystems without
-  the lock, the transition-lock/heartbeat lease is the documented weaker
-  fallback. Keep the lock file: never unlink it (that would let two processes
-  own different inodes).
+  (`LockFenced`). A fallback/legacy record is protected unless its same-host
+  owner is provably dead; age, ambiguous host/PID identity, or a free new lock
+  does not prove that an older writer cannot resume. If the lifetime lock cannot
+  be acquired (unsupported, denied, or filesystem error), fail the operation
+  before mutating claims or payloads and preserve partials; this is an
+  operation-time safety error, not a permanent platform-support policy. Keep
+  the ownership lock file: never unlink it (that would let two processes own
+  different inodes).
 - Before routing an item to the single-request path, detect usable multipart
   resume state: a valid v2 `<staging>.incomplete`/`.meta` pair (including the
   blob-keyed LFS pair) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
@@ -200,13 +202,12 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   file through the single path, and remove the obsolete v2 pair only after the
   final file is durable and claim-checked; the legacy family is removed by the
   single-path success cleanup.
-- Serialize every staging-record transition (claim, takeover, checkpoint,
-  heartbeat, removal) with the sibling O_EXCL lock and re-read ownership under
-  it; a heartbeat must never recreate or replace another writer's claim. Cleanup
-  must re-check the claim under the same lock and keep a live owner's state.
-  Publish must re-read the record under that lock and verify the OS ownership
-  lock is still held before the rename; a missing or foreign record is refused,
-  never renamed.
+- Serialize current-process record transitions with the per-staging metadata
+  mutex while the lifetime OS lock excludes foreign current-version mutators.
+  Never recover a transition by age or unlink a lock that a suspended holder may
+  still own. Re-read claim identity before mutation; cleanup and publish require
+  the lifetime capability, and publish checks cancellation immediately before
+  rename. A missing or foreign record is refused, never renamed.
 - Size checks are only a fallback for files without a trusted hash.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to

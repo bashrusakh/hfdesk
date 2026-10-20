@@ -1790,20 +1790,14 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 		filepath.Join(blobsDir, blobSHA+".incomplete.meta"),
 	}
 	for _, path := range artifacts {
-		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// These are the artifacts of a paused job whose downloader goroutine has
-	// already exited. The .meta fixtures are unreadable placeholders; age them
-	// past the claim grace window so claim-aware cleanup classifies them as
-	// stale (rather than a live foreign mid-claim writer) and removes them.
-	old := time.Now().Add(-time.Hour)
-	for _, path := range artifacts {
+		body := []byte("partial")
 		if strings.HasSuffix(path, ".meta") {
-			if err := os.Chtimes(path, old, old); err != nil {
-				t.Fatal(err)
-			}
+			// A current-version claim is only reclaimable after its lifetime
+			// OS lock is free; age alone is not evidence of owner death.
+			body = []byte(`{"lock_fenced":true}`)
+		}
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 	// A "completed" blob that must survive any cleanup.

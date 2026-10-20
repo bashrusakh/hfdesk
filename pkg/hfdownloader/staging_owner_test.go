@@ -192,10 +192,9 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 
 // TestCheckBlob_OwnershipIdentity pins the CheckBlob consumer of the ownership
 // classification. A lock-fenced record on a platform with the OS lock is
-// authoritative: a free lock means the owner is gone (stale/take-over-able),
-// even when the record carries our live PID and a fresh heartbeat. Fallback
-// records keep the lease heuristic, where a fresh foreign record with our PID
-// is still "downloading".
+// authoritative: a free lock means the current-version owner is gone even when
+// the record carries our live PID and a fresh heartbeat. Unfenced records stay
+// "downloading" unless same-host process death can be proven.
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir, time.Minute)
@@ -239,8 +238,8 @@ func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 		t.Fatalf("lock-fenced foreign instance with our PID and a free lock = %v (err=%v), want BlobStale", status, err)
 	}
 
-	// A fallback record (no OS lock) keeps the lease heuristic: a fresh foreign
-	// record with our live PID is still "downloading".
+	// An unfenced record does not become safe merely because the new lock probe
+	// is free: a fresh foreign record with our live PID remains "downloading".
 	fallback := foreign
 	fallback.LockFenced = false
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &fallback); err != nil {

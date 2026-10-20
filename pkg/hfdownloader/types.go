@@ -248,11 +248,11 @@ type Settings struct {
 	// starts and cleared and flushed only after the proof succeeds, immediately
 	// before publication. On resume it forces the proof in every mode except
 	// "none" (including "size") whenever the item has a known digest, so a
-	// crash mid-proof, a mismatch whose cleanup cannot take the transition lock,
+	// crash mid-proof, a mismatch whose cleanup fails,
 	// or a later Verify-mode change cannot publish unproven all-Done ranges. On
 	// a mismatch the flag stays set, poison is attempted only while the claim is
-	// still owned under the transition lock (a fallback writer that lost a
-	// takeover must not truncate the successor's payload), and the owned discard
+	// still owned under lifetime exclusion and metadata serialization (an
+	// unfenced legacy writer must not truncate another owner's payload), and the owned discard
 	// is attempted; if either cannot verify ownership, the durable flag remains
 	// the guard and the next run re-proves or discards. Publish refuses while the
 	// flag is still set for a known digest. Verify "none" is the explicit
