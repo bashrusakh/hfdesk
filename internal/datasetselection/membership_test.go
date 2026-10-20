@@ -176,9 +176,11 @@ func TestRecognizeSplitPrefixBoundaries(t *testing.T) {
 		{Path: "pretrain_000.parquet"},
 		{Path: "train-data.parquet"},
 		{Path: "train.parquet"},
+		{Path: "model.train.parquet"},
+		{Path: "corpus.train.000.parquet"},
 	}
 	r := Recognize(files)
-	assertIndexes(t, r.Groups["train"], 0, 3, 4)
+	assertIndexes(t, r.Groups["train"], 0, 3, 4, 5, 6)
 	assertIndexes(t, r.Groups["test"], 1)
 	assertIndexes(t, r.Groups["default"], 2)
 }

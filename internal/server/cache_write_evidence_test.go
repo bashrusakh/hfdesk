@@ -1063,3 +1063,37 @@ func TestBroadMutationFailsClosedForFailedDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBroadMutationFindsEvidenceForNormalizedStartingDescriptor(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "local")
+	job := &Job{ID: "writer", Repo: "owner/repo", LocalDir: local, Flat: true, Status: JobStatusQueued, starting: true}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	m.jobs[job.ID] = job
+	m.mu.Lock()
+	m.registerRunActivityLocked(job)
+	m.mu.Unlock()
+	base := jobDestinationBase(job)
+	if base == "" {
+		t.Fatal("writer destination base unavailable")
+	}
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	end := m.beginObservedMutation([]string{filepath.Join(base, "scratch")})
+	a := testCacheWriteAttempt(m)
+	a.CollectSnapshot(m.captureWriteDecision())
+
+	descriptor := decisionJob(job)
+	if _, ok := a.evidence[decisionDescriptorKey(descriptor)]; ok {
+		t.Fatal("fixture unexpectedly collected exact-key evidence for the starting descriptor")
+	}
+	if !a.HasActiveBroadMutationFor(descriptor, nil) {
+		t.Fatal("normalized starting descriptor missed its claimed activity's namespace conflict")
+	}
+
+	end()
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

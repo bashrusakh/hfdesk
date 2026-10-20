@@ -252,6 +252,18 @@ func descriptorForStartingJob(job, activity writeDecisionJob) bool {
 	return decisionDescriptorKey(job) == decisionDescriptorKey(activity)
 }
 
+// decisionLookupKey matches a descriptor against collected evidence. Activity
+// identity is not part of the job-level key, and a starting job descriptor is
+// advanced once to its claimed activity generation.
+func decisionLookupKey(descriptor writeDecisionJob) string {
+	wasActivity := descriptor.activityID != 0
+	descriptor.activityID = 0
+	if descriptor.starting && !wasActivity {
+		descriptor.generation++
+	}
+	return decisionDescriptorKey(descriptor)
+}
+
 func jobFromDecision(d writeDecisionJob) *Job {
 	return &Job{ID: d.id, Repo: d.repo, Revision: d.revision, OutputDir: d.output, HubDir: d.hub,
 		LocalDir: d.local, LocalRepo: d.localRepo, Status: d.status, starting: d.starting,
@@ -375,13 +387,7 @@ func (a *cacheWriteAttempt) MayWrite(job *Job, targets []string) bool {
 // not part of the job-level key, and a starting job descriptor is advanced once
 // to match its claimed activity.
 func (a *cacheWriteAttempt) descriptorFailed(descriptor writeDecisionJob) bool {
-	base := descriptor
-	wasActivity := base.activityID != 0
-	base.activityID = 0
-	if base.starting && !wasActivity {
-		base.generation++
-	}
-	baseKey := decisionDescriptorKey(base)
+	baseKey := decisionLookupKey(descriptor)
 	for key, stored := range a.descriptors {
 		candidate := stored
 		candidate.activityID = 0
@@ -396,16 +402,11 @@ func (a *cacheWriteAttempt) MayWriteDescriptor(descriptor writeDecisionJob, targ
 	if a == nil {
 		return true
 	}
-	base := descriptor
-	wasActivity := base.activityID != 0
-	base.activityID = 0
 	// registerRunActivityLocked already advances the descriptor generation
-	// when a run claims a starting job. Preserve that generation when checking
-	// the activity; only a starting job descriptor needs the claim adjustment.
-	if base.starting && !wasActivity {
-		base.generation++
-	}
-	baseKey := decisionDescriptorKey(base)
+	// when a run claims a starting job. decisionLookupKey preserves that
+	// generation when checking the activity and only adjusts a starting job
+	// descriptor for the claim.
+	baseKey := decisionLookupKey(descriptor)
 	identities := make([]string, len(targets))
 	for i, p := range targets {
 		probe, err := captureWriteIdentityProbe(p, false)
@@ -496,9 +497,28 @@ func (a *cacheWriteAttempt) hasActiveBroadMutation(descriptor *writeDecisionJob,
 		if a.descriptorFailed(*descriptor) {
 			return true
 		}
+		// Match evidence the same way MayWriteDescriptor and descriptorFailed
+		// do: ignore activity identity and advance a starting job once to its
+		// claimed activity generation. The exact key remains as a fallback for
+		// a starting descriptor whose activity has not been registered yet.
+		baseKey := decisionLookupKey(*descriptor)
+		matched := make(map[string]bool, len(a.descriptors))
+		for key, stored := range a.descriptors {
+			candidate := stored
+			candidate.activityID = 0
+			if decisionDescriptorKey(candidate) != baseKey {
+				continue
+			}
+			matched[key] = true
+			if ev, ok := a.evidence[key]; ok {
+				evidence = append(evidence, ev)
+			}
+		}
 		key := decisionDescriptorKey(*descriptor)
-		if ev, ok := a.evidence[key]; ok {
-			evidence = append(evidence, ev)
+		if !matched[key] {
+			if ev, ok := a.evidence[key]; ok {
+				evidence = append(evidence, ev)
+			}
 		}
 	}
 	// beginCacheMutation and HF reservations name directory scopes; selected

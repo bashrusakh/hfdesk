@@ -255,7 +255,8 @@ func pathGroups(p, base string) []string {
 
 // hasSplitToken recognizes the conventional split marker anywhere in a
 // basename, provided it is delimiter-bounded on both sides. This retains
-// corpus_train_000.parquet without treating pretrain_000.parquet as train.
+// corpus_train_000.parquet and model.train.parquet without treating
+// pretrain_000.parquet as train.
 func hasSplitToken(base, split string) bool {
 	for start := 0; ; {
 		i := strings.Index(base[start:], split)
@@ -264,7 +265,7 @@ func hasSplitToken(base, split string) bool {
 		}
 		i += start
 		end := i + len(split)
-		before := i == 0 || base[i-1] == '-' || base[i-1] == '_'
+		before := i == 0 || base[i-1] == '-' || base[i-1] == '_' || base[i-1] == '.'
 		after := end == len(base) || base[end] == '-' || base[end] == '_' || base[end] == '.'
 		if before && after {
 			return true
