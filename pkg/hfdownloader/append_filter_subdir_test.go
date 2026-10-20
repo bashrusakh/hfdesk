@@ -187,8 +187,10 @@ func TestDownload_RetainedModelVocabKeepsRepoRelativeDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep AppendFilterSubdir enabled while selecting the same artifact through
+	// a single-component filter; path-shaped filters are rejected by contract.
 	err = Download(context.Background(), Job{
-		Repo: "owner/model", Revision: "main", Filters: []string{"weights/model.safetensors"}, ExactMatch: true, AppendFilterSubdir: true,
+		Repo: "owner/model", Revision: "main", Filters: []string{"model.safetensors"}, ExactMatch: true, AppendFilterSubdir: true,
 	}, Settings{Endpoint: server.URL, OutputDir: out, Concurrency: 1, MaxActiveDownloads: 1}, nil)
 	if err != nil {
 		t.Fatalf("Download: %v", err)

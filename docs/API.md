@@ -477,6 +477,13 @@ applicable; it can be empty for ordinary non-LFS model files whose destination
 remains repository-relative. `ScanPlan` preview events and the `/api/plan`
 response remain repository-relative.
 
+`AppendFilterSubdir` is limited to single-component group/token filters because
+the filter becomes a destination directory name. `PlanRepo` and `Download`
+reject a path-shaped filter (one containing `/` or `\`, including a `./` prefix
+or trailing separator, or the `.`/`..` components) with
+`ErrAppendFilterSubdirPathFilter` before any network or plan work. Such filters
+remain valid when `AppendFilterSubdir` is disabled.
+
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with
 `400` and error code `no_filter_match`; retained companion/metadata files alone

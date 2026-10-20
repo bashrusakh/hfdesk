@@ -34,6 +34,15 @@ var (
 	// ErrAmbiguousSelection is returned when dataset membership ambiguity could
 	// change the emitted files for a recognized dataset-group selection.
 	ErrAmbiguousSelection = errors.New("dataset selection is ambiguous")
+
+	// ErrAppendFilterSubdirPathFilter is returned when AppendFilterSubdir is
+	// enabled together with a path-shaped filter (one containing "/" or "\",
+	// including a "./" prefix or trailing separator, or the exact components
+	// "."/".."). AppendFilterSubdir names the destination directory after the
+	// filter, which is only meaningful for single-component group/token
+	// filters; path filters must use AppendFilterSubdir=false. Distinguishable
+	// via errors.Is.
+	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
 )
 
 // DownloadError wraps an error with file context.

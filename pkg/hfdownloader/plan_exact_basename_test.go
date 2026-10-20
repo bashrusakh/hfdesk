@@ -43,7 +43,9 @@ func TestPlanRepoRootSelectorAndLegacyBasename(t *testing.T) {
 		}
 		return plan.Items
 	}
-	root := planFor("./model-Q4_0.gguf", true)
+	// Root selectors are path-shaped, so they require AppendFilterSubdir=false.
+	// DestinationSubdir is still populated and must not leak the "./" marker.
+	root := planFor("./model-Q4_0.gguf", false)
 	if len(root) != 1 || root[0].RelativePath != "model-Q4_0.gguf" {
 		t.Fatalf("root selector planned %+v, want only root artifact", root)
 	}
@@ -93,13 +95,22 @@ func TestDatasetRootArtifactSelectorAttributionDoesNotLeakMarker(t *testing.T) {
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 
-	for _, appendSubdir := range []bool{false, true} {
+	for _, tc := range []struct {
+		filter       string
+		appendSubdir bool
+	}{
+		// Path-shaped root selectors require AppendFilterSubdir=false.
+		{filter: "./model-Q4_0.gguf", appendSubdir: false},
+		// AppendFilterSubdir remains covered through an equivalent
+		// single-component filter for the same fixture.
+		{filter: "model-Q4_0.gguf", appendSubdir: true},
+	} {
 		plan, err := PlanRepo(t.Context(), Job{
-			Repo: "owner/data", IsDataset: true, Filters: []string{"./model-Q4_0.gguf"},
-			ExactMatch: true, AppendFilterSubdir: appendSubdir,
+			Repo: "owner/data", IsDataset: true, Filters: []string{tc.filter},
+			ExactMatch: true, AppendFilterSubdir: tc.appendSubdir,
 		}, Settings{Endpoint: srv.URL})
 		if err != nil {
-			t.Fatalf("dataset GGUF PlanRepo append=%v: %v", appendSubdir, err)
+			t.Fatalf("dataset GGUF PlanRepo filter=%q append=%v: %v", tc.filter, tc.appendSubdir, err)
 		}
 		var selected *PlanItem
 		for i := range plan.Items {
@@ -108,10 +119,10 @@ func TestDatasetRootArtifactSelectorAttributionDoesNotLeakMarker(t *testing.T) {
 			}
 		}
 		if selected == nil {
-			t.Fatalf("dataset GGUF plan append=%v omitted raw repository path: %+v", appendSubdir, plan.Items)
+			t.Fatalf("dataset GGUF plan filter=%q append=%v omitted raw repository path: %+v", tc.filter, tc.appendSubdir, plan.Items)
 		}
 		if selected.Subdir != "model-Q4_0.gguf" || selected.DestinationSubdir != "model-Q4_0.gguf" {
-			t.Errorf("dataset GGUF attribution append=%v = %q/%q; want marker-free basename", appendSubdir, selected.Subdir, selected.DestinationSubdir)
+			t.Errorf("dataset GGUF attribution filter=%q append=%v = %q/%q; want marker-free basename", tc.filter, tc.appendSubdir, selected.Subdir, selected.DestinationSubdir)
 		}
 	}
 	plan, err := PlanRepo(t.Context(), Job{
@@ -130,7 +141,7 @@ func TestDatasetRootNonGGUFSelectorAttributionDoesNotLeakMarker(t *testing.T) {
 	})
 	defer srv.Close()
 	plan, err := PlanRepo(t.Context(), Job{
-		Repo: "owner/data", IsDataset: true, Filters: []string{"./data.csv"}, ExactMatch: true, AppendFilterSubdir: true,
+		Repo: "owner/data", IsDataset: true, Filters: []string{"./data.csv"}, ExactMatch: true, AppendFilterSubdir: false,
 	}, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("dataset non-GGUF PlanRepo: %v", err)

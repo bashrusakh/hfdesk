@@ -41,7 +41,32 @@ func validate(job Job, cfg Settings) error {
 	if !IsValidModelName(job.Repo) {
 		return fmt.Errorf("invalid repo id %q (expected owner/name)", job.Repo)
 	}
+	if job.AppendFilterSubdir {
+		if err := validateAppendFilterSubdirFilters(job.Filters); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// validateAppendFilterSubdirFilters rejects path-shaped filters when the
+// downloader would use each filter as a destination directory name. A filter
+// that names a repository path (or the "."/".." components) is not a
+// single-component group/token, so appending it as a directory would nest the
+// matched file under a misleading path. Path filters remain valid when
+// AppendFilterSubdir is disabled.
+func validateAppendFilterSubdirFilters(filters []string) error {
+	var pathFilters []string
+	for _, filter := range filters {
+		normalized := strings.ReplaceAll(filter, `\`, "/")
+		if normalized == "." || normalized == ".." || strings.Contains(normalized, "/") {
+			pathFilters = append(pathFilters, filter)
+		}
+	}
+	if len(pathFilters) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q", ErrAppendFilterSubdirPathFilter, pathFilters)
 }
 
 // backoff implements exponential backoff with jitter.

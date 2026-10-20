@@ -114,6 +114,13 @@ type Job struct {
 	//   <output>/<repo>/q4_0/<filename>
 	// Instead of:
 	//   <output>/<repo>/<filename>
+	//
+	// Only single-component group/token filters are supported because the
+	// filter becomes a destination directory name. Path-shaped filters (any
+	// filter containing "/" or "\", including a "./" prefix or trailing
+	// separator, or the "."/".." components) must use
+	// AppendFilterSubdir=false and cause PlanRepo and Download to return
+	// ErrAppendFilterSubdirPathFilter before any network or plan work.
 	AppendFilterSubdir bool
 
 	// LocalRepo overrides the destination folder path when set.
