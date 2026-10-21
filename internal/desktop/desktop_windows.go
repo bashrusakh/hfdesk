@@ -161,6 +161,12 @@ func run(o Options, logPath string) (err error) {
 		return err
 	}
 
+	// The signal ends the whole host, not only the server.
+	//
+	// The signal context is cancelled by the signal, so the server stops
+	// through the graceful path of the application. The host itself ends
+	// through the quit below, which is the same path the menu action of
+	// the tray uses.
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	ctx, cancel := context.WithCancel(signalCtx)
@@ -195,10 +201,52 @@ func run(o Options, logPath string) (err error) {
 	}
 
 	if err := application.Start(ctx); err != nil {
+		if signalCtx.Err() != nil {
+			// A signal ended the host during the startup: the server
+			// never served, so the host ends without a failure report.
+			//
+			// The wait stops the server through the graceful path of
+			// the application, so the process never ends with a running
+			// server that was not stopped through the graceful path.
+			desktopLog.Info("the desktop host stopped after a signal during the startup")
+			if waitErr := application.Wait(); waitErr != nil {
+				desktopLog.Error("the server did not stop cleanly", "error", waitErr)
+			}
+			return nil
+		}
 		reportStartupFailure("HFDesk could not start",
 			fmt.Sprintf("HFDesk could not start its local server.\n\n%v", err), logPath)
 		return err
 	}
+
+	// The tray reports that it is ready through its ready callback.
+	ready := make(chan struct{})
+
+	// The quit ends the host: it stops the server through the graceful
+	// path and ends the message loop of the tray.
+	//
+	// The quit hands the shutdown off to a goroutine and returns: the
+	// message loop of the tray keeps running until the shutdown has
+	// finished, so the process never exits in the middle of it.
+	//
+	// The menu action of the tray and the signal handler use this very
+	// quit, so the two cannot drift apart.
+	requestQuit := func() {
+		go guard.runBackground(func() {
+			endHost(shutdown, ready, systray.Quit)
+		})
+	}
+
+	// A signal ends the host as one unit: the server is stopped through
+	// the graceful path and the message loop of the tray ends, so the
+	// process exits instead of leaving a tray icon behind that serves
+	// nothing.
+	//
+	// The signal handler uses the same quit as the menu action of the
+	// tray, so the two cannot drift apart.
+	go guard.runBackground(func() {
+		endHostOnSignal(signalCtx, requestQuit)
+	})
 
 	url := application.URL()
 	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
@@ -231,17 +279,6 @@ func run(o Options, logPath string) (err error) {
 		desktopLog.Info("the WebView2 runtime is available", "version", webview2Version)
 	}
 
-	// The quit action hands the shutdown off to a goroutine and returns:
-	// the message loop of the tray keeps running until the shutdown has
-	// finished, so the process never exits in the middle of it.
-	requestQuit := func() {
-		go guard.runBackground(func() {
-			shutdown()
-			systray.Quit()
-		})
-	}
-
-	ready := make(chan struct{})
 	go guard.runBackground(func() {
 		select {
 		case <-ready:
@@ -288,8 +325,41 @@ func run(o Options, logPath string) (err error) {
 	// The tray loop ended. The server is stopped before the process
 	// exits, also when the loop ended for another reason than the quit
 	// action.
+	//
+	// The shutdown runs once, whoever asks for it: when the quit already
+	// stopped the server, this call waits for that shutdown to finish
+	// and stops nothing. The invariant of the host is that the process
+	// never ends with a running server that was not stopped through the
+	// graceful path.
 	shutdown()
 	return nil
+}
+
+// endHost ends the desktop host.
+//
+// The server is stopped through the graceful path and the message loop of
+// the tray ends afterwards, so the host ends as one unit: the tray never
+// outlives the server it belongs to, and the process never ends with a
+// running server that was not stopped through the graceful path.
+//
+// The end of the message loop waits for the notification area host: the
+// tray library reaches the host only when its window exists, so a quit
+// that ends the loop before that would be lost and the host would keep
+// running with a stopped server.
+func endHost(shutdown func(), trayReady <-chan struct{}, endTray func()) {
+	shutdown()
+	<-trayReady
+	endTray()
+}
+
+// endHostOnSignal ends the host when the signal arrives.
+//
+// The signal context is cancelled by the signal, so the host ends through
+// the quit of the caller. The quit is the same path the menu action of
+// the tray uses, so a signal and the menu action cannot drift apart.
+func endHostOnSignal(signalCtx context.Context, quit func()) {
+	<-signalCtx.Done()
+	quit()
 }
 
 // stopServer runs the graceful shutdown and waits for it with a bound.

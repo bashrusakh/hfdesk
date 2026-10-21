@@ -107,8 +107,10 @@ jobs:
           VERSION: ci
           # The target of the step is stated here, so a runner default
           # cannot change it. The desktop artifact is linked with
-          # -H=windowsgui, which makes the linker emit a PE image, and
-          # that flag crashes the linker when the target is not Windows.
+          # -H=windowsgui, and that flag makes the linker emit a Windows
+          # PE image whatever the target is, so an unset or changed GOOS
+          # would silently produce a PE binary where a host binary was
+          # intended.
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0

@@ -217,6 +217,82 @@ func TestStopServerStopsTheRunningServer(t *testing.T) {
 	}
 }
 
+// endOfHostTimeout bounds the wait for the end of the host.
+const endOfHostTimeout = 5 * time.Second
+
+// trayReadyWait is the pause that proves that the end of the host waits
+// for the notification area host.
+//
+// The wait is short: it only has to be long enough for a quit that does
+// not wait to show itself.
+const trayReadyWait = 100 * time.Millisecond
+
+// TestSignalEndsTheWholeHost proves that a signal ends the desktop host
+// as one unit: the server is stopped through the graceful path and the
+// message loop of the tray ends afterwards, so the host never keeps
+// running with a stopped server.
+//
+// The test drives the end of the host the way the signal handler drives
+// it: the signal context is cancelled and the quit path runs.
+//
+// Not covered here: the notification area icon and the WebView2 window.
+// They need an interactive Windows session, and the test only needs the
+// order of the two steps of the end.
+func TestSignalEndsTheWholeHost(t *testing.T) {
+	// The signal context of the host and the ready callback of the tray.
+	signalCtx, stopSignal := context.WithCancel(context.Background())
+	defer stopSignal()
+	ready := make(chan struct{})
+
+	var mu sync.Mutex
+	var steps []string
+
+	shutdown := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		steps = append(steps, "shutdown")
+	}
+	endTray := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		steps = append(steps, "tray")
+	}
+
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		endHostOnSignal(signalCtx, func() {
+			endHost(shutdown, ready, endTray)
+		})
+	}()
+
+	// The signal arrives.
+	stopSignal()
+
+	// The end of the message loop waits for the notification area host:
+	// the tray library reaches the host only when its window exists, so
+	// a quit that ends the loop before that would be lost.
+	select {
+	case <-ended:
+		t.Fatal("the host ended before the notification area host was ready")
+	case <-time.After(trayReadyWait):
+	}
+
+	close(ready)
+
+	select {
+	case <-ended:
+	case <-time.After(endOfHostTimeout):
+		t.Fatal("the signal did not end the host")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(steps) != 2 || steps[0] != "shutdown" || steps[1] != "tray" {
+		t.Fatalf("the steps of the end of the host = %v, want the server stopped before the tray loop ends", steps)
+	}
+}
+
 // runtimeStatus is the part of the runtime status the smoke test reads.
 type runtimeStatus struct {
 	Version    string `json:"version"`
