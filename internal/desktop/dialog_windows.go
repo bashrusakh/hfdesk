@@ -21,10 +21,17 @@ var standardLog = logging.NewComponentLogger("stdlib")
 
 // showMessage shows a native message box.
 //
+// It is a package level variable so the tests can replace it: the real
+// message box blocks a process without an interactive window station, so a
+// test that drives a path that reports a failure would never end.
+var showMessage = showNativeMessage
+
+// showNativeMessage shows a native message box.
+//
 // The message box is the only error surface a windowless process has: a GUI
 // subsystem process has no console, so a message that is only written to
 // standard error would vanish.
-func showMessage(caption, text string, icon uint32) {
+func showNativeMessage(caption, text string, icon uint32) {
 	textPtr, err := windows.UTF16PtrFromString(text)
 	if err != nil {
 		return

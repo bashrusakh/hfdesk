@@ -27,8 +27,9 @@ import (
 //
 // The returned warning is empty when the build is correct. The warning is a
 // property of the binary, so the caller decides when it is shown: a launch
-// that finds a running instance reports that instance and leaves the warning
-// to the launch that runs the host.
+// that finds a running instance reports that instance and stops before the
+// check, so the check and its record belong to the launch that runs the
+// host.
 func checkSubsystem() string {
 	path, err := os.Executable()
 	if err != nil {

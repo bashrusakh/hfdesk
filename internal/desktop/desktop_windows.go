@@ -25,6 +25,13 @@ import (
 // desktopLog is the logger of the desktop host.
 var desktopLog = logging.NewComponentLogger("desktop")
 
+// openBrowser opens a URL in the default browser of the user.
+//
+// It is a package level variable so the tests can replace it: the browser
+// of the machine is not the browser of a test, and the path that reports a
+// failed open needs a browser that fails.
+var openBrowser = app.OpenBrowser
+
 // trayStartupTimeout bounds the wait for the tray.
 //
 // The tray reports that it is ready through its ready callback. Without a
@@ -43,8 +50,8 @@ const gracefulShutdownTimeout = 30 * time.Second
 
 // Run starts the desktop host and blocks until the user quits it.
 //
-// The sequence is the one of the shared application layer: the logging
-// pipeline is installed, the single instance lock is taken, the server is
+// The sequence is the one of the shared application layer: the single
+// instance lock is taken, the logging pipeline is installed, the server is
 // started in-process and the system tray takes over the main thread.
 //
 // Run returns nil after a normal quit and after a launch that found a
@@ -59,6 +66,9 @@ func Run(o Options) error {
 }
 
 // run performs the desktop startup.
+//
+// The single instance lock is taken before the log file is opened, so only
+// the launch that runs the host owns the rotating log file.
 //
 // A panic of the host is caught here: the desktop host has no console, so a
 // panic that is not caught ends the process without an explanation and
@@ -110,6 +120,33 @@ func run(o Options, logPath string) (err error) {
 		err = fmt.Errorf("desktop: the desktop host stopped after a panic: %s", detail)
 	}()
 
+	// The single instance lock is taken before the log file is opened.
+	//
+	// The rotating log file belongs to the launch that runs the host: a
+	// second launch must not open it. Two processes that hold the same
+	// log file break its rotation, because the rename of the rotation
+	// fails while the other process holds the file, and a failed
+	// rotation stops the persistent log.
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		// The logging pipeline does not exist yet, so the failure cannot
+		// be recorded in the log file. The message box is the only
+		// surface the user has, and it names no log file, because there
+		// is none.
+		reportStartupFailure("HFDesk could not start",
+			fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err), "")
+		return err
+	}
+	defer lock.Release()
+
+	if lock.Exists() {
+		// Another instance holds the lock: the lock is the authority on
+		// whether HFDesk is already running. This instance starts no
+		// server and opens no log file.
+		reportAlreadyRunning()
+		return nil
+	}
+
 	pipeline, err = setupLogging(o.App.LogLevel, logPath)
 	if err != nil {
 		return err
@@ -120,10 +157,10 @@ func run(o Options, logPath string) (err error) {
 	// notification area icon, so the user is told how to rebuild it. The
 	// check only reports the problem: the host starts either way.
 	//
-	// The record is written on every launch, so the log file always shows
-	// that the build is wrong. The message box belongs to the launch that
-	// runs the host: a second launch reports the running instance, and the
-	// launch that runs the host has already told the user about the build.
+	// The record is written by the launch that runs the host, so the log
+	// file of the running instance always shows that the build is wrong.
+	// A second launch reports the running instance and stops before this
+	// point: it opens no log file and writes no record.
 	subsystemWarningText := checkSubsystem()
 
 	// The third party libraries report their problems through the
@@ -134,26 +171,9 @@ func run(o Options, logPath string) (err error) {
 	restoreLogger := installStandardLogger()
 	defer restoreLogger()
 
-	lock, err := acquireInstanceLock()
-	if err != nil {
-		reportStartupFailure("HFDesk could not start",
-			fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err), logPath)
-		return err
-	}
-	defer lock.Release()
-
-	if lock.Exists() {
-		// Another instance holds the lock: the lock is the authority on
-		// whether HFDesk is already running. This instance starts no
-		// server.
-		reportAlreadyRunning()
-		return nil
-	}
-
 	// The message box of the subsystem warning belongs to this launch: it
-	// is the launch that runs the host, and the first launch has already
-	// reported the build. A second launch shows the notice of the running
-	// instance only.
+	// is the launch that runs the host, and a second launch shows the
+	// notice of the running instance only.
 	if subsystemWarningText != "" {
 		showSubsystemWarning(subsystemWarningText)
 	}
@@ -475,22 +495,33 @@ func setupLogging(level, logPath string) (*logging.Pipeline, error) {
 //
 // The published URL is only opened when the running instance answers it, so
 // a stale state file never sends the browser to a dead URL.
+//
+// The web UI is opened before the notice is shown, so the notice tells the
+// user what really happened. The second launch has no log file of its own:
+// the log file belongs to the launch that runs the host, so a record of
+// this launch reaches the standard logger and vanishes in a GUI process.
+// A failure the user has to know about is therefore reported in a message
+// box, and the failure is recorded as well.
 func reportAlreadyRunning() {
 	url := publishedURL()
 	if url == "" || !serverReachable(url) {
-		showMessage("HFDesk is already running",
-			"HFDesk is already running.\n\nUse the icon in the notification area to open the Runtime / Logs window.",
+		showMessage(alreadyRunningCaption,
+			alreadyRunningUnreachableText(),
 			windows.MB_ICONINFORMATION)
 		return
 	}
 
-	showMessage("HFDesk is already running",
-		fmt.Sprintf("HFDesk is already running.\n\nThe running instance serves %s.\n\nThe web UI is opened in your default browser.", url),
-		windows.MB_ICONINFORMATION)
-
-	if err := app.OpenBrowser(url); err != nil {
+	if err := openBrowser(url); err != nil {
 		desktopLog.Warn("could not open the web UI of the running instance", "url", url, "error", err)
+		showMessage(alreadyRunningOpenFailedCaption,
+			alreadyRunningOpenFailedText(url, err),
+			windows.MB_ICONERROR)
+		return
 	}
+
+	showMessage(alreadyRunningCaption,
+		alreadyRunningText(url),
+		windows.MB_ICONINFORMATION)
 }
 
 // showRuntimeWindow shows the Runtime / Logs window.
