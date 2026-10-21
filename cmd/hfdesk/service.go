@@ -150,6 +150,10 @@ func serviceErrorText(err error) string {
 }
 
 // writeServiceUsage prints the usage block of the service command family.
+//
+// An option of a single subcommand is listed with the subcommand that owns
+// it: a family level option list would offer a flag that the other
+// subcommands reject.
 func writeServiceUsage(w io.Writer) {
 	fmt.Fprint(w, "Usage: hfdesk service <subcommand> [options]\n\n")
 	fmt.Fprint(w, "Subcommands:\n")
@@ -169,7 +173,7 @@ Scope:
   --user        per-user installation (the default on Linux and macOS)
   --system      machine-wide installation (the default on Windows)
 
-Options:
+Options of the "install" subcommand:
   --listen HOST:PORT
                 bind address of the instance (default %s)
 
@@ -337,6 +341,13 @@ type installFlags struct {
 // The cache directories are derived from the runtime paths, so they are
 // resolved after the overrides: a machine-wide instance keeps its cache
 // inside its own state root even when the state root was overridden.
+//
+// The cache root and the hub directory are one layout, so an explicit cache
+// root moves the hub directory with it: a registration that names a cache
+// root and the hub of another tree would write the blobs of the instance
+// into a directory its own cache root does not contain. A hub directory that
+// was named explicitly is honoured as given: it separates the two locations
+// on purpose, the same independence HF_HOME and HF_HUB_CACHE have.
 func buildInstallOptions(scope service.Scope, flags installFlags, executable string) (service.InstallOptions, error) {
 	paths, err := service.DefaultPaths(scope)
 	if err != nil {
@@ -355,6 +366,9 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	cacheRoot, hubDir := service.DefaultCacheDirs(scope, paths)
 	if flags.cacheDir != "" {
 		cacheRoot = flags.cacheDir
+		if flags.hubDir == "" {
+			hubDir = filepath.Join(cacheRoot, "hub")
+		}
 	}
 	if flags.hubDir != "" {
 		hubDir = flags.hubDir
@@ -458,11 +472,14 @@ func serviceInstall(args []string, stdout io.Writer) error {
 // The path of the registration and the state of the instance are known only
 // after the installation, so both are read back from the supervisor.
 //
-// The cache root is the effective one: the config file of the instance wins
-// over the registered value, because the cache directory is changed in the
-// settings of the instance and the change has to survive a restart.
+// The cache root and the hub directory are the effective ones: the config
+// file of the instance wins over the registered values, because the cache
+// directory is changed in the settings of the instance and the change has to
+// survive a restart.
 func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, scope service.Scope, opts service.InstallOptions) {
 	status, statusErr := mgr.Status(ctx)
+
+	cacheRoot, hubDir := effectiveCacheDirs(opts)
 
 	writeField(w, "Service", service.ServiceName)
 	writeField(w, "Scope", string(scope))
@@ -472,7 +489,8 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	writeField(w, "Config file", opts.Paths.ConfigFile)
 	writeField(w, "State dir", opts.Paths.StateDir)
 	writeField(w, "Log dir", opts.Paths.LogDir)
-	writeField(w, "Cache root", service.EffectiveCacheDir(opts.Paths.ConfigFile, opts.CacheDir))
+	writeField(w, "Cache root", cacheRoot)
+	writeField(w, "Hub dir", hubDir)
 
 	if warning := nonLoopbackWarning(opts.Listen); warning != "" {
 		fmt.Fprintln(w)
@@ -486,6 +504,36 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The service was registered.")
 	writeInstallState(w, status, statusErr)
+}
+
+// effectiveCacheDirs returns the cache root and the hub directory the
+// instance uses.
+//
+// The rule is the one the headless host applies to the running instance: a
+// config file that defines a cache root owns the whole cache layout of the
+// instance, so the hub directory is the "hub" child of that root. Without a
+// cache root from the config file the registration keeps its hub directory,
+// and a registration without one falls back to the "hub" child of the
+// effective cache root.
+//
+// The two directories are reported as one pair: a summary that named a cache
+// root without its hub directory would hide a layout that sends the blobs of
+// the instance somewhere else.
+func effectiveCacheDirs(opts service.InstallOptions) (string, string) {
+	cacheRoot := service.EffectiveCacheDir(opts.Paths.ConfigFile, opts.CacheDir)
+
+	// The registered value is empty when the config file of the instance
+	// defines a cache root of its own: the config file then owns the whole
+	// layout of the instance.
+	if configured := service.EffectiveCacheDir(opts.Paths.ConfigFile, ""); configured != "" {
+		return configured, filepath.Join(configured, "hub")
+	}
+
+	hubDir := opts.HubDir
+	if hubDir == "" && cacheRoot != "" {
+		hubDir = filepath.Join(cacheRoot, "hub")
+	}
+	return cacheRoot, hubDir
 }
 
 // writeInstallState prints the state the instance reached after the

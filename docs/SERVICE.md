@@ -71,13 +71,22 @@ never opens a browser.
 | `--config PATH` | Absolute path of the config file the instance owns. |
 | `--state-dir DIR` | Absolute path of the state directory (jobs, history, mirror targets). |
 | `--log-dir DIR` | Absolute path of the log directory. |
-| `--cache-dir DIR` | Absolute path of the Hugging Face cache root. |
-| `--hub-dir DIR` | Absolute path of the Hugging Face hub cache directory. |
+| `--cache-dir DIR` | Absolute path of the Hugging Face cache root. Without `--hub-dir`, the hub directory follows it: `<cache root>/hub`. |
+| `--hub-dir DIR` | Absolute path of the Hugging Face hub cache directory. Given explicitly, it separates the hub from the cache root on purpose. |
 | `--local-dir DIR` | Absolute path of the flat output directory. |
 
 The path flags override the default locations of the scope. Every path of an
 installation must be absolute; a relative path is rejected instead of being
 resolved against the working directory of the supervisor.
+
+The cache root and the hub directory are **one layout**: the cache root holds
+the friendly views (`models/`, `datasets/`), the hub directory holds the
+blobs. `--cache-dir` alone therefore moves the whole pair — the registered
+hub directory becomes the `hub` child (`<cache root>/hub`) of the registered
+cache root, so a registration never names two different trees. `--hub-dir`
+names the hub directory explicitly and separates the two locations on
+purpose, the same independence `HF_HOME` and `HF_HUB_CACHE` have. The
+summary of the installation reports both halves of the pair it registered.
 
 A cache or output directory recorded in the registration is the **fallback**
 of the instance: the config file the instance owns wins over it (see
@@ -145,7 +154,9 @@ By default the registration records the cache root of the scope: the
 Hugging Face cache of the user (`HF_HOME`, otherwise `~/.cache/huggingface`)
 for a user-scope instance, and `<state dir>/cache` for a machine-wide one
 (`/var/lib/hfdesk/cache` on Linux and macOS, `%ProgramData%\HFDesk\cache` on
-Windows).
+Windows). The registered hub directory is the `hub` child of the registered
+cache root, unless a hub directory was given explicitly (see
+[Install flags](#install-flags)).
 
 **Consequence for the user:** changing the cache directory in the settings of
 the service (`POST /api/settings`) is honoured by the next start of the
@@ -209,7 +220,7 @@ supervisor: the systemd journal on Linux, the launchd log files on macOS.
 
 | Command | Effect |
 |---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope. An existing registration is overwritten. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is overwritten. |
 | `uninstall` | Removes the **registration only**. |
 | `start` | Starts the registered service. |
 | `stop` | Stops the registered service. |
@@ -226,6 +237,10 @@ cache root of the instance — the one the instance actually uses (see
 [The effective cache root of an instance](#the-effective-cache-root-of-an-instance)).
 It is not necessarily the cache root that was recorded in the registration:
 an instance whose own config file defines a `cache-dir` uses that one.
+
+The summary of `install` reports the same pair: its `Cache root` and `Hub
+dir` lines name the two directories the registered instance uses, so a reader
+sees at once which tree the models of the instance go into.
 
 The commands are idempotent where the wanted state is already reached:
 

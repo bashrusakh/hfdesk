@@ -73,6 +73,40 @@ func writeConfigFile(t *testing.T, path, cacheRoot string) {
 	}
 }
 
+// summaryField returns the value of a "Key: value" line of a summary block.
+//
+// The value is read from the line of the key itself, so a value that is the
+// prefix of another value of the same block cannot satisfy the check.
+func summaryField(out, key string) string {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, key+":") {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, key+":"))
+	}
+	return ""
+}
+
+// usageOptionOwner returns the heading that introduces the option block the
+// given option belongs to.
+func usageOptionOwner(out, option string) string {
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), option) {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			heading := strings.TrimSpace(lines[j])
+			if heading == "" {
+				continue
+			}
+			return heading
+		}
+	}
+	return ""
+}
+
 func TestServiceUsageListsEverySubcommand(t *testing.T) {
 	var buf bytes.Buffer
 	writeServiceUsage(&buf)
@@ -81,6 +115,41 @@ func TestServiceUsageListsEverySubcommand(t *testing.T) {
 	for _, name := range serviceSubcommands {
 		if !strings.Contains(out, name) {
 			t.Errorf("the usage block does not mention the %q subcommand:\n%s", name, out)
+		}
+	}
+}
+
+// TestServiceUsageNamesTheOwnerOfTheListenOption checks that the usage
+// block of the family does not offer a bind address as an option of the
+// family: the option is listed with the subcommand that accepts it, because
+// the other subcommands reject it.
+func TestServiceUsageNamesTheOwnerOfTheListenOption(t *testing.T) {
+	var buf bytes.Buffer
+	writeServiceUsage(&buf)
+	out := buf.String()
+
+	owner := usageOptionOwner(out, "--listen")
+	if owner == "" {
+		// The family block does not offer the option at all: nothing it
+		// advertises is rejected by a subcommand.
+		return
+	}
+	if !strings.Contains(owner, "install") {
+		t.Errorf("the usage block offers --listen without naming the subcommand that accepts it (%q):\n%s", owner, out)
+	}
+}
+
+// TestServiceLifecycleSubcommandsRejectTheListenOption checks that the bind
+// address is an option of the install subcommand only.
+func TestServiceLifecycleSubcommandsRejectTheListenOption(t *testing.T) {
+	for _, sub := range []string{"uninstall", "start", "stop", "restart", "status"} {
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{sub, "--listen", "127.0.0.1:9090"}, &stdout, &stderr)
+		if code == 0 {
+			t.Errorf("the %q subcommand must reject --listen, got exit code %d", sub, code)
+		}
+		if !strings.Contains(stderr.String(), "listen") {
+			t.Errorf("the error of the %q subcommand does not name the rejected option:\n%s", sub, stderr.String())
 		}
 	}
 }
@@ -293,6 +362,69 @@ func TestBuildInstallOptionsAppliesTheOverrides(t *testing.T) {
 	}
 	if opts.LocalDir != "/srv/models" {
 		t.Errorf("the local dir is %q, want %q", opts.LocalDir, "/srv/models")
+	}
+}
+
+// TestBuildInstallOptionsKeepsTheCacheLayoutTogether checks that the
+// registered cache root and the registered hub directory are one layout: an
+// explicit cache root moves the hub directory with it, and an explicit hub
+// directory is honoured as given.
+//
+// A registration that names a cache root and the hub of another tree would
+// write the blobs of the instance into a directory its own cache root does
+// not contain.
+func TestBuildInstallOptionsKeepsTheCacheLayoutTogether(t *testing.T) {
+	const executable = "/usr/local/bin/hfdesk"
+
+	defaults, err := service.DefaultPaths(service.ScopeUser)
+	if err != nil {
+		t.Fatalf("the default paths of the scope: %v", err)
+	}
+	defaultRoot, defaultHub := service.DefaultCacheDirs(service.ScopeUser, defaults)
+
+	for _, tc := range []struct {
+		name     string
+		flags    installFlags
+		wantRoot string
+		wantHub  string
+	}{
+		{
+			name:     "a cache root alone moves the hub directory with it",
+			flags:    installFlags{cacheDir: "/srv/cache"},
+			wantRoot: "/srv/cache",
+			wantHub:  "/srv/cache/hub",
+		},
+		{
+			name:     "a hub directory alone is honoured as given",
+			flags:    installFlags{hubDir: "/mnt/hub"},
+			wantRoot: defaultRoot,
+			wantHub:  "/mnt/hub",
+		},
+		{
+			name:     "both directories are honoured as given",
+			flags:    installFlags{cacheDir: "/srv/cache", hubDir: "/mnt/hub"},
+			wantRoot: "/srv/cache",
+			wantHub:  "/mnt/hub",
+		},
+		{
+			name:     "without an override the pair of the scope is kept",
+			flags:    installFlags{},
+			wantRoot: defaultRoot,
+			wantHub:  defaultHub,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := buildInstallOptions(service.ScopeUser, tc.flags, executable)
+			if err != nil {
+				t.Fatalf("build the install options: %v", err)
+			}
+			if opts.CacheDir != tc.wantRoot {
+				t.Errorf("the cache root is %q, want %q", opts.CacheDir, tc.wantRoot)
+			}
+			if opts.HubDir != tc.wantHub {
+				t.Errorf("the hub dir is %q, want %q", opts.HubDir, tc.wantHub)
+			}
+		})
 	}
 }
 
@@ -531,6 +663,75 @@ func TestInstallSummaryReportsTheEffectiveCacheRoot(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, cacheRoot) {
 		t.Errorf("the install summary does not report the cache root %q of the config file:\n%s", cacheRoot, out)
+	}
+}
+
+// TestInstallSummaryReportsTheCachePairOfTheInstance checks that the
+// summary of the installation names the cache root and the hub directory of
+// the pair the instance uses.
+//
+// A summary that names a cache root without its hub directory hides a layout
+// that sends the blobs of the instance somewhere else.
+func TestInstallSummaryReportsTheCachePairOfTheInstance(t *testing.T) {
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(t.TempDir(), "hfdesk.json"),
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		CacheDir: "/srv/cache",
+		HubDir:   "/srv/cache/hub",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+	out := buf.String()
+	if got := summaryField(out, "Cache root"); got != "/srv/cache" {
+		t.Errorf("the cache root of the summary is %q, want %q:\n%s", got, "/srv/cache", out)
+	}
+	if got := summaryField(out, "Hub dir"); got != "/srv/cache/hub" {
+		t.Errorf("the hub dir of the summary is %q, want %q:\n%s", got, "/srv/cache/hub", out)
+	}
+}
+
+// TestInstallSummaryReportsTheHubDirOfTheConfigFile checks that the summary
+// names the hub directory of the cache root the config file of the instance
+// defines: the config file owns the whole cache layout of the instance.
+func TestInstallSummaryReportsTheHubDirOfTheConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "hfdesk.json")
+	cacheRoot := filepath.Join(dir, "instance-cache")
+	writeConfigFile(t, configFile, cacheRoot)
+
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: configFile,
+			StateDir:   filepath.Join(dir, "state"),
+			LogDir:     filepath.Join(dir, "logs"),
+		},
+		CacheDir: "/srv/cache",
+		HubDir:   "/srv/cache/hub",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+	out := buf.String()
+	if got := summaryField(out, "Cache root"); got != cacheRoot {
+		t.Errorf("the cache root of the summary is %q, want %q:\n%s", got, cacheRoot, out)
+	}
+	wantHub := filepath.Join(cacheRoot, "hub")
+	if got := summaryField(out, "Hub dir"); got != wantHub {
+		t.Errorf("the hub dir of the summary is %q, want %q:\n%s", got, wantHub, out)
 	}
 }
 
