@@ -102,7 +102,7 @@ func run(o Options, logPath string) (err error) {
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
-			closePipeline(pipeline)
+			closePipelineWithFailure(pipeline, err)
 			return
 		}
 		detail := guard.report(recovered)
@@ -422,6 +422,23 @@ func closePipeline(pipeline *logging.Pipeline) {
 		return
 	}
 	_ = pipeline.Close()
+}
+
+// closePipelineWithFailure records the failure of the startup in the log file
+// and closes the log pipeline.
+//
+// The order matters: the record has to be written before the pipeline is
+// closed, because a closed file sink drops the records that are emitted
+// afterwards. The desktop host has no console, so the log file is the only
+// place where the failure survives the process: it is the support material
+// the user is asked to attach to a bug report.
+//
+// A start that ends without a failure records nothing.
+func closePipelineWithFailure(pipeline *logging.Pipeline, err error) {
+	if err != nil {
+		desktopLog.Error("the desktop host could not start", "error", err)
+	}
+	closePipeline(pipeline)
 }
 
 // setupLogging installs the logging pipeline of the desktop host.

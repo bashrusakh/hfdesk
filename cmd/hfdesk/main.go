@@ -21,7 +21,6 @@ var Version = "dev"
 
 func main() {
 	if err := run(); err != nil {
-		reportFailure(err)
 		os.Exit(1)
 	}
 }
@@ -32,7 +31,12 @@ func main() {
 // The configuration assembly, the version propagation, the server startup and
 // the browser handling live in the shared application layer, so the desktop
 // host runs the very same code in-process.
-func run() error {
+//
+// A failure is reported before it is returned, while the logging pipeline is
+// still open: the file sink drops the records that are emitted after it was
+// closed, so a failure that is reported after the close would be missing
+// from the log file the user is asked to attach to a bug report.
+func run() (err error) {
 	var opts app.Options
 
 	flag.Usage = func() {
@@ -51,9 +55,21 @@ func run() error {
 		FilePath: opts.LogFile,
 	})
 	if err != nil {
+		// The pipeline could not be installed: there is no log file to
+		// write to and no console sink, so the failure goes to standard
+		// error in a readable form.
+		reportFailure(err)
 		return err
 	}
-	defer pipeline.Close()
+	defer func() {
+		// The failure is recorded through the pipeline before the pipeline
+		// is closed: a closed file sink drops the records that are emitted
+		// afterwards, so the log file would not contain the failure.
+		if err != nil {
+			reportFailure(err)
+		}
+		_ = pipeline.Close()
+	}()
 
 	application, err := app.New(opts, Version)
 	if err != nil {
@@ -76,10 +92,14 @@ func run() error {
 	return application.Wait()
 }
 
-// reportFailure writes a failure to standard error.
+// reportFailure reports a failure of the startup.
 //
-// The logging pipeline writes to standard error as well, so the message
-// reaches the terminal in either case.
+// The failure is recorded through the logging pipeline, so it reaches the
+// console sink and the file sink. The pipeline is still open when the
+// failure is reported, so the record reaches the log file.
+//
+// When the pipeline could not be installed there is no pipeline to record
+// the failure in, so the message goes to standard error in a readable form.
 func reportFailure(err error) {
 	if logging.Default() != nil {
 		logging.Component("app").Error("hfdesk failed", "error", err)

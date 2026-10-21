@@ -21,8 +21,10 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/bashrusakh/hfdesk/internal/app"
@@ -34,12 +36,8 @@ import (
 var Version = "dev"
 
 func main() {
-	if err := run(); err != nil {
-		// The desktop host reports its failures to the user itself, in a
-		// native message box. On a platform without a desktop host there
-		// is no message box, so the error goes to the console.
-		fmt.Fprintf(os.Stderr, "hfdesk-desktop: %v\n", err)
-		os.Exit(1)
+	if code := run(); code != 0 {
+		os.Exit(code)
 	}
 }
 
@@ -48,15 +46,44 @@ func main() {
 //
 // The flags are the flags of the hfdesk command, so both hosts accept the
 // same options and read the same configuration file.
-func run() error {
+//
+// The flags are parsed with ContinueOnError: the default of the flag package
+// prints the error and the usage to standard error and ends the process, and
+// a GUI subsystem program has no console, so the user would see a process
+// that vanished without an explanation. The problem is reported to the user
+// in a native message box instead, and the process ends with a non-zero exit
+// code.
+//
+// The exit code of the process is returned: zero for a host that started and
+// that ended without a failure.
+func run() int {
 	var opts app.Options
 
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "HFDesk %s\n\nUsage: hfdesk-desktop [options]\n\nOptions:\n", Version)
-		flag.PrintDefaults()
+	// The usage is collected on its own: the desktop host shows the
+	// command line problem in a message box, and the box shows the error
+	// and the usage. The output of the flag package is discarded, so the
+	// error is not reported a second time.
+	var usageText bytes.Buffer
+	fs := flag.NewFlagSet("hfdesk-desktop", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {
+		fs.SetOutput(&usageText)
+		fmt.Fprintf(&usageText, "HFDesk %s\n\nUsage: hfdesk-desktop [options]\n\nOptions:\n", Version)
+		fs.PrintDefaults()
+		fs.SetOutput(io.Discard)
 	}
-	app.RegisterFlags(flag.CommandLine, &opts)
-	flag.Parse()
+	app.RegisterFlags(fs, &opts)
 
-	return desktop.Run(desktop.Options{App: opts, Version: Version})
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return desktop.ReportCommandLine(err, usageText.String())
+	}
+
+	if err := desktop.Run(desktop.Options{App: opts, Version: Version}); err != nil {
+		// The desktop host reports its failures to the user itself, in a
+		// native message box. On a platform without a desktop host there
+		// is no message box, so the error goes to the console.
+		fmt.Fprintf(os.Stderr, "hfdesk-desktop: %v\n", err)
+		return 1
+	}
+	return 0
 }

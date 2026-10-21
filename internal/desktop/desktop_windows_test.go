@@ -8,9 +8,11 @@ package desktop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -290,6 +292,48 @@ func TestSignalEndsTheWholeHost(t *testing.T) {
 	defer mu.Unlock()
 	if len(steps) != 2 || steps[0] != "shutdown" || steps[1] != "tray" {
 		t.Fatalf("the steps of the end of the host = %v, want the server stopped before the tray loop ends", steps)
+	}
+}
+
+// TestStartupFailureIsRecordedInTheLogFile proves that a failure of the
+// startup reaches the log file.
+//
+// The desktop host has no console, so the log file is the only place where
+// the failure survives the process. The pipeline is closed when the host
+// ends, and a closed file sink drops the records that are emitted
+// afterwards, so the record of the failure has to be written before the
+// close.
+//
+// The test drives the end of the host, not the whole startup: the startup
+// itself shows a message box for every failure, and a message box would
+// block an agent without an interactive window station.
+func TestStartupFailureIsRecordedInTheLogFile(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	logFile := filepath.Join(t.TempDir(), "hfdesk.log")
+	previous := slog.Default()
+	pipeline, err := app.SetupLogging(app.LogOptions{
+		Level:    "info",
+		Console:  false,
+		FilePath: logFile,
+	})
+	if err != nil {
+		t.Fatalf("install the logging pipeline: %v", err)
+	}
+	defer func() {
+		// The pipeline is the process wide default logger, so the logger
+		// the other tests of the package expect is put back.
+		slog.SetDefault(previous)
+	}()
+
+	closePipelineWithFailure(pipeline, errors.New("the local server could not be started"))
+
+	logged, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read the log file: %v", err)
+	}
+	if !strings.Contains(string(logged), "the local server could not be started") {
+		t.Fatalf("the log file does not contain the failure: %q", logged)
 	}
 }
 
