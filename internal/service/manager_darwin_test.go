@@ -2263,3 +2263,140 @@ func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 		}
 	}
 }
+
+// TestLaunchdLifecycleOfAnAbsentRegistration checks the lifecycle commands
+// against an instance that is not registered: the stop is a stable success,
+// and the start and the restart report that the instance is not installed.
+//
+// The test never touches a real installation: the registration of the user
+// scope lives in a temporary home directory, and the test skips itself when
+// the machine holds a LaunchDaemon.
+func TestLaunchdLifecycleOfAnAbsentRegistration(t *testing.T) {
+	t.Run("the user scope", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeUser, uid: strconv.Itoa(os.Getuid()), home: t.TempDir()}
+		path := launchd.plistPath()
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("the registration %q exists, the test needs an instance that is not registered", path)
+		}
+
+		ctx := context.Background()
+		// An instance that is not registered does not run either: the
+		// state the caller asked for already holds.
+		if err := launchd.Stop(ctx); err != nil {
+			t.Errorf("Stop() = %v, want nil for an instance that is not registered", err)
+		}
+		// An instance that is not registered cannot be started, and the
+		// reason is reported in every shell.
+		err := launchd.Start(ctx)
+		if err == nil {
+			t.Fatal("Start() = nil, want an error for an instance that is not registered")
+		}
+		if !strings.Contains(err.Error(), "not installed") {
+			t.Errorf("Start() = %v, want an error that names the missing registration", err)
+		}
+		// A restart cannot start the instance either.
+		err = launchd.Restart(ctx)
+		if err == nil {
+			t.Fatal("Restart() = nil, want an error for an instance that is not registered")
+		}
+		if !strings.Contains(err.Error(), "not installed") {
+			t.Errorf("Restart() = %v, want an error that names the missing registration", err)
+		}
+	})
+
+	t.Run("the machine-wide scope", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem, uid: "0", home: t.TempDir()}
+		path := launchd.plistPath()
+		if _, err := os.Stat(path); err == nil {
+			t.Skipf("the machine has a registration at %q: the test does not touch it", path)
+		}
+
+		// The elevation requirement refuses a shell that is not
+		// elevated.
+		if err := launchd.requireElevatedFor("a stop", 501); err == nil {
+			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
+		}
+
+		ctx := context.Background()
+		// The existence of the registration comes first, so the stop of
+		// an instance that is not registered stays a clean success even
+		// when the shell is not elevated.
+		if err := launchd.Stop(ctx); err != nil {
+			t.Errorf("Stop() = %v, want nil for an instance that is not registered", err)
+		}
+		err := launchd.Start(ctx)
+		if err == nil {
+			t.Fatal("Start() = nil, want an error for an instance that is not registered")
+		}
+		if !strings.Contains(err.Error(), "not installed") {
+			t.Errorf("Start() = %v, want an error that names the missing registration", err)
+		}
+		if strings.Contains(err.Error(), "elevated shell") {
+			t.Errorf("Start() = %v, want the missing registration and not the elevation requirement", err)
+		}
+		err = launchd.Restart(ctx)
+		if err == nil {
+			t.Fatal("Restart() = nil, want an error for an instance that is not registered")
+		}
+		if !strings.Contains(err.Error(), "not installed") {
+			t.Errorf("Restart() = %v, want an error that names the missing registration", err)
+		}
+	})
+}
+
+// TestLaunchdMachineWideLifecycleNeedsAnElevatedShell checks the elevation
+// requirement of the machine-wide scope for the lifecycle commands.
+//
+// A LaunchDaemon is registered in /Library/LaunchDaemons and it is started
+// and stopped by the system domain: both belong to the machine and need
+// root. The user scope needs no elevation: a LaunchAgent belongs to the
+// user who installs it.
+//
+// The decision is the same function that the installation uses, with the
+// user id of the process as a parameter, so the test drives both branches
+// without an elevated shell.
+func TestLaunchdMachineWideLifecycleNeedsAnElevatedShell(t *testing.T) {
+	for _, action := range []string{"a start", "a stop", "a restart"} {
+		t.Run("the machine-wide scope refuses "+action+" without an elevated shell", func(t *testing.T) {
+			launchd := &launchdManager{scope: ScopeSystem, uid: "501", home: "/Users/somebody"}
+
+			err := launchd.requireElevatedFor(action, 501)
+			if err == nil {
+				t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
+			}
+			want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+			if err.Error() != want {
+				t.Errorf("requireElevatedFor() = %q, want %q", err, want)
+			}
+		})
+
+		t.Run("the machine-wide scope accepts "+action+" with an elevated shell", func(t *testing.T) {
+			launchd := &launchdManager{scope: ScopeSystem}
+
+			if err := launchd.requireElevatedFor(action, 0); err != nil {
+				t.Errorf("requireElevatedFor() = %v, want nil for an elevated shell", err)
+			}
+		})
+
+		t.Run("the user scope is not refused for "+action, func(t *testing.T) {
+			launchd := &launchdManager{scope: ScopeUser, uid: "501", home: "/Users/somebody"}
+
+			if err := launchd.requireElevatedFor(action, 501); err != nil {
+				t.Errorf("requireElevatedFor() = %v, want nil for a user scope instance", err)
+			}
+		})
+	}
+
+	t.Run("the check of the process uses the effective user id of the process", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem}
+
+		err := launchd.requireElevated("a start")
+		forced := launchd.requireElevatedFor("a start", os.Geteuid())
+		switch {
+		case err == nil && forced == nil:
+		case err != nil && forced != nil && err.Error() == forced.Error():
+		default:
+			t.Errorf("requireElevated() = %v, want the decision of requireElevatedFor(%d) = %v", err, os.Geteuid(), forced)
+		}
+	})
+}

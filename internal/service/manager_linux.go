@@ -54,6 +54,8 @@ const (
 // A system scope installation is a machine wide system unit. It is an
 // explicit choice and it needs root: the manager never escalates
 // privileges, it fails with a clear error when the process is not root.
+// The lifecycle commands of the machine wide scope need root as well: the
+// unit of the machine belongs to the machine.
 //
 // The supervisor owns the lifecycle of the instance. HFDesk stays a normal
 // foreground process: the unit is a simple service, the process is never
@@ -165,10 +167,24 @@ func (m *systemdManager) runSystemctl(ctx context.Context, args ...string) (stri
 // process does not have it. The manager never escalates privileges itself:
 // it never calls sudo, su or pkexec.
 func (m *systemdManager) requireRoot(action string) error {
+	return m.requireRootFor(action, os.Geteuid())
+}
+
+// requireRootFor rejects a machine wide operation when the given user id is
+// not the one of root.
+//
+// The user id is a parameter, so the decision can be driven from both sides
+// without an elevated shell: the real check passes the effective user id of
+// the process, and the test passes the ids of the two cases.
+//
+// A user scope instance belongs to the user of the session: it is written
+// into the configuration directory of the user and it is driven by the
+// supervisor of that session, so it never needs root.
+func (m *systemdManager) requireRootFor(action string, uid int) error {
 	if m.scope != ScopeSystem {
 		return nil
 	}
-	if os.Geteuid() == 0 {
+	if uid == 0 {
 		return nil
 	}
 	return fmt.Errorf("service: %s in the system scope requires root: run the command as root, HFDesk never escalates privileges itself", action)
@@ -822,10 +838,44 @@ func (m *systemdManager) Uninstall(ctx context.Context) error {
 	return nil
 }
 
+// lifecycleKind tells the guard of a lifecycle command what the command
+// needs from the registration of the service.
+type lifecycleKind int
+
+const (
+	// lifecycleStart is a command that brings the service up, a start or a
+	// restart: it needs a registration, so an absent one is a refusal.
+	lifecycleStart lifecycleKind = iota
+	// lifecycleStop is a command that stops the service: a service that is
+	// not registered does not run either, so an absent registration is a
+	// stable success.
+	lifecycleStop
+)
+
+// lifecycleOutcome is the answer of the guard of a lifecycle command.
+type lifecycleOutcome int
+
+const (
+	// lifecycleRun means the command may touch the supervisor.
+	lifecycleRun lifecycleOutcome = iota
+	// lifecycleAlreadyReached means the wanted state of the command holds
+	// already: the service is not registered, so it does not run either,
+	// and the command is a stable success that must not touch the
+	// supervisor.
+	lifecycleAlreadyReached
+)
+
 // Start starts the registered unit. Starting a unit that already runs is a
 // stable success, not an error.
+//
+// A unit that is not registered cannot be started: the command reports that
+// the service is not installed.
 func (m *systemdManager) Start(ctx context.Context) error {
-	if err := m.requireInstalled(); err != nil {
+	installed, err := m.installed()
+	if err != nil {
+		return err
+	}
+	if _, err := m.requireLifecycle(lifecycleStart, installed, os.Geteuid(), "a start"); err != nil {
 		return err
 	}
 	if _, err := m.runSystemctl(ctx, "start", unitName); err != nil {
@@ -840,10 +890,21 @@ func (m *systemdManager) Start(ctx context.Context) error {
 }
 
 // Stop stops the registered unit. Stopping a unit that is already stopped is
-// a stable success, not an error.
+// a stable success, not an error, and so is stopping a unit that is not
+// registered at all: it does not run either.
 func (m *systemdManager) Stop(ctx context.Context) error {
-	if err := m.requireInstalled(); err != nil {
+	installed, err := m.installed()
+	if err != nil {
 		return err
+	}
+	outcome, err := m.requireLifecycle(lifecycleStop, installed, os.Geteuid(), "a stop")
+	if err != nil {
+		return err
+	}
+	if outcome == lifecycleAlreadyReached {
+		// The unit is not registered, so it does not run either: the
+		// state the caller asked for already holds.
+		return nil
 	}
 	if _, err := m.runSystemctl(ctx, "stop", unitName); err != nil {
 		// A unit the supervisor does not know is not running, so the
@@ -860,8 +921,15 @@ func (m *systemdManager) Stop(ctx context.Context) error {
 }
 
 // Restart stops and starts the registered unit.
+//
+// A unit that is not registered cannot be restarted: the command reports
+// that the service is not installed.
 func (m *systemdManager) Restart(ctx context.Context) error {
-	if err := m.requireInstalled(); err != nil {
+	installed, err := m.installed()
+	if err != nil {
+		return err
+	}
+	if _, err := m.requireLifecycle(lifecycleStart, installed, os.Geteuid(), "a restart"); err != nil {
 		return err
 	}
 	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
@@ -870,21 +938,51 @@ func (m *systemdManager) Restart(ctx context.Context) error {
 	return nil
 }
 
-// requireInstalled rejects a lifecycle command for a service that is not
-// registered, so the caller gets a readable reason instead of a cryptic
-// supervisor error.
-func (m *systemdManager) requireInstalled() error {
+// requireLifecycle reports what a lifecycle command of the manager may do.
+//
+// The registration of the service comes first: it needs no privilege and it
+// gives the more useful answer. A stop of a service that is not registered
+// reaches its wanted state already, because such a service does not run
+// either.
+//
+// The elevation requirement comes second: a machine wide unit belongs to
+// the machine, so a lifecycle command of that scope needs root. A user scope
+// instance belongs to the user of the session and needs no elevation.
+//
+// The state of the registration and the effective user id are parameters,
+// so the decision can be driven from both sides without an elevated shell:
+// the command passes the state of the file system and the id of the process,
+// and the test passes the states of the cases.
+func (m *systemdManager) requireLifecycle(kind lifecycleKind, installed bool, uid int, action string) (lifecycleOutcome, error) {
+	if !installed {
+		if kind == lifecycleStop {
+			return lifecycleAlreadyReached, nil
+		}
+		return lifecycleRun, fmt.Errorf("service: %s is not installed", unitName)
+	}
+	if err := m.requireRootFor(action, uid); err != nil {
+		return lifecycleRun, err
+	}
+	return lifecycleRun, nil
+}
+
+// installed reports whether the unit file of the manager scope is there.
+//
+// The registration is read from the file system, so the answer needs no
+// privilege: a caller that is not elevated still learns whether the
+// service is registered.
+func (m *systemdManager) installed() (bool, error) {
 	path, err := m.unitPath()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("service: %s is not installed", unitName)
+			return false, nil
 		}
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // currentState queries the supervisor for the state of the unit. The second

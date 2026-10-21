@@ -324,6 +324,13 @@ func (m *launchdManager) Uninstall(ctx context.Context) error {
 // is a stable no-op. A job that was unloaded by a stop is registered again
 // from the property list that is on disk, so a start after a stop works
 // without a reinstall.
+//
+// A machine-wide instance needs an elevated shell: the LaunchDaemon is
+// registered in /Library/LaunchDaemons and it is started by the system
+// domain, and both belong to the machine. The check runs after the
+// existence of the registration, so a registration that is not there is
+// reported as such in every shell. A user scope instance belongs to the
+// user who installs it and needs no elevation.
 func (m *launchdManager) Start(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
@@ -331,6 +338,12 @@ func (m *launchdManager) Start(ctx context.Context) error {
 			return fmt.Errorf("service: %s is not installed", m.target())
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
+	}
+	// The elevation requirement is checked before the job is started: a
+	// permission error of the machine is a much less readable answer than
+	// the real reason.
+	if err := m.requireElevated("a start"); err != nil {
+		return err
 	}
 	if err := m.ensureLoaded(ctx, path); err != nil {
 		return err
@@ -353,6 +366,13 @@ func (m *launchdManager) Start(ctx context.Context) error {
 //
 // Stopping an instance that does not run is a stable no-op: the state the
 // caller asked for already holds.
+//
+// A machine-wide instance needs an elevated shell: the LaunchDaemon is
+// unloaded from the system domain, and the system domain belongs to the
+// machine. The check runs after the existence of the registration, so a
+// registration that is not there stays a clean success in every shell. A
+// user scope instance belongs to the user who installs it and needs no
+// elevation.
 func (m *launchdManager) Stop(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
@@ -361,6 +381,13 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 			return nil
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
+	}
+
+	// The elevation requirement is checked before the job is unloaded: a
+	// permission error of the machine is a much less readable answer than
+	// the real reason.
+	if err := m.requireElevated("a stop"); err != nil {
+		return err
 	}
 
 	_, output, err := m.printState(ctx)
@@ -385,6 +412,13 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 //
 // The job is restarted with "launchctl kickstart -k": the running process
 // is replaced by a new one instead of waiting for it to end.
+//
+// A machine-wide instance needs an elevated shell: the LaunchDaemon is
+// registered in /Library/LaunchDaemons and it is started by the system
+// domain, and both belong to the machine. The check runs after the
+// existence of the registration, so a registration that is not there is
+// reported as such in every shell. A user scope instance belongs to the
+// user who installs it and needs no elevation.
 func (m *launchdManager) Restart(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
@@ -392,6 +426,12 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 			return fmt.Errorf("service: %s is not installed", m.target())
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
+	}
+	// The elevation requirement is checked before the job is started: a
+	// permission error of the machine is a much less readable answer than
+	// the real reason.
+	if err := m.requireElevated("a restart"); err != nil {
+		return err
 	}
 	if err := m.ensureLoaded(ctx, path); err != nil {
 		return err
