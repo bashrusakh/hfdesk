@@ -9,9 +9,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -108,8 +110,19 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // Install registers the instance with the service control manager.
 //
 // The installation validates the options, prepares the directories of the
-// instance, registers the service, registers the event log source of the
-// instance and restricts the access to the state of the instance.
+// instance, restricts the access to them, checks the directories the
+// installation reuses, registers the service and registers the event log
+// source of the instance.
+//
+// The state of the instance is restricted before the registration is
+// written: every directory the instance owns carries the restrictive
+// descriptor, so the directories the instance creates inside them inherit
+// it and the account of the instance can work with them.
+//
+// The reused directories are checked before the registration is written as
+// well: a directory the account of the instance cannot reach is a failed
+// installation and not a service that fails later with an opaque access
+// error.
 //
 // A service that is registered already is not registered a second time:
 // its registration is updated instead, so the instance keeps its identity.
@@ -117,8 +130,8 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // An installation never starts the instance: starting is an explicit,
 // separate command.
 //
-// A failure after the registration was created removes the registration
-// again, so a failed installation never leaves a half-configured service
+// Every failure of the installation happens before the registration is
+// written, so a failed installation never leaves a half-configured service
 // behind.
 func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := ValidateInstallOptions(opts); err != nil {
@@ -133,6 +146,13 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := PrepareDirs(opts); err != nil {
 		return err
 	}
+	// The state of the instance is restricted before the reused
+	// directories are checked: the directories the instance creates
+	// inside its own directories inherit the restrictive descriptor, so
+	// the account of the instance can work with them.
+	if err := restrictInstanceState(opts); err != nil {
+		return err
+	}
 	if err := m.preflight(opts); err != nil {
 		return err
 	}
@@ -145,7 +165,6 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
-	created := false
 	switch {
 	case err == nil:
 		// The service is registered already. The registration is
@@ -164,7 +183,6 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 			return fmt.Errorf("service: register %s: %w", ServiceName, err)
 		}
 		defer handle.Close()
-		created = true
 	default:
 		return fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
 	}
@@ -176,18 +194,6 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := registerEventSource(); err != nil {
 		log.Printf("service: the event log source of %s was not registered: %v", ServiceName, err)
 		logEvent(eventLogWarning, fmt.Sprintf("hfdesk: the event log source of %s was not registered: %v", ServiceName, err))
-	}
-
-	// The state of the instance belongs to the machine.
-	if err := restrictInstanceState(opts); err != nil {
-		// A registration that this call created is removed again: a
-		// half-configured service must not survive a failed
-		// installation. A registration that was already there stays:
-		// it belongs to the machine and not to this call.
-		if created {
-			rollbackRegistration(handle)
-		}
-		return err
 	}
 	return nil
 }
@@ -336,9 +342,7 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 	if err != nil {
 		return status, err
 	}
-	status.Executable = registration.executable
-	status.Listen = registration.listen()
-	status.Paths = registration.paths()
+	applyRegistration(&status, registration)
 
 	if status.Executable != "" {
 		if _, err := os.Stat(status.Executable); err != nil {
@@ -357,6 +361,19 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 		status.Detail = fmt.Sprintf("the instance exited with the code %d", query.Win32ExitCode)
 	}
 	return status, nil
+}
+
+// applyRegistration fills the status with the facts of the registration.
+//
+// The cache root of the status is the effective one: the cache directory of
+// the config file of the instance wins over the registered one, because the
+// user changes it in the settings of the instance. A registration that
+// defines no cache root at all reports none.
+func applyRegistration(status *Status, registration scmRegistration) {
+	status.Executable = registration.executable
+	status.Listen = registration.listen()
+	status.Paths = registration.paths()
+	status.CacheDir = EffectiveCacheDir(status.Paths.ConfigFile, registration.cacheDir())
 }
 
 // openRegistration opens the registration of the instance.
@@ -433,7 +450,12 @@ func (m *scmManager) waitForStopped(ctx context.Context, handle *mgr.Service) er
 }
 
 // preflight rejects an installation the service control manager could not
-// run: an unusable executable or an invalid bind address.
+// run: an unusable executable, an invalid bind address or a directory the
+// account of the instance cannot reach.
+//
+// The preflight runs before the registration is written, so a rejected
+// installation never leaves a service behind that fails later with an
+// opaque access error.
 func (m *scmManager) preflight(opts InstallOptions) error {
 	if !filepath.IsAbs(opts.Executable) {
 		return fmt.Errorf("service: executable %q must be an absolute path", opts.Executable)
@@ -448,7 +470,348 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 	if _, _, err := ParseListen(opts.Listen); err != nil {
 		return err
 	}
+	return preflightDataPaths(opts)
+}
+
+// The service identity of the instance is the account the registration runs
+// the program as: LocalService (S-1-5-19). The access control list of a
+// directory the installation reuses has to grant that account the access
+// the instance needs, otherwise the instance fails later with an opaque
+// access error.
+const (
+	// scmServiceIdentitySID is the SID of the account the instance runs
+	// as: LocalService (S-1-5-19).
+	scmServiceIdentitySID = "S-1-5-19"
+
+	// scmServiceIdentityName is the name of the account the instance runs
+	// as. The name is part of the message of a failed installation, so
+	// the user knows which account needs the access.
+	scmServiceIdentityName = `NT AUTHORITY\LocalService`
+)
+
+// scmIdentityGroups are the groups the account of the instance belongs to.
+//
+// An access control list that grants access to one of them grants the
+// access to the account of the instance as well.
+var scmIdentityGroups = []string{
+	"S-1-1-0",      // Everyone
+	"S-1-5-32-545", // Users
+	"S-1-5-11",     // Authenticated Users
+	"S-1-5-4",      // Interactive Users
+}
+
+// preflightDataPaths checks the directories an installation reuses: the
+// cache root, the hub directory and the local output directory.
+//
+// The directories do not belong to the instance: they can hold the models
+// and the cache of an interactive run of the user. Their access control
+// list is only read, never changed, and never changed recursively.
+func preflightDataPaths(opts InstallOptions) error {
+	for _, dir := range []struct {
+		name string
+		path string
+	}{
+		{"cache dir", opts.CacheDir},
+		{"hub dir", opts.HubDir},
+		{"local dir", opts.LocalDir},
+	} {
+		if dir.path == "" {
+			continue
+		}
+		if err := preflightDataPath(dir.name, dir.path); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// preflightDataPath checks that the account of the instance can work with
+// the directory the installation reuses.
+//
+// A directory that does not exist yet is created by the installation, which
+// runs elevated: the nearest existing ancestor has to grant the account the
+// access to create it, and the created directory is checked again.
+func preflightDataPath(name, path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("service: %s %q must be an absolute path", name, path)
+	}
+
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("service: %s %q is not a directory: the instance needs a directory there", name, path)
+		}
+		return checkServiceAccess(name, path)
+	case !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("service: %s %q is not usable: %w", name, path, err)
+	}
+
+	// The directory does not exist yet. The account of the instance has to
+	// be able to create it in the nearest existing ancestor.
+	ancestor, err := nearestExistingDir(path)
+	if err != nil {
+		return fmt.Errorf("service: %s %q cannot be created: %w", name, path, err)
+	}
+	if err := checkServiceAccess("parent directory", ancestor); err != nil {
+		return fmt.Errorf("service: %s %q cannot be created: %w", name, path, err)
+	}
+	if err := os.MkdirAll(path, dirMode); err != nil {
+		return fmt.Errorf("service: create %s %q: %w", name, path, err)
+	}
+	return checkServiceAccess(name, path)
+}
+
+// nearestExistingDir returns the closest ancestor of a path that exists.
+//
+// The ancestor is the directory the installation has to create the missing
+// path in.
+func nearestExistingDir(path string) (string, error) {
+	current := filepath.Clean(path)
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing directory was found above %q", path)
+		}
+		info, err := os.Stat(parent)
+		if err == nil {
+			if !info.IsDir() {
+				return "", fmt.Errorf("%q is not a directory", parent)
+			}
+			return parent, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("read %q: %w", parent, err)
+		}
+		current = parent
+	}
+}
+
+// checkServiceAccess reads the access control list of a path and checks
+// that the account of the instance can work with it.
+//
+// The access control list is only read: the descriptor of the instance is
+// never applied to a path the installation reuses.
+func checkServiceAccess(label, path string) error {
+	// The owner and the group are read next to the access control list:
+	// the conversion of a descriptor into its SDDL form needs the whole
+	// descriptor, and reading them needs no right beyond the one the
+	// access control list needs.
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return fmt.Errorf("service: the access rights of the %s %q cannot be read: %w: the installation cannot tell whether the account %s can use the path", label, path, err, scmServiceIdentityName)
+	}
+	sddl := sd.String()
+	if sddl == "" {
+		return fmt.Errorf("service: the access rights of the %s %q cannot be read: the installation cannot tell whether the account %s can use the path", label, path, scmServiceIdentityName)
+	}
+	if err := sddlGrantsIdentity(sddl); err != nil {
+		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %w: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, err)
+	}
+	return nil
+}
+
+// sddlGrantsIdentity reports whether the access control list of an SDDL
+// string grants the account of the instance the access it needs.
+//
+// The check is a permission preflight, not a simulation of the access check
+// of the operating system: it reads the access control list of the path
+// itself, it does not resolve the inheritance of a parent directory, the
+// privileges of a token or the membership of a group that is not listed
+// here.
+//
+// A denied entry wins over an allowed one, so a directory that grants the
+// account the access and denies it as well is refused.
+func sddlGrantsIdentity(sddl string) error {
+	var (
+		allowed bool
+		read    bool
+		write   bool
+	)
+	for _, ace := range parseSDDLAces(sddl) {
+		if !ace.coversIdentity() {
+			continue
+		}
+		switch ace.kind {
+		case "D", "OD":
+			return fmt.Errorf("the access control list denies the account %s", scmServiceIdentityName)
+		case "A", "OA":
+			allowed = true
+			read = read || maskGrantsRead(ace.rights)
+			write = write || maskGrantsWrite(ace.rights)
+		}
+	}
+	switch {
+	case !allowed:
+		return fmt.Errorf("the access control list grants the account %s no access", scmServiceIdentityName)
+	case !read:
+		return fmt.Errorf("the access control list grants the account %s no read access", scmServiceIdentityName)
+	case !write:
+		return fmt.Errorf("the access control list grants the account %s no write access", scmServiceIdentityName)
+	}
+	return nil
+}
+
+// sddlACE is one access control entry of an SDDL string.
+type sddlACE struct {
+	// kind is the type of the entry: "A" for an allowed entry and "D"
+	// for a denied one.
+	kind string
+	// rights is the access mask the entry grants or denies.
+	rights uint32
+	// trustee is the SID the entry applies to.
+	trustee string
+}
+
+// coversIdentity reports whether the entry applies to the account of the
+// instance or to one of the groups it belongs to.
+//
+// The trustees of an SDDL string are raw SIDs. The aliases of the platform
+// are accepted as well, so a descriptor that was written by hand is read
+// the same way.
+func (ace sddlACE) coversIdentity() bool {
+	trustee := strings.ToUpper(strings.TrimSpace(ace.trustee))
+	if sid, ok := sddlTrusteeAliases[trustee]; ok {
+		trustee = sid
+	}
+	if trustee == scmServiceIdentitySID {
+		return true
+	}
+	for _, group := range scmIdentityGroups {
+		if trustee == group {
+			return true
+		}
+	}
+	return false
+}
+
+// sddlTrusteeAliases maps the aliases of a trustee of an SDDL access
+// control entry onto the SID they stand for.
+var sddlTrusteeAliases = map[string]string{
+	"WD": "S-1-1-0",      // Everyone
+	"BU": "S-1-5-32-545", // Users
+	"AU": "S-1-5-11",     // Authenticated Users
+	"IU": "S-1-5-4",      // Interactive Users
+	"LS": "S-1-5-19",     // LocalService
+}
+
+// maskGrantsRead reports whether an access mask grants the read access the
+// instance needs.
+//
+// The generic rights and the file specific rights are two different bit
+// sets: an entry that grants one of them grants the read access.
+func maskGrantsRead(mask uint32) bool {
+	if mask&windows.GENERIC_ALL != 0 || mask&windows.GENERIC_READ != 0 {
+		return true
+	}
+	return mask&windows.FILE_GENERIC_READ == windows.FILE_GENERIC_READ
+}
+
+// maskGrantsWrite reports whether an access mask grants the write access
+// the instance needs.
+//
+// The generic rights and the file specific rights are two different bit
+// sets: an entry that grants one of them grants the write access.
+func maskGrantsWrite(mask uint32) bool {
+	if mask&windows.GENERIC_ALL != 0 || mask&windows.GENERIC_WRITE != 0 {
+		return true
+	}
+	return mask&windows.FILE_GENERIC_WRITE == windows.FILE_GENERIC_WRITE
+}
+
+// parseSDDLAces returns the access control entries of an SDDL string.
+//
+// The entries are the parenthesized groups of the string. The parts around
+// them (the header of the descriptor, the owner and the group) carry no
+// entry.
+func parseSDDLAces(sddl string) []sddlACE {
+	var aces []sddlACE
+	for i := 0; i < len(sddl); {
+		open := strings.IndexByte(sddl[i:], '(')
+		if open < 0 {
+			break
+		}
+		i += open + 1
+		end := strings.IndexByte(sddl[i:], ')')
+		if end < 0 {
+			break
+		}
+		body := sddl[i : i+end]
+		i += end + 1
+		if ace, ok := parseSDDLACE(body); ok {
+			aces = append(aces, ace)
+		}
+	}
+	return aces
+}
+
+// parseSDDLACE reads one access control entry of an SDDL string.
+//
+// The entry has the shape (type;flags;rights;object-type;inheritance;trustee).
+// The trustee is the last field of the entry and the rights the third one.
+func parseSDDLACE(body string) (sddlACE, bool) {
+	fields := strings.Split(body, ";")
+	if len(fields) < 2 {
+		return sddlACE{}, false
+	}
+	ace := sddlACE{
+		kind:    strings.ToUpper(strings.TrimSpace(fields[0])),
+		trustee: strings.TrimSpace(fields[len(fields)-1]),
+	}
+	if len(fields) >= 3 {
+		ace.rights = parseSDDLRights(fields[2])
+	}
+	return ace, true
+}
+
+// parseSDDLRights reads the rights field of an access control entry.
+//
+// The field holds an access mask as a hexadecimal number or as one of the
+// aliases of the platform. A field that cannot be read grants nothing.
+func parseSDDLRights(field string) uint32 {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return 0
+	}
+	if mask, ok := sddlRights[strings.ToUpper(field)]; ok {
+		return mask
+	}
+	text := strings.TrimPrefix(strings.TrimPrefix(field, "0x"), "0X")
+	mask, err := strconv.ParseUint(text, 16, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(mask)
+}
+
+// scmFileAllAccess is the access mask of the alias "FA" of the rights field
+// of an SDDL entry: the standard rights of a file plus every right on the
+// data of the file. The platform does not export the constant.
+const scmFileAllAccess uint32 = 0x001F01FF
+
+// sddlRights maps the aliases of the rights field of an SDDL access control
+// entry onto the access mask they stand for.
+//
+// The aliases are the ones the platform reads and writes: the generic
+// rights (GA, GR, GW, GX), the standard rights (RC, SD, WD, WO) and the
+// file rights (FA, FR, FW, FX).
+var sddlRights = map[string]uint32{
+	"GA": windows.GENERIC_ALL,
+	"GR": windows.GENERIC_READ,
+	"GW": windows.GENERIC_WRITE,
+	"GX": windows.GENERIC_EXECUTE,
+	"RC": windows.READ_CONTROL,
+	"SD": windows.DELETE,
+	"WD": windows.WRITE_DAC,
+	"WO": windows.WRITE_OWNER,
+	"FA": scmFileAllAccess,
+	"FR": windows.FILE_GENERIC_READ,
+	"FW": windows.FILE_GENERIC_WRITE,
+	"FX": windows.FILE_GENERIC_EXECUTE,
 }
 
 // requireElevated rejects a machine-wide operation that needs an elevated
@@ -520,6 +883,15 @@ func (r scmRegistration) paths() runtimepaths.Paths {
 		StateDir:   r.flagValue("--state-dir"),
 		LogDir:     r.flagValue("--log-dir"),
 	}
+}
+
+// cacheDir returns the cache root the registration carries.
+//
+// The registration holds the cache root the installation was made with. The
+// effective cache root of the instance is the one of its own config file
+// when that file defines one.
+func (r scmRegistration) cacheDir() string {
+	return r.flagValue("--cache-dir")
 }
 
 // flagValue returns the value of a flag of the argument vector.
@@ -618,23 +990,52 @@ func registerEventSource() error {
 // administrators of the machine and the account the instance runs as may
 // work with it, nobody else.
 //
-// Only the state directory and the config file are touched. The model and
-// the cache trees of an installation are never re-owned and never re-ACLed:
-// they can hold gigabytes of data that the user may reuse from an
-// interactive run, and a recursive change of the access rights would take
-// the data away from the user who owns it.
+// Every directory the instance owns carries the descriptor: the directory
+// of the config file, the state directory and the log directory, and so
+// does the config file itself. The descriptor is applied to the path
+// itself and never recursively.
+//
+// The model and the cache trees of an installation are never re-owned and
+// never re-ACLed: they can hold gigabytes of data that the user may reuse
+// from an interactive run, and a recursive change of the access rights
+// would take the data away from the user who owns it.
 func restrictInstanceState(opts InstallOptions) error {
-	if err := applyRestrictiveACL(opts.Paths.StateDir); err != nil {
-		return err
-	}
-	// The config file only exists when it was written already. A file
-	// that is created later inherits the descriptor of the directory.
-	if info, err := os.Stat(opts.Paths.ConfigFile); err == nil && info.Mode().IsRegular() {
-		if err := applyRestrictiveACL(opts.Paths.ConfigFile); err != nil {
+	for _, path := range instanceStatePaths(opts) {
+		if err := applyRestrictiveACL(path); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// instanceStatePaths returns the paths of the instance that carry the
+// restrictive descriptor: the directory of the config file, the state
+// directory, the log directory and the config file itself.
+//
+// The config file is the only path that may not exist yet: a config file
+// that is written later inherits the descriptor of its directory. A path
+// that is named twice is returned once: the config file can live in the
+// state directory of the instance.
+func instanceStatePaths(opts InstallOptions) []string {
+	paths := []string{
+		filepath.Dir(opts.Paths.ConfigFile),
+		opts.Paths.StateDir,
+		opts.Paths.LogDir,
+	}
+	if info, err := os.Stat(opts.Paths.ConfigFile); err == nil && info.Mode().IsRegular() {
+		paths = append(paths, opts.Paths.ConfigFile)
+	}
+
+	unique := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		unique = append(unique, path)
+	}
+	return unique
 }
 
 // applyRestrictiveACL applies the security descriptor of the instance to a
@@ -679,15 +1080,4 @@ func applyRestrictiveACL(path string) error {
 // directory is not inherited.
 func scmStateSDDL() string {
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)"
-}
-
-// rollbackRegistration removes a registration that a failed installation
-// left behind.
-//
-// The rollback is best effort: the original failure of the installation is
-// the error the caller gets.
-func rollbackRegistration(handle *mgr.Service) {
-	if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		log.Printf("service: the registration of %s could not be removed: %v", ServiceName, err)
-	}
 }

@@ -37,6 +37,13 @@ import (
 // state of a user: its home is the machine-level state root of the platform
 // and its paths are the machine-level paths.
 //
+// The machine-wide scope needs an elevated shell: the property list of a
+// LaunchDaemon is written into /Library/LaunchDaemons and the job is loaded
+// into the system domain, and both belong to the machine. The manager never
+// escalates privileges itself: it fails with a clear error when the process
+// is not root. The user scope needs no elevation: a LaunchAgent belongs to
+// the user who installs it.
+//
 // The label of the registration is com.hfdesk.hfdesk. It is derived from the
 // service name ("hfdesk") and the reverse DNS prefix of the project, and it
 // is also the name of the property list file: launchd refuses to load a
@@ -84,7 +91,8 @@ type launchdManager struct {
 	// of the gui domain of a user scope instance.
 	uid string
 	// home is the home directory of the invoking user. It holds the
-	// property list of a user scope instance.
+	// property list of a user scope instance and it is the reference that
+	// keeps a machine-wide instance away from the state of a user.
 	home string
 }
 
@@ -155,6 +163,20 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 	if err := ValidateInstallOptions(opts); err != nil {
 		return err
 	}
+	// A machine-wide instance must not adopt the state of the user who
+	// runs the install command. The check runs before the elevation
+	// requirement, before any directory is created and before the property
+	// list is written: a refused installation leaves nothing behind, and
+	// every platform reports the same reason for the same command line.
+	if err := m.checkSystemPaths(opts); err != nil {
+		return err
+	}
+	// The elevation requirement is checked before any directory is created:
+	// a permission error of the machine-wide directories is a much less
+	// readable answer than the real reason.
+	if err := m.requireElevated("an installation"); err != nil {
+		return err
+	}
 	if err := PrepareDirs(opts); err != nil {
 		return err
 	}
@@ -189,6 +211,13 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 // Only the registration is removed. The config file, the jobs, the history,
 // the logs, the models and the cache of the instance are left alone: an
 // uninstall removes the registration of the service, not its data.
+//
+// A machine-wide uninstallation needs an elevated shell: the LaunchDaemon is
+// registered in /Library/LaunchDaemons and it is unloaded from the system
+// domain, and both belong to the machine. The check runs after the existence
+// of the registration, so a registration that is not there stays a clean
+// success in every shell. A user scope instance belongs to the user who
+// installed it and needs no elevation.
 func (m *launchdManager) Uninstall(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
@@ -197,6 +226,13 @@ func (m *launchdManager) Uninstall(ctx context.Context) error {
 			return nil
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
+	}
+
+	// The elevation requirement is checked before the job is unloaded and
+	// before the property list is removed: a permission error of the
+	// machine is a much less readable answer than the real reason.
+	if err := m.requireElevated("an uninstallation"); err != nil {
+		return err
 	}
 
 	// The job is unloaded before the property list is removed, so launchd
@@ -327,6 +363,12 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 	status.Executable = registration.executable()
 	status.Listen = registration.listen()
 	status.Paths = registration.paths()
+	// The cache root of the instance is the cache directory of the
+	// instance's own config file when it defines one, and the cache
+	// directory of the registration otherwise. Both come from the
+	// registration on disk, so the status describes the instance and not
+	// the intent of the caller.
+	status.CacheDir = EffectiveCacheDir(status.Paths.ConfigFile, registration.cacheDir())
 
 	loaded, output, err := m.printState(ctx)
 	if err != nil {
@@ -372,10 +414,40 @@ func (m *launchdManager) preflight(opts InstallOptions) error {
 	if info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("service: executable %q is not executable", opts.Executable)
 	}
-	if m.scope == ScopeSystem {
-		return m.checkSystemPaths(opts)
-	}
 	return nil
+}
+
+// requireElevated rejects a machine-wide operation that needs an elevated
+// shell when the process does not have one.
+//
+// A LaunchDaemon is registered in /Library/LaunchDaemons and started by the
+// system domain: both belong to the machine and need root. The manager never
+// escalates privileges itself: it never calls sudo, su or osascript and it
+// never asks the user for a password, so it refuses the operation with a
+// readable reason instead of letting it fail with a permission error of a
+// directory of the machine.
+func (m *launchdManager) requireElevated(action string) error {
+	return m.requireElevatedFor(action, os.Geteuid())
+}
+
+// requireElevatedFor rejects a machine-wide operation when the given user id
+// is not the one of an elevated shell.
+//
+// The user id is a parameter, so the decision can be driven from both sides
+// without an elevated shell: the real check passes the effective user id of
+// the process, and the test passes the ids of the two cases.
+//
+// A user scope instance belongs to the user who installs it: it is written
+// into the LaunchAgents directory of that user and it is loaded into the gui
+// domain of that user, so it never needs an elevated shell.
+func (m *launchdManager) requireElevatedFor(action string, uid int) error {
+	if m.scope != ScopeSystem {
+		return nil
+	}
+	if uid == 0 {
+		return nil
+	}
+	return fmt.Errorf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
 }
 
 // checkSystemPaths rejects a machine-wide installation that would reuse the
@@ -388,9 +460,18 @@ func (m *launchdManager) preflight(opts InstallOptions) error {
 // trees are never touched by an installation: only the three directories of
 // the instance (the config directory, the state directory and the log
 // directory) are created, and nothing is ever chowned.
+//
+// A user scope instance is supposed to live inside the directories of its own
+// user, so the guard does not touch it.
 func (m *launchdManager) checkSystemPaths(opts InstallOptions) error {
+	if m.scope != ScopeSystem {
+		return nil
+	}
 	home := m.home
 	if home == "" {
+		// The home directory of the invoking user is unknown: there is
+		// nothing to compare the paths of the installation with, and an
+		// unknown home is not a failed installation.
 		return nil
 	}
 	for _, p := range []struct {
@@ -1101,6 +1182,16 @@ func (r plistRegistration) argumentValue(flag string) string {
 // listen returns the bind address of the registration.
 func (r plistRegistration) listen() string {
 	return r.argumentValue("--listen")
+}
+
+// cacheDir returns the Hugging Face cache root recorded in the
+// registration.
+//
+// The value is empty when the registration carries no cache directory: the
+// instance then uses the cache root of its own config file, or the default
+// cache root of the platform.
+func (r plistRegistration) cacheDir() string {
+	return r.argumentValue("--cache-dir")
 }
 
 // paths returns the runtime path model of the registration.

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 const (
@@ -182,6 +183,14 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 	if err := ValidateInstallOptions(opts); err != nil {
 		return err
 	}
+	// A machine-wide instance must not adopt the state of the user who
+	// runs the install command. The check runs before the root
+	// requirement, before any directory is created and before the unit
+	// file is written: a refused installation leaves nothing behind, and
+	// every platform reports the same reason for the same command line.
+	if err := m.checkSystemPaths(opts); err != nil {
+		return err
+	}
 	// The root requirement is checked before any directory is created: a
 	// permission error of the machine wide directories is a much less
 	// readable answer than the real reason.
@@ -236,6 +245,63 @@ func (m *systemdManager) preflight(opts InstallOptions) error {
 	}
 	if info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("service: executable %q is not executable", opts.Executable)
+	}
+	return nil
+}
+
+// checkSystemPaths rejects a machine-wide installation that would adopt the
+// state of the user who runs the install command.
+//
+// A system scope unit runs as root. A path inside the home directory of the
+// invoking user would either expose the state of the user to the machine or
+// take the state of the user away from it, so the installation is refused
+// instead of silently taking the state over. The model and the cache trees
+// are never touched by an installation: only the three directories of the
+// instance (the config directory, the state directory and the log directory)
+// are created, and nothing is ever chowned.
+//
+// A user scope instance is supposed to live inside the directories of its own
+// user, so the guard does not touch it.
+//
+// The comparison is lexical: the paths are compared as they are written and
+// the symbolic links of the file system are not resolved. A path that only
+// reaches the home directory of the user through a symbolic link is
+// therefore compared by its own path and not caught. The lexical test is the
+// conservative choice: it never resolves a link of an unprivileged user into
+// a machine-wide instance, and it reports the paths of the command line as
+// they were typed.
+func (m *systemdManager) checkSystemPaths(opts InstallOptions) error {
+	if m.scope != ScopeSystem {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// The home directory of the invoking user is unknown: there is
+		// nothing to compare the paths of the installation with, and an
+		// unknown home is not a failed installation.
+		return nil
+	}
+	for _, p := range []struct {
+		name string
+		path string
+	}{
+		{"config file", opts.Paths.ConfigFile},
+		{"state dir", opts.Paths.StateDir},
+		{"log dir", opts.Paths.LogDir},
+		{"cache dir", opts.CacheDir},
+		{"hub dir", opts.HubDir},
+		{"local dir", opts.LocalDir},
+	} {
+		if p.path == "" {
+			continue
+		}
+		// The containment helper of the downloader package is a lexical
+		// test: it counts the home directory itself as inside it and it
+		// keeps a sibling that shares the prefix of the home ("/home/user2"
+		// against "/home/user") outside it.
+		if hfdownloader.PathInside(home, p.path) {
+			return fmt.Errorf("service: the %s %q of a machine-wide instance must not live inside the home directory %q of the invoking user", p.name, p.path, home)
+		}
 	}
 	return nil
 }
@@ -420,6 +486,12 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 	status.Executable = unit.ExecStart
 	status.Listen = unit.listen()
 	status.Paths = unit.paths()
+	// The cache root of the instance is the cache dir of the config file
+	// of the instance when that file defines one, and the registered cache
+	// dir otherwise: the status describes the instance that runs, not the
+	// registration alone. An instance that defines no cache root at all
+	// reports none.
+	status.CacheDir = EffectiveCacheDir(unit.flagValue("--config"), unit.flagValue("--cache-dir"))
 
 	if status.Executable != "" {
 		if _, err := os.Stat(status.Executable); err != nil {

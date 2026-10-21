@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // systemdTestOptions returns an installation for the systemd tests. The
@@ -56,6 +58,18 @@ func unitDirectives(unit string) []string {
 		directives = append(directives, trimmed)
 	}
 	return directives
+}
+
+// systemdTestExecutable writes a program that can be registered and returns
+// its path. An installation refuses a program that does not exist, so every
+// test of an installation needs one.
+func systemdTestExecutable(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write the program: %v", err)
+	}
+	return path
 }
 
 func TestSystemdRenderUnitUserScope(t *testing.T) {
@@ -159,8 +173,6 @@ func TestSystemdRenderUnitCarriesNoCredential(t *testing.T) {
 	// Every field that could plausibly carry access data is filled with
 	// the sentinel, so the check keeps its meaning when such a field is
 	// added.
-	opts.User = sentinel + "_user"
-	opts.UID = sentinel + "_uid"
 	setCredentialFields(&opts, sentinel)
 
 	unit, err := renderUnit(opts)
@@ -585,4 +597,254 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	if err := m.Uninstall(ctx); err != nil {
 		t.Errorf("the second Uninstall() = %v, want nil", err)
 	}
+}
+
+// TestSystemdPathInsideHome pins the semantics of the containment helper the
+// guard of the machine-wide scope relies on.
+//
+// The test is lexical, the home directory itself counts as inside it, and a
+// sibling that shares the prefix of the home does not.
+func TestSystemdPathInsideHome(t *testing.T) {
+	const home = "/home/user"
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "a directory inside the home", path: "/home/user/.config/HFDesk/service", want: true},
+		{name: "the home itself", path: "/home/user", want: true},
+		{name: "a sibling with a common prefix", path: "/home/user2", want: false},
+		{name: "a directory outside the home", path: "/srv/hfdesk", want: false},
+		{name: "a path that leaves the home again", path: "/home/user/../user2", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hfdownloader.PathInside(home, tc.path); got != tc.want {
+				t.Errorf("PathInside(%q, %q) = %v, want %v", home, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSystemdCheckSystemPaths checks the guard of the machine-wide scope: a
+// path inside the home directory of the user who runs the install command is
+// refused, the machine-level paths are accepted, and a user scope instance is
+// not touched at all.
+func TestSystemdCheckSystemPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	inside := filepath.Join(home, ".config", "HFDesk", "service")
+	// A sibling of the home that shares its prefix is not inside the home.
+	sibling := home + "2"
+
+	refused := []struct {
+		name  string
+		field string
+		apply func(*InstallOptions)
+	}{
+		{name: "config file", field: "config file", apply: func(o *InstallOptions) { o.Paths.ConfigFile = inside }},
+		{name: "state dir", field: "state dir", apply: func(o *InstallOptions) { o.Paths.StateDir = inside }},
+		{name: "log dir", field: "log dir", apply: func(o *InstallOptions) { o.Paths.LogDir = inside }},
+		{name: "cache dir", field: "cache dir", apply: func(o *InstallOptions) { o.CacheDir = inside }},
+		{name: "hub dir", field: "hub dir", apply: func(o *InstallOptions) { o.HubDir = inside }},
+		{name: "local dir", field: "local dir", apply: func(o *InstallOptions) { o.LocalDir = inside }},
+	}
+	for _, tc := range refused {
+		t.Run("the "+tc.name+" inside the home of the user is refused", func(t *testing.T) {
+			opts := systemdTestOptions(t, ScopeSystem)
+			tc.apply(&opts)
+
+			m := &systemdManager{scope: ScopeSystem}
+			err := m.checkSystemPaths(opts)
+			if err == nil {
+				t.Fatalf("checkSystemPaths() = nil, want the refusal of the %s", tc.name)
+			}
+			want := fmt.Sprintf("service: the %s %q of a machine-wide instance must not live inside the home directory %q of the invoking user", tc.field, inside, home)
+			if err.Error() != want {
+				t.Errorf("checkSystemPaths() = %q, want %q", err, want)
+			}
+		})
+	}
+
+	t.Run("the home itself is refused", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.Paths.StateDir = home
+
+		m := &systemdManager{scope: ScopeSystem}
+		err := m.checkSystemPaths(opts)
+		if err == nil {
+			t.Fatal("checkSystemPaths() = nil, want the refusal of the home directory of the user")
+		}
+		want := fmt.Sprintf("service: the state dir %q of a machine-wide instance must not live inside the home directory %q of the invoking user", home, home)
+		if err.Error() != want {
+			t.Errorf("checkSystemPaths() = %q, want %q", err, want)
+		}
+	})
+
+	t.Run("a sibling with a common prefix is accepted", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.Paths.StateDir = sibling
+
+		m := &systemdManager{scope: ScopeSystem}
+		if err := m.checkSystemPaths(opts); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for the sibling %q of the home %q", err, sibling, home)
+		}
+	})
+
+	t.Run("the machine-level paths are accepted", func(t *testing.T) {
+		m := &systemdManager{scope: ScopeSystem}
+		if err := m.checkSystemPaths(systemdTestOptions(t, ScopeSystem)); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for the machine-level paths", err)
+		}
+	})
+
+	t.Run("the user scope is not affected", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeUser)
+		opts.Paths.StateDir = inside
+		opts.CacheDir = inside
+
+		m := &systemdManager{scope: ScopeUser}
+		if err := m.checkSystemPaths(opts); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for a user scope instance", err)
+		}
+	})
+}
+
+// TestSystemdSystemInstallRefusesTheHomeOfTheUser checks that the guard of
+// the machine-wide scope runs before the unit file is written: a refused
+// installation leaves no unit file and no directory of the instance behind.
+func TestSystemdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	m := &systemdManager{scope: ScopeSystem}
+	path, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v, want nil", err)
+	}
+	// The unit file of the machine scope lives in a fixed place of the
+	// machine. The test never writes it: the refusal happens before the
+	// unit file is written. The state of the file is compared before and
+	// after the installation, so a unit that is installed already is never
+	// touched by the test.
+	before, existedBefore, err := readUnitFile(path)
+	if err != nil {
+		t.Logf("the unit file %q cannot be read: %v", path, err)
+	}
+
+	root := filepath.Join(home, ".config", "HFDesk", "service")
+	opts := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: systemdTestExecutable(t),
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			// The config file of the instance stays on the machine, the
+			// state root of the instance is the one of the user: that is
+			// the case the guard refuses.
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   root,
+			LogDir:     filepath.Join(root, "logs"),
+		},
+		CacheDir: "/var/lib/hfdesk/cache",
+		HubDir:   "/var/lib/hfdesk/cache/hub",
+		LocalDir: "/var/lib/hfdesk/models",
+	}
+
+	err = m.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the home directory of the user")
+	}
+	want := fmt.Sprintf("service: the state dir %q of a machine-wide instance must not live inside the home directory %q of the invoking user", root, home)
+	if err.Error() != want {
+		t.Errorf("Install() = %q, want %q", err, want)
+	}
+
+	// The refused installation writes no unit file.
+	after, existedAfter, err := readUnitFile(path)
+	if err != nil {
+		t.Logf("the unit file %q cannot be read: %v", path, err)
+	}
+	if existedBefore != existedAfter || string(before) != string(after) {
+		t.Errorf("the refused installation changed the unit file %q", path)
+	}
+	// The refused installation creates no directory of the instance
+	// either.
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the state directory %q: %v", root, err)
+	}
+}
+
+// TestSystemdStatusReportsTheCacheRoot checks that the status of an instance
+// reports the cache root the instance uses: the cache dir of the config file
+// of the instance when that file defines one, and the registered cache dir
+// otherwise.
+func TestSystemdStatusReportsTheCacheRoot(t *testing.T) {
+	root := t.TempDir()
+	configFile := filepath.Join(root, "hfdesk.json")
+	registered := filepath.Join(root, "cache")
+
+	t.Run("the registered cache dir", func(t *testing.T) {
+		if err := os.WriteFile(configFile, []byte(`{"local-dir":"/srv/hfdesk/models"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		status := systemdStatus(t, "--config", configFile, "--cache-dir", registered)
+		if status.CacheDir != registered {
+			t.Errorf("the cache root = %q, want the registered %q", status.CacheDir, registered)
+		}
+	})
+
+	t.Run("the cache dir of the config file of the instance", func(t *testing.T) {
+		configured := filepath.Join(root, "configured")
+		if err := os.WriteFile(configFile, []byte(`{"cache-dir":"`+configured+`"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		status := systemdStatus(t, "--config", configFile, "--cache-dir", registered)
+		if status.CacheDir != configured {
+			t.Errorf("the cache root = %q, want the cache dir %q of the config file of the instance", status.CacheDir, configured)
+		}
+	})
+
+	t.Run("no cache dir at all", func(t *testing.T) {
+		if err := os.WriteFile(configFile, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		status := systemdStatus(t, "--config", configFile)
+		if status.CacheDir != "" {
+			t.Errorf("the cache root = %q, want none", status.CacheDir)
+		}
+	})
+}
+
+// systemdStatus registers a unit with the given arguments in a temporary
+// configuration directory and returns the status of the instance.
+//
+// The unit points at a program that exists, so the status describes a
+// registration and not a broken one.
+func systemdStatus(t *testing.T, args ...string) Status {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := &systemdManager{scope: ScopeUser}
+	path, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v, want nil", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the unit directory: %v", err)
+	}
+	words := append([]string{systemdTestExecutable(t)}, args...)
+	unit := "[Service]\nExecStart=" + strings.Join(words, " ") + "\n"
+	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+		t.Fatalf("write the unit file: %v", err)
+	}
+
+	status, err := m.Status(context.Background())
+	if err != nil {
+		// The supervisor of the test environment may not know the unit:
+		// the registration facts are filled before the supervisor is
+		// asked, and they are the subject of the test.
+		t.Logf("the supervisor did not answer: %v", err)
+	}
+	return status
 }

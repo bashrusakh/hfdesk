@@ -7,6 +7,9 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,8 +44,6 @@ func darwinUserOptions(t *testing.T) InstallOptions {
 		CacheDir:   cache,
 		HubDir:     hub,
 		LocalDir:   filepath.Join(paths.StateDir, "models"),
-		User:       darwinCredentialSentinel,
-		UID:        darwinCredentialSentinel,
 	}
 }
 
@@ -62,8 +63,6 @@ func darwinSystemOptions(t *testing.T) InstallOptions {
 		CacheDir:   cache,
 		HubDir:     hub,
 		LocalDir:   filepath.Join(paths.StateDir, "models"),
-		User:       darwinCredentialSentinel,
-		UID:        darwinCredentialSentinel,
 	}
 }
 
@@ -308,6 +307,55 @@ func TestParsePlistRecoversTheRegistration(t *testing.T) {
 	}
 }
 
+// TestParsePlistRecoversTheConfigFileAndTheCacheDir checks that the config
+// file and the cache directory of the registration are recovered from a
+// property list.
+//
+// Both values come from the argument vector of the registered process: the
+// status describes the registration, so it needs the config file of the
+// instance and the cache directory the registration recorded.
+func TestParsePlistRecoversTheConfigFileAndTheCacheDir(t *testing.T) {
+	cases := []struct {
+		name      string
+		cacheDir  string
+		wantCache string
+	}{
+		{
+			name:      "a registration with a cache directory",
+			cacheDir:  "/registered/cache",
+			wantCache: "/registered/cache",
+		},
+		{
+			name:      "a registration without a cache directory",
+			cacheDir:  "",
+			wantCache: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := darwinUserOptions(t)
+			opts.CacheDir = tc.cacheDir
+
+			rendered, err := renderPlist(opts)
+			if err != nil {
+				t.Fatalf("renderPlist(): %v", err)
+			}
+			registration, err := parsePlist([]byte(rendered))
+			if err != nil {
+				t.Fatalf("parsePlist(): %v", err)
+			}
+
+			if got := registration.paths().ConfigFile; got != opts.Paths.ConfigFile {
+				t.Errorf("the config file = %q, want %q", got, opts.Paths.ConfigFile)
+			}
+			if got := registration.cacheDir(); got != tc.wantCache {
+				t.Errorf("the cache dir = %q, want %q", got, tc.wantCache)
+			}
+		})
+	}
+}
+
 // TestParsePlistRejectsBrokenContent checks that a broken property list is
 // reported instead of read as an empty registration.
 func TestParsePlistRejectsBrokenContent(t *testing.T) {
@@ -522,6 +570,98 @@ func TestStatusReportsAMissingExecutable(t *testing.T) {
 	}
 }
 
+// TestStatusReportsTheCacheDirOfTheInstance checks the cache root the status
+// reports: the cache directory of the instance's own config file when it
+// defines one, the cache directory of the registration otherwise.
+//
+// The values come from the property list on disk, so the status describes the
+// registration and not the intent of the caller.
+func TestStatusReportsTheCacheDirOfTheInstance(t *testing.T) {
+	launchctl, err := exec.LookPath("launchctl")
+	if err != nil {
+		t.Skipf("launchctl is not available: %v", err)
+	}
+
+	root := t.TempDir()
+	withCacheDir := filepath.Join(root, "with-cache.json")
+	if err := os.WriteFile(withCacheDir, []byte(`{"cache-dir":"/from/config/file"}`), 0o600); err != nil {
+		t.Fatalf("write the config file: %v", err)
+	}
+	withoutCacheDir := filepath.Join(root, "without-cache.json")
+	if err := os.WriteFile(withoutCacheDir, []byte(`{"local-dir":"/from/config/file/models"}`), 0o600); err != nil {
+		t.Fatalf("write the config file: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		// configFile is the config file the registration points at.
+		configFile string
+		// registered is the cache directory the registration records.
+		registered string
+		// want is the cache root the status has to report.
+		want string
+	}{
+		{
+			name:       "the config file of the instance wins",
+			configFile: withCacheDir,
+			registered: "/registered/cache",
+			want:       "/from/config/file",
+		},
+		{
+			name:       "the registration is the fallback",
+			configFile: withoutCacheDir,
+			registered: "/registered/cache",
+			want:       "/registered/cache",
+		},
+		{
+			name:       "a missing config file falls back to the registration",
+			configFile: filepath.Join(root, "missing.json"),
+			registered: "/registered/cache",
+			want:       "/registered/cache",
+		},
+		{
+			name:       "no cache dir at all",
+			configFile: withoutCacheDir,
+			registered: "",
+			want:       "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			launchd := darwinStatusManager(t)
+			if output, err := exec.Command(launchctl, "print", launchd.domain()).CombinedOutput(); err != nil {
+				t.Skipf("the domain %s is not available: %v\n%s", launchd.domain(), err, output)
+			}
+
+			stateDir := t.TempDir()
+			opts := InstallOptions{
+				Scope:      ScopeUser,
+				Executable: darwinWriteFakeExecutable(t),
+				Listen:     DefaultListen,
+				Paths: runtimepaths.Paths{
+					ConfigFile: tc.configFile,
+					StateDir:   stateDir,
+					LogDir:     filepath.Join(stateDir, "logs"),
+				},
+				CacheDir: tc.registered,
+			}
+			darwinWriteRegistration(t, launchd, opts)
+
+			status, err := launchd.Status(context.Background())
+			if err != nil {
+				t.Fatalf("Status(): %v", err)
+			}
+			if status.State == StateNotInstalled {
+				t.Fatalf("the state = %q, want the state of a registered instance", status.State)
+			}
+			if status.CacheDir != tc.want {
+				t.Errorf("the cache dir = %q, want %q", status.CacheDir, tc.want)
+			}
+		})
+	}
+}
+
 // TestLaunchdLifecycle runs the whole lifecycle of an instance against
 // launchd.
 //
@@ -660,6 +800,340 @@ func TestLaunchdLifecycle(t *testing.T) {
 	}
 }
 
+// TestLaunchdMachineWideInstallNeedsAnElevatedShell checks the elevation
+// requirement of the machine-wide scope.
+//
+// A LaunchDaemon is registered in /Library/LaunchDaemons and started by the
+// system domain: both belong to the machine and need root. The user scope
+// needs no elevation: a LaunchAgent belongs to the user who installs it.
+//
+// The decision is a separate function that takes the user id of the process,
+// so the test drives both branches without an elevated shell.
+func TestLaunchdMachineWideInstallNeedsAnElevatedShell(t *testing.T) {
+	const action = "an installation"
+
+	t.Run("the machine-wide scope refuses a shell that is not elevated", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem, uid: "501", home: "/Users/somebody"}
+
+		err := launchd.requireElevatedFor(action, 501)
+		if err == nil {
+			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
+		}
+		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+		if err.Error() != want {
+			t.Errorf("requireElevatedFor() = %q, want %q", err, want)
+		}
+		if !strings.Contains(err.Error(), "elevated shell") {
+			t.Errorf("requireElevatedFor() = %v, want an error that names the elevated shell", err)
+		}
+	})
+
+	t.Run("the machine-wide scope accepts an elevated shell", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem}
+
+		if err := launchd.requireElevatedFor(action, 0); err != nil {
+			t.Errorf("requireElevatedFor() = %v, want nil for an elevated shell", err)
+		}
+	})
+
+	t.Run("the user scope is not refused", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeUser, uid: "501", home: "/Users/somebody"}
+
+		if err := launchd.requireElevatedFor(action, 501); err != nil {
+			t.Errorf("requireElevatedFor() = %v, want nil for a user scope instance", err)
+		}
+	})
+
+	t.Run("the check of the process uses the effective user id of the process", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem}
+
+		err := launchd.requireElevated(action)
+		forced := launchd.requireElevatedFor(action, os.Geteuid())
+		switch {
+		case err == nil && forced == nil:
+		case err != nil && forced != nil && err.Error() == forced.Error():
+		default:
+			t.Errorf("requireElevated() = %v, want the decision of requireElevatedFor(%d) = %v", err, os.Geteuid(), forced)
+		}
+	})
+}
+
+// TestLaunchdMachineWideUninstallNeedsAnElevatedShell checks the elevation
+// requirement of the machine-wide scope for an uninstallation.
+//
+// A LaunchDaemon is registered in /Library/LaunchDaemons and it is unloaded
+// from the system domain: both belong to the machine and need root, so the
+// removal of the registration needs an elevated shell as well. The user
+// scope needs no elevation: a LaunchAgent belongs to the user who installed
+// it.
+//
+// The decision is the same function that the installation uses, with the user
+// id of the process as a parameter, so the test drives both branches without
+// an elevated shell.
+func TestLaunchdMachineWideUninstallNeedsAnElevatedShell(t *testing.T) {
+	const action = "an uninstallation"
+
+	t.Run("the machine-wide scope refuses a shell that is not elevated", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem, uid: "501", home: "/Users/somebody"}
+
+		err := launchd.requireElevatedFor(action, 501)
+		if err == nil {
+			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
+		}
+		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+		if err.Error() != want {
+			t.Errorf("requireElevatedFor() = %q, want %q", err, want)
+		}
+		if !strings.Contains(err.Error(), "elevated shell") {
+			t.Errorf("requireElevatedFor() = %v, want an error that names the elevated shell", err)
+		}
+	})
+
+	t.Run("the machine-wide scope accepts an elevated shell", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem}
+
+		if err := launchd.requireElevatedFor(action, 0); err != nil {
+			t.Errorf("requireElevatedFor() = %v, want nil for an elevated shell", err)
+		}
+	})
+
+	t.Run("the user scope is not refused", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeUser, uid: "501", home: "/Users/somebody"}
+
+		if err := launchd.requireElevatedFor(action, 501); err != nil {
+			t.Errorf("requireElevatedFor() = %v, want nil for a user scope instance", err)
+		}
+	})
+
+	t.Run("the check of the process uses the effective user id of the process", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem}
+
+		err := launchd.requireElevated(action)
+		forced := launchd.requireElevatedFor(action, os.Geteuid())
+		switch {
+		case err == nil && forced == nil:
+		case err != nil && forced != nil && err.Error() == forced.Error():
+		default:
+			t.Errorf("requireElevated() = %v, want the decision of requireElevatedFor(%d) = %v", err, os.Geteuid(), forced)
+		}
+	})
+}
+
+// TestLaunchdUninstallOfAnAbsentRegistrationIsACleanSuccess checks that the
+// existence of the registration is checked before the elevation
+// requirement.
+//
+// A registration that is not there is an uninstallation that is already
+// done: it is a clean success, and it stays one when the shell is not
+// elevated. The existence of the registration comes first, so the
+// machine-wide scope reports the same clean success for an absent
+// registration instead of the elevation requirement.
+func TestLaunchdUninstallOfAnAbsentRegistrationIsACleanSuccess(t *testing.T) {
+	t.Run("the machine-wide scope of an absent registration", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem, uid: "501", home: "/Users/somebody"}
+		path := launchd.plistPath()
+		if _, err := os.Stat(path); err == nil {
+			// The machine has a machine-wide registration: the test must
+			// never remove it.
+			t.Skipf("the machine has a registration at %q: the test does not touch it", path)
+		}
+
+		// The elevation requirement refuses a shell that is not elevated.
+		if err := launchd.requireElevatedFor("an uninstallation", 501); err == nil {
+			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
+		}
+
+		// The uninstallation of an absent registration is a clean success.
+		if err := launchd.Uninstall(context.Background()); err != nil {
+			t.Errorf("Uninstall() = %v, want nil for an absent registration", err)
+		}
+
+		if os.Geteuid() != 0 {
+			// The shell of the test is not elevated, so the elevation
+			// requirement refuses it: the clean success above shows that
+			// the existence of the registration is checked first.
+			if err := launchd.requireElevated("an uninstallation"); err == nil {
+				t.Errorf("requireElevated() = nil, want the refusal of the shell %d", os.Geteuid())
+			}
+		}
+	})
+
+	t.Run("the user scope of an absent registration", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeUser, uid: "501", home: t.TempDir()}
+
+		if err := launchd.Uninstall(context.Background()); err != nil {
+			t.Errorf("Uninstall() = %v, want nil for an absent registration", err)
+		}
+	})
+}
+
+// TestLaunchdCheckSystemPaths checks the guard of the machine-wide scope: a
+// path inside the home directory of the user who runs the install command is
+// refused, the machine-level paths are accepted, and a user scope instance is
+// not touched at all.
+func TestLaunchdCheckSystemPaths(t *testing.T) {
+	home := t.TempDir()
+	inside := filepath.Join(home, ".config", "HFDesk", "service")
+	// A sibling of the home that shares its prefix is not inside the home.
+	sibling := home + "2"
+
+	refused := []struct {
+		name  string
+		field string
+		apply func(*InstallOptions)
+	}{
+		{name: "config file", field: "config file", apply: func(o *InstallOptions) { o.Paths.ConfigFile = inside }},
+		{name: "state dir", field: "state dir", apply: func(o *InstallOptions) { o.Paths.StateDir = inside }},
+		{name: "log dir", field: "log dir", apply: func(o *InstallOptions) { o.Paths.LogDir = inside }},
+		{name: "cache dir", field: "cache dir", apply: func(o *InstallOptions) { o.CacheDir = inside }},
+		{name: "hub dir", field: "hub dir", apply: func(o *InstallOptions) { o.HubDir = inside }},
+		{name: "local dir", field: "local dir", apply: func(o *InstallOptions) { o.LocalDir = inside }},
+	}
+	for _, tc := range refused {
+		t.Run("the "+tc.name+" inside the home of the user is refused", func(t *testing.T) {
+			opts := darwinSystemOptions(t)
+			tc.apply(&opts)
+
+			launchd := &launchdManager{scope: ScopeSystem, home: home}
+			err := launchd.checkSystemPaths(opts)
+			if err == nil {
+				t.Fatalf("checkSystemPaths() = nil, want the refusal of the %s", tc.name)
+			}
+			want := fmt.Sprintf("service: the %s %q of a machine-wide instance must not live inside the home directory %q of the invoking user", tc.field, inside, home)
+			if err.Error() != want {
+				t.Errorf("checkSystemPaths() = %q, want %q", err, want)
+			}
+		})
+	}
+
+	t.Run("the home itself is refused", func(t *testing.T) {
+		opts := darwinSystemOptions(t)
+		opts.Paths.StateDir = home
+
+		launchd := &launchdManager{scope: ScopeSystem, home: home}
+		err := launchd.checkSystemPaths(opts)
+		if err == nil {
+			t.Fatal("checkSystemPaths() = nil, want the refusal of the home directory of the user")
+		}
+		want := fmt.Sprintf("service: the state dir %q of a machine-wide instance must not live inside the home directory %q of the invoking user", home, home)
+		if err.Error() != want {
+			t.Errorf("checkSystemPaths() = %q, want %q", err, want)
+		}
+	})
+
+	t.Run("a sibling with a common prefix is accepted", func(t *testing.T) {
+		opts := darwinSystemOptions(t)
+		opts.Paths.StateDir = sibling
+
+		launchd := &launchdManager{scope: ScopeSystem, home: home}
+		if err := launchd.checkSystemPaths(opts); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for the sibling %q of the home %q", err, sibling, home)
+		}
+	})
+
+	t.Run("a path that leaves the home again is accepted", func(t *testing.T) {
+		opts := darwinSystemOptions(t)
+		opts.Paths.StateDir = filepath.Join(home, "..", "user2")
+
+		launchd := &launchdManager{scope: ScopeSystem, home: home}
+		if err := launchd.checkSystemPaths(opts); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for the path %q that leaves the home %q", err, opts.Paths.StateDir, home)
+		}
+	})
+
+	t.Run("the machine-level paths are accepted", func(t *testing.T) {
+		launchd := &launchdManager{scope: ScopeSystem, home: home}
+		if err := launchd.checkSystemPaths(darwinSystemOptions(t)); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for the machine-level paths", err)
+		}
+	})
+
+	t.Run("the user scope is not affected", func(t *testing.T) {
+		opts := darwinUserOptions(t)
+		opts.Paths.StateDir = inside
+		opts.CacheDir = inside
+
+		launchd := &launchdManager{scope: ScopeUser, home: home}
+		if err := launchd.checkSystemPaths(opts); err != nil {
+			t.Errorf("checkSystemPaths() = %v, want nil for a user scope instance", err)
+		}
+	})
+}
+
+// TestLaunchdSystemInstallRefusesTheHomeOfTheUser checks that the guard of
+// the machine-wide scope runs before the property list is written and before
+// any directory is created: a refused installation leaves nothing behind.
+//
+// The guard runs before the elevation requirement, so the refusal is the same
+// answer whether the command runs from an elevated shell or not, and it is
+// the same answer the Linux manager gives for the same command line.
+func TestLaunchdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	manager, err := newPlatformManager(ScopeSystem)
+	if err != nil {
+		t.Fatalf("newPlatformManager(ScopeSystem): %v", err)
+	}
+	launchd, ok := manager.(*launchdManager)
+	if !ok {
+		t.Fatalf("newPlatformManager(ScopeSystem) = %T, want a launchd manager", manager)
+	}
+
+	// The property list of the machine-wide scope lives in a fixed place of
+	// the machine. The test never writes it: the refusal happens before
+	// the property list is written. The state of the file is compared
+	// before and after the installation, so a registration that exists
+	// already is never touched by the test.
+	path := launchd.plistPath()
+	before, err := backupPlist(path)
+	if err != nil {
+		t.Logf("the registration %q cannot be read: %v", path, err)
+		before = &plistBackup{path: path}
+	}
+
+	root := filepath.Join(home, ".config", "HFDesk", "service")
+	opts := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: darwinWriteFakeExecutable(t),
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			// The config file of the instance stays on the machine, the
+			// state root of the instance is the one of the user: that is
+			// the case the guard refuses.
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   root,
+			LogDir:     filepath.Join(root, "logs"),
+		},
+		CacheDir: "/var/lib/hfdesk/cache",
+		HubDir:   "/var/lib/hfdesk/cache/hub",
+		LocalDir: "/var/lib/hfdesk/models",
+	}
+
+	err = launchd.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the home directory of the user")
+	}
+	want := fmt.Sprintf("service: the state dir %q of a machine-wide instance must not live inside the home directory %q of the invoking user", root, home)
+	if err.Error() != want {
+		t.Errorf("Install() = %q, want %q", err, want)
+	}
+
+	// The refused installation creates no directory of the instance.
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the state directory %q: %v", root, err)
+	}
+	// The refused installation writes no property list.
+	after, err := backupPlist(path)
+	if err != nil {
+		t.Logf("the registration %q cannot be read: %v", path, err)
+		after = &plistBackup{path: path}
+	}
+	if before.existed != after.existed || string(before.content) != string(after.content) {
+		t.Errorf("the refused installation changed the registration %q", path)
+	}
+}
+
 // darwinWaitForState waits until the instance reaches a state.
 func darwinWaitForState(t *testing.T, manager *launchdManager, want State) Status {
 	t.Helper()
@@ -691,6 +1165,35 @@ func darwinWriteFakeExecutable(t *testing.T) string {
 		t.Fatalf("write the program: %v", err)
 	}
 	return path
+}
+
+// darwinStatusManager returns a manager that reads its registration from a
+// temporary home directory, so a test never touches the registration of the
+// user of the test.
+func darwinStatusManager(t *testing.T) *launchdManager {
+	t.Helper()
+	return &launchdManager{
+		scope: ScopeUser,
+		uid:   strconv.Itoa(os.Getuid()),
+		home:  t.TempDir(),
+	}
+}
+
+// darwinWriteRegistration renders the property list of an installation and
+// writes it to the registration of the manager.
+func darwinWriteRegistration(t *testing.T, launchd *launchdManager, opts InstallOptions) {
+	t.Helper()
+	rendered, err := renderPlist(opts)
+	if err != nil {
+		t.Fatalf("renderPlist(): %v", err)
+	}
+	path := launchd.plistPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the registration directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(rendered), plistMode); err != nil {
+		t.Fatalf("write the property list: %v", err)
+	}
 }
 
 // darwinPlistStrings returns every string of a registration, including the

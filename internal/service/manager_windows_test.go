@@ -7,6 +7,9 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -79,8 +82,7 @@ func TestSCMCommandLineCarriesNoCredential(t *testing.T) {
 	opts := scmTestOptions()
 	// Every field of the options that could carry a credential carries
 	// the sentinel.
-	opts.User = secretSentinel
-	opts.UID = secretSentinel
+	setCredentialFields(&opts, secretSentinel)
 
 	commandLine := scmCommandLine(opts)
 	if strings.Contains(commandLine, secretSentinel) {
@@ -327,5 +329,252 @@ func TestSCMLifecycle(t *testing.T) {
 	// The removal of an absent registration is a clean success.
 	if err := service.Uninstall(ctx); err != nil {
 		t.Errorf("the second Uninstall() = %v, want nil", err)
+	}
+}
+
+// TestSDDLGrantsIdentity checks the access control list of a path against
+// the account the instance runs as.
+//
+// The access control lists are the SDDL strings the platform writes: the
+// trustees appear as raw SIDs and not as aliases.
+func TestSDDLGrantsIdentity(t *testing.T) {
+	cases := []struct {
+		name    string
+		sddl    string
+		wantErr bool
+	}{
+		{"the account itself", "D:P(A;;FA;;;S-1-5-19)", false},
+		{"everyone", "D:P(A;;FA;;;S-1-1-0)", false},
+		{"the users group", "D:P(A;;FA;;;S-1-5-32-545)", false},
+		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", false},
+		{"the interactive users group", "D:P(A;;FA;;;S-1-5-4)", false},
+		{"an unrelated account", "D:P(A;;FA;;;S-1-5-18)", true},
+		{"an unrelated group", "D:P(A;;FA;;;S-1-5-32-544)", true},
+		{"the alias of the account", "D:P(A;;FA;;;LS)", false},
+		{"the alias of everyone", "D:P(A;;FA;;;WD)", false},
+		{"the alias of the users group", "D:P(A;;FA;;;BU)", false},
+		{"a denied entry next to an allowed one", "D:P(D;;GA;;;S-1-5-19)(A;;FA;;;S-1-1-0)", true},
+		{"a denied entry for a group of the account", "D:P(D;;GA;;;S-1-1-0)(A;;FA;;;S-1-5-19)", true},
+		{"read only rights", "D:P(A;;FR;;;S-1-5-19)", true},
+		{"write only rights", "D:P(A;;FW;;;S-1-5-19)", true},
+		{"the generic rights", "D:P(A;;0xC0000000;;;S-1-5-19)", false},
+		{"the file rights", "D:P(A;;0x0013019F;;;S-1-5-19)", false},
+		{"an empty list", "D:P", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sddlGrantsIdentity(tc.sddl)
+			if tc.wantErr && err == nil {
+				t.Errorf("sddlGrantsIdentity(%q) = nil, want an error", tc.sddl)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("sddlGrantsIdentity(%q) = %v, want nil", tc.sddl, err)
+			}
+		})
+	}
+}
+
+// TestPreflightDataPathRefusesAFile checks that a file where the instance
+// needs a directory is refused.
+func TestPreflightDataPathRefusesAFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cache")
+	if err := os.WriteFile(path, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	err := preflightDataPath("cache dir", path)
+	if err == nil {
+		t.Fatalf("preflightDataPath(%q) = nil, want an error", path)
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the reason", path, err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
+	}
+}
+
+// TestPreflightDataPathRefusesAPathTheIdentityCannotReach checks that a
+// directory the account of the instance cannot reach is refused before the
+// registration is written.
+//
+// The directory does not exist yet: the nearest existing ancestor has to
+// grant the account the access, otherwise the installation would leave a
+// directory behind that the instance cannot use.
+func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	// The directory grants the machine and its administrators the access,
+	// not the account the instance runs as.
+	scmTestSetDACL(t, parent, fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t)))
+
+	path := filepath.Join(parent, "cache")
+	err := preflightDataPath("cache dir", path)
+	if err == nil {
+		t.Fatalf("preflightDataPath(%q) = nil, want an error", path)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
+	}
+	// The refused directory is not created behind the back of the user.
+	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused directory %q exists: %v", path, statErr)
+	}
+}
+
+// TestApplyRegistrationReportsTheEffectiveCacheDir checks that the status
+// reports the cache root the instance uses: the cache directory of the
+// config file of the instance wins over the registered one.
+func TestApplyRegistrationReportsTheEffectiveCacheDir(t *testing.T) {
+	root := t.TempDir()
+	configFile := filepath.Join(root, "hfdesk.json")
+	registered := filepath.ToSlash(filepath.Join(root, "registered-cache"))
+	fromConfig := filepath.ToSlash(filepath.Join(root, "cache-of-the-config-file"))
+
+	opts := scmTestOptions()
+	opts.Paths.ConfigFile = configFile
+	opts.CacheDir = registered
+
+	registration, err := parseSCMCommandLine(scmCommandLine(opts))
+	if err != nil {
+		t.Fatalf("parseSCMCommandLine() = %v, want nil", err)
+	}
+
+	status := Status{}
+	applyRegistration(&status, registration)
+	if status.CacheDir != registered {
+		t.Errorf("the cache dir = %q, want the registered %q", status.CacheDir, registered)
+	}
+	if status.Paths.ConfigFile != configFile {
+		t.Errorf("the config file = %q, want %q", status.Paths.ConfigFile, configFile)
+	}
+
+	// The config file of the instance wins over the registration.
+	if err := os.WriteFile(configFile, []byte(`{"cache-dir":"`+fromConfig+`"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+	status = Status{}
+	applyRegistration(&status, registration)
+	if status.CacheDir != fromConfig {
+		t.Errorf("the cache dir = %q, want the cache dir of the config file %q", status.CacheDir, fromConfig)
+	}
+
+	// A registration without a cache root and a config file without one
+	// report no cache root at all.
+	opts.CacheDir = ""
+	opts.Paths.ConfigFile = filepath.Join(root, "without-cache.json")
+	registration, err = parseSCMCommandLine(scmCommandLine(opts))
+	if err != nil {
+		t.Fatalf("parseSCMCommandLine() = %v, want nil", err)
+	}
+	status = Status{}
+	applyRegistration(&status, registration)
+	if status.CacheDir != "" {
+		t.Errorf("the cache dir = %q, want none", status.CacheDir)
+	}
+}
+
+// TestInstanceStatePathsProtectEveryOwnedPath checks that every path the
+// instance owns carries the restrictive descriptor: the directory of the
+// config file, the state directory, the log directory and the config file
+// itself.
+func TestInstanceStatePathsProtectEveryOwnedPath(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	if err := os.MkdirAll(filepath.Dir(opts.Paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("MkdirAll() = %v, want nil", err)
+	}
+	if err := os.WriteFile(opts.Paths.ConfigFile, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	want := []string{
+		filepath.Dir(opts.Paths.ConfigFile),
+		opts.Paths.StateDir,
+		opts.Paths.LogDir,
+		opts.Paths.ConfigFile,
+	}
+	got := instanceStatePaths(opts)
+	if len(got) != len(want) {
+		t.Fatalf("instanceStatePaths() = %v, want %v", got, want)
+	}
+	protected := make(map[string]bool, len(got))
+	for _, path := range got {
+		protected[path] = true
+	}
+	for _, path := range want {
+		if !protected[path] {
+			t.Errorf("instanceStatePaths() = %v, want %v", got, want)
+		}
+	}
+
+	// A config file that does not exist yet inherits the descriptor of its
+	// directory, so it is not part of the paths.
+	if err := os.Remove(opts.Paths.ConfigFile); err != nil {
+		t.Fatalf("Remove() = %v, want nil", err)
+	}
+	got = instanceStatePaths(opts)
+	if len(got) != len(want)-1 {
+		t.Fatalf("instanceStatePaths() = %v, want the three directories of the instance", got)
+	}
+	for _, path := range got {
+		if path == opts.Paths.ConfigFile {
+			t.Errorf("instanceStatePaths() = %v, want no config file", got)
+		}
+	}
+}
+
+// scmTestCurrentUserSID returns the SID of the account the test runs as.
+//
+// The account is needed by the tests that build an access control list: the
+// list has to keep the access of the test itself, so the test can still
+// read the directory it restricted.
+func scmTestCurrentUserSID(t *testing.T) string {
+	t.Helper()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Skipf("the account of the process is unknown: %v", err)
+	}
+	if user.User.Sid == nil {
+		t.Skip("the account of the process carries no SID")
+	}
+	return user.User.Sid.String()
+}
+
+// scmTestSetDACL applies an access control list to a path.
+//
+// The descriptor is applied to the path itself and never recursively.
+func scmTestSetDACL(t *testing.T, path, sddl string) {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("SecurityDescriptorFromString(%q) = %v, want nil", sddl, err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("the access control list of %q cannot be read: %v", sddl, err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		dacl,
+		nil,
+	); err != nil {
+		t.Fatalf("the access control list %q cannot be applied to %q: %v", sddl, path, err)
 	}
 }
