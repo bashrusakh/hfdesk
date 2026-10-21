@@ -149,6 +149,12 @@ jobs:
       - name: Test service package
         run: go test ./internal/service -v
 
+      # The command layer is platform independent, so it is exercised on
+      # Windows too: a check of the command line that only holds on Unix
+      # would otherwise stay unnoticed until a Windows installation.
+      - name: Test command layer
+        run: go test ./cmd/hfdesk -v
+
   # The launchd manager and the property list rendering are darwin-only code,
   # so they need a macOS runner. The run executes the plist validation
   # (plutil -lint) and the launchctl integration cycle where the runner
@@ -161,6 +167,10 @@ jobs:
   go-macos:
     name: Go checks (macOS)
     runs-on: macos-latest
+    # A macOS runner is slow and a stalled lifecycle test would occupy it
+    # until the default limit of the platform. The limit is comfortably
+    # above the duration of the job.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -184,4 +194,11 @@ jobs:
       # lifecycle where the runner allows it.
       - name: Test service package
         run: go test ./internal/service -v
+
+
+      # The command layer is platform independent, so it is exercised on
+      # macOS too: a check of the command line that only holds on another
+      # platform would otherwise stay unnoticed until a macOS installation.
+      - name: Test command layer
+        run: go test ./cmd/hfdesk -v
 

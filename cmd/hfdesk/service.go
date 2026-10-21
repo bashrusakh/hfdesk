@@ -62,6 +62,17 @@ const (
 	// registration carries, so the summary names the account the instance
 	// really runs as and not the one a command line asked for.
 	windowsServiceAccount = `NT AUTHORITY\LocalService`
+
+	// userScopeFlag is the name of the flag that selects the per-user
+	// scope.
+	//
+	// The flag is written in one place, so the hint of the summary names
+	// the same scope selector the parser of the command line accepts.
+	userScopeFlag = "user"
+
+	// systemScopeFlag is the name of the flag that selects the
+	// machine-wide scope.
+	systemScopeFlag = "system"
 )
 
 // serviceSubcommands lists the subcommands of the family in the order the
@@ -348,8 +359,8 @@ type scopeFlags struct {
 
 // registerScopeFlags registers the scope selector on a flag set.
 func registerScopeFlags(fs *flag.FlagSet, flags *scopeFlags) {
-	fs.BoolVar(&flags.user, "user", false, "per-user installation (the default on Linux and macOS)")
-	fs.BoolVar(&flags.system, "system", false, "machine-wide installation (the default on Windows)")
+	fs.BoolVar(&flags.user, userScopeFlag, false, "per-user installation (the default on Linux and macOS)")
+	fs.BoolVar(&flags.system, systemScopeFlag, false, "machine-wide installation (the default on Windows)")
 }
 
 // pathFlag is one path flag of the command line.
@@ -471,7 +482,13 @@ func hasPathSeparator(path string) bool {
 //
 // The path must be absolute (a supervised process must not resolve a
 // relative path against the working directory of the supervisor), it must
-// exist, it must be a regular file and it must be executable.
+// exist and it must be a regular file.
+//
+// The execute bit is not a check of the command line: it is a fact of the
+// platform, and the platform manager owns it. Windows reports a regular
+// file without any execute bit, so a check of the permission bits would
+// refuse every binary of a Windows installation. The managers of the
+// platforms that require the bit enforce it themselves.
 //
 // A rejected path is a command line that could not be understood, so the
 // error carries that kind.
@@ -485,9 +502,6 @@ func validateExecutablePath(path string) (string, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return "", newServiceUsageError(fmt.Errorf("the executable %q is not a regular file", path))
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		return "", newServiceUsageError(fmt.Errorf("the executable %q is not executable", path))
 	}
 	return path, nil
 }
@@ -676,6 +690,10 @@ func serviceInstall(args []string, stdout io.Writer) error {
 // The path of the registration and the state of the instance are known only
 // after the installation, so both are read back from the supervisor.
 //
+// The scope of the instance is carried into the hint that starts it: the
+// hint has to start the instance that was registered and not the one of
+// the default scope of the platform.
+//
 // The cache root and the hub directory are the effective ones: the config
 // file of the instance wins over the registered values, because the cache
 // directory is changed in the settings of the instance and the change has to
@@ -708,7 +726,7 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The service was registered.")
-	writeInstallState(w, status, statusErr)
+	writeInstallState(w, scope, status, statusErr)
 }
 
 // installAccount returns the account the registered instance runs as.
@@ -787,7 +805,12 @@ func effectiveCacheDirs(opts service.InstallOptions) (string, string) {
 // instance was not started. A state the supervisor did not report is
 // reported as unknown, and the successful registration is reported
 // nevertheless.
-func writeInstallState(w io.Writer, status service.Status, statusErr error) {
+//
+// The hint names the scope of the instance that was registered: the
+// default scope of the platform is not the scope of every installation,
+// so a hint without the scope would start another instance than the one
+// that was just registered.
+func writeInstallState(w io.Writer, scope service.Scope, status service.Status, statusErr error) {
 	switch {
 	case statusErr != nil:
 		writeField(w, "State", fmt.Sprintf("unknown (the state could not be determined: %s)", serviceErrorText(statusErr)))
@@ -801,7 +824,28 @@ func writeInstallState(w io.Writer, status service.Status, statusErr error) {
 	// instance then has to be started by the user, and a state that could
 	// not be read back at all does not say that the instance runs.
 	if status.State != service.StateRunning && status.State != service.StateStarting {
-		fmt.Fprintln(w, "Start it with: hfdesk service start")
+		fmt.Fprintf(w, "Start it with: %s\n", startCommand(scope))
+	}
+}
+
+// startCommand returns the command that starts the instance of the scope.
+//
+// The scope selector is part of the command: the default scope of the
+// platform is the user scope on Linux and macOS and the machine-wide scope
+// on Windows, so a command without the selector would start another
+// instance than the one that was registered.
+//
+// A scope the family does not know has no selector: the command then
+// starts the default scope of the platform.
+func startCommand(scope service.Scope) string {
+	command := "hfdesk service start"
+	switch scope {
+	case service.ScopeUser:
+		return command + " --" + userScopeFlag
+	case service.ScopeSystem:
+		return command + " --" + systemScopeFlag
+	default:
+		return command
 	}
 }
 

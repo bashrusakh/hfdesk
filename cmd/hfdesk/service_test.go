@@ -1165,6 +1165,61 @@ func TestInstallSummaryReportsTheStateOfTheInstance(t *testing.T) {
 	}
 }
 
+// TestInstallSummaryNamesTheScopeInTheStartHint checks that the hint of
+// the summary starts the instance that was registered.
+//
+// The default scope of the platform is the user scope on Linux and macOS
+// and the machine-wide scope on Windows: a hint without the scope starts
+// another instance than the one that was just registered.
+func TestInstallSummaryNamesTheScopeInTheStartHint(t *testing.T) {
+	for _, tc := range []struct {
+		scope    service.Scope
+		selector string
+	}{
+		{scope: service.ScopeUser, selector: "--user"},
+		{scope: service.ScopeSystem, selector: "--system"},
+	} {
+		t.Run(string(tc.scope), func(t *testing.T) {
+			opts := service.InstallOptions{
+				Scope:      tc.scope,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/etc/hfdesk/hfdesk.json",
+					StateDir:   "/var/lib/hfdesk",
+					LogDir:     "/var/log/hfdesk",
+				},
+			}
+
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateStopped}}
+			writeInstallSummary(&buf, context.Background(), mgr, tc.scope, opts)
+
+			out := buf.String()
+			hint := startHint(out)
+			want := "hfdesk service start " + tc.selector
+			if hint != want {
+				t.Errorf("the hint of the summary is %q, want %q:\n%s", hint, want, out)
+			}
+		})
+	}
+}
+
+// startHint returns the command of the hint that starts the instance.
+//
+// The hint is the only line of a summary that names the command, so the
+// line is found by its prefix.
+func startHint(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "Start it with:") {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, "Start it with:"))
+	}
+	return ""
+}
+
 // TestInstallSummaryReportsAFailedStatusQuery checks that a state that could
 // not be determined is reported as such, and that the successful
 // registration is reported nevertheless.
@@ -1403,13 +1458,11 @@ func TestUpgradeWarningDescribesTheRegisteredPath(t *testing.T) {
 // installation is refused when the named binary cannot be registered.
 //
 // The registration points at that exact path, so a path that is not a
-// program would break the instance at the first start.
+// program would break the instance at the first start. The checks of the
+// command line are the ones that hold on every platform: the path is
+// absolute, it exists and it is a regular file.
 func TestServiceInstallRejectsAnUnusableExecutable(t *testing.T) {
 	dir := t.TempDir()
-	plain := filepath.Join(dir, "notes.txt")
-	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 
 	for _, tc := range []struct {
 		name string
@@ -1419,7 +1472,6 @@ func TestServiceInstallRejectsAnUnusableExecutable(t *testing.T) {
 		{"a relative path", "bin/hfdesk", "absolute"},
 		{"a missing file", filepath.Join(dir, "missing"), "not usable"},
 		{"a directory", dir, "regular file"},
-		{"a file that is not executable", plain, "not executable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -1434,6 +1486,35 @@ func TestServiceInstallRejectsAnUnusableExecutable(t *testing.T) {
 				t.Errorf("a refused installation must not report a registration:\n%s", stdout.String())
 			}
 		})
+	}
+}
+
+// TestServiceInstallAcceptsAnExistingExecutable checks that a binary that
+// exists is accepted by the command layer.
+//
+// The command layer checks what is meaningful on every platform: the path
+// is absolute, it exists and it is a regular file. The execute bit is a
+// fact of the platform and belongs to the platform manager: Windows
+// reports a regular file without any execute bit, so a check of the
+// permission bits would refuse every binary of a Windows installation.
+func TestServiceInstallAcceptsAnExistingExecutable(t *testing.T) {
+	useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+
+	dir := t.TempDir()
+	program := filepath.Join(dir, "hfdesk")
+	// The file carries no execute bit: the command line does not look at
+	// the permission bits.
+	if err := os.WriteFile(program, []byte("not a program\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "The service was registered.") {
+		t.Errorf("the summary does not report the registration:\n%s", stdout.String())
 	}
 }
 
@@ -1590,15 +1671,15 @@ func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 }
 
 // TestResolveExecutableRejectsAnUnusableExplicitPath checks that an
-// explicit path has to be a program that can be started.
+// explicit path has to be a file the registration can point at.
+//
+// The path must be absolute, it must exist and it must be a regular file.
+// The execute bit is not checked here: it is a fact of the platform, and
+// the platform manager owns it.
 func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 	root := t.TempDir()
 	program := filepath.Join(root, "hfdesk")
 	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	plain := filepath.Join(root, "notes.txt")
-	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1610,7 +1691,6 @@ func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 		{"a relative path", "bin/hfdesk", "absolute"},
 		{"a missing file", filepath.Join(root, "missing"), "not usable"},
 		{"a directory", root, "regular file"},
-		{"a file that is not executable", plain, "not executable"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1622,6 +1702,29 @@ func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 				t.Errorf("the error of resolveExecutable(%q) = %v, want it to mention %q", tc.path, err, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveExecutableAcceptsAnExistingFile checks that an existing
+// regular file is accepted, whatever its permission bits say.
+//
+// The execute bit is a fact of the platform: Windows reports a regular
+// file without any execute bit, so a check of the permission bits would
+// refuse every binary of a Windows installation. The managers of the
+// platforms that require the bit enforce it themselves.
+func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
+	root := t.TempDir()
+	plain := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveExecutable(plain, "")
+	if err != nil {
+		t.Fatalf("resolveExecutable(%q) = %v, want nil", plain, err)
+	}
+	if got != plain {
+		t.Errorf("the registered executable is %q, want %q", got, plain)
 	}
 }
 
