@@ -32,6 +32,13 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # The service mode adds process-global mutable state (the installed
+      # runtime path model behind a lock, and the standard logger's output
+      # being redirected by the service host), so the race detector must run
+      # over the whole suite on the Linux runner.
+      - name: Test (race detector)
+        run: go test ./... -race
+
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
   # argument validation cannot regress silently.
