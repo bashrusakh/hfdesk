@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -68,6 +69,10 @@ func (p *ProxyConfig) IsConfigured() bool {
 
 // GetProxyURL returns the parsed proxy URL with authentication applied.
 // Returns nil if no proxy is configured.
+//
+// A parse failure is reported without the proxy URL: the URL can embed the
+// proxy credentials, and this error travels to the API responses and to the
+// log records of the callers.
 func (p *ProxyConfig) GetProxyURL() (*url.URL, error) {
 	if p == nil || p.URL == "" {
 		return nil, nil
@@ -75,7 +80,7 @@ func (p *ProxyConfig) GetProxyURL() (*url.URL, error) {
 
 	proxyURL, err := url.Parse(p.URL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+		return nil, fmt.Errorf("invalid proxy URL: %s", proxyParseFailureReason(p.URL))
 	}
 
 	// Apply username/password if not already in URL
@@ -88,6 +93,98 @@ func (p *ProxyConfig) GetProxyURL() (*url.URL, error) {
 	}
 
 	return proxyURL, nil
+}
+
+// proxyParseFailureReason explains why a proxy URL failed to parse without
+// quoting the URL or any part of it.
+//
+// url.Parse reports a failure as a *url.Error whose Error() embeds the whole
+// URL — including the proxy credentials — and whose Err carries the reason.
+// The reason is not safe to quote either: it can repeat a fragment of a
+// malformed credential (an invalid percent escape inside the userinfo). The
+// reason is therefore taken from a parse of the URL with its credentials
+// removed. A URL whose credentials cannot be located, and a URL whose
+// credentials alone made it unparseable, are reported without a reason.
+func proxyParseFailureReason(raw string) string {
+	sanitized, ok := stripProxyCredentials(raw)
+	if !ok {
+		return "invalid proxy URL"
+	}
+	if _, err := url.Parse(sanitized); err != nil {
+		return parseFailureReason(err)
+	}
+	return "invalid proxy credentials or URL syntax"
+}
+
+// stripProxyCredentials removes the userinfo (the "user:password" part) from
+// a proxy URL and keeps the scheme, the host and the path.
+//
+// The userinfo is everything between the scheme separator and the last "@"
+// of the authority. A URL without an "@" in its authority carries no embedded
+// credential. A URL without a scheme has no authority, so its credentials
+// cannot be located: it reports false and must not be quoted at all.
+func stripProxyCredentials(raw string) (string, bool) {
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 0 {
+		return "", false
+	}
+	rest := raw[schemeEnd+3:]
+	authorityEnd := len(rest)
+	for i := 0; i < len(rest); i++ {
+		if c := rest[i]; c == '/' || c == '?' || c == '#' {
+			authorityEnd = i
+			break
+		}
+	}
+	authority := rest[:authorityEnd]
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return raw, true
+	}
+	return raw[:schemeEnd+3] + authority[at+1:] + rest[authorityEnd:], true
+}
+
+// sanitizeProxyURL removes the credentials from a proxy URL so that it can be
+// shown or reported.
+//
+// A URL whose credentials cannot be located is replaced by a fixed
+// description: no part of it may be shown.
+func sanitizeProxyURL(raw string) string {
+	sanitized, ok := stripProxyCredentials(raw)
+	if !ok {
+		return "invalid proxy URL"
+	}
+	return sanitized
+}
+
+// parseFailureReason renders the reason of a URL parse failure without the
+// URL the parse failed on.
+//
+// The reason of a *url.Error is the cause of the failure, which never quotes
+// the URL itself.
+func parseFailureReason(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
+}
+
+// proxyErrorReason renders the reason of a proxy configuration failure
+// without the proxy URL.
+//
+// A proxy URL parse failure carries the whole proxy URL, and that URL can
+// carry the proxy credentials, so only the reason of the failure may reach a
+// log record.
+func proxyErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
 }
 
 // IsSocks returns true if the proxy uses SOCKS5 protocol.
@@ -473,7 +570,10 @@ func GetProxyInfoString(proxyCfg *ProxyConfig) string {
 	// Parse URL to hide password
 	u, err := url.Parse(proxyCfg.URL)
 	if err != nil {
-		return proxyCfg.URL
+		// The URL does not parse, so it cannot be masked field by field.
+		// Strip the credentials instead: the raw URL can carry the proxy
+		// password and this string is shown to the user.
+		return sanitizeProxyURL(proxyCfg.URL)
 	}
 
 	// Apply auth if separate

@@ -5,9 +5,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -15,8 +15,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// searchLog is the logger of the search subsystem. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var searchLog = logging.NewComponentLogger("search")
+
+// proxyErrorReason renders the reason of a proxy configuration failure
+// without the proxy URL.
+//
+// A parse failure carries the whole proxy URL, and that URL can carry the
+// proxy credentials, so it must not reach a log record. The reason of the
+// failure never contains the credentials.
+func proxyErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
+}
 
 // SearchResult is one model returned by /api/search.
 type SearchResult struct {
@@ -127,14 +150,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	httpClient, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
-		log.Printf("search: invalid proxy config: %v", err)
+		// The proxy URL can carry the proxy credentials, so only the reason
+		// of the failure reaches the log record.
+		searchLog.Info("invalid proxy config", "error", proxyErrorReason(err))
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
 	}
 	httpClient.Timeout = 20 * time.Second
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("search: upstream error: %v", err)
+		searchLog.Info("upstream error", "error", err)
 		writeError(w, http.StatusBadGateway, "Upstream request failed", err.Error())
 		return
 	}
