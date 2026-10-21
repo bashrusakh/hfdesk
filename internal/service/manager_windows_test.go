@@ -583,6 +583,294 @@ func TestSCMLifecycle(t *testing.T) {
 	}
 }
 
+// TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine checks
+// that the status of a registered instance is built out of the facts of a
+// read-only lookup.
+//
+// The mapping is checked without a registration of its own: reading the
+// command line of a registration needs a real service in the service
+// control manager, which a test cannot create without an elevated shell.
+func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestOptions()
+	opts.Executable = filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Running,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateRunning {
+		t.Errorf("the state = %q, want %q", status.State, StateRunning)
+	}
+	if status.Scope != ScopeSystem {
+		t.Errorf("the scope = %q, want %q", status.Scope, ScopeSystem)
+	}
+	if status.Name != ServiceName {
+		t.Errorf("the name = %q, want %q", status.Name, ServiceName)
+	}
+	if status.UnitPath != scmRegistrationPath {
+		t.Errorf("the registration path = %q, want %q", status.UnitPath, scmRegistrationPath)
+	}
+	if status.Executable != opts.Executable {
+		t.Errorf("the registered executable = %q, want %q", status.Executable, opts.Executable)
+	}
+	if status.Listen != opts.Listen {
+		t.Errorf("the registered listen address = %q, want %q", status.Listen, opts.Listen)
+	}
+	if status.Paths != opts.Paths {
+		t.Errorf("the registered paths = %+v, want %+v", status.Paths, opts.Paths)
+	}
+	if status.CacheDir != opts.CacheDir {
+		t.Errorf("the cache dir = %q, want %q", status.CacheDir, opts.CacheDir)
+	}
+}
+
+// TestSCMStatusFromAnAbsentRegistrationIsNotInstalled checks that an
+// instance that is not registered is reported as not installed, without an
+// error.
+func TestSCMStatusFromAnAbsentRegistrationIsNotInstalled(t *testing.T) {
+	status, err := scmStatusFrom(ScopeSystem, scmRegistrationFacts{})
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil for an absent registration", err)
+	}
+	if status.State != StateNotInstalled {
+		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
+	}
+	if status.Scope != ScopeSystem {
+		t.Errorf("the scope = %q, want %q", status.Scope, ScopeSystem)
+	}
+	if status.Name != ServiceName {
+		t.Errorf("the name = %q, want %q", status.Name, ServiceName)
+	}
+	if !strings.Contains(status.Detail, ServiceName) {
+		t.Errorf("the detail = %q, want the name of the missing registration %q", status.Detail, ServiceName)
+	}
+}
+
+// TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable checks
+// that a registration that points at a program that is gone is reported as
+// broken, and that the detail names the missing program.
+//
+// The broken registration is the case a normal shell has to be able to
+// see: the registration is readable, the program behind it is not there
+// anymore.
+func TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "gone", "hfdesk.exe")
+	opts := scmTestOptions()
+	opts.Executable = missing
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Stopped,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateBroken {
+		t.Errorf("the state = %q, want %q", status.State, StateBroken)
+	}
+	if !strings.Contains(status.Detail, missing) {
+		t.Errorf("the detail = %q, want the path of the missing executable %q", status.Detail, missing)
+	}
+}
+
+// TestSCMStatusFromAStoppedInstanceNamesTheExitCode checks that the exit
+// code of a stopped instance is reported.
+func TestSCMStatusFromAStoppedInstanceNamesTheExitCode(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestOptions()
+	opts.Executable = filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Stopped,
+		exitCode:    3,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateStopped {
+		t.Errorf("the state = %q, want %q", status.State, StateStopped)
+	}
+	if !strings.Contains(status.Detail, "3") {
+		t.Errorf("the detail = %q, want the exit code of the instance", status.Detail)
+	}
+}
+
+// TestSCMLookupErrorReportsTheElevationRequirement checks that a caller
+// that may not read the registration is told about the elevation
+// requirement, and not about the raw access denied error of the platform.
+func TestSCMLookupErrorReportsTheElevationRequirement(t *testing.T) {
+	err := scmLookupError("open the registration of "+ServiceName, windows.ERROR_ACCESS_DENIED)
+	if err == nil {
+		t.Fatal("scmLookupError(access denied) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "elevated") {
+		t.Errorf("scmLookupError(access denied) = %v, want an error that names the elevated shell", err)
+	}
+	if !strings.Contains(err.Error(), "administrator") {
+		t.Errorf("scmLookupError(access denied) = %v, want an error that tells the user what to do", err)
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Errorf("scmLookupError(access denied) = %v, want the elevation requirement and not the raw access denied error", err)
+	}
+
+	// A failure that is not about the rights of the shell is reported as
+	// it is.
+	other := errors.New("the service control manager is gone")
+	if got := scmLookupError("connect to the service control manager", other); !errors.Is(got, other) {
+		t.Errorf("scmLookupError(%v) = %v, want the error itself", other, got)
+	}
+	if got := scmLookupError("connect to the service control manager", nil); got != nil {
+		t.Errorf("scmLookupError(nil) = %v, want nil", got)
+	}
+}
+
+// TestSCMLookupRegistrationReportsAnAbsentRegistration checks the
+// read-only lookup against the service control manager of the machine: a
+// name that cannot be registered is reported as absent, without an error.
+func TestSCMLookupRegistrationReportsAnAbsentRegistration(t *testing.T) {
+	name := fmt.Sprintf("HfdeskTestAbsentRegistration%d", time.Now().UnixNano())
+	facts, err := scmLookupRegistration(name)
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if facts.present {
+		t.Errorf("scmLookupRegistration(%q) = a registered instance, want an absent registration", name)
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil for an absent registration", err)
+	}
+	if status.State != StateNotInstalled {
+		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
+	}
+}
+
+// TestSCMLookupRegistrationReadsARegisteredService checks the read-only
+// lookup against the service control manager of the machine: a service of
+// the operating system is reported with its state and its registered
+// command line.
+//
+// The lookup needs no elevated shell: it opens the service control manager
+// with the right to connect and the registration with the right to query
+// its state and its configuration.
+func TestSCMLookupRegistrationReadsARegisteredService(t *testing.T) {
+	name := scmTestFindReadableService(t)
+	facts, err := scmLookupRegistration(name)
+	if err != nil {
+		t.Fatalf("scmLookupRegistration(%q) = %v, want nil", name, err)
+	}
+	if !facts.present {
+		t.Errorf("scmLookupRegistration(%q) = an absent registration, want a registered one", name)
+	}
+	if facts.commandLine == "" {
+		t.Errorf("the command line of %q is empty, want the registered command line", name)
+	}
+	if facts.state == 0 {
+		t.Errorf("the state of %q = %d, want a state of the supervisor", name, facts.state)
+	}
+}
+
+// TestSCMLookupRegistrationNeedsNoElevatedShell checks that the read-only
+// lookup reads a registration where the privileged connection of the
+// platform is refused.
+//
+// The privileged connection asks for every right of the service control
+// manager, so a normal shell does not have it. The read-only lookup opens
+// the manager with the right to connect and the registration with the
+// rights a status needs, so it reads the state of a registration in a
+// normal shell.
+func TestSCMLookupRegistrationNeedsNoElevatedShell(t *testing.T) {
+	manager, err := mgr.Connect()
+	if err == nil {
+		manager.Disconnect()
+		t.Skip("the shell of the test is elevated, the read-only path cannot be told apart from the privileged one")
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+
+	name := scmTestFindReadableService(t)
+	facts, err := scmLookupRegistration(name)
+	if err != nil {
+		t.Fatalf("scmLookupRegistration(%q) = %v, want nil", name, err)
+	}
+	if !facts.present {
+		t.Errorf("scmLookupRegistration(%q) = an absent registration, want a registered one", name)
+	}
+}
+
+// scmTestFindReadableService returns the name of a service of the
+// operating system that this shell may read.
+//
+// The candidates are the services every installation of the operating
+// system carries. The test is skipped when the machine carries none of
+// them that this shell may read.
+func scmTestFindReadableService(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{"EventLog", "RpcSs", "Dhcp", "W32Time", "NlaSvc", "Schedule", "Power"} {
+		facts, err := scmLookupRegistration(candidate)
+		if err != nil || !facts.present || facts.commandLine == "" {
+			// The service is not there or not readable from this
+			// shell: the next candidate is tried.
+			continue
+		}
+		return candidate
+	}
+	t.Skip("the machine carries no service that this shell may read")
+	return ""
+}
+
+// TestSCMStatusOfAnAbsentRegistrationIsNotInstalled checks the status of
+// an instance that is not registered: it reports that the instance is not
+// installed, and it does so without an error and without an elevated
+// shell.
+//
+// The test is skipped when the instance is registered, so it never reads a
+// real installation.
+func TestSCMStatusOfAnAbsentRegistrationIsNotInstalled(t *testing.T) {
+	state, err := scmRegistrationStateOf()
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if state != scmRegistrationAbsent {
+		t.Skipf("%s is registered, the test would read a real installation", ServiceName)
+	}
+
+	manager := &scmManager{scope: ScopeSystem}
+	status, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() = %v, want nil for an absent registration", err)
+	}
+	if status.State != StateNotInstalled {
+		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
+	}
+	if status.Name != ServiceName {
+		t.Errorf("the name = %q, want %q", status.Name, ServiceName)
+	}
+}
+
 // TestSCMBrokenRegistration checks that a registration that points at a
 // program that is gone is reported as broken.
 //

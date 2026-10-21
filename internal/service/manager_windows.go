@@ -46,6 +46,12 @@ import (
 // the instance, so it can tell an absent registration from a registration
 // it may not look at. A registration that is not there is a clean success
 // in every shell.
+//
+// The status of the instance is read with the rights a status needs only:
+// the right to query the state of the instance and the right to query its
+// configuration. The default descriptor of a service grants both of them
+// to the interactive users of the machine, so a normal shell reads the
+// state of a registration without an elevated shell.
 const (
 	// scmDisplayName is the name the service manager shows.
 	scmDisplayName = "HFDesk"
@@ -363,6 +369,12 @@ func (m *scmManager) Restart(ctx context.Context) error {
 
 // Status reports the state of the registered instance.
 //
+// The registration is read with the rights a status needs only: the right
+// to query the state of the instance and the right to query its
+// configuration. The default descriptor of a service grants both of them
+// to the interactive users of the machine, so a normal shell reads the
+// state of a registration without an elevated shell.
+//
 // The description of the instance comes from the registration, so the status
 // describes the registration and not the intent of the caller. A registered
 // executable that is gone is reported as broken, so a moved or deleted
@@ -372,29 +384,128 @@ func (m *scmManager) Restart(ctx context.Context) error {
 // keeps its database in the registry, so the registration path is the
 // registry key of the service.
 func (m *scmManager) Status(ctx context.Context) (Status, error) {
-	status := Status{
+	facts, err := scmLookupRegistration(ServiceName)
+	if err != nil {
+		return scmBaseStatus(m.scope), err
+	}
+	return scmStatusFrom(m.scope, facts)
+}
+
+// scmBaseStatus returns the status of the instance without the facts of a
+// registration.
+//
+// The status names the instance and its registration even when the
+// registration could not be read: the reader sees which instance the
+// answer is about.
+func scmBaseStatus(scope Scope) Status {
+	return Status{
 		State:    StateNotInstalled,
-		Scope:    m.scope,
+		Scope:    scope,
 		Name:     ServiceName,
 		UnitPath: scmRegistrationPath,
 	}
+}
 
-	manager, handle, ok, err := m.openRegistration("a status")
+// scmRegistrationFacts are the facts of a registration the status needs.
+//
+// The facts are read with the rights a status needs only, so a normal
+// shell can read them.
+type scmRegistrationFacts struct {
+	// present reports whether the instance is registered at all.
+	present bool
+	// state is the state the service control manager reports.
+	state svc.State
+	// exitCode is the exit code the instance ended with.
+	exitCode uint32
+	// commandLine is the command line the registration carries.
+	commandLine string
+}
+
+// scmLookupRegistration reads the facts of the registration of the given
+// name with the rights a status needs.
+//
+// The service control manager is opened with the right to connect only and
+// the registration with the right to query its state and the right to
+// query its configuration. The privileged connection of the platform asks
+// for every right instead, which a normal shell does not have.
+//
+// An absent registration is not an error: it is the state the caller asked
+// about, and it is reported as such. A registration the caller may not
+// look at is reported as the elevation requirement it is: the raw access
+// denied error of the platform does not tell the user what to do.
+func scmLookupRegistration(name string) (scmRegistrationFacts, error) {
+	facts := scmRegistrationFacts{}
+
+	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
-		return status, err
+		return facts, scmLookupError("connect to the service control manager", err)
 	}
-	if !ok {
+	defer windows.CloseServiceHandle(manager)
+
+	pointer, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return facts, fmt.Errorf("service: the name of the service cannot be read: %w", err)
+	}
+	handle, err := windows.OpenService(manager, pointer, windows.SERVICE_QUERY_STATUS|windows.SERVICE_QUERY_CONFIG)
+	if err != nil {
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			// The instance is not registered: that is the state the
+			// caller asked about, not a failure.
+			return facts, nil
+		}
+		return facts, scmLookupError(fmt.Sprintf("open the registration of %s", name), err)
+	}
+	defer windows.CloseServiceHandle(handle)
+
+	var query windows.SERVICE_STATUS
+	if err := windows.QueryServiceStatus(handle, &query); err != nil {
+		return facts, scmLookupError(fmt.Sprintf("query the state of %s", name), err)
+	}
+	commandLine, err := queryServiceCommandLine(handle)
+	if err != nil {
+		return facts, scmLookupError(fmt.Sprintf("read the registration of %s", name), err)
+	}
+
+	facts.present = true
+	facts.state = svc.State(query.CurrentState)
+	facts.exitCode = query.Win32ExitCode
+	facts.commandLine = commandLine
+	return facts, nil
+}
+
+// scmLookupError reports the reason of a failed read-only lookup.
+//
+// A refusal of the platform because the shell has no rights on the
+// registration is reported as the elevation requirement it is: the raw
+// access denied error of the platform does not tell the user what to do.
+func scmLookupError(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return scmElevationRequired("a status")
+	}
+	return fmt.Errorf("service: %s: %w", what, err)
+}
+
+// scmStatusFrom builds the status of the instance out of the facts of a
+// registration.
+//
+// The mapping is a pure function of the facts, so it can be checked
+// without a registration of its own: reading the command line of a
+// registration needs a real service in the service control manager, which
+// a test cannot create without an elevated shell.
+//
+// An absent registration is reported as not installed: the registration is
+// not there, so there is nothing to describe.
+func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
+	status := scmBaseStatus(scope)
+	if !facts.present {
 		status.Detail = fmt.Sprintf("%s is not registered", ServiceName)
 		return status, nil
 	}
-	defer manager.Disconnect()
-	defer handle.Close()
 
-	commandLine, err := queryServiceCommandLine(handle.Handle)
-	if err != nil {
-		return status, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
-	}
-	registration, err := parseSCMCommandLine(commandLine)
+	registration, err := parseSCMCommandLine(facts.commandLine)
 	if err != nil {
 		return status, err
 	}
@@ -406,13 +517,9 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 		return status, nil
 	}
 
-	query, err := handle.Query()
-	if err != nil {
-		return status, fmt.Errorf("service: query the state of %s: %w", ServiceName, err)
-	}
-	status.State = scmState(query.State)
-	if status.State == StateStopped && query.Win32ExitCode != 0 {
-		status.Detail = fmt.Sprintf("the instance exited with the code %d", query.Win32ExitCode)
+	status.State = scmState(facts.state)
+	if status.State == StateStopped && facts.exitCode != 0 {
+		status.Detail = fmt.Sprintf("the instance exited with the code %d", facts.exitCode)
 	}
 	return status, nil
 }
