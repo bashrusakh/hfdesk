@@ -429,14 +429,128 @@ func portOfURL(t *testing.T, url string) int {
 	return port
 }
 
+// stateDirCleanupTimeout bounds the wait for the removal of a temporary
+// state directory.
+//
+// The WebView2 runtime keeps its user data in the per user configuration
+// directory, and its browser process is a process of its own: it can hold
+// the files of that data for a moment after the window was closed. The
+// removal of the directory is retried within this budget, so the browser
+// process can release the files, and a directory that stays locked is left
+// behind instead of failing the test.
+const stateDirCleanupTimeout = 10 * time.Second
+
+// stateDirCleanupInterval is the pause between two attempts of the removal
+// of a temporary state directory.
+const stateDirCleanupInterval = 100 * time.Millisecond
+
 // useTemporaryStateDir points the per user configuration directory of the
 // platform at a temporary directory and moves the working directory, so the
 // test never reads or writes the state of the real installation.
+//
+// The directories are not the temporary directories of the test framework:
+// the framework removes its own directories strictly and reports a failure
+// of the test when that fails, and the browser process of the WebView2
+// runtime can still hold the files of its user data when the test ends. The
+// directories are removed on a best effort basis instead.
+//
+// The removal is registered before the window of the test is created, and
+// the cleanups of the test framework run in the reverse order of their
+// registration: the window is closed first, the directories are removed
+// afterwards.
 func useTemporaryStateDir(t *testing.T) {
 	t.Helper()
 
-	root := t.TempDir()
+	root := temporaryStateDir(t, "hfdesk-state")
 	t.Setenv("AppData", root)
 	t.Setenv("LOCALAPPDATA", root)
-	t.Chdir(t.TempDir())
+	t.Chdir(temporaryStateDir(t, "hfdesk-work"))
+}
+
+// temporaryStateDir creates a temporary directory for the state of a test
+// and removes it on a best effort basis when the test ends.
+//
+// The directory lives outside of the temporary directory of the test
+// framework, because the framework removes its own directories strictly.
+func temporaryStateDir(t *testing.T, pattern string) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", pattern+"-*")
+	if err != nil {
+		t.Fatalf("create the temporary %s directory: %v", pattern, err)
+	}
+
+	t.Cleanup(func() {
+		// A directory that stays locked is left behind: a file that a
+		// child process still holds is not a failure of the test.
+		if err := removeStateDir(dir, stateDirCleanupTimeout); err != nil {
+			t.Logf("the temporary %s directory %s was left behind: %v", pattern, dir, err)
+		}
+	})
+	return dir
+}
+
+// removeStateDir removes the directory and its content.
+//
+// The removal is retried within the budget, so a child process that still
+// holds a file of the directory can release it. The error of the last
+// attempt is returned, so the caller can report the leftover.
+func removeStateDir(dir string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(stateDirCleanupInterval)
+	}
+}
+
+// TestStateDirCleanupLeavesALockedDirectoryBehind proves that the cleanup
+// of a temporary state directory does not fail the test over a file that
+// another handle still holds.
+//
+// The browser process of the WebView2 runtime holds the files of its user
+// data for a moment after the window was closed, and Windows does not
+// allow the removal of a file that another handle still holds. The cleanup
+// has to leave the directory behind in that case instead of failing the
+// test, and it has to remove the directory once the file is released.
+func TestStateDirCleanupLeavesALockedDirectoryBehind(t *testing.T) {
+	// The budget of the probe is short: the file is held for the whole
+	// test, so no amount of waiting releases it.
+	const probeBudget = 200 * time.Millisecond
+
+	dir, err := os.MkdirTemp("", "hfdesk-locked-*")
+	if err != nil {
+		t.Fatalf("create the temporary directory: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// A file that is held open for the whole test.
+	locked, err := os.OpenFile(filepath.Join(dir, "locked.pma"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("create the locked file: %v", err)
+	}
+	defer locked.Close()
+
+	// The cleanup of the state directory does not fail over the file
+	// that is still held.
+	if err := removeStateDir(dir, probeBudget); err == nil {
+		t.Skip("the platform removed the file that was still open: the locked directory is not covered here")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the locked directory is gone: %v", err)
+	}
+
+	// The file is released, so the directory can be removed.
+	_ = locked.Close()
+	if err := removeStateDir(dir, probeBudget); err != nil {
+		t.Fatalf("the directory was not removed after the file was released: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the directory is still there after the removal: %v", err)
+	}
 }

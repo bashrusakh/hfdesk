@@ -145,6 +145,14 @@ func TestDesktopRuntimeHostCreatesWindow(t *testing.T) {
 	// The WebView2 runtime keeps its user data in the per user
 	// configuration directory, so the test points it at a temporary
 	// directory and never touches the data of a real installation.
+	//
+	// The browser process of the runtime is a process of its own and it
+	// can still hold the files of that data when the window was closed,
+	// so the temporary directory is removed on a best effort basis. The
+	// removal runs after the window was closed: the cleanup of the
+	// window is registered after the cleanup of the directory, and the
+	// cleanups of the test framework run in the reverse order of their
+	// registration.
 	useTemporaryStateDir(t)
 
 	// The window shows a page of a local server, so the navigation stays
