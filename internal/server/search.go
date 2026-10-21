@@ -5,7 +5,6 @@ package server
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,23 +22,6 @@ import (
 // default logger on every call, so records reach whichever pipeline the
 // application installed.
 var searchLog = logging.NewComponentLogger("search")
-
-// proxyErrorReason renders the reason of a proxy configuration failure
-// without the proxy URL.
-//
-// A parse failure carries the whole proxy URL, and that URL can carry the
-// proxy credentials, so it must not reach a log record. The reason of the
-// failure never contains the credentials.
-func proxyErrorReason(err error) string {
-	if err == nil {
-		return ""
-	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return urlErr.Err.Error()
-	}
-	return err.Error()
-}
 
 // SearchResult is one model returned by /api/search.
 type SearchResult struct {
@@ -152,7 +134,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The proxy URL can carry the proxy credentials, so only the reason
 		// of the failure reaches the log record.
-		searchLog.Info("invalid proxy config", "error", proxyErrorReason(err))
+		searchLog.Info("invalid proxy config", "error", hfdownloader.ProxyErrorReason(err))
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
 	}

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // capturedLog is a concurrency-safe buffer that collects what a logging
@@ -254,12 +255,15 @@ func TestServerRequestLogUsesStructuredPipeline(t *testing.T) {
 // TestProxyErrorReasonDropsCredentialBearingURL proves that a proxy
 // configuration failure cannot put the proxy credentials into a log record:
 // the parse failure carries the whole proxy URL, the logged reason does not.
+//
+// The rule itself lives in pkg/hfdownloader, so the reason is rendered by
+// the shared helper and not by a second implementation.
 func TestProxyErrorReasonDropsCredentialBearingURL(t *testing.T) {
 	_, err := url.Parse("http://proxyuser:proxysecret@proxy.example:notaport")
 	if err == nil {
 		t.Fatal("expected the proxy URL to fail parsing")
 	}
-	reason := proxyErrorReason(fmt.Errorf("invalid proxy URL: %w", err))
+	reason := hfdownloader.ProxyErrorReason(fmt.Errorf("invalid proxy URL: %w", err))
 	if reason == "" {
 		t.Fatal("proxy error reason is empty")
 	}

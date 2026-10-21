@@ -111,7 +111,7 @@ func proxyParseFailureReason(raw string) string {
 		return "invalid proxy URL"
 	}
 	if _, err := url.Parse(sanitized); err != nil {
-		return parseFailureReason(err)
+		return ProxyErrorReason(err)
 	}
 	return "invalid proxy credentials or URL syntax"
 }
@@ -157,26 +157,23 @@ func sanitizeProxyURL(raw string) string {
 	return sanitized
 }
 
-// parseFailureReason renders the reason of a URL parse failure without the
-// URL the parse failed on.
-//
-// The reason of a *url.Error is the cause of the failure, which never quotes
-// the URL itself.
-func parseFailureReason(err error) string {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return urlErr.Err.Error()
-	}
-	return err.Error()
-}
-
-// proxyErrorReason renders the reason of a proxy configuration failure
+// ProxyErrorReason renders the reason of a proxy configuration failure
 // without the proxy URL.
 //
 // A proxy URL parse failure carries the whole proxy URL, and that URL can
 // carry the proxy credentials, so only the reason of the failure may reach a
-// log record.
-func proxyErrorReason(err error) string {
+// log record or an API response.
+//
+// The reason of a *url.Error is the cause of the failure, which never quotes
+// the URL itself. A failure that is not a URL parse failure is reported with
+// its own message.
+//
+// A nil error has no reason: the empty string is returned for it.
+//
+// This is the single implementation of the rule: the callers in this package
+// and the server package use it, so the reason can never grow a second
+// spelling that quotes the URL.
+func ProxyErrorReason(err error) string {
 	if err == nil {
 		return ""
 	}

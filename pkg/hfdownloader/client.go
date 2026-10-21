@@ -59,7 +59,7 @@ func buildHTTPClientWithProxy(proxy *ProxyConfig) *http.Client {
 		// without it. Only the reason of the failure is recorded: the
 		// proxy URL can carry the proxy credentials.
 		downloadLog.Warn("invalid proxy configuration, using direct connection",
-			"error", proxyErrorReason(err))
+			"error", ProxyErrorReason(err))
 		// Fallback to no proxy on error
 		client, _ = BuildHTTPClient(&ProxyConfig{NoEnvProxy: true})
 	}
