@@ -77,6 +77,45 @@ var serviceSubcommands = []string{
 // is not a failure: the command exits with 0.
 var errHelpRequested = errors.New("help requested")
 
+// serviceUsageError reports a command line that could not be understood.
+//
+// The type is the marker of the exit code 2: the family answers a command
+// line it cannot understand with the exit code 2 and an operation that was
+// understood but failed with the exit code 1. The kind of the failure
+// travels with the error, so the classification is the same for every
+// subcommand and never depends on the call site that reports the error.
+type serviceUsageError struct {
+	err error
+}
+
+// newServiceUsageError marks an error as a command line that could not be
+// understood.
+func newServiceUsageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &serviceUsageError{err: err}
+}
+
+// Error renders the message of the wrapped error.
+func (e *serviceUsageError) Error() string { return e.err.Error() }
+
+// Unwrap gives access to the wrapped error.
+func (e *serviceUsageError) Unwrap() error { return e.err }
+
+// isServiceUsageError reports whether the error reports a command line that
+// could not be understood.
+func isServiceUsageError(err error) bool {
+	var usage *serviceUsageError
+	return errors.As(err, &usage)
+}
+
+// newServiceManager opens the manager of the platform supervisor of a scope.
+//
+// The variable is the seam of the tests: the command family is exercised
+// without touching the system of the test run.
+var newServiceManager = service.New
+
 // versionLikeSegment matches a "digit.digit" segment of a file name.
 //
 // The heuristic is deliberately simple: a release artifact carries its
@@ -101,9 +140,9 @@ func isServiceCommand(args []string) bool {
 // starting a process.
 func runServiceCommand(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "hfdesk service: a subcommand is required")
+		code := serviceCommandResult(stderr, newServiceUsageError(errors.New("a subcommand is required")))
 		writeServiceUsage(stderr)
-		return serviceUsageExitCode
+		return code
 	}
 
 	sub, rest := args[0], args[1:]
@@ -127,25 +166,33 @@ func runServiceCommand(args []string, stdout, stderr io.Writer) int {
 		writeServiceUsage(stdout)
 		return 0
 	default:
-		fmt.Fprintf(stderr, "hfdesk service: unknown subcommand %q\n", sub)
+		code := serviceCommandResult(stderr, newServiceUsageError(fmt.Errorf("unknown subcommand %q", sub)))
 		fmt.Fprintf(stderr, "Valid subcommands: %s\n", strings.Join(serviceSubcommands, ", "))
 		writeServiceUsage(stderr)
-		return serviceUsageExitCode
+		return code
 	}
 }
 
 // serviceCommandResult prints the error of a failed command and returns the
 // exit code of the process.
+//
+// The exit code is the kind of the failure and nothing else: a command line
+// that could not be understood exits with 2, an operation that was
+// understood but failed exits with 1. The kind travels with the error, so
+// every subcommand classifies a failure the same way.
 func serviceCommandResult(stderr io.Writer, err error) int {
 	switch {
 	case err == nil:
 		return 0
 	case errors.Is(err, errHelpRequested):
 		return 0
-	default:
-		fmt.Fprintf(stderr, "hfdesk service: %s\n", serviceErrorText(err))
-		return serviceFailureExitCode
 	}
+
+	fmt.Fprintf(stderr, "hfdesk service: %s\n", serviceErrorText(err))
+	if isServiceUsageError(err) {
+		return serviceUsageExitCode
+	}
+	return serviceFailureExitCode
 }
 
 // serviceErrorText renders an error of the service layer for the command
@@ -192,8 +239,10 @@ Options of the "install" subcommand:
 
 Exit codes:
   0  the operation succeeded
-  1  the operation failed
-  2  the command line could not be understood
+  1  the operation failed: the service is not installed, the elevation is
+     missing, the supervisor refused the operation
+  2  the command line could not be understood: an unknown subcommand or
+     flag, a relative path, an unusable --executable, an unparsable --listen
 
 "hfdesk service status" exits with 0 when the service is running, stopped,
 starting or stopping, and with 1 when it is not installed, broken, failed or
@@ -209,7 +258,7 @@ func writeSubcommandUsage(w io.Writer, fs *flag.FlagSet, summary string) {
 	fmt.Fprintf(w, "Usage: %s [options]\n\n%s\n\nOptions:\n", fs.Name(), summary)
 	fs.SetOutput(w)
 	fs.PrintDefaults()
-	fmt.Fprint(w, "\nExit codes: 0 success, 1 failed operation, 2 invalid command line.\n")
+	fmt.Fprint(w, "\nExit codes: 0 the operation succeeded, 1 the operation failed, 2 the command line could not be understood.\n")
 }
 
 // writeField writes one "Key: value" line of a summary block. The keys are
@@ -249,13 +298,16 @@ func defaultScope() service.Scope {
 //
 // The selectors are mutually exclusive: two scopes are two installations,
 // so an ambiguous command line is rejected instead of picking one of them.
+//
+// A rejected selector is a command line that could not be understood, so the
+// error carries that kind.
 func resolveScope(user, system bool) (service.Scope, error) {
 	switch {
 	case user && system:
-		return "", errors.New("--user and --system are mutually exclusive, choose one scope")
+		return "", newServiceUsageError(errors.New("--user and --system are mutually exclusive, choose one scope"))
 	case user:
 		if isWindows() {
-			return "", errors.New("--user is not available on windows: the service control manager registers machine-wide services only, use --system")
+			return "", newServiceUsageError(errors.New("--user is not available on windows: the service control manager registers machine-wide services only, use --system"))
 		}
 		return service.ScopeUser, nil
 	case system:
@@ -288,13 +340,16 @@ type pathFlag struct {
 // A supervised process must not resolve a path against the working
 // directory of the supervisor, so a relative path is a mistake and not a
 // default.
+//
+// A rejected path is a command line that could not be understood, so the
+// error carries that kind.
 func validateAbsolutePaths(paths []pathFlag) error {
 	for _, p := range paths {
 		if p.value == "" {
 			continue
 		}
 		if !filepath.IsAbs(p.value) {
-			return fmt.Errorf("%s %q must be an absolute path", p.name, p.value)
+			return newServiceUsageError(fmt.Errorf("%s %q must be an absolute path", p.name, p.value))
 		}
 	}
 	return nil
@@ -306,10 +361,13 @@ func validateAbsolutePaths(paths []pathFlag) error {
 // The rules are the rules of the service layer: the address must name a
 // host and a port, and an empty host is rejected because it binds every
 // interface.
+//
+// A rejected address is a command line that could not be understood, so the
+// error carries that kind.
 func validateListen(listen string) (string, error) {
 	host, port, err := service.ParseListen(listen)
 	if err != nil {
-		return "", err
+		return "", newServiceUsageError(err)
 	}
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
@@ -331,6 +389,11 @@ func validateListen(listen string) (string, error) {
 // It is always a real file, but it is the target of a symbolic link, so a
 // registration that uses it points at a version-stamped release artifact
 // instead of at the stable name of the installation.
+//
+// A named path that cannot be registered is a command line that could not be
+// understood, so its error carries that kind. A binary of the process that
+// cannot be located is not a mistake of the command line: the operation
+// failed, so its error keeps the kind of a failed operation.
 func resolveExecutable(explicit, invocation string) (string, error) {
 	if explicit != "" {
 		return validateExecutablePath(explicit)
@@ -386,19 +449,22 @@ func hasPathSeparator(path string) bool {
 // The path must be absolute (a supervised process must not resolve a
 // relative path against the working directory of the supervisor), it must
 // exist, it must be a regular file and it must be executable.
+//
+// A rejected path is a command line that could not be understood, so the
+// error carries that kind.
 func validateExecutablePath(path string) (string, error) {
 	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("the executable %q must be an absolute path", path)
+		return "", newServiceUsageError(fmt.Errorf("the executable %q must be an absolute path", path))
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("the executable %q is not usable: %w", path, err)
+		return "", newServiceUsageError(fmt.Errorf("the executable %q is not usable: %w", path, err))
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("the executable %q is not a regular file", path)
+		return "", newServiceUsageError(fmt.Errorf("the executable %q is not a regular file", path))
 	}
 	if info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("the executable %q is not executable", path)
+		return "", newServiceUsageError(fmt.Errorf("the executable %q is not executable", path))
 	}
 	return path, nil
 }
@@ -439,9 +505,12 @@ type installFlags struct {
 // The service account belongs to the machine-wide scope only: a user scope
 // instance runs as the user itself, so naming an account there is a
 // mistake of the command line and not a default.
+//
+// A named account of a user scope instance is a command line that could not
+// be understood, so the error carries that kind.
 func buildInstallOptions(scope service.Scope, flags installFlags, executable string) (service.InstallOptions, error) {
 	if flags.serviceUser != "" && scope == service.ScopeUser {
-		return service.InstallOptions{}, errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system")
+		return service.InstallOptions{}, newServiceUsageError(errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system"))
 	}
 
 	paths, err := service.DefaultPaths(scope)
@@ -513,10 +582,10 @@ func serviceInstall(args []string, stdout io.Writer) error {
 			writeSubcommandUsage(stdout, fs, "Register HFDesk with the platform supervisor of the scope.\n\nThe registration is written. The summary reports the state the supervisor\nreached: a registration that starts the instance starts it.")
 			return errHelpRequested
 		}
-		return fmt.Errorf("invalid command line: %w", err)
+		return newServiceUsageError(fmt.Errorf("invalid command line: %w", err))
 	}
 	if rest := fs.Args(); len(rest) > 0 {
-		return fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0])
+		return newServiceUsageError(fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0]))
 	}
 
 	scope, err := resolveScope(flags.user, flags.system)
@@ -551,7 +620,7 @@ func serviceInstall(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	mgr, err := service.New(scope)
+	mgr, err := newServiceManager(scope)
 	if err != nil {
 		return err
 	}
@@ -724,24 +793,34 @@ func serviceUninstall(args []string, stdout io.Writer) error {
 	defer stop()
 
 	// The paths of the registration are read before it is removed, so the
-	// report can name the directories the data stays in.
-	paths, cacheRoot := instanceDataPaths(ctx, mgr, scope)
+	// report can name the directories the data stays in. The state of the
+	// scope is read as well, so the report can state what the removal did.
+	paths, cacheRoot, registered := instanceDataPaths(ctx, mgr, scope)
 
 	if err := mgr.Uninstall(ctx); err != nil {
 		return err
 	}
 
-	writeUninstallSummary(stdout, scope, paths, cacheRoot)
+	writeUninstallSummary(stdout, scope, paths, cacheRoot, registered)
 	return nil
 }
 
 // writeUninstallSummary prints what was removed and what was kept.
 //
+// The summary states what the uninstallation did: a registration that was
+// there is removed, and a scope without a registration has nothing to
+// remove. A summary that always claims a removal hides the difference
+// between the two.
+//
 // The directories of the kept data are named, so the reader knows where the
 // models, the cache, the config file, the job history and the logs of the
 // instance stay.
-func writeUninstallSummary(w io.Writer, scope service.Scope, paths runtimepaths.Paths, cacheRoot string) {
-	fmt.Fprintf(w, "The registration of %s (%s scope) was removed.\n", service.ServiceName, scope)
+func writeUninstallSummary(w io.Writer, scope service.Scope, paths runtimepaths.Paths, cacheRoot string, registered bool) {
+	if registered {
+		fmt.Fprintf(w, "The registration of %s (%s scope) was removed.\n", service.ServiceName, scope)
+	} else {
+		fmt.Fprintf(w, "There was no registration of %s (%s scope) to remove.\n", service.ServiceName, scope)
+	}
 	fmt.Fprintln(w, "The user data was kept: models, cache, config, jobs/history and logs are still there.")
 	writeField(w, "Config file", paths.ConfigFile)
 	writeField(w, "State dir", paths.StateDir)
@@ -750,7 +829,7 @@ func writeUninstallSummary(w io.Writer, scope service.Scope, paths runtimepaths.
 }
 
 // instanceDataPaths returns the runtime paths and the cache root of the
-// instance of the scope.
+// instance of the scope, and whether the scope had a registration.
 //
 // The registration is read first, so the report names the directories the
 // data of the registration stays in. A registration that cannot be read
@@ -759,13 +838,21 @@ func writeUninstallSummary(w io.Writer, scope service.Scope, paths runtimepaths.
 // The cache root is the effective one of the instance: the default of the
 // scope and the personal cache of the invoking user are never reported
 // instead, because the instance does not use them.
-func instanceDataPaths(ctx context.Context, mgr service.Manager, scope service.Scope) (runtimepaths.Paths, string) {
+//
+// A scope without a registration is reported as such: the supervisor answers
+// it with the state "not-installed", and the removal of such a scope has
+// nothing to remove. A scope whose state the supervisor did not report
+// counts as a registration: the removal succeeded, so whatever was
+// registered is gone.
+func instanceDataPaths(ctx context.Context, mgr service.Manager, scope service.Scope) (runtimepaths.Paths, string, bool) {
 	paths, err := service.DefaultPaths(scope)
 	if err != nil {
 		paths = runtimepaths.Paths{}
 	}
 	cacheRoot := cacheRootNotRecorded
+	registered := true
 	if status, statusErr := mgr.Status(ctx); statusErr == nil {
+		registered = status.State != service.StateNotInstalled
 		if status.Paths.ConfigFile != "" {
 			paths.ConfigFile = status.Paths.ConfigFile
 		}
@@ -777,7 +864,7 @@ func instanceDataPaths(ctx context.Context, mgr service.Manager, scope service.S
 		}
 		cacheRoot = effectiveCacheRoot(status)
 	}
-	return paths, cacheRoot
+	return paths, cacheRoot, registered
 }
 
 // effectiveCacheRoot returns the Hugging Face cache root the instance uses.
@@ -800,6 +887,10 @@ func effectiveCacheRoot(status service.Status) string {
 
 // newLifecycleManager prepares a lifecycle command: it parses the scope
 // selector and opens the manager of the scope.
+//
+// A command line the parser rejects is a command line that could not be
+// understood, so its error carries that kind. An error of the platform
+// manager is a failed operation and keeps the kind of one.
 func newLifecycleManager(name string, args []string, stdout io.Writer, summary string) (service.Manager, service.Scope, error) {
 	flags := scopeFlags{}
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -811,17 +902,17 @@ func newLifecycleManager(name string, args []string, stdout io.Writer, summary s
 			writeSubcommandUsage(stdout, fs, summary)
 			return nil, "", errHelpRequested
 		}
-		return nil, "", fmt.Errorf("invalid command line: %w", err)
+		return nil, "", newServiceUsageError(fmt.Errorf("invalid command line: %w", err))
 	}
 	if rest := fs.Args(); len(rest) > 0 {
-		return nil, "", fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0])
+		return nil, "", newServiceUsageError(fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0]))
 	}
 
 	scope, err := resolveScope(flags.user, flags.system)
 	if err != nil {
 		return nil, "", err
 	}
-	mgr, err := service.New(scope)
+	mgr, err := newServiceManager(scope)
 	if err != nil {
 		return nil, "", err
 	}
@@ -902,7 +993,10 @@ func writeLifecycleState(ctx context.Context, mgr service.Manager, w io.Writer) 
 // instance that is not installed, broken, failed or unknown.
 func serviceStatus(args []string, stdout, stderr io.Writer) int {
 	mgr, scope, err := newLifecycleManager("hfdesk service status", args, stdout,
-		"Report the scope, the state and the paths of the instance.")
+		"Report the scope, the state and the paths of the instance.\n\n"+
+			"The exit code tells a script whether the instance is in a usable state:\n"+
+			"0 for a running, stopped, starting or stopping instance, 1 for an\n"+
+			"instance that is not installed, broken, failed or in an unknown state.")
 	if err != nil {
 		return serviceCommandResult(stderr, err)
 	}
@@ -913,8 +1007,7 @@ func serviceStatus(args []string, stdout, stderr io.Writer) int {
 	status, statusErr := mgr.Status(ctx)
 	renderStatus(stdout, scope, status)
 	if statusErr != nil {
-		fmt.Fprintf(stderr, "hfdesk service: %s\n", serviceErrorText(statusErr))
-		return serviceFailureExitCode
+		return serviceCommandResult(stderr, statusErr)
 	}
 	return statusExitCode(status.State)
 }
@@ -1074,7 +1167,7 @@ func serviceRun(args []string, stdout io.Writer) error {
 			writeSubcommandUsage(stdout, fs, "Run the headless host of an instance.\n\nThis mode is internal: the supervisor invokes it. It never opens a browser\nand never creates a tray icon.")
 			return errHelpRequested
 		}
-		return fmt.Errorf("invalid command line: %w", err)
+		return newServiceUsageError(fmt.Errorf("invalid command line: %w", err))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1098,10 +1191,14 @@ func registerRunFlags(fs *flag.FlagSet) {
 //
 // The host never opens a browser and never creates a tray icon: the
 // instance is supervised and there is no desktop session to interact with.
+//
+// An argument vector the parser rejects is a command line that could not be
+// understood, so its error carries that kind. A host that cannot run is a
+// failed operation and keeps the kind of one.
 func runServiceHost(ctx context.Context, args []string) error {
 	opts, err := service.ParseRunArgs(args)
 	if err != nil {
-		return err
+		return newServiceUsageError(err)
 	}
 	return service.RunProcess(ctx, opts)
 }

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,20 +33,37 @@ var interactiveFlagPattern = regexp.MustCompile(`flag\.\w+Var\(&\w+, "([^"]+)"`)
 type fakeManager struct {
 	status service.Status
 	err    error
+	// opErr is the failure of every lifecycle operation. It is the
+	// answer of a supervisor that refuses the operation, e.g. a service
+	// that is not installed.
+	opErr error
 }
 
-func (m fakeManager) Install(context.Context, service.InstallOptions) error { return nil }
+func (m fakeManager) Install(context.Context, service.InstallOptions) error { return m.opErr }
 
-func (m fakeManager) Uninstall(context.Context) error { return nil }
+func (m fakeManager) Uninstall(context.Context) error { return m.opErr }
 
-func (m fakeManager) Start(context.Context) error { return nil }
+func (m fakeManager) Start(context.Context) error { return m.opErr }
 
-func (m fakeManager) Stop(context.Context) error { return nil }
+func (m fakeManager) Stop(context.Context) error { return m.opErr }
 
-func (m fakeManager) Restart(context.Context) error { return nil }
+func (m fakeManager) Restart(context.Context) error { return m.opErr }
 
 func (m fakeManager) Status(context.Context) (service.Status, error) {
 	return m.status, m.err
+}
+
+// useFakeManager replaces the manager of the platform supervisor for the
+// duration of the test.
+//
+// The command family never touches the system of the test run: the manager
+// of the platform is the fake one, so a lifecycle command can be driven
+// through every answer of a supervisor.
+func useFakeManager(t *testing.T, mgr service.Manager) {
+	t.Helper()
+	previous := newServiceManager
+	newServiceManager = func(service.Scope) (service.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { newServiceManager = previous })
 }
 
 // personalCacheRoot returns the Hugging Face cache of the user that runs
@@ -145,8 +163,8 @@ func TestServiceLifecycleSubcommandsRejectTheListenOption(t *testing.T) {
 	for _, sub := range []string{"uninstall", "start", "stop", "restart", "status"} {
 		var stdout, stderr bytes.Buffer
 		code := runServiceCommand([]string{sub, "--listen", "127.0.0.1:9090"}, &stdout, &stderr)
-		if code == 0 {
-			t.Errorf("the %q subcommand must reject --listen, got exit code %d", sub, code)
+		if code != serviceUsageExitCode {
+			t.Errorf("the %q subcommand must reject --listen with the exit code %d, got %d", sub, serviceUsageExitCode, code)
 		}
 		if !strings.Contains(stderr.String(), "listen") {
 			t.Errorf("the error of the %q subcommand does not name the rejected option:\n%s", sub, stderr.String())
@@ -169,8 +187,8 @@ func TestServiceLifecycleSubcommandsRejectTheInstallOnlyOptions(t *testing.T) {
 		} {
 			var stdout, stderr bytes.Buffer
 			code := runServiceCommand(append([]string{sub}, option...), &stdout, &stderr)
-			if code == 0 {
-				t.Errorf("the %q subcommand must reject %s, got exit code %d", sub, option[0], code)
+			if code != serviceUsageExitCode {
+				t.Errorf("the %q subcommand must reject %s with the exit code %d, got %d", sub, option[0], serviceUsageExitCode, code)
 			}
 			// The parser names the option without its leading dashes.
 			name := strings.TrimPrefix(option[0], "--")
@@ -193,8 +211,8 @@ func TestServiceUserIsRejectedForTheUserScope(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"install", "--user", "--service-user", "hfdesk"}, &stdout, &stderr)
-	if code == 0 {
-		t.Fatalf("the user scope must reject --service-user, got exit code %d", code)
+	if code != serviceUsageExitCode {
+		t.Fatalf("the user scope must reject --service-user with the exit code %d, got %d", serviceUsageExitCode, code)
 	}
 	errText := stderr.String()
 	if !strings.Contains(errText, "--service-user") {
@@ -313,8 +331,8 @@ func TestServiceHelpSucceeds(t *testing.T) {
 func TestServiceUnknownSubcommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"frobnicate"}, &stdout, &stderr)
-	if code == 0 {
-		t.Errorf("an unknown subcommand must not succeed, got exit code %d", code)
+	if code != serviceUsageExitCode {
+		t.Errorf("an unknown subcommand must exit with %d, got %d", serviceUsageExitCode, code)
 	}
 
 	errText := stderr.String()
@@ -331,8 +349,8 @@ func TestServiceUnknownSubcommand(t *testing.T) {
 func TestServiceWithoutSubcommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand(nil, &stdout, &stderr)
-	if code == 0 {
-		t.Errorf("a missing subcommand must not succeed, got exit code %d", code)
+	if code != serviceUsageExitCode {
+		t.Errorf("a missing subcommand must exit with %d, got %d", serviceUsageExitCode, code)
 	}
 	for _, name := range serviceSubcommands {
 		if !strings.Contains(stderr.String(), name) {
@@ -348,11 +366,52 @@ func TestServiceScopeSelectorsAreExclusive(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"install", "--user", "--system"}, &stdout, &stderr)
-	if code == 0 {
-		t.Errorf("an ambiguous scope must not succeed, got exit code %d", code)
+	if code != serviceUsageExitCode {
+		t.Errorf("an ambiguous scope must exit with %d, got %d", serviceUsageExitCode, code)
 	}
 	if !strings.Contains(stderr.String(), "--user") || !strings.Contains(stderr.String(), "--system") {
 		t.Errorf("the error does not name both selectors:\n%s", stderr.String())
+	}
+}
+
+// TestServiceScopeSelectorsAreExclusiveEverywhere checks that every
+// subcommand that carries the scope selector rejects an ambiguous one.
+//
+// Two scopes are two installations, so an ambiguous command line is a
+// command line that could not be understood, on every subcommand that
+// carries the selector.
+func TestServiceScopeSelectorsAreExclusiveEverywhere(t *testing.T) {
+	for _, sub := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{sub, "--user", "--system"}, &stdout, &stderr)
+		if code != serviceUsageExitCode {
+			t.Errorf("the %q subcommand must reject two scopes with the exit code %d, got %d",
+				sub, serviceUsageExitCode, code)
+		}
+		if !strings.Contains(stderr.String(), "--user") || !strings.Contains(stderr.String(), "--system") {
+			t.Errorf("the error of the %q subcommand does not name both selectors:\n%s", sub, stderr.String())
+		}
+	}
+}
+
+// TestServiceRunRejectsAnInvalidVector checks that an argument vector the
+// host mode cannot parse is a command line that could not be understood.
+//
+// The vector of the host mode is the one the supervisor invokes, so a
+// broken vector is a mistake of the invocation and not a failed operation.
+func TestServiceRunRejectsAnInvalidVector(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--config", "relative/hfdesk.json"},
+		{"run", "--config", "/tmp/hfdesk.json"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand(args, &stdout, &stderr)
+		if code != serviceUsageExitCode {
+			t.Errorf("%v must exit with %d, got %d", args, serviceUsageExitCode, code)
+		}
+		if stderr.Len() == 0 {
+			t.Errorf("%v is rejected without a reason", args)
+		}
 	}
 }
 
@@ -417,8 +476,8 @@ func TestServiceRelativePathsAreRejected(t *testing.T) {
 	} {
 		var stdout, stderr bytes.Buffer
 		code := runServiceCommand(args, &stdout, &stderr)
-		if code == 0 {
-			t.Errorf("%v must be rejected, got exit code %d", args, code)
+		if code != serviceUsageExitCode {
+			t.Errorf("%v must exit with %d, got %d", args, serviceUsageExitCode, code)
 		}
 		if !strings.Contains(stderr.String(), "absolute") {
 			t.Errorf("%v is not reported as a relative path:\n%s", args, stderr.String())
@@ -916,10 +975,10 @@ func TestUninstallSummaryNamesTheEffectiveCacheRoot(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mgr := fakeManager{status: tc.status}
-			paths, reported := instanceDataPaths(context.Background(), mgr, service.ScopeUser)
+			paths, reported, registered := instanceDataPaths(context.Background(), mgr, service.ScopeUser)
 
 			var buf bytes.Buffer
-			writeUninstallSummary(&buf, service.ScopeUser, paths, reported)
+			writeUninstallSummary(&buf, service.ScopeUser, paths, reported, registered)
 
 			out := buf.String()
 			if !strings.Contains(out, tc.want) {
@@ -1002,8 +1061,8 @@ func TestServiceInstallRejectsAnUnusableExecutable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := runServiceCommand([]string{"install", "--system", "--executable", tc.path}, &stdout, &stderr)
-			if code == 0 {
-				t.Fatalf("the installation must be refused, got exit code %d", code)
+			if code != serviceUsageExitCode {
+				t.Fatalf("the installation must be refused with the exit code %d, got %d", serviceUsageExitCode, code)
 			}
 			if !strings.Contains(stderr.String(), tc.want) {
 				t.Errorf("the error does not report %q:\n%s", tc.want, stderr.String())
@@ -1328,5 +1387,194 @@ func TestServiceDispatchIsExact(t *testing.T) {
 		if isServiceCommand(args) {
 			t.Errorf("%v must not select the service command family", args)
 		}
+	}
+}
+
+// TestServiceUnknownFlagIsAUsageError checks that an unknown flag of every
+// subcommand is a command line that could not be understood.
+//
+// The exit code 2 tells a script that the invocation was wrong. The exit
+// code 1 would tell it that the operation failed, and the script would
+// report a broken installation for a typo.
+func TestServiceUnknownFlagIsAUsageError(t *testing.T) {
+	for _, sub := range serviceSubcommands {
+		t.Run(sub, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand([]string{sub, "--bogus"}, &stdout, &stderr)
+			if code != serviceUsageExitCode {
+				t.Errorf("the %q subcommand must reject an unknown flag with the exit code %d, got %d",
+					sub, serviceUsageExitCode, code)
+			}
+			if !strings.Contains(stderr.String(), "bogus") {
+				t.Errorf("the error of the %q subcommand does not name the rejected flag:\n%s", sub, stderr.String())
+			}
+		})
+	}
+}
+
+// TestServiceInvalidListenIsAUsageError checks that a bind address the
+// command line cannot be parsed with is a command line that could not be
+// understood.
+//
+// An empty host binds every interface, a port out of range names no port
+// and a missing port is no address at all.
+func TestServiceInvalidListenIsAUsageError(t *testing.T) {
+	for _, listen := range []string{
+		":8080",
+		"127.0.0.1:0",
+		"127.0.0.1:70000",
+		"127.0.0.1",
+		"localhost",
+		"",
+	} {
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{"install", "--listen", listen}, &stdout, &stderr)
+		if code != serviceUsageExitCode {
+			t.Errorf("the bind address %q must exit with %d, got %d", listen, serviceUsageExitCode, code)
+		}
+		if stderr.Len() == 0 {
+			t.Errorf("the bind address %q is rejected without a reason", listen)
+		}
+	}
+}
+
+// TestServiceOperationalFailureExitsWithOne checks that an operation that
+// was understood but failed exits with 1.
+//
+// The failure of the supervisor is the case of the family: the service is
+// not installed, the elevation is missing or the supervisor refuses. The
+// exit code 1 keeps it apart from a command line that could not be
+// understood.
+func TestServiceOperationalFailureExitsWithOne(t *testing.T) {
+	useFakeManager(t, fakeManager{opErr: errors.New("service: hfdesk.service is not installed")})
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"start"}, &stdout, &stderr)
+	if code != serviceFailureExitCode {
+		t.Errorf("a failed operation must exit with %d, got %d", serviceFailureExitCode, code)
+	}
+	if !strings.Contains(stderr.String(), "not installed") {
+		t.Errorf("the error does not name the reason of the failure:\n%s", stderr.String())
+	}
+}
+
+// TestServiceStatusOfAnAbsentRegistrationExitsWithOne checks that the
+// status of a service that is not installed is a failed operation.
+//
+// The state is not one a script can use, so the command reports it with the
+// exit code 1 and not with the exit code 0 of a usable instance.
+func TestServiceStatusOfAnAbsentRegistrationExitsWithOne(t *testing.T) {
+	useFakeManager(t, fakeManager{status: service.Status{State: service.StateNotInstalled}})
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"status"}, &stdout, &stderr)
+	if code != serviceFailureExitCode {
+		t.Errorf("the status of an absent registration must exit with %d, got %d", serviceFailureExitCode, code)
+	}
+}
+
+// TestServiceSuccessfulCommandExitsWithZero checks that a command that did
+// what it was asked to do exits with 0.
+func TestServiceSuccessfulCommandExitsWithZero(t *testing.T) {
+	useFakeManager(t, fakeManager{status: service.Status{State: service.StateRunning}})
+
+	for _, sub := range []string{"start", "status"} {
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{sub}, &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("the %q subcommand must exit with 0, got %d:\n%s", sub, code, stderr.String())
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("the %q subcommand must not write to stderr:\n%s", sub, stderr.String())
+		}
+	}
+}
+
+// TestUninstallSummaryStatesWhatTheRemovalDid checks that the summary of
+// the uninstall states what actually happened.
+//
+// A summary that always claims a removal hides the difference between a
+// scope that had a registration and a scope that had none.
+func TestUninstallSummaryStatesWhatTheRemovalDid(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   service.State
+		want    string
+		notWant string
+	}{
+		{
+			name:    "a scope with a registration",
+			state:   service.StateStopped,
+			want:    "The registration of hfdesk (user scope) was removed.",
+			notWant: "There was no registration",
+		},
+		{
+			name:    "a scope without a registration",
+			state:   service.StateNotInstalled,
+			want:    "There was no registration of hfdesk (user scope) to remove.",
+			notWant: "was removed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			writeUninstallSummary(&buf, service.ScopeUser, runtimepaths.Paths{}, cacheRootNotRecorded,
+				tc.state != service.StateNotInstalled)
+
+			out := buf.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("the uninstall summary does not state %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, tc.notWant) {
+				t.Errorf("the uninstall summary states %q as well:\n%s", tc.notWant, out)
+			}
+			if !strings.Contains(out, "The user data was kept") {
+				t.Errorf("the uninstall summary does not report the kept user data:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestServiceUninstallReportsWhatTheRemovalDid drives the uninstall
+// command through the manager of the test and checks that the summary
+// states what the removal did.
+func TestServiceUninstallReportsWhatTheRemovalDid(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   service.State
+		want    string
+		notWant string
+	}{
+		{
+			name:    "a registered service",
+			state:   service.StateStopped,
+			want:    fmt.Sprintf("The registration of %s (%s scope) was removed.", service.ServiceName, defaultScope()),
+			notWant: "There was no registration",
+		},
+		{
+			name:    "an unregistered service",
+			state:   service.StateNotInstalled,
+			want:    fmt.Sprintf("There was no registration of %s (%s scope) to remove.", service.ServiceName, defaultScope()),
+			notWant: "was removed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, fakeManager{status: service.Status{State: tc.state}})
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand([]string{"uninstall"}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("the uninstall must exit with 0, got %d:\n%s", code, stderr.String())
+			}
+			out := stdout.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("the uninstall summary does not state %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, tc.notWant) {
+				t.Errorf("the uninstall summary states %q as well:\n%s", tc.notWant, out)
+			}
+			if !strings.Contains(out, "The user data was kept") {
+				t.Errorf("the uninstall summary does not report the kept user data:\n%s", out)
+			}
+		})
 	}
 }
