@@ -12,10 +12,12 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -69,7 +71,7 @@ func darwinSystemOptions(t *testing.T) InstallOptions {
 // TestRenderPlistForTheUserScope checks the property list of a LaunchAgent.
 func TestRenderPlistForTheUserScope(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts)
+	rendered, err := renderPlist(opts, nil)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}
@@ -132,7 +134,10 @@ func TestRenderPlistForTheUserScope(t *testing.T) {
 // LaunchDaemon.
 func TestRenderPlistForTheSystemScope(t *testing.T) {
 	opts := darwinSystemOptions(t)
-	rendered, err := renderPlist(opts)
+	account := darwinCurrentAccount(t)
+	opts.ServiceUser = account.Name
+
+	rendered, err := renderPlist(opts, account)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}
@@ -142,12 +147,16 @@ func TestRenderPlistForTheSystemScope(t *testing.T) {
 		t.Fatalf("parsePlist(): %v", err)
 	}
 
-	// The daemon runs as root of the machine.
-	if registration.UserName != "root" {
-		t.Errorf("UserName = %q, want %q", registration.UserName, "root")
+	// The daemon runs as the service account of the machine, not as root:
+	// the instance owns its directories and needs no privilege of root.
+	if registration.UserName != account.Name {
+		t.Errorf("UserName = %q, want the service account %q", registration.UserName, account.Name)
 	}
-	if registration.GroupName != "wheel" {
-		t.Errorf("GroupName = %q, want %q", registration.GroupName, "wheel")
+	if registration.UserName == "root" {
+		t.Error("the machine-wide instance runs as root, want the service account")
+	}
+	if registration.GroupName != account.Group {
+		t.Errorf("GroupName = %q, want the primary group %q of the service account", registration.GroupName, account.Group)
 	}
 
 	// The machine-wide instance never reuses the home directory of the user
@@ -179,19 +188,24 @@ func TestRenderPlistForTheSystemScope(t *testing.T) {
 // nothing else. The credentials of an instance come from its own config
 // file.
 func TestRenderPlistCarriesNoCredential(t *testing.T) {
+	current := darwinCurrentAccount(t)
+
 	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
 		t.Run(string(scope), func(t *testing.T) {
 			var opts InstallOptions
+			var account *serviceAccount
 			if scope == ScopeUser {
 				opts = darwinUserOptions(t)
 			} else {
 				opts = darwinSystemOptions(t)
+				opts.ServiceUser = current.Name
+				account = current
 			}
 			// Every string field of the options that could carry a
 			// credential carries the sentinel.
 			setCredentialFields(&opts, darwinCredentialSentinel)
 
-			rendered, err := renderPlist(opts)
+			rendered, err := renderPlist(opts, account)
 			if err != nil {
 				t.Fatalf("renderPlist(): %v", err)
 			}
@@ -229,8 +243,10 @@ func TestRenderPlistCarriesNoCredential(t *testing.T) {
 				opts.Executable:     true,
 				opts.Paths.StateDir: true,
 				"Background":        true,
-				"root":              true,
-				"wheel":             true,
+			}
+			if scope == ScopeSystem {
+				allowed[current.Name] = true
+				allowed[current.Group] = true
 			}
 			for _, arg := range RunArgs(opts) {
 				allowed[arg] = true
@@ -255,7 +271,7 @@ func TestRenderPlistCarriesNoCredential(t *testing.T) {
 // own bounded rotating log file into the log directory of the instance.
 func TestRenderPlistKeepsTheLogFilesOfTheSupervisorOut(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts)
+	rendered, err := renderPlist(opts, nil)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}
@@ -277,7 +293,7 @@ func TestRenderPlistKeepsTheLogFilesOfTheSupervisorOut(t *testing.T) {
 // and the bind address are recovered from a property list.
 func TestParsePlistRecoversTheRegistration(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts)
+	rendered, err := renderPlist(opts, nil)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}
@@ -337,7 +353,7 @@ func TestParsePlistRecoversTheConfigFileAndTheCacheDir(t *testing.T) {
 			opts := darwinUserOptions(t)
 			opts.CacheDir = tc.cacheDir
 
-			rendered, err := renderPlist(opts)
+			rendered, err := renderPlist(opts, nil)
 			if err != nil {
 				t.Fatalf("renderPlist(): %v", err)
 			}
@@ -441,16 +457,20 @@ func TestPlutilAcceptsTheRenderedPlist(t *testing.T) {
 	if err != nil {
 		t.Skipf("plutil is not available: %v", err)
 	}
+	current := darwinCurrentAccount(t)
 
 	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
 		t.Run(string(scope), func(t *testing.T) {
 			var opts InstallOptions
+			var account *serviceAccount
 			if scope == ScopeUser {
 				opts = darwinUserOptions(t)
 			} else {
 				opts = darwinSystemOptions(t)
+				opts.ServiceUser = current.Name
+				account = current
 			}
-			rendered, err := renderPlist(opts)
+			rendered, err := renderPlist(opts, account)
 			if err != nil {
 				t.Fatalf("renderPlist(): %v", err)
 			}
@@ -540,7 +560,7 @@ func TestStatusReportsAMissingExecutable(t *testing.T) {
 			LogDir:     filepath.Join(stateDir, "logs"),
 		},
 	}
-	rendered, err := renderPlist(opts)
+	rendered, err := renderPlist(opts, nil)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}
@@ -1134,6 +1154,679 @@ func TestLaunchdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
 	}
 }
 
+// TestLaunchdServiceAccountName checks the name of the account a
+// machine-wide instance runs as.
+//
+// The name of the options wins: an installation may name another account.
+// An empty name means the default account of the platform.
+func TestLaunchdServiceAccountName(t *testing.T) {
+	if got := DefaultServiceUser(); got != "_hfdesk" {
+		t.Errorf("DefaultServiceUser() = %q, want %q", got, "_hfdesk")
+	}
+
+	opts := InstallOptions{Scope: ScopeSystem}
+	if got := serviceAccountName(opts); got != DefaultServiceUser() {
+		t.Errorf("serviceAccountName() = %q, want the default account %q", got, DefaultServiceUser())
+	}
+
+	opts.ServiceUser = "hfdesk_other_account"
+	if got := serviceAccountName(opts); got != "hfdesk_other_account" {
+		t.Errorf("serviceAccountName() = %q, want %q", got, "hfdesk_other_account")
+	}
+}
+
+// TestLaunchdSystemInstallRefusesAMissingServiceAccount checks that a
+// machine-wide installation whose service account does not exist is refused
+// with an actionable message, and that the refusal leaves nothing behind.
+//
+// The account is never created by the installation: the message names the
+// account and the commands that create it. The check runs before any
+// directory is created and before the property list is written, so the
+// refusal is the same in every shell.
+func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
+	const missing = "hfdesk_missing_service_account_for_the_test"
+
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+
+	manager, err := newPlatformManager(ScopeSystem)
+	if err != nil {
+		t.Fatalf("newPlatformManager(ScopeSystem): %v", err)
+	}
+	launchd, ok := manager.(*launchdManager)
+	if !ok {
+		t.Fatalf("newPlatformManager(ScopeSystem) = %T, want a launchd manager", manager)
+	}
+
+	// The property list of the machine-wide scope lives in a fixed place of
+	// the machine. The test never writes it: the refusal happens before
+	// the property list is written. The state of the file is compared
+	// before and after the installation, so a registration that exists
+	// already is never touched by the test.
+	path := launchd.plistPath()
+	before, err := backupPlist(path)
+	if err != nil {
+		t.Logf("the registration %q cannot be read: %v", path, err)
+		before = &plistBackup{path: path}
+	}
+
+	opts := InstallOptions{
+		Scope:       ScopeSystem,
+		Executable:  darwinWriteFakeExecutable(t),
+		Listen:      DefaultListen,
+		ServiceUser: missing,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   stateDir,
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+
+	err = launchd.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of a missing service account")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		missing,
+		"dscl",
+		"UserShell",
+		"UserHome",
+		"UniqueID",
+		"a free numeric id",
+		"HFDesk never creates accounts itself",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("Install() = %q, want a message that mentions %q", message, want)
+		}
+	}
+
+	// The refused installation creates no directory of the instance.
+	if _, err := os.Stat(stateDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the state directory %q: %v", stateDir, err)
+	}
+	// The refused installation writes no property list.
+	after, err := backupPlist(path)
+	if err != nil {
+		t.Logf("the registration %q cannot be read: %v", path, err)
+		after = &plistBackup{path: path}
+	}
+	if before.existed != after.existed || string(before.content) != string(after.content) {
+		t.Errorf("the refused installation changed the registration %q", path)
+	}
+}
+
+// TestLaunchdRenderPlistCarriesTheServiceAccount checks that the property
+// list of a machine-wide instance names the account it runs as and the
+// primary group of that account, and that the property list of a user scope
+// instance names neither.
+func TestLaunchdRenderPlistCarriesTheServiceAccount(t *testing.T) {
+	account := darwinCurrentAccount(t)
+
+	t.Run("the machine-wide instance runs as the service account", func(t *testing.T) {
+		opts := darwinSystemOptions(t)
+		opts.ServiceUser = account.Name
+
+		rendered, err := renderPlist(opts, account)
+		if err != nil {
+			t.Fatalf("renderPlist(): %v", err)
+		}
+		registration, err := parsePlist([]byte(rendered))
+		if err != nil {
+			t.Fatalf("parsePlist(): %v", err)
+		}
+		if registration.UserName != account.Name {
+			t.Errorf("UserName = %q, want the service account %q", registration.UserName, account.Name)
+		}
+		if registration.GroupName != account.Group {
+			t.Errorf("GroupName = %q, want the primary group %q of the service account", registration.GroupName, account.Group)
+		}
+	})
+
+	t.Run("the machine-wide instance needs an account", func(t *testing.T) {
+		opts := darwinSystemOptions(t)
+
+		if _, err := renderPlist(opts, nil); err == nil {
+			t.Error("renderPlist() = nil, want the refusal of a machine-wide instance without an account")
+		}
+	})
+
+	t.Run("the user scope instance runs as the user itself", func(t *testing.T) {
+		opts := darwinUserOptions(t)
+
+		rendered, err := renderPlist(opts, nil)
+		if err != nil {
+			t.Fatalf("renderPlist(): %v", err)
+		}
+		registration, err := parsePlist([]byte(rendered))
+		if err != nil {
+			t.Fatalf("parsePlist(): %v", err)
+		}
+		if registration.UserName != "" || registration.GroupName != "" {
+			t.Errorf("UserName = %q, GroupName = %q; want none for a user scope instance", registration.UserName, registration.GroupName)
+		}
+	})
+}
+
+// TestLaunchdGrantInstanceDirs checks that the directories of the instance
+// are granted to the service account, and that the model and the cache trees
+// are never touched.
+//
+// The test needs an elevated shell: only root may change the ownership of a
+// directory. The test skips itself when the shell of the test is not
+// elevated.
+func TestLaunchdGrantInstanceDirs(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skipf("only root may change the ownership of a directory, the shell of the test is %d", os.Geteuid())
+	}
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	cache := filepath.Join(root, "cache")
+	if err := os.Mkdir(cache, 0o755); err != nil {
+		t.Fatalf("create the cache directory: %v", err)
+	}
+	model := filepath.Join(cache, "model.bin")
+	if err := os.WriteFile(model, []byte("model"), 0o644); err != nil {
+		t.Fatalf("write the model: %v", err)
+	}
+	cacheOwnerUID, cacheOwnerGID := darwinOwner(t, cache)
+	modelOwnerUID, modelOwnerGID := darwinOwner(t, model)
+
+	opts := InstallOptions{
+		Scope:    ScopeSystem,
+		CacheDir: cache,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "state"),
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+
+	// The directories of the instance do not exist yet: the installation
+	// creates them and grants them to the account.
+	created := make(map[string][]string, 3)
+	for _, dir := range instanceDirs(opts) {
+		created[dir.path] = createdDirs(dir.path)
+	}
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs(): %v", err)
+	}
+
+	launchd := &launchdManager{scope: ScopeSystem}
+	if err := launchd.grantInstanceDirs(opts, account, created); err != nil {
+		t.Fatalf("grantInstanceDirs(): %v", err)
+	}
+
+	for _, dir := range instanceDirs(opts) {
+		owner, group := darwinOwner(t, dir.path)
+		if owner != account.UID {
+			t.Errorf("the owner of the %s %q = %d, want the service account %d", dir.name, dir.path, owner, account.UID)
+		}
+		if group != account.GID {
+			t.Errorf("the group of the %s %q = %d, want the primary group of the service account %d", dir.name, dir.path, group, account.GID)
+		}
+	}
+
+	// The cache tree belongs to whoever put it there: the installation
+	// never chowns it and never walks into it.
+	if owner, group := darwinOwner(t, cache); owner != cacheOwnerUID || group != cacheOwnerGID {
+		t.Errorf("the owner of the cache directory %q = %d:%d, want %d:%d", cache, owner, group, cacheOwnerUID, cacheOwnerGID)
+	}
+	if owner, group := darwinOwner(t, model); owner != modelOwnerUID || group != modelOwnerGID {
+		t.Errorf("the owner of the model %q = %d:%d, want %d:%d", model, owner, group, modelOwnerUID, modelOwnerGID)
+	}
+}
+
+// TestLaunchdGrantInstanceDirsRefusesBeforeItGrants checks that a refused
+// installation leaves every ownership exactly as it was.
+//
+// The first directory of the instance can be granted to the service
+// account, the second one cannot be used: the installation has to refuse it
+// before it grants the first one, so a refused installation never leaves a
+// partially granted instance behind.
+//
+// Only root can change the ownership of a directory, so the test skips
+// itself when the shell of the test is not elevated. Every path of the test
+// lives in a temporary directory: the test never touches a directory of the
+// machine.
+func TestLaunchdGrantInstanceDirsRefusesBeforeItGrants(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skipf("only root may change the ownership of a directory, the shell of the test is %d", os.Geteuid())
+	}
+	account := darwinOtherAccount(t)
+
+	// The state directory is the second directory of the instance: it is
+	// the one that cannot be used. It either belongs to somebody else or
+	// it is not a directory at all.
+	cases := []struct {
+		name string
+		// prepare makes the state directory of the instance unusable.
+		prepare func(t *testing.T, path string)
+		// want is the refusal the installation has to report.
+		want func(state string) string
+	}{
+		{
+			name: "the account cannot write into the directory",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				// The directory belongs to the user of the test, so the
+				// service account cannot write into it.
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("create the state directory: %v", err)
+				}
+			},
+			want: func(state string) string {
+				return fmt.Sprintf("service: the state directory %q of the machine-wide instance is not writable by the service account %q: grant it to the account (for example %q) and install again",
+					state, account.Name, "chown "+account.Name+" "+state)
+			},
+		},
+		{
+			name: "the path is not a directory",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("not a directory"), 0o600); err != nil {
+					t.Fatalf("write the state directory: %v", err)
+				}
+			},
+			want: func(state string) string {
+				return fmt.Sprintf("service: the state directory %q of the machine-wide instance cannot be used: it exists and is not a directory", state)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			configDir := filepath.Join(root, "etc")
+			state := filepath.Join(root, "state")
+			logDir := filepath.Join(root, "logs")
+
+			opts := InstallOptions{
+				Scope:  ScopeSystem,
+				Listen: DefaultListen,
+				Paths: runtimepaths.Paths{
+					ConfigFile: filepath.Join(configDir, "hfdesk.json"),
+					StateDir:   state,
+					LogDir:     logDir,
+				},
+			}
+
+			// The state directory existed before the installation.
+			tc.prepare(t, state)
+
+			// The directories the installation is about to create are
+			// remembered before they are created, exactly like the
+			// installation does it.
+			created := make(map[string][]string, 3)
+			for _, dir := range instanceDirs(opts) {
+				created[dir.path] = createdDirs(dir.path)
+			}
+			// The installation creates the directories it owns itself.
+			for _, path := range created[configDir] {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatalf("create the config directory: %v", err)
+				}
+			}
+			for _, path := range created[logDir] {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatalf("create the log directory: %v", err)
+				}
+			}
+
+			configOwner, configGroup := darwinOwner(t, configDir)
+			logOwner, logGroup := darwinOwner(t, logDir)
+			stateOwner, stateGroup := darwinOwner(t, state)
+
+			launchd := &launchdManager{scope: ScopeSystem}
+			err := launchd.grantInstanceDirs(opts, account, created)
+			if err == nil {
+				t.Fatal("grantInstanceDirs() = nil, want the refusal of the state directory")
+			}
+			want := tc.want(state)
+			if err.Error() != want {
+				t.Errorf("grantInstanceDirs() = %q, want %q", err, want)
+			}
+
+			// The refusal happened before the first ownership was changed,
+			// so the directory the installation would have granted still
+			// belongs to its owner.
+			if owner, group := darwinOwner(t, configDir); owner != configOwner || group != configGroup {
+				t.Errorf("the ownership of the config directory %q = %d:%d, want %d:%d", configDir, owner, group, configOwner, configGroup)
+			}
+			if owner, group := darwinOwner(t, logDir); owner != logOwner || group != logGroup {
+				t.Errorf("the ownership of the log directory %q = %d:%d, want %d:%d", logDir, owner, group, logOwner, logGroup)
+			}
+			// The directory that existed before the installation is left
+			// alone as well.
+			if owner, group := darwinOwner(t, state); owner != stateOwner || group != stateGroup {
+				t.Errorf("the ownership of the state directory %q = %d:%d, want %d:%d", state, owner, group, stateOwner, stateGroup)
+			}
+		})
+	}
+}
+
+// TestLaunchdGrantInstanceDirsKeepsAWritablePreExistingDirectory checks
+// that a directory that existed before the installation and that the service
+// account can write into is accepted and left alone.
+//
+// The directory belongs to whoever owns it, so the installation grants it to
+// nobody: it only makes sure that the account can work there.
+func TestLaunchdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T) {
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	opts := InstallOptions{
+		Scope:  ScopeSystem,
+		Listen: DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "state"),
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+	// Every directory of the instance exists before the installation and
+	// is writable by the account.
+	owners := map[string][2]int{}
+	for _, dir := range instanceDirs(opts) {
+		if err := os.MkdirAll(dir.path, 0o700); err != nil {
+			t.Fatalf("create the %s %q: %v", dir.name, dir.path, err)
+		}
+		// The mode of a create call is filtered by the umask of the
+		// process, so the mode is set explicitly.
+		if err := os.Chmod(dir.path, 0o777); err != nil {
+			t.Fatalf("make the %s %q writable: %v", dir.name, dir.path, err)
+		}
+		owner, group := darwinOwner(t, dir.path)
+		owners[dir.path] = [2]int{owner, group}
+	}
+
+	created := make(map[string][]string, 3)
+	for _, dir := range instanceDirs(opts) {
+		created[dir.path] = createdDirs(dir.path)
+	}
+
+	launchd := &launchdManager{scope: ScopeSystem}
+	if err := launchd.grantInstanceDirs(opts, account, created); err != nil {
+		t.Fatalf("grantInstanceDirs() = %v, want nil for a pre-existing directory the account can write into", err)
+	}
+
+	// The directories still belong to their owner: the installation grants
+	// only the directories it created itself.
+	for _, dir := range instanceDirs(opts) {
+		owner, group := darwinOwner(t, dir.path)
+		want := owners[dir.path]
+		if owner != want[0] || group != want[1] {
+			t.Errorf("the ownership of the %s %q = %d:%d, want %d:%d", dir.name, dir.path, owner, group, want[0], want[1])
+		}
+	}
+}
+
+// TestLaunchdMachineDir checks the pure test that tells a directory of the
+// machine from a directory of the instance.
+//
+// A directory of the machine is a top level directory of the file system,
+// like /etc or /var. The account of a machine-wide instance may never own
+// it: the account would own everything below it.
+//
+// The test is lexical: it never touches the file system, so it can name a
+// directory of the machine without creating it.
+func TestLaunchdMachineDir(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "the root of the file system", path: "/", want: true},
+		{name: "a top level directory of the machine", path: "/etc", want: true},
+		{name: "another top level directory of the machine", path: "/var", want: true},
+		{name: "a world writable directory of the machine", path: "/tmp", want: true},
+		{name: "a directory below a directory of the machine", path: "/etc/hfdesk", want: false},
+		{name: "a directory of the instance", path: "/var/lib/hfdesk", want: false},
+		{name: "a relative path", path: "etc/hfdesk", want: false},
+		{name: "an empty path", path: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := machineDir(tc.path); got != tc.want {
+				t.Errorf("machineDir(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLaunchdGrantInstanceDirsRefusesADirectoryOfTheMachine checks that a
+// machine-wide installation never hands a directory of the machine to the
+// account of the instance.
+//
+// The rule is the rule of the Linux installation: a top level directory of
+// the file system belongs to the machine, so the instance needs a directory
+// of its own below it. The same command line is answered the same way on
+// both platforms.
+//
+// The refusal happens in the check phase of the installation, before the
+// first ownership is changed, so a refused installation leaves every
+// ownership exactly as it was.
+//
+// The directory of the machine is only named by the test: every path the
+// test writes to lives in a temporary directory.
+func TestLaunchdGrantInstanceDirsRefusesADirectoryOfTheMachine(t *testing.T) {
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc")
+	logDir := filepath.Join(root, "logs")
+	for _, path := range []string{configDir, logDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatalf("create the directory %q: %v", path, err)
+		}
+	}
+
+	opts := InstallOptions{
+		Scope:  ScopeSystem,
+		Listen: DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(configDir, "hfdesk.json"),
+			// The state directory is a top level directory of the
+			// machine: the account would own everything below it.
+			StateDir: "/etc",
+			LogDir:   logDir,
+		},
+	}
+
+	// The directories the installation would grant to the account are
+	// remembered before they are created, exactly like the installation
+	// does it. The directory of the machine is never created: it is only
+	// named by the command line.
+	created := map[string][]string{
+		configDir: {configDir},
+		"/etc":    nil,
+		logDir:    {logDir},
+	}
+
+	owners := map[string][2]int{}
+	for _, path := range []string{configDir, logDir} {
+		owner, group := darwinOwner(t, path)
+		owners[path] = [2]int{owner, group}
+	}
+
+	launchd := &launchdManager{scope: ScopeSystem}
+	err := launchd.grantInstanceDirs(opts, account, created)
+	if err == nil {
+		t.Fatal("grantInstanceDirs() = nil, want the refusal of a directory of the machine")
+	}
+	want := `service: the state directory "/etc" is a directory of the machine: the instance needs a directory of its own, name one below a directory of the machine`
+	if err.Error() != want {
+		t.Errorf("grantInstanceDirs() = %q, want %q", err, want)
+	}
+
+	// The refusal happened before the first ownership was changed, so the
+	// directories the installation would have granted still belong to
+	// their owner.
+	for _, path := range []string{configDir, logDir} {
+		owner, group := darwinOwner(t, path)
+		want := owners[path]
+		if owner != want[0] || group != want[1] {
+			t.Errorf("the ownership of the directory %q = %d:%d, want %d:%d", path, owner, group, want[0], want[1])
+		}
+	}
+}
+
+// TestLaunchdGrantInstanceDirsKeepsADirectoryBelowADirectoryOfTheMachine
+// checks that the rule of the directories of the machine does not reach a
+// directory below a directory of the machine.
+//
+// Only a top level directory of the file system belongs to the machine. A
+// directory below it, like /etc/hfdesk, is a directory of the instance, so
+// the rule of the machine directories does not refuse it.
+//
+// The path is only named by the test: the test never writes to it, it only
+// reads the answer of the installation.
+func TestLaunchdGrantInstanceDirsKeepsADirectoryBelowADirectoryOfTheMachine(t *testing.T) {
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc")
+	logDir := filepath.Join(root, "logs")
+	for _, path := range []string{configDir, logDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatalf("create the directory %q: %v", path, err)
+		}
+	}
+
+	opts := InstallOptions{
+		Scope:  ScopeSystem,
+		Listen: DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(configDir, "hfdesk.json"),
+			// The state directory lies below a directory of the
+			// machine: it is not a directory of the machine itself.
+			StateDir: "/etc/hfdesk",
+			LogDir:   logDir,
+		},
+	}
+	created := map[string][]string{
+		configDir:     {configDir},
+		"/etc/hfdesk": nil,
+		logDir:        {logDir},
+	}
+
+	owners := map[string][2]int{}
+	for _, path := range []string{configDir, logDir} {
+		owner, group := darwinOwner(t, path)
+		owners[path] = [2]int{owner, group}
+	}
+
+	launchd := &launchdManager{scope: ScopeSystem}
+	err := launchd.grantInstanceDirs(opts, account, created)
+	// The installation answers the question of the writability of the
+	// directory, but it never refuses the directory as a directory of the
+	// machine.
+	if err != nil && strings.Contains(err.Error(), "is a directory of the machine") {
+		t.Fatalf("grantInstanceDirs() = %q, want no refusal of a directory below a directory of the machine", err)
+	}
+
+	// Nothing was granted either way.
+	for _, path := range []string{configDir, logDir} {
+		owner, group := darwinOwner(t, path)
+		want := owners[path]
+		if owner != want[0] || group != want[1] {
+			t.Errorf("the ownership of the directory %q = %d:%d, want %d:%d", path, owner, group, want[0], want[1])
+		}
+	}
+}
+
+// TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite checks that
+// a cache directory the service account cannot write to is refused with an
+// actionable message, and that the installation leaves the tree alone.
+//
+// The installation never chowns a cache tree: the guidance names the
+// commands that grant the access, the administrator runs them.
+func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	cache := filepath.Join(root, "cache")
+	if err := os.Mkdir(cache, 0o755); err != nil {
+		t.Fatalf("create the cache directory: %v", err)
+	}
+	beforeUID, beforeGID := darwinOwner(t, cache)
+
+	manager, err := newPlatformManager(ScopeSystem)
+	if err != nil {
+		t.Fatalf("newPlatformManager(ScopeSystem): %v", err)
+	}
+	launchd, ok := manager.(*launchdManager)
+	if !ok {
+		t.Fatalf("newPlatformManager(ScopeSystem) = %T, want a launchd manager", manager)
+	}
+
+	stateDir := filepath.Join(root, "state")
+	opts := InstallOptions{
+		Scope:       ScopeSystem,
+		Executable:  darwinWriteFakeExecutable(t),
+		Listen:      DefaultListen,
+		ServiceUser: account.Name,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   stateDir,
+			LogDir:     filepath.Join(root, "logs"),
+		},
+		CacheDir: cache,
+		HubDir:   filepath.Join(cache, "hub"),
+		LocalDir: filepath.Join(root, "models"),
+	}
+
+	err = launchd.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of a cache directory the account cannot write to")
+	}
+	message := err.Error()
+	for _, want := range []string{account.Name, cache, "chown"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("Install() = %q, want a message that mentions %q", message, want)
+		}
+	}
+
+	// The ownership of the cache tree is unchanged.
+	if owner, group := darwinOwner(t, cache); owner != beforeUID || group != beforeGID {
+		t.Errorf("the owner of the cache directory %q = %d:%d, want %d:%d", cache, owner, group, beforeUID, beforeGID)
+	}
+	// The refused installation creates no directory of the instance.
+	if _, err := os.Stat(stateDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the state directory %q: %v", stateDir, err)
+	}
+}
+
+// TestLaunchdUserScopeNeedsNoServiceAccount checks that the user scope is
+// unaffected by the service account of the machine-wide scope.
+//
+// A user scope instance runs as the user who installs it: it needs no
+// service account, it is granted no directory and it names no account in
+// its registration.
+func TestLaunchdUserScopeNeedsNoServiceAccount(t *testing.T) {
+	launchd := &launchdManager{scope: ScopeUser, home: t.TempDir()}
+
+	opts := darwinUserOptions(t)
+	// The account of the options is ignored in the user scope: the
+	// instance runs as the user itself.
+	opts.ServiceUser = "hfdesk_missing_service_account_for_the_test"
+
+	account, err := launchd.resolveAccount(opts)
+	if err != nil {
+		t.Fatalf("resolveAccount() = %v, want nil for a user scope instance", err)
+	}
+	if account != nil {
+		t.Errorf("resolveAccount() = %+v, want nil for a user scope instance", account)
+	}
+	if err := launchd.checkNamedDirs(opts, account); err != nil {
+		t.Errorf("checkNamedDirs() = %v, want nil for a user scope instance", err)
+	}
+	if err := launchd.grantInstanceDirs(opts, account, nil); err != nil {
+		t.Errorf("grantInstanceDirs() = %v, want nil for a user scope instance", err)
+	}
+}
+
 // darwinWaitForState waits until the instance reaches a state.
 func darwinWaitForState(t *testing.T, manager *launchdManager, want State) Status {
 	t.Helper()
@@ -1179,11 +1872,63 @@ func darwinStatusManager(t *testing.T) *launchdManager {
 	}
 }
 
+// darwinCurrentAccount returns the service account of the user of the test.
+//
+// The account of the user of the test exists on every machine, so the tests
+// use it as the identity of a machine-wide instance.
+func darwinCurrentAccount(t *testing.T) *serviceAccount {
+	t.Helper()
+	current, err := user.Current()
+	if err != nil {
+		t.Skipf("the user of the test cannot be resolved: %v", err)
+	}
+	account, err := resolveServiceAccount(InstallOptions{Scope: ScopeSystem, ServiceUser: current.Username})
+	if err != nil {
+		t.Skipf("the account %q of the user of the test cannot be resolved: %v", current.Username, err)
+	}
+	return account
+}
+
+// darwinOtherAccount returns an account of the machine that is not the user
+// of the test.
+//
+// The tests need an account that exists and that owns nothing of the test,
+// so the ownership of the directories of the test is unchanged.
+func darwinOtherAccount(t *testing.T) *serviceAccount {
+	t.Helper()
+	for _, name := range []string{"nobody", "daemon"} {
+		account, err := resolveServiceAccount(InstallOptions{Scope: ScopeSystem, ServiceUser: name})
+		if err != nil {
+			continue
+		}
+		if account.UID == os.Getuid() {
+			continue
+		}
+		return account
+	}
+	t.Skip("the machine has no service account besides the user of the test")
+	return nil
+}
+
+// darwinOwner returns the owner and the group of a path.
+func darwinOwner(t *testing.T, path string) (int, int) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %q: %v", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("the ownership of %q cannot be read", path)
+	}
+	return int(stat.Uid), int(stat.Gid)
+}
+
 // darwinWriteRegistration renders the property list of an installation and
 // writes it to the registration of the manager.
 func darwinWriteRegistration(t *testing.T, launchd *launchdManager, opts InstallOptions) {
 	t.Helper()
-	rendered, err := renderPlist(opts)
+	rendered, err := renderPlist(opts, nil)
 	if err != nil {
 		t.Fatalf("renderPlist(): %v", err)
 	}

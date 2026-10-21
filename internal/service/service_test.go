@@ -101,16 +101,17 @@ func TestRunArgsUsesDefaultListenWhenUnset(t *testing.T) {
 
 // installOptionStringFields are the string fields of InstallOptions.
 //
-// Every one of them carries the scope, a path or the bind address of an
-// instance. The type carries no credential field at all, so a registration
-// can never carry one.
+// Every one of them carries the scope, a path, the bind address or the
+// account of an instance. The type carries no credential field at all, so a
+// registration can never carry one.
 var installOptionStringFields = map[string]bool{
-	"Scope":      true,
-	"Executable": true,
-	"Listen":     true,
-	"CacheDir":   true,
-	"HubDir":     true,
-	"LocalDir":   true,
+	"Scope":       true,
+	"Executable":  true,
+	"Listen":      true,
+	"CacheDir":    true,
+	"HubDir":      true,
+	"LocalDir":    true,
+	"ServiceUser": true,
 }
 
 // TestInstallOptionsCarryNoCredentialField checks that the options of an
@@ -340,19 +341,17 @@ func TestValidateInstallOptionsRejectsInvalidInstallation(t *testing.T) {
 	}
 }
 
+// TestPrepareDirsCreatesOwnedDirectories checks that the directories an
+// installation owns are created owner-only.
+//
+// They hold the job list, the download history, the mirror targets and the
+// credentials of the instance, so a directory that is missing at the start
+// of an instance must not be created world-readable.
 func TestPrepareDirsCreatesOwnedDirectories(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc")
 	stateDir := filepath.Join(root, "var")
 	logDir := filepath.Join(root, "var", "logs")
-
-	// An existing state directory with loose permissions must be tightened.
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
 
 	opts := InstallOptions{
 		Paths: runtimepaths.Paths{
@@ -378,6 +377,47 @@ func TestPrepareDirsCreatesOwnedDirectories(t *testing.T) {
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 			t.Errorf("%s mode = %v, want 0700", dir, info.Mode().Perm())
 		}
+	}
+}
+
+// TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone checks that the
+// installation never changes the permissions of a directory the user named.
+//
+// An explicit --state-dir or --config can point at a directory that is
+// shared with something else. Tightening it to 0700 would silently take it
+// away from its other users, so the installation only makes sure that the
+// directory exists.
+func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mode bits are emulated and do not represent DACL permissions")
+	}
+
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "var")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := InstallOptions{
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   stateDir,
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		t.Fatalf("stat %s: %v", stateDir, err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("the mode of %s is %v, want the untouched 0755", stateDir, info.Mode().Perm())
 	}
 }
 
@@ -457,6 +497,43 @@ func TestPrepareDirsRejectsTheFilesystemRoot(t *testing.T) {
 func TestNewRejectsUnknownScope(t *testing.T) {
 	if m, err := New(Scope("root")); err == nil {
 		t.Errorf("New(root) = %v, want an error", m)
+	}
+}
+
+// TestDefaultServiceUserIsTheAccountOfThePlatform checks the default
+// account of a machine-wide instance.
+//
+// The account is a dedicated, stable and unprivileged service account: the
+// files it owns have to stay writable across reboots, and the instance
+// needs no privilege of root. Windows has no account to name: the instance
+// runs as the built-in LocalService account.
+func TestDefaultServiceUserIsTheAccountOfThePlatform(t *testing.T) {
+	want := map[string]string{
+		"linux":   "hfdesk",
+		"darwin":  "_hfdesk",
+		"windows": "",
+	}
+	expected, ok := want[runtime.GOOS]
+	if !ok {
+		expected = ""
+	}
+	if got := DefaultServiceUser(); got != expected {
+		t.Errorf("DefaultServiceUser() = %q, want %q", got, expected)
+	}
+}
+
+// TestDefaultServiceUserIsStable checks that the default account does not
+// depend on the machine or on the user that runs the command.
+//
+// The account owns the files of the instance, and those files have to stay
+// writable across reboots: an account that changed from run to run would
+// break the instance at the next restart.
+func TestDefaultServiceUserIsStable(t *testing.T) {
+	first := DefaultServiceUser()
+	for i := 0; i < 3; i++ {
+		if got := DefaultServiceUser(); got != first {
+			t.Fatalf("DefaultServiceUser() = %q, want the stable value %q", got, first)
+		}
 	}
 }
 

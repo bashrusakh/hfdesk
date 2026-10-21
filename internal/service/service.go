@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -124,6 +125,33 @@ type InstallOptions struct {
 	HubDir string
 	// LocalDir is the absolute flat output dir. It may be empty.
 	LocalDir string
+	// ServiceUser is the account a machine-wide instance runs as.
+	//
+	// It applies to the machine-wide scope only: a user scope instance
+	// runs as the user itself and never names a service account. An
+	// empty value means the default account of the platform
+	// (DefaultServiceUser), and a platform without a named account
+	// (Windows uses the built-in LocalService) keeps its own identity.
+	//
+	// The account is never created by an installation: it is the identity
+	// the supervisor starts the instance with, and the installation
+	// refuses to register an instance whose account does not exist.
+	ServiceUser string
+}
+
+// DefaultServiceUser returns the default account a machine-wide instance
+// runs as on this platform.
+//
+// The account is a dedicated, stable and unprivileged service account: the
+// files it owns have to stay writable across reboots, and a machine-wide
+// instance needs no privilege of root. The name is only a default, the
+// caller may name another account.
+//
+// A platform without a named service account returns an empty string:
+// Windows runs the instance as the built-in LocalService account, which has
+// no name of its own.
+func DefaultServiceUser() string {
+	return defaultServiceUser()
 }
 
 // Manager drives the platform supervisor. The common layer owns the command
@@ -329,8 +357,14 @@ func ValidateInstallOptions(opts InstallOptions) error {
 
 // PrepareDirs creates the directories an installation owns: the parent
 // directory of the config file, the state directory and the log directory.
-// They are created with mode 0700 and an existing directory is tightened to
-// the same mode. Nothing outside those three directories is touched.
+//
+// A directory that is missing is created with the mode the instance owns
+// (0700). The mode of a directory that already exists is never changed: a
+// user who names an existing directory with --state-dir or --config keeps
+// the permissions of that directory, and the installation only makes sure
+// that it exists.
+//
+// Nothing outside those three directories is touched.
 func PrepareDirs(opts InstallOptions) error {
 	dirs := []struct {
 		name string
@@ -357,14 +391,85 @@ func PrepareDirs(opts InstallOptions) error {
 		}
 		seen[dir.path] = true
 
-		if err := os.MkdirAll(dir.path, dirMode); err != nil {
-			return fmt.Errorf("service: create %s %q: %w", dir.name, dir.path, err)
-		}
-		if err := os.Chmod(dir.path, dirMode); err != nil {
-			return fmt.Errorf("service: restrict %s %q: %w", dir.name, dir.path, err)
+		if err := ensureDir(dir.path, dirMode); err != nil {
+			return fmt.Errorf("service: %s %q: %w", dir.name, dir.path, err)
 		}
 	}
 	return nil
+}
+
+// ensureDir creates a directory that is missing and leaves the mode of a
+// directory that already exists alone.
+//
+// The mode of a directory the installation creates itself is the owner-only
+// mode of the instance: the state directory holds the job list, the history
+// and the mirror targets, and the config directory holds the credentials.
+// The mode of a directory that already exists belongs to whoever named it,
+// so the installation never changes it.
+func ensureDir(path string, mode os.FileMode) error {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("it exists and is not a directory")
+		}
+		return nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return err
+	}
+
+	created, err := createMissingDirs(path, mode)
+	if err != nil {
+		return err
+	}
+	// The mode of a create call is filtered by the umask of the process,
+	// so the mode of every directory the installation created is set
+	// explicitly.
+	for _, dir := range created {
+		if err := os.Chmod(dir, mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createMissingDirs creates the directory and the missing parents of it and
+// returns the directories it created.
+//
+// The parents are collected first, so the directories are created from the
+// top down and every missing one is known afterwards. A directory that
+// appears in the meantime is not created and not touched.
+func createMissingDirs(path string, mode os.FileMode) ([]string, error) {
+	var missing []string
+	current := filepath.Clean(path)
+	for {
+		if _, err := os.Stat(current); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+
+	created := make([]string, 0, len(missing))
+	for i := len(missing) - 1; i >= 0; i-- {
+		err := os.Mkdir(missing[i], mode)
+		if errors.Is(err, fs.ErrExist) {
+			// The directory appeared in the meantime: its permissions
+			// belong to whoever created it.
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		created = append(created, missing[i])
+	}
+	return created, nil
 }
 
 // isRootDir reports whether the path is the root of its filesystem. Such a

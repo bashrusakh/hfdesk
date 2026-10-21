@@ -103,6 +103,12 @@ type destinations struct {
 // the changed value. The registration is the fallback for a destination the
 // config file does not define.
 //
+// The runtime path model of the instance is installed here, so the settings
+// of the instance come from its own config file and never from an ambient
+// global the caller did not set. The server applies the settings of the
+// instance through the process wide path model, and the model of the
+// instance is the only one that may be in place.
+//
 // The cache environment is pinned from the effective values after the
 // configuration was loaded: the server reads HF_HOME and HF_HUB_CACHE when
 // it captures the cache identity of the process, and neither variable is
@@ -111,6 +117,11 @@ func buildConfig(opts RunOptions, host string, port int) (server.Config, error) 
 	if opts.Paths.StateDir == "" || !filepath.IsAbs(opts.Paths.StateDir) {
 		return server.Config{}, fmt.Errorf("service: state dir %q must be an absolute path", opts.Paths.StateDir)
 	}
+
+	// The path model of the instance is installed before any server state
+	// is read: the config file, the job state, the download history and
+	// the mirror targets all resolve from it.
+	runtimepaths.Install(opts.Paths)
 
 	// server.ApplyConfigToServer prefers HF_TOKEN over the config file, so
 	// the environment must not keep a credential: it is removed before the

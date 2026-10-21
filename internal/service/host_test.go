@@ -180,6 +180,61 @@ func TestBuildConfigUsesTheServiceOwnedPaths(t *testing.T) {
 	}
 }
 
+// TestBuildConfigInstallsTheRuntimeModel checks that the settings of an
+// instance come from its own config file, even when no runtime path model
+// was installed before.
+//
+// The server applies the settings of the instance through the process wide
+// path model. Without a model of its own, the instance would read the
+// settings of an ambient model instead of its own config file.
+func TestBuildConfigInstallsTheRuntimeModel(t *testing.T) {
+	// No model is installed: the interactive resolution is in place.
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(root, "from-config-file")
+	data, err := json.Marshal(map[string]string{
+		"cache-dir": cacheRoot,
+		"token":     "hf_token_of_the_instance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := buildConfig(RunOptions{
+		Paths:    model,
+		CacheDir: "/registered/cache",
+	}, "127.0.0.1", 8080)
+	if err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+
+	if cfg.CacheDir != cacheRoot {
+		t.Errorf("CacheDir = %q, want the cache dir of the config file of the instance %q", cfg.CacheDir, cacheRoot)
+	}
+	// The token is applied through the path model of the instance, so it
+	// is the token of the config file of the instance and never the one
+	// of an ambient config file.
+	if cfg.Token != "hf_token_of_the_instance" {
+		t.Errorf("Token = %q, want the token of the config file of the instance", cfg.Token)
+	}
+	if got := runtimepaths.Current(); got != model {
+		t.Errorf("runtimepaths.Current() = %+v, want the model of the instance %+v", got, model)
+	}
+}
+
 // serviceInstance writes the config file of a service instance with the given
 // fields and installs the runtime path model that owns it. The model is
 // restored when the test ends.

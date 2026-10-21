@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -32,10 +34,17 @@ import (
 //
 // A user scope instance is a LaunchAgent: it belongs to the user who
 // installed it and it lives in the gui domain of that user. A system scope
-// instance is a LaunchDaemon: it belongs to the machine, it runs as root and
-// it lives in the system domain. The machine-wide instance never reuses the
-// state of a user: its home is the machine-level state root of the platform
-// and its paths are the machine-level paths.
+// instance is a LaunchDaemon: it belongs to the machine and it lives in the
+// system domain. The machine-wide instance never reuses the state of a user:
+// its home is the machine-level state root of the platform and its paths are
+// the machine-level paths.
+//
+// A machine-wide instance runs as a dedicated service account, not as root:
+// the account is a stable, unprivileged identity that owns the three
+// directories of the instance (the config directory, the state directory and
+// the log directory) and nothing else. The installation never creates the
+// account: it validates the account and refuses the installation with the
+// commands that create it when the account does not exist.
 //
 // The machine-wide scope needs an elevated shell: the property list of a
 // LaunchDaemon is written into /Library/LaunchDaemons and the job is loaded
@@ -159,6 +168,11 @@ func (m *launchdManager) target() string {
 // domain of the instance. An installation that fails after the property list
 // was written restores the previous registration, so a failed installation
 // never leaves a half configured registration behind.
+//
+// A machine-wide instance runs as a service account. The account is
+// resolved and validated before any directory is created and before the
+// property list is written, so a refused installation leaves nothing behind
+// and every shell reports the same reason.
 func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := ValidateInstallOptions(opts); err != nil {
 		return err
@@ -171,20 +185,50 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 	if err := m.checkSystemPaths(opts); err != nil {
 		return err
 	}
+	// The service account of a machine-wide instance is resolved before
+	// anything is created: an account that does not exist is a refusal with
+	// the commands that create it, not a property list that points at an
+	// identity the machine does not know.
+	account, err := m.resolveAccount(opts)
+	if err != nil {
+		return err
+	}
+	// A directory the user named outside of the state directory of the
+	// instance has to be writable by the account. The check runs before the
+	// directories of the instance are created, so a refused installation
+	// leaves nothing behind.
+	if err := m.checkNamedDirs(opts, account); err != nil {
+		return err
+	}
 	// The elevation requirement is checked before any directory is created:
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := m.requireElevated("an installation"); err != nil {
 		return err
 	}
+	// The directories the installation is about to create are remembered
+	// before they are created, so the account is given the ownership of
+	// exactly those and of nothing else.
+	var created map[string][]string
+	if account != nil {
+		created = make(map[string][]string, 3)
+		for _, dir := range instanceDirs(opts) {
+			created[dir.path] = createdDirs(dir.path)
+		}
+	}
 	if err := PrepareDirs(opts); err != nil {
+		return err
+	}
+	// The instance runs as the account, so the account owns the directories
+	// the instance writes.
+	if err := m.grantInstanceDirs(opts, account, created); err != nil {
 		return err
 	}
 	if err := m.preflight(opts); err != nil {
 		return err
 	}
 
-	content, err := renderPlist(opts)
+	content, err := renderPlist(opts, account)
 	if err != nil {
 		return err
 	}
@@ -453,13 +497,14 @@ func (m *launchdManager) requireElevatedFor(action string, uid int) error {
 // checkSystemPaths rejects a machine-wide installation that would reuse the
 // state of a user.
 //
-// A LaunchDaemon runs as root. A state directory inside the home directory
-// of the invoking user would either expose the state of the user to the
-// machine or take the state of the user away from it, so the installation is
-// refused instead of silently taking the state over. The model and the cache
-// trees are never touched by an installation: only the three directories of
-// the instance (the config directory, the state directory and the log
-// directory) are created, and nothing is ever chowned.
+// A LaunchDaemon runs as the service account of the machine. A state
+// directory inside the home directory of the invoking user would either
+// expose the state of the user to the machine or take the state of the user
+// away from it, so the installation is refused instead of silently taking
+// the state over. The model and the cache trees are never touched by an
+// installation: only the three directories of the instance (the config
+// directory, the state directory and the log directory) are created, and
+// only those are granted to the service account.
 //
 // A user scope instance is supposed to live inside the directories of its own
 // user, so the guard does not touch it.
@@ -493,6 +538,388 @@ func (m *launchdManager) checkSystemPaths(opts InstallOptions) error {
 		}
 	}
 	return nil
+}
+
+// serviceAccount is the identity a machine-wide instance runs as.
+//
+// The account is a dedicated, stable and unprivileged identity: it owns the
+// three directories of the instance and nothing else, so the files it writes
+// stay writable across reboots and the instance needs no privilege of root.
+type serviceAccount struct {
+	// Name is the name of the account.
+	Name string
+	// UID is the numeric id of the account.
+	UID int
+	// GID is the numeric id of the primary group of the account.
+	GID int
+	// Group is the name of the primary group of the account.
+	Group string
+	// Groups holds the numeric ids of the groups the account belongs to.
+	Groups []int
+}
+
+// serviceAccountName returns the name of the account a machine-wide instance
+// runs as.
+//
+// The name of the options wins: an installation may name another account. An
+// empty name means the default account of the platform.
+func serviceAccountName(opts InstallOptions) string {
+	if name := strings.TrimSpace(opts.ServiceUser); name != "" {
+		return name
+	}
+	return DefaultServiceUser()
+}
+
+// resolveAccount returns the account a machine-wide instance runs as.
+//
+// A user scope instance runs as the user who installs it: it needs no
+// service account, and the returned account is nil.
+func (m *launchdManager) resolveAccount(opts InstallOptions) (*serviceAccount, error) {
+	if m.scope != ScopeSystem {
+		return nil, nil
+	}
+	return resolveServiceAccount(opts)
+}
+
+// resolveServiceAccount resolves the account of a machine-wide instance.
+//
+// The account is looked up in the user database of the machine: on macOS the
+// lookup queries the OpenDirectory, so an account that was created with
+// "dscl" is found. A build without cgo only knows the accounts of
+// /etc/passwd, so it does not find a local account of the OpenDirectory.
+//
+// The installation never creates an account: an account that does not exist
+// is refused with the commands that create it.
+func resolveServiceAccount(opts InstallOptions) (*serviceAccount, error) {
+	name := serviceAccountName(opts)
+	entry, err := user.Lookup(name)
+	if err != nil {
+		return nil, missingServiceAccountError(name)
+	}
+	uid, err := unixID(entry.Uid)
+	if err != nil {
+		return nil, fmt.Errorf("service: the service account %q has the unreadable user id %q", name, entry.Uid)
+	}
+	gid, err := unixID(entry.Gid)
+	if err != nil {
+		return nil, fmt.Errorf("service: the service account %q has the unreadable group id %q", name, entry.Gid)
+	}
+	group, err := user.LookupGroupId(entry.Gid)
+	if err != nil {
+		return nil, fmt.Errorf("service: the primary group %q of the service account %q cannot be resolved: %w (give the account a primary group and install again)", entry.Gid, name, err)
+	}
+
+	account := &serviceAccount{
+		Name:  entry.Username,
+		UID:   uid,
+		GID:   gid,
+		Group: group.Name,
+		// The primary group belongs to the account as well, so it is
+		// part of the groups the account may own a directory through.
+		Groups: []int{gid},
+	}
+	if ids, err := entry.GroupIds(); err == nil {
+		for _, id := range ids {
+			if gid, err := unixID(id); err == nil {
+				account.Groups = append(account.Groups, gid)
+			}
+		}
+	}
+	return account, nil
+}
+
+// missingServiceAccountError reports the refusal of an installation whose
+// service account does not exist.
+//
+// The installation never creates an account: it names the account and the
+// commands that create it, so the administrator can run them and install
+// again.
+func missingServiceAccountError(name string) error {
+	return fmt.Errorf("service: the machine-wide instance needs the service account %q: create it with %q, %q and %q, then install again (HFDesk never creates accounts itself)",
+		name,
+		fmt.Sprintf("dscl . -create /Users/%s UserShell /usr/bin/false", name),
+		fmt.Sprintf("dscl . -create /Users/%s UserHome %s", name, systemHome),
+		fmt.Sprintf("dscl . -create /Users/%s UniqueID <a free numeric id>", name))
+}
+
+// unixID converts the numeric id of the user database into the unsigned form
+// the file system uses.
+//
+// The user database of macOS knows the account "nobody" with the id -2, and
+// the file system holds the very same id as the unsigned 4294967294.
+func unixID(value string) (int, error) {
+	id, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	if id < 0 {
+		id += 1 << 32
+	}
+	return id, nil
+}
+
+// instanceDirs returns the directories an instance owns: the directory of
+// the config file, the state directory and the log directory.
+//
+// They are the only directories the installation creates, so they are the
+// only directories the service account is given the ownership of. The model
+// and the cache trees are never part of them.
+func instanceDirs(opts InstallOptions) []instanceDir {
+	return []instanceDir{
+		{name: "config directory", path: filepath.Dir(opts.Paths.ConfigFile)},
+		{name: "state directory", path: opts.Paths.StateDir},
+		{name: "log directory", path: opts.Paths.LogDir},
+	}
+}
+
+// instanceDir is one directory an instance owns.
+type instanceDir struct {
+	// name is the name of the directory in an error message.
+	name string
+	// path is the absolute path of the directory.
+	path string
+}
+
+// createdDirs returns the directories that do not exist yet on the way to
+// the path, from the top down.
+//
+// The list holds the path itself when it is missing: it is the set of
+// directories an installation creates for the path. The list is read before
+// the directories are created, so the installation knows which of them it
+// owns.
+func createdDirs(path string) []string {
+	var missing []string
+	current := filepath.Clean(path)
+	for {
+		if _, err := os.Stat(current); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			break
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	// The list was collected from the bottom up, the directories are
+	// created from the top down.
+	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
+		missing[i], missing[j] = missing[j], missing[i]
+	}
+	return missing
+}
+
+// machineDir reports whether the directory is a directory of the machine
+// itself: a top level directory of the file system, like /etc or /usr.
+//
+// Such a directory belongs to the machine and to the software it holds, so
+// it is never handed to the account of an instance. The instance needs a
+// directory of its own below it.
+//
+// The rule is the rule of the Linux installation, so the same command line
+// is answered the same way on both platforms.
+func machineDir(path string) bool {
+	clean := filepath.Clean(path)
+	return filepath.Dir(clean) == string(filepath.Separator)
+}
+
+// grantInstanceDirs grants the directories of the instance to the account.
+//
+// The directories the installation creates belong to the account: the
+// instance writes its config file, its state and its logs there, and it runs
+// as the account. The ownership is granted with a single chown per
+// directory: the tree of a directory is never walked, and the model and the
+// cache trees are never touched.
+//
+// A directory that existed before the installation belongs to whoever owns
+// it, so it is not chowned. The account still has to be able to write there,
+// and the installation refuses to go on when it cannot.
+//
+// A directory of the machine is refused: the directory of the config file is
+// derived from the path of a file, so a config file in /etc would hand /etc
+// itself to the account of the instance.
+//
+// Every directory is checked before the first of them is granted, so a
+// refused installation leaves every ownership exactly as it was.
+//
+// The created map holds the directories the installation creates for every
+// directory of the instance. It is read before the directories are created,
+// so the installation knows which of them it owns.
+func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *serviceAccount, created map[string][]string) error {
+	if account == nil {
+		// A user scope instance runs as the user who installs it: it owns
+		// its directories already.
+		return nil
+	}
+	dirs := instanceDirs(opts)
+	// A directory of the machine is refused before the first ownership is
+	// changed, so a refused installation leaves every ownership exactly as
+	// it was.
+	for _, dir := range dirs {
+		if machineDir(dir.path) {
+			return fmt.Errorf("service: the %s %q is a directory of the machine: the instance needs a directory of its own, name one below a directory of the machine", dir.name, dir.path)
+		}
+	}
+	// The directories are checked before the first of them is granted, so a
+	// refused installation leaves every ownership as it was.
+	for _, dir := range dirs {
+		if len(created[dir.path]) > 0 {
+			// The installation creates the directory: it owns it and
+			// grants it to the account below.
+			continue
+		}
+		// The directory existed before the installation: it belongs to its
+		// owner, so it is left alone. The account still has to be able to
+		// write there.
+		ok, err := accountCanWrite(dir.path, account)
+		if err != nil {
+			return fmt.Errorf("service: the %s %q of the machine-wide instance cannot be used: %w", dir.name, dir.path, err)
+		}
+		if !ok {
+			return fmt.Errorf("service: the %s %q of the machine-wide instance is not writable by the service account %q: grant it to the account (for example %q) and install again",
+				dir.name, dir.path, account.Name, "chown "+account.Name+" "+dir.path)
+		}
+	}
+	// Every directory passed the check: the directories the installation
+	// created belong to the account now.
+	for _, dir := range dirs {
+		for _, path := range created[dir.path] {
+			if err := os.Chown(path, account.UID, account.GID); err != nil {
+				return fmt.Errorf("service: grant the %s %q to the service account %q: %w", dir.name, path, account.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// checkNamedDirs verifies that the service account can write to the
+// directories the user named explicitly.
+//
+// The defaults of the scope live inside the state directory of the instance,
+// and the state directory belongs to the account, so they need no check. A
+// directory the user named is outside of the instance: the installation
+// verifies that the account can write there and refuses the installation
+// with the commands that grant the access when it cannot.
+//
+// The installation never changes the ownership or the permissions of such a
+// tree: a model or a cache tree belongs to whoever put it there.
+func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAccount) error {
+	if account == nil {
+		// A user scope instance runs as the user who installs it: it can
+		// write into its own directories.
+		return nil
+	}
+	for _, dir := range []struct {
+		name string
+		path string
+	}{
+		{"cache directory", opts.CacheDir},
+		{"hub directory", opts.HubDir},
+		{"local directory", opts.LocalDir},
+	} {
+		if dir.path == "" {
+			continue
+		}
+		if pathWithin(dir.path, opts.Paths.StateDir) {
+			// The default of the scope lives inside the state directory
+			// of the instance, and the state directory belongs to the
+			// account.
+			continue
+		}
+		ok, err := accountCanWrite(dir.path, account)
+		if err != nil {
+			return fmt.Errorf("service: the %s %q of the machine-wide instance cannot be used: %w", dir.name, dir.path, err)
+		}
+		if !ok {
+			return fmt.Errorf("service: the service account %q cannot write to the %s %q: grant it access (for example %q or by adding it to the group that owns the directory) and install again",
+				account.Name, dir.name, dir.path, "chown -R "+account.Name+" "+dir.path)
+		}
+	}
+	return nil
+}
+
+// accountCanWrite reports whether the account can write to the directory.
+//
+// The directory itself is checked when it exists: it has to be a directory,
+// and the account has to own it, to belong to the group that owns it and
+// that group has to be allowed to write, or the directory has to be
+// writable by everybody.
+//
+// A directory that does not exist yet is checked through its nearest
+// existing ancestor: the account has to be able to create it there.
+func accountCanWrite(path string, account *serviceAccount) (bool, error) {
+	target := path
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return false, fmt.Errorf("it exists and is not a directory")
+		}
+	case os.IsNotExist(err):
+		ancestor, err := nearestExistingDir(path)
+		if err != nil {
+			return false, err
+		}
+		target = ancestor
+		info, err = os.Stat(target)
+		if err != nil {
+			return false, err
+		}
+	default:
+		return false, err
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("the ownership of %q cannot be read", target)
+	}
+	if int(stat.Uid) == account.UID {
+		return true, nil
+	}
+	if info.Mode().Perm()&0o002 != 0 {
+		return true, nil
+	}
+	if info.Mode().Perm()&0o020 != 0 && accountInGroup(int(stat.Gid), account) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// accountInGroup reports whether the account belongs to the group.
+func accountInGroup(gid int, account *serviceAccount) bool {
+	for _, group := range account.Groups {
+		if group == gid {
+			return true
+		}
+	}
+	return false
+}
+
+// nearestExistingDir returns the nearest existing ancestor of the path.
+//
+// The ancestor has to be a directory: a path below a file can never be a
+// directory.
+func nearestExistingDir(path string) (string, error) {
+	current := filepath.Dir(filepath.Clean(path))
+	for {
+		info, err := os.Stat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return "", fmt.Errorf("%q is not a directory", current)
+			}
+			return current, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing parent directory of %q was found", path)
+		}
+		current = parent
+	}
 }
 
 // load registers the property list with launchd and reports whether the job
@@ -780,6 +1207,10 @@ func pathWithin(path, dir string) bool {
 // else: a token, a proxy password or a basic auth password is never part of
 // a registration, because a property list is readable by every user of the
 // machine. The credentials of an instance come from its own config file.
+//
+// A machine-wide instance names the account it runs as and the primary group
+// of that account. A user scope instance names neither: a LaunchAgent runs
+// as the user of its gui domain.
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -808,11 +1239,11 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 		<key>HOME</key>
 		<string>{{.Home | xml}}</string>
 	</dict>
-{{- if .System}}
+{{- if .UserName}}
 	<key>UserName</key>
-	<string>root</string>
+	<string>{{.UserName | xml}}</string>
 	<key>GroupName</key>
-	<string>wheel</string>
+	<string>{{.GroupName | xml}}</string>
 {{- end}}
 </dict>
 </plist>
@@ -841,8 +1272,12 @@ type plistData struct {
 	WorkingDirectory string
 	// Home is the home directory of the registered process.
 	Home string
-	// System reports whether the instance is a machine-wide one.
-	System bool
+	// UserName is the account the registered process runs as. It is empty
+	// for a user scope instance: a LaunchAgent runs as the user of its
+	// gui domain.
+	UserName string
+	// GroupName is the primary group of the account.
+	GroupName string
 }
 
 // renderPlist renders the launchd property list of an installation.
@@ -850,7 +1285,13 @@ type plistData struct {
 // The function is pure: it reads the environment of the caller and it
 // writes nothing, so the property list of an installation can be inspected
 // and tested without touching the machine.
-func renderPlist(opts InstallOptions) (string, error) {
+//
+// A machine-wide instance runs as the given service account: the property
+// list names the account and its primary group, so launchd starts the
+// instance with the identity the installation granted its directories to.
+// A user scope instance names neither: it runs as the user of its gui
+// domain.
+func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
 	if err := validatePlistOptions(opts); err != nil {
 		return "", err
 	}
@@ -864,7 +1305,13 @@ func renderPlist(opts InstallOptions) (string, error) {
 		ProgramArguments: append([]string{opts.Executable}, RunArgs(opts)...),
 		WorkingDirectory: opts.Paths.StateDir,
 		Home:             home,
-		System:           opts.Scope == ScopeSystem,
+	}
+	if opts.Scope == ScopeSystem {
+		if account == nil {
+			return "", fmt.Errorf("service: the machine-wide instance needs a service account")
+		}
+		data.UserName = account.Name
+		data.GroupName = account.Group
 	}
 	tmpl, err := template.New("plist").Funcs(plistFuncs).Parse(plistTemplate)
 	if err != nil {
