@@ -87,7 +87,12 @@ const (
 
 // stopWaitTimeout is the time the manager waits for the graceful shutdown of
 // the instance before it unloads the job.
-const stopWaitTimeout = 10 * time.Second
+//
+// The wait covers the whole orderly shutdown of the server: the drain of its
+// HTTP server and the close of its job manager. It is the shared budget of
+// the service layer, so the manager never kills an instance that is still
+// saving its state.
+const stopWaitTimeout = ShutdownBudget
 
 // stopPollInterval is the interval between two checks of the state of the
 // job.
@@ -963,84 +968,20 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 
 // accountCanWrite reports whether the account can write to the directory.
 //
-// The directory itself is checked when it exists: it has to be a directory,
-// and the account has to own it, to belong to the group that owns it and
-// that group has to be allowed to write, or the directory has to be
-// writable by everybody.
+// The check is the effective one: the account has to create entries in the
+// directory and to reach it. A directory the account owns with the mode 0500
+// is not writable at all, because the owner has no write permission in it,
+// and a directory below a parent without the execute permission cannot be
+// reached at all.
 //
 // A directory that does not exist yet is checked through its nearest
 // existing ancestor: the account has to be able to create it there.
 func accountCanWrite(path string, account *serviceAccount) (bool, error) {
-	target := path
-	info, err := os.Stat(path)
-	switch {
-	case err == nil:
-		if !info.IsDir() {
-			return false, fmt.Errorf("it exists and is not a directory")
-		}
-	case os.IsNotExist(err):
-		ancestor, err := nearestExistingDir(path)
-		if err != nil {
-			return false, err
-		}
-		target = ancestor
-		info, err = os.Stat(target)
-		if err != nil {
-			return false, err
-		}
-	default:
-		return false, err
-	}
-
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, fmt.Errorf("the ownership of %q cannot be read", target)
-	}
-	if int(stat.Uid) == account.UID {
-		return true, nil
-	}
-	if info.Mode().Perm()&0o002 != 0 {
-		return true, nil
-	}
-	if info.Mode().Perm()&0o020 != 0 && accountInGroup(int(stat.Gid), account) {
-		return true, nil
-	}
-	return false, nil
-}
-
-// accountInGroup reports whether the account belongs to the group.
-func accountInGroup(gid int, account *serviceAccount) bool {
-	for _, group := range account.Groups {
-		if group == gid {
-			return true
-		}
-	}
-	return false
-}
-
-// nearestExistingDir returns the nearest existing ancestor of the path.
-//
-// The ancestor has to be a directory: a path below a file can never be a
-// directory.
-func nearestExistingDir(path string) (string, error) {
-	current := filepath.Dir(filepath.Clean(path))
-	for {
-		info, err := os.Stat(current)
-		if err == nil {
-			if !info.IsDir() {
-				return "", fmt.Errorf("%q is not a directory", current)
-			}
-			return current, nil
-		}
-		if !os.IsNotExist(err) {
-			return "", err
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", fmt.Errorf("no existing parent directory of %q was found", path)
-		}
-		current = parent
-	}
+	return accountCanUseDir(path, accessAccount{
+		UID:    account.UID,
+		GID:    account.GID,
+		Groups: account.Groups,
+	})
 }
 
 // load registers the property list with launchd and reports whether the job
@@ -1324,6 +1265,14 @@ func pathWithin(path, dir string) bool {
 // the instance instead (see the service host), and the standard output and
 // the standard error of the process stay connected to the supervisor.
 //
+// The property list carries the ExitTimeOut of the job: the number of
+// seconds launchd waits after it asked the instance to stop before it kills
+// it. The default of launchd is 20 seconds, which is exactly the total
+// budget of the graceful shutdown of the server, so the default would kill
+// an instance that is still saving its state. The registration carries the
+// shared budget of the service layer instead, so the deadline of the
+// supervisor is never shorter than the shutdown it waits for.
+//
 // The environment of the process carries the home directory and nothing
 // else: a token, a proxy password or a basic auth password is never part of
 // a registration, because a property list is readable by every user of the
@@ -1355,6 +1304,8 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	</dict>
 	<key>ProcessType</key>
 	<string>Background</string>
+	<key>ExitTimeOut</key>
+	<integer>{{.ExitTimeOut}}</integer>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>HOME</key>
@@ -1399,6 +1350,11 @@ type plistData struct {
 	UserName string
 	// GroupName is the primary group of the account.
 	GroupName string
+	// ExitTimeOut is the number of seconds launchd waits after it asked
+	// the instance to stop before it kills it. It is the shared budget of
+	// the service layer, so the deadline of the supervisor is never
+	// shorter than the graceful shutdown of the instance.
+	ExitTimeOut int
 }
 
 // renderPlist renders the launchd property list of an installation.
@@ -1426,6 +1382,7 @@ func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
 		ProgramArguments: append([]string{opts.Executable}, RunArgs(opts)...),
 		WorkingDirectory: opts.Paths.StateDir,
 		Home:             home,
+		ExitTimeOut:      int(ShutdownBudget / time.Second),
 	}
 	if opts.Scope == ScopeSystem {
 		if account == nil {
@@ -1617,6 +1574,18 @@ func (v plistValue) boolValue() (bool, bool) {
 	return false, false
 }
 
+// intValue returns the value as an integer.
+func (v plistValue) intValue() (int, bool) {
+	if v.Kind != "integer" {
+		return 0, false
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(v.Text))
+	if err != nil {
+		return 0, false
+	}
+	return number, true
+}
+
 // decodePlistChildren reads the child elements of the current element.
 func decodePlistChildren(dec *xml.Decoder) ([]plistValue, error) {
 	var items []plistValue
@@ -1678,6 +1647,9 @@ type plistRegistration struct {
 	// dictionary. It is false in a HFDesk registration: the job is
 	// restarted after a failure, not after a clean exit.
 	KeepAliveSuccessfulExit bool
+	// ExitTimeOut is the number of seconds launchd waits after it asked
+	// the instance to stop before it kills it.
+	ExitTimeOut int
 	// Keys are the keys of the property list, in the order they appear.
 	Keys []string
 }
@@ -1718,6 +1690,8 @@ func parsePlist(content []byte) (plistRegistration, error) {
 			registration.GroupName, _ = value.stringValue()
 		case "RunAtLoad":
 			registration.RunAtLoad, _ = value.boolValue()
+		case "ExitTimeOut":
+			registration.ExitTimeOut, _ = value.intValue()
 		case "KeepAlive":
 			if value.Dict == nil {
 				continue

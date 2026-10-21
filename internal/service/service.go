@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
@@ -48,6 +49,29 @@ const (
 	// dirMode is the permission mode of a directory owned by a service
 	// installation.
 	dirMode os.FileMode = 0o700
+
+	// shutdownMargin is the room a supervisor keeps on top of the budget
+	// the server publishes for its own shutdown.
+	//
+	// The margin covers the work that happens around the shutdown of the
+	// server: the process still has to leave its event loop, close its log
+	// sink and return from the supervisor call.
+	shutdownMargin = 5 * time.Second
+
+	// ShutdownBudget is the time a supervisor waits for the graceful
+	// shutdown of an instance.
+	//
+	// The server publishes the budget of its own orderly shutdown
+	// (server.GracefulShutdownTimeout): it drains its HTTP server and then
+	// closes its job manager, and every phase of it has its own budget. A
+	// supervisor waits for that total plus a margin, so it never kills an
+	// instance that is still saving its state.
+	//
+	// Every supervisor side wait and timeout of the service layer is sized
+	// after this budget: the wait of the launchd manager, the kill deadline
+	// of the launchd job, the stop timeout of the systemd unit and the wait
+	// of the Windows service handler.
+	ShutdownBudget = server.GracefulShutdownTimeout + shutdownMargin
 )
 
 // ErrNotImplemented reports that service mode is not available on the

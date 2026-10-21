@@ -101,6 +101,133 @@ func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
 	t.Fatalf("the health endpoint never answered: %v", lastErr)
 }
 
+// TestRunShutdownPersistsTheJobListWithinTheBudget checks the graceful
+// shutdown of a running instance.
+//
+// The instance is stopped while a request is in flight and while its job
+// list is not empty. The host has to return within the shared budget of the
+// service layer, and the job list has to end up in the state directory of
+// the instance.
+//
+// The budget is the one every supervisor of the service layer waits for: a
+// supervisor that waits less kills the instance while it is still saving
+// its state.
+func TestRunShutdownPersistsTheJobListWithinTheBudget(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	// The instance starts with a job in its list: the shutdown has to
+	// persist it.
+	runtimepaths.Install(model)
+	if err := server.SaveJobsState([]*server.Job{{
+		ID:     "job-of-the-test",
+		Repo:   "owner/model",
+		Status: server.JobStatusPaused,
+	}}); err != nil {
+		t.Fatalf("SaveJobsState(): %v", err)
+	}
+	stateFile := model.JobsStateFile()
+
+	port := freePort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RunOptions{Paths: model, Listen: addr})
+	}()
+
+	if _, err := waitForSettings(t, addr); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("the instance never answered: %v", err)
+	}
+
+	// The job list of the running instance is not empty.
+	client := &http.Client{Timeout: 2 * time.Second}
+	body, status, err := get(client, "http://"+addr+"/api/jobs")
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("the job list of the instance: %v", err)
+	}
+	if status != http.StatusOK {
+		cancel()
+		<-done
+		t.Fatalf("the job list of the instance: status %d: %s", status, body)
+	}
+	if !strings.Contains(body, "job-of-the-test") {
+		cancel()
+		<-done
+		t.Fatalf("the job list of the instance = %s, want the job of the test", body)
+	}
+
+	// A request is in flight while the instance stops. The client sends
+	// the head of a request and the rest of it after the stop was asked
+	// for, so the drain of the HTTP server has to wait for it.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("dial the instance: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("GET /api/health HTTP/1.1\r\nHost: hfdesk\r\n")); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("write the head of the request: %v", err)
+	}
+	// The server reads the head of the request and waits for the rest of
+	// it. The pause gives it the time to do so.
+	time.Sleep(100 * time.Millisecond)
+
+	// The state file of the job list is removed, so the file that is there
+	// after the stop is the one the shutdown wrote.
+	if err := os.Remove(stateFile); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("remove %q: %v", stateFile, err)
+	}
+
+	const hold = 200 * time.Millisecond
+	start := time.Now()
+	cancel()
+	time.Sleep(hold)
+	if _, err := conn.Write([]byte("\r\n")); err != nil {
+		t.Logf("write the rest of the request: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	case <-time.After(ShutdownBudget + shutdownMargin):
+		t.Fatalf("Run() did not return within %s", ShutdownBudget+shutdownMargin)
+	}
+	elapsed := time.Since(start)
+
+	// The shutdown waited for the request that was in flight.
+	if elapsed < hold {
+		t.Errorf("the shutdown returned after %s, want at least %s: the drain of the HTTP server has to wait for the request in flight", elapsed, hold)
+	}
+
+	// The job list is persisted in the state directory of the instance.
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read %q: %v", stateFile, err)
+	}
+	if !strings.Contains(string(data), "job-of-the-test") {
+		t.Errorf("%q = %s, want the job of the instance", stateFile, data)
+	}
+}
+
 // get performs a GET request and returns the body and the status code.
 func get(client *http.Client, url string) (string, int, error) {
 	resp, err := client.Get(url)

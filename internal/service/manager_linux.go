@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
@@ -293,68 +292,55 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 // checkDirWritableByAccount reports whether the account can write into the
 // given directory.
 //
-// The directory itself is checked when it exists. A directory that is
-// missing is checked through its nearest existing ancestor: the instance
-// creates the directory it needs inside a directory that has to be writable
-// for it.
+// The check is the effective one: the account has to create entries in the
+// directory and to reach it. A directory the account owns with the mode 0500
+// is not writable at all, because the owner has no write permission in it,
+// and a directory below a parent without the execute permission cannot be
+// reached at all.
+//
+// A directory that is missing is checked through its nearest existing
+// ancestor: the instance creates the directory it needs inside a directory
+// that has to be writable for it.
 func checkDirWritableByAccount(path string, account *user.User) error {
-	dir := path
-	for {
-		info, err := os.Stat(dir)
-		if err == nil {
-			if !info.IsDir() {
-				return fmt.Errorf("%q is not a directory", path)
-			}
-			if writableByAccount(info, account) {
-				return nil
-			}
-			return errNotWritable
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			// The root of the file system is never missing, so there
-			// is nothing left to check.
-			return errNotWritable
-		}
-		dir = parent
+	identity, err := linuxAccessAccount(account)
+	if err != nil {
+		return err
 	}
+	ok, err := accountCanUseDir(path, identity)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errNotWritable
+	}
+	return nil
 }
 
-// writableByAccount reports whether the account can write into the
-// directory the file information describes.
+// linuxAccessAccount returns the identity of the account an access check
+// runs for.
 //
-// The owner of a directory can always widen the permissions of it, so a
-// directory the account owns counts as writable. A group the account belongs
-// to needs the group write permission, and a directory of the machine needs
-// the world write permission.
-func writableByAccount(info fs.FileInfo, account *user.User) bool {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
+// The groups of the account are its primary group and the supplementary
+// groups the group database of the machine knows: a directory the account
+// reaches through a supplementary group is as usable as one it reaches
+// through its primary group.
+func linuxAccessAccount(account *user.User) (accessAccount, error) {
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return accessAccount{}, fmt.Errorf("the user id %q of the account %q cannot be read: %w", account.Uid, account.Username, err)
 	}
-	if strconv.Itoa(int(stat.Uid)) == account.Uid {
-		return true
+	gid, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		return accessAccount{}, fmt.Errorf("the group id %q of the account %q cannot be read: %w", account.Gid, account.Username, err)
 	}
-	mode := info.Mode().Perm()
-	if mode&0o002 != 0 {
-		return true
-	}
-	if mode&0o020 == 0 {
-		return false
-	}
-	gid := strconv.Itoa(int(stat.Gid))
-	if gid == account.Gid {
-		return true
-	}
-	for _, group := range accountGroupIds(account) {
-		if group == gid {
-			return true
+	identity := accessAccount{UID: uid, GID: gid}
+	for _, id := range accountGroupIds(account) {
+		group, err := strconv.Atoi(id)
+		if err != nil {
+			continue
 		}
+		identity.Groups = append(identity.Groups, group)
 	}
-	return false
+	return identity, nil
 }
 
 // accountGroupIds returns the ids of the groups the account belongs to.
@@ -1205,6 +1191,10 @@ Type=simple
 WorkingDirectory=%s
 Restart=on-failure
 RestartSec=5s
+# The supervisor waits for the graceful shutdown of the instance before it
+# kills it. The wait covers the whole orderly shutdown of the server, so a
+# stop never interrupts an instance that is still saving its state.
+TimeoutStopSec=%s
 NoNewPrivileges=true
 UMask=0077
 Environment=%s
@@ -1247,9 +1237,23 @@ func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 		identity,
 		strings.Join(words, " "),
 		systemdQuote(opts.Paths.StateDir),
+		systemdStopTimeout(),
 		systemdQuote("HOME="+home),
 		target,
 	), nil
+}
+
+// systemdStopTimeout returns the value of the TimeoutStopSec directive of a
+// unit.
+//
+// The directive is the deadline of the supervisor: systemd asks the instance
+// to stop and kills it when the deadline is over. The deadline is the shared
+// budget of the service layer, so it covers the whole orderly shutdown of
+// the server and can never be shorter than it.
+//
+// The value is written as a duration, the form systemd reads in every unit.
+func systemdStopTimeout() string {
+	return ShutdownBudget.String()
 }
 
 // unitIdentity renders the identity directives of a unit.

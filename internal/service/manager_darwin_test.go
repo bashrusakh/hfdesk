@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 // darwinCredentialSentinel is the value the credential looking fields of an
@@ -215,7 +216,7 @@ func TestRenderPlistCarriesNoCredential(t *testing.T) {
 
 			// The registration holds the known keys only: there is no
 			// place a credential could hide in.
-			want := []string{"Label", "ProgramArguments", "WorkingDirectory", "RunAtLoad", "KeepAlive", "ProcessType", "EnvironmentVariables"}
+			want := []string{"Label", "ProgramArguments", "WorkingDirectory", "RunAtLoad", "KeepAlive", "ProcessType", "ExitTimeOut", "EnvironmentVariables"}
 			if scope == ScopeSystem {
 				want = append(want, "UserName", "GroupName")
 			}
@@ -1789,7 +1790,7 @@ func TestLaunchdGrantInstanceDirsRefusesBeforeItGrants(t *testing.T) {
 func TestLaunchdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T) {
 	account := darwinOtherAccount(t)
 
-	root := t.TempDir()
+	root := darwinTraversableTempDir(t)
 	opts := InstallOptions{
 		Scope:  ScopeSystem,
 		Listen: DefaultListen,
@@ -2146,6 +2147,237 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 	}
 }
 
+// TestLaunchdAccessCheckUsesTheEffectivePermission checks that the access
+// check of a directory the service account has to use is the effective one.
+//
+// The ownership of a directory is not enough: a directory the account owns
+// with the mode 0500 is not writable, because the owner has no write
+// permission in it, and a directory below a parent without the execute
+// permission cannot be reached at all.
+//
+// The account of the checks owns nothing of the test and belongs to the
+// group of its directories, so the group permissions are the ones that
+// apply to it.
+func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
+	root := darwinTraversableTempDir(t)
+
+	// The group of the directories of the test is the group of the test
+	// process, so the other identity reaches them through the group.
+	probe := filepath.Join(root, "probe")
+	if err := os.Mkdir(probe, 0o700); err != nil {
+		t.Fatalf("create the probe directory: %v", err)
+	}
+	_, group := darwinOwner(t, probe)
+
+	// The owner of the test is the account of the test process.
+	owner := &serviceAccount{
+		Name:   "hfdesk-owner-test",
+		UID:    os.Getuid(),
+		GID:    os.Getgid(),
+		Group:  "hfdesk-owner-test",
+		Groups: []int{os.Getgid()},
+	}
+	// The other identity owns nothing of the test and belongs to the
+	// group of its directories.
+	other := &serviceAccount{
+		Name:   "hfdesk-access-test",
+		UID:    65534,
+		GID:    group,
+		Group:  "hfdesk-access-test",
+		Groups: []int{group},
+	}
+
+	cases := []struct {
+		name    string
+		dir     string
+		account *serviceAccount
+		mode    os.FileMode
+		wantErr bool
+	}{
+		{
+			name:    "a directory the account owns",
+			dir:     "owned",
+			account: owner,
+			mode:    0o700,
+		},
+		{
+			name:    "a directory the account owns without the write permission",
+			dir:     "readonly",
+			account: owner,
+			mode:    0o500,
+			wantErr: true,
+		},
+		{
+			name:    "a directory the account owns without the write and the execute permission",
+			dir:     "closed",
+			account: owner,
+			mode:    0o400,
+			wantErr: true,
+		},
+		{
+			name:    "a directory of the group of the account",
+			dir:     "group",
+			account: other,
+			mode:    0o770,
+		},
+		{
+			name:    "a directory of the group of the account without the execute permission",
+			dir:     "group-without-execute",
+			account: other,
+			mode:    0o620,
+			wantErr: true,
+		},
+		{
+			name:    "a directory the account does not own and cannot write into",
+			dir:     "foreign",
+			account: other,
+			mode:    0o700,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(root, tc.dir)
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("create the directory: %v", err)
+			}
+			// The mode of a create call is filtered by the umask of
+			// the process, so the mode is set explicitly.
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatalf("set the mode of the directory: %v", err)
+			}
+			ok, err := accountCanWrite(dir, tc.account)
+			if tc.wantErr {
+				if ok {
+					t.Errorf("accountCanWrite(%q) = true, want a refusal", dir)
+				}
+				return
+			}
+			if !ok {
+				t.Errorf("accountCanWrite(%q) = false (%v), want true", dir, err)
+			}
+		})
+	}
+
+	t.Run("a directory below a parent without the execute permission", func(t *testing.T) {
+		parent := filepath.Join(root, "closed-parent")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatalf("create the parent directory: %v", err)
+		}
+		child := filepath.Join(parent, "child")
+		if err := os.Mkdir(child, 0o700); err != nil {
+			t.Fatalf("create the child directory: %v", err)
+		}
+		// The group of the child directory is the group of the
+		// account, so the account could use it if it could reach it.
+		if err := os.Chmod(child, 0o770); err != nil {
+			t.Fatalf("make the child directory usable: %v", err)
+		}
+		// The parent is closed for everybody but its owner.
+		if err := os.Chmod(parent, 0o700); err != nil {
+			t.Fatalf("close the parent directory: %v", err)
+		}
+		ok, err := accountCanWrite(child, other)
+		if ok {
+			t.Error("accountCanWrite() = true, want the refusal of a directory the account cannot reach")
+		}
+		if err != nil {
+			t.Logf("accountCanWrite() = %v", err)
+		}
+	})
+}
+
+// TestLaunchdAccessCheckUsesTheSupplementaryGroups checks that the access
+// check of a directory the service account has to use knows the
+// supplementary groups of the account.
+//
+// The primary group of the account of the check is another one, so the
+// directory is reachable through the supplementary group alone.
+func TestLaunchdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
+	supplementary, ok := darwinSupplementaryGroup(t)
+	if !ok {
+		t.Skip("skipping: the account of the test belongs to no group besides its primary one")
+	}
+	root := darwinTraversableTempDir(t)
+
+	dir := filepath.Join(root, "supplementary")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create the directory: %v", err)
+	}
+	// The directory belongs to the supplementary group of the account, not
+	// to the account itself.
+	if err := os.Chown(dir, os.Getuid(), supplementary); err != nil {
+		t.Fatalf("give the directory to the group %d: %v", supplementary, err)
+	}
+
+	account := &serviceAccount{
+		Name:   "hfdesk-access-test",
+		UID:    65534,
+		GID:    os.Getgid(),
+		Group:  "hfdesk-access-test",
+		Groups: []int{os.Getgid(), supplementary},
+	}
+
+	// The group permissions apply to the account: it can create entries
+	// in the directory and it can reach it.
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("make the directory usable: %v", err)
+	}
+	allowed, err := accountCanWrite(dir, account)
+	if !allowed {
+		t.Errorf("accountCanWrite() = false (%v), want true for a directory of the supplementary group of the account", err)
+	}
+
+	// The group has no execute permission: the account cannot use the
+	// directory.
+	if err := os.Chmod(dir, 0o620); err != nil {
+		t.Fatalf("close the directory: %v", err)
+	}
+	allowed, err = accountCanWrite(dir, account)
+	if allowed {
+		t.Error("accountCanWrite() = true, want the refusal of a directory without the execute permission of the group")
+	}
+}
+
+// TestLaunchdStopWaitCoversTheShutdownOfTheServer checks that the deadline
+// of the supervisor covers the graceful shutdown of the server.
+//
+// The server publishes the budget of its own shutdown: the drain of the HTTP
+// server and the close of the job manager, each with its own budget. The
+// job and the manager have to wait at least that long, or launchd kills the
+// instance while it is still saving its state.
+func TestLaunchdStopWaitCoversTheShutdownOfTheServer(t *testing.T) {
+	if ShutdownBudget < server.GracefulShutdownTimeout {
+		t.Errorf("the shared budget of the service layer = %s, want at least %s", ShutdownBudget, server.GracefulShutdownTimeout)
+	}
+	if stopWaitTimeout < server.GracefulShutdownTimeout {
+		t.Errorf("the stop wait of the manager = %s, want at least %s", stopWaitTimeout, server.GracefulShutdownTimeout)
+	}
+	if stopWaitTimeout != ShutdownBudget {
+		t.Errorf("the stop wait of the manager = %s, want the shared budget %s", stopWaitTimeout, ShutdownBudget)
+	}
+
+	opts := darwinUserOptions(t)
+	rendered, err := renderPlist(opts, nil)
+	if err != nil {
+		t.Fatalf("renderPlist(): %v", err)
+	}
+	registration, err := parsePlist([]byte(rendered))
+	if err != nil {
+		t.Fatalf("parsePlist(): %v", err)
+	}
+	if registration.ExitTimeOut == 0 {
+		t.Fatalf("the property list has no ExitTimeOut key:\n%s", rendered)
+	}
+	timeout := time.Duration(registration.ExitTimeOut) * time.Second
+	if timeout < server.GracefulShutdownTimeout {
+		t.Errorf("the ExitTimeOut of the property list = %s, want at least %s", timeout, server.GracefulShutdownTimeout)
+	}
+	if timeout != ShutdownBudget {
+		t.Errorf("the ExitTimeOut of the property list = %s, want the shared budget %s", timeout, ShutdownBudget)
+	}
+}
+
 // TestLaunchdUserScopeNeedsNoServiceAccount checks that the user scope is
 // unaffected by the service account of the machine-wide scope.
 //
@@ -2288,6 +2520,51 @@ func darwinOwner(t *testing.T, path string) (int, int) {
 		t.Fatalf("the ownership of %q cannot be read", path)
 	}
 	return int(stat.Uid), int(stat.Gid)
+}
+
+// darwinTraversableTempDir returns a temporary directory the account of the
+// test can pass through.
+//
+// The temporary directory of a test is owner-only, so an account that is not
+// the owner of the test never reaches a directory below it. The access check
+// of the service layer asks for the same: a directory below a parent
+// without the execute permission is out of reach of the account.
+func darwinTraversableTempDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	// The mode of a create call is filtered by the umask of the process,
+	// so the mode is set explicitly.
+	for _, path := range []string{root, filepath.Dir(root)} {
+		if err := os.Chmod(path, 0o711); err != nil {
+			t.Fatalf("make %q traversable: %v", path, err)
+		}
+	}
+	return root
+}
+
+// darwinSupplementaryGroup returns the id of a supplementary group of the
+// account of the test process.
+//
+// The second result is false when the account of the test belongs to no
+// group besides its primary one.
+func darwinSupplementaryGroup(t *testing.T) (int, bool) {
+	t.Helper()
+	current, err := user.Current()
+	if err != nil {
+		t.Skipf("skipping: the account of the test process is unknown: %v", err)
+	}
+	ids, err := current.GroupIds()
+	if err != nil {
+		t.Skipf("skipping: the groups of the account of the test are unknown: %v", err)
+	}
+	for _, id := range ids {
+		gid, err := strconv.Atoi(id)
+		if err != nil || gid == os.Getgid() {
+			continue
+		}
+		return gid, true
+	}
+	return 0, false
 }
 
 // darwinWriteRegistration renders the property list of an installation and

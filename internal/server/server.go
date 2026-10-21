@@ -26,9 +26,18 @@ import (
 // the application installed.
 var serverLog = logging.NewComponentLogger("server")
 
-// serverShutdownTimeout bounds the graceful shutdown sequence: the HTTP
-// drain and the job manager close each get this budget.
-const serverShutdownTimeout = 10 * time.Second
+// ShutdownPhaseTimeout bounds one phase of the graceful shutdown sequence:
+// the HTTP drain and the job manager close each get this budget, so a phase
+// never eats the budget of the next one.
+//
+// The budget is published so a supervisor that waits for the instance knows
+// how long the process may need to finish its shutdown. A supervisor that
+// waits less kills the instance while it is still saving its state.
+const ShutdownPhaseTimeout = 10 * time.Second
+
+// GracefulShutdownTimeout is the total budget of the orderly shutdown: the
+// sum of the budgets of its phases.
+const GracefulShutdownTimeout = 2 * ShutdownPhaseTimeout
 
 // Config holds server configuration.
 type Config struct {
@@ -236,7 +245,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), serverShutdownTimeout)
+		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), ShutdownPhaseTimeout)
 	}
 	return s.Serve(ctx, listener)
 }
@@ -252,7 +261,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.setBoundAddr(ln.Addr())
 	s.logStartup(ln.Addr())
-	return s.serveListener(ctx, ln, s.handler(), serverShutdownTimeout)
+	return s.serveListener(ctx, ln, s.handler(), ShutdownPhaseTimeout)
 }
 
 // BoundAddr returns the effective address the server is actually bound to.

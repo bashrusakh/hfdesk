@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
@@ -1179,6 +1180,58 @@ func systemdOwner(t *testing.T, path string) (string, string) {
 	return strconv.Itoa(int(stat.Uid)), strconv.Itoa(int(stat.Gid))
 }
 
+// systemdTraversableTempDir returns a temporary directory the account of the
+// test can pass through.
+//
+// The temporary directory of a test is owner-only, so an account that is not
+// the owner of the test never reaches a directory below it. The access check
+// of the service layer asks for the same: a directory below a parent
+// without the execute permission is out of reach of the account.
+func systemdTraversableTempDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	// The mode of a create call is filtered by the umask of the process,
+	// so the mode is set explicitly.
+	for _, path := range []string{root, filepath.Dir(root)} {
+		if err := os.Chmod(path, 0o711); err != nil {
+			t.Fatalf("make %q traversable: %v", path, err)
+		}
+	}
+	return root
+}
+
+// systemdSupplementaryGroup returns the id of a supplementary group of the
+// account of the test process.
+//
+// The groups of an account are read from the group database of the machine,
+// so the test needs a group whose member list holds the account of the
+// test. The second result is false when the machine knows no such group.
+func systemdSupplementaryGroup(t *testing.T) (string, bool) {
+	t.Helper()
+	current := systemdCurrentAccount(t)
+	content, err := os.ReadFile("/etc/group")
+	if err != nil {
+		t.Skipf("skipping: the group database of the machine cannot be read: %v", err)
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[2] == current.Gid {
+			// The primary group of the account is no supplementary
+			// group of it.
+			continue
+		}
+		for _, member := range strings.Split(fields[3], ",") {
+			if member == current.Username {
+				return fields[2], true
+			}
+		}
+	}
+	return "", false
+}
+
 // TestSystemdServiceAccountName checks how the account of a machine-wide
 // instance is resolved: the account the user named wins, and an empty value
 // falls back to the default of the platform.
@@ -1562,7 +1615,7 @@ func TestSystemdGrantInstanceDirsRefusesAPreExistingDirectory(t *testing.T) {
 func TestSystemdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T) {
 	account := systemdSecondAccount(t)
 
-	root := t.TempDir()
+	root := systemdTraversableTempDir(t)
 	opts := InstallOptions{
 		Scope:      ScopeSystem,
 		Executable: systemdTestExecutable(t),
@@ -1838,6 +1891,226 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 			t.Errorf("checkServiceAccountAccess() = %v, want nil for a user scope instance", err)
 		}
 	})
+}
+
+// TestSystemdAccessCheckUsesTheEffectivePermission checks that the access
+// check of a directory the service account has to use is the effective one.
+//
+// The ownership of a directory is not enough: a directory the account owns
+// with the mode 0500 is not writable, because the owner has no write
+// permission in it, and a directory below a parent without the execute
+// permission cannot be reached at all.
+//
+// The account of the checks owns nothing of the test and belongs to the
+// group of its directories, so the group permissions are the ones that
+// apply to it.
+func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
+	current := systemdCurrentAccount(t)
+	root := systemdTraversableTempDir(t)
+
+	// The group of the directories of the test is the group of the test
+	// process, so the other identity reaches them through the group.
+	probe := filepath.Join(root, "probe")
+	if err := os.Mkdir(probe, 0o700); err != nil {
+		t.Fatalf("create the probe directory: %v", err)
+	}
+	_, group := systemdOwner(t, probe)
+
+	// The other identity owns nothing of the test and belongs to the
+	// group of its directories.
+	other := &user.User{
+		Username: "hfdesk-access-test",
+		Uid:      "65534",
+		Gid:      group,
+		Name:     "HFDesk access test account",
+		HomeDir:  "/nonexistent",
+	}
+
+	cases := []struct {
+		name    string
+		dir     string
+		account *user.User
+		mode    os.FileMode
+		wantErr bool
+	}{
+		{
+			name:    "a directory the account owns",
+			dir:     "owned",
+			account: current,
+			mode:    0o700,
+		},
+		{
+			name:    "a directory the account owns without the write permission",
+			dir:     "readonly",
+			account: current,
+			mode:    0o500,
+			wantErr: true,
+		},
+		{
+			name:    "a directory the account owns without the write and the execute permission",
+			dir:     "closed",
+			account: current,
+			mode:    0o400,
+			wantErr: true,
+		},
+		{
+			name:    "a directory of the group of the account",
+			dir:     "group",
+			account: other,
+			mode:    0o770,
+		},
+		{
+			name:    "a directory of the group of the account without the execute permission",
+			dir:     "group-without-execute",
+			account: other,
+			mode:    0o620,
+			wantErr: true,
+		},
+		{
+			name:    "a directory the account does not own and cannot write into",
+			dir:     "foreign",
+			account: other,
+			mode:    0o700,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(root, tc.dir)
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("create the directory: %v", err)
+			}
+			// The mode of a create call is filtered by the umask of
+			// the process, so the mode is set explicitly.
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatalf("set the mode of the directory: %v", err)
+			}
+			err := checkDirWritableByAccount(dir, tc.account)
+			if tc.wantErr && err == nil {
+				t.Errorf("checkDirWritableByAccount(%q) = nil, want a refusal", dir)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("checkDirWritableByAccount(%q) = %v, want nil", dir, err)
+			}
+		})
+	}
+
+	t.Run("a directory below a parent without the execute permission", func(t *testing.T) {
+		parent := filepath.Join(root, "closed-parent")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatalf("create the parent directory: %v", err)
+		}
+		child := filepath.Join(parent, "child")
+		if err := os.Mkdir(child, 0o700); err != nil {
+			t.Fatalf("create the child directory: %v", err)
+		}
+		// The group of the child directory is the group of the
+		// account, so the account could use it if it could reach it.
+		if err := os.Chmod(child, 0o770); err != nil {
+			t.Fatalf("make the child directory usable: %v", err)
+		}
+		// The parent is closed for everybody but its owner.
+		if err := os.Chmod(parent, 0o700); err != nil {
+			t.Fatalf("close the parent directory: %v", err)
+		}
+		if err := checkDirWritableByAccount(child, other); err == nil {
+			t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory the account cannot reach")
+		}
+	})
+}
+
+// TestSystemdAccessCheckUsesTheSupplementaryGroups checks that the access
+// check of a directory the service account has to use knows the
+// supplementary groups of the account.
+//
+// The groups of an account are read from the group database of the machine,
+// so the test needs a group the account of the test belongs to. The test
+// skips itself when the machine knows no such group.
+func TestSystemdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
+	current := systemdCurrentAccount(t)
+	group, ok := systemdSupplementaryGroup(t)
+	if !ok {
+		t.Skip("skipping: the machine knows no supplementary group of the account of the test")
+	}
+	root := systemdTraversableTempDir(t)
+
+	dir := filepath.Join(root, "supplementary")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create the directory: %v", err)
+	}
+	gid, err := strconv.Atoi(group)
+	if err != nil {
+		t.Fatalf("the group id %q is not a number: %v", group, err)
+	}
+	// The directory belongs to the group of the account, not to the
+	// account itself.
+	if err := os.Chown(dir, os.Getuid(), gid); err != nil {
+		t.Fatalf("give the directory to the group %q: %v", group, err)
+	}
+
+	// The account of the check carries the name of the account of the
+	// test, so the group database of the machine gives it the
+	// supplementary group of the account of the test. It owns nothing of
+	// the test.
+	account := &user.User{
+		Username: current.Username,
+		Uid:      "65534",
+		Gid:      current.Gid,
+		Name:     current.Name,
+		HomeDir:  current.HomeDir,
+	}
+
+	// The group permissions apply to the account: it can create entries
+	// in the directory and it can reach it.
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("make the directory usable: %v", err)
+	}
+	if err := checkDirWritableByAccount(dir, account); err != nil {
+		t.Errorf("checkDirWritableByAccount() = %v, want nil for a directory of the supplementary group of the account", err)
+	}
+
+	// The group has no execute permission: the account cannot use the
+	// directory.
+	if err := os.Chmod(dir, 0o620); err != nil {
+		t.Fatalf("close the directory: %v", err)
+	}
+	if err := checkDirWritableByAccount(dir, account); err == nil {
+		t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory without the execute permission of the group")
+	}
+}
+
+// TestSystemdStopTimeoutCoversTheShutdownOfTheServer checks that the
+// deadline of the supervisor covers the graceful shutdown of the server.
+//
+// The server publishes the budget of its own shutdown: the drain of the HTTP
+// server and the close of the job manager, each with its own budget. The
+// unit has to wait at least that long, or systemd kills the instance while
+// it is still saving its state.
+func TestSystemdStopTimeoutCoversTheShutdownOfTheServer(t *testing.T) {
+	if ShutdownBudget < server.GracefulShutdownTimeout {
+		t.Errorf("the shared budget of the service layer = %s, want at least %s", ShutdownBudget, server.GracefulShutdownTimeout)
+	}
+
+	opts := systemdTestOptions(t, ScopeUser)
+	unit, err := renderUnit(opts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+
+	value := unitDirective(unit, "TimeoutStopSec")
+	if value == "" {
+		t.Fatalf("the unit has no TimeoutStopSec directive:\n%s", unit)
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		t.Fatalf("the TimeoutStopSec of the unit = %q, want a duration: %v", value, err)
+	}
+	if timeout < server.GracefulShutdownTimeout {
+		t.Errorf("the TimeoutStopSec of the unit = %s, want at least %s: the deadline of the supervisor has to cover the graceful shutdown of the server", timeout, server.GracefulShutdownTimeout)
+	}
+	if timeout != ShutdownBudget {
+		t.Errorf("the TimeoutStopSec of the unit = %s, want the shared budget %s", timeout, ShutdownBudget)
+	}
 }
 
 // TestSystemdInstallRefusesACacheDirTheAccountCannotWrite checks that a
