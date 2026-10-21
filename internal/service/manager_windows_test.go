@@ -332,6 +332,50 @@ func TestSCMLifecycle(t *testing.T) {
 	}
 }
 
+// TestSCMBrokenRegistration checks that a registration that points at a
+// program that is gone is reported as broken.
+//
+// The decision is checked on the registered path alone: reading the command
+// line of a registration needs a real service in the service control
+// manager, which a test cannot create without an elevated shell.
+func TestSCMBrokenRegistration(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(existing, []byte("not a program"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+	missing := filepath.Join(root, "gone", "hfdesk.exe")
+
+	// A registered program that is gone is a broken registration, and the
+	// detail names the missing path.
+	broken, detail := scmBrokenRegistration(missing)
+	if !broken {
+		t.Errorf("scmBrokenRegistration(%q) = %v, want a broken registration", missing, broken)
+	}
+	if !strings.Contains(detail, missing) {
+		t.Errorf("the detail = %q, want the path of the missing program %q", detail, missing)
+	}
+
+	// A registered program that exists is not a broken registration.
+	broken, detail = scmBrokenRegistration(existing)
+	if broken {
+		t.Errorf("scmBrokenRegistration(%q) = %v, want no broken registration", existing, broken)
+	}
+	if detail != "" {
+		t.Errorf("the detail = %q, want none", detail)
+	}
+
+	// A registration that carries no program has nothing that could be
+	// missing.
+	broken, detail = scmBrokenRegistration("")
+	if broken {
+		t.Errorf("scmBrokenRegistration(\"\") = %v, want no broken registration", broken)
+	}
+	if detail != "" {
+		t.Errorf("the detail = %q, want none", detail)
+	}
+}
+
 // TestSDDLGrantsIdentity checks the access control list of a path against
 // the account the instance runs as.
 //

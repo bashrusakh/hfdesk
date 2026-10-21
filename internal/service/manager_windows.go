@@ -344,12 +344,10 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 	}
 	applyRegistration(&status, registration)
 
-	if status.Executable != "" {
-		if _, err := os.Stat(status.Executable); err != nil {
-			status.State = StateBroken
-			status.Detail = fmt.Sprintf("the registered executable %s does not exist", status.Executable)
-			return status, nil
-		}
+	if broken, detail := scmBrokenRegistration(status.Executable); broken {
+		status.State = StateBroken
+		status.Detail = detail
+		return status, nil
 	}
 
 	query, err := handle.Query()
@@ -361,6 +359,28 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 		status.Detail = fmt.Sprintf("the instance exited with the code %d", query.Win32ExitCode)
 	}
 	return status, nil
+}
+
+// scmBrokenRegistration reports whether the registration points at an
+// executable that is gone and describes the damage.
+//
+// A registration that points at a program that does not exist anymore is
+// broken: the instance can never run again until it is installed again. A
+// registration that carries no executable at all is not broken: there is no
+// program that could be missing.
+//
+// The decision is a pure function of the registered path, so it can be
+// checked without a registration of its own: reading the command line of a
+// registration needs a real service in the service control manager, which a
+// test cannot create without an elevated shell.
+func scmBrokenRegistration(executable string) (bool, string) {
+	if executable == "" {
+		return false, ""
+	}
+	if _, err := os.Stat(executable); err != nil {
+		return true, fmt.Sprintf("the registered executable %s does not exist", executable)
+	}
+	return false, ""
 }
 
 // applyRegistration fills the status with the facts of the registration.

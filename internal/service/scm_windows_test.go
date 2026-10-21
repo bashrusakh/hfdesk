@@ -6,6 +6,8 @@
 package service
 
 import (
+	"net"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -199,5 +201,77 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 	}
 	if opts.Listen != "127.0.0.1:9090" {
 		t.Errorf("the listen address = %q, want %q", opts.Listen, "127.0.0.1:9090")
+	}
+}
+
+// TestSCMProbeAddressMapsTheWildcardBindOntoTheLoopback checks the address
+// the readiness probe dials.
+//
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and ::
+// are the addresses every interface answers on, and a connect() to them
+// fails with WSAEADDRNOTAVAIL. The probe therefore dials the loopback
+// address of the same family, and every other host is used unchanged.
+func TestSCMProbeAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
+	cases := []struct {
+		name   string
+		listen string
+		want   string
+	}{
+		{"the IPv4 wildcard", "0.0.0.0:8080", "127.0.0.1:8080"},
+		{"the IPv6 wildcard", "[::]:8080", "[::1]:8080"},
+		{"an empty host", ":8080", "127.0.0.1:8080"},
+		{"an IPv4 loopback", "127.0.0.1:8080", "127.0.0.1:8080"},
+		{"an IPv6 loopback", "[::1]:8080", "[::1]:8080"},
+		{"an address of the network", "192.168.1.5:8080", "192.168.1.5:8080"},
+		{"a host name", "localhost:8080", "localhost:8080"},
+		{"no address at all", "", DefaultListen},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmProbeAddress(tc.listen); got != tc.want {
+				t.Errorf("scmProbeAddress(%q) = %q, want %q", tc.listen, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeServiceReadyReachesAWildcardListener checks that the readiness
+// probe reaches a server that binds every interface of the machine.
+//
+// The server answers with the status of the basic authentication of the
+// instance: the probe accepts every answer, because the point of the probe
+// is that an HTTP server listens on the address and not that it answers
+// with a particular code.
+func TestProbeServiceReadyReachesAWildcardListener(t *testing.T) {
+	cases := []struct {
+		name string
+		bind string
+		host string
+	}{
+		{"the IPv4 wildcard", "0.0.0.0:0", "0.0.0.0"},
+		{"the IPv6 wildcard", "[::]:0", "::"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", tc.bind)
+			if err != nil {
+				t.Skipf("the address %q cannot be bound: %v", tc.bind, err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			})}
+			go func() {
+				_ = server.Serve(listener)
+			}()
+			t.Cleanup(func() {
+				_ = server.Close()
+			})
+
+			port := listener.Addr().(*net.TCPAddr).Port
+			listen := net.JoinHostPort(tc.host, strconv.Itoa(port))
+			if err := probeServiceReady(listen); err != nil {
+				t.Errorf("probeServiceReady(%q) = %v, want nil for a server that binds %q", listen, err, tc.bind)
+			}
+		})
 	}
 }

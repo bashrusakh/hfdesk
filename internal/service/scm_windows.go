@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -364,12 +365,10 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, hostErr <-
 //
 // Any HTTP status is accepted: the point of the probe is that an HTTP
 // server listens on the address and answers, not that it answers with a
-// particular code.
+// particular code. A server that answers with the status of the basic
+// authentication of the instance is a server that answers.
 func probeServiceReady(listen string) error {
-	addr := listen
-	if addr == "" {
-		addr = DefaultListen
-	}
+	addr := scmProbeAddress(listen)
 	conn, err := net.DialTimeout("tcp", addr, scmProbeTimeout)
 	if err != nil {
 		return err
@@ -384,6 +383,42 @@ func probeServiceReady(listen string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// scmProbeAddress maps the bind address of the instance onto the address
+// the readiness probe dials.
+//
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are
+// the addresses every interface of the machine answers on, and a connect()
+// to them fails with WSAEADDRNOTAVAIL. The probe therefore dials the
+// loopback address of the same family, which a wildcard listener accepts
+// like any other client. Every other host is used unchanged.
+//
+// The port of the bind address is always kept: the probe has to reach the
+// server of the instance and not another one.
+func scmProbeAddress(listen string) string {
+	addr := strings.TrimSpace(listen)
+	if addr == "" {
+		addr = DefaultListen
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// An address that carries no port cannot be mapped: it is used
+		// unchanged, so the probe reports the error of the dial itself.
+		return addr
+	}
+	switch host {
+	case "0.0.0.0":
+		host = "127.0.0.1"
+	case "::":
+		host = "::1"
+	case "":
+		// An empty host binds every interface of every family. The
+		// probe uses the loopback address of the IPv4 family, which a
+		// dual-stack listener accepts.
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // eventLogLevel is the kind of a message of the Windows Event Log.
