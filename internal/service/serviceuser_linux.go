@@ -16,3 +16,29 @@ package service
 func defaultServiceUser() string {
 	return "hfdesk"
 }
+
+// defaultScope returns the default installation scope on Linux.
+//
+// The systemd supervisor registers a per-user unit as well as a
+// machine-wide one, so the user scope is the default here.
+func defaultScope() Scope {
+	return ScopeUser
+}
+
+// supportsUserScope reports that a per-user installation exists on Linux.
+//
+// The systemd supervisor registers a per-user unit, so the scope is
+// available.
+func supportsUserScope() bool {
+	return true
+}
+
+// supportsNamedServiceAccount reports that the account of a machine-wide
+// instance can be named on Linux.
+//
+// The instance runs as a dedicated account of the machine, and the
+// installation refuses to register an instance whose account does not
+// exist.
+func supportsNamedServiceAccount() bool {
+	return true
+}

@@ -15,7 +15,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,9 +32,9 @@ import (
 //
 // Everything platform specific stays in internal/service: the command
 // family only describes what the user asked for and reports what the
-// supervisor answered. The only platform check of the command line is the
-// default scope, because the Windows service control manager registers
-// machine-wide services only.
+// supervisor answered. The command line never compares the operating
+// system itself: the scope and the account of an instance are facts of the
+// platform, and the service layer owns them.
 
 const (
 	// serviceUsageExitCode is the exit code of a command line that could
@@ -275,30 +274,46 @@ func writeField(w io.Writer, key, value string) {
 	fmt.Fprintf(w, "%-14s %s\n", key+":", value)
 }
 
-// platformGOOS is the operating system the command line decides for.
+// platformFacts are the facts of the platform that the command line decides
+// with.
+//
+// The facts come from the service layer: it owns everything that depends on
+// the operating system, so the command line never compares one itself.
+type platformFacts struct {
+	// defaultScope is the scope of an installation that does not ask for
+	// one.
+	defaultScope service.Scope
+	// supportsUserScope reports whether a per-user installation exists.
+	supportsUserScope bool
+	// supportsNamedServiceAccount reports whether the account of a
+	// machine-wide instance can be named.
+	supportsNamedServiceAccount bool
+}
+
+// hostPlatform holds the facts of the platform the command line runs on.
 //
 // The variable is the seam of the tests: the decisions of the command line
-// that depend on the platform (the default scope, the account of an
-// instance) are checked on every platform, so the behaviour of a Windows
-// instance is covered by a test that runs on Linux as well.
-var platformGOOS = runtime.GOOS
+// that depend on the platform (the default scope, the scope of an
+// installation, the account of an instance) are checked on every platform,
+// so the behaviour of a Windows instance is covered by a test that runs on
+// Linux as well.
+var hostPlatform = platformFactsOfTheHost()
 
-// isWindows reports whether the command line behaves as on Windows.
-func isWindows() bool {
-	return platformGOOS == "windows"
+// platformFactsOfTheHost returns the facts of the platform of the process.
+func platformFactsOfTheHost() platformFacts {
+	return platformFacts{
+		defaultScope:                service.DefaultScope(),
+		supportsUserScope:           service.SupportsUserScope(),
+		supportsNamedServiceAccount: service.SupportsNamedServiceAccount(),
+	}
 }
 
 // defaultScope returns the scope of an installation that does not ask for
 // one.
 //
-// The user scope is the default on Linux and macOS. The Windows service
-// control manager registers machine-wide services only, so the system scope
-// is the default there.
+// The default scope is a fact of the platform: the service layer owns it.
 func defaultScope() service.Scope {
-	if isWindows() {
-		return service.ScopeSystem
-	}
-	return service.ScopeUser
+	return hostPlatform.defaultScope
 }
 
 // resolveScope turns the scope selector of the command line into the scope
@@ -314,7 +329,7 @@ func resolveScope(user, system bool) (service.Scope, error) {
 	case user && system:
 		return "", newServiceUsageError(errors.New("--user and --system are mutually exclusive, choose one scope"))
 	case user:
-		if isWindows() {
+		if !hostPlatform.supportsUserScope {
 			return "", newServiceUsageError(errors.New("--user is not available on windows: the service control manager registers machine-wide services only, use --system"))
 		}
 		return service.ScopeUser, nil
@@ -528,7 +543,7 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 		if scope == service.ScopeUser {
 			return service.InstallOptions{}, newServiceUsageError(errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system"))
 		}
-		if isWindows() {
+		if !hostPlatform.supportsNamedServiceAccount {
 			return service.InstallOptions{}, newServiceUsageError(fmt.Errorf("--service-user is not available on windows: the machine-wide instance runs as the built-in %s account and the account cannot be chosen on this platform (a service under a user account needs a credential, and a credential must never reach a command line), drop the option", windowsServiceAccount))
 		}
 	}
@@ -711,7 +726,7 @@ func installAccount(scope service.Scope, serviceUser string) string {
 	switch {
 	case scope == service.ScopeUser:
 		return invokingUser()
-	case isWindows():
+	case !hostPlatform.supportsNamedServiceAccount:
 		return windowsServiceAccount
 	case serviceUser != "":
 		return serviceUser

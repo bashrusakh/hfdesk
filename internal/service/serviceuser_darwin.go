@@ -20,3 +20,29 @@ package service
 func defaultServiceUser() string {
 	return "_hfdesk"
 }
+
+// defaultScope returns the default installation scope on macOS.
+//
+// The launchd supervisor registers a per-user agent as well as a
+// machine-wide one, so the user scope is the default here.
+func defaultScope() Scope {
+	return ScopeUser
+}
+
+// supportsUserScope reports that a per-user installation exists on macOS.
+//
+// The launchd supervisor registers a per-user agent, so the scope is
+// available.
+func supportsUserScope() bool {
+	return true
+}
+
+// supportsNamedServiceAccount reports that the account of a machine-wide
+// instance can be named on macOS.
+//
+// The instance runs as a dedicated account of the machine, and the
+// installation refuses to register an instance whose account does not
+// exist.
+func supportsNamedServiceAccount() bool {
+	return true
+}

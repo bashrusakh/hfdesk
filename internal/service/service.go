@@ -13,7 +13,9 @@
 // Windows SCM registration) live in separate files with a build tag and
 // implement the Manager interface. The shared layer never branches on the
 // operating system: it owns the command semantics and the validation, the
-// platform files own the supervisor details.
+// platform files own the supervisor details and the facts of the platform
+// (the default scope, the scopes an installation may have and the account of
+// a machine-wide instance).
 package service
 
 import (
@@ -152,6 +154,43 @@ type InstallOptions struct {
 // no name of its own.
 func DefaultServiceUser() string {
 	return defaultServiceUser()
+}
+
+// DefaultScope returns the scope of an installation that does not ask for
+// one.
+//
+// The user scope is the default on Linux and macOS. The Windows service
+// control manager registers machine-wide services only, so the system scope
+// is the default there.
+//
+// The default scope is a fact of the platform: the shared layer never
+// compares the operating system itself.
+func DefaultScope() Scope {
+	return defaultScope()
+}
+
+// SupportsUserScope reports whether a per-user installation exists on this
+// platform.
+//
+// Every platform but Windows offers the per-user scope: the service control
+// manager of Windows registers machine-wide services only, so a per-user
+// instance does not exist there.
+//
+// A platform without a supervisor does not restrict the scope either: it
+// reports that service mode is unavailable, which is a more useful answer
+// than a refusal of the scope.
+func SupportsUserScope() bool {
+	return supportsUserScope()
+}
+
+// SupportsNamedServiceAccount reports whether the account of a machine-wide
+// instance can be named on this platform.
+//
+// The account can be named on Linux and macOS. Windows has no account to
+// name: the instance runs as the built-in LocalService account, which has
+// no name of its own.
+func SupportsNamedServiceAccount() bool {
+	return supportsNamedServiceAccount()
 }
 
 // Manager drives the platform supervisor. The common layer owns the command

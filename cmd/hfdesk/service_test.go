@@ -9,10 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -66,6 +70,31 @@ func useFakeManager(t *testing.T, mgr service.Manager) {
 	t.Cleanup(func() { newServiceManager = previous })
 }
 
+// platformFactsByName holds the facts of the platforms of the service
+// layer.
+//
+// The facts are the ones the service layer defines per platform: the test
+// injects them, so the behaviour of a Windows instance is covered by a test
+// that runs on Linux as well. The guard that keeps them in step with the
+// service layer is TestServicePerPlatformFacts.
+var platformFactsByName = map[string]platformFacts{
+	"linux": {
+		defaultScope:                service.ScopeUser,
+		supportsUserScope:           true,
+		supportsNamedServiceAccount: true,
+	},
+	"darwin": {
+		defaultScope:                service.ScopeUser,
+		supportsUserScope:           true,
+		supportsNamedServiceAccount: true,
+	},
+	"windows": {
+		defaultScope:                service.ScopeSystem,
+		supportsUserScope:           false,
+		supportsNamedServiceAccount: false,
+	},
+}
+
 // usePlatform makes the command line behave as on the given platform for
 // the duration of the test.
 //
@@ -74,9 +103,13 @@ func useFakeManager(t *testing.T, mgr service.Manager) {
 // Windows instance is covered by a test that runs on Linux as well.
 func usePlatform(t *testing.T, goos string) {
 	t.Helper()
-	previous := platformGOOS
-	platformGOOS = goos
-	t.Cleanup(func() { platformGOOS = previous })
+	facts, ok := platformFactsByName[goos]
+	if !ok {
+		t.Fatalf("the test does not know the facts of the platform %q", goos)
+	}
+	previous := hostPlatform
+	hostPlatform = facts
+	t.Cleanup(func() { hostPlatform = previous })
 }
 
 // personalCacheRoot returns the Hugging Face cache of the user that runs
@@ -247,8 +280,8 @@ func TestServiceLifecycleSubcommandsRejectTheInstallOnlyOptions(t *testing.T) {
 // A user scope instance runs as the user itself, so an account name would
 // be a promise the installation cannot keep.
 func TestServiceUserIsRejectedForTheUserScope(t *testing.T) {
-	if isWindows() {
-		t.Skip("the user scope does not exist on windows")
+	if !service.SupportsUserScope() {
+		t.Skip("the user scope does not exist on this platform")
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -346,8 +379,8 @@ func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 // TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope checks that
 // a user scope instance never carries a service account.
 func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope(t *testing.T) {
-	if isWindows() {
-		t.Skip("the user scope does not exist on windows")
+	if !service.SupportsUserScope() {
+		t.Skip("the user scope does not exist on this platform")
 	}
 	if _, err := buildInstallOptions(service.ScopeUser, installFlags{serviceUser: "hfdesk"}, "/usr/local/bin/hfdesk"); err == nil {
 		t.Error("the user scope must reject a service account")
@@ -748,8 +781,10 @@ func TestServiceScopeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the default scope must resolve: %v", err)
 	}
+	// The default scope of an installation is the scope of the platform:
+	// the user scope on Linux and macOS, the system scope on Windows.
 	want := service.ScopeUser
-	if isWindows() {
+	if runtime.GOOS == "windows" {
 		want = service.ScopeSystem
 	}
 	if scope != want {
@@ -1905,4 +1940,232 @@ func TestServiceUninstallReportsWhatTheRemovalDid(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServicePlatformFactsOfTheHost checks that the facts the service layer
+// exposes are the facts of the platform the test runs on.
+//
+// The command line decides with these facts, so a fact that does not match
+// the platform would make the command line decide about another platform.
+func TestServicePlatformFactsOfTheHost(t *testing.T) {
+	want, ok := platformFactsByName[runtime.GOOS]
+	if !ok {
+		t.Skipf("the platform %q is not one of the platforms of the service layer", runtime.GOOS)
+	}
+
+	if got := service.DefaultScope(); got != want.defaultScope {
+		t.Errorf("the default scope of %s is %q, want %q", runtime.GOOS, got, want.defaultScope)
+	}
+	if got := service.SupportsUserScope(); got != want.supportsUserScope {
+		t.Errorf("%s has a per-user scope: %v, want %v", runtime.GOOS, got, want.supportsUserScope)
+	}
+	if got := service.SupportsNamedServiceAccount(); got != want.supportsNamedServiceAccount {
+		t.Errorf("%s has a named service account: %v, want %v", runtime.GOOS, got, want.supportsNamedServiceAccount)
+	}
+}
+
+// TestServicePerPlatformFacts checks the facts every platform of the
+// service layer defines.
+//
+// The default scope of an installation is the user scope on Linux and
+// macOS and the system scope on Windows, and the account of a machine-wide
+// instance can be named on Linux and macOS but not on Windows.
+//
+// The facts of a platform live in the file of that platform, so the guard
+// reads them from the source: a test that runs on one platform cannot call
+// the code of another one.
+func TestServicePerPlatformFacts(t *testing.T) {
+	for _, tc := range []struct {
+		file      string
+		scope     service.Scope
+		userScope bool
+		namedUser bool
+	}{
+		{file: "serviceuser_linux.go", scope: service.ScopeUser, userScope: true, namedUser: true},
+		{file: "serviceuser_darwin.go", scope: service.ScopeUser, userScope: true, namedUser: true},
+		{file: "serviceuser_windows.go", scope: service.ScopeSystem, userScope: false, namedUser: false},
+		{file: "serviceuser_other.go", scope: service.ScopeUser, userScope: true, namedUser: true},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			if got := serviceScopeOf(platformFactOf(t, tc.file, "defaultScope")); got != tc.scope {
+				t.Errorf("the default scope of %s is %q, want %q", tc.file, got, tc.scope)
+			}
+			if got := platformFactOf(t, tc.file, "supportsUserScope"); got != boolName(tc.userScope) {
+				t.Errorf("the per-user scope of %s is %q, want %q", tc.file, got, boolName(tc.userScope))
+			}
+			if got := platformFactOf(t, tc.file, "supportsNamedServiceAccount"); got != boolName(tc.namedUser) {
+				t.Errorf("the named service account of %s is %q, want %q", tc.file, got, boolName(tc.namedUser))
+			}
+		})
+	}
+}
+
+// TestServiceDefaultScopeFollowsThePlatformFacts checks that the default
+// scope of an installation is the scope of the platform.
+//
+// The user scope is the default on Linux and macOS, the system scope on
+// Windows: the service control manager of Windows registers machine-wide
+// services only.
+func TestServiceDefaultScopeFollowsThePlatformFacts(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			usePlatform(t, goos)
+
+			scope, err := resolveScope(false, false)
+			if err != nil {
+				t.Fatalf("the default scope must resolve: %v", err)
+			}
+			if want := platformFactsByName[goos].defaultScope; scope != want {
+				t.Errorf("the default scope on %s is %q, want %q", goos, scope, want)
+			}
+		})
+	}
+}
+
+// TestServiceUserScopeRefusalFollowsThePlatformFacts checks that the
+// per-user scope is refused where the platform does not have it.
+//
+// The service control manager of Windows registers machine-wide services
+// only, so a per-user installation does not exist there.
+func TestServiceUserScopeRefusalFollowsThePlatformFacts(t *testing.T) {
+	for _, tc := range []struct {
+		goos      string
+		wantError bool
+	}{
+		{goos: "linux"},
+		{goos: "darwin"},
+		{goos: "windows", wantError: true},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			usePlatform(t, tc.goos)
+
+			scope, err := resolveScope(true, false)
+			if !tc.wantError {
+				if err != nil {
+					t.Fatalf("the per-user scope must resolve on %s: %v", tc.goos, err)
+				}
+				if scope != service.ScopeUser {
+					t.Errorf("the scope on %s is %q, want %q", tc.goos, scope, service.ScopeUser)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("the per-user scope must be refused where the platform does not have it")
+			}
+			if !isServiceUsageError(err) {
+				t.Errorf("the refusal must be a command line that could not be understood: %v", err)
+			}
+		})
+	}
+}
+
+// TestServiceUserRefusalKeepsItsMessage checks that the refusal of a named
+// account on Windows keeps its message.
+//
+// The message names the account the instance really runs as and explains
+// why the account cannot be chosen: a user of the platform has to know what
+// to do instead of the option.
+func TestServiceUserRefusalKeepsItsMessage(t *testing.T) {
+	usePlatform(t, "windows")
+
+	_, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, "/usr/local/bin/hfdesk")
+	if err == nil {
+		t.Fatal("the machine-wide scope must reject a service account on windows")
+	}
+	want := "--service-user is not available on windows: the machine-wide instance runs as the built-in " +
+		windowsServiceAccount + " account and the account cannot be chosen on this platform " +
+		"(a service under a user account needs a credential, and a credential must never reach a command line), drop the option"
+	if err.Error() != want {
+		t.Errorf("the refusal is %q, want %q", err.Error(), want)
+	}
+}
+
+// TestServiceCommandHasNoOperatingSystemComparison checks that the command
+// family does not compare the operating system.
+//
+// The scope and the account of an instance are facts of the platform, and
+// the service layer owns them: a comparison in the command line would put
+// the decision about the platform back into a shared layer.
+//
+// The guard names the comparison and not the platform: the messages of the
+// command line name the platform they talk about.
+func TestServiceCommandHasNoOperatingSystemComparison(t *testing.T) {
+	source, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Fatalf("read service.go: %v", err)
+	}
+
+	text := string(source)
+	for _, forbidden := range []string{"runtime.GOOS", "platformGOOS", "isWindows"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("the command family compares the operating system (%q):\n%s", forbidden, sourceLinesWith(text, forbidden))
+		}
+	}
+}
+
+// platformFactOf returns the value a per-platform function of the service
+// layer returns.
+//
+// The facts of a platform live in the file of that platform, and the code
+// of another platform cannot be called from a test that runs on this one:
+// the guard reads the facts from the source of the platform file.
+func platformFactOf(t *testing.T, file, name string) string {
+	t.Helper()
+
+	path := filepath.Join("..", "..", "internal", "service", file)
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != name || fn.Body == nil {
+			continue
+		}
+		for _, stmt := range fn.Body.List {
+			ret, ok := stmt.(*ast.ReturnStmt)
+			if !ok || len(ret.Results) != 1 {
+				continue
+			}
+			if value, ok := ret.Results[0].(*ast.Ident); ok {
+				return value.Name
+			}
+		}
+	}
+
+	t.Fatalf("%s does not return a value from %s", path, name)
+	return ""
+}
+
+// serviceScopeOf turns the name of a scope of the service layer into the
+// scope it names.
+func serviceScopeOf(name string) service.Scope {
+	switch name {
+	case "ScopeUser":
+		return service.ScopeUser
+	case "ScopeSystem":
+		return service.ScopeSystem
+	}
+	return service.Scope(name)
+}
+
+// boolName returns the name a boolean literal has in the source of the
+// service layer.
+func boolName(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+// sourceLinesWith returns the lines of a source that hold the given text.
+func sourceLinesWith(source, text string) string {
+	var lines []string
+	for _, line := range strings.Split(source, "\n") {
+		if strings.Contains(line, text) {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
