@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -208,6 +209,256 @@ func TestRequireElevatedNamesTheMissingPrivilege(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "elevated") {
 		t.Errorf("requireElevated() = %v, want an error that names the elevated shell", err)
+	}
+}
+
+// TestSCMClassifyRegistrationError checks that the outcome of the
+// existence check tells the three cases apart: the registration is not
+// there, the registration is there, and the caller may not look at it.
+func TestSCMClassifyRegistrationError(t *testing.T) {
+	// A registration that is there.
+	state, err := scmClassifyRegistrationError(nil)
+	if state != scmRegistrationPresent {
+		t.Errorf("scmClassifyRegistrationError(nil) = %v, want %v", state, scmRegistrationPresent)
+	}
+	if err != nil {
+		t.Errorf("scmClassifyRegistrationError(nil) = %v, want no error", err)
+	}
+
+	// A registration that is not there is not an error: it is the state
+	// the caller asked about.
+	state, err = scmClassifyRegistrationError(windows.ERROR_SERVICE_DOES_NOT_EXIST)
+	if state != scmRegistrationAbsent {
+		t.Errorf("scmClassifyRegistrationError(ERROR_SERVICE_DOES_NOT_EXIST) = %v, want %v", state, scmRegistrationAbsent)
+	}
+	if err != nil {
+		t.Errorf("scmClassifyRegistrationError(ERROR_SERVICE_DOES_NOT_EXIST) = %v, want no error", err)
+	}
+
+	// A registration the caller may not look at is not an absent
+	// registration, and the raw access denied error is not reported: the
+	// elevation requirement is the truthful reason.
+	state, err = scmClassifyRegistrationError(windows.ERROR_ACCESS_DENIED)
+	if state != scmRegistrationUnreadable {
+		t.Errorf("scmClassifyRegistrationError(ERROR_ACCESS_DENIED) = %v, want %v", state, scmRegistrationUnreadable)
+	}
+	if err != nil {
+		t.Errorf("scmClassifyRegistrationError(ERROR_ACCESS_DENIED) = %v, want no error", err)
+	}
+
+	// A failure that is not about the registration is reported as it is.
+	other := errors.New("the service control manager is gone")
+	state, err = scmClassifyRegistrationError(other)
+	if state != scmRegistrationUnreadable {
+		t.Errorf("scmClassifyRegistrationError(%v) = %v, want %v", other, state, scmRegistrationUnreadable)
+	}
+	if !errors.Is(err, other) {
+		t.Errorf("scmClassifyRegistrationError(%v) = %v, want the error itself", other, err)
+	}
+}
+
+// TestSCMUninstallActionFor checks the decision of the uninstallation: an
+// absent registration needs nothing, a registered one has to be removed,
+// and a registration the caller may not look at needs an elevated shell.
+func TestSCMUninstallActionFor(t *testing.T) {
+	cases := []struct {
+		name  string
+		state scmRegistrationState
+		want  scmUninstallAction
+	}{
+		{"absent", scmRegistrationAbsent, scmUninstallNothing},
+		{"present", scmRegistrationPresent, scmUninstallRemove},
+		{"unreadable", scmRegistrationUnreadable, scmUninstallElevate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmUninstallActionFor(tc.state); got != tc.want {
+				t.Errorf("scmUninstallActionFor(%v) = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSCMUninstallOfAnAbsentRegistrationIsACleanSuccess checks that the
+// uninstallation of an instance that is not registered is a clean success
+// in every shell.
+//
+// The decision is driven from both sides: the state of the registration
+// and the state of the token of the process are parameters, so the test
+// needs neither a registration nor an elevated shell of its own. The real
+// command is checked as well, against the service control manager of the
+// machine.
+func TestSCMUninstallOfAnAbsentRegistrationIsACleanSuccess(t *testing.T) {
+	manager := &scmManager{scope: ScopeSystem}
+	ctx := context.Background()
+
+	// The decision does not ask for an elevated shell: a registration
+	// that is not there is uninstalled already.
+	for _, elevated := range []bool{false, true} {
+		if err := manager.uninstall(ctx, scmRegistrationAbsent, elevated); err != nil {
+			t.Errorf("uninstall(absent, elevated=%v) = %v, want nil", elevated, err)
+		}
+	}
+
+	// The real command against the service control manager of the
+	// machine.
+	state, err := scmRegistrationStateOf()
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if state != scmRegistrationAbsent {
+		t.Skipf("%s is registered, the test would remove a real installation", ServiceName)
+	}
+	if err := manager.Uninstall(ctx); err != nil {
+		t.Errorf("Uninstall() = %v, want nil for an absent registration", err)
+	}
+}
+
+// TestSCMUninstallOfARegisteredInstanceNeedsElevation checks that the
+// removal of a registration asks for an elevated shell.
+//
+// The state of the registration is a parameter of the decision, so the
+// test never opens the registration of the instance: the elevation
+// requirement is answered before the service control manager is asked for
+// anything.
+func TestSCMUninstallOfARegisteredInstanceNeedsElevation(t *testing.T) {
+	manager := &scmManager{scope: ScopeSystem}
+	err := manager.uninstall(context.Background(), scmRegistrationPresent, false)
+	if err == nil {
+		t.Fatal("uninstall(present) = nil, want an error that names the elevated shell")
+	}
+	if !strings.Contains(err.Error(), "elevated") {
+		t.Errorf("uninstall(present) = %v, want an error that names the elevated shell", err)
+	}
+	if !strings.Contains(err.Error(), "administrator") {
+		t.Errorf("uninstall(present) = %v, want an error that tells the user what to do", err)
+	}
+}
+
+// TestSCMUninstallOfAnUnreadableRegistrationNeedsElevation checks that a
+// registration the caller may not look at is reported as the elevation
+// requirement it is, and not as the raw access denied error of the
+// platform.
+func TestSCMUninstallOfAnUnreadableRegistrationNeedsElevation(t *testing.T) {
+	manager := &scmManager{scope: ScopeSystem}
+	for _, elevated := range []bool{false, true} {
+		err := manager.uninstall(context.Background(), scmRegistrationUnreadable, elevated)
+		if err == nil {
+			t.Fatalf("uninstall(unreadable, elevated=%v) = nil, want an error", elevated)
+		}
+		if !strings.Contains(err.Error(), "elevated") {
+			t.Errorf("uninstall(unreadable, elevated=%v) = %v, want an error that names the elevated shell", elevated, err)
+		}
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Errorf("uninstall(unreadable, elevated=%v) = %v, want the elevation requirement and not the raw access denied error", elevated, err)
+		}
+	}
+}
+
+// TestSCMRefusedReportsTheElevationRequirement checks that a refusal of the
+// service control manager because the shell has no rights is reported as
+// the elevation requirement it is, and not as the raw access denied error
+// of the platform.
+func TestSCMRefusedReportsTheElevationRequirement(t *testing.T) {
+	for _, action := range []string{"a start", "a stop"} {
+		err := scmRefused(action, fmt.Errorf("service: start %s: %w", ServiceName, windows.ERROR_ACCESS_DENIED))
+		if err == nil {
+			t.Fatalf("scmRefused(%q, access denied) = nil, want an error", action)
+		}
+		if !strings.Contains(err.Error(), "elevated") {
+			t.Errorf("scmRefused(%q, access denied) = %v, want an error that names the elevated shell", action, err)
+		}
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Errorf("scmRefused(%q, access denied) = %v, want the elevation requirement and not the raw access denied error", action, err)
+		}
+	}
+
+	// A failure that is not about the rights of the shell is reported as
+	// it is.
+	other := errors.New("the service control manager is gone")
+	if got := scmRefused("a start", other); !errors.Is(got, other) {
+		t.Errorf("scmRefused(%q, %v) = %v, want the error itself", "a start", other, got)
+	}
+	if got := scmRefused("a start", nil); got != nil {
+		t.Errorf("scmRefused(%q, nil) = %v, want nil", "a start", got)
+	}
+}
+
+// TestSCMRegistrationStateOfFindsAnAbsentRegistration checks the existence
+// check against the service control manager of the machine: a name that
+// cannot be registered is reported as absent.
+//
+// The check reads the registration with the right to query its state only,
+// so it works in a normal shell as well.
+func TestSCMRegistrationStateOfFindsAnAbsentRegistration(t *testing.T) {
+	name := fmt.Sprintf("HfdeskTestAbsentRegistration%d", time.Now().UnixNano())
+	state, err := scmRegistrationStateOfName(name)
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if state == scmRegistrationUnreadable {
+		t.Skip("the service control manager cannot be read from this shell")
+	}
+	if state != scmRegistrationAbsent {
+		t.Errorf("scmRegistrationStateOfName(%q) = %v, want %v", name, state, scmRegistrationAbsent)
+	}
+}
+
+// TestSCMRegistrationStateOfFindsARegisteredService checks the existence
+// check against the service control manager of the machine: a service of
+// the operating system is reported as registered.
+//
+// The test needs a service that is registered on the machine. The
+// candidates are the services every installation of the operating system
+// carries, so the test is skipped when the machine carries none of them.
+func TestSCMRegistrationStateOfFindsARegisteredService(t *testing.T) {
+	for _, candidate := range []string{"EventLog", "RpcSs", "Dhcp", "W32Time", "NlaSvc", "Schedule", "Power"} {
+		state, err := scmRegistrationStateOfName(candidate)
+		if err != nil {
+			t.Skipf("the service control manager is not available: %v", err)
+		}
+		switch state {
+		case scmRegistrationPresent:
+			return
+		case scmRegistrationAbsent:
+			continue
+		default:
+			t.Skipf("the registration of %s cannot be read from this shell", candidate)
+		}
+	}
+	t.Skip("the machine carries none of the services of the operating system")
+}
+
+// TestSCMStartAndStopOfAnAbsentRegistration checks the lifecycle commands
+// against an instance that is not registered: the stop is a clean success
+// and the start reports that the instance is not installed.
+//
+// The test is skipped when the instance is registered, so it never touches
+// a real installation.
+func TestSCMStartAndStopOfAnAbsentRegistration(t *testing.T) {
+	state, err := scmRegistrationStateOf()
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if state != scmRegistrationAbsent {
+		t.Skipf("%s is registered, the test would touch a real installation", ServiceName)
+	}
+
+	manager := &scmManager{scope: ScopeSystem}
+	ctx := context.Background()
+
+	// An instance that does not run is stopped already.
+	if err := manager.Stop(ctx); err != nil {
+		t.Errorf("Stop() = %v, want nil for an instance that is not registered", err)
+	}
+	// An instance that is not registered cannot be started, and the
+	// reason is reported in every shell.
+	err = manager.Start(ctx)
+	if err == nil {
+		t.Fatal("Start() = nil, want an error for an instance that is not registered")
+	}
+	if !strings.Contains(err.Error(), "not installed") {
+		t.Errorf("Start() = %v, want an error that names the missing registration", err)
 	}
 }
 

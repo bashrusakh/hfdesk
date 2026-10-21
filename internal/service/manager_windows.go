@@ -36,9 +36,16 @@ import (
 // PowerShell and the shell are never called, so a path with a space or a
 // quote in it cannot change the command that runs.
 //
-// The manager never escalates privileges itself: an installation and an
-// uninstallation need an elevated shell, and the manager fails with a
-// clear message when the process does not have one.
+// The manager never escalates privileges itself: an installation needs an
+// elevated shell, and so does an uninstallation that has a registration to
+// remove. The manager fails with a clear message when the process does not
+// have one.
+//
+// The existence of the registration is looked up before the elevation
+// requirement is applied: an ordinary shell can read the registration of
+// the instance, so it can tell an absent registration from a registration
+// it may not look at. A registration that is not there is a clean success
+// in every shell.
 const (
 	// scmDisplayName is the name the service manager shows.
 	scmDisplayName = "HFDesk"
@@ -203,16 +210,61 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 // It removes the registration only: the config file, the jobs, the history,
 // the logs, the models and the cache of the instance are never touched. An
 // absent registration is a clean success.
+//
+// The existence of the registration is checked before the elevation
+// requirement is applied. An ordinary shell can read the registration of
+// the instance, so it tells an absent registration from a registration it
+// may not look at: an absent registration is a clean success in every
+// shell, and the elevation requirement applies only when there is
+// something to remove.
 func (m *scmManager) Uninstall(ctx context.Context) error {
-	if err := requireElevated("an uninstallation"); err != nil {
+	state, err := scmRegistrationStateOf()
+	if err != nil {
 		return err
 	}
-	manager, handle, ok, err := m.openRegistration()
+	return m.uninstall(ctx, state, isElevatedProcess())
+}
+
+// uninstall removes the registration of the instance after the existence
+// of the registration was established.
+//
+// The state of the registration and the state of the token of the process
+// are parameters, so the decision of the uninstallation can be driven from
+// both sides without an elevated shell: the service control manager
+// accepts a machine-wide registration only from an administrator, so a
+// test cannot create one without an elevated shell.
+func (m *scmManager) uninstall(ctx context.Context, state scmRegistrationState, elevated bool) error {
+	switch scmUninstallActionFor(state) {
+	case scmUninstallNothing:
+		// There is no registration: the uninstallation is already done.
+		return nil
+	case scmUninstallElevate:
+		// The registration could not be read: the shell of the caller
+		// has no rights on it. The elevation requirement is the
+		// truthful reason, so it is reported instead of the access
+		// denied error of the platform.
+		if err := requireElevatedFor("an uninstallation", elevated); err != nil {
+			return err
+		}
+		return scmElevationRequired("an uninstallation")
+	case scmUninstallRemove:
+		// The registration has to be removed: the elevation requirement
+		// is checked before the removal.
+	}
+
+	// The elevation requirement is checked before the registration is
+	// removed: a permission error of the machine is a much less readable
+	// answer than the real reason.
+	if err := requireElevatedFor("an uninstallation", elevated); err != nil {
+		return err
+	}
+	manager, handle, ok, err := m.openRegistrationPrivileged("an uninstallation")
 	if err != nil {
 		return err
 	}
 	if !ok {
-		// There is no registration: the uninstallation is already done.
+		// The registration is gone between the check and the removal:
+		// the uninstallation is already done.
 		return nil
 	}
 	defer manager.Disconnect()
@@ -238,8 +290,12 @@ func (m *scmManager) Uninstall(ctx context.Context) error {
 //
 // Starting an instance that runs already is a stable success: the state
 // the caller asked for already holds.
+//
+// The existence of the registration is looked up with a read-only
+// connection, so the answer does not depend on the rights of the shell: an
+// instance that is not registered is reported as such in every shell.
 func (m *scmManager) Start(ctx context.Context) error {
-	manager, handle, ok, err := m.openRegistration()
+	manager, handle, ok, err := m.openRegistration("a start")
 	if err != nil {
 		return err
 	}
@@ -253,7 +309,7 @@ func (m *scmManager) Start(ctx context.Context) error {
 		if errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
 			return nil
 		}
-		return fmt.Errorf("service: start %s: %w", ServiceName, err)
+		return scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, err))
 	}
 	return nil
 }
@@ -264,7 +320,7 @@ func (m *scmManager) Start(ctx context.Context) error {
 // is stopping an instance that is not registered at all: it does not run
 // either.
 func (m *scmManager) Stop(ctx context.Context) error {
-	manager, handle, ok, err := m.openRegistration()
+	manager, handle, ok, err := m.openRegistration("a stop")
 	if err != nil {
 		return err
 	}
@@ -283,7 +339,7 @@ func (m *scmManager) Stop(ctx context.Context) error {
 // completes before a new process is started, so the two instances never
 // compete for the bind address.
 func (m *scmManager) Restart(ctx context.Context) error {
-	manager, handle, ok, err := m.openRegistration()
+	manager, handle, ok, err := m.openRegistration("a restart")
 	if err != nil {
 		return err
 	}
@@ -300,7 +356,7 @@ func (m *scmManager) Restart(ctx context.Context) error {
 		if errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
 			return nil
 		}
-		return fmt.Errorf("service: start %s: %w", ServiceName, err)
+		return scmRefused("a restart", fmt.Errorf("service: start %s: %w", ServiceName, err))
 	}
 	return nil
 }
@@ -323,7 +379,7 @@ func (m *scmManager) Status(ctx context.Context) (Status, error) {
 		UnitPath: scmRegistrationPath,
 	}
 
-	manager, handle, ok, err := m.openRegistration()
+	manager, handle, ok, err := m.openRegistration("a status")
 	if err != nil {
 		return status, err
 	}
@@ -396,14 +452,166 @@ func applyRegistration(status *Status, registration scmRegistration) {
 	status.CacheDir = EffectiveCacheDir(status.Paths.ConfigFile, registration.cacheDir())
 }
 
+// scmRegistrationState describes what the service control manager knows
+// about the registration of the instance.
+type scmRegistrationState int
+
+const (
+	// scmRegistrationAbsent means the instance is not registered.
+	scmRegistrationAbsent scmRegistrationState = iota
+	// scmRegistrationPresent means the instance is registered.
+	scmRegistrationPresent
+	// scmRegistrationUnreadable means the caller may not look at the
+	// registration, so it cannot tell whether the instance is
+	// registered.
+	scmRegistrationUnreadable
+)
+
+// scmRegistrationStateOf reports what the service control manager knows
+// about the registration of the instance.
+func scmRegistrationStateOf() (scmRegistrationState, error) {
+	return scmRegistrationStateOfName(ServiceName)
+}
+
+// scmRegistrationStateOfName reports what the service control manager
+// knows about the registration of the given name.
+//
+// The check opens the service control manager with the right to connect
+// only and the registration with the right to query its state only: an
+// ordinary shell can read the registration of the instance, so it can tell
+// whether the instance is installed at all. The manager of the platform
+// opens the service control manager with every right instead, which an
+// ordinary shell does not have.
+//
+// A registration the caller may not look at is not an absent registration:
+// the caller cannot tell, and the truth is that the operation needs the
+// rights of the machine either way.
+func scmRegistrationStateOfName(name string) (scmRegistrationState, error) {
+	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		state, reason := scmClassifyRegistrationError(err)
+		if reason != nil {
+			return state, fmt.Errorf("service: connect to the service control manager: %w", reason)
+		}
+		return state, nil
+	}
+	defer windows.CloseServiceHandle(manager)
+
+	pointer, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return scmRegistrationUnreadable, fmt.Errorf("service: the name of the service cannot be read: %w", err)
+	}
+	handle, err := windows.OpenService(manager, pointer, windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		state, reason := scmClassifyRegistrationError(err)
+		if reason != nil {
+			return state, fmt.Errorf("service: open the registration of %s: %w", name, reason)
+		}
+		return state, nil
+	}
+	windows.CloseServiceHandle(handle)
+	return scmRegistrationPresent, nil
+}
+
+// scmClassifyRegistrationError classifies the error of an existence check.
+//
+// An absent registration is not an error: it is the state the caller asked
+// about. A registration the caller may not look at is not an absent
+// registration either: the caller cannot tell, and the truth is that the
+// operation needs the rights of the machine either way.
+//
+// The second result is the error the caller reports. An access denied
+// error is not reported as it is: the elevation requirement is the
+// truthful reason, so the raw error of the platform is dropped.
+func scmClassifyRegistrationError(err error) (scmRegistrationState, error) {
+	switch {
+	case err == nil:
+		return scmRegistrationPresent, nil
+	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
+		return scmRegistrationAbsent, nil
+	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
+		return scmRegistrationUnreadable, nil
+	default:
+		return scmRegistrationUnreadable, err
+	}
+}
+
+// scmUninstallAction is what an uninstallation does with the registration
+// of the instance.
+type scmUninstallAction int
+
+const (
+	// scmUninstallNothing means there is no registration to remove.
+	scmUninstallNothing scmUninstallAction = iota
+	// scmUninstallRemove means the registration has to be removed.
+	scmUninstallRemove
+	// scmUninstallElevate means the caller has to run the command as an
+	// administrator before the registration can be removed.
+	scmUninstallElevate
+)
+
+// scmUninstallActionFor decides what an uninstallation does after the
+// existence of the registration was established.
+//
+// The decision is a pure function of the outcome of the existence check,
+// so it can be checked without a registration of its own: the service
+// control manager accepts a machine-wide registration only from an
+// administrator, so a test cannot create one without an elevated shell.
+//
+// An absent registration is a clean success: the uninstallation is already
+// done and it needs no elevation at all. A registration the caller may not
+// look at needs an elevated shell: the caller cannot tell whether the
+// instance is installed, and the removal needs the rights of the machine
+// either way.
+func scmUninstallActionFor(state scmRegistrationState) scmUninstallAction {
+	switch state {
+	case scmRegistrationAbsent:
+		return scmUninstallNothing
+	case scmRegistrationPresent:
+		return scmUninstallRemove
+	default:
+		return scmUninstallElevate
+	}
+}
+
 // openRegistration opens the registration of the instance.
 //
 // The second result reports whether the service is registered at all: an
 // absent registration is not an error, it is the state the caller asked
 // about.
-func (m *scmManager) openRegistration() (*mgr.Mgr, *mgr.Service, bool, error) {
+//
+// The existence of the registration is looked up with a read-only
+// connection first: an ordinary shell can read the registration of the
+// instance, so it tells an absent registration from a registration it may
+// not look at. The privileged connection is opened only when there is
+// something to change.
+func (m *scmManager) openRegistration(action string) (*mgr.Mgr, *mgr.Service, bool, error) {
+	state, err := scmRegistrationStateOf()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	switch state {
+	case scmRegistrationAbsent:
+		return nil, nil, false, nil
+	case scmRegistrationUnreadable:
+		return nil, nil, false, scmElevationRequired(action)
+	}
+	return m.openRegistrationPrivileged(action)
+}
+
+// openRegistrationPrivileged opens the registration of the instance with
+// the rights the supervisor needs to change it.
+//
+// The connection of the platform asks for every right of the service
+// control manager, so an ordinary shell cannot open it. A refusal of the
+// platform because the shell has no rights is reported as the elevation
+// requirement it is.
+func (m *scmManager) openRegistrationPrivileged(action string) (*mgr.Mgr, *mgr.Service, bool, error) {
 	manager, err := mgr.Connect()
 	if err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return nil, nil, false, scmElevationRequired(action)
+		}
 		return nil, nil, false, fmt.Errorf("service: connect to the service control manager: %w", err)
 	}
 	handle, err := manager.OpenService(ServiceName)
@@ -411,6 +619,9 @@ func (m *scmManager) openRegistration() (*mgr.Mgr, *mgr.Service, bool, error) {
 		manager.Disconnect()
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 			return nil, nil, false, nil
+		}
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return nil, nil, false, scmElevationRequired(action)
 		}
 		return nil, nil, false, fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
 	}
@@ -425,7 +636,7 @@ func (m *scmManager) openRegistration() (*mgr.Mgr, *mgr.Service, bool, error) {
 func (m *scmManager) stopService(ctx context.Context, handle *mgr.Service) error {
 	status, err := handle.Query()
 	if err != nil {
-		return fmt.Errorf("service: query the state of %s: %w", ServiceName, err)
+		return scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
 	}
 	if status.State == svc.Stopped {
 		return nil
@@ -437,7 +648,7 @@ func (m *scmManager) stopService(ctx context.Context, handle *mgr.Service) error
 			return nil
 		}
 		if !errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
-			return fmt.Errorf("service: stop %s: %w", ServiceName, err)
+			return scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
 		}
 	}
 	return m.waitForStopped(ctx, handle)
@@ -453,7 +664,7 @@ func (m *scmManager) waitForStopped(ctx context.Context, handle *mgr.Service) er
 	for {
 		status, err := handle.Query()
 		if err != nil {
-			return fmt.Errorf("service: query the state of %s: %w", ServiceName, err)
+			return scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
 		}
 		if status.State == svc.Stopped {
 			return nil
@@ -840,10 +1051,48 @@ var sddlRights = map[string]uint32{
 // The manager never escalates privileges itself: it never starts a runas
 // call, never starts PowerShell and never starts a shell.
 func requireElevated(action string) error {
-	if isElevatedProcess() {
+	return requireElevatedFor(action, isElevatedProcess())
+}
+
+// requireElevatedFor rejects a machine-wide operation when the process does
+// not hold an elevated token.
+//
+// The state of the token is a parameter, so the decision can be driven from
+// both sides without an elevated shell: the real check passes the state of
+// the token of the process, and the test passes the state of the two cases.
+func requireElevatedFor(action string, elevated bool) error {
+	if elevated {
 		return nil
 	}
 	return fmt.Errorf("service: %s needs an elevated shell: run the command as an administrator, HFDesk never escalates privileges itself", action)
+}
+
+// scmElevationRequired reports that the service control manager refused an
+// operation because the shell of the caller has no rights on the
+// registration.
+//
+// The elevation requirement is the truthful reason: the registration of a
+// machine-wide instance belongs to the machine, so a shell that is not an
+// administrator shell can neither read it nor change it. The manager never
+// escalates privileges itself.
+func scmElevationRequired(action string) error {
+	return fmt.Errorf("service: %s needs an elevated shell: the service control manager refused the operation because the shell has no rights on the registration of %s, run the command as an administrator, HFDesk never escalates privileges itself", action, ServiceName)
+}
+
+// scmRefused reports the reason of a refused operation of the service
+// control manager.
+//
+// A refusal because the shell of the caller has no rights on the
+// registration is reported as the elevation requirement it is: the raw
+// access denied error of the platform does not tell the user what to do.
+func scmRefused(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return scmElevationRequired(action)
+	}
+	return err
 }
 
 // isElevatedProcess reports whether the process holds an elevated token.
