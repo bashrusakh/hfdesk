@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
@@ -26,7 +27,7 @@ type MirrorTargetRequest struct {
 
 // handleMirrorTargetsList returns all configured mirror targets.
 func (s *Server) handleMirrorTargetsList(w http.ResponseWriter, r *http.Request) {
-	cfg, err := hfdownloader.LoadTargets("")
+	cfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
@@ -93,7 +94,7 @@ func (s *Server) handleMirrorTargetAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := hfdownloader.LoadTargets("")
+	cfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
@@ -101,7 +102,7 @@ func (s *Server) handleMirrorTargetAdd(w http.ResponseWriter, r *http.Request) {
 
 	cfg.Add(req.Name, absPath, req.Description)
 
-	if err := cfg.Save(""); err != nil {
+	if err := cfg.Save(runtimepaths.Current().TargetsFile()); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
 		return
 	}
@@ -125,7 +126,7 @@ func (s *Server) handleMirrorTargetRemove(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cfg, err := hfdownloader.LoadTargets("")
+	cfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
@@ -136,7 +137,7 @@ func (s *Server) handleMirrorTargetRemove(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := cfg.Save(""); err != nil {
+	if err := cfg.Save(runtimepaths.Current().TargetsFile()); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
 		return
 	}
@@ -179,7 +180,7 @@ func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve target path
-	targetsCfg, err := hfdownloader.LoadTargets("")
+	targetsCfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
@@ -328,7 +329,7 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve target path
-	targetsCfg, err := hfdownloader.LoadTargets("")
+	targetsCfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
@@ -371,7 +372,7 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve target path
-	targetsCfg, err := hfdownloader.LoadTargets("")
+	targetsCfg, err := hfdownloader.LoadTargets(runtimepaths.Current().TargetsFile())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
 		return
