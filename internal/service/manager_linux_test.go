@@ -816,12 +816,87 @@ func TestSystemdStatusReportsTheCacheRoot(t *testing.T) {
 	})
 }
 
+// TestSystemdStatusReportsAMissingExecutable checks that a registration that
+// points at a program that is gone is reported as broken: the state of the
+// instance is broken and the detail names the path of the missing program.
+//
+// The unit file is written into the temporary unit directory of the test, so
+// the registration of the user of the machine is never touched, and the
+// registration facts of the unit are parsed as they are in a real
+// installation.
+//
+// The test does not need a running supervisor: a broken registration is
+// decided from the unit file alone, and the other two cases only assert that
+// the registration is not broken, whatever the supervisor answers.
+func TestSystemdStatusReportsAMissingExecutable(t *testing.T) {
+	t.Run("the registered executable is gone", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "bin", "hfdesk")
+		status := systemdStatusOf(t, missing)
+		if status.State != StateBroken {
+			t.Errorf("the state = %q, want %q", status.State, StateBroken)
+		}
+		if !strings.Contains(status.Detail, missing) {
+			t.Errorf("the detail = %q, want the path of the missing program %q", status.Detail, missing)
+		}
+		if status.Executable != missing {
+			t.Errorf("the executable = %q, want %q", status.Executable, missing)
+		}
+	})
+
+	t.Run("the registered executable exists", func(t *testing.T) {
+		executable := systemdTestExecutable(t)
+		status := systemdStatusOf(t, executable)
+		if status.State == StateBroken {
+			t.Errorf("the state = %q, want a state that is not broken", status.State)
+		}
+		if status.Executable != executable {
+			t.Errorf("the executable = %q, want %q", status.Executable, executable)
+		}
+	})
+
+	t.Run("the registration holds no executable", func(t *testing.T) {
+		status := systemdStatusOf(t)
+		if status.State == StateBroken {
+			t.Errorf("the state = %q, want a state that is not broken", status.State)
+		}
+		if status.Executable != "" {
+			t.Errorf("the executable = %q, want none", status.Executable)
+		}
+		// The unit file was really read: the registration that the status
+		// describes is the unit of the temporary unit directory, and it
+		// holds no program at all.
+		content, err := os.ReadFile(status.UnitPath)
+		if err != nil {
+			t.Fatalf("read the unit file %q: %v", status.UnitPath, err)
+		}
+		if !strings.Contains(string(content), "ExecStart=") {
+			t.Errorf("the unit file holds no ExecStart directive:\n%s", content)
+		}
+	})
+}
+
 // systemdStatus registers a unit with the given arguments in a temporary
 // configuration directory and returns the status of the instance.
 //
 // The unit points at a program that exists, so the status describes a
 // registration and not a broken one.
 func systemdStatus(t *testing.T, args ...string) Status {
+	t.Helper()
+	return systemdStatusOf(t, append([]string{systemdTestExecutable(t)}, args...)...)
+}
+
+// systemdStatusOf registers a unit that starts the given words in a
+// temporary configuration directory and returns the status of the instance.
+//
+// The words are the argument vector of the registered program, so an empty
+// vector registers a unit without a program.
+//
+// The unit file is written into the temporary unit directory of the test, so
+// the registration of the user of the machine is never touched. The
+// supervisor of the environment may not know the unit: the registration
+// facts are filled before the supervisor is asked, and they are the subject
+// of the tests.
+func systemdStatusOf(t *testing.T, words ...string) Status {
 	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -833,8 +908,11 @@ func systemdStatus(t *testing.T, args ...string) Status {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the unit directory: %v", err)
 	}
-	words := append([]string{systemdTestExecutable(t)}, args...)
-	unit := "[Service]\nExecStart=" + strings.Join(words, " ") + "\n"
+	quoted := make([]string, 0, len(words))
+	for _, word := range words {
+		quoted = append(quoted, systemdQuoteAlways(word))
+	}
+	unit := "[Service]\nExecStart=" + strings.Join(quoted, " ") + "\n"
 	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
 		t.Fatalf("write the unit file: %v", err)
 	}

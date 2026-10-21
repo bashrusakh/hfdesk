@@ -493,12 +493,10 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 	// reports none.
 	status.CacheDir = EffectiveCacheDir(unit.flagValue("--config"), unit.flagValue("--cache-dir"))
 
-	if status.Executable != "" {
-		if _, err := os.Stat(status.Executable); err != nil {
-			status.State = StateBroken
-			status.Detail = fmt.Sprintf("registered executable not found: %s", status.Executable)
-			return status, nil
-		}
+	if broken, detail := brokenExecutable(status.Executable); broken {
+		status.State = StateBroken
+		status.Detail = detail
+		return status, nil
 	}
 
 	out, err := m.runSystemctl(ctx, "show", unitName,
@@ -517,6 +515,27 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 		status.Detail = fmt.Sprintf("the unit failed, see `%s status %s`", m.supervisorHint(), unitName)
 	}
 	return status, nil
+}
+
+// brokenExecutable reports whether a registration that points at the given
+// executable is broken, and the detail that names the missing program.
+//
+// A registration without an executable is not broken: there is no program
+// that could be missing. A registered program that cannot be reached is
+// broken: the instance can never run again until the program is installed
+// again.
+//
+// The decision is pure and separate from the supervisor: a broken
+// registration is described by the unit file alone, so the status of a
+// broken registration never depends on a running supervisor.
+func brokenExecutable(executable string) (bool, string) {
+	if executable == "" {
+		return false, ""
+	}
+	if _, err := os.Stat(executable); err != nil {
+		return true, fmt.Sprintf("registered executable not found: %s", executable)
+	}
+	return false, ""
 }
 
 // isUnitAbsent reports whether a supervisor error means that the unit is
