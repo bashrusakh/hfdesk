@@ -252,6 +252,10 @@ var errNotWritable = errors.New("the service account cannot write into the direc
 // The scope defaults are not checked: the cache of a machine-wide instance
 // lives inside its own state directory, which the installation owns.
 //
+// A directory inside the state directory of the instance is not checked
+// either: the installation creates the state directory and grants it to the
+// account, so the account can use the directory itself.
+//
 // The ownership and the permissions of a named tree are never changed: the
 // installation refuses the installation and names the way to grant the
 // access.
@@ -272,6 +276,12 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		if dir.path == "" || dir.path == dir.def {
 			continue
 		}
+		// A directory inside the state directory of the instance belongs
+		// to the account: the installation grants the state directory to
+		// the account, so the account can use the directory itself.
+		if pathInsideStateRoot(opts.Paths.StateDir, dir.path) {
+			continue
+		}
 		if err := checkDirWritableByAccount(dir.path, account); err != nil {
 			if !errors.Is(err, errNotWritable) {
 				return fmt.Errorf("service: the %s directory %q of the machine-wide instance is not usable: %w", dir.kind, dir.path, err)
@@ -287,6 +297,24 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		}
 	}
 	return nil
+}
+
+// pathInsideStateRoot reports whether the path lies inside the state
+// directory of the instance.
+//
+// The state directory of the instance belongs to the service account: the
+// installation creates it and grants it to the account. A directory inside it
+// is therefore usable by the account, so the installation does not check it
+// against the account.
+//
+// The comparison is lexical: the paths are compared as they are written and
+// the symbolic links of the file system are not resolved, the same way the
+// guard of the home directory of the invoking user compares its paths.
+func pathInsideStateRoot(stateDir, path string) bool {
+	if stateDir == "" || path == "" {
+		return false
+	}
+	return hfdownloader.PathInside(stateDir, path)
 }
 
 // checkDirWritableByAccount reports whether the account can write into the
@@ -587,6 +615,14 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // leaves the machine as it was.
 func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := ValidateInstallOptions(opts); err != nil {
+		return err
+	}
+	// A path with a control character would end up in the unit file
+	// literally, and a newline in it would split the unit into another
+	// directive the installation never wrote. The check runs before the
+	// root requirement, before any directory is created and before the
+	// unit file is written: a refused installation leaves nothing behind.
+	if err := validateUnitPaths(opts); err != nil {
 		return err
 	}
 	// A machine-wide instance must not adopt the state of the user who
@@ -1223,9 +1259,9 @@ func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 	}
 
 	words := make([]string, 0, len(RunArgs(opts))+1)
-	words = append(words, systemdQuoteAlways(opts.Executable))
+	words = append(words, systemdQuoteCommandAlways(opts.Executable))
 	for _, arg := range RunArgs(opts) {
-		words = append(words, systemdQuote(arg))
+		words = append(words, systemdQuoteCommand(arg))
 	}
 
 	target := "default.target"
@@ -1241,6 +1277,52 @@ func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 		systemdQuote("HOME="+home),
 		target,
 	), nil
+}
+
+// validateUnitPaths rejects an installation whose paths carry a control
+// character.
+//
+// A unit file is a line based file: a control character in a path would end
+// up in it literally, and a newline would end the directive it is written in
+// and start another one the installation never wrote.
+//
+// The check covers every path that ends up in the unit: the executable, the
+// paths of the instance and the directories the user named.
+func validateUnitPaths(opts InstallOptions) error {
+	for _, p := range []struct {
+		name string
+		path string
+	}{
+		{"executable", opts.Executable},
+		{"config file", opts.Paths.ConfigFile},
+		{"state dir", opts.Paths.StateDir},
+		{"log dir", opts.Paths.LogDir},
+		{"cache dir", opts.CacheDir},
+		{"hub dir", opts.HubDir},
+		{"local dir", opts.LocalDir},
+	} {
+		if p.path == "" {
+			continue
+		}
+		if r, ok := controlCharacter(p.path); ok {
+			return fmt.Errorf("service: the %s %q contains the control character %q: a path of an installation must not contain a control character", p.name, p.path, r)
+		}
+	}
+	return nil
+}
+
+// controlCharacter returns the first control character of the value.
+//
+// A control character is a character of the C0 control set: the unit file is
+// a line based file, so a newline in a path would end the directive it is
+// written in.
+func controlCharacter(value string) (rune, bool) {
+	for _, r := range value {
+		if r < 0x20 {
+			return r, true
+		}
+	}
+	return 0, false
 }
 
 // systemdStopTimeout returns the value of the TimeoutStopSec directive of a
@@ -1321,6 +1403,10 @@ func unitHomeDir(opts InstallOptions) (string, error) {
 
 // systemdQuote renders one value of a unit file. The value is quoted only
 // when it needs it, so a plain path stays readable.
+//
+// The value is a setting of the unit and not a part of its command line:
+// the supervisor expands the environment of the unit in a command line only,
+// so a dollar sign of such a value is a literal one.
 func systemdQuote(value string) string {
 	if value == "" {
 		return `""`
@@ -1346,6 +1432,56 @@ func systemdQuoteAlways(value string) string {
 			// A percent sign starts a specifier of the supervisor, a
 			// doubled one is a literal percent sign.
 			b.WriteString("%%")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// systemdQuoteCommand renders one word of the command line of a unit file.
+//
+// The command line is the one place where the supervisor expands the
+// environment of the unit: a dollar sign starts a reference to a variable of
+// the unit, and a doubled dollar sign is the documented escape of a literal
+// dollar sign. Every dollar sign of the word is therefore doubled, so the
+// process sees the path as it was written.
+//
+// The word is quoted only when it needs it, so a plain path stays readable.
+func systemdQuoteCommand(value string) string {
+	if value == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(value, " \t\"'\\%$") {
+		return value
+	}
+	return systemdQuoteCommandAlways(value)
+}
+
+// systemdQuoteCommandAlways renders one word of the command line of a unit
+// file in the C style quoting of systemd, no matter what the word contains.
+//
+// The dollar sign of the word is doubled: the supervisor expands the
+// environment of the unit in the command line, and a doubled dollar sign is
+// the documented escape of a literal dollar sign.
+func systemdQuoteCommandAlways(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '%':
+			// A percent sign starts a specifier of the supervisor, a
+			// doubled one is a literal percent sign.
+			b.WriteString("%%")
+		case '$':
+			// A dollar sign starts a variable of the unit, a doubled
+			// one is a literal dollar sign.
+			b.WriteString("$$")
 		default:
 			b.WriteRune(r)
 		}
@@ -1423,7 +1559,7 @@ func parseUnit(content string) parsedUnit {
 		}
 		switch strings.TrimSpace(key) {
 		case "ExecStart":
-			words := splitSystemdWords(value)
+			words := resolveSystemdDollars(splitSystemdWords(value))
 			if len(words) == 0 {
 				continue
 			}
@@ -1515,6 +1651,26 @@ func splitSystemdWords(line string) []string {
 		}
 	}
 	flush()
+	return words
+}
+
+// resolveSystemdDollars resolves the escaped dollar signs of the words of a
+// command line.
+//
+// The supervisor expands the environment of the unit in a command line, and a
+// doubled dollar sign is the documented escape of a literal dollar sign. The
+// parser resolves it the way the supervisor does, so the registration of a
+// path that holds a dollar sign describes the path the process really sees.
+//
+// The words of a setting of the unit are not touched: the supervisor does not
+// expand the environment of the unit there.
+func resolveSystemdDollars(words []string) []string {
+	for i, word := range words {
+		if !strings.Contains(word, "$$") {
+			continue
+		}
+		words[i] = strings.ReplaceAll(word, "$$", "$")
+	}
 	return words
 }
 

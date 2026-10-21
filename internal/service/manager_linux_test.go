@@ -279,6 +279,63 @@ func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
+// TestSystemdRenderUnitEscapesTheDollarSign checks that a path with a dollar
+// sign reaches the process as it was written.
+//
+// The supervisor expands the environment of the unit in the command line of
+// the unit, so a dollar sign in a path would be rewritten before the process
+// sees it. A doubled dollar sign is the documented escape of a literal dollar
+// sign, so the unit carries the escaped form and the supervisor hands the
+// original path to the process.
+func TestSystemdRenderUnitEscapesTheDollarSign(t *testing.T) {
+	opts := systemdTestOptions(t, ScopeUser)
+	opts.Executable = "/opt/hf$desk/bin/hfdesk"
+	opts.Paths.ConfigFile = "/etc/hf$desk/hfdesk.json"
+	opts.Paths.StateDir = "/var/lib/hf$desk"
+	opts.Paths.LogDir = "/var/log/hf$desk"
+	opts.CacheDir = "/var/cache/hf$desk"
+	opts.HubDir = "/var/cache/hf$desk/hub"
+	opts.LocalDir = "/var/lib/models/hf$desk"
+
+	unit, err := renderUnit(opts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+
+	command := unitDirective(unit, "ExecStart")
+	if command == "" {
+		t.Fatalf("the unit has no ExecStart directive:\n%s", unit)
+	}
+	if !strings.Contains(command, "hf$$desk") {
+		t.Errorf("the command of the unit does not escape the dollar sign of the paths: %q", command)
+	}
+	if strings.Contains(command, "hf$desk") {
+		t.Errorf("the command of the unit holds an unescaped dollar sign: %q", command)
+	}
+
+	// The supervisor reconstructs the paths the process sees.
+	parsed := parseUnit(unit)
+	if parsed.ExecStart != opts.Executable {
+		t.Errorf("ExecStart = %q, want %q", parsed.ExecStart, opts.Executable)
+	}
+	wantArgs := RunArgs(opts)
+	if len(parsed.ExecArgs) != len(wantArgs) {
+		t.Fatalf("the arguments of the unit = %v, want %v", parsed.ExecArgs, wantArgs)
+	}
+	for i := range wantArgs {
+		if parsed.ExecArgs[i] != wantArgs[i] {
+			t.Errorf("the argument %d of the unit = %q, want %q", i, parsed.ExecArgs[i], wantArgs[i])
+		}
+	}
+
+	// The working directory is a setting of the unit and not a part of its
+	// command line: the supervisor does not expand the environment of the
+	// unit there, so the path stays as it was written.
+	if parsed.WorkingDirectory != opts.Paths.StateDir {
+		t.Errorf("WorkingDirectory = %q, want %q", parsed.WorkingDirectory, opts.Paths.StateDir)
+	}
+}
+
 func TestSystemdUnitPaths(t *testing.T) {
 	t.Run("user scope with XDG_CONFIG_HOME", func(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", "/tmp/hfdesk-xdg")
@@ -1893,6 +1950,58 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 	})
 }
 
+// TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance checks
+// that a directory inside the state directory of the instance is not checked
+// against the service account.
+//
+// The installation creates the state directory of the instance and grants it
+// to the account, so a directory inside it belongs to the account: the check
+// of the named directories must not refuse it. A directory outside of the
+// state directory is still checked, because the installation never grants it
+// to the account.
+func TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance(t *testing.T) {
+	other := systemdSecondAccount(t)
+	root := systemdTraversableTempDir(t)
+
+	// The state directory belongs to the account of the test, so the
+	// account of the check cannot write into it.
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatalf("create the state directory: %v", err)
+	}
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatalf("close the state directory: %v", err)
+	}
+
+	m := &systemdManager{scope: ScopeSystem}
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.Paths.StateDir = state
+	opts.CacheDir = filepath.Join(state, "cache")
+	opts.HubDir = filepath.Join(opts.CacheDir, "hub")
+	// The local directory lies inside the state directory of the instance:
+	// the installation grants the state directory to the account, so the
+	// account can use the local directory as well.
+	opts.LocalDir = filepath.Join(state, "output")
+
+	if err := m.checkServiceAccountAccess(opts, other); err != nil {
+		t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
+	}
+
+	// A directory outside of the state directory is still checked: the
+	// installation never grants it to the account.
+	foreign := filepath.Join(root, "foreign")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatalf("create the foreign directory: %v", err)
+	}
+	if err := os.Chmod(foreign, 0o700); err != nil {
+		t.Fatalf("close the foreign directory: %v", err)
+	}
+	opts.LocalDir = foreign
+	if err := m.checkServiceAccountAccess(opts, other); err == nil {
+		t.Error("checkServiceAccountAccess() = nil, want the refusal of a directory outside of the state directory of the instance")
+	}
+}
+
 // TestSystemdAccessCheckUsesTheEffectivePermission checks that the access
 // check of a directory the service account has to use is the effective one.
 //
@@ -2017,6 +2126,128 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 			t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory the account cannot reach")
 		}
 	})
+}
+
+// TestSystemdAccessCheckResolvesTheSymlinksOfThePath checks that the access
+// check judges the real location of a path.
+//
+// The kernel follows the symbolic links of a path before it uses it, so a
+// directory that is reached through a link is used by its real location. A
+// check that asked about the path as it was written would accept a directory
+// whose real location the account never reaches, and the instance would fail
+// with a permission error of the file system.
+//
+// The account of the check owns nothing of the test and is not a member of
+// the group of its directories, so the permissions of the other accounts
+// apply to it.
+func TestSystemdAccessCheckResolvesTheSymlinksOfThePath(t *testing.T) {
+	other := systemdSecondAccount(t)
+	root := systemdTraversableTempDir(t)
+
+	// The public directory is world writable, so the account could create
+	// a directory in it. The private directory is closed for everybody but
+	// its owner, so the account never reaches what is below it.
+	public := filepath.Join(root, "public")
+	if err := os.Mkdir(public, 0o777); err != nil {
+		t.Fatalf("create the public directory: %v", err)
+	}
+	if err := os.Chmod(public, 0o777); err != nil {
+		t.Fatalf("make the public directory world writable: %v", err)
+	}
+	private := filepath.Join(root, "private")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatalf("create the private directory: %v", err)
+	}
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatalf("close the private directory: %v", err)
+	}
+	data := filepath.Join(private, "data")
+	if err := os.Mkdir(data, 0o777); err != nil {
+		t.Fatalf("create the data directory: %v", err)
+	}
+	if err := os.Chmod(data, 0o777); err != nil {
+		t.Fatalf("make the data directory world writable: %v", err)
+	}
+
+	// The open directory is traversable by the account, so the real
+	// location of the directory below it is usable.
+	open := filepath.Join(root, "open")
+	if err := os.Mkdir(open, 0o755); err != nil {
+		t.Fatalf("create the open directory: %v", err)
+	}
+	openData := filepath.Join(open, "data")
+	if err := os.Mkdir(openData, 0o777); err != nil {
+		t.Fatalf("create the data directory of the open directory: %v", err)
+	}
+	if err := os.Chmod(openData, 0o777); err != nil {
+		t.Fatalf("make the data directory world writable: %v", err)
+	}
+
+	// The locked directory is closed for everybody but its owner, so the
+	// account never reaches the link in it.
+	locked := filepath.Join(root, "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatalf("create the locked directory: %v", err)
+	}
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatalf("close the locked directory: %v", err)
+	}
+	lockedLink := filepath.Join(locked, "cache")
+	if err := os.Symlink(filepath.Join("..", "open", "data"), lockedLink); err != nil {
+		t.Fatalf("create the link in the locked directory: %v", err)
+	}
+
+	// The links are the paths the user names: the cache points into the
+	// private directory, the models into the open one.
+	linked := filepath.Join(public, "cache")
+	if err := os.Symlink(filepath.Join("..", "private", "data"), linked); err != nil {
+		t.Fatalf("create the link into the private directory: %v", err)
+	}
+	linkedMissing := filepath.Join(public, "missing")
+	if err := os.Symlink(filepath.Join("..", "private", "new"), linkedMissing); err != nil {
+		t.Fatalf("create the link into the missing directory: %v", err)
+	}
+	openLink := filepath.Join(public, "models")
+	if err := os.Symlink(filepath.Join("..", "open", "data"), openLink); err != nil {
+		t.Fatalf("create the link into the open directory: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{
+			name:    "a link into a directory the account cannot reach",
+			path:    linked,
+			wantErr: true,
+		},
+		{
+			name:    "a link into a directory that does not exist yet below a directory the account cannot reach",
+			path:    linkedMissing,
+			wantErr: true,
+		},
+		{
+			name:    "a link the account cannot reach itself",
+			path:    lockedLink,
+			wantErr: true,
+		},
+		{
+			name: "a link into a directory the account can reach",
+			path: openLink,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkDirWritableByAccount(tc.path, other)
+			if tc.wantErr && err == nil {
+				t.Errorf("checkDirWritableByAccount(%q) = nil, want the refusal of the real location of the path", tc.path)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("checkDirWritableByAccount(%q) = %v, want nil for the real location of the path", tc.path, err)
+			}
+		})
+	}
 }
 
 // TestSystemdAccessCheckUsesTheSupplementaryGroups checks that the access
@@ -2180,6 +2411,59 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 		if _, err := os.Stat(dir.path); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("the refused installation created the %s %q: %v", dir.name, dir.path, err)
 		}
+	}
+}
+
+// TestSystemdInstallRefusesAControlCharacterInAPath checks that an
+// installation whose path carries a control character is refused before
+// anything is written.
+//
+// A unit file is a line based file: a newline in a path would end the
+// directive it is written in and start another one the installation never
+// wrote.
+func TestSystemdInstallRefusesAControlCharacterInAPath(t *testing.T) {
+	root := t.TempDir()
+	// The unit of the user scope lives in the configuration directory of
+	// the user, so the test points it at a directory of its own.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+
+	m := &systemdManager{scope: ScopeUser}
+	opts := InstallOptions{
+		Scope:      ScopeUser,
+		Executable: systemdTestExecutable(t),
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+		LocalDir: filepath.Join(root, "var", "lib", "hf\ndesk"),
+	}
+
+	err := m.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of a path with a control character")
+	}
+	if !strings.Contains(err.Error(), "control character") {
+		t.Errorf("Install() = %q, want the refusal of the control character", err)
+	}
+	if !strings.Contains(err.Error(), "local dir") {
+		t.Errorf("Install() = %q, want the name of the path in the refusal", err)
+	}
+
+	// The refusal happens before anything is written: no directory of the
+	// instance exists and no unit file was written.
+	for _, dir := range instanceDirs(opts) {
+		if _, err := os.Stat(dir.path); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the refused installation created the %s %q: %v", dir.name, dir.path, err)
+		}
+	}
+	path, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v, want nil", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation wrote the unit file %q: %v", path, err)
 	}
 }
 

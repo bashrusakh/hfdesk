@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -28,6 +29,21 @@ import (
 // cannot drift apart. The identity of the account stays with the platform
 // managers: how the account of a machine-wide instance is resolved is a
 // fact of the platform.
+//
+// The check judges the real location of a path. The kernel follows the
+// symbolic links of a path before it uses it, so a directory that is reached
+// through a link is used by its real location and not by the path of the
+// link: the check resolves the path and asks about the resolved directory
+// and the resolved ancestors of it. A check that asked about the path as it
+// was written would accept a directory whose real location the account never
+// reaches.
+
+// maxResolvedLinks is the number of symbolic links the resolution of a path
+// follows before it gives up.
+//
+// The kernel refuses a path with a link loop after a few links, so the
+// resolution refuses it as well instead of following it forever.
+const maxResolvedLinks = 40
 
 // accessAccount is the identity an access check runs for.
 type accessAccount struct {
@@ -42,6 +58,11 @@ type accessAccount struct {
 
 // accountCanUseDir reports whether the account can use the directory path.
 //
+// The check judges the real location of the path: the kernel follows the
+// symbolic links of a path before it uses it, so the permissions of the
+// resolved directory and the traversal of the resolved ancestors of it are
+// the ones that decide whether the account can use the directory.
+//
 // The account has to create entries in the directory: it needs the write and
 // the execute permission on it. A directory that does not exist yet is
 // checked through its nearest existing ancestor: the account has to be able
@@ -49,20 +70,29 @@ type accessAccount struct {
 //
 // Every directory above the target has to be traversable by the account: it
 // needs the execute permission on it, otherwise the account never reaches
-// the target.
+// the target. The directories of the path as it was written have to be
+// traversable as well: the kernel resolves the path part by part, so it
+// passes through them to reach the symbolic links of it.
 //
 // The answer is a plain yes or no. An error means that the directory could
 // not be read at all, which is a refusal as well.
 func accountCanUseDir(path string, account accessAccount) (bool, error) {
-	target := path
-	info, err := os.Stat(path)
+	// The real location of the path is the one the kernel uses, so the
+	// check judges it and not the path as it was written.
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return false, err
+	}
+
+	target := resolved
+	info, err := os.Stat(target)
 	switch {
 	case err == nil:
 		if !info.IsDir() {
 			return false, fmt.Errorf("it exists and is not a directory")
 		}
 	case errors.Is(err, fs.ErrNotExist):
-		ancestor, err := nearestExistingDir(path)
+		ancestor, err := nearestExistingDir(target)
 		if err != nil {
 			return false, err
 		}
@@ -81,9 +111,21 @@ func accountCanUseDir(path string, account accessAccount) (bool, error) {
 		return false, nil
 	}
 
-	// Every directory above the target has to be traversable, otherwise
-	// the account never reaches the target.
-	return accountCanTraverse(filepath.Dir(target), account)
+	// Every directory above the real location of the target has to be
+	// traversable, otherwise the account never reaches the target.
+	ok, err := accountCanTraverse(filepath.Dir(target), account)
+	if err != nil || !ok {
+		return ok, err
+	}
+
+	// The path as it was written has to be traversable as well: the
+	// kernel resolves it part by part, so it passes through the
+	// directories of the path to reach the symbolic links in it.
+	written, err := nearestExistingDir(path)
+	if err != nil {
+		return false, err
+	}
+	return accountCanTraverse(written, account)
 }
 
 // accountCanTraverse reports whether the account can pass through the
@@ -180,4 +222,84 @@ func nearestExistingDir(path string) (string, error) {
 		}
 		current = parent
 	}
+}
+
+// resolvePath returns the real location of the path.
+//
+// The kernel follows the symbolic links of a path before it uses it, so the
+// real location of the path is the one that decides whether the account can
+// use it. The resolution follows the links of the path part by part: a link
+// is replaced by its target and the parts that follow it stay behind it.
+//
+// The resolution stops at the first part of the path that does not exist:
+// the parts that are missing are appended to the real location of the path,
+// so the caller can tell a directory that is there from one that has to be
+// created.
+func resolvePath(path string) (string, error) {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		// An installation only ever names absolute paths, but a relative
+		// one is resolved against the working directory of the process, so
+		// the answer is always about a real location.
+		absolute, err := filepath.Abs(clean)
+		if err != nil {
+			return "", err
+		}
+		clean = absolute
+	}
+
+	resolved := string(filepath.Separator)
+	pending := pathComponents(clean)
+	links := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		candidate := filepath.Join(resolved, part)
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				return "", err
+			}
+			// The path does not exist from here on: the parts that are
+			// missing keep the location they were written with.
+			return filepath.Join(append([]string{resolved}, pending...)...), nil
+		}
+		pending = pending[1:]
+		if info.Mode()&fs.ModeSymlink == 0 {
+			resolved = candidate
+			continue
+		}
+		// The part is a symbolic link: the link is replaced by its
+		// target, and the parts that follow the link stay behind it. A
+		// relative target is resolved against the directory of the link.
+		links++
+		if links > maxResolvedLinks {
+			return "", fmt.Errorf("%q holds a symbolic link loop", path)
+		}
+		target, err := os.Readlink(candidate)
+		if err != nil {
+			return "", err
+		}
+		target = filepath.Clean(target)
+		if filepath.IsAbs(target) {
+			resolved = string(filepath.Separator)
+		}
+		pending = append(pathComponents(target), pending...)
+	}
+	return resolved, nil
+}
+
+// pathComponents splits a path into the parts below its root.
+//
+// The empty parts and the "." part name the directory itself and not a part
+// below it, so they are left out.
+func pathComponents(path string) []string {
+	parts := strings.Split(path, string(filepath.Separator))
+	filtered := parts[:0]
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return filtered
 }
