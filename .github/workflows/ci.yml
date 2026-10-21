@@ -84,3 +84,45 @@ jobs:
 
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
+
+      # The Windows desktop host is a second binary of HFDesk. Its defining
+      # property is the PE subsystem of the produced file: the console host
+      # stays a console subsystem executable and the desktop host is a GUI
+      # subsystem executable, so a desktop launch never opens a console
+      # window. The subsystem is a build time property, so CI checks it
+      # instead of trusting the build script.
+      #
+      # Not covered automatically: the notification area icon, the WebView2
+      # window and the interaction with them. They need an interactive
+      # Windows session, which a CI agent does not provide. The PE subsystem
+      # assertion is what mechanically guarantees "no console window" for
+      # the desktop launch.
+      - name: Install rsrc
+        run: |
+          go install github.com/akavel/rsrc@v0.10.2
+          echo "$(go env GOPATH)\bin" >> $env:GITHUB_PATH
+
+      - name: Build the Windows artifacts
+        env:
+          VERSION: ci
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+          go build -ldflags "-s -w -X main.Version=$env:VERSION" -o hfdesk_windows_amd64_ci.exe ./cmd/hfdesk
+          go build -ldflags "-s -w -X main.Version=$env:VERSION -H=windowsgui" -o hfdesk-desktop_windows_amd64_ci.exe ./cmd/hfdesk-desktop
+
+      - name: Check the PE subsystem of the Windows artifacts
+        run: |
+          go run .github/scripts/pesubsystem.go hfdesk_windows_amd64_ci.exe 3
+          go run .github/scripts/pesubsystem.go hfdesk-desktop_windows_amd64_ci.exe 2
+
+      - name: Cleanup Windows resources
+        run: |
+          Remove-Item -Force -ErrorAction SilentlyContinue cmd/hfdesk/resource_windows_amd64.syso, cmd/hfdesk/hfdesk.ico, cmd/hfdesk-desktop/resource_windows_amd64.syso
+
+      # The desktop host without a visible desktop: the single instance lock
+      # and the server lifecycle are exercised, the tray and the WebView2
+      # window are not, because they need an interactive session.
+      - name: Test the desktop host lifecycle
+        run: go test ./internal/desktop -count=1 -v

@@ -5,10 +5,12 @@ on:
     paths:
       - '.github/scripts/release-version.sh'
       - '.github/scripts/test-release-version.sh'
+      - '.github/scripts/pesubsystem.go'
       - '.github/workflows/release.yml'
       - '.github/workflows/beta-release-validation.yml'
       - 'packaging/rpm/**'
       - 'cmd/hfdesk/**'
+      - 'cmd/hfdesk-desktop/**'
       - 'CHANGELOG.md'
 
 permissions:

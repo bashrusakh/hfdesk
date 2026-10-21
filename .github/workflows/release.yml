@@ -100,11 +100,16 @@ jobs:
         if: ${{ matrix.os == 'windows' }}
         run: go install github.com/akavel/rsrc@v0.10.2
 
-      - name: Generate Windows icon resource (Windows only)
+      # The icon is generated once and embedded into both Windows binaries.
+      # Every package needs its own resource file: the linker picks up the
+      # .syso file of the package it builds, so the desktop host cannot
+      # borrow the resource of the console host.
+      - name: Generate Windows icon resources (Windows only)
         if: ${{ matrix.os == 'windows' }}
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
 
       - name: Build binary
         env:
@@ -116,16 +121,40 @@ jobs:
             -o hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
             ./cmd/hfdesk
 
+      # The desktop host is the second Windows binary. It is built with the
+      # GUI subsystem, so it never opens a console window: the subsystem is a
+      # property of the produced file, and the CI check reads it out of the
+      # PE header of the artifact.
+      - name: Build desktop binary (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }} -H=windowsgui" \
+            -o hfdesk-desktop_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
+            ./cmd/hfdesk-desktop
+
       - name: Cleanup Windows resources (Windows only)
         if: ${{ matrix.os == 'windows' }}
         run: |
           rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
+          rm -f cmd/hfdesk-desktop/resource_windows_amd64.syso
 
       - name: Upload raw binary
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
+
+      - name: Upload desktop binary
+        if: ${{ matrix.os == 'windows' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: hfdesk-desktop_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
           make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
 
   linux-desktop:

@@ -29,10 +29,14 @@ jobs:
       - name: Install rsrc
         run: go install github.com/akavel/rsrc@v0.10.2
 
-      - name: Generate Windows icon resource
+      # The icon is generated once and embedded into both Windows binaries.
+      # Every package needs its own resource file: the linker picks up the
+      # .syso file of the package it builds.
+      - name: Generate Windows icon resources
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
 
       - name: Build
         env:
@@ -46,13 +50,35 @@ jobs:
             -o hfdesk_windows_amd64_${VERSION}.exe \
             ./cmd/hfdesk
 
+      # The desktop host is the second Windows binary. It is built with the
+      # GUI subsystem, so it never opens a console window.
+      - name: Build desktop
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          go build -ldflags="-X main.Version=${VERSION} -H=windowsgui" \
+            -trimpath \
+            -o hfdesk-desktop_windows_amd64_${VERSION}.exe \
+            ./cmd/hfdesk-desktop
+
       - name: Cleanup Windows resources
         run: |
           rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
+          rm -f cmd/hfdesk-desktop/resource_windows_amd64.syso
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: hfdesk-windows-amd64
           path: hfdesk_windows_amd64_*.exe
+          retention-days: 7
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfdesk-desktop-windows-amd64
+          path: hfdesk-desktop_windows_amd64_*.exe
           retention-days: 7
