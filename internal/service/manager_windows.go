@@ -145,7 +145,10 @@ func newPlatformManager(scope Scope) (Manager, error) {
 //
 // Every failure of the installation happens before the registration is
 // written, so a failed installation never leaves a half-configured service
-// behind.
+// behind. A failure removes the directories the installation created as
+// well, so a refused attempt leaves the machine as it was: the directories
+// it created are removed while they are still empty, and a directory that
+// existed before is never touched.
 func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := ValidateInstallOptions(opts); err != nil {
 		return err
@@ -156,23 +159,44 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := requireElevated("an installation"); err != nil {
 		return err
 	}
-	if err := PrepareDirs(opts); err != nil {
+	// The directories the installation is about to create are remembered
+	// before they are created, so the installation knows which of them it
+	// owns. The list holds the directories of the instance and the
+	// directories the installation reuses: the preflight creates the
+	// missing ones as well, so they belong to the installation too.
+	dirs := scmInstallDirs(opts)
+	created := make(map[string][]string, len(dirs))
+	for _, dir := range dirs {
+		created[dir] = createdDirs(dir)
+	}
+	order := createdDirOrder(opts, created)
+	// A failed installation removes the directories it created. The
+	// cleanup is best effort: it never replaces the error of the
+	// installation, which is what the caller gets.
+	fail := func(err error) error {
+		removeCreatedDirs(order)
 		return err
+	}
+	if err := PrepareDirs(opts); err != nil {
+		// The preparation may have created some of the directories
+		// before it failed: they are removed again, so a failed attempt
+		// leaves the machine as it was.
+		return fail(err)
 	}
 	// The state of the instance is restricted before the reused
 	// directories are checked: the directories the instance creates
 	// inside its own directories inherit the restrictive descriptor, so
 	// the account of the instance can work with them.
 	if err := restrictInstanceState(opts); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := m.preflight(opts); err != nil {
-		return err
+		return fail(err)
 	}
 
 	manager, err := mgr.Connect()
 	if err != nil {
-		return fmt.Errorf("service: connect to the service control manager: %w", err)
+		return fail(fmt.Errorf("service: connect to the service control manager: %w", err))
 	}
 	defer manager.Disconnect()
 
@@ -186,18 +210,18 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 		// one service.
 		defer handle.Close()
 		if err := handle.UpdateConfig(config); err != nil {
-			return fmt.Errorf("service: update the registration of %s: %w", ServiceName, err)
+			return fail(fmt.Errorf("service: update the registration of %s: %w", ServiceName, err))
 		}
 		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
 		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
 	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
 		handle, err = manager.CreateService(ServiceName, opts.Executable, config, RunArgs(opts)...)
 		if err != nil {
-			return fmt.Errorf("service: register %s: %w", ServiceName, err)
+			return fail(fmt.Errorf("service: register %s: %w", ServiceName, err))
 		}
 		defer handle.Close()
 	default:
-		return fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
+		return fail(fmt.Errorf("service: open the registration of %s: %w", ServiceName, err))
 	}
 
 	// The event log source carries the diagnostics of the instance. A
@@ -209,6 +233,119 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 		logEvent(eventLogWarning, fmt.Sprintf("hfdesk: the event log source of %s was not registered: %v", ServiceName, err))
 	}
 	return nil
+}
+
+// scmInstallDirs returns the directories an installation creates, in the
+// order it creates them.
+//
+// The instance owns three directories: the directory of the config file, the
+// state directory and the log directory. The preflight creates the
+// directories the installation reuses afterwards: the cache root, the hub
+// directory and the local output directory.
+//
+// The list holds every path once: the config file can live in the state
+// directory of the instance, and the hub directory can live in the cache
+// root.
+func scmInstallDirs(opts InstallOptions) []string {
+	dirs := []string{
+		filepath.Dir(opts.Paths.ConfigFile),
+		opts.Paths.StateDir,
+		opts.Paths.LogDir,
+		opts.CacheDir,
+		opts.HubDir,
+		opts.LocalDir,
+	}
+
+	unique := make([]string, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, dir := range dirs {
+		if dir == "" || dir == "." || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		unique = append(unique, dir)
+	}
+	return unique
+}
+
+// createdDirs returns the directories that do not exist yet on the way to
+// the path, from the top down.
+//
+// The list holds the path itself when it is missing: it is the set of
+// directories an installation creates for the path. The list is read before
+// the directories are created, so the installation knows which of them it
+// owns.
+func createdDirs(path string) []string {
+	var missing []string
+	current := filepath.Clean(path)
+	for {
+		if _, err := os.Stat(current); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	// The list was collected from the bottom up, the directories are
+	// created from the top down.
+	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
+		missing[i], missing[j] = missing[j], missing[i]
+	}
+	return missing
+}
+
+// createdDirOrder returns the directories an installation creates, in the
+// order it creates them.
+//
+// The map holds the directories of every directory of the installation. The
+// directories are created in the order of scmInstallDirs (the directories of
+// the instance first, the directories the installation reuses afterwards)
+// and from the top down inside each of them, so the list is the order of the
+// creation.
+//
+// A directory that several directories need is listed once: the first
+// directory that needed it is the one that created it.
+func createdDirOrder(opts InstallOptions, created map[string][]string) []string {
+	var order []string
+	seen := make(map[string]bool, len(created))
+	for _, dir := range scmInstallDirs(opts) {
+		for _, path := range created[dir] {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			order = append(order, path)
+		}
+	}
+	return order
+}
+
+// removeCreatedDirs removes the directories an installation created.
+//
+// The directories are removed in the reverse order of their creation, so a
+// parent is only removed after its children. A directory that is not empty is
+// kept: the removal never deletes data and it never walks into a directory.
+//
+// The removal is best effort: a failure of the removal is ignored, so the
+// original failure of the installation stays the error the caller gets.
+func removeCreatedDirs(dirs []string) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		path := dirs[i]
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() {
+			// The directory is gone already, or it is not a directory
+			// any more: nothing is removed, so no file is ever deleted.
+			continue
+		}
+		// A directory that holds something is kept: the removal of such
+		// a directory would delete what it holds.
+		_ = os.Remove(path)
+	}
 }
 
 // Uninstall removes the registration of the instance.
@@ -1221,7 +1358,13 @@ func buildSCMConfig(opts InstallOptions) mgr.Config {
 		DisplayName:      scmDisplayName,
 		Description:      scmDescription,
 		ServiceStartName: scmLocalServiceAccount,
-		BinaryPathName:   scmCommandLine(opts),
+		// BinaryPathName is the command line of the update path: the
+		// update of a registration sends the field to the service
+		// control manager. The create path ignores the field: the
+		// service control manager rebuilds the command line of a new
+		// registration from the executable and the arguments, so the
+		// field does not control the create path.
+		BinaryPathName: scmCommandLine(opts),
 	}
 }
 

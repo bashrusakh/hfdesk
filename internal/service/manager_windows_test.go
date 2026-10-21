@@ -1161,3 +1161,399 @@ func scmTestSetDACL(t *testing.T, path, sddl string) {
 		t.Fatalf("the access control list %q cannot be applied to %q: %v", sddl, path, err)
 	}
 }
+
+// scmTestInstallOptions returns the options of an installation whose
+// directories live below the given root.
+//
+// The executable is a program of the operating system: the preflight needs a
+// regular file it can stat. The cache root lives in the state directory of
+// the instance, the way the default paths of a machine-wide instance build
+// it.
+func scmTestInstallOptions(t *testing.T, root string) InstallOptions {
+	t.Helper()
+	executable := filepath.Join("C:\\Windows", "System32", "cmd.exe")
+	if _, err := os.Stat(executable); err != nil {
+		t.Skipf("the test program %s is not available: %v", executable, err)
+	}
+	return InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: executable,
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+		CacheDir: filepath.Join(root, "var", "lib", "hfdesk", "cache"),
+		HubDir:   filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
+		LocalDir: filepath.Join(root, "models"),
+	}
+}
+
+// scmTestDenyInstanceIdentityDACL returns a descriptor that grants the
+// machine, its administrators and the account of the test the access, and
+// the account of the instance none.
+//
+// A directory with this descriptor is refused by the preflight: the account
+// the instance runs as cannot work with it.
+func scmTestDenyInstanceIdentityDACL(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t))
+}
+
+// scmTestAllowInstanceIdentityDACL returns a descriptor that grants the
+// machine, its administrators, the account of the instance and the account
+// of the test the access.
+//
+// A directory with this descriptor passes the preflight: the account the
+// instance runs as can work with it.
+func scmTestAllowInstanceIdentityDACL(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("%s(A;OICI;FA;;;%s)", scmStateSDDL(), scmTestCurrentUserSID(t))
+}
+
+// scmTestSecurity returns the owner and the permissions of a path.
+//
+// The owner is the account that owns the path, the permissions are the
+// security descriptor of the path in its SDDL form.
+func scmTestSecurity(t *testing.T, path string) (string, string) {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		t.Fatalf("the security descriptor of %q cannot be read: %v", path, err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		t.Fatalf("the owner of %q cannot be read: %v", path, err)
+	}
+	if owner == nil {
+		t.Fatalf("the owner of %q is unknown", path)
+	}
+	return owner.String(), sd.String()
+}
+
+// scmTestOwnerAndMode returns the owner and the mode of a path.
+//
+// The owner is the account that owns the path, the mode are the permission
+// bits of the path.
+func scmTestOwnerAndMode(t *testing.T, path string) (string, os.FileMode) {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		t.Fatalf("the owner of %q cannot be read: %v", path, err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		t.Fatalf("the owner of %q cannot be read: %v", path, err)
+	}
+	if owner == nil {
+		t.Fatalf("the owner of %q is unknown", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the mode of %q cannot be read: %v", path, err)
+	}
+	return owner.String(), info.Mode().Perm()
+}
+
+// scmTestRefuseLocalDir turns the local directory of an installation into a
+// directory the account of the instance cannot reach.
+//
+// The preflight refuses the installation when it reaches the local
+// directory, so the installation fails after the directories of the instance
+// were created: the point a failed installation has to clean up.
+func scmTestRefuseLocalDir(t *testing.T, opts InstallOptions) {
+	t.Helper()
+	if err := os.MkdirAll(opts.LocalDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", opts.LocalDir, err)
+	}
+	scmTestSetDACL(t, opts.LocalDir, scmTestDenyInstanceIdentityDACL(t))
+}
+
+// TestSCMCreatedDirOrder checks the order of the directories a failed
+// installation removes: the directories are listed in the order they are
+// created, so a parent is always removed after its children.
+//
+// The directories of the instance come first, the directories the
+// installation reuses come afterwards: the preflight creates them once the
+// directories of the instance exist.
+func TestSCMCreatedDirOrder(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	dirs := scmInstallDirs(opts)
+	created := make(map[string][]string, len(dirs))
+	for _, dir := range dirs {
+		created[dir] = createdDirs(dir)
+	}
+	order := createdDirOrder(opts, created)
+
+	want := []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
+		filepath.Join(root, "models"),
+	}
+	if strings.Join(order, "\n") != strings.Join(want, "\n") {
+		t.Errorf("createdDirOrder() =\n%s\nwant\n%s", strings.Join(order, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestSCMFailedInstallRemovesTheDirectoriesItCreated checks that a failed
+// installation removes the directories it created, so a failed attempt
+// leaves the machine as it was.
+//
+// The installation is refused by the preflight: the local directory cannot
+// be reached by the account of the instance. The refusal happens after the
+// directories of the instance were created, so the cleanup has to remove
+// them again.
+func TestSCMFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+	scmTestRefuseLocalDir(t, opts)
+
+	service := &scmManager{scope: ScopeSystem}
+	if err := service.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install() = nil, want the refusal of the local directory")
+	}
+
+	// Every directory the installation created is gone again: the cache
+	// root of the instance is removed before the state directory that
+	// holds it.
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q is still there after the failed installation (stat error: %v)", dir, err)
+		}
+	}
+}
+
+// TestSCMFailedInstallKeepsADirectoryThatExistedBefore checks that a failed
+// installation never removes a directory that existed before it: such a
+// directory belongs to whoever owns it.
+//
+// The local directory is a directory the installation reuses: the
+// installation never describes it, so its owner and its permissions are the
+// ones it had. The config directory of the instance is a directory the
+// installation owns: it is still there as well, with the owner it had. Its
+// descriptor is the restrictive one of the instance, because the
+// installation restricts the directories of the instance before it checks the
+// directories it reuses.
+func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+	scmTestRefuseLocalDir(t, opts)
+
+	// The config directory of the instance existed before the
+	// installation as well.
+	configDir := filepath.Dir(opts.Paths.ConfigFile)
+	if err := os.MkdirAll(configDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", configDir, err)
+	}
+	configOwner, configMode := scmTestOwnerAndMode(t, configDir)
+
+	owner, permissions := scmTestSecurity(t, opts.LocalDir)
+
+	service := &scmManager{scope: ScopeSystem}
+	if err := service.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install() = nil, want the refusal of the local directory")
+	}
+
+	// The directory the installation reuses is still there, with the
+	// owner and the permissions it had.
+	info, err := os.Stat(opts.LocalDir)
+	if err != nil {
+		t.Fatalf("the local directory %q is gone after the failed installation: %v", opts.LocalDir, err)
+	}
+	if !info.IsDir() {
+		t.Errorf("the path %q is not a directory after the failed installation", opts.LocalDir)
+	}
+	gotOwner, gotPermissions := scmTestSecurity(t, opts.LocalDir)
+	if gotOwner != owner {
+		t.Errorf("the owner of the local directory %q = %q, want %q", opts.LocalDir, gotOwner, owner)
+	}
+	if gotPermissions != permissions {
+		t.Errorf("the permissions of the local directory %q = %q, want %q", opts.LocalDir, gotPermissions, permissions)
+	}
+
+	// The directory of the instance that existed before the installation
+	// is still there as well, with the owner and the mode it had.
+	if _, err := os.Stat(configDir); err != nil {
+		t.Errorf("the config directory %q is gone after the failed installation: %v", configDir, err)
+	}
+	gotConfigOwner, gotConfigMode := scmTestOwnerAndMode(t, configDir)
+	if gotConfigOwner != configOwner {
+		t.Errorf("the owner of the config directory %q = %q, want %q", configDir, gotConfigOwner, configOwner)
+	}
+	if gotConfigMode != configMode {
+		t.Errorf("the mode of the config directory %q = %v, want %v", configDir, gotConfigMode, configMode)
+	}
+}
+
+// TestSCMRemoveCreatedDirsKeepsADirectoryThatHoldsData checks that the
+// cleanup of a failed installation never deletes data: a directory that
+// holds something is kept, and the empty directories around it are removed.
+//
+// The directory that holds data is checked on the cleanup itself: an
+// installation writes no file into the directories it creates, so a
+// directory that holds something is a directory that holds the data of
+// somebody else.
+func TestSCMRemoveCreatedDirsKeepsADirectoryThatHoldsData(t *testing.T) {
+	root := t.TempDir()
+	holding := filepath.Join(root, "holding")
+	if err := os.Mkdir(holding, 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	marker := filepath.Join(holding, "marker")
+	if err := os.WriteFile(marker, []byte("data"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+	empty := filepath.Join(root, "empty")
+	if err := os.Mkdir(empty, 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+
+	removeCreatedDirs([]string{holding, empty})
+
+	// The directory that holds data and the file in it are still there.
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the file of the directory that holds data is gone: %v", err)
+	}
+	if _, err := os.Stat(holding); err != nil {
+		t.Errorf("the directory %q that holds data is gone: %v", holding, err)
+	}
+	// The empty directory is gone.
+	if _, err := os.Stat(empty); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the empty directory %q is still there (stat error: %v)", empty, err)
+	}
+}
+
+// TestSCMFailedInstallReportsTheOriginalError checks that the cleanup of a
+// failed installation never replaces the error of the installation: the
+// caller gets the refusal of the preflight itself.
+func TestSCMFailedInstallReportsTheOriginalError(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+	scmTestRefuseLocalDir(t, opts)
+
+	// The refusal of the preflight is the error the caller gets.
+	want := preflightDataPath("local dir", opts.LocalDir)
+	if want == nil {
+		t.Fatal("the local directory is usable by the account of the instance, the test cannot fail the installation")
+	}
+
+	service := &scmManager{scope: ScopeSystem}
+	err := service.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the local directory")
+	}
+	if err.Error() != want.Error() {
+		t.Errorf("Install() = %q, want %q", err, want)
+	}
+}
+
+// TestSCMSuccessfulInstallKeepsItsDirectories checks that a successful
+// installation keeps the directories it created: the cleanup of a failed
+// installation never touches the directories of an instance that is
+// installed.
+//
+// The test registers the instance in the service control manager of the
+// machine, so it needs an elevated shell. The registration never survives
+// the test.
+func TestSCMSuccessfulInstallKeepsItsDirectories(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	// A registration that exists already belongs to the machine and not
+	// to this test: it is never touched here.
+	state, err := scmRegistrationStateOf()
+	if err != nil {
+		t.Skipf("the service control manager is not available: %v", err)
+	}
+	if state != scmRegistrationAbsent {
+		t.Skipf("%s is registered, the test would touch a real installation", ServiceName)
+	}
+
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+	// The local directory has to be usable by the account of the
+	// instance: the preflight refuses the installation otherwise.
+	if err := os.MkdirAll(opts.LocalDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", opts.LocalDir, err)
+	}
+	scmTestSetDACL(t, opts.LocalDir, scmTestAllowInstanceIdentityDACL(t))
+
+	// The registration never survives the test.
+	t.Cleanup(func() {
+		cleanupManager, err := mgr.Connect()
+		if err != nil {
+			return
+		}
+		defer cleanupManager.Disconnect()
+		handle, err := cleanupManager.OpenService(ServiceName)
+		if err != nil {
+			return
+		}
+		defer handle.Close()
+		_ = handle.Delete()
+	})
+
+	service := &scmManager{scope: ScopeSystem}
+	if err := service.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache"),
+		filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+		filepath.Join(root, "models"),
+	} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Errorf("the directory %q is gone after the successful installation: %v", dir, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("the path %q is not a directory after the successful installation", dir)
+		}
+	}
+}
