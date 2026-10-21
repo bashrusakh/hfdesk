@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -489,11 +490,7 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 		status.State = StateStopped
 		status.Detail = fmt.Sprintf("%s is not loaded into %s", launchdLabel(), m.domain())
 	} else {
-		status.State = parseLaunchdPrint(output)
-		if status.State == StateFailed {
-			_, exitCode, _ := launchdPrintFields(output)
-			status.Detail = fmt.Sprintf("the instance exited with the status %d", exitCode)
-		}
+		status.State, status.Detail = launchdStatusState(m.target(), output)
 	}
 
 	// A registration that points at a program that is gone is broken: the
@@ -1131,7 +1128,7 @@ func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 			return nil
 		}
 		state, _, current := launchdPrintFields(output)
-		if state != "running" {
+		if !launchdJobRunning(state, current) {
 			return nil
 		}
 		if pid > 0 && current != pid {
@@ -1774,6 +1771,39 @@ func (r plistRegistration) paths() runtimepaths.Paths {
 	}
 }
 
+// launchdStatusState maps the output of "launchctl print" to the state of the
+// instance and to the detail of the status.
+//
+// A job that runs is running, a job that exited with a non-zero status
+// failed, and a job that is not running and that exited cleanly is stopped.
+//
+// The output of launchd is not an API, so a state line of a release that
+// this build does not know is read through the process of the job: launchd
+// reports the pid of the live process of a job that runs. A job that does
+// not run, that exited cleanly and whose state this build does not know is
+// reported as unknown, and the detail carries what the supervisor reported,
+// so an administrator and a failing test see the same thing.
+func launchdStatusState(target, output string) (State, string) {
+	state := parseLaunchdPrint(output)
+	switch state {
+	case StateFailed:
+		_, exitCode, _ := launchdPrintFields(output)
+		return state, fmt.Sprintf("the instance exited with the status %d", exitCode)
+	case StateUnknown:
+		_, exitCode, pid := launchdPrintFields(output)
+		switch {
+		case pid > 0 && launchdProcessAlive(pid):
+			return StateRunning, fmt.Sprintf("launchctl print %s reported no state, but the process %d of the instance is alive", target, pid)
+		case exitCode != 0:
+			return StateFailed, fmt.Sprintf("the instance exited with the status %d", exitCode)
+		default:
+			return state, launchdUnknownStateDetail(target, output)
+		}
+	default:
+		return state, ""
+	}
+}
+
 // parseLaunchdPrint maps the output of "launchctl print" to the state of the
 // instance.
 //
@@ -1781,10 +1811,10 @@ func (r plistRegistration) paths() runtimepaths.Paths {
 // status: such a job failed.
 func parseLaunchdPrint(output string) State {
 	state, exitCode, _ := launchdPrintFields(output)
-	switch state {
+	switch strings.ToLower(state) {
 	case "running":
 		return StateRunning
-	case "exited", "not running":
+	case "exited", "not running", "stopped":
 		if exitCode != 0 {
 			return StateFailed
 		}
@@ -1798,23 +1828,183 @@ func parseLaunchdPrint(output string) State {
 
 // launchdPrintFields extracts the state, the last exit code and the process
 // id from the output of "launchctl print".
+//
+// The output of "launchctl print" is not an API: Apple documents that it may
+// change from release to release without warning. The fields are therefore
+// read defensively. A line is trimmed, the key and the value are separated
+// at the first "=", the key may be quoted, the value may be quoted and it
+// may end with a semicolon, and a field is looked for in the whole output:
+// a state of a nested block of the output is a state of the job as well.
+//
+// The first occurrence of a field wins: the properties of the job itself are
+// printed before the nested dictionaries of the output, so the state of the
+// job is the first state of the output.
 func launchdPrintFields(output string) (state string, exitCode int, pid int) {
+	var haveState, haveExit, havePID bool
 	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "state = "):
-			state = strings.TrimSpace(strings.TrimPrefix(line, "state = "))
-		case strings.HasPrefix(line, "last exit code = "):
-			code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "last exit code = ")))
-			if err == nil {
-				exitCode = code
+		key, value, ok := launchdPrintPair(line)
+		if !ok {
+			continue
+		}
+		switch launchdPrintKey(key) {
+		case "state":
+			if !haveState {
+				state, haveState = value, true
 			}
-		case strings.HasPrefix(line, "pid = "):
-			value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
-			if err == nil {
-				pid = value
+		case "pid":
+			if !havePID {
+				if number, err := strconv.Atoi(value); err == nil {
+					pid, havePID = number, true
+				}
+			}
+		case "lastexitcode", "lastexitstatus":
+			if !haveExit {
+				if code, err := strconv.Atoi(value); err == nil {
+					exitCode, haveExit = code, true
+				}
 			}
 		}
 	}
 	return state, exitCode, pid
+}
+
+// launchdPrintPair splits a line of the output of "launchctl print" into its
+// key and its value.
+//
+// The output is not a property list, but it borrows the shape of one: the
+// key and the value are separated by "=", the key may be quoted, the value
+// may be quoted and it may end with a semicolon. A line without a key or
+// without a value is not a field.
+func launchdPrintPair(line string) (key, value string, ok bool) {
+	line = strings.TrimSpace(line)
+	sep := strings.Index(line, "=")
+	if sep < 0 {
+		return "", "", false
+	}
+	key = strings.Trim(strings.TrimSpace(line[:sep]), `"`)
+	value = strings.TrimSpace(line[sep+1:])
+	value = strings.TrimSpace(strings.TrimSuffix(value, ";"))
+	value = strings.Trim(value, `"`)
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+// launchdPrintKey normalizes the key of a field of the output of "launchctl
+// print".
+//
+// The keys of the output are lower case and separated by spaces ("last exit
+// code"), the keys of a property list are not ("LastExitStatus"). The spaces
+// and the underscores are removed and the case is ignored, so a key of the
+// output and a key of a property list name the same field.
+func launchdPrintKey(key string) string {
+	key = strings.ToLower(key)
+	key = strings.ReplaceAll(key, " ", "")
+	key = strings.ReplaceAll(key, "_", "")
+	return key
+}
+
+// launchdJobRunning reports whether the job of the output of "launchctl
+// print" runs.
+//
+// A job runs when launchd reports the state "running" or when launchd
+// reports the pid of a live process: a state line of a release that this
+// build does not know must not hide a running instance.
+func launchdJobRunning(state string, pid int) bool {
+	if strings.EqualFold(strings.TrimSpace(state), "running") {
+		return true
+	}
+	return pid > 0 && launchdProcessAlive(pid)
+}
+
+// launchdProcessAlive reports whether the process with the given id exists.
+//
+// A process of another user cannot be signalled: the check of such a process
+// ends in a permission error, and the process exists.
+func launchdProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
+}
+
+// launchdUnknownStateDetail describes the output of "launchctl print" for an
+// instance whose state could not be read.
+//
+// The detail carries what the supervisor reported, so an administrator and a
+// failing test see the same thing. The excerpt is short: the output of
+// launchd is not an API, and a status is a line of a terminal.
+func launchdUnknownStateDetail(target, output string) string {
+	return fmt.Sprintf("the state of %s is unknown: launchctl print %s reported: %s",
+		launchdLabel(), target, launchdPrintExcerpt(output, launchdStateDetailLimit))
+}
+
+// launchdStateDetailLimit is the maximum number of characters of the output
+// of "launchctl print" that the detail of a status carries.
+const launchdStateDetailLimit = 400
+
+// launchdPrintExcerpt returns the output of "launchctl print" as a single
+// line of at most limit characters.
+//
+// The empty lines are dropped and the lines are joined with a semicolon, so
+// the excerpt stays one line. The value of an environment variable whose
+// name looks like a secret is removed: the registration of HFDesk carries no
+// credential, but the output of launchd is not under the control of HFDesk.
+func launchdPrintExcerpt(output string, limit int) string {
+	lines := make([]string, 0, 8)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines = append(lines, launchdRedactSecret(line))
+	}
+	excerpt := strings.Join(lines, "; ")
+	if runes := []rune(excerpt); len(runes) > limit {
+		excerpt = string(runes[:limit]) + "..."
+	}
+	return excerpt
+}
+
+// launchdSecretMarkers are the parts of the name of an environment variable
+// whose value must not reach a status detail.
+var launchdSecretMarkers = []string{
+	"token",
+	"secret",
+	"password",
+	"passwd",
+	"credential",
+	"apikey",
+	"privatekey",
+}
+
+// launchdRedactSecret removes the value of an environment variable whose name
+// looks like a secret.
+//
+// The name of the variable is the part of the line before the separator, so
+// only the value of a variable with a secret looking name is removed.
+func launchdRedactSecret(line string) string {
+	arrow := strings.Index(line, "=>")
+	sep := arrow
+	if sep < 0 {
+		sep = strings.Index(line, "=")
+	}
+	if sep < 0 {
+		return line
+	}
+	name := strings.ToLower(line[:sep])
+	for _, marker := range launchdSecretMarkers {
+		if strings.Contains(name, marker) {
+			if arrow >= 0 {
+				return line[:arrow+2] + " <redacted>"
+			}
+			return line[:sep+1] + " <redacted>"
+		}
+	}
+	return line
 }

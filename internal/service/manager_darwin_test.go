@@ -394,6 +394,31 @@ func TestParseLaunchdPrint(t *testing.T) {
 			want:   StateRunning,
 		},
 		{
+			name:   "a running job with a quoted state",
+			output: "com.hfdesk.hfdesk = {\n\t\"state\" = \"running\";\n\t\"pid\" = 4711;\n}",
+			want:   StateRunning,
+		},
+		{
+			name:   "a running job with a state in a nested block",
+			output: "com.hfdesk.hfdesk = {\n\tactive count = 1\n\tjob = {\n\t\tstate = running\n\t\tpid = 4711\n\t}\n}",
+			want:   StateRunning,
+		},
+		{
+			name:   "a running job with a state that ends with a semicolon",
+			output: "com.hfdesk.hfdesk = {\n\tstate = running;\n}",
+			want:   StateRunning,
+		},
+		{
+			name:   "a running job with a capitalized state",
+			output: "com.hfdesk.hfdesk = {\n\tState = running\n}",
+			want:   StateRunning,
+		},
+		{
+			name:   "the state of the job wins over a nested state",
+			output: "com.hfdesk.hfdesk = {\n\tstate = running\n\tjob = {\n\t\tstate = not running\n\t}\n}",
+			want:   StateRunning,
+		},
+		{
 			name:   "a job that is not running",
 			output: "com.hfdesk.hfdesk = {\n\tstate = not running\n\tlast exit code = 0\n}",
 			want:   StateStopped,
@@ -445,6 +470,220 @@ func TestParseLaunchdPrint(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := parseLaunchdPrint(test.output); got != test.want {
 				t.Errorf("parseLaunchdPrint() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestLaunchdPrintFieldsReadsTheVariantsOfTheOutput checks the fields that
+// are read from the output of "launchctl print".
+//
+// The output of launchd is not an API: the fields are read defensively, so
+// the fields of every known spelling are found.
+func TestLaunchdPrintFieldsReadsTheVariantsOfTheOutput(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		state    string
+		exitCode int
+		pid      int
+	}{
+		{
+			name:   "the fields of a running job",
+			output: "com.hfdesk.hfdesk = {\n\tstate = running\n\tpid = 4711\n}",
+			state:  "running",
+			pid:    4711,
+		},
+		{
+			name:   "the fields of a quoted job",
+			output: "com.hfdesk.hfdesk = {\n\t\"state\" = \"not running\";\n\t\"pid\" = 4711;\n}",
+			state:  "not running",
+			pid:    4711,
+		},
+		{
+			name:     "the fields of a job in a nested block",
+			output:   "com.hfdesk.hfdesk = {\n\tjob = {\n\t\tstate = exited\n\t\tlast exit code = 78\n\t}\n}",
+			state:    "exited",
+			exitCode: 78,
+		},
+		{
+			name:     "the exit code of a property list",
+			output:   "{\n\"Label\" = \"com.hfdesk.hfdesk\";\n\"LastExitStatus\" = 3;\n};",
+			exitCode: 3,
+		},
+		{
+			name:     "the exit status of the output",
+			output:   "com.hfdesk.hfdesk = {\n\tstate = exited\n\tlast exit status = 4\n}",
+			state:    "exited",
+			exitCode: 4,
+		},
+		{
+			name:   "the default state is not the state",
+			output: "com.hfdesk.hfdesk = {\n\tstate = running\n\tdefault state = stopped\n}",
+			state:  "running",
+		},
+		{
+			name:   "no field at all",
+			output: "com.hfdesk.hfdesk = {\n\tactive count = 0\n}",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, exitCode, pid := launchdPrintFields(test.output)
+			if state != test.state {
+				t.Errorf("the state = %q, want %q", state, test.state)
+			}
+			if exitCode != test.exitCode {
+				t.Errorf("the exit code = %d, want %d", exitCode, test.exitCode)
+			}
+			if pid != test.pid {
+				t.Errorf("the pid = %d, want %d", pid, test.pid)
+			}
+		})
+	}
+}
+
+// TestLaunchdUnknownStateDetailCarriesTheOutputOfTheSupervisor checks the
+// detail of a status whose state could not be read.
+//
+// The detail has to name what the supervisor reported, so an administrator
+// and a failing test see the same thing. It must stay short, and it must not
+// carry a credential.
+func TestLaunchdUnknownStateDetailCarriesTheOutputOfTheSupervisor(t *testing.T) {
+	output := "com.hfdesk.hfdesk = {\n\tactive count = 0\n\tpath = /Users/somebody/Library/LaunchAgents/com.hfdesk.hfdesk.plist\n" +
+		"\tenvironment = {\n\t\tHOME => /Users/somebody\n\t\tHF_TOKEN => hf_secret_value\n\t}\n}"
+
+	detail := launchdUnknownStateDetail("gui/501/com.hfdesk.hfdesk", output)
+	if !strings.Contains(detail, "active count = 0") {
+		t.Errorf("the detail = %q, want the output of the supervisor", detail)
+	}
+	if !strings.Contains(detail, "launchctl print gui/501/com.hfdesk.hfdesk") {
+		t.Errorf("the detail = %q, want the target of the supervisor", detail)
+	}
+	if strings.Contains(detail, "hf_secret_value") {
+		t.Errorf("the detail = %q, want no credential", detail)
+	}
+	if !strings.Contains(detail, "redacted") {
+		t.Errorf("the detail = %q, want the removed value to be named", detail)
+	}
+	if len(detail) > launchdStateDetailLimit+200 {
+		t.Errorf("the detail is %d characters long, want at most %d", len(detail), launchdStateDetailLimit+200)
+	}
+
+	// A long output is cut, and the cut is visible.
+	long := strings.Repeat("a very long line of the output of the supervisor. ", 100)
+	cut := launchdPrintExcerpt(long, launchdStateDetailLimit)
+	if len([]rune(cut)) > launchdStateDetailLimit+3 {
+		t.Errorf("the excerpt is %d characters long, want at most %d", len([]rune(cut)), launchdStateDetailLimit+3)
+	}
+	if !strings.HasSuffix(cut, "...") {
+		t.Errorf("the excerpt = %q, want the cut to be visible", cut)
+	}
+}
+
+// TestLaunchdProcessAlive checks the check of a live process.
+func TestLaunchdProcessAlive(t *testing.T) {
+	if launchdProcessAlive(0) {
+		t.Error("launchdProcessAlive(0) = true, want false for a process that does not exist")
+	}
+	if launchdProcessAlive(-1) {
+		t.Error("launchdProcessAlive(-1) = true, want false for a process that does not exist")
+	}
+	if !launchdProcessAlive(os.Getpid()) {
+		t.Error("launchdProcessAlive() = false, want true for the process of the test")
+	}
+}
+
+// TestLaunchdStatusStateMapsTheOutputOfTheSupervisor checks the state and
+// the detail a status carries for the output of "launchctl print".
+//
+// A broken instance must not look healthy: an instance that exited with a
+// non-zero status is failed, and an instance that is not loaded is stopped.
+func TestLaunchdStatusStateMapsTheOutputOfTheSupervisor(t *testing.T) {
+	live := os.Getpid()
+	tests := []struct {
+		name       string
+		output     string
+		want       State
+		wantDetail string
+	}{
+		{
+			name:   "a running job",
+			output: "com.hfdesk.hfdesk = {\n\tstate = running\n\tpid = 4711\n}",
+			want:   StateRunning,
+		},
+		{
+			name:       "a job that exited with a non-zero status",
+			output:     "com.hfdesk.hfdesk = {\n\tstate = exited\n\tlast exit code = 1\n}",
+			want:       StateFailed,
+			wantDetail: "the instance exited with the status 1",
+		},
+		{
+			name:   "a job that is not running",
+			output: "com.hfdesk.hfdesk = {\n\tstate = not running\n\tlast exit code = 0\n}",
+			want:   StateStopped,
+		},
+		{
+			name:       "a job with a live process and an unknown state",
+			output:     "com.hfdesk.hfdesk = {\n\tpid = " + strconv.Itoa(live) + "\n}",
+			want:       StateRunning,
+			wantDetail: "launchctl print gui/501/com.hfdesk.hfdesk reported no state, but the process " + strconv.Itoa(live) + " of the instance is alive",
+		},
+		{
+			name:       "a job without a state and with a non-zero exit status",
+			output:     "com.hfdesk.hfdesk = {\n\tactive count = 0\n\tlast exit code = 3\n}",
+			want:       StateFailed,
+			wantDetail: "the instance exited with the status 3",
+		},
+		{
+			name:   "a job without a state and without a process",
+			output: "com.hfdesk.hfdesk = {\n\tactive count = 0\n}",
+			want:   StateUnknown,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, detail := launchdStatusState("gui/501/com.hfdesk.hfdesk", test.output)
+			if state != test.want {
+				t.Errorf("the state = %q, want %q", state, test.want)
+			}
+			if test.wantDetail != "" && detail != test.wantDetail {
+				t.Errorf("the detail = %q, want %q", detail, test.wantDetail)
+			}
+			if test.want == StateUnknown && !strings.Contains(detail, "launchctl print gui/501/com.hfdesk.hfdesk reported") {
+				t.Errorf("the detail = %q, want the output of the supervisor", detail)
+			}
+		})
+	}
+}
+
+// TestLaunchdJobRunningDetectsARunningJob checks the detection of a job that
+// runs.
+//
+// The detection is the same for the status of an instance and for the test
+// of the lifecycle: the state of the job is "running", or the job has a live
+// process.
+func TestLaunchdJobRunningDetectsARunningJob(t *testing.T) {
+	live := os.Getpid()
+	tests := []struct {
+		name  string
+		state string
+		pid   int
+		want  bool
+	}{
+		{name: "the state says the job runs", state: "running", want: true},
+		{name: "the state says the job does not run", state: "not running", want: false},
+		{name: "an unknown state and a live process", pid: live, want: true},
+		{name: "an unknown state and no process", want: false},
+		{name: "a state that does not run and a live process", state: "exited", pid: live, want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := launchdJobRunning(test.state, test.pid); got != test.want {
+				t.Errorf("launchdJobRunning(%q, %d) = %v, want %v", test.state, test.pid, got, test.want)
 			}
 		})
 	}
@@ -687,6 +926,12 @@ func TestStatusReportsTheCacheDirOfTheInstance(t *testing.T) {
 //
 // The test uses the property list of the user of the test: a registration
 // that was there before the test is restored at the end of it.
+//
+// A LaunchAgent needs a session that can run the jobs of the gui domain. An
+// environment without such a session loads the registration but never starts
+// the instance: the test skips then, and it names what the supervisor
+// reported, so the next run of the test is conclusive. An environment that
+// runs the instance asserts the whole lifecycle.
 func TestLaunchdLifecycle(t *testing.T) {
 	launchctl, err := exec.LookPath("launchctl")
 	if err != nil {
@@ -740,7 +985,13 @@ func TestLaunchdLifecycle(t *testing.T) {
 		t.Fatalf("the property list is missing: %v", err)
 	}
 
-	status := darwinWaitForState(t, launchd, StateRunning)
+	// The description of the instance comes from the registration and not
+	// from the state of the job, so it holds even in an environment that
+	// cannot run a LaunchAgent.
+	status, err := launchd.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status(): %v", err)
+	}
 	if status.Executable != opts.Executable {
 		t.Errorf("the executable = %q, want %q", status.Executable, opts.Executable)
 	}
@@ -755,6 +1006,29 @@ func TestLaunchdLifecycle(t *testing.T) {
 	}
 	if status.Paths.ConfigFile != opts.Paths.ConfigFile {
 		t.Errorf("the config file = %q, want %q", status.Paths.ConfigFile, opts.Paths.ConfigFile)
+	}
+
+	// The instance has to run for the rest of the lifecycle. An
+	// environment that cannot run the jobs of the gui domain loads the
+	// registration but never starts the instance: the test skips then,
+	// and it names what the supervisor reported.
+	status, running := darwinWaitForRunning(t, launchd, 15*time.Second)
+	if !running {
+		loaded, output, err := launchd.printState(ctx)
+		if err != nil {
+			t.Fatalf("printState(): %v", err)
+		}
+		if !loaded {
+			// The installation registered the job with launchd, so a
+			// job that is not loaded any more is a defect of the
+			// installation and not a limitation of the environment.
+			t.Fatalf("the job %s is not loaded into %s after the installation", launchdLabel(), launchd.domain())
+		}
+		t.Skipf("the environment cannot run a LaunchAgent: launchctl print %s reported: %s",
+			launchd.target(), launchdPrintExcerpt(output, 4000))
+	}
+	if status.State != StateRunning {
+		t.Errorf("the state = %q, want %q", status.State, StateRunning)
 	}
 
 	// Starting a running instance is stable.
@@ -1901,10 +2175,18 @@ func TestLaunchdUserScopeNeedsNoServiceAccount(t *testing.T) {
 	}
 }
 
-// darwinWaitForState waits until the instance reaches a state.
-func darwinWaitForState(t *testing.T, manager *launchdManager, want State) Status {
+// darwinWaitForRunning waits until the instance runs and reports whether it
+// runs.
+//
+// The instance runs when the supervisor reports the state "running" or when
+// the supervisor reports the pid of a live process: a state line of a
+// release that this build does not know must not hide a running instance.
+// The decision is the decision of the status, so the test and the status
+// never disagree about the state of the instance. The status of the last
+// poll is returned as well, so a caller can report what the supervisor said.
+func darwinWaitForRunning(t *testing.T, manager *launchdManager, timeout time.Duration) (Status, bool) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(timeout)
 	var status Status
 	for {
 		var err error
@@ -1912,11 +2194,21 @@ func darwinWaitForState(t *testing.T, manager *launchdManager, want State) Statu
 		if err != nil {
 			t.Fatalf("Status(): %v", err)
 		}
-		if status.State == want {
-			return status
+		if status.State == StateRunning {
+			return status, true
+		}
+		loaded, output, err := manager.printState(context.Background())
+		if err != nil {
+			t.Fatalf("printState(): %v", err)
+		}
+		if loaded {
+			state, _ := launchdStatusState(manager.target(), output)
+			if state == StateRunning {
+				return status, true
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the state = %q, want %q (%s)", status.State, want, status.Detail)
+			return status, false
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
