@@ -101,6 +101,18 @@ is a GUI program and never opens a console window. The console binary is
 unchanged and stays the right one for a terminal, for redirecting the output
 into a file, for a script and for a service.
 
+The GUI subsystem is a build time property of the linker, so a local build of
+the desktop host needs the flag `-H=windowsgui`:
+
+```bash
+go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
+```
+
+A binary that was built without the flag opens a console window next to the
+notification area icon. The desktop host reads the PE header of its own
+executable at startup and tells you how to rebuild the binary when it was
+built wrong.
+
 The desktop host runs the very same HFDesk server in its own process and adds
 a desktop shell around it:
 
@@ -220,6 +232,13 @@ git clone https://github.com/bashrusakh/hfdesk
 cd hfdesk
 go build -o hfdesk ./cmd/hfdesk
 ./hfdesk
+```
+
+The Windows desktop host is built with the GUI subsystem, so it never opens a
+console window:
+
+```bash
+GOOS=windows go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
 ```
 
 Run tests:
