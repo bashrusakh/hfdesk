@@ -109,6 +109,51 @@ func TestSetupLoggingWritesTheRequestedFile(t *testing.T) {
 	}
 }
 
+// TestSetupLoggingKeepsRotatedBackups proves that the production logging
+// configuration keeps the history of the log: a rotated backup file appears
+// next to the active file.
+//
+// The desktop host writes its log file because the file is its support
+// material, so a run that keeps no history of the log loses the records of
+// the previous runs. The test writes the records of a host that says
+// nothing about the backups, so it covers the configuration the product
+// really uses.
+func TestSetupLoggingKeepsRotatedBackups(t *testing.T) {
+	restoreDefaultLogger(t)
+
+	path := filepath.Join(t.TempDir(), "hfdesk.log")
+	pipeline, err := SetupLogging(LogOptions{Level: "info", FilePath: path})
+	if err != nil {
+		t.Fatalf("SetupLogging: %v", err)
+	}
+	defer pipeline.Close()
+
+	// The records are large enough to push the file past its maximum size
+	// after a few of them, so the sink rotates while the test writes.
+	logger := logging.Component("app")
+	payload := strings.Repeat("x", 4096)
+	for i := range 2000 {
+		logger.Info("rotating record", "index", i, "payload", payload)
+		if _, err := os.Stat(path + ".1"); err == nil {
+			break
+		}
+	}
+
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("no rotated backup was kept next to the active log file: %v", err)
+	}
+
+	// The backups are bounded: the log files never use more disk than the
+	// maximum size of the active file times the number of kept backups.
+	matches, err := filepath.Glob(path + "*")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if limit := logging.DefaultFileMaxBackups + 1; len(matches) > limit {
+		t.Errorf("retained %d log files, want at most %d", len(matches), limit)
+	}
+}
+
 // TestDefaultLogPathDoesNotCreateAnything proves that the default log path
 // is a per-user path and that asking for it creates nothing.
 func TestDefaultLogPathDoesNotCreateAnything(t *testing.T) {

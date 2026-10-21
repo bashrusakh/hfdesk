@@ -19,6 +19,14 @@ type LogOptions struct {
 	Level    string // "debug"|"info"|"warn"|"error"; empty means info
 	Console  bool
 	FilePath string // empty means no file sink
+
+	// FileMaxBackups is the number of rotated log files kept next to the
+	// active file.
+	//
+	// Zero selects logging.DefaultFileMaxBackups, so a host that says
+	// nothing about the backups keeps the history of the log. A negative
+	// value keeps no rotated file at all.
+	FileMaxBackups int
 }
 
 // SetupLogging installs the application logging pipeline and returns it.
@@ -36,11 +44,22 @@ func SetupLogging(o LogOptions) (*logging.Pipeline, error) {
 		return nil, err
 	}
 
+	// The rotated files are the history of the log: the desktop host
+	// enables the file sink because the log file is its support material,
+	// so a host that says nothing about the backups keeps them.
+	maxBackups := o.FileMaxBackups
+	if maxBackups == 0 {
+		maxBackups = logging.DefaultFileMaxBackups
+	} else if maxBackups < 0 {
+		maxBackups = 0
+	}
+
 	pipeline, err := logging.Install(logging.Options{
-		Level:    level,
-		Console:  o.Console,
-		File:     o.FilePath != "",
-		FilePath: o.FilePath,
+		Level:          level,
+		Console:        o.Console,
+		File:           o.FilePath != "",
+		FilePath:       o.FilePath,
+		FileMaxBackups: maxBackups,
 	})
 	if err != nil {
 		return nil, err
