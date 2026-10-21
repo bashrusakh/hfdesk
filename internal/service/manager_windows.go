@@ -128,9 +128,16 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // source of the instance.
 //
 // The state of the instance is restricted before the registration is
-// written: every directory the instance owns carries the restrictive
+// written: every directory the installation created carries the restrictive
 // descriptor, so the directories the instance creates inside them inherit
 // it and the account of the instance can work with them.
+//
+// A path of the instance that existed before the installation keeps its
+// descriptor: it belongs to whoever named it, and the installation never
+// takes a directory over from the owner it already has. The installation
+// only reads the descriptor of such a path, to check that the account of
+// the instance can work with it, and it refuses the installation before it
+// changes a single descriptor when it cannot.
 //
 // The reused directories are checked before the registration is written as
 // well: a directory the account of the instance cannot reach is a failed
@@ -159,17 +166,13 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	if err := requireElevated("an installation"); err != nil {
 		return err
 	}
-	// The directories the installation is about to create are remembered
-	// before they are created, so the installation knows which of them it
-	// owns. The list holds the directories of the instance and the
-	// directories the installation reuses: the preflight creates the
-	// missing ones as well, so they belong to the installation too.
-	dirs := scmInstallDirs(opts)
-	created := make(map[string][]string, len(dirs))
-	for _, dir := range dirs {
-		created[dir] = createdDirs(dir)
-	}
-	order := createdDirOrder(opts, created)
+	// The paths the installation is about to create are remembered before
+	// they are created, so the installation knows which of them it owns.
+	// The list holds the directories of the instance and the directories
+	// the installation reuses: the preflight creates the missing ones as
+	// well, so they belong to the installation too.
+	snapshot := newSCMInstallSnapshot(opts)
+	order := createdDirOrder(opts, snapshot.created)
 	// A failed installation removes the directories it created. The
 	// cleanup is best effort: it never replaces the error of the
 	// installation, which is what the caller gets.
@@ -187,7 +190,13 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	// directories are checked: the directories the instance creates
 	// inside its own directories inherit the restrictive descriptor, so
 	// the account of the instance can work with them.
-	if err := restrictInstanceState(opts); err != nil {
+	//
+	// A path of the instance that existed before the installation is
+	// never rewritten: its descriptor is only read, to check that the
+	// account of the instance can work with it. The check of every such
+	// path happens before the first descriptor is changed, so a refused
+	// installation leaves every descriptor of the machine as it was.
+	if err := restrictInstanceState(opts, snapshot); err != nil {
 		return fail(err)
 	}
 	if err := m.preflight(opts); err != nil {
@@ -323,6 +332,48 @@ func createdDirOrder(opts InstallOptions, created map[string][]string) []string 
 		}
 	}
 	return order
+}
+
+// scmInstallSnapshot is the state of the paths of an installation before it
+// creates anything.
+//
+// The snapshot is read before the first directory is created, so the
+// installation knows which of the paths of the instance it owns and which
+// ones belong to whoever named them.
+type scmInstallSnapshot struct {
+	// created holds the directories the installation creates for every
+	// directory of the installation, the missing parents included.
+	created map[string][]string
+	// configFileMissing reports whether the config file of the instance
+	// did not exist before the installation.
+	configFileMissing bool
+}
+
+// newSCMInstallSnapshot reads the state of the paths of an installation
+// before it creates anything.
+//
+// The directories of the installation are read one by one: a directory that
+// does not exist yet is a directory the installation creates, and so are the
+// missing parents of it.
+func newSCMInstallSnapshot(opts InstallOptions) scmInstallSnapshot {
+	dirs := scmInstallDirs(opts)
+	created := make(map[string][]string, len(dirs))
+	for _, dir := range dirs {
+		created[dir] = createdDirs(dir)
+	}
+	return scmInstallSnapshot{
+		created:           created,
+		configFileMissing: pathMissing(opts.Paths.ConfigFile),
+	}
+}
+
+// pathMissing reports whether a path does not exist.
+//
+// A path that cannot be read is not missing: the installation leaves such a
+// path alone instead of taking it over.
+func pathMissing(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // removeCreatedDirs removes the directories an installation created.
@@ -1509,52 +1560,118 @@ func registerEventSource() error {
 // administrators of the machine and the account the instance runs as may
 // work with it, nobody else.
 //
-// Every directory the instance owns carries the descriptor: the directory
-// of the config file, the state directory and the log directory, and so
-// does the config file itself. The descriptor is applied to the path
-// itself and never recursively.
+// The restrictive descriptor is applied to the paths the installation
+// created: the directory of the config file, the state directory, the log
+// directory and the config file itself. The descriptor is applied to the
+// path itself and never recursively.
+//
+// A path that existed before the installation belongs to whoever owns it:
+// its descriptor is only read, to check that the account of the instance can
+// work with it. The check of every such path happens before the first
+// descriptor is changed, so a refused installation leaves every descriptor
+// of the machine as it was.
 //
 // The model and the cache trees of an installation are never re-owned and
 // never re-ACLed: they can hold gigabytes of data that the user may reuse
 // from an interactive run, and a recursive change of the access rights
 // would take the data away from the user who owns it.
-func restrictInstanceState(opts InstallOptions) error {
-	for _, path := range instanceStatePaths(opts) {
-		if err := applyRestrictiveACL(path); err != nil {
+func restrictInstanceState(opts InstallOptions, snapshot scmInstallSnapshot) error {
+	paths := instanceStatePaths(opts, snapshot)
+	// The paths that existed before the installation are checked first:
+	// the account of the instance has to be able to work with them
+	// before a single descriptor is changed.
+	for _, path := range paths {
+		if path.created {
+			continue
+		}
+		if err := checkServiceAccess(path.name, path.path); err != nil {
+			return err
+		}
+	}
+	for _, path := range paths {
+		if !path.created {
+			continue
+		}
+		if err := applyRestrictiveACL(path.path); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// instanceStatePaths returns the paths of the instance that carry the
-// restrictive descriptor: the directory of the config file, the state
+// scmInstancePath is one path of the instance whose descriptor the
+// installation manages.
+type scmInstancePath struct {
+	// name names the path in an error message.
+	name string
+	// path is the absolute path of the path.
+	path string
+	// created reports whether the installation creates the path itself.
+	created bool
+}
+
+// instanceStatePaths returns the paths of the instance whose descriptor the
+// installation manages: the directory of the config file, the state
 // directory, the log directory and the config file itself.
 //
-// The config file is the only path that may not exist yet: a config file
-// that is written later inherits the descriptor of its directory. A path
-// that is named twice is returned once: the config file can live in the
-// state directory of the instance.
-func instanceStatePaths(opts InstallOptions) []string {
-	paths := []string{
-		filepath.Dir(opts.Paths.ConfigFile),
-		opts.Paths.StateDir,
-		opts.Paths.LogDir,
-	}
-	if info, err := os.Stat(opts.Paths.ConfigFile); err == nil && info.Mode().IsRegular() {
-		paths = append(paths, opts.Paths.ConfigFile)
-	}
-
-	unique := make([]string, 0, len(paths))
-	seen := make(map[string]bool, len(paths))
-	for _, path := range paths {
-		if path == "" || seen[path] {
-			continue
+// A path the installation creates is marked as created: the snapshot holds
+// the directories an installation creates for every directory of the
+// installation, and it is read before the directories are created, so the
+// installation knows which of them it owns. The missing parents of such a
+// directory belong to the installation as well.
+//
+// A path that existed before the installation is not marked: it belongs to
+// whoever owns it.
+//
+// The config file is a file the instance writes itself: a file that existed
+// before the installation is not marked, a file the installation created is.
+//
+// A path that is named twice is returned once: the config file can live in
+// the state directory of the instance.
+func instanceStatePaths(opts InstallOptions, snapshot scmInstallSnapshot) []scmInstancePath {
+	var paths []scmInstancePath
+	seen := make(map[string]bool, 4)
+	add := func(name, path string, created bool) {
+		if path == "" || path == "." || seen[path] {
+			return
 		}
 		seen[path] = true
-		unique = append(unique, path)
+		paths = append(paths, scmInstancePath{name: name, path: path, created: created})
 	}
-	return unique
+
+	for _, dir := range []struct {
+		name string
+		path string
+	}{
+		{"config dir", filepath.Dir(opts.Paths.ConfigFile)},
+		{"state dir", opts.Paths.StateDir},
+		{"log dir", opts.Paths.LogDir},
+	} {
+		if dir.path == "" || dir.path == "." {
+			continue
+		}
+		own := snapshot.created[dir.path]
+		if len(own) == 0 {
+			// The directory existed before the installation: it
+			// belongs to whoever owns it.
+			add(dir.name, dir.path, false)
+			continue
+		}
+		// The installation creates the directory and the missing
+		// parents of it: they belong to the installation.
+		for _, path := range own {
+			add(dir.name, path, true)
+		}
+	}
+
+	// The config file holds the credentials of the instance. It is a
+	// file the instance writes itself, so it is only a path of the
+	// installation when it exists: a file that is written later inherits
+	// the descriptor of its directory.
+	if info, err := os.Stat(opts.Paths.ConfigFile); err == nil && info.Mode().IsRegular() {
+		add("config file", opts.Paths.ConfigFile, snapshot.configFileMissing)
+	}
+	return paths
 }
 
 // applyRestrictiveACL applies the security descriptor of the instance to a

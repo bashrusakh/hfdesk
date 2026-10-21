@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1064,11 +1065,14 @@ func TestApplyRegistrationReportsTheEffectiveCacheDir(t *testing.T) {
 	}
 }
 
-// TestInstanceStatePathsProtectEveryOwnedPath checks that every path the
-// instance owns carries the restrictive descriptor: the directory of the
-// config file, the state directory, the log directory and the config file
-// itself.
-func TestInstanceStatePathsProtectEveryOwnedPath(t *testing.T) {
+// TestInstanceStatePathsTellTheCreatedPathsFromTheExistingOnes checks that
+// the installation knows which paths of the instance it owns: the
+// directories it creates carry the restrictive descriptor, the paths that
+// existed before the installation do not.
+//
+// A directory that existed before the installation belongs to whoever owns
+// it, so the installation reads its descriptor and changes nothing.
+func TestInstanceStatePathsTellTheCreatedPathsFromTheExistingOnes(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Paths = runtimepaths.Paths{
@@ -1076,6 +1080,12 @@ func TestInstanceStatePathsProtectEveryOwnedPath(t *testing.T) {
 		StateDir:   filepath.Join(root, "var"),
 		LogDir:     filepath.Join(root, "var", "logs"),
 	}
+	opts.CacheDir = filepath.Join(root, "cache")
+	opts.HubDir = filepath.Join(root, "cache", "hub")
+	opts.LocalDir = filepath.Join(root, "models")
+
+	// The config directory and the config file existed before the
+	// installation.
 	if err := os.MkdirAll(filepath.Dir(opts.Paths.ConfigFile), 0o700); err != nil {
 		t.Fatalf("MkdirAll() = %v, want nil", err)
 	}
@@ -1083,38 +1093,34 @@ func TestInstanceStatePathsProtectEveryOwnedPath(t *testing.T) {
 		t.Fatalf("WriteFile() = %v, want nil", err)
 	}
 
-	want := []string{
-		filepath.Dir(opts.Paths.ConfigFile),
-		opts.Paths.StateDir,
-		opts.Paths.LogDir,
-		opts.Paths.ConfigFile,
-	}
-	got := instanceStatePaths(opts)
-	if len(got) != len(want) {
-		t.Fatalf("instanceStatePaths() = %v, want %v", got, want)
-	}
-	protected := make(map[string]bool, len(got))
-	for _, path := range got {
-		protected[path] = true
-	}
-	for _, path := range want {
-		if !protected[path] {
-			t.Errorf("instanceStatePaths() = %v, want %v", got, want)
+	snapshot := newSCMInstallSnapshot(opts)
+	paths := instanceStatePaths(opts, snapshot)
+
+	created := make(map[string]bool, len(paths))
+	existing := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path.created {
+			created[path.path] = true
+			continue
 		}
+		existing[path.path] = true
 	}
 
-	// A config file that does not exist yet inherits the descriptor of its
-	// directory, so it is not part of the paths.
-	if err := os.Remove(opts.Paths.ConfigFile); err != nil {
-		t.Fatalf("Remove() = %v, want nil", err)
+	// The directories the installation creates are the state directory
+	// and the log directory: the config directory existed already.
+	for _, want := range []string{opts.Paths.StateDir, opts.Paths.LogDir} {
+		if !created[want] {
+			t.Errorf("the state directory %q is not marked as created: %v", want, paths)
+		}
 	}
-	got = instanceStatePaths(opts)
-	if len(got) != len(want)-1 {
-		t.Fatalf("instanceStatePaths() = %v, want the three directories of the instance", got)
+	for _, want := range []string{filepath.Dir(opts.Paths.ConfigFile), opts.Paths.ConfigFile} {
+		if !existing[want] {
+			t.Errorf("the path %q is not marked as existing: %v", want, paths)
+		}
 	}
-	for _, path := range got {
-		if path == opts.Paths.ConfigFile {
-			t.Errorf("instanceStatePaths() = %v, want no config file", got)
+	for path := range created {
+		if existing[path] {
+			t.Errorf("the path %q is marked as created and as existing: %v", path, paths)
 		}
 	}
 }
@@ -1134,6 +1140,304 @@ func scmTestCurrentUserSID(t *testing.T) string {
 		t.Skip("the account of the process carries no SID")
 	}
 	return user.User.Sid.String()
+}
+
+// scmTestAliases maps the aliases of the trustees of an access control
+// entry onto the SID they stand for.
+//
+// The platform writes a trustee as an alias or as a raw SID, depending on
+// the entry. The tests compare the trustees as SIDs, so the form the
+// platform uses does not matter.
+var scmTestAliases = map[string]string{
+	"SY": "S-1-5-18",     // LocalSystem
+	"BA": "S-1-5-32-544", // Administrators
+	"LS": "S-1-5-19",     // LocalService
+	"WD": "S-1-1-0",      // Everyone
+}
+
+// scmTestDACL returns the access control list of a path in its SDDL form.
+//
+// The descriptor of a path carries the owner and the group next to the
+// access control list: only the list is compared, so a change of the access
+// rights is told apart from a change of the owner.
+func scmTestDACL(t *testing.T, path string) string {
+	t.Helper()
+	_, permissions := scmTestSecurity(t, path)
+	index := strings.Index(permissions, "D:")
+	if index < 0 {
+		t.Fatalf("the security descriptor of %q = %q, want an access control list", path, permissions)
+	}
+	return permissions[index:]
+}
+
+// scmTestTrustees returns the trustees of the access control list of a path.
+//
+// The trustees are returned as SIDs: the aliases of the platform are
+// resolved, so the assertions do not depend on the form the platform writes
+// them in.
+func scmTestTrustees(t *testing.T, path string) []string {
+	t.Helper()
+	var trustees []string
+	for _, ace := range parseSDDLAces(scmTestDACL(t, path)) {
+		trustee := strings.ToUpper(strings.TrimSpace(ace.trustee))
+		if sid, ok := scmTestAliases[trustee]; ok {
+			trustee = sid
+		}
+		trustees = append(trustees, trustee)
+	}
+	return trustees
+}
+
+// scmTestDACLProtected reports whether the access control list of a path
+// blocks the inheritance of its parent directory.
+//
+// The flag is read from the descriptor of the path itself and not from its
+// SDDL form, so the assertion does not depend on the way the platform writes
+// the flag.
+func scmTestDACLProtected(t *testing.T, path string) bool {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		t.Fatalf("the security descriptor of %q cannot be read: %v", path, err)
+	}
+	control, _, err := sd.Control()
+	if err != nil {
+		t.Fatalf("the control bits of %q cannot be read: %v", path, err)
+	}
+	return control&windows.SE_DACL_PROTECTED != 0
+}
+
+// TestSCMInstanceStateRestrictsTheDirectoriesItCreated checks that the
+// directories the installation creates carry the restrictive descriptor of
+// the instance.
+//
+// The descriptor is the one of the instance: SYSTEM, the administrators of
+// the machine and the account the instance runs as, nobody else, and the
+// inheritance of the parent directory is cut off.
+func TestSCMInstanceStateRestrictsTheDirectoriesItCreated(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	snapshot := newSCMInstallSnapshot(opts)
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+	if err := restrictInstanceState(opts, snapshot); err != nil {
+		t.Fatalf("restrictInstanceState() = %v, want nil", err)
+	}
+
+	want := []string{"S-1-5-18", "S-1-5-19", "S-1-5-32-544"}
+	for _, dir := range []string{
+		filepath.Dir(opts.Paths.ConfigFile),
+		opts.Paths.StateDir,
+		opts.Paths.LogDir,
+	} {
+		if !scmTestDACLProtected(t, dir) {
+			t.Errorf("the access control list of %q is not protected, want a protected one", dir)
+		}
+		got := scmTestTrustees(t, dir)
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("the trustees of %q = %v, want %v", dir, got, want)
+		}
+	}
+}
+
+// TestSCMInstanceStateKeepsTheDescriptorOfADirectoryThatExistedBefore
+// checks that a directory the user named and that existed before the
+// installation keeps its descriptor.
+//
+// The descriptor of the directory grants the access to everybody, so a
+// rewrite of it by the restrictive descriptor of the instance would be
+// visible in the comparison.
+func TestSCMInstanceStateKeepsTheDescriptorOfADirectoryThatExistedBefore(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	// The state directory existed before the installation.
+	stateDir := opts.Paths.StateDir
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", stateDir, err)
+	}
+	scmTestSetDACL(t, stateDir, fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)"))
+	before := scmTestDACL(t, stateDir)
+
+	snapshot := newSCMInstallSnapshot(opts)
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+	if err := restrictInstanceState(opts, snapshot); err != nil {
+		t.Fatalf("restrictInstanceState() = %v, want nil", err)
+	}
+
+	if after := scmTestDACL(t, stateDir); after != before {
+		t.Errorf("the access control list of the state directory %q = %q, want %q", stateDir, after, before)
+	}
+	// The restrictive descriptor of the instance was not applied to it:
+	// everybody still has the access the directory had.
+	trustees := scmTestTrustees(t, stateDir)
+	if !slices.Contains(trustees, "S-1-1-0") {
+		t.Errorf("the trustees of the state directory %q = %v, want everybody", stateDir, trustees)
+	}
+}
+
+// TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse checks that a
+// directory that existed before the installation and that the account of the
+// instance cannot use is refused, and that no descriptor was changed.
+//
+// The refusal happens before the first descriptor is changed, so the
+// directories the installation created keep the descriptor they inherited.
+func TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	// The state directory existed before the installation and grants the
+	// access to the machine and to its administrators only.
+	stateDir := opts.Paths.StateDir
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", stateDir, err)
+	}
+	scmTestSetDACL(t, stateDir, scmTestDenyInstanceIdentityDACL(t))
+
+	snapshot := newSCMInstallSnapshot(opts)
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+	before := make(map[string]string, 3)
+	for _, path := range []string{
+		stateDir,
+		filepath.Dir(opts.Paths.ConfigFile),
+		opts.Paths.LogDir,
+	} {
+		before[path] = scmTestDACL(t, path)
+	}
+
+	err := restrictInstanceState(opts, snapshot)
+	if err == nil {
+		t.Fatal("restrictInstanceState() = nil, want the refusal of the state directory")
+	}
+	if !strings.Contains(err.Error(), stateDir) {
+		t.Errorf("restrictInstanceState() = %v, want an error that names the path", err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("restrictInstanceState() = %v, want an error that names the account of the instance", err)
+	}
+	if !strings.Contains(err.Error(), "grant the account") {
+		t.Errorf("restrictInstanceState() = %v, want an error that tells the user what to do", err)
+	}
+
+	// No descriptor was changed anywhere: not on the directory that
+	// existed before and not on the directories the installation
+	// created.
+	for path, want := range before {
+		if got := scmTestDACL(t, path); got != want {
+			t.Errorf("the access control list of %q = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// TestSCMInstanceStateKeepsTheDescriptorOfAConfigFileThatExistedBefore
+// checks that the config file of the instance keeps its descriptor when it
+// existed before the installation.
+//
+// The config file holds the credentials of the instance, but it belongs to
+// whoever wrote it: the installation reads its descriptor and changes
+// nothing.
+func TestSCMInstanceStateKeepsTheDescriptorOfAConfigFileThatExistedBefore(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	// The config directory and the config file existed before the
+	// installation.
+	configDir := filepath.Dir(opts.Paths.ConfigFile)
+	if err := os.MkdirAll(configDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v, want nil", configDir, err)
+	}
+	// The directory has to be usable by the account of the instance,
+	// otherwise the installation refuses it.
+	scmTestSetDACL(t, configDir, scmTestAllowInstanceIdentityDACL(t))
+	if err := os.WriteFile(opts.Paths.ConfigFile, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, opts.Paths.ConfigFile, fmt.Sprintf("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"))
+	before := scmTestDACL(t, opts.Paths.ConfigFile)
+
+	snapshot := newSCMInstallSnapshot(opts)
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+	if err := restrictInstanceState(opts, snapshot); err != nil {
+		t.Fatalf("restrictInstanceState() = %v, want nil", err)
+	}
+
+	if after := scmTestDACL(t, opts.Paths.ConfigFile); after != before {
+		t.Errorf("the access control list of the config file %q = %q, want %q", opts.Paths.ConfigFile, after, before)
+	}
+}
+
+// TestSCMInstanceStateKeepsTheDescriptorOfTheReusedDirectories checks that
+// the directories the installation reuses keep their descriptor.
+//
+// The cache root, the hub directory and the local output directory can hold
+// the models of the user: the installation reads their descriptor and never
+// changes it.
+func TestSCMInstanceStateKeepsTheDescriptorOfTheReusedDirectories(t *testing.T) {
+	if !isElevatedProcess() {
+		t.Skip("an installation needs an elevated shell, run the test as an administrator")
+	}
+	root := t.TempDir()
+	opts := scmTestInstallOptions(t, root)
+
+	// The reused directories existed before the installation. The
+	// descriptor of every one of them is protected, so the inheritance
+	// of the platform cannot change it behind the back of the test.
+	reused := []string{opts.CacheDir, opts.HubDir, opts.LocalDir}
+	before := make(map[string]string, len(reused))
+	for _, dir := range reused {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("MkdirAll(%q) = %v, want nil", dir, err)
+		}
+		scmTestSetDACL(t, dir, scmTestAllowInstanceIdentityDACL(t))
+		before[dir] = scmTestDACL(t, dir)
+	}
+	// The cache root lives in the state directory of the instance, so the
+	// state directory existed before the installation as well: it has to
+	// be usable by the account of the instance.
+	scmTestSetDACL(t, opts.Paths.StateDir, scmTestAllowInstanceIdentityDACL(t))
+
+	snapshot := newSCMInstallSnapshot(opts)
+	if err := PrepareDirs(opts); err != nil {
+		t.Fatalf("PrepareDirs() = %v, want nil", err)
+	}
+	if err := restrictInstanceState(opts, snapshot); err != nil {
+		t.Fatalf("restrictInstanceState() = %v, want nil", err)
+	}
+	// The preflight reads the reused directories as well.
+	if err := preflightDataPaths(opts); err != nil {
+		t.Fatalf("preflightDataPaths() = %v, want nil", err)
+	}
+
+	for _, dir := range reused {
+		if after := scmTestDACL(t, dir); after != before[dir] {
+			t.Errorf("the access control list of the reused directory %q = %q, want %q", dir, after, before[dir])
+		}
+	}
 }
 
 // scmTestSetDACL applies an access control list to a path.
@@ -1361,10 +1665,9 @@ func TestSCMFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
 // The local directory is a directory the installation reuses: the
 // installation never describes it, so its owner and its permissions are the
 // ones it had. The config directory of the instance is a directory the
-// installation owns: it is still there as well, with the owner it had. Its
-// descriptor is the restrictive one of the instance, because the
-// installation restricts the directories of the instance before it checks the
-// directories it reuses.
+// installation owns as well: it is still there as well, with the owner it
+// had and with the descriptor it had, because the installation never
+// rewrites the descriptor of a path that existed before it.
 func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	if !isElevatedProcess() {
 		t.Skip("an installation needs an elevated shell, run the test as an administrator")
@@ -1379,7 +1682,12 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", configDir, err)
 	}
+	// The directory has to be usable by the account of the instance:
+	// the installation refuses it otherwise, before it reaches the local
+	// directory.
+	scmTestSetDACL(t, configDir, scmTestAllowInstanceIdentityDACL(t))
 	configOwner, configMode := scmTestOwnerAndMode(t, configDir)
+	configPermissions := scmTestDACL(t, configDir)
 
 	owner, permissions := scmTestSecurity(t, opts.LocalDir)
 
@@ -1406,7 +1714,8 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	}
 
 	// The directory of the instance that existed before the installation
-	// is still there as well, with the owner and the mode it had.
+	// is still there as well, with the owner, the mode and the
+	// descriptor it had.
 	if _, err := os.Stat(configDir); err != nil {
 		t.Errorf("the config directory %q is gone after the failed installation: %v", configDir, err)
 	}
@@ -1416,6 +1725,9 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	}
 	if gotConfigMode != configMode {
 		t.Errorf("the mode of the config directory %q = %v, want %v", configDir, gotConfigMode, configMode)
+	}
+	if gotConfigDACL := scmTestDACL(t, configDir); gotConfigDACL != configPermissions {
+		t.Errorf("the access control list of the config directory %q = %q, want %q", configDir, gotConfigDACL, configPermissions)
 	}
 }
 
