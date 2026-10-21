@@ -95,66 +95,197 @@ func (p *ProxyConfig) GetProxyURL() (*url.URL, error) {
 	return proxyURL, nil
 }
 
+// proxyURLShape classifies the authority of a raw proxy URL.
+//
+// The authority is the only place a proxy URL can carry a credential, so its
+// shape decides what may be shown and what may not.
+type proxyURLShape int
+
+const (
+	// proxyURLUnlocatable means that the authority of the URL cannot be
+	// located: the URL has no scheme separator, or the part before it is
+	// not a scheme. That part can hold anything, a credential included,
+	// so no part of such a URL may be shown.
+	proxyURLUnlocatable proxyURLShape = iota
+
+	// proxyURLHost means that the authority is a host with an optional
+	// port. It carries no credential.
+	proxyURLHost
+
+	// proxyURLUserinfo means that the authority carried a userinfo: the
+	// part before the last "@" is the credential of the URL.
+	proxyURLUserinfo
+
+	// proxyURLAmbiguous means that the authority is neither a host nor a
+	// userinfo that ends with an "@". It may be a credential that was not
+	// terminated by an "@", so no part of it may be shown.
+	proxyURLAmbiguous
+)
+
+// redactedProxyAuthority replaces the authority of a proxy URL that cannot
+// be shown. It is a display marker, not a host.
+const redactedProxyAuthority = "<redacted>"
+
 // proxyParseFailureReason explains why a proxy URL failed to parse without
-// quoting the URL or any part of it.
+// quoting the URL or any part of it that could be a credential.
 //
 // url.Parse reports a failure as a *url.Error whose Error() embeds the whole
 // URL — including the proxy credentials — and whose Err carries the reason.
 // The reason is not safe to quote either: it can repeat a fragment of a
 // malformed credential (an invalid percent escape inside the userinfo). The
 // reason is therefore taken from a parse of the URL with its credentials
-// removed. A URL whose credentials cannot be located, and a URL whose
-// credentials alone made it unparseable, are reported without a reason.
+// removed. A URL whose authority cannot be located is reported without
+// naming a part of it, and a URL whose credentials alone made it
+// unparseable is reported with a reason that names no part of the URL
+// either.
+//
+// A URL that parses has no failure to explain: the reason of such a URL is
+// the empty string.
 func proxyParseFailureReason(raw string) string {
-	sanitized, ok := stripProxyCredentials(raw)
-	if !ok {
-		return "invalid proxy URL"
+	_, parseErr := url.Parse(raw)
+	if parseErr == nil {
+		// The URL parses, so there is no failure to explain.
+		return ""
 	}
-	if _, err := url.Parse(sanitized); err != nil {
-		return ProxyErrorReason(err)
+
+	prefix, host, rest, shape := splitProxyURL(raw)
+
+	switch shape {
+	case proxyURLUnlocatable:
+		// No part of the URL may be shown, so the reason names no part
+		// of it either.
+		return "the scheme of the proxy URL is missing or invalid"
+	case proxyURLAmbiguous:
+		// The authority may be a credential, so it is not part of the URL
+		// that is parsed for the reason. The rest of the URL can still
+		// be at fault.
+		if _, err := url.Parse(prefix + rest); err != nil {
+			return ProxyErrorReason(err)
+		}
+		return "the host or the port of the proxy URL is invalid"
+	case proxyURLUserinfo:
+		// The credential is dropped: what is left of the URL is a host
+		// with an optional port, and it carries no credential.
+		if _, err := url.Parse(prefix + host + rest); err != nil {
+			return ProxyErrorReason(err)
+		}
+		// The URL parses without its credential, so the credential is
+		// what made it fail.
+		return "invalid proxy credentials or URL syntax"
+	default:
+		// The remaining shape is proxyURLHost: the authority is a host,
+		// so the failure is in the rest of the URL and the reason of it
+		// carries no credential.
+		return ProxyErrorReason(parseErr)
 	}
-	return "invalid proxy credentials or URL syntax"
 }
 
-// stripProxyCredentials removes the userinfo (the "user:password" part) from
-// a proxy URL and keeps the scheme, the host and the path.
+// splitProxyURL splits a raw proxy URL into the parts that may be shown and
+// classifies its authority.
 //
-// The userinfo is everything between the scheme separator and the last "@"
-// of the authority. A URL without an "@" in its authority carries no embedded
-// credential. A URL without a scheme has no authority, so its credentials
-// cannot be located: it reports false and must not be quoted at all.
-func stripProxyCredentials(raw string) (string, bool) {
+// The scheme has to be a real scheme: the part before the "://" of a URL
+// whose scheme is not a scheme can hold anything, a credential included, so
+// such a URL is not locatable and none of its parts may be shown.
+func splitProxyURL(raw string) (prefix, host, rest string, shape proxyURLShape) {
 	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd < 0 {
-		return "", false
+	if schemeEnd < 0 || !isURLScheme(raw[:schemeEnd]) {
+		return "", "", "", proxyURLUnlocatable
 	}
-	rest := raw[schemeEnd+3:]
-	authorityEnd := len(rest)
-	for i := 0; i < len(rest); i++ {
-		if c := rest[i]; c == '/' || c == '?' || c == '#' {
+	prefix = raw[:schemeEnd+3]
+	remainder := raw[schemeEnd+3:]
+
+	authorityEnd := len(remainder)
+	for i := 0; i < len(remainder); i++ {
+		if c := remainder[i]; c == '/' || c == '?' || c == '#' {
 			authorityEnd = i
 			break
 		}
 	}
-	authority := rest[:authorityEnd]
-	at := strings.LastIndex(authority, "@")
-	if at < 0 {
-		return raw, true
+	authority := remainder[:authorityEnd]
+	rest = remainder[authorityEnd:]
+
+	// The userinfo of an authority ends at its last "@": everything before
+	// it is the credential of the URL and is dropped. What follows is the
+	// host with its optional port.
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+		shape = proxyURLUserinfo
+	} else {
+		shape = proxyURLHost
 	}
-	return raw[:schemeEnd+3] + authority[at+1:] + rest[authorityEnd:], true
+
+	if !isHostWithPort(authority) {
+		// The authority is not a host with a valid port. It is the shape
+		// of a credential that was not terminated by an "@": a parser
+		// reads the user of "user:password" as the host and the password
+		// as the port, and that is indistinguishable from a host with a
+		// port that is not a number.
+		//
+		// The whole authority is dropped, because the host of that shape
+		// can be the user of the credential: never leaking is preferred
+		// over keeping a host that may be a user.
+		return prefix, "", rest, proxyURLAmbiguous
+	}
+	return prefix, authority, rest, shape
+}
+
+// isURLScheme reports whether the text is a URL scheme.
+//
+// A scheme starts with a letter and continues with letters, digits, "+", "-"
+// and "." (RFC 3986).
+func isURLScheme(text string) bool {
+	if text == "" {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9', c == '+', c == '-', c == '.':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isHostWithPort reports whether the authority of a proxy URL is a host with
+// an optional port.
+//
+// The standard library is the authority: a port that is not a number is not
+// a port, and a host literal that does not close is not a host. The test
+// uses a fixed scheme, because the grammar of a host does not depend on the
+// scheme of the URL.
+func isHostWithPort(authority string) bool {
+	_, err := url.Parse("http://" + authority)
+	return err == nil
 }
 
 // sanitizeProxyURL removes the credentials from a proxy URL so that it can be
 // shown or reported.
 //
-// A URL whose credentials cannot be located is replaced by a fixed
+// The userinfo of the URL is its credential and is dropped. An authority
+// that is not a host is dropped as a whole, because it may be a credential
+// that was not terminated by an "@": its host can be the user and its port
+// can be the password of that credential.
+//
+// A URL whose authority cannot be located is replaced by a fixed
 // description: no part of it may be shown.
 func sanitizeProxyURL(raw string) string {
-	sanitized, ok := stripProxyCredentials(raw)
-	if !ok {
+	prefix, host, rest, shape := splitProxyURL(raw)
+	switch shape {
+	case proxyURLUnlocatable:
 		return "invalid proxy URL"
+	case proxyURLAmbiguous:
+		// The authority may be a credential, so it is replaced by a
+		// marker instead of being shown.
+		return prefix + redactedProxyAuthority + rest
+	default:
+		return prefix + host + rest
 	}
-	return sanitized
 }
 
 // ProxyErrorReason renders the reason of a proxy configuration failure
@@ -546,46 +677,23 @@ func GetProxyInfo() *ProxyInfo {
 }
 
 // GetProxyInfoString returns a human-readable description of the proxy configuration.
+//
+// The description never carries the proxy credentials: the userinfo of the
+// URL is dropped, and the separate credentials of the configuration are not
+// shown either. The description is shown to the user and reaches the API
+// responses, so the user of the proxy is as sensitive as its password.
 func GetProxyInfoString(proxyCfg *ProxyConfig) string {
 	if proxyCfg == nil || proxyCfg.URL == "" {
 		// Check environment
-		if httpProxy := os.Getenv("HTTP_PROXY"); httpProxy != "" {
-			return fmt.Sprintf("Environment: %s", httpProxy)
-		}
-		if httpProxy := os.Getenv("http_proxy"); httpProxy != "" {
-			return fmt.Sprintf("Environment: %s", httpProxy)
-		}
-		if httpsProxy := os.Getenv("HTTPS_PROXY"); httpsProxy != "" {
-			return fmt.Sprintf("Environment: %s", httpsProxy)
-		}
-		if httpsProxy := os.Getenv("https_proxy"); httpsProxy != "" {
-			return fmt.Sprintf("Environment: %s", httpsProxy)
+		for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"} {
+			if value := os.Getenv(name); value != "" {
+				// The environment value can carry the credentials of
+				// the proxy just like the configured URL does.
+				return fmt.Sprintf("Environment: %s", sanitizeProxyURL(value))
+			}
 		}
 		return "None (direct connection)"
 	}
 
-	// Parse URL to hide password
-	u, err := url.Parse(proxyCfg.URL)
-	if err != nil {
-		// The URL does not parse, so it cannot be masked field by field.
-		// Strip the credentials instead: the raw URL can carry the proxy
-		// password and this string is shown to the user.
-		return sanitizeProxyURL(proxyCfg.URL)
-	}
-
-	// Apply auth if separate
-	if u.User == nil && proxyCfg.Username != "" {
-		if proxyCfg.Password != "" {
-			u.User = url.UserPassword(proxyCfg.Username, "****")
-		} else {
-			u.User = url.User(proxyCfg.Username)
-		}
-	} else if u.User != nil {
-		// Mask existing password
-		if _, hasPass := u.User.Password(); hasPass {
-			u.User = url.UserPassword(u.User.Username(), "****")
-		}
-	}
-
-	return u.String()
+	return sanitizeProxyURL(proxyCfg.URL)
 }
