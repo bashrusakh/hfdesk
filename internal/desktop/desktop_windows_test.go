@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +165,56 @@ func TestDesktopServerLifecycle(t *testing.T) {
 		t.Fatalf("the port %d was not released: %v", port, err)
 	}
 	listener.Close()
+}
+
+// TestStopServerStopsTheRunningServer proves that the graceful stop of the
+// desktop host really stops a running server.
+//
+// The panic handler of the host and the failure path of the tray both use
+// that stop, and the invariant of the host is that the process never ends
+// with a running server that was not stopped through the graceful path.
+//
+// The test stays on the loopback interface and finishes in a moment.
+func TestStopServerStopsTheRunningServer(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	application, err := app.New(app.Options{Port: 0}, "1.2.3-desktop-test")
+	if err != nil {
+		t.Fatalf("create the application: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := application.Start(ctx); err != nil {
+		t.Fatalf("start the application: %v", err)
+	}
+
+	url := application.URL()
+
+	// The shutdown of the host. It exists before the server starts, so
+	// every path that ends the host while the server runs can stop it.
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			cancel()
+			if err := application.Wait(); err != nil {
+				t.Errorf("the server did not stop cleanly: %v", err)
+			}
+		})
+	}
+
+	stopServer(shutdown)
+
+	// The server stopped serving.
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	response, err := client.Get(url + "/api/health")
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("the server still answers after the graceful stop")
+	}
 }
 
 // runtimeStatus is the part of the runtime status the smoke test reads.

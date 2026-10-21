@@ -73,6 +73,12 @@ func run(o Options, logPath string) (err error) {
 	// The guard ends the host after a panic: it removes the published
 	// state, stops the server through the normal path and closes the log
 	// pipeline.
+	//
+	// The shutdown is missing only while the host has not reached the
+	// server yet, and the server is started after the shutdown exists, so
+	// a missing shutdown means that no server is running: the process
+	// never ends with a running server that was not stopped through the
+	// graceful path.
 	guard := panicGuard{
 		logPath: logPath,
 		end: func() {
@@ -109,7 +115,12 @@ func run(o Options, logPath string) (err error) {
 	// that was built without it opens a console window next to the
 	// notification area icon, so the user is told how to rebuild it. The
 	// check only reports the problem: the host starts either way.
-	checkSubsystem()
+	//
+	// The record is written on every launch, so the log file always shows
+	// that the build is wrong. The message box belongs to the launch that
+	// runs the host: a second launch reports the running instance, and the
+	// launch that runs the host has already told the user about the build.
+	subsystemWarningText := checkSubsystem()
 
 	// The third party libraries report their problems through the
 	// standard library logger, and one of them ends the process on its
@@ -135,6 +146,14 @@ func run(o Options, logPath string) (err error) {
 		return nil
 	}
 
+	// The message box of the subsystem warning belongs to this launch: it
+	// is the launch that runs the host, and the first launch has already
+	// reported the build. A second launch shows the notice of the running
+	// instance only.
+	if subsystemWarningText != "" {
+		showSubsystemWarning(subsystemWarningText)
+	}
+
 	application, err := app.New(o.App, o.Version)
 	if err != nil {
 		reportStartupFailure("HFDesk could not start",
@@ -147,12 +166,6 @@ func run(o Options, logPath string) (err error) {
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 
-	if err := application.Start(ctx); err != nil {
-		reportStartupFailure("HFDesk could not start",
-			fmt.Sprintf("HFDesk could not start its local server.\n\n%v", err), logPath)
-		return err
-	}
-
 	// The runtime window is created further down; the shutdown closes it
 	// when it exists.
 	var window *runtimeWindow
@@ -160,9 +173,12 @@ func run(o Options, logPath string) (err error) {
 	// The shutdown stops the server and waits for the graceful shutdown
 	// to finish. It runs once, whoever asks for it.
 	//
-	// It exists from the moment the server runs, so every path that ends
-	// the host while the server is running can stop it through the normal
-	// path.
+	// It is assigned before the server starts, so it exists from the
+	// moment the server can run. The invariant of the host is that the
+	// process never ends with a running server that was not stopped
+	// through this path: a panic between the start of the server and
+	// the end of the host finds the shutdown here and stops the server
+	// through it.
 	var shutdownOnce sync.Once
 	shutdown = func() {
 		shutdownOnce.Do(func() {
@@ -176,6 +192,12 @@ func run(o Options, logPath string) (err error) {
 				window.Close()
 			}
 		})
+	}
+
+	if err := application.Start(ctx); err != nil {
+		reportStartupFailure("HFDesk could not start",
+			fmt.Sprintf("HFDesk could not start its local server.\n\n%v", err), logPath)
+		return err
 	}
 
 	url := application.URL()

@@ -18,34 +18,45 @@ import (
 // The GUI subsystem is a build time property of the linker: a desktop host
 // that was built without -H=windowsgui is a console subsystem program and
 // opens a console window next to the notification area icon. The check reads
-// the PE header of the running executable and tells the user what is wrong
-// with the build and how to rebuild it.
+// the PE header of the running executable, records the problem in the log
+// file and returns the warning that is shown to the user.
 //
 // The check is cheap: it reads the header of one small file. It reports the
 // problem and nothing else: a mis-built binary is still a working
 // application, so the host starts and keeps running.
-func checkSubsystem() {
+//
+// The returned warning is empty when the build is correct. The warning is a
+// property of the binary, so the caller decides when it is shown: a launch
+// that finds a running instance reports that instance and leaves the warning
+// to the launch that runs the host.
+func checkSubsystem() string {
 	path, err := os.Executable()
 	if err != nil {
 		desktopLog.Warn("could not read the path of the running executable", "error", err)
-		return
+		return ""
 	}
 
 	subsystem, err := pe.Subsystem(path)
 	if err != nil {
 		desktopLog.Warn("could not read the PE subsystem of the running executable",
 			"executable", path, "error", err)
-		return
+		return ""
 	}
 
 	warning := subsystemWarning(subsystem)
 	if warning == "" {
-		return
+		return ""
 	}
 
 	desktopLog.Warn("the desktop host was not built with the Windows GUI subsystem",
 		"executable", path,
 		"subsystem", subsystem,
 		"subsystemName", pe.SubsystemName(subsystem))
+	return warning
+}
+
+// showSubsystemWarning shows the warning of a build that is not a GUI
+// subsystem image to the user.
+func showSubsystemWarning(warning string) {
 	showMessage("HFDesk - this build opens a console window", warning, windows.MB_ICONWARNING)
 }
