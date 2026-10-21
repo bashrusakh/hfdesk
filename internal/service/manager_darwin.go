@@ -649,9 +649,13 @@ func (m *launchdManager) resolveAccount(opts InstallOptions) (*serviceAccount, e
 // resolveServiceAccount resolves the account of a machine-wide instance.
 //
 // The account is looked up in the user database of the machine: on macOS the
-// lookup queries the OpenDirectory, so an account that was created with
-// "dscl" is found. A build without cgo only knows the accounts of
-// /etc/passwd, so it does not find a local account of the OpenDirectory.
+// lookup goes through the directory service, so an account that was created
+// with "dscl" is found.
+//
+// The lookup does not depend on cgo: the darwin build of os/user calls the
+// getpwnam_r of libSystem, which asks the directory service, and the reader
+// of /etc/passwd is only compiled when the osusergo build tag is set
+// explicitly.
 //
 // The installation never creates an account: an account that does not exist
 // is refused with the commands that create it.
@@ -919,6 +923,12 @@ func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *service
 //
 // The installation never changes the ownership or the permissions of such a
 // tree: a model or a cache tree belongs to whoever put it there.
+//
+// The refusal names the directory, the account and the access that is
+// missing. It never recommends a recursive ownership change of such a tree:
+// the access is granted to the directory itself or through the group that
+// owns it, and for a tree that holds a lot of data the group is preferable
+// to a new owner.
 func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAccount) error {
 	if account == nil {
 		// A user scope instance runs as the user who installs it: it can
@@ -947,8 +957,8 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 			return fmt.Errorf("service: the %s %q of the machine-wide instance cannot be used: %w", dir.name, dir.path, err)
 		}
 		if !ok {
-			return fmt.Errorf("service: the service account %q cannot write to the %s %q: grant it access (for example %q or by adding it to the group that owns the directory) and install again",
-				account.Name, dir.name, dir.path, "chown -R "+account.Name+" "+dir.path)
+			return fmt.Errorf("service: the service account %q has no write access to the %s %q: grant it access to that directory (for example %q) or make it a member of the group that owns the directory; for a tree that holds a lot of data, granting group access is preferable to changing the owner, and install again",
+				account.Name, dir.name, dir.path, "chown "+account.Name+" "+dir.path)
 		}
 	}
 	return nil

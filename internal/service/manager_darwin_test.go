@@ -1741,7 +1741,8 @@ func TestLaunchdGrantInstanceDirsKeepsADirectoryBelowADirectoryOfTheMachine(t *t
 // actionable message, and that the installation leaves the tree alone.
 //
 // The installation never chowns a cache tree: the guidance names the
-// commands that grant the access, the administrator runs them.
+// commands that grant the access, the administrator runs them. The guidance
+// never asks for a recursive ownership change of the tree.
 func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	account := darwinOtherAccount(t)
 
@@ -1787,6 +1788,11 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 			t.Errorf("Install() = %q, want a message that mentions %q", message, want)
 		}
 	}
+	// The refusal never recommends a recursive ownership change of the
+	// cache tree.
+	if strings.Contains(message, "-R") {
+		t.Errorf("Install() = %q, want a message without a recursive ownership command", message)
+	}
 
 	// The ownership of the cache tree is unchanged.
 	if owner, group := darwinOwner(t, cache); owner != beforeUID || group != beforeGID {
@@ -1795,6 +1801,74 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 	// The refused installation creates no directory of the instance.
 	if _, err := os.Stat(stateDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the refused installation created the state directory %q: %v", stateDir, err)
+	}
+}
+
+// TestLaunchdRefusesANamedDirTheAccountCannotWrite checks the refusal of a
+// named directory the service account cannot write to.
+//
+// The refusal names the directory, the account and the access that is
+// missing. It never recommends a recursive ownership change of a model or a
+// cache tree: the access is granted to the directory itself or through the
+// group that owns it, and for a tree that holds a lot of data the group is
+// preferable to a new owner.
+//
+// The test needs no elevated shell: it only reads the ownership of a
+// directory of a temporary directory.
+func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
+	account := darwinOtherAccount(t)
+
+	root := t.TempDir()
+	// The directory belongs to the user of the test and to nobody else, so
+	// the service account has no write access to it.
+	cache := filepath.Join(root, "cache")
+	if err := os.Mkdir(cache, 0o700); err != nil {
+		t.Fatalf("create the cache directory: %v", err)
+	}
+
+	opts := InstallOptions{
+		Scope:    ScopeSystem,
+		CacheDir: cache,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "state"),
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+
+	launchd := &launchdManager{scope: ScopeSystem}
+	err := launchd.checkNamedDirs(opts, account)
+	if err == nil {
+		t.Fatal("checkNamedDirs() = nil, want the refusal of a cache directory the account cannot write to")
+	}
+	message := err.Error()
+
+	// The refusal names the directory, the account and the access that is
+	// missing.
+	for _, want := range []string{
+		"the service account " + strconv.Quote(account.Name),
+		strconv.Quote(cache),
+		"write access",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("checkNamedDirs() = %q, want a message that mentions %q", message, want)
+		}
+	}
+	// The refusal never recommends a recursive ownership change of the
+	// tree.
+	if strings.Contains(message, "-R") {
+		t.Errorf("checkNamedDirs() = %q, want a message without a recursive ownership command", message)
+	}
+	// The guidance is the ownership of the directory itself and the group
+	// that owns it.
+	for _, want := range []string{
+		"chown " + account.Name + " " + cache,
+		"member of the group that owns the directory",
+		"group access is preferable to changing the owner",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("checkNamedDirs() = %q, want a message that mentions %q", message, want)
+		}
 	}
 }
 
