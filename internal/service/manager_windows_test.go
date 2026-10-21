@@ -688,9 +688,15 @@ func TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable(t *testing.T)
 	}
 }
 
-// TestSCMStatusFromAStoppedInstanceNamesTheExitCode checks that the exit
-// code of a stopped instance is reported.
-func TestSCMStatusFromAStoppedInstanceNamesTheExitCode(t *testing.T) {
+// TestSCMStatusFromAFailedInstanceIsFailedAndNamesTheExitCode checks that
+// an instance that crashed is reported as failed, and that the detail names
+// the exit code it ended with.
+//
+// The service control manager has no state of its own for a failure: it
+// reports a crashed instance as stopped, like a cleanly stopped one. The
+// exit code is what tells the two apart, and the managers of the other
+// platforms report the same crash as failed.
+func TestSCMStatusFromAFailedInstanceIsFailedAndNamesTheExitCode(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Executable = filepath.Join(root, "hfdesk.exe")
@@ -709,11 +715,90 @@ func TestSCMStatusFromAStoppedInstanceNamesTheExitCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scmStatusFrom() = %v, want nil", err)
 	}
-	if status.State != StateStopped {
-		t.Errorf("the state = %q, want %q", status.State, StateStopped)
+	if status.State != StateFailed {
+		t.Errorf("the state = %q, want %q", status.State, StateFailed)
 	}
 	if !strings.Contains(status.Detail, "3") {
 		t.Errorf("the detail = %q, want the exit code of the instance", status.Detail)
+	}
+}
+
+// TestSCMStatusFromACleanlyStoppedInstanceIsStopped checks that an
+// instance that ended cleanly is reported as stopped, and not as failed.
+//
+// The exit code of a clean run is zero, so the instance is not a failed one:
+// the two cases are told apart by the exit code alone.
+func TestSCMStatusFromACleanlyStoppedInstanceIsStopped(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestOptions()
+	opts.Executable = filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Stopped,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateStopped {
+		t.Errorf("the state = %q, want %q", status.State, StateStopped)
+	}
+	if status.Detail != "" {
+		t.Errorf("the detail = %q, want none", status.Detail)
+	}
+}
+
+// TestSCMStatusFromKeepsTheOtherSupervisorStates checks that the exit code
+// of an earlier run does not turn an instance that runs, that starts or that
+// stops into a failed one.
+//
+// The exit code is only read for an instance that is stopped: every other
+// state of the supervisor is reported as it is, the way the managers of the
+// other platforms report it.
+func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
+	cases := []struct {
+		name  string
+		state svc.State
+		want  State
+	}{
+		{"running", svc.Running, StateRunning},
+		{"start pending", svc.StartPending, StateStarting},
+		{"stop pending", svc.StopPending, StateStopping},
+		{"paused", svc.Paused, StateUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			opts := scmTestOptions()
+			opts.Executable = filepath.Join(root, "hfdesk.exe")
+			if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
+				t.Fatalf("WriteFile() = %v, want nil", err)
+			}
+
+			facts := scmRegistrationFacts{
+				present:     true,
+				state:       tc.state,
+				exitCode:    3,
+				commandLine: scmCommandLine(opts),
+			}
+
+			status, err := scmStatusFrom(ScopeSystem, facts)
+			if err != nil {
+				t.Fatalf("scmStatusFrom() = %v, want nil", err)
+			}
+			if status.State != tc.want {
+				t.Errorf("the state = %q, want %q", status.State, tc.want)
+			}
+			if status.Detail != "" {
+				t.Errorf("the detail = %q, want none", status.Detail)
+			}
+		})
 	}
 }
 

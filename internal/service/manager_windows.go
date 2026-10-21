@@ -686,6 +686,11 @@ func scmLookupError(what string, err error) error {
 //
 // An absent registration is reported as not installed: the registration is
 // not there, so there is nothing to describe.
+//
+// An instance that crashed is reported as failed: the service control
+// manager has no state of its own for a failure and reports a crashed
+// instance as stopped, so the exit code is what tells a failed instance
+// from a cleanly stopped one.
 func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 	status := scmBaseStatus(scope)
 	if !facts.present {
@@ -707,6 +712,13 @@ func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 
 	status.State = scmState(facts.state)
 	if status.State == StateStopped && facts.exitCode != 0 {
+		// The service control manager has no state of its own for a
+		// failure: an instance that crashed is reported as stopped
+		// there, like an instance that ended cleanly. The exit code is
+		// what tells the two apart, so a stopped instance that ended
+		// with a non-zero code is reported as failed, the way the
+		// managers of the other platforms report the same crash.
+		status.State = StateFailed
 		status.Detail = fmt.Sprintf("the instance exited with the code %d", facts.exitCode)
 	}
 	return status, nil
