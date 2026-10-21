@@ -1895,6 +1895,16 @@ async function loadRepositoryDetails(entry) {
 
         data.selectable_items.forEach(item => {
           const key = selectableStatusKey(item);
+          // This endpoint reports the repo's latest cached snapshot without a
+          // revision identity. It cannot prove that a branch-backed option is
+          // present, so do not retain a stored 'done' chip for one.
+          if (branchVariantRevision(item)) {
+            if (map[key] === 'done') {
+              delete map[key];
+              changed = true;
+            }
+            return;
+          }
           const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
           if (!key || !files.length) return;
 
@@ -1923,7 +1933,7 @@ async function loadRepositoryDetails(entry) {
       let changed = false;
       data.selectable_items.forEach(item => {
         const key = selectableStatusKey(item);
-        if (!String(key).startsWith('artifact:') || map[key] !== 'done') return;
+        if ((!String(key).startsWith('artifact:') && !branchVariantRevision(item)) || map[key] !== 'done') return;
         delete map[key];
         changed = true;
       });
@@ -1936,11 +1946,19 @@ async function loadRepositoryDetails(entry) {
   }
 
   function selectableStatusKey(item) {
+    const branchRevision = branchVariantRevision(item);
+    if (branchRevision) return `branch:${branchRevision}`;
     const files = Array.isArray(item?.files) ? item.files : [];
     if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
       return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
     }
     return item?.filter_value || item?.id || '';
+  }
+
+  function branchVariantRevision(item) {
+    return item?.category === 'quantization' && typeof item.revision === 'string'
+      ? item.revision
+      : '';
   }
 
   function artifactRequestPaths(files) {
@@ -5386,6 +5404,29 @@ async function loadRepositoryDetails(entry) {
     return active;
   }
 
+  // Branch-backed rows select a whole repository revision (no file filters),
+  // so only a live unfiltered job at that exact revision can mark one active.
+  // Job completion and repo-wide cache snapshots do not prove branch contents.
+  function branchActiveKeys(items, jobs) {
+    const branchItems = (items || []).map(item => {
+      const revision = branchVariantRevision(item);
+      return revision ? { key: selectableStatusKey(item), revision } : null;
+    }).filter(Boolean);
+    const active = {};
+    if (!branchItems.length) return active;
+    jobs.forEach(job => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
+      if ((job.filters || []).length > 0) return;
+      if ((job.excludes || []).length > 0) return;
+      branchItems.forEach(({ key, revision }) => {
+        if (job.revision !== revision) return;
+        const status = job.status === 'running' ? 'running' : 'queued';
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
   function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
     // Reconcile per-quant status with the live job list. Active jobs set
     // running/queued; artifact completion is never inferred from job status,
@@ -5396,7 +5437,7 @@ async function loadRepositoryDetails(entry) {
     const map = getDlStatus(repo, isDataset);
     const jobs = Array.from(state.jobs.values())
       .filter(job => jobMatchesAnalysis(job, { repo, is_dataset: isDataset }));
-    const active = artifactActiveKeys(items, jobs);
+    const active = { ...artifactActiveKeys(items, jobs), ...branchActiveKeys(items, jobs) };
     jobs.forEach(j => {
       const f = (j.filters || []).join(',') || '__all__';
       if (j.status === 'completed') active[f] = 'done';
@@ -5494,10 +5535,11 @@ async function loadRepositoryDetails(entry) {
 
   function selectableDownloadControl(item, status) {
     const repo = currentAnalysis?.repo || '';
-    const fv = item.filter_value || item.id || '';
+    const branchRevision = branchVariantRevision(item);
+    const fv = branchRevision ? '' : (item.filter_value || item.id || '');
     const files = Array.isArray(item.files) ? item.files : [];
-    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
-    const statusKey = exactArtifact ? selectableStatusKey(item) : fv;
+    const exactArtifact = !branchRevision && files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+    const statusKey = exactArtifact || branchRevision ? selectableStatusKey(item) : fv;
     const dlRepo = item.upstream_repo || repo;
     const statusRepo = repo;
     const chip = selectableStatusChip(status);
@@ -5509,7 +5551,7 @@ async function loadRepositoryDetails(entry) {
     return {
       statusKey,
       html: `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
-               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null}))}">${dlIcon}</button>`
+               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null, ...(branchRevision ? {revision: branchRevision} : {})}))}">${dlIcon}</button>`
     };
   }
 
@@ -5599,7 +5641,8 @@ async function loadRepositoryDetails(entry) {
         const ram     = item.ram_human   ? `<span class="quant-ram">${escapeHtml(item.ram_human)} RAM</span>` : '';
         const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
 
-        const fv = item.filter_value || item.id || '';
+        const branchRevision = branchVariantRevision(item);
+        const fv = branchRevision ? '' : (item.filter_value || item.id || '');
         const statusKey = selectableStatusKey(item);
         const dlStatus = dlMap[statusKey] || '';
         // Left control: a Download button when idle; otherwise it is REPLACED by
@@ -5631,18 +5674,18 @@ async function loadRepositoryDetails(entry) {
   window.downloadQuantFromButton = function(button) {
     try {
       const args = JSON.parse(decodeURIComponent(button.dataset.download));
-      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey);
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey, args.revision);
     } catch (e) { console.error('Invalid selectable download data', e); }
   };
 
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey, selectedRevision) {
     try {
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
       // the repo being analyzed, not to its ancestors.
       const revision = (repo === currentAnalysis?.repo)
-        ? (currentAnalysis?.branch || 'main')
+        ? (selectedRevision || currentAnalysis?.branch || 'main')
         : 'main';
       const body = {
         repo,

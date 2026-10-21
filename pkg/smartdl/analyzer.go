@@ -180,6 +180,17 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 	// Populate SelectableItems based on type
 	populateSelectableItems(info)
 
+	// Repositories that keep EXL2/EXL3 bitrate variants on branches may have
+	// no model weights on main. Keep ordinary main-branch analysis unchanged;
+	// the branch analyzer checks for missing weights independently of type.
+	if !isDataset && revision == "main" {
+		branchItems, err := a.exlBranchVariantItems(ctx, info)
+		if err != nil {
+			return nil, err
+		}
+		info.SelectableItems = append(info.SelectableItems, branchItems...)
+	}
+
 	// Populate web/API download defaults.
 	info.PopulateDownloadSelection()
 

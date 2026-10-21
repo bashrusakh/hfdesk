@@ -120,8 +120,92 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
     assert.deepEqual(download.body, preview.body, 'guard and creation must use the identical request');
     assert.equal(download.data.outputDir, appPath, 'CreateJob retains the app/friendly root');
     assert.equal(download.data.hubDir || download.data.outputDir, preview.data.path, 'Physical job destination must match disk preview');
-    if (entry === 'quant') assert.equal(download.body.localRepo, 'fixture/parent');
+    if (entry === 'quant') {
+      assert.equal(download.body.localRepo, 'fixture/parent');
+      assert.equal(download.body.revision, 'custom', 'legacy selectable rows keep the analyzed revision');
+      assert.deepEqual(download.body.filters, ['weights'], 'legacy selectable rows keep their filter');
+      assert.equal(download.body.exactMatch, true, 'legacy selectable rows keep exact filter matching');
+    }
+    if (entry === 'all') {
+      assert.equal(download.body.revision, 'custom', 'the existing wizard keeps the analyzed revision');
+      assert.deepEqual(download.body.filters, [], 'the existing wizard keeps its unfiltered Download All request');
+    }
   }
+}
+
+async function runBranchVariant() {
+  const repo = 'fixture/exl-branches';
+  const revision = 'refs/bpw/4.0';
+  const item = {
+    id: `exl-branch:${revision}`,
+    label: revision,
+    description: 'EXL3 · 4 BPW · head 6 bits',
+    category: 'quantization',
+    recommended: true,
+    revision,
+    size: 12 * 1024 * 1024 * 1024,
+    size_human: '12 GiB'
+  };
+  const analysis = {
+    repo,
+    type: 'generic',
+    branch: 'main',
+    is_dataset: false,
+    selectable_items: [item],
+    recommended_download: { repo, revision, filters: [], exactMatch: false }
+  };
+  ui.setAnalysis(analysis);
+  const html = ui.renderSelectableItems([item], 'selectableItems');
+  assert(html.includes('>refs/bpw/4.0</span>'), 'branch label is rendered in the existing selectable row');
+  assert(html.includes('EXL3 · 4 BPW · head 6 bits'), 'branch details use the existing row description');
+  assert(html.includes('12 GiB'), 'optional branch size uses the existing size affordance');
+  assert(html.includes('★ rec'), 'recommended branch keeps the existing recommendation affordance');
+
+  const encoded = html.match(/data-download="([^"]+)"/)?.[1];
+  assert(encoded, 'branch row exposes its download action');
+  const args = JSON.parse(decodeURIComponent(encoded));
+  assert.equal(args.revision, revision, 'the row carries its own branch revision');
+  assert.equal(args.filterValue, '', 'branch id is not reused as a file filter');
+  assert.equal(args.files, null, 'whole-branch selection has no file list');
+  assert.equal(args.statusKey, `branch:${revision}`, 'branch row carries its revision-scoped status key');
+
+  calls.length = 0;
+  messages.length = 0;
+  const sourceRow = { dataset: {}, querySelector() { return null; } };
+  await window.downloadQuantFromButton({ dataset: { download: encoded }, closest: () => sourceRow });
+  const preview = calls.find(c => c.path === '/api/diskfree');
+  const download = calls.find(c => c.path === '/api/download');
+  assert(preview, 'branch download includes the normal disk-space guard');
+  assert(download, 'branch download reaches the real download handler');
+  assert.deepEqual(download.body, preview.body, 'branch guard and creation use the identical request');
+  assert.equal(download.body.repo, repo);
+  assert.equal(download.body.revision, revision, 'selected branch wins over currentAnalysis main');
+  assert.deepEqual(download.body.filters, [], 'branch request includes all branch files');
+  assert.equal(download.body.exactMatch, false, 'branch request does not use exact file matching');
+  assert.equal(download.body.excludes, undefined, 'branch request keeps branch support files unfiltered');
+  assert.equal(download.data.revision, revision, 'the created job retains the selected revision');
+
+  const noSizeItem = { ...item, id: 'exl-branch:refs/bpw/5.0', label: 'refs/bpw/5.0', revision: 'refs/bpw/5.0', recommended: false, size: undefined, size_human: undefined };
+  const noSizeHtml = ui.renderSelectableItems([noSizeItem], 'selectableItems');
+  assert(!noSizeHtml.includes('quant-size'), 'unknown branch size is omitted rather than rendered as zero');
+  assert(!noSizeHtml.includes('0 B'), 'unknown branch size is not mislabeled as measured zero');
+}
+
+async function runUpstreamCompanion() {
+  const repo = 'fixture/parent-model';
+  ui.setAnalysis({ repo, type: 'gguf', branch: 'refs/bpw/4.0', is_dataset: false });
+  calls.length = 0;
+  const sourceRow = { dataset: {}, querySelector() { return null; } };
+  await window.downloadQuant(
+    'fixture/upstream-base', 'mmproj', false, 'MMProj', repo, repo,
+    ['mmproj-model-f16.gguf'], sourceRow, 'artifact:mmproj', 'refs/bpw/4.0'
+  );
+  const download = calls.find(c => c.path === '/api/download');
+  assert(download, 'upstream companion reaches the real download handler');
+  assert.equal(download.body.revision, 'main', 'upstream companion remains pinned to main');
+  assert.equal(download.body.localRepo, repo, 'upstream companion remains stored with the analyzed model');
+  assert.deepEqual(download.body.filters, ['./mmproj-model-f16.gguf'], 'upstream companion keeps exact file selection');
+  assert.equal(download.body.exactMatch, true);
 }
 
 (async () => {
@@ -139,6 +223,8 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   }
   await run('quant', 'gguf', { choice: '' });
   if (fixture.routes?.audio) await run('quant', 'gguf', { choice: 'audio' });
+  await runBranchVariant();
+  await runUpstreamCompanion();
   // File-list downloads select a repository-relative path exactly: a root-level
   // entry is encoded as "./name" so a same-named nested alias is not selected,
   // while a nested entry keeps its canonical relative path. The displayed name

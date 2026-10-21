@@ -115,6 +115,52 @@ Important response fields:
 
 `recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
+For EXL2/EXL3 model repositories whose `main` revision has no recognized model
+weight files, branch names containing a bitrate (for example `4.00bpw` or
+`SC_6.00bpw_H6_V6`) are returned as branch-backed `selectable_items`,
+regardless of modality classification. The `N_M` spelling (for example
+`4_25`) is recognized only when the repository name contains `exl2` or `exl3`.
+Tags and unrelated branches such as `fp16` are not bitrate options. Branch
+metadata is resolved from its quantization config when available. The
+repository name or main-branch config is the method fallback. `method` is
+`exl2` or `exl3`, `bits_per_weight` is the effective bitrate, and `head_bits`
+is included when declared by the branch config or branch name.
+
+```json
+{
+  "selectable_items": [
+    {
+      "id": "exl-branch:SC_6.00bpw_H6_V6",
+      "label": "SC_6.00bpw_H6_V6",
+      "category": "quantization",
+      "filter_value": "",
+      "revision": "SC_6.00bpw_H6_V6",
+      "method": "exl3",
+      "bits_per_weight": 6,
+      "head_bits": 6,
+      "size": 6400000000,
+      "size_human": "5.96 GiB"
+    }
+  ],
+  "recommended_download": {
+    "repo": "owner/example-EXL3-model",
+    "revision": "4.00bpw"
+  }
+}
+```
+
+Branch selections use `revision` as the identity, not `files` or
+`filter_value`. Send the selected item's URL-encoded `revision` to
+`GET /api/analyze/{owner}/{repo}?revision=...` to analyze that branch, or send
+`{"repo":"owner/name","revision":"..."}` to `/api/download` to download
+the complete branch, including its model support/config/tokenizer files. The
+single recommended branch uses the same unfiltered request shape. Branch size
+lookups are optional and bounded to 16 branches with at most three concurrent
+lookups; every listed branch remains selectable when a size lookup is skipped
+or fails, and the `size`/`size_human` fields are then omitted. These fields are
+specific to branch-backed items; existing non-branch `selectable_items` keep
+their existing filter/file semantics.
+
 ### Model/dataset selection
 
 If the repository exists as both a model and a dataset, auto-detection returns

@@ -120,6 +120,24 @@ func TestRepoInfo_PopulateDownloadSelection(t *testing.T) {
 			t.Errorf("RecommendedDownload = %+v, want nil", info.RecommendedDownload)
 		}
 	})
+
+	t.Run("branch recommendation uses only its revision", func(t *testing.T) {
+		info := &RepoInfo{
+			Repo:   "owner/repo",
+			Branch: "main",
+			SelectableItems: []SelectableItem{
+				{ID: "legacy", FilterValue: "safetensors", Recommended: true},
+				{ID: "exl-branch:4.00bpw", Revision: "4.00bpw", Recommended: true},
+			},
+		}
+		info.PopulateDownloadSelection()
+		if info.RecommendedDownload == nil || info.RecommendedDownload.Revision != "4.00bpw" || len(info.RecommendedDownload.Filters) != 0 {
+			t.Fatalf("RecommendedDownload = %+v, want unfiltered branch request", info.RecommendedDownload)
+		}
+		if len(info.RecommendedFilters) != 0 {
+			t.Fatalf("RecommendedFilters = %v, want empty for revision selection", info.RecommendedFilters)
+		}
+	})
 }
 
 func TestRepoInfo_GetSelectedSize(t *testing.T) {

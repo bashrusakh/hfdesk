@@ -236,6 +236,15 @@ function artifactItem(files, label = 'Q4_0', filterValue = 'q4_0') {
   };
 }
 
+function branchItem(revision, label = revision) {
+  return {
+    category: 'quantization',
+    id: `exl-branch:${revision}`,
+    revision,
+    label
+  };
+}
+
 function visionItem(files, label = 'MMProj', filterValue = 'mmproj') {
   return {
     category: 'vision_encoder',
@@ -454,6 +463,96 @@ scenario('legacy token status survives cache 404', async () => {
   const { map, html } = await reconcile([item]);
   eq(map['Q4_K_M'], 'done', 'legacy token remains done after 404 reconciliation');
   assertDone(html, '', 'legacy 404 token row');
+});
+
+scenario('branch variants isolate status by revision and never infer done from unqualified cache', async () => {
+  const branchA = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const branchB = branchItem('refs/bpw/5.0', 'EXL3 5.0 BPW');
+  const keyA = ui.selectableStatusKey(branchA);
+  const keyB = ui.selectableStatusKey(branchB);
+  eq(keyA !== keyB, true, 'different branch revisions have independent status keys');
+
+  // The cache endpoint reports a repository snapshot without revision proof;
+  // even old stored done values cannot disable either full-branch row.
+  reset({
+    cacheFiles: FILES,
+    initial: { [keyA]: 'done', [keyB]: 'done' }
+  });
+  let result = await reconcile([branchA, branchB]);
+  eq(result.map[keyA], undefined, 'unqualified cache cannot retain branch A done');
+  eq(result.map[keyB], undefined, 'unqualified cache cannot retain branch B done');
+  assertIdle(result.html, branchA.label, 'branch A without revision-specific cache evidence');
+  assertIdle(result.html, branchB.label, 'branch B without revision-specific cache evidence');
+
+  // Only a full-branch job at the exact revision marks the matching row active.
+  reset({
+    jobs: [liveJob({ status: 'running', revision: branchA.revision, filters: [] })],
+    cacheStatus: 404
+  });
+  result = await reconcile([branchA, branchB]);
+  eq(result.map[keyA], 'running', 'matching revision job marks branch A running');
+  eq(result.map[keyB], undefined, 'branch A job does not mark branch B running');
+  match(rowFor(result.html, branchA.label), /quant-dl-btn-running/, 'matching branch row shows running');
+  assertIdle(result.html, branchB.label, 'different branch row stays downloadable');
+
+  reset({
+    jobs: [liveJob({ status: 'queued', revision: branchB.revision, filters: [] })],
+    cacheStatus: 404
+  });
+  result = await reconcile([branchA, branchB]);
+  eq(result.map[keyA], undefined, 'branch B queued job does not mark branch A');
+  eq(result.map[keyB], 'queued', 'matching revision job marks branch B queued');
+  assertQueued(rowFor(result.html, branchB.label), 'matching branch row shows queued');
+
+  // A filtered request is not the whole selected branch and must not be
+  // represented as downloading the branch-backed selectable row.
+  reset({
+    jobs: [liveJob({ status: 'queued', revision: branchA.revision, filters: ['config.json'] })],
+    cacheStatus: 404
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'filtered job does not mark a full-branch row queued');
+  assertIdle(result.html, branchA.label, 'filtered job leaves the full-branch row downloadable');
+
+  reset({
+    jobs: [liveJob({ status: 'queued', revision: branchA.revision, filters: [], excludes: ['*.md'] })],
+    cacheStatus: 404
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'job excluding branch support files does not mark the full-branch row queued');
+
+  // Completion is not revision-specific cache evidence; it clears the active
+  // chip but does not make the branch row permanently done.
+  reset({
+    jobs: [liveJob({ status: 'completed', revision: branchA.revision, filters: [] })],
+    cacheFiles: FILES,
+    initial: { [keyA]: 'queued' }
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'completed branch job does not infer done without revision-specific cache evidence');
+  assertIdle(result.html, branchA.label, 'completed branch row remains available');
+});
+
+scenario('live branch job updates only its matching selectable row', async () => {
+  const branchA = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const branchB = branchItem('refs/bpw/5.0', 'EXL3 5.0 BPW');
+  const keyA = ui.selectableStatusKey(branchA);
+  const keyB = ui.selectableStatusKey(branchB);
+  reset({ items: [branchA, branchB], cacheStatus: 404 });
+  const rows = installRows([branchA, branchB]);
+
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ id: 'branch-running', status: 'running', revision: branchA.revision, filters: [] })
+  });
+  await ui.flushLiveReconcile();
+
+  eq(ui.getDlStatus(REPO, false)[keyA], 'running', 'live matching revision updates its status key');
+  eq(ui.getDlStatus(REPO, false)[keyB], undefined, 'live job does not update another revision key');
+  eq(rows[0].dataset.dlStatus, 'running', 'live matching row is updated in place');
+  eq(rows[1].dataset.dlStatus, '', 'other branch row remains idle');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-running/, 'matching branch row shows running chip');
+  assertIdle(ui.renderSelectableItems([branchA, branchB], 'selectableItems'), branchB.label, 'other branch row remains downloadable');
 });
 
 scenario('distinct artifacts sharing a quant/filter stay independent', async () => {
