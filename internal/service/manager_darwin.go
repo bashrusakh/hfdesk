@@ -167,7 +167,9 @@ func (m *launchdManager) target() string {
 // The property list is rendered, written atomically and loaded into the
 // domain of the instance. An installation that fails after the property list
 // was written restores the previous registration, so a failed installation
-// never leaves a half configured registration behind.
+// never leaves a half configured registration behind. A failure removes the
+// directories the installation created as well, so a failed attempt leaves
+// the machine as it was.
 //
 // A machine-wide instance runs as a service account. The account is
 // resolved and validated before any directory is created and before the
@@ -209,16 +211,39 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
 	// exactly those and of nothing else.
-	var created map[string][]string
-	if account != nil {
-		created = make(map[string][]string, 3)
-		for _, dir := range instanceDirs(opts) {
-			created[dir.path] = createdDirs(dir.path)
-		}
+	//
+	// The list is also what a failed installation removes again, so a
+	// failed installation leaves the machine as it was.
+	created := make(map[string][]string, 3)
+	for _, dir := range instanceDirs(opts) {
+		created[dir.path] = createdDirs(dir.path)
 	}
 	if err := PrepareDirs(opts); err != nil {
+		// The preparation may have created some of the directories
+		// before it failed: they are removed again, so a failed attempt
+		// leaves the machine as it was.
+		removeCreatedDirs(createdDirOrder(opts, created))
 		return err
 	}
+	// The installation owns the directories it created from here on: a
+	// failure removes them again, so a failed installation never leaves
+	// the directories of the instance behind.
+	if err := m.register(ctx, opts, account, created); err != nil {
+		removeCreatedDirs(createdDirOrder(opts, created))
+		return err
+	}
+	return nil
+}
+
+// register writes the registration of the instance and hands it to the
+// supervisor.
+//
+// The directories of the instance are already created when the function is
+// called. A failure of the registration is rolled back: the property list is
+// restored and the directories the installation created are removed by the
+// caller, so a failed installation leaves no half configured registration and
+// no empty directories behind.
+func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string) error {
 	// The instance runs as the account, so the account owns the directories
 	// the instance writes.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
@@ -709,6 +734,55 @@ func createdDirs(path string) []string {
 		missing[i], missing[j] = missing[j], missing[i]
 	}
 	return missing
+}
+
+// createdDirOrder returns the directories an installation creates, in the
+// order it creates them.
+//
+// The map holds the directories of every directory of the instance. The
+// directories of the instance are created in the order of instanceDirs (the
+// config directory, the state directory and the log directory) and from the
+// top down inside each of them, so the list is the order of the creation.
+//
+// A directory that several directories of the instance need is listed once:
+// the first directory of the instance that needed it is the one that created
+// it.
+func createdDirOrder(opts InstallOptions, created map[string][]string) []string {
+	var order []string
+	seen := make(map[string]bool, len(created))
+	for _, dir := range instanceDirs(opts) {
+		for _, path := range created[dir.path] {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			order = append(order, path)
+		}
+	}
+	return order
+}
+
+// removeCreatedDirs removes the directories an installation created.
+//
+// The directories are removed in the reverse order of their creation, so a
+// parent is only removed after its children. A directory that is not empty is
+// kept: the removal never deletes data and it never walks into a directory.
+//
+// The removal is best effort: a failure of the removal is ignored, so the
+// original failure of the installation stays the error the caller gets.
+func removeCreatedDirs(dirs []string) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		path := dirs[i]
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() {
+			// The directory is gone already, or it is not a directory
+			// any more: nothing is removed, so no file is ever deleted.
+			continue
+		}
+		// A directory that holds something is kept: the removal of such
+		// a directory would delete what it holds.
+		_ = os.Remove(path)
+	}
 }
 
 // machineDir reports whether the directory is a directory of the machine

@@ -1974,3 +1974,292 @@ func darwinStripXMLEntities(value string) string {
 	}
 	return value
 }
+
+// darwinFakeSupervisor replaces the supervisor of the machine with a fake
+// one, so an installation can be driven through a known point.
+//
+// The fake fails every call, unless the environment variable
+// HFDESK_TEST_SUPERVISOR is "ok". A failing installation therefore stops
+// after the directories of the instance were created, which is the point the
+// cleanup of a failed installation has to cover.
+//
+// The fake writes a marker file into the directory of the environment
+// variable HFDESK_TEST_MARKER_DIR when that variable names a directory, so
+// a test can make a directory of the instance hold data before the
+// installation fails.
+func darwinFakeSupervisor(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ -n "$HFDESK_TEST_MARKER_DIR" ]; then
+	mkdir -p "$HFDESK_TEST_MARKER_DIR" || exit 1
+	: > "$HFDESK_TEST_MARKER_DIR/marker" || exit 1
+fi
+if [ "$HFDESK_TEST_SUPERVISOR" = "ok" ]; then
+	exit 0
+fi
+echo "the fake supervisor refuses the command" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(dir, "launchctl"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write the fake supervisor: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// darwinTempInstallOptions returns the options of a user scope installation
+// whose directories live below the given root.
+//
+// The scope is the user scope: it needs neither an elevated shell nor a
+// service account, so the test runs everywhere.
+func darwinTempInstallOptions(t *testing.T, root string) InstallOptions {
+	t.Helper()
+	executable := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write the program: %v", err)
+	}
+	return InstallOptions{
+		Scope:      ScopeUser,
+		Executable: executable,
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+	}
+}
+
+// TestLaunchdCreatedDirOrder checks the order of the directories a failed
+// installation removes: the directories are listed in the order they are
+// created, so a parent is always removed after its children.
+func TestLaunchdCreatedDirOrder(t *testing.T) {
+	root := t.TempDir()
+	opts := InstallOptions{
+		Scope:      ScopeUser,
+		Executable: filepath.Join(root, "hfdesk"),
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+	}
+
+	created := make(map[string][]string, 3)
+	for _, dir := range instanceDirs(opts) {
+		created[dir.path] = createdDirs(dir.path)
+	}
+	order := createdDirOrder(opts, created)
+
+	want := []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	}
+	if !reflect.DeepEqual(order, want) {
+		t.Errorf("createdDirOrder() = %v, want %v", order, want)
+	}
+}
+
+// TestLaunchdFailedInstallRemovesTheDirectoriesItCreated checks that a
+// failed installation removes the directories it created, so a failed attempt
+// leaves the machine as it was.
+func TestLaunchdFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
+	darwinFakeSupervisor(t)
+	root := t.TempDir()
+
+	opts := darwinTempInstallOptions(t, root)
+	m := darwinStatusManager(t)
+	if err := m.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install() = nil, want the failure of the supervisor")
+	}
+
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q is still there after the failed installation (stat error: %v)", dir, err)
+		}
+	}
+}
+
+// TestLaunchdFailedInstallKeepsADirectoryThatExistedBefore checks that a
+// failed installation never removes a directory that existed before it: such
+// a directory belongs to whoever owns it, with the ownership and the
+// permissions it had.
+func TestLaunchdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
+	darwinFakeSupervisor(t)
+	root := t.TempDir()
+
+	// The config directory existed before the installation.
+	config := filepath.Join(root, "etc")
+	if err := os.Mkdir(config, 0o750); err != nil {
+		t.Fatalf("create the config directory: %v", err)
+	}
+	owner, group := darwinOwner(t, config)
+
+	opts := darwinTempInstallOptions(t, root)
+	m := darwinStatusManager(t)
+	if err := m.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install() = nil, want the failure of the supervisor")
+	}
+
+	// The directory that existed before the installation is still there,
+	// with the owner and the permissions it had.
+	info, err := os.Stat(config)
+	if err != nil {
+		t.Fatalf("the config directory %q is gone after the failed installation: %v", config, err)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Errorf("the mode of the config directory %q = %v, want %v", config, info.Mode().Perm(), os.FileMode(0o750))
+	}
+	if uid, gid := darwinOwner(t, config); uid != owner || gid != group {
+		t.Errorf("the ownership of the config directory %q = %d:%d, want %d:%d", config, uid, gid, owner, group)
+	}
+	// The directory the installation created inside it is gone.
+	created := filepath.Join(config, "hfdesk")
+	if _, err := os.Stat(created); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the directory %q is still there after the failed installation (stat error: %v)", created, err)
+	}
+}
+
+// TestLaunchdFailedInstallKeepsACreatedDirectoryThatHoldsData checks that
+// the cleanup of a failed installation never deletes data: a directory the
+// installation created but that holds something is kept, and the caller
+// still gets the original error of the installation.
+func TestLaunchdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
+	darwinFakeSupervisor(t)
+	root := t.TempDir()
+
+	opts := darwinTempInstallOptions(t, root)
+	state := opts.Paths.StateDir
+	m := darwinStatusManager(t)
+
+	// The error of the failed supervisor call is the error the caller
+	// gets: the cleanup of the directories never replaces it.
+	t.Setenv("HFDESK_TEST_MARKER_DIR", t.TempDir())
+	_, _, wantErr := m.printState(context.Background())
+	if wantErr == nil {
+		t.Fatal("the fake supervisor did not fail")
+	}
+
+	// The fake supervisor writes a marker into the state directory, so the
+	// directory holds data when the installation fails.
+	t.Setenv("HFDESK_TEST_MARKER_DIR", state)
+	err := m.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the supervisor")
+	}
+	if err.Error() != wantErr.Error() {
+		t.Errorf("Install() = %q, want %q", err, wantErr)
+	}
+
+	// The state directory holds the marker, so it is kept, and so are the
+	// directories that hold it.
+	for _, dir := range []string{
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		state,
+	} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the directory %q is gone after the failed installation: %v", dir, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(state, "marker")); err != nil {
+		t.Errorf("the marker of the state directory is gone: %v", err)
+	}
+	// The other directories of the instance are empty, so they are gone.
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q is still there after the failed installation (stat error: %v)", dir, err)
+		}
+	}
+}
+
+// TestLaunchdFailedInstallRemovesTheDirectoriesOfAFailedPreparation checks
+// that an installation that fails while it prepares the directories of the
+// instance leaves the machine as it was as well: the directories it created
+// before the failure are removed too.
+func TestLaunchdFailedInstallRemovesTheDirectoriesOfAFailedPreparation(t *testing.T) {
+	darwinFakeSupervisor(t)
+	root := t.TempDir()
+
+	opts := darwinTempInstallOptions(t, root)
+	// The log directory is the root of the file system: the installation
+	// refuses to tighten it, and it fails after the other two
+	// directories were created.
+	opts.Paths.LogDir = string(filepath.Separator)
+
+	m := darwinStatusManager(t)
+	err := m.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the log directory")
+	}
+	want := fmt.Sprintf("service: log dir path %q is the filesystem root and must not be tightened", string(filepath.Separator))
+	if err.Error() != want {
+		t.Errorf("Install() = %q, want %q", err, want)
+	}
+
+	// The directories the installation created before it failed are gone.
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q is still there after the failed installation (stat error: %v)", dir, err)
+		}
+	}
+}
+
+// TestLaunchdSuccessfulInstallKeepsItsDirectories checks that a successful
+// installation keeps the directories it created: the cleanup of a failed
+// installation never touches the directories of an instance that runs.
+func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
+	darwinFakeSupervisor(t)
+	t.Setenv("HFDESK_TEST_SUPERVISOR", "ok")
+	root := t.TempDir()
+
+	opts := darwinTempInstallOptions(t, root)
+	m := darwinStatusManager(t)
+	if err := m.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Errorf("the directory %q is gone after the successful installation: %v", dir, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("the path %q is not a directory after the successful installation", dir)
+		}
+	}
+}
