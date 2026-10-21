@@ -107,3 +107,21 @@ func probeStagingOSLock(path string) (bool, error) {
 	_ = syscall.CloseHandle(h)
 	return false, nil
 }
+
+// observeStagingOSLockHolder is implemented once, in staging_oslock.go, on
+// top of the shared non-owning status probe.
+//
+// On Windows the status probe is exactly the right primitive. A Windows open
+// succeeds only when it is compatible with EVERY existing handle in both
+// directions. The owner holds a deny-all handle (dwShareMode=0), so a
+// shared-access open (FILE_SHARE_READ|FILE_SHARE_WRITE, GENERIC_READ) is:
+//
+//   - REFUSED by the deny-all owner, because the owner's share mode does not
+//     permit the new access => an exclusive holder exists; and
+//   - GRANTED when only a reader holds the file, because the reader's share
+//     mode permits the new access.
+//
+// The observation must never open the file with dwShareMode=0. A deny-all
+// observer is itself an exclusive holder, so every peer — a concurrent
+// claimant or a concurrent status probe — would see a live writer that does
+// not exist and would skip files nobody is downloading.

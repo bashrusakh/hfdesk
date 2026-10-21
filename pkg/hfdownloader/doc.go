@@ -182,6 +182,28 @@ The ownership probe itself is non-owning (a shared lock on Unix, a
 shared-access open on Windows), so concurrent probes are never mistaken for a
 writer.
 
+The lock file therefore has two roles, and a claimant must tell them apart
+before it acts on a busy lock. On Unix a status probe's shared flock refuses a
+claimant's exclusive flock on the same inode — even within one process, because
+flock locks belong to the open file description, not the process.
+
+Only the real lifetime writer may take the exclusive lock. Every observation —
+the status probe and the contention check alike — stays non-owning, because an
+observer that took the exclusive lock would itself look like a live writer to
+every peer: a concurrent claimant or status probe would then skip files that
+nobody is downloading. The observation therefore asks one question with one
+atomic, non-owning operation: is an exclusive holder present? A shared probe
+is granted unless an exclusive holder exists, so a refused shared probe proves
+a live writer (the claimant skips, exactly as before), and a granted shared
+probe proves no exclusive holder is present (the claimant retries its own
+acquisition within a bounded, cancellable window). A granted shared probe does
+not distinguish "a reader holds it" from "nobody holds it", and it does not
+need to: the real acquisition is the only operation that resolves that case.
+A contention that never resolves is reported as an actionable failure, never as
+a successful skip, because no live writer is proven to exist. A status probe in
+flight can therefore never turn a resumable download into a silently skipped
+file.
+
 The claim record remains the identity/resume state and is heartbeated through
 transfers, retry waits, strict verification and finalization. Per-path in-process
 metadata gates serialize record transitions while the lifetime OS lock excludes

@@ -11,6 +11,12 @@ package hfdownloader
 // also conflict (the in-process registry makes that a defensive property, not
 // the primary exclusion). Closing the descriptor releases the lock, including
 // when the process dies.
+//
+// Only the real lifetime writer takes LOCK_EX. Every observation uses
+// LOCK_SH, which is granted unless an exclusive holder exists: a refused
+// shared lock proves an exclusive holder, and a granted shared lock proves
+// none. An exclusive observer would itself be an exclusive holder and would
+// make every peer see a live writer that does not exist.
 
 import (
 	"errors"

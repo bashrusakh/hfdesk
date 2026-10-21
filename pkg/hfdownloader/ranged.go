@@ -198,7 +198,7 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string) {
 	if stagingArtifactsAbsent(staging, metaPath) {
 		return
 	}
-	own, oerr := stagingOwnershipAcquire(staging)
+	own, oerr := acquireStagingOwnershipLockWithin(context.Background(), staging, stagingLockCleanupWait)
 	if errors.Is(oerr, errStagingOwnershipBusy) {
 		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
 		return
@@ -330,11 +330,14 @@ type stagingClaimState struct {
 //   - in-process: the stagingOwners registry serializes downloads inside
 //     this process (including two plan items that share one blob SHA);
 //   - OS-level: the persistent <staging>.lock is taken exclusively and held
-//     for the whole ownership interval. A busy lock is a live owner (even one
-//     that stopped heartbeating while suspended), so the caller skips with
-//     errBlobIncompleteOwned. A crashed owner's lock is released by the kernel
-//     at death, so takeover is safe only after the old process is gone. If the
-//     platform/filesystem cannot supply the lock, the operation fails closed;
+//     for the whole ownership interval. The acquisition waits out transient
+//     contention (a read-only status probe shares the lock file briefly), so a
+//     probe in flight does not read as an owner. Only a PROVEN exclusive
+//     holder is a live owner (even one that stopped heartbeating while
+//     suspended), so the caller skips with errBlobIncompleteOwned. A crashed
+//     owner's lock is released by the kernel at death, so takeover is safe
+//     only after the old process is gone. If the platform/filesystem cannot
+//     supply the lock, the operation fails closed;
 //   - record transitions: the per-path in-process metadata gate serializes
 //     local read-modify-write operations. Current-version foreign processes
 //     cannot reach them without first acquiring the lifetime OS lock. A
@@ -388,8 +391,15 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		// OS-level exclusion for the whole ownership interval. This is the
 		// fence the record lease cannot provide; it must be acquired before
 		// the record is evaluated so a suspended predecessor can never resume
-		// writing after we take its record over. A busy lock is a live owner.
-		own, oerr := stagingOwnershipAcquire(staging)
+		// writing after we take its record over.
+		//
+		// The acquisition observes the lock non-owningly and waits out
+		// transient contention: a read-only status probe touches the same
+		// lock file briefly, and on Unix a probe's shared lock makes this
+		// exclusive acquisition fail even though no writer exists. Only a
+		// PROVEN exclusive holder skips the file; an unresolvable contention
+		// is an actionable failure, never a successful skip.
+		own, oerr := acquireStagingOwnershipLockCtx(ctx, staging)
 		osExclusive := oerr == nil
 		if oerr != nil {
 			stagingOwnersMu.Lock()
@@ -397,7 +407,11 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			stagingOwnersMu.Unlock()
 			close(entry.done)
 			if errors.Is(oerr, errStagingOwnershipBusy) {
+				// A proven live writer owns this staging file.
 				return nil, errBlobIncompleteOwned
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
 			}
 			return nil, fmt.Errorf("cannot safely claim ranged staging %s: lifetime ownership lock acquisition failed: %w", staging, oerr)
 		}
@@ -904,7 +918,7 @@ func removeStagingArtifactsLocked(staging, metaPath string) {
 // skips the removal. A cancel/hash-discard of our own claim uses
 // removeStagingArtifactsOwned instead.
 func removeStagingArtifacts(staging, metaPath string) {
-	own, oerr := stagingOwnershipAcquire(staging)
+	own, oerr := acquireStagingOwnershipLockWithin(context.Background(), staging, stagingLockCleanupWait)
 	if errors.Is(oerr, errStagingOwnershipBusy) {
 		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
 		return
