@@ -10,15 +10,25 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/assets"
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// serverLog is the logger of the HTTP server subsystem. It resolves the
+// current default logger on every call, so records reach whichever pipeline
+// the application installed.
+var serverLog = logging.NewComponentLogger("server")
+
+// serverShutdownTimeout bounds the graceful shutdown sequence: the HTTP
+// drain and the job manager close each get this budget.
+const serverShutdownTimeout = 10 * time.Second
 
 // Config holds server configuration.
 type Config struct {
@@ -107,6 +117,16 @@ type Server struct {
 	jobs                *JobManager
 	wsHub               *WSHub
 	selectedDeleteHooks selectedDeleteHooks
+	// boundAddr holds the effective address the server is actually bound to.
+	// It is written once the listener exists and read by BoundAddr and
+	// BrowserURL, which must work before the server finished starting.
+	boundAddrMu sync.RWMutex
+	boundAddr   net.Addr
+	// pipelineProvider resolves the logging pipeline the runtime and log
+	// endpoints read their records from. It is nil in production, where
+	// the process wide default is used; the tests set it to install a
+	// pipeline without touching the process wide default.
+	pipelineProvider func() *logging.Pipeline
 }
 
 // snapshotConfig returns a value copy of the current server config taken
@@ -201,7 +221,149 @@ func New(cfg Config) *Server {
 }
 
 // ListenAndServe starts the HTTP server.
+//
+// It binds the configured address and serves the listener through Serve, so
+// the effective bound address is known as soon as the listener exists.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	cfg := s.snapshotConfig()
+	addr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), serverShutdownTimeout)
+	}
+	return s.Serve(ctx, listener)
+}
+
+// Serve runs the HFDesk HTTP server on a caller-provided listener.
+//
+// It uses the same handler chain and the same graceful shutdown sequence as
+// ListenAndServe: the job manager is quiesced first, HTTP is drained within
+// the shutdown timeout, and the job manager is closed afterwards. The
+// effective bound address of the listener is recorded, so BoundAddr and
+// BrowserURL report the real address even when the caller asked for an
+// OS-assigned port.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	s.setBoundAddr(ln.Addr())
+	s.logStartup(ln.Addr())
+	return s.serveListener(ctx, ln, s.handler(), serverShutdownTimeout)
+}
+
+// BoundAddr returns the effective address the server is actually bound to.
+//
+// It reports the real listener address, including an OS-assigned port when
+// the listener was bound to port 0. It returns nil while the server is not
+// bound. It is safe to call concurrently with the running server.
+func (s *Server) BoundAddr() net.Addr {
+	s.boundAddrMu.RLock()
+	defer s.boundAddrMu.RUnlock()
+	return s.boundAddr
+}
+
+// BrowserURL returns a browser-safe URL for the running server.
+//
+// A wildcard bind (0.0.0.0, :: or an empty host) yields the loopback
+// address 127.0.0.1 instead of the wildcard address, because a browser
+// cannot open the wildcard address. Any other host is used as bound. The
+// effective port is always included.
+func (s *Server) BrowserURL() string {
+	host, port := s.boundHostPort()
+	return browserURLFor(host, port)
+}
+
+// ActiveJobCounts returns how many jobs are running and how many are queued.
+//
+// A job that has been dispatched but is not marked running yet counts as
+// running, which is the same notion of an active job the scheduler uses to
+// enforce the max-active limit. The counts are safe to call concurrently
+// with the scheduler.
+func (s *Server) ActiveJobCounts() (running, queued int) {
+	if s.jobs == nil {
+		return 0, 0
+	}
+	return s.jobs.activeCounts()
+}
+
+// setBoundAddr records the effective bound address of the server.
+func (s *Server) setBoundAddr(addr net.Addr) {
+	s.boundAddrMu.Lock()
+	s.boundAddr = addr
+	s.boundAddrMu.Unlock()
+}
+
+// boundHostPort returns the host and the effective port of the running
+// server. Before the server is bound it falls back to the configured
+// address and port.
+func (s *Server) boundHostPort() (string, int) {
+	if addr := s.BoundAddr(); addr != nil {
+		return splitAddrHostPort(addr)
+	}
+	cfg := s.snapshotConfig()
+	return cfg.Addr, cfg.Port
+}
+
+// browserURLFor builds the browser-safe URL for a bind host and an effective
+// port.
+func browserURLFor(host string, port int) string {
+	return "http://" + net.JoinHostPort(browserHost(host), strconv.Itoa(port))
+}
+
+// browserHost maps a bind host to a host a browser can open. A wildcard or
+// empty bind host becomes the loopback address; every other host is kept.
+func browserHost(host string) string {
+	if host == "" {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return "127.0.0.1"
+	}
+	return host
+}
+
+// splitAddrHostPort splits a listener address into its host and port.
+func splitAddrHostPort(addr net.Addr) (string, int) {
+	if addr == nil {
+		return "", 0
+	}
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		host := ""
+		if tcp.IP != nil {
+			host = tcp.IP.String()
+		}
+		return host, tcp.Port
+	}
+	host, portText, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String(), 0
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return host, 0
+	}
+	return host, port
+}
+
+// logStartup records the startup information that used to be printed as a
+// banner: the listening address, the dashboard and API URLs, and the fact
+// that authentication is enabled.
+func (s *Server) logStartup(addr net.Addr) {
+	cfg := s.snapshotConfig()
+	_, port := splitAddrHostPort(addr)
+	listenURL := "http://" + addr.String()
+	dashboardURL := "http://localhost:" + strconv.Itoa(port)
+	serverLog.Info("server starting",
+		"addr", listenURL,
+		"dashboard", dashboardURL,
+		"api", dashboardURL+"/api",
+	)
+	if cfg.AuthUser != "" {
+		serverLog.Info("auth enabled", "user", cfg.AuthUser)
+	}
+}
+
+// handler builds the HTTP handler chain: the API routes, the embedded static
+// files and the middleware chain (CORS -> Auth -> Logging -> mux).
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// API routes
@@ -242,24 +404,15 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	addr := fmt.Sprintf("%s:%d", s.config.Addr, s.config.Port)
-
 	// Build middleware chain: CORS -> Auth -> Logging -> Handler
-	handler := s.corsMiddleware(s.basicAuthMiddleware(s.loggingMiddleware(mux)))
-
-	log.Printf("🚀 Server starting on http://%s", addr)
-	log.Printf("   Dashboard: http://localhost:%d", s.config.Port)
-	log.Printf("   API:       http://localhost:%d/api", s.config.Port)
-	if s.config.AuthUser != "" {
-		log.Printf("   Auth:      enabled (user: %s)", s.config.AuthUser)
-	}
-
-	return s.serveHTTP(ctx, addr, handler, 10*time.Second)
+	return s.corsMiddleware(s.basicAuthMiddleware(s.loggingMiddleware(mux)))
 }
 
-func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
+// serveListener serves handler on listener with the shared HTTP server
+// configuration and the graceful shutdown sequence.
+func (s *Server) serveListener(ctx context.Context, listener net.Listener, handler http.Handler, shutdownTimeout time.Duration) error {
 	s.httpServer = &http.Server{
-		Addr:        addr,
+		Addr:        listener.Addr().String(),
 		Handler:     handler,
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout arms a write deadline (now + WriteTimeout) when each
@@ -271,14 +424,18 @@ func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handle
 		WriteTimeout: 70 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), shutdownTimeout)
-	}
 	if s.wsHub != nil {
 		go s.wsHub.Run()
 	}
 	return s.serveHTTPListener(ctx, listener, shutdownTimeout)
+}
+
+func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), shutdownTimeout)
+	}
+	return s.serveListener(ctx, listener, handler, shutdownTimeout)
 }
 
 func (s *Server) serveHTTPListener(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) error {
@@ -397,6 +554,23 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 
 	// WebSocket
 	mux.HandleFunc("GET /api/ws", s.handleWebSocket)
+
+	// Runtime status and logs. These endpoints expose the local process
+	// diagnostics, so they are guarded by the local-only rule and stay
+	// reachable from the local machine only, whatever the server binds to.
+	mux.HandleFunc("GET /api/runtime", s.localOnly(s.handleRuntimeStatus))
+	mux.HandleFunc("GET /api/runtime/logs", s.localOnly(s.handleRuntimeLogs))
+	mux.HandleFunc("GET /api/runtime/logs/stream", s.localOnly(s.handleRuntimeLogStream))
+	// The open-logs action changes the state of the desktop, so it is a
+	// POST, and it is guarded by the same local-only rule as the other
+	// runtime endpoints.
+	mux.HandleFunc("POST /api/runtime/open-logs", s.localOnly(s.handleRuntimeOpenLogs))
+	// The open-ui action opens the web UI of the running instance in the
+	// default browser of the operating system. A page cannot do that by
+	// itself, so the runtime view asks the server to do it. It changes the
+	// state of the desktop, so it is a POST, and it is guarded by the same
+	// local-only rule as the other runtime endpoints.
+	mux.HandleFunc("POST /api/runtime/open-ui", s.localOnly(s.handleRuntimeOpenUI))
 }
 
 // Middleware
@@ -405,7 +579,13 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		// The path is logged without the query string: a query can carry a
+		// credential the caller put there.
+		serverLog.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"duration", time.Since(start).Round(time.Millisecond),
+		)
 	})
 }
 
