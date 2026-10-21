@@ -59,11 +59,18 @@
 //
 //	records, truncated := pipeline.Records(cursor, logging.OldestFirst)
 //
-// The boolean result reports whether the requested window is still fully
-// covered by the ring. When it is false the cursor has already fallen out of
-// ring and the caller has to fall back to a fresh snapshot. Cursor returns
-// the sequence number of the most recently emitted record and is the cursor
-// a reader has to send to continue where it stopped.
+// The boolean result reports whether the requested window is no longer fully
+// covered by the ring. It is true when the records after the cursor were
+// already dropped, and also when the cursor is ahead of every record the
+// ring ever held: the sequence numbers belong to the run of the process that
+// emitted them and start over with every run, so such a cursor comes from an
+// earlier run of the application. The caller cannot be served a complete
+// answer for such a cursor and has to fall back to a fresh snapshot.
+//
+// A cursor that is exactly at the newest record is not truncated: there is
+// simply nothing new after it. Cursor returns the sequence number of the
+// most recently emitted record and is the cursor a reader has to send to
+// continue where it stopped.
 //
 // # Live subscriptions
 //

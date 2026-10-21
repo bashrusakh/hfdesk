@@ -118,9 +118,16 @@ type RuntimeLogsResponse struct {
 	Records []RuntimeLogRecord `json:"records"`
 	// Cursor is the cursor to send for the next page.
 	Cursor uint64 `json:"cursor"`
-	// Truncated reports that the requested window is no longer fully
-	// covered by the bounded ring, so the client must not assume that the
-	// page continues the history it has.
+	// Truncated reports that the caller cannot be served a complete answer
+	// for the requested cursor and has to start over.
+	//
+	// It is true when the requested window is no longer fully covered by
+	// the bounded ring, so the client must not assume that the page
+	// continues the history it has. It is also true when the cursor is
+	// ahead of every record the server holds: the sequence numbers of the
+	// log belong to the run of the process that emits them and start over
+	// with every run, so such a cursor comes from an earlier run of the
+	// server.
 	Truncated bool `json:"truncated"`
 }
 
@@ -282,8 +289,8 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(records) == 0 {
 		// There is nothing new. The cursor stays at the head of the
-		// pipeline, so a client that sent a cursor from the future does
-		// not get stuck on it.
+		// pipeline, so a client that sent a cursor from an earlier run of
+		// the server does not get stuck on it.
 		cursor = head
 	}
 
@@ -422,8 +429,10 @@ func (st *runtimeLogStream) replay(pipeline *logging.Pipeline) error {
 	}
 	if truncated {
 		// The window the client asked for is no longer fully covered by
-		// the ring. The client has to re-sync instead of assuming that
-		// the replay continues its history.
+		// the ring, or the cursor is ahead of every record the server
+		// holds and belongs to an earlier run of it. The client has to
+		// re-sync instead of assuming that the replay continues its
+		// history.
 		return st.writeEvent("gap", RuntimeLogResync{Cursor: st.position})
 	}
 	return nil

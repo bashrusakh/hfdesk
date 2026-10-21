@@ -12,7 +12,8 @@ import (
 // The ring never grows beyond its capacity: appending to a full ring
 // overwrites the oldest record. Every record carries the sequence number
 // assigned by the pipeline, which lets a reader ask for "records after
-// cursor N" and detect that the cursor has already fallen out of the ring.
+// cursor N" and detect that the cursor has already fallen out of the ring
+// or that it belongs to an earlier run of the application.
 type RingSink struct {
 	mu       sync.Mutex
 	capacity int
@@ -90,17 +91,37 @@ func (r *RingSink) Append(rec Record) {
 }
 
 // Records returns the retained records that were emitted after the given
-// cursor, together with a flag that reports whether the requested window is
-// still fully covered by the ring.
+// cursor, together with a flag that reports whether the caller can be served
+// a complete answer for that cursor.
 //
-// The flag is true when records after the cursor have already been dropped
-// from the ring, which means the caller cannot be served a complete answer
-// for that cursor and has to fall back to a fresh snapshot.
+// The flag is true when the requested window is not fully covered by the ring
+// anymore, which happens in two cases:
+//
+//   - The records after the cursor were already dropped, because the ring
+//     overwrote them with newer records.
+//   - The cursor is ahead of every record the ring ever held. The sequence
+//     numbers are assigned by the pipeline of the running process and start
+//     over with every run, so such a cursor belongs to an earlier run of the
+//     application.
+//
+// In both cases the caller cannot be served a complete answer for the cursor
+// and has to start over.
+//
+// The flag is false when the cursor is exactly at the newest retained
+// record: there is simply nothing new after it.
 func (r *RingSink) Records(after uint64, order Order) ([]Record, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.count == 0 || after >= r.newest {
+	if after > r.newest {
+		// The cursor is ahead of every record the ring ever held, so it
+		// belongs to an earlier run of the application. There is nothing
+		// to return and the caller has to start over.
+		return nil, true
+	}
+
+	if r.count == 0 || after == r.newest {
+		// There is nothing new after the cursor.
 		return nil, false
 	}
 

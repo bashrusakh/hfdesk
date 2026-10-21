@@ -52,6 +52,10 @@
   const RECONNECT_MIN = 1000;
   const RECONNECT_MAX = 10000;
 
+  // RESTART_MESSAGE is the message of the re-sync that follows a restart of
+  // the server.
+  const RESTART_MESSAGE = 'The server restarted, the log was re-synced';
+
   // LEVEL_RANK maps a level onto its severity. The level filter is a
   // minimum severity, so a filter of "warn" shows the warn and the error
   // records.
@@ -315,18 +319,68 @@
 
   // refreshStatus reads the runtime status of the server.
   async function refreshStatus() {
+    let read = false;
+
     try {
       const data = await fetchJSON('/api/runtime');
       state.status = data && typeof data === 'object' ? data : {};
       state.statusError = '';
       applyStatus();
       renderError();
+      read = true;
     } catch (err) {
       state.statusError = `The runtime status could not be read: ${err.message}`;
       applyStatusFailure();
       renderError();
       logErrorOnce(state.statusError);
     }
+
+    // The status carries the head of the log of the running server, so it
+    // is where a restart of the server shows up. A failed read keeps the
+    // previous status, whose head can be older than the cursor of the
+    // client, so the check only runs on a status that was really read.
+    if (read) await checkServerRestart();
+  }
+
+  // serverRestarted reports whether the head of the server belongs to a
+  // different run than the cursor of the client.
+  //
+  // The sequence numbers of the log are assigned by the logging pipeline of
+  // the running process, so they start over with every run of the server. A
+  // head that is lower than the cursor of the client therefore means that
+  // the client is talking to another run of the server: the records it
+  // waits for will never arrive, because their sequence numbers start over.
+  function serverRestarted(head) {
+    if (!state.cursorValid) return false;
+    if (head === null || head === undefined) return false;
+
+    const cursor = Number(state.cursor) || 0;
+    const serverHead = Number(head);
+    if (!Number.isFinite(serverHead)) return false;
+
+    return serverHead < cursor;
+  }
+
+  // resyncReason picks the message of a re-sync.
+  //
+  // The cause decides the message: a cursor of the server that is lower than
+  // the cursor of the client means that the server restarted, so the message
+  // names the restart instead of the records the server dropped.
+  function resyncReason(fallback, serverCursor) {
+    if (serverRestarted(serverCursor)) return RESTART_MESSAGE;
+    return fallback;
+  }
+
+  // checkServerRestart re-syncs the view when the server restarted.
+  //
+  // The check runs after every status refresh. The re-sync it triggers puts
+  // the cursor of the client back at the head of the server, so a restart is
+  // reported once and not on every poll.
+  async function checkServerRestart() {
+    if (state.resyncing) return;
+    if (!serverRestarted(state.status?.logCursor)) return;
+
+    await resync(RESTART_MESSAGE, 'info');
   }
 
   // applyStatus renders the runtime status.
@@ -655,8 +709,10 @@
   // resync re-reads the newest window of the log.
   //
   // A gap in the history cannot be repaired, so the view starts again from
-  // the records the server still holds and the user is told about it.
-  async function resync(reason) {
+  // the records the server still holds and the user is told about it. The
+  // filters and the follow mode are kept: only the records and the cursor
+  // are replaced.
+  async function resync(reason, type = 'error') {
     if (state.resyncing) return;
     state.resyncing = true;
 
@@ -682,7 +738,7 @@
       renderError();
 
       if (reason) {
-        showToast(reason, 'error');
+        showToast(reason, type);
         announce(reason);
       }
     } catch (err) {
@@ -704,7 +760,7 @@
 
       if (page.truncated) {
         state.resyncing = false;
-        await resync(reason);
+        await resync(resyncReason(reason, page.cursor));
         return;
       }
 
@@ -886,6 +942,7 @@
     state.polling = true;
 
     let truncated = false;
+    let serverCursor = null;
 
     try {
       const page = await readLogs(state.cursor, PAGE_SIZE);
@@ -894,6 +951,7 @@
         // The window of the cursor fell out of the ring: the history has a
         // hole and cannot be continued.
         truncated = true;
+        serverCursor = page.cursor;
       } else {
         ingest(page.records);
         if (page.cursor !== null && page.cursor > state.cursor) {
@@ -919,7 +977,7 @@
     }
 
     if (truncated) {
-      await resync('The server dropped older log records, re-syncing');
+      await resync(resyncReason('The server dropped older log records, re-syncing', serverCursor));
     }
 
     if (!state.source) schedulePoll(state.pollDelay);

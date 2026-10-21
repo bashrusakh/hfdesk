@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -409,6 +410,46 @@ func TestRuntimeLogsTruncation(t *testing.T) {
 	}
 }
 
+// TestRuntimeLogsTruncationForACursorOfAnEarlierRun proves that the
+// endpoint reports the loss for a cursor that belongs to an earlier run of
+// the server.
+//
+// The sequence numbers of the log belong to the run of the process that
+// emits them and start over with every run, so a cursor of an earlier run is
+// ahead of every record the server holds. The client has to learn that it
+// cannot be served a complete answer for it.
+func TestRuntimeLogsTruncationForACursorOfAnEarlierRun(t *testing.T) {
+	pipeline, logger := newRuntimeTestPipeline(t, 16)
+	logger.Info("first")
+	logger.Info("second")
+
+	handler := newRuntimeTestServer(pipeline).handler()
+
+	// A cursor of an earlier run is ahead of the head of the server.
+	page := runtimeLogsPage(t, handler, "127.0.0.1:5555", "after=99")
+	if !page.Truncated {
+		t.Error("truncated = false, want true for a cursor of an earlier run")
+	}
+	if len(page.Records) != 0 {
+		t.Fatalf("records = %d, want 0", len(page.Records))
+	}
+	if page.Cursor != pipeline.Cursor() {
+		t.Errorf("cursor = %d, want the head of the server (%d)", page.Cursor, pipeline.Cursor())
+	}
+
+	// A cursor at the head is not truncated: there is nothing new after it.
+	page = runtimeLogsPage(t, handler, "127.0.0.1:5555", fmt.Sprintf("after=%d", pipeline.Cursor()))
+	if page.Truncated {
+		t.Error("truncated = true, want false for a cursor at the head")
+	}
+	if len(page.Records) != 0 {
+		t.Fatalf("records = %d, want 0", len(page.Records))
+	}
+	if page.Cursor != pipeline.Cursor() {
+		t.Errorf("cursor = %d, want the head of the server (%d)", page.Cursor, pipeline.Cursor())
+	}
+}
+
 // TestRuntimeLogsRecordShape proves the wire shape of a record: the level is
 // a name and not a number, the attributes are an object and the timestamp is
 // RFC3339.
@@ -706,6 +747,51 @@ func TestRuntimeLogStreamReportsGap(t *testing.T) {
 			t.Errorf("gap cursor = %d, want %d", resync.Cursor, pipeline.Cursor())
 		}
 		return
+	}
+}
+
+// TestRuntimeLogStreamReportsGapForACursorOfAnEarlierRun proves that a
+// stream whose cursor belongs to an earlier run of the server tells the
+// client that it has to re-sync.
+//
+// The sequence numbers of the log start over with every run of the server,
+// so a cursor of an earlier run is ahead of every record the server holds
+// and the replay cannot continue the history of the client.
+func TestRuntimeLogStreamReportsGapForACursorOfAnEarlierRun(t *testing.T) {
+	pipeline, logger := newRuntimeTestPipeline(t, 16)
+	logger.Info("first")
+	logger.Info("second")
+
+	s := newRuntimeTestServer(pipeline)
+	server := httptest.NewServer(s.handler())
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/runtime/logs/stream?after=99", nil)
+	if err != nil {
+		t.Fatalf("build stream request: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("open log stream: %v", err)
+	}
+	defer response.Body.Close()
+
+	reader := bufio.NewReader(response.Body)
+	event := readRuntimeLogEvent(t, reader)
+	if event.Name != "gap" {
+		t.Fatalf("event = %q, want a gap event", event.Name)
+	}
+
+	var resync RuntimeLogResync
+	if err := json.Unmarshal([]byte(event.Data), &resync); err != nil {
+		t.Fatalf("decode gap event %q: %v", event.Data, err)
+	}
+	// The replay delivered no record, so the gap event carries the cursor
+	// the client sent.
+	if resync.Cursor != 99 {
+		t.Errorf("gap cursor = %d, want 99", resync.Cursor)
 	}
 }
 

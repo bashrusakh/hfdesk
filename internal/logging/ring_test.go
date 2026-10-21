@@ -75,6 +75,9 @@ func TestRingCursorReturnsOnlyRecordsAfterTheCursor(t *testing.T) {
 	}
 }
 
+// TestRingCursorAtTheNewestRecordYieldsNothing proves that a cursor that is
+// exactly at the newest retained record is not a loss: there is simply
+// nothing new after it.
 func TestRingCursorAtTheNewestRecordYieldsNothing(t *testing.T) {
 	ring := NewRingSink(10)
 	for seq := uint64(1); seq <= 3; seq++ {
@@ -87,6 +90,73 @@ func TestRingCursorAtTheNewestRecordYieldsNothing(t *testing.T) {
 	}
 	if truncated {
 		t.Errorf("truncated = true, want false")
+	}
+}
+
+// TestRingCursorAheadOfTheNewestRecordReportsTheLoss proves that a cursor
+// that is ahead of every record the ring holds is reported as a loss.
+//
+// The sequence numbers are assigned by the pipeline of the running process
+// and start over with every run, so such a cursor belongs to an earlier run
+// of the application. The caller cannot be served a complete answer for it
+// and has to start over.
+func TestRingCursorAheadOfTheNewestRecordReportsTheLoss(t *testing.T) {
+	ring := NewRingSink(10)
+	for seq := uint64(1); seq <= 3; seq++ {
+		ring.Append(ringRecord(seq, "record"))
+	}
+
+	records, truncated := ring.Records(4, OldestFirst)
+	if !truncated {
+		t.Errorf("truncated = false, want true for a cursor ahead of the newest record")
+	}
+	if len(records) != 0 {
+		t.Errorf("got %d records, want 0", len(records))
+	}
+}
+
+// TestRingEmptyRingHasNothingAfterTheCursor proves that an empty ring
+// reports no loss for the cursor that starts a run: there is simply nothing
+// new after it.
+func TestRingEmptyRingHasNothingAfterTheCursor(t *testing.T) {
+	ring := NewRingSink(10)
+
+	records, truncated := ring.Records(0, OldestFirst)
+	if len(records) != 0 {
+		t.Errorf("got %d records, want 0", len(records))
+	}
+	if truncated {
+		t.Errorf("truncated = true, want false for an empty ring")
+	}
+}
+
+// TestPipelineRecordsReportsACursorOfAnEarlierRun proves that the pipeline
+// reports the loss for a cursor that belongs to an earlier run of the
+// application, so a reader that kept a cursor across a restart of the
+// application learns that it has to start over.
+func TestPipelineRecordsReportsACursorOfAnEarlierRun(t *testing.T) {
+	p, _ := newTestPipeline(t, Options{RingCapacity: 8})
+	logger := p.Logger()
+	logger.Info("first")
+	logger.Info("second")
+
+	// The cursor of the earlier run is ahead of the head of the pipeline.
+	records, truncated := p.Records(p.Cursor()+1, OldestFirst)
+	if !truncated {
+		t.Errorf("truncated = false, want true for a cursor of an earlier run")
+	}
+	if len(records) != 0 {
+		t.Errorf("got %d records, want 0", len(records))
+	}
+
+	// The cursor of the head of the pipeline is not a loss: there is
+	// nothing new after it.
+	records, truncated = p.Records(p.Cursor(), OldestFirst)
+	if truncated {
+		t.Errorf("truncated = true, want false for the cursor of the head")
+	}
+	if len(records) != 0 {
+		t.Errorf("got %d records, want 0", len(records))
 	}
 }
 

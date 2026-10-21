@@ -109,11 +109,17 @@ not write a log file.
   invalid value is rejected with `400`.
 
 `cursor` is the cursor to send for the next page. `truncated` reports that
-the requested window is no longer fully covered by the retained records, so
-the client must not assume that the page continues the history it has. The
-records come from a bounded in-memory ring: the log file is never read, so
-a reconnect does not re-read it and a single request cannot ask for an
-unbounded amount of data.
+the caller cannot be served a complete answer for the requested cursor and
+has to start over. It is true when the requested window is no longer fully
+covered by the retained records, so the client must not assume that the page
+continues the history it has. It is also true when the cursor is ahead of
+every record the server holds: the sequence numbers of the log belong to the
+run of the process that emits them and start over with every run, so such a
+cursor comes from an earlier run of the server. A cursor that is exactly at
+the newest record is not truncated, because there is simply nothing new after
+it. The records come from a bounded in-memory ring: the log file is never
+read, so a reconnect does not re-read it and a single request cannot ask for
+an unbounded amount of data.
 
 `GET /api/runtime/logs/stream` is a Server-Sent Events stream of the same
 records. It replays the retained records after `after` first and then
@@ -126,8 +132,8 @@ events:
   up: `{"dropped": 3, "cursor": 42}`. The client re-syncs by reading
   `GET /api/runtime/logs` after the reported cursor.
 - `gap` — the requested window had already fallen out of the retained
-  records: `{"dropped": 0, "cursor": 42}`. The client re-syncs the same
-  way.
+  records, or the cursor was ahead of every record the server holds:
+  `{"dropped": 0, "cursor": 42}`. The client re-syncs the same way.
 
 The stream ends when the client goes away, and a keep-alive comment is sent
 while it is idle. Log traffic does not use the job WebSocket of `/api/ws`.

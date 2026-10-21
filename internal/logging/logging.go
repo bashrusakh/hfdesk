@@ -182,17 +182,29 @@ func (p *Pipeline) Logger() *slog.Logger {
 //
 // It is the cursor a reader has to send to get the records emitted after it.
 // The cursor advances even when the ring already dropped the record it
-// refers to, in which case a read reports the loss.
+// refers to, in which case a read reports the loss. The sequence numbers
+// belong to the run of the process that emits the records and start over
+// with every run, so a cursor of an earlier run is ahead of the cursor of a
+// fresh pipeline and a read reports the loss as well.
 func (p *Pipeline) Cursor() uint64 {
 	return p.seq.Load()
 }
 
 // Records returns the retained records emitted after the given cursor.
 //
-// The boolean result reports whether the requested window is still fully
-// covered by the ring. It is false when records after the cursor were already
-// dropped, in which case the caller cannot be served a complete answer for
-// that cursor.
+// The boolean result reports whether the caller can be served a complete
+// answer for that cursor.
+//
+// It is false when the cursor is at the newest retained record, because
+// there is simply nothing new after it.
+//
+// It is true when the requested window is not fully covered by the ring
+// anymore: either the records after the cursor were already dropped, or the
+// cursor is ahead of every record the ring ever held. The second case means
+// that the cursor belongs to an earlier run of the application, because the
+// sequence numbers are assigned by the pipeline of the running process and
+// start over with every run. The caller cannot be served a complete answer
+// for such a cursor and has to start over.
 func (p *Pipeline) Records(after uint64, order Order) ([]Record, bool) {
 	return p.ring.Records(after, order)
 }
