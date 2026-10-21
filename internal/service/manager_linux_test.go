@@ -437,6 +437,91 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	}
 }
 
+// TestSystemdAnalyzeVerifySystemScope checks the machine-wide unit with the
+// verifier of the supervisor itself: the machine-wide unit names an account,
+// and the verifier resolves that name against the accounts of the machine.
+//
+// The unit of the test names the account of the test process, which is what
+// a machine-wide installation names when the operator names their own
+// account. The template names the account and its group with the same name,
+// so the machine has to know a group of that name as well.
+//
+// The executable of the unit is the test binary, so the verifier finds an
+// executable that really exists, and the working directory of the unit is the
+// temporary directory of the test, so the verifier finds a directory that
+// really exists. Every other path of the unit stays the machine level path
+// of the template.
+//
+// The test needs no privilege and installs nothing: it writes its unit into
+// a temporary directory and hands it to the verifier.
+func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
+	analyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skipf("skipping: systemd-analyze is not available in this environment: %v", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable() = %v, want nil", err)
+	}
+	account, err := user.Current()
+	if err != nil {
+		t.Skipf("skipping: the account of the test process is unknown: %v", err)
+	}
+	// The unit names the account by its name, so the machine has to
+	// resolve that name the way the supervisor resolves it.
+	if _, err := user.Lookup(account.Username); err != nil {
+		t.Skipf("skipping: the machine knows no account %q: %v", account.Username, err)
+	}
+	// The template names the group of the unit with the name of the
+	// account as well.
+	if _, err := user.LookupGroup(account.Username); err != nil {
+		t.Skipf("skipping: the machine knows no group %q: %v", account.Username, err)
+	}
+
+	root := t.TempDir()
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.Executable = executable
+	opts.ServiceUser = account.Username
+	// The working directory of the unit has to exist, so the state
+	// directory of the test is the temporary directory. Every other path
+	// stays the machine level path of the template.
+	opts.Paths.StateDir = root
+
+	unit, err := renderUnit(opts)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+	// The unit that is verified is the machine-wide one: it names the
+	// account and it is enabled for the boot of the machine.
+	if want := "User=" + systemdQuote(account.Username) + "\n"; !strings.Contains(unit, want) {
+		t.Fatalf("the unit does not run as the account %q:\n%s", account.Username, unit)
+	}
+	if !strings.Contains(unit, "WantedBy=multi-user.target") {
+		t.Fatalf("the unit is not enabled for the boot of the machine:\n%s", unit)
+	}
+	// The machine-wide unit keeps the machine level home of the instance:
+	// it never adopts the home of the user who runs the test.
+	if want := "Environment=HOME=" + systemServiceHome; !strings.Contains(unit, want) {
+		t.Fatalf("the unit does not carry the machine level home %q:\n%s", systemServiceHome, unit)
+	}
+
+	path := filepath.Join(root, unitName)
+	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, analyze, "verify", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	t.Logf("running %s verify %s", analyze, path)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("systemd-analyze verify %s = %v\n%s\nthe unit:\n%s", path, err, stderr.String(), unit)
+	}
+	t.Logf("%s verify %s accepted the machine-wide unit", analyze, path)
+}
+
 // systemdUserSessionUsable reports whether the supervisor of the session of
 // the user can be reached.
 func systemdUserSessionUsable() bool {
