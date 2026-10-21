@@ -7,15 +7,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
 	"syscall"
-	"time"
 
-	"github.com/bashrusakh/hfdesk/internal/server"
+	"github.com/bashrusakh/hfdesk/internal/app"
+	"github.com/bashrusakh/hfdesk/internal/logging"
 )
 
 // Version is set at build time via ldflags (-X main.Version=...) from the
@@ -23,75 +20,70 @@ import (
 var Version = "dev"
 
 func main() {
-	// Surface the build version to the API/UI so the displayed version tracks
-	// the binary instead of a hardcoded string.
-	server.Version = Version
+	if err := run(); err != nil {
+		reportFailure(err)
+		os.Exit(1)
+	}
+}
 
-	var (
-		port         int
-		cacheDir     string
-		token        string
-		localDir     string
-		stallTimeout string
-		openUI       bool
-		noOpen       bool
-	)
+// run performs the CLI startup: it parses the flags, installs the logging
+// pipeline and hands the shared application layer over to the host.
+//
+// The configuration assembly, the version propagation, the server startup and
+// the browser handling live in the shared application layer, so the desktop
+// host runs the very same code in-process.
+func run() error {
+	var opts app.Options
 
-	flag.IntVar(&port, "port", 8080, "HTTP port")
-	flag.StringVar(&cacheDir, "cache-dir", "", "Hugging Face cache directory")
-	flag.StringVar(&token, "token", "", "Hugging Face token (also reads HF_TOKEN env)")
-	flag.StringVar(&localDir, "local-dir", "", "write real files into this directory instead of the HF cache layout")
-	flag.StringVar(&stallTimeout, "stall-timeout", "", "abort a stalled download read after this duration (e.g. 60s; 0 disables)")
-	flag.BoolVar(&openUI, "open", true, "open the web UI in the default browser")
-	flag.BoolVar(&noOpen, "no-open", false, "do not open the web UI automatically")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "HFDesk %s\n\nUsage: hfdesk [options]\n\nOptions:\n", Version)
 		flag.PrintDefaults()
 	}
+	app.RegisterFlags(flag.CommandLine, &opts)
 	flag.Parse()
 
-	cfg := server.DefaultConfig()
-	cfg.Port = port
-	cfg.CacheDir = cacheDir
-	cfg.Token = token
-	cfg.LocalDir = localDir
-	if err := server.ApplyConfigToServer(&cfg); err != nil {
-		log.Fatalf("load config: %v", err)
+	// The console sink writes to standard error, so redirecting stdout
+	// keeps working for scripts. The file sink is only enabled when a log
+	// file was requested, so the default run writes no files.
+	pipeline, err := app.SetupLogging(app.LogOptions{
+		Level:    opts.LogLevel,
+		Console:  true,
+		FilePath: opts.LogFile,
+	})
+	if err != nil {
+		return err
 	}
-	// CLI flag takes precedence over the persisted setting. Reject a negative
-	// or unparseable value: it must never silently disable the stall watchdog
-	// or be accepted as a bogus duration.
-	if stallTimeout != "" {
-		d, err := time.ParseDuration(stallTimeout)
-		if err != nil || d < 0 {
-			log.Fatalf("invalid --stall-timeout %q: expected a non-negative duration such as 60s or 0 to disable", stallTimeout)
-		}
-		cfg.StallTimeout = stallTimeout
+	defer pipeline.Close()
+
+	application, err := app.New(opts, Version)
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if openUI && !noOpen {
-		go openBrowser(fmt.Sprintf("http://localhost:%d", cfg.Port))
+	if err := application.Start(ctx); err != nil {
+		return err
 	}
 
-	if err := server.New(cfg).ListenAndServe(ctx); err != nil {
-		log.Fatal(err)
+	if opts.ShouldOpenUI() {
+		if err := application.OpenBrowser(); err != nil {
+			logging.Component("app").Warn("could not open the web UI", "error", err)
+		}
 	}
+
+	return application.Wait()
 }
 
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		cmd = exec.Command("open", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
+// reportFailure writes a failure to standard error.
+//
+// The logging pipeline writes to standard error as well, so the message
+// reaches the terminal in either case.
+func reportFailure(err error) {
+	if logging.Default() != nil {
+		logging.Component("app").Error("hfdesk failed", "error", err)
+		return
 	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("open browser: %v", err)
-	}
+	fmt.Fprintf(os.Stderr, "hfdesk: %v\n", err)
 }
