@@ -250,7 +250,7 @@ func AppendHistory(job *Job) error {
 	// The state directory comes from the effective runtime path model, so a
 	// supervised instance writes its history into its own state root. The
 	// directory is created with the mode the server owns.
-	if err := os.MkdirAll(runtimepaths.Current().StateDir, serverDirMode()); err != nil {
+	if err := os.MkdirAll(runtimepaths.StateDir(), serverDirMode()); err != nil {
 		return err
 	}
 	return os.WriteFile(HistoryPath(), data, 0o644)

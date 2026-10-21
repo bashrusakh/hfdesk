@@ -62,6 +62,142 @@ func TestInteractiveCurrentFollowsEnvironment(t *testing.T) {
 	}
 }
 
+func TestStateDirReturnsTheInstalledStateDirectory(t *testing.T) {
+	model := Paths{
+		ConfigFile: filepath.Join("/etc", "hfdesk", "hfdesk.json"),
+		StateDir:   filepath.Join("/var", "lib", "hfdesk"),
+		LogDir:     filepath.Join("/var", "log", "hfdesk"),
+	}
+	Install(model)
+	t.Cleanup(Reset)
+
+	if got, want := StateDir(), model.StateDir; got != want {
+		t.Fatalf("StateDir() = %q, want the installed state directory %q", got, want)
+	}
+
+	// The installed state directory does not depend on the environment.
+	setSandboxEnv(t, t.TempDir())
+	t.Chdir(t.TempDir())
+
+	if got, want := StateDir(), model.StateDir; got != want {
+		t.Fatalf("StateDir() = %q, want the installed state directory %q", got, want)
+	}
+}
+
+func TestStateDirFollowsTheInteractiveEnvironment(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+
+	root := t.TempDir()
+	setSandboxEnv(t, root)
+
+	got := StateDir()
+	if want := referenceAppConfigDir(); got != want {
+		t.Fatalf("StateDir() = %q, want %q", got, want)
+	}
+	if !strings.Contains(got, root) {
+		t.Fatalf("StateDir() = %q, want a directory inside the sandbox %q", got, root)
+	}
+
+	// The state directory is resolved on every call, so a later environment
+	// change must be picked up.
+	next := t.TempDir()
+	setSandboxEnv(t, next)
+
+	got = StateDir()
+	if want := referenceAppConfigDir(); got != want {
+		t.Fatalf("StateDir() after the environment change = %q, want %q", got, want)
+	}
+	if !strings.Contains(got, next) {
+		t.Fatalf("StateDir() = %q, want a directory inside the sandbox %q", got, next)
+	}
+}
+
+func TestStateDirDoesNotResolveTheConfigFile(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+
+	// The home directory has to be captured before the sandbox environment
+	// replaces it: the run directory must not look like a temporary one.
+	home := currentHomeDir(t)
+
+	setSandboxEnv(t, t.TempDir())
+
+	stateDir := StateDir()
+
+	// A config file next to the run directory is the config file of the
+	// model, but it does not change the state directory.
+	runDir := nonTempRunDir(t, home)
+	if err := os.WriteFile(filepath.Join(runDir, "hfdesk.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(runDir)
+
+	if got, want := Current().ConfigFile, filepath.Join(runDir, "hfdesk.json"); got != want {
+		t.Fatalf("config file = %q, want %q", got, want)
+	}
+	if got := StateDir(); got != stateDir {
+		t.Fatalf("StateDir() = %q, want the unchanged state directory %q", got, stateDir)
+	}
+	if got, want := StateDir(), referenceAppConfigDir(); got != want {
+		t.Fatalf("StateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestStateDirAgreesWithCurrent(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+
+	model := Paths{
+		ConfigFile: filepath.Join("/etc", "hfdesk", "hfdesk.json"),
+		StateDir:   filepath.Join("/var", "lib", "hfdesk"),
+		LogDir:     filepath.Join("/var", "log", "hfdesk"),
+	}
+
+	check := func(stage string) {
+		t.Helper()
+		if got, want := StateDir(), Current().StateDir; got != want {
+			t.Fatalf("%s: StateDir() = %q, want Current().StateDir = %q", stage, got, want)
+		}
+	}
+
+	setSandboxEnv(t, t.TempDir())
+	check("interactive")
+
+	Install(model)
+	check("installed")
+
+	// An installed model without a state directory keeps its empty state
+	// directory: the accessor does not invent one.
+	Install(Paths{})
+	check("installed without a state directory")
+
+	Reset()
+	check("after reset")
+
+	if got, want := StateDir(), referenceAppConfigDir(); got != want {
+		t.Fatalf("StateDir() after Reset = %q, want %q", got, want)
+	}
+}
+
+func TestStateDirAgreesWithCurrentWithoutAnEnvironment(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+
+	// Without a home and a config directory the interactive model falls
+	// back to the run directory. The accessor has to agree there too.
+	for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"} {
+		t.Setenv(key, "")
+	}
+
+	if got, want := StateDir(), Current().StateDir; got != want {
+		t.Fatalf("StateDir() = %q, want Current().StateDir = %q", got, want)
+	}
+	if got := StateDir(); got == "" {
+		t.Fatalf("StateDir() = %q, want a usable path", got)
+	}
+}
+
 func TestDerivedFileNamesLiveInStateDir(t *testing.T) {
 	stateDir := filepath.Join("var", "lib", "hfdesk")
 	p := Paths{StateDir: stateDir}

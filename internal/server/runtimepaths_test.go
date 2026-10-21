@@ -35,6 +35,33 @@ func TestServerPathsFollowInstalledRuntimeModel(t *testing.T) {
 	if got, want := HistoryPath(), filepath.Join(state, "download_history.json"); got != want {
 		t.Errorf("HistoryPath() = %q, want %q", got, want)
 	}
+	if got, want := TargetsFilePath(), filepath.Join(state, "targets.yaml"); got != want {
+		t.Errorf("TargetsFilePath() = %q, want %q", got, want)
+	}
+}
+
+func TestServerPathsFollowTheEnvironmentWithoutAnInstalledModel(t *testing.T) {
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+
+	root := t.TempDir()
+	setServerSandboxEnv(t, root)
+
+	// The per-user config directory of the sandboxed environment.
+	stateDir := referenceAppConfigDir()
+	if !strings.HasPrefix(stateDir, root) {
+		t.Fatalf("config directory %q is not inside the sandbox %q", stateDir, root)
+	}
+
+	if got, want := JobsStatePath(), filepath.Join(stateDir, "jobs_state.json"); got != want {
+		t.Errorf("JobsStatePath() = %q, want %q", got, want)
+	}
+	if got, want := HistoryPath(), filepath.Join(stateDir, "download_history.json"); got != want {
+		t.Errorf("HistoryPath() = %q, want %q", got, want)
+	}
+	if got, want := TargetsFilePath(), filepath.Join(stateDir, "targets.yaml"); got != want {
+		t.Errorf("TargetsFilePath() = %q, want %q", got, want)
+	}
 }
 
 func TestServerPathsInteractiveWithoutInstalledModel(t *testing.T) {
@@ -70,6 +97,23 @@ func TestMirrorTargetsUseInstalledRuntimeModel(t *testing.T) {
 	}
 
 	targetsFile := filepath.Join(state, "targets.yaml")
+	data, err := os.ReadFile(targetsFile)
+	if err != nil {
+		t.Fatalf("read targets file %s: %v", targetsFile, err)
+	}
+	if !strings.Contains(string(data), "backup") {
+		t.Errorf("targets file %s does not contain the new target:\n%s", targetsFile, data)
+	}
+}
+
+func TestMirrorTargetsFollowTheEnvironmentWithoutAnInstalledModel(t *testing.T) {
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+	setServerSandboxEnv(t, t.TempDir())
+
+	addMirrorTarget(t)
+
+	targetsFile := filepath.Join(referenceAppConfigDir(), "targets.yaml")
 	data, err := os.ReadFile(targetsFile)
 	if err != nil {
 		t.Fatalf("read targets file %s: %v", targetsFile, err)

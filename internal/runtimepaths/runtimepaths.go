@@ -34,19 +34,29 @@ type Paths struct {
 // configFileNames are the accepted config file names, in search order.
 var configFileNames = []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"}
 
+// The names of the state files inside the state directory.
+const (
+	// JobsStateFileName is the name of the persisted job list.
+	JobsStateFileName = "jobs_state.json"
+	// HistoryFileName is the name of the download history.
+	HistoryFileName = "download_history.json"
+	// TargetsFileName is the name of the mirror targets config.
+	TargetsFileName = "targets.yaml"
+)
+
 // JobsStateFile returns the path of the persisted job list.
 func (p Paths) JobsStateFile() string {
-	return filepath.Join(p.StateDir, "jobs_state.json")
+	return filepath.Join(p.StateDir, JobsStateFileName)
 }
 
 // HistoryFile returns the path of the download history.
 func (p Paths) HistoryFile() string {
-	return filepath.Join(p.StateDir, "download_history.json")
+	return filepath.Join(p.StateDir, HistoryFileName)
 }
 
 // TargetsFile returns the path of the mirror targets config.
 func (p Paths) TargetsFile() string {
-	return filepath.Join(p.StateDir, "targets.yaml")
+	return filepath.Join(p.StateDir, TargetsFileName)
 }
 
 var (
@@ -90,6 +100,23 @@ func Current() Paths {
 		return *p
 	}
 	return interactivePaths()
+}
+
+// StateDir returns the state directory of the effective path model.
+//
+// Unlike Current it does not resolve the config file, so it stays cheap
+// enough for the hot paths that write the job list, the download history and
+// the mirror targets on every save. The result is always the StateDir of
+// Current: the installed state directory of a supervised instance and the
+// per-user config directory of an interactive run.
+func StateDir() string {
+	installedMu.RLock()
+	p := installed
+	installedMu.RUnlock()
+	if p != nil {
+		return p.StateDir
+	}
+	return AppConfigDir()
 }
 
 // interactivePaths resolves the interactive path model from the current

@@ -23,14 +23,22 @@ func RunDir() string {
 	return runtimepaths.RunDir()
 }
 
-// JobsStatePath returns the path to jobs_state.json in the app config directory.
+// JobsStatePath returns the path to jobs_state.json in the state directory
+// of the effective runtime path model.
 func JobsStatePath() string {
-	return runtimepaths.Current().JobsStateFile()
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.JobsStateFileName)
 }
 
-// HistoryPath returns the path to download_history.json in the app config directory.
+// HistoryPath returns the path to download_history.json in the state
+// directory of the effective runtime path model.
 func HistoryPath() string {
-	return runtimepaths.Current().HistoryFile()
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.HistoryFileName)
+}
+
+// TargetsFilePath returns the path to targets.yaml in the state directory of
+// the effective runtime path model.
+func TargetsFilePath() string {
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.TargetsFileName)
 }
 
 // ConfigFile represents the persistent configuration file format.
