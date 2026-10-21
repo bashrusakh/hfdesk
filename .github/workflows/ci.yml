@@ -105,6 +105,13 @@ jobs:
       - name: Build the Windows artifacts
         env:
           VERSION: ci
+          # The target of the step is stated here, so a runner default
+          # cannot change it. The desktop artifact is linked with
+          # -H=windowsgui, which makes the linker emit a PE image, and
+          # that flag crashes the linker when the target is not Windows.
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
