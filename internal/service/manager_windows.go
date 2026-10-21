@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // The Windows service mode of HFDesk is a registration in the service
@@ -176,9 +177,9 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	}
 	// The paths the installation is about to create are remembered before
 	// they are created, so the installation knows which of them it owns.
-	// The list holds the directories of the instance and the directories
-	// the installation reuses: the preflight creates the missing ones as
-	// well, so they belong to the installation too.
+	// The list holds the directories of the instance only: a directory the
+	// installation reuses belongs to whoever named it, and the installation
+	// never creates one.
 	snapshot := newSCMInstallSnapshot(opts)
 	order := createdDirOrder(opts, snapshot.created)
 	// A failed installation removes the directories it created. The
@@ -256,9 +257,12 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 // order it creates them.
 //
 // The instance owns three directories: the directory of the config file, the
-// state directory and the log directory. The preflight creates the
-// directories the installation reuses afterwards: the cache root, the hub
-// directory and the local output directory.
+// state directory and the log directory.
+//
+// The directories the installation reuses (the cache root, the hub directory
+// and the local output directory) are not part of the list: a named data
+// directory belongs to whoever named it, and the installation never creates
+// one.
 //
 // The list holds every path once: the config file can live in the state
 // directory of the instance, and the hub directory can live in the cache
@@ -268,9 +272,6 @@ func scmInstallDirs(opts InstallOptions) []string {
 		filepath.Dir(opts.Paths.ConfigFile),
 		opts.Paths.StateDir,
 		opts.Paths.LogDir,
-		opts.CacheDir,
-		opts.HubDir,
-		opts.LocalDir,
 	}
 
 	unique := make([]string, 0, len(dirs))
@@ -963,39 +964,39 @@ func (m *scmManager) openRegistrationPrivileged(action string) (*mgr.Mgr, *mgr.S
 	return manager, handle, true, nil
 }
 
+// scmServiceControl is the part of a registration the stop of an instance
+// needs.
+//
+// The interface is the seam of the test: the manager talks to the service
+// control manager through it, so the retry of a refused stop can be driven
+// from a test without a registration of its own.
+type scmServiceControl interface {
+	// Query returns the state of the registration.
+	Query() (svc.Status, error)
+	// Control sends a control request to the registration.
+	Control(c svc.Cmd) (svc.Status, error)
+}
+
 // stopService stops the instance and waits for the graceful shutdown to
 // finish.
 //
 // Stopping an instance that does not run is a stable success: the state the
 // caller asked for already holds.
-func (m *scmManager) stopService(ctx context.Context, handle *mgr.Service) error {
-	status, err := handle.Query()
-	if err != nil {
-		return scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
-	}
-	if status.State == svc.Stopped {
-		return nil
-	}
-	if _, err := handle.Control(svc.Stop); err != nil {
-		if errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-			// The instance is not running: the wanted state already
-			// holds.
-			return nil
-		}
-		if !errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
-			return scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
-		}
-	}
-	return m.waitForStopped(ctx, handle)
-}
-
-// waitForStopped waits until the service control manager reports the
-// instance as stopped.
 //
-// The wait is bounded: an instance that ignores the stop request must not
-// block the caller forever.
-func (m *scmManager) waitForStopped(ctx context.Context, handle *mgr.Service) error {
+// The stop control is delivered again while the wait lasts: the service
+// control manager refuses the control of an instance that is still starting
+// (ERROR_SERVICE_CANNOT_ACCEPT_CTRL), and the instance of the platform
+// accepts the control only after it reported the running state. A refusal
+// is therefore not the end of the stop: the control is delivered again on
+// the next step of the wait, until the instance stops or the budget of the
+// wait is over.
+//
+// The wait is bounded by the shared budget of the service layer, so the
+// outcome is the same on every machine: the instance stopped, or the wait
+// is over and the instance is still running.
+func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) error {
 	deadline := time.Now().Add(scmStopTimeout)
+	delivered := false
 	for {
 		status, err := handle.Query()
 		if err != nil {
@@ -1004,8 +1005,30 @@ func (m *scmManager) waitForStopped(ctx context.Context, handle *mgr.Service) er
 		if status.State == svc.Stopped {
 			return nil
 		}
+		if !delivered {
+			if _, err := handle.Control(svc.Stop); err != nil {
+				switch {
+				case errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE):
+					// The instance is not running: the wanted state
+					// already holds.
+					return nil
+				case errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL):
+					// The instance is still starting and the
+					// supervisor refuses the control. The
+					// control is delivered again inside the
+					// wait.
+					log.Printf("service: %s is still starting (the state of the instance is %v), the stop request is delivered again", ServiceName, status.State)
+				default:
+					return scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
+				}
+			} else {
+				// The supervisor accepted the control: the instance
+				// stops.
+				delivered = true
+			}
+		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("service: %s did not stop within %s", ServiceName, scmStopTimeout)
+			return fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopTimeout, status.State)
 		}
 		select {
 		case <-ctx.Done():
@@ -1135,40 +1158,69 @@ const (
 
 	// scmLogon32ProviderDefault is the logon provider of the platform.
 	scmLogon32ProviderDefault uintptr = 0
+
+	// scmServiceIdentityUser is the user name of the account the instance
+	// runs as.
+	//
+	// The built-in service accounts are named without their domain: the
+	// platform reads the account from the domain "NT AUTHORITY". The
+	// documentation of the platform shows the call that opens a token of
+	// the account:
+	//
+	//	LogonUser(L"LocalService", L"NT AUTHORITY", NULL,
+	//	          LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, &hToken)
+	//
+	// The full name of the account ("NT AUTHORITY\LocalService") is not
+	// a user name of a logon: the platform reads it as a user of the
+	// domain "NT AUTHORITY" and refuses the logon.
+	scmServiceIdentityUser = "LocalService"
+
+	// scmServiceIdentityDomain is the domain of the built-in service
+	// accounts of the platform.
+	scmServiceIdentityDomain = "NT AUTHORITY"
 )
 
 // scmLogonServiceToken logs the account of the instance on as a service and
 // returns the token of the logon.
 //
-// The built-in service accounts have no password, so the logon needs no
-// credential of the user. The caller needs the right to log on as a service,
-// which the administrators of the machine hold.
+// The call is the one the platform documents for a built-in service account:
+// the user name "LocalService", the domain "NT AUTHORITY", no password at
+// all and the logon type of a service. The password is a null pointer and
+// not an empty string: the built-in service accounts have no password, and
+// the platform refuses an empty one.
+//
+// The caller needs the right to log on as a service, which the
+// administrators of the machine hold.
 //
 // The token is a real token and has to be closed.
-func scmLogonServiceToken(account string) (windows.Token, error) {
-	username, err := windows.UTF16PtrFromString(account)
+func scmLogonServiceToken() (windows.Token, error) {
+	username, err := windows.UTF16PtrFromString(scmServiceIdentityUser)
 	if err != nil {
 		return 0, fmt.Errorf("the name of the account cannot be read: %w", err)
 	}
-	password, err := windows.UTF16PtrFromString("")
+	domain, err := windows.UTF16PtrFromString(scmServiceIdentityDomain)
 	if err != nil {
-		return 0, fmt.Errorf("the empty password of the account cannot be read: %w", err)
+		return 0, fmt.Errorf("the domain of the account cannot be read: %w", err)
 	}
 	var handle windows.Handle
 	result, _, callErr := scmLogonUserW.Call(
 		uintptr(unsafe.Pointer(username)),
-		// The domain of a service logon is empty.
+		uintptr(unsafe.Pointer(domain)),
+		// The account has no password: the platform wants a null
+		// pointer and not an empty string.
 		0,
-		uintptr(unsafe.Pointer(password)),
 		scmLogon32LogonService,
 		scmLogon32ProviderDefault,
 		uintptr(unsafe.Pointer(&handle)),
 	)
 	if result == 0 {
-		if callErr == nil {
-			callErr = windows.ERROR_INVALID_FUNCTION
+		if callErr == nil || errors.Is(callErr, windows.ERROR_SUCCESS) {
+			// The platform refused the logon without an error code:
+			// the reason is unknown, and the message says so instead
+			// of naming an error that never happened.
+			return 0, fmt.Errorf("the account %s cannot be logged on as a service: the platform refused the logon without an error code", scmServiceIdentityName)
 		}
-		return 0, fmt.Errorf("the account %s cannot be logged on as a service: %w", account, callErr)
+		return 0, fmt.Errorf("the account %s cannot be logged on as a service: %w", scmServiceIdentityName, callErr)
 	}
 	return windows.Token(handle), nil
 }
@@ -1213,17 +1265,6 @@ func scmIdentitySIDsFromToken(token windows.Token) (scmIdentitySIDs, error) {
 	return scmIdentitySIDs{sids: sids, exact: true}, nil
 }
 
-// scmServiceIdentityAccounts are the names the account of the instance can be
-// logged on with.
-//
-// The account is a well-known account of the machine: the platform knows it
-// under its full name and under its short name, and the logon of a service
-// accepts both of them.
-var scmServiceIdentityAccounts = []string{
-	`NT AUTHORITY\LocalService`,
-	`LocalService`,
-}
-
 // scmReadServiceIdentitySIDs reads the effective membership of the account
 // the instance runs as out of a token of the account.
 //
@@ -1232,36 +1273,24 @@ var scmServiceIdentityAccounts = []string{
 // while it runs as the instance.
 //
 // A platform that refuses the logon of the account leaves the membership
-// unknown, and the caller falls back to the certain subset.
+// unknown, and the caller falls back to the certain subset. The refusal
+// carries the error of the platform, so a broken call is never mistaken for
+// a platform that cannot answer the question.
 func scmReadServiceIdentitySIDs() (scmIdentitySIDs, error) {
-	var reasons []string
-	for _, account := range scmServiceIdentityAccounts {
-		identity, err := scmServiceIdentityOfAccount(account)
-		if err == nil {
-			return identity, nil
-		}
-		reasons = append(reasons, err.Error())
-	}
-	return scmIdentitySIDs{}, fmt.Errorf("the account %s cannot be logged on as a service: %s", scmServiceIdentityName, strings.Join(reasons, "; "))
-}
-
-// scmServiceIdentityOfAccount logs an account on as a service and reads its
-// effective membership out of the token of the logon.
-//
-// A token that belongs to another account is not the token of the identity:
-// the membership is unknown then.
-func scmServiceIdentityOfAccount(account string) (scmIdentitySIDs, error) {
-	token, err := scmLogonServiceToken(account)
+	token, err := scmLogonServiceToken()
 	if err != nil {
 		return scmIdentitySIDs{}, err
 	}
 	defer token.Close()
+
 	identity, err := scmIdentitySIDsFromToken(token)
 	if err != nil {
 		return scmIdentitySIDs{}, err
 	}
+	// A token that belongs to another account is not the token of the
+	// identity: the membership is unknown then.
 	if !identity.covers(scmServiceIdentitySID) {
-		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s belongs to another account than %s", account, scmServiceIdentityName)
+		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s does not belong to the account %s", scmServiceIdentityUser, scmServiceIdentityName)
 	}
 	return identity, nil
 }
@@ -1318,6 +1347,16 @@ var scmServiceIdentity = sync.OnceValue(scmServiceIdentitySIDs)
 // The directories do not belong to the instance: they can hold the models
 // and the cache of an interactive run of the user. Their access control
 // list is only read, never changed, and never changed recursively.
+//
+// A directory that lives inside the state directory of the instance belongs
+// to the instance: the state directory belongs to the account the instance
+// runs as, and the instance creates the cache tree it needs inside it. Such
+// a directory is neither checked nor created.
+//
+// A directory the user named is outside of the instance: it has to exist,
+// and the account of the instance has to be able to work with it. The
+// installation never creates such a directory: it belongs to whoever named
+// it, and the installation only reads its access control list.
 func preflightDataPaths(opts InstallOptions) error {
 	for _, dir := range []struct {
 		name string
@@ -1330,6 +1369,12 @@ func preflightDataPaths(opts InstallOptions) error {
 		if dir.path == "" {
 			continue
 		}
+		if hfdownloader.PathInside(opts.Paths.StateDir, dir.path) {
+			// The default of the scope lives inside the state
+			// directory of the instance, and the state directory
+			// belongs to the account of the instance.
+			continue
+		}
 		if err := preflightDataPath(dir.name, dir.path); err != nil {
 			return err
 		}
@@ -1340,9 +1385,13 @@ func preflightDataPaths(opts InstallOptions) error {
 // preflightDataPath checks that the account of the instance can work with
 // the directory the installation reuses.
 //
-// A directory that does not exist yet is created by the installation, which
-// runs elevated: the nearest existing ancestor has to grant the account the
-// access to create it, and the created directory is checked again.
+// The directory has to exist: the installation never creates a directory the
+// user named, because such a directory belongs to whoever named it. A
+// missing directory is refused with the guidance that tells the user what
+// to do.
+//
+// The access control list of the directory is only read: the descriptor of
+// the instance is never applied to a path the installation reuses.
 func preflightDataPath(name, path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("service: %s %q must be an absolute path", name, path)
@@ -1359,44 +1408,11 @@ func preflightDataPath(name, path string) error {
 		return fmt.Errorf("service: %s %q is not usable: %w", name, path, err)
 	}
 
-	// The directory does not exist yet. The account of the instance has to
-	// be able to create it in the nearest existing ancestor.
-	ancestor, err := nearestExistingDir(path)
-	if err != nil {
-		return fmt.Errorf("service: %s %q cannot be created: %w", name, path, err)
-	}
-	if err := checkServiceAccess("parent directory", ancestor); err != nil {
-		return fmt.Errorf("service: %s %q cannot be created: %w", name, path, err)
-	}
-	if err := os.MkdirAll(path, dirMode); err != nil {
-		return fmt.Errorf("service: create %s %q: %w", name, path, err)
-	}
-	return checkServiceAccess(name, path)
-}
-
-// nearestExistingDir returns the closest ancestor of a path that exists.
-//
-// The ancestor is the directory the installation has to create the missing
-// path in.
-func nearestExistingDir(path string) (string, error) {
-	current := filepath.Clean(path)
-	for {
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", fmt.Errorf("no existing directory was found above %q", path)
-		}
-		info, err := os.Stat(parent)
-		if err == nil {
-			if !info.IsDir() {
-				return "", fmt.Errorf("%q is not a directory", parent)
-			}
-			return parent, nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("read %q: %w", parent, err)
-		}
-		current = parent
-	}
+	// The directory does not exist. The installation never creates a
+	// directory the user named: the directory and the access rights of
+	// it belong to whoever named it, and an installation that created
+	// one would take a tree of models over without being asked to.
+	return fmt.Errorf("service: the %s %q does not exist: the installation never creates a directory the user named: create it and grant the account read and write access to it, or install the instance without this path", name, path)
 }
 
 // checkServiceAccess reads the access control list of a path and checks
@@ -1443,6 +1459,10 @@ func checkServiceAccess(label, path string) error {
 //
 // A denied entry wins over an allowed one, so a directory that grants the
 // account the access and denies it as well is refused.
+//
+// An inherit only entry applies to the children of the object and never to
+// the object itself: it grants the account nothing on the directory the
+// check is made for, and it denies it nothing either.
 func sddlGrantsIdentity(sddl string, identity scmIdentitySIDs) error {
 	var (
 		allowed bool
@@ -1450,6 +1470,11 @@ func sddlGrantsIdentity(sddl string, identity scmIdentitySIDs) error {
 		write   bool
 	)
 	for _, ace := range parseSDDLAces(sddl) {
+		if ace.inheritOnly() {
+			// The entry is about the children of the directory, not
+			// about the directory itself.
+			continue
+		}
 		if !ace.coversIdentity(identity) {
 			continue
 		}
@@ -1478,10 +1503,30 @@ type sddlACE struct {
 	// kind is the type of the entry: "A" for an allowed entry and "D"
 	// for a denied one.
 	kind string
+	// flags holds the inheritance flags of the entry.
+	flags string
 	// rights is the access mask the entry grants or denies.
 	rights uint32
 	// trustee is the SID the entry applies to.
 	trustee string
+}
+
+// inheritOnly reports whether the entry applies to the children of the
+// object and never to the object itself.
+//
+// The inherit only flag ("IO") is one of the two letter codes of the flags
+// field of an entry. The field is a concatenation of such codes, so the
+// codes are read one after the other: a search for the text of the code
+// would read the letters of two neighbouring codes as the inherit only
+// flag.
+func (ace sddlACE) inheritOnly() bool {
+	flags := strings.ToUpper(ace.flags)
+	for i := 0; i+2 <= len(flags); i += 2 {
+		if flags[i:i+2] == "IO" {
+			return true
+		}
+	}
+	return false
 }
 
 // coversIdentity reports whether the entry applies to the account of the
@@ -1571,7 +1616,8 @@ func parseSDDLAces(sddl string) []sddlACE {
 // parseSDDLACE reads one access control entry of an SDDL string.
 //
 // The entry has the shape (type;flags;rights;object-type;inheritance;trustee).
-// The trustee is the last field of the entry and the rights the third one.
+// The trustee is the last field of the entry, the rights the third one and
+// the flags the second one.
 func parseSDDLACE(body string) (sddlACE, bool) {
 	fields := strings.Split(body, ";")
 	if len(fields) < 2 {
@@ -1579,6 +1625,7 @@ func parseSDDLACE(body string) (sddlACE, bool) {
 	}
 	ace := sddlACE{
 		kind:    strings.ToUpper(strings.TrimSpace(fields[0])),
+		flags:   strings.ToUpper(strings.TrimSpace(fields[1])),
 		trustee: strings.TrimSpace(fields[len(fields)-1]),
 	}
 	if len(fields) >= 3 {

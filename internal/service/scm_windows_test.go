@@ -6,11 +6,13 @@
 package service
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,6 +95,140 @@ func TestSCMHandlerReportsTheLifecycle(t *testing.T) {
 	}
 
 	want := []svc.State{svc.StartPending, svc.Running, svc.StopPending, svc.Stopped}
+	if !reflect.DeepEqual(states, want) {
+		t.Errorf("the reported states = %v, want %v", states, want)
+	}
+}
+
+// TestSCMHandlerWaitsForTheHostWhenTheReadinessFails checks that the
+// handler waits for the host of the instance before it reports the instance
+// as stopped.
+//
+// The readiness of the instance fails while the host keeps running: the
+// handler has to cancel the instance and wait for the host, so the drain of
+// the HTTP server and the write back of the job manager are not cut short.
+// The instance is reported as stopped only after the host ended.
+//
+// The wait is the one of the normal stop path, so it is bounded by the
+// shared budget of the service layer.
+func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	// The address of the instance is occupied by something that is not the
+	// HTTP server of the instance: the readiness of the instance fails and
+	// it fails for sure, because the port belongs to the test.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	addr := listener.Addr().String()
+	args := []string{
+		ServiceName,
+		"service", "run",
+		"--config", model.ConfigFile,
+		"--state-dir", model.StateDir,
+		"--log-dir", model.LogDir,
+		"--listen", addr,
+	}
+
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 50 * time.Millisecond
+	handler.readinessInterval = 10 * time.Millisecond
+
+	// The host of the instance: it runs until the context of the instance
+	// is cancelled, and it takes its time to finish, the way a server that
+	// drains its connections does.
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHost := func() { releaseOnce.Do(func() { close(release) }) }
+	// The host never outlives the test, not even when the test fails
+	// before it releases the host.
+	t.Cleanup(releaseHost)
+	handler.run = func(ctx context.Context, opts RunOptions) error {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		<-release
+		return nil
+	}
+
+	changes := make(chan svc.Status, 16)
+	requests := make(chan svc.ChangeRequest)
+
+	type result struct {
+		specific bool
+		code     uint32
+	}
+	done := make(chan result, 1)
+	go func() {
+		specific, code := handler.Execute(args, requests, changes)
+		done <- result{specific: specific, code: code}
+		close(changes)
+	}()
+
+	// The host of the instance runs.
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the host of the instance did not start")
+	}
+
+	// The instance reports that it starts.
+	select {
+	case status := <-changes:
+		if status.State != svc.StartPending {
+			t.Fatalf("the first reported state = %v, want %v", status.State, svc.StartPending)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the instance did not report that it starts")
+	}
+
+	// The readiness of the instance fails: the handler cancels the
+	// instance and waits for the host.
+	select {
+	case <-cancelled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the instance was not cancelled after the failed readiness")
+	}
+
+	// The instance is not reported as stopped while the host still runs.
+	select {
+	case status := <-changes:
+		t.Fatalf("the handler reported the state %v while the host of the instance was still running", status.State)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The host ends: the instance is reported as stopped afterwards.
+	releaseHost()
+
+	var states []svc.State
+	for status := range changes {
+		states = append(states, status.State)
+	}
+
+	res := <-done
+	if res.code == 0 {
+		t.Errorf("the exit code = %d, want a non-zero code for a failed start", res.code)
+	}
+	want := []svc.State{svc.StartPending, svc.Stopped}
 	if !reflect.DeepEqual(states, want) {
 		t.Errorf("the reported states = %v, want %v", states, want)
 	}

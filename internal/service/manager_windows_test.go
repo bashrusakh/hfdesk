@@ -489,6 +489,66 @@ func TestSCMStopWaitCoversTheShutdownOfTheServer(t *testing.T) {
 	}
 }
 
+// scmTestServiceControl is a registration of the service control manager
+// that a test drives.
+//
+// The registration refuses the stop control while the instance is still
+// starting, the way the platform does: the control of an instance that did
+// not report the running state yet is refused with
+// ERROR_SERVICE_CANNOT_ACCEPT_CTRL.
+type scmTestServiceControl struct {
+	// state is the state the registration reports.
+	state svc.State
+	// refusals is the number of times the registration refuses the stop
+	// control.
+	refusals int
+	// controls counts the delivered stop controls.
+	controls int
+}
+
+// Query returns the state of the registration.
+func (c *scmTestServiceControl) Query() (svc.Status, error) {
+	return svc.Status{State: c.state}, nil
+}
+
+// Control sends the stop control to the registration.
+//
+// The control is refused while the registration has refusals left: the
+// instance is still starting then. The control that is accepted stops the
+// instance.
+func (c *scmTestServiceControl) Control(cmd svc.Cmd) (svc.Status, error) {
+	c.controls++
+	if c.refusals > 0 {
+		c.refusals--
+		return svc.Status{State: c.state}, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+	}
+	c.state = svc.Stopped
+	return svc.Status{State: svc.Stopped}, nil
+}
+
+// TestSCMStopRetriesTheControlOfAnInstanceThatIsStillStarting checks that a
+// stop the supervisor refuses because the instance is still starting is
+// delivered again, and not given up on.
+//
+// The service control manager refuses the control of an instance that did not
+// report the running state yet (ERROR_SERVICE_CANNOT_ACCEPT_CTRL). The
+// refusal is not the end of the stop: the control is delivered again inside
+// the wait, until the instance stops or the budget of the wait is over.
+func TestSCMStopRetriesTheControlOfAnInstanceThatIsStillStarting(t *testing.T) {
+	handle := &scmTestServiceControl{state: svc.StartPending, refusals: 2}
+
+	manager := &scmManager{scope: ScopeSystem}
+	if err := manager.stopService(context.Background(), handle); err != nil {
+		t.Fatalf("stopService() = %v, want nil: the refusal of a starting instance is not the end of the stop", err)
+	}
+	if handle.controls < 3 {
+		t.Errorf("the stop control was delivered %d times, want it delivered again after every refusal", handle.controls)
+	}
+	if handle.state != svc.Stopped {
+		t.Errorf("the state of the instance = %v, want %v", handle.state, svc.Stopped)
+	}
+}
+
 // TestSCMLifecycle drives the registration of a service against the real
 // service control manager.
 //
@@ -1125,6 +1185,22 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
 	identity := scmTestEffectiveIdentitySIDs(t)
 
+	// The membership the check is made against: it is the effective one,
+	// it carries the account itself and everybody, and it never carries
+	// the interactive users, because the instance runs a service logon.
+	if !identity.exact {
+		t.Fatal("the membership of the account is not the effective one, want the membership of a token")
+	}
+	if !identity.covers(scmServiceIdentitySID) {
+		t.Fatalf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
+	}
+	if !identity.covers(scmEveryoneSID) {
+		t.Fatalf("the membership %v does not carry everybody", identity.sids)
+	}
+	if identity.covers(scmInteractiveUsersSID) {
+		t.Fatalf("the membership %v carries the interactive users, want a membership without them", identity.sids)
+	}
+
 	// The account itself.
 	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-19)", identity); err != nil {
 		t.Errorf("sddlGrantsIdentity() = %v, want nil for the account itself", err)
@@ -1148,6 +1224,48 @@ func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
 		if err := sddlGrantsIdentity("D:P(A;;FA;;;"+group+")", identity); err != nil {
 			t.Errorf("sddlGrantsIdentity() = %v, want nil for the group %s the account carries", err, group)
 		}
+	}
+}
+
+// TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess checks that an access
+// control entry that applies to the children of the object grants the
+// account of the instance nothing on the object itself.
+//
+// An inherit only entry ("IO") is about the children of the directory: the
+// directory itself is not covered by it, so a directory whose only entry for
+// the account of the instance is an inherit only one is a directory the
+// instance can never use.
+func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
+	identity := scmCertainIdentitySIDs(errors.New("the test checks the certain subset"))
+
+	// The entry is about the children of the directory: it grants the
+	// account nothing on the directory itself.
+	err := sddlGrantsIdentity("D:P(A;OICIIO;FA;;;LS)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of an inherit only entry")
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the account of the instance", err)
+	}
+
+	// The same entry without the inherit only flag applies to the
+	// directory itself and grants the account the access.
+	if err := sddlGrantsIdentity("D:P(A;OICI;FA;;;LS)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil for an entry that applies to the directory itself", err)
+	}
+
+	// An inherit only entry does not deny the account either: the
+	// directory is refused because nothing grants it, and not because
+	// something denies it.
+	err = sddlGrantsIdentity("D:P(D;OICIIO;GA;;;LS)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a directory that grants the account nothing")
+	}
+	if !strings.Contains(err.Error(), "no access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want the refusal of the missing access and not a denial", err)
+	}
+	if strings.Contains(err.Error(), "denies") {
+		t.Errorf("sddlGrantsIdentity() = %v, want no denial: an inherit only entry denies the account nothing", err)
 	}
 }
 
@@ -1201,14 +1319,16 @@ func TestSddlGrantsIdentityNamesTheCertainSubset(t *testing.T) {
 // The membership is a property of the machine: the test skips when the
 // platform refuses the logon of the account, because the machine cannot
 // answer the question then.
+//
+// The refusal of the platform is carried by the message of the skip: a
+// broken call of the logon is never mistaken for a platform that cannot
+// answer the question. Nothing else skips the test: the logon of the
+// account is the only thing the platform is asked for.
 func scmTestEffectiveIdentitySIDs(t *testing.T) scmIdentitySIDs {
 	t.Helper()
-	if !isElevatedProcess() {
-		t.Skip("the logon of a service account needs an elevated shell, run the test as an administrator")
-	}
 	identity, err := scmReadServiceIdentitySIDs()
 	if err != nil {
-		t.Skipf("the account %s cannot be logged on as a service: %v", scmServiceIdentityName, err)
+		t.Skipf("the platform refused the logon of the account %s: %v", scmServiceIdentityName, err)
 	}
 	return identity
 }
@@ -1263,6 +1383,72 @@ func TestPreflightDataPathRefusesAFile(t *testing.T) {
 	}
 	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
+	}
+}
+
+// TestPreflightDataPathsRefuseAMissingNamedDirectory checks that a
+// directory the user named and that does not exist is refused with the
+// guidance that tells the user what to do, and that the installation never
+// creates it.
+//
+// A named data directory belongs to whoever named it: the installation only
+// reads its access control list, and it never creates a directory the user
+// named. A directory that does not exist is a failed installation and not a
+// service that fails later with an opaque access error.
+func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
+	cases := []struct {
+		name string
+		// path returns the named directory of the installation.
+		path func(opts *InstallOptions, root string) string
+	}{
+		{"the cache dir", func(opts *InstallOptions, root string) string {
+			opts.CacheDir = filepath.Join(root, "cache")
+			return opts.CacheDir
+		}},
+		{"the hub dir", func(opts *InstallOptions, root string) string {
+			opts.HubDir = filepath.Join(root, "hub")
+			return opts.HubDir
+		}},
+		{"the local dir", func(opts *InstallOptions, root string) string {
+			opts.LocalDir = filepath.Join(root, "models")
+			return opts.LocalDir
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			opts := scmTestOptions()
+			opts.Paths = runtimepaths.Paths{
+				ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+				StateDir:   filepath.Join(root, "var"),
+				LogDir:     filepath.Join(root, "var", "logs"),
+			}
+			// Only the directory of the case is named: the other ones
+			// are not part of the installation.
+			opts.CacheDir = ""
+			opts.HubDir = ""
+			opts.LocalDir = ""
+			path := tc.path(&opts, root)
+
+			err := preflightDataPaths(opts)
+			if err == nil {
+				t.Fatalf("preflightDataPaths() = nil, want the refusal of %s", tc.name)
+			}
+			if !scmTestNamesPath(err.Error(), path) {
+				t.Errorf("preflightDataPaths() = %v, want an error that names the path %q", err, path)
+			}
+			if !strings.Contains(err.Error(), "never creates a directory the user named") {
+				t.Errorf("preflightDataPaths() = %v, want an error that tells the user that the installation creates no directory of its own", err)
+			}
+			if !strings.Contains(err.Error(), "create it and grant the account read and write access to it") {
+				t.Errorf("preflightDataPaths() = %v, want an error that tells the user what to do", err)
+			}
+			// The refused directory was not created behind the back of
+			// the user.
+			if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("the refused directory %q exists: %v", path, statErr)
+			}
+		})
 	}
 }
 
@@ -1323,6 +1509,43 @@ func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheInteractiveUsers(t *
 	err := preflightDataPath("cache dir", path)
 	if err == nil {
 		t.Fatalf("preflightDataPath(%q) = nil, want the refusal of a directory that grants the access to the interactive users only", path)
+	}
+	if !scmTestNamesPath(err.Error(), path) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
+	}
+	if !strings.Contains(err.Error(), "grant the account") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
+	}
+}
+
+// TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren checks
+// that a directory whose only entry for the account of the instance applies
+// to its children is refused.
+//
+// An inherit only entry is about the children of the directory: the
+// directory itself is not covered by it. A directory the account of the
+// instance can only reach through its children is a directory the instance
+// can never use, and the preflight has to refuse it.
+func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cache")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	// The directory grants the account of the instance the access to its
+	// children only, and the account of the test the access to the
+	// directory itself: the test has to keep the access to the directory
+	// it restricted.
+	scmTestSetDACL(t, path, fmt.Sprintf(
+		"D:P(A;OICIIO;FA;;;%s)(A;;FA;;;%s)",
+		scmServiceIdentitySID, scmTestCurrentUserSID(t)))
+
+	err := preflightDataPath("cache dir", path)
+	if err == nil {
+		t.Fatalf("preflightDataPath(%q) = nil, want the refusal of a directory that grants the account the access to its children only", path)
 	}
 	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)

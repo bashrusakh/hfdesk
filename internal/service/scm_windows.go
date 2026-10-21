@@ -102,6 +102,14 @@ type scmHandler struct {
 	// argument vector of its own still runs with them.
 	opts RunOptions
 
+	// run starts the host of the instance.
+	//
+	// The field is the seam of the test: the handler runs the host of the
+	// service layer, and a test can drive the lifecycle of the handler
+	// with a host of its own, so the wait for the shutdown can be
+	// observed without a server of its own.
+	run func(context.Context, RunOptions) error
+
 	// readinessTimeout bounds the wait for the HTTP server.
 	readinessTimeout time.Duration
 
@@ -123,6 +131,7 @@ type scmHandler struct {
 func newSCMHandler(opts RunOptions) *scmHandler {
 	return &scmHandler{
 		opts:              opts,
+		run:               Run,
 		readinessTimeout:  scmReadinessTimeout,
 		readinessInterval: scmReadinessInterval,
 		shutdownTimeout:   ShutdownBudget,
@@ -150,24 +159,36 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hostErr := make(chan error, 1)
-	go func() {
-		hostErr <- Run(ctx, opts)
-	}()
+	host := h.startHost(ctx, opts)
 
 	// The instance is only reported as running when the HTTP server
 	// really answers: a process that is alive but does not serve is not a
 	// running service.
-	stopRequested, err := h.waitForReady(ctx, opts.Listen, hostErr, r, changes)
+	stopRequested, err := h.waitForReady(ctx, opts.Listen, host, r, changes)
 	if err != nil {
 		logEvent(eventLogError, fmt.Sprintf("hfdesk: the service could not be started: %v", err))
-		cancel()
+		// The host is given the time to finish its own shutdown before
+		// the instance is reported as stopped: the drain of the HTTP
+		// server and the write back of the job manager belong to the
+		// lifecycle of the instance, and the service control manager
+		// must never be told that the instance is stopped while it is
+		// still busy.
+		//
+		// The wait is the one of the normal stop path and it is bounded
+		// by the shared budget of the service layer.
+		ended := host.ended()
+		if shutdownErr := h.waitForShutdown(cancel, host); shutdownErr != nil && !ended {
+			// The host was still running when the readiness failed, so
+			// the error is about the shutdown and not about the start
+			// that failed already.
+			logEvent(eventLogError, fmt.Sprintf("hfdesk: the instance did not stop cleanly: %v", shutdownErr))
+		}
 		changes <- svc.Status{State: svc.Stopped}
 		return false, 1
 	}
 	if stopRequested {
 		// The manager asked the instance to stop while it was starting.
-		if err := h.stopInstance(cancel, hostErr, changes); err != nil {
+		if err := h.stopInstance(cancel, host, changes); err != nil {
 			return false, 1
 		}
 		return false, 0
@@ -182,7 +203,7 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 			if !ok {
 				// The dispatcher closed the channel: the instance is
 				// asked to stop.
-				if err := h.stopInstance(cancel, hostErr, changes); err != nil {
+				if err := h.stopInstance(cancel, host, changes); err != nil {
 					return false, 1
 				}
 				return false, 0
@@ -193,15 +214,15 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 				// is reported again and the instance keeps running.
 				changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 			case svc.Stop, svc.Shutdown:
-				if err := h.stopInstance(cancel, hostErr, changes); err != nil {
+				if err := h.stopInstance(cancel, host, changes); err != nil {
 					return false, 1
 				}
 				return false, 0
 			}
-		case err := <-hostErr:
+		case <-host.done:
 			// The host ended on its own: the instance does not run any
 			// more.
-			if err != nil {
+			if err := host.err; err != nil {
 				logEvent(eventLogError, fmt.Sprintf("hfdesk: the service failed: %v", err))
 				changes <- svc.Status{State: svc.Stopped}
 				return false, 1
@@ -213,16 +234,59 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 	}
 }
 
+// scmHost is the goroutine of the host of an instance.
+//
+// The result of the host is kept next to the signal of its end: the error
+// of a host that ended already is read from the value, and not from a
+// channel that carries it once. A wait for the shutdown would otherwise
+// wait for a value that was consumed somewhere else, and it would block
+// until the budget of the wait is over.
+type scmHost struct {
+	// done is closed when the host ended.
+	done chan struct{}
+
+	// err holds the error the host ended with. It is written before done
+	// is closed, so it is safe to read it once the host ended.
+	err error
+}
+
+// startHost runs the host of the instance in a goroutine of its own.
+//
+// The goroutine ends with the host: it keeps the error of the host and it
+// closes the signal of the end of the host when the host returned.
+func (h *scmHandler) startHost(ctx context.Context, opts RunOptions) *scmHost {
+	host := &scmHost{done: make(chan struct{})}
+	run := h.run
+	if run == nil {
+		run = Run
+	}
+	go func() {
+		host.err = run(ctx, opts)
+		close(host.done)
+	}()
+	return host
+}
+
+// ended reports whether the host ended already.
+func (h *scmHost) ended() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // stopInstance drives the graceful shutdown of the instance.
 //
 // The application context is cancelled first: the server quiesces, drains
 // its connections and closes the job manager. Only when that is done the
 // instance is reported as stopped, so the service control manager never
 // kills a process that is still busy.
-func (h *scmHandler) stopInstance(cancel context.CancelFunc, hostErr <-chan error, changes chan<- svc.Status) error {
+func (h *scmHandler) stopInstance(cancel context.CancelFunc, host *scmHost, changes chan<- svc.Status) error {
 	changes <- svc.Status{State: svc.StopPending}
 	logEvent(eventLogInfo, "hfdesk: the service is stopping")
-	err := h.waitForShutdown(cancel, hostErr)
+	err := h.waitForShutdown(cancel, host)
 	if err != nil {
 		logEvent(eventLogError, fmt.Sprintf("hfdesk: the service did not stop cleanly: %v", err))
 	}
@@ -240,15 +304,15 @@ func (h *scmHandler) stopInstance(cancel context.CancelFunc, hostErr <-chan erro
 // The bound is the shared budget of the service layer, so the handler
 // never gives up before the server had the time to finish its own
 // shutdown.
-func (h *scmHandler) waitForShutdown(cancel context.CancelFunc, hostErr <-chan error) error {
+func (h *scmHandler) waitForShutdown(cancel context.CancelFunc, host *scmHost) error {
 	timeout := h.shutdownTimeout
 	if timeout <= 0 {
 		timeout = ShutdownBudget
 	}
 	cancel()
 	select {
-	case err := <-hostErr:
-		return err
+	case <-host.done:
+		return host.err
 	case <-time.After(timeout):
 		return fmt.Errorf("the instance did not stop within %s", timeout)
 	}
@@ -321,7 +385,7 @@ func scmArgumentCandidates(args []string, processArgs []string) [][]string {
 //
 // The first result reports whether the manager asked the instance to stop
 // while it was starting.
-func (h *scmHandler) waitForReady(ctx context.Context, listen string, hostErr <-chan error, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, error) {
+func (h *scmHandler) waitForReady(ctx context.Context, listen string, host *scmHost, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, error) {
 	timeout := h.readinessTimeout
 	if timeout <= 0 {
 		timeout = scmReadinessTimeout
@@ -336,7 +400,10 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, hostErr <-
 			return false, nil
 		}
 		select {
-		case err := <-hostErr:
+		case <-host.done:
+			// The host ended before the HTTP server answered: the
+			// instance failed to start.
+			err := host.err
 			if err == nil {
 				return false, errors.New("the instance ended before the HTTP server answered")
 			}
