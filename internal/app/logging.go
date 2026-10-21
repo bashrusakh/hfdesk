@@ -20,13 +20,19 @@ type LogOptions struct {
 	Console  bool
 	FilePath string // empty means no file sink
 
-	// FileMaxBackups is the number of rotated log files kept next to the
+	// RotatedFiles is the number of rotated log files kept next to the
 	// active file.
 	//
 	// Zero selects logging.DefaultFileMaxBackups, so a host that says
-	// nothing about the backups keeps the history of the log. A negative
-	// value keeps no rotated file at all.
-	FileMaxBackups int
+	// nothing about the rotated files keeps the history of the log. A
+	// negative value keeps no rotated file at all.
+	//
+	// The field is not named FileMaxBackups on purpose: the logging
+	// package uses that name for the opposite convention, where zero
+	// retains no rotated file and a negative value selects the default.
+	// The translation to the logging package happens in SetupLogging, so
+	// the two layers cannot be confused about the meaning of a count.
+	RotatedFiles int
 }
 
 // SetupLogging installs the application logging pipeline and returns it.
@@ -46,8 +52,14 @@ func SetupLogging(o LogOptions) (*logging.Pipeline, error) {
 
 	// The rotated files are the history of the log: the desktop host
 	// enables the file sink because the log file is its support material,
-	// so a host that says nothing about the backups keeps them.
-	maxBackups := o.FileMaxBackups
+	// so a host that says nothing about the rotated files keeps them.
+	//
+	// This is the one place where the count of this layer is translated
+	// into the count of the logging package. The two layers spell the
+	// zero and the negative value the other way round, so the logging
+	// package only ever sees a count it reads the same way: the default
+	// history of three rotated files, or no rotated file at all.
+	maxBackups := o.RotatedFiles
 	if maxBackups == 0 {
 		maxBackups = logging.DefaultFileMaxBackups
 	} else if maxBackups < 0 {

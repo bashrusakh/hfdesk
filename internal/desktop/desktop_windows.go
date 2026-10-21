@@ -68,7 +68,11 @@ func Run(o Options) error {
 func run(o Options, logPath string) (err error) {
 	var pipeline *logging.Pipeline
 	var shutdown func()
-	var statePath string
+
+	// The state path is the path of the published state file. It is
+	// computed before anything of the host starts, so every goroutine of
+	// the host reads a path that never changes.
+	statePath := publishedStatePath()
 
 	// The guard ends the host after a panic: it removes the published
 	// state, stops the server through the normal path and closes the log
@@ -172,8 +176,8 @@ func run(o Options, logPath string) (err error) {
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 
-	// The runtime window is created further down; the shutdown closes it
-	// when it exists.
+	// The runtime window is created further down, before the signal
+	// watcher starts; the shutdown closes it when it exists.
 	var window *runtimeWindow
 
 	// The shutdown stops the server and waits for the graceful shutdown
@@ -237,23 +241,11 @@ func run(o Options, logPath string) (err error) {
 		})
 	}
 
-	// A signal ends the host as one unit: the server is stopped through
-	// the graceful path and the message loop of the tray ends, so the
-	// process exits instead of leaving a tray icon behind that serves
-	// nothing.
-	//
-	// The signal handler uses the same quit as the menu action of the
-	// tray, so the two cannot drift apart.
-	go guard.runBackground(func() {
-		endHostOnSignal(signalCtx, requestQuit)
-	})
-
 	url := application.URL()
 	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	// The effective URL is published, so a second launch can open the web
 	// UI of this instance.
-	statePath = publishedStatePath()
 	if err := publishState(statePath, url); err != nil {
 		desktopLog.Warn("could not publish the effective URL", "path", statePath, "error", err)
 	}
@@ -278,6 +270,33 @@ func run(o Options, logPath string) (err error) {
 	} else {
 		desktopLog.Info("the WebView2 runtime is available", "version", webview2Version)
 	}
+
+	// A signal ends the host as one unit: the server is stopped through
+	// the graceful path and the message loop of the tray ends, so the
+	// process exits instead of leaving a tray icon behind that serves
+	// nothing.
+	//
+	// The signal handler uses the same quit as the menu action of the
+	// tray, so the two cannot drift apart.
+	//
+	// The watcher starts here, after every value it can reach has been
+	// published. It runs on a goroutine of its own and reaches the
+	// published state, the runtime window and the shutdown through the
+	// quit path, so a value that is assigned after this point would be
+	// read by the watcher while this goroutine writes it: an
+	// unsynchronized read and write pair, which is a data race. The order
+	// of the startup is therefore part of the contract of the host:
+	//
+	//   - the state path is assigned before the guard exists,
+	//   - the shutdown is assigned before the server starts,
+	//   - the runtime window is assigned before this goroutine starts.
+	//
+	// A signal that arrives before this goroutine starts is not lost:
+	// the signal context stays cancelled, so the watcher ends the host
+	// as soon as it starts.
+	go guard.runBackground(func() {
+		endHostOnSignal(signalCtx, requestQuit)
+	})
 
 	go guard.runBackground(func() {
 		select {

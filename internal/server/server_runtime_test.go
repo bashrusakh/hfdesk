@@ -174,6 +174,115 @@ func TestServeBrowserURLUsesLoopbackForWildcardBind(t *testing.T) {
 	}
 }
 
+// TestStartupRecordUsesTheBrowserURL proves that the startup record spells
+// the dashboard URL the way the application opens it and the runtime API
+// reports it, so the product has exactly one spelling of the dashboard URL.
+//
+// The record used to spell the URL as http://localhost:<port>, which is not
+// the address a user reaches when the server binds a routable address.
+func TestStartupRecordUsesTheBrowserURL(t *testing.T) {
+	t.Run("the address of the running server", func(t *testing.T) {
+		captured := installCapturingPipeline(t)
+
+		m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+		registerTestJobManagerCleanup(t, m)
+		s := &Server{jobs: m}
+
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- s.Serve(ctx, listener) }()
+
+		waitForServerBoundAddr(t, s, listener.Addr().String())
+
+		_, port := splitAddrHostPort(s.BoundAddr())
+		want := "http://127.0.0.1:" + strconv.Itoa(port)
+		record := waitForLogRecord(t, captured, "server starting")
+
+		if !strings.Contains(record, "dashboard="+want) {
+			t.Errorf("startup record = %q, want the dashboard URL %q", record, want)
+		}
+		if !strings.Contains(record, "api="+want+"/api") {
+			t.Errorf("startup record = %q, want the API URL %q", record, want+"/api")
+		}
+		if !strings.Contains(record, "addr=http://"+listener.Addr().String()) {
+			t.Errorf("startup record = %q, want the listening address", record)
+		}
+		if strings.Contains(record, "localhost") {
+			t.Errorf("startup record = %q, want no second spelling of the dashboard URL", record)
+		}
+
+		cancel()
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatalf("Serve returned %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Serve did not return after the context was cancelled")
+		}
+	})
+
+	t.Run("a routable bound address", func(t *testing.T) {
+		captured := installCapturingPipeline(t)
+
+		// The server records the address it is bound to before it writes
+		// the startup record, so the record and the browser URL are built
+		// from the same address.
+		s := &Server{config: Config{AuthUser: "tester"}}
+		addr := &net.TCPAddr{IP: net.ParseIP("192.168.1.5"), Port: 8080}
+		s.setBoundAddr(addr)
+
+		s.logStartup(addr)
+
+		want := "http://192.168.1.5:8080"
+		record := waitForLogRecord(t, captured, "server starting")
+
+		if !strings.Contains(record, "dashboard="+want) {
+			t.Errorf("startup record = %q, want the dashboard URL %q", record, want)
+		}
+		if !strings.Contains(record, "api="+want+"/api") {
+			t.Errorf("startup record = %q, want the API URL %q", record, want+"/api")
+		}
+		if !strings.Contains(record, "addr=http://"+addr.String()) {
+			t.Errorf("startup record = %q, want the listening address", record)
+		}
+		if strings.Contains(record, "localhost") {
+			t.Errorf("startup record = %q, want no second spelling of the dashboard URL", record)
+		}
+
+		auth := waitForLogRecord(t, captured, "auth enabled")
+		if !strings.Contains(auth, "user=tester") {
+			t.Errorf("auth record = %q, want the configured user", auth)
+		}
+	})
+}
+
+// waitForLogRecord waits until the captured log holds a record with the given
+// message and returns the line of that record.
+//
+// The server writes its records from its own goroutines, so the record of the
+// startup is not there when the caller asks for it.
+func waitForLogRecord(t *testing.T, captured *capturedLog, message string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, line := range strings.Split(captured.String(), "\n") {
+			if strings.Contains(line, message) {
+				return line
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q record was written to the log: %q", message, captured.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestBrowserURLDerivation covers the host-to-URL derivation of BrowserURL.
 func TestBrowserURLDerivation(t *testing.T) {
 	for _, tc := range []struct {

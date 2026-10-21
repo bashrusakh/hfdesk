@@ -154,6 +154,49 @@ func TestSetupLoggingKeepsRotatedBackups(t *testing.T) {
 	}
 }
 
+// TestSetupLoggingKeepsNoRotatedFile proves the mapping of the rotated file
+// count of this layer onto the logging package: a negative value keeps no
+// rotated file at all, while the zero value keeps the default history.
+//
+// The two layers spell the zero and the negative value the other way round,
+// so the test pins the translation of SetupLogging: the logging package only
+// ever sees a count it reads the same way.
+func TestSetupLoggingKeepsNoRotatedFile(t *testing.T) {
+	restoreDefaultLogger(t)
+
+	path := filepath.Join(t.TempDir(), "hfdesk.log")
+	pipeline, err := SetupLogging(LogOptions{Level: "info", FilePath: path, RotatedFiles: -1})
+	if err != nil {
+		t.Fatalf("SetupLogging: %v", err)
+	}
+	defer pipeline.Close()
+
+	// The records are large enough to push the file past its maximum size
+	// after a few of them, so the sink rotates while the test writes.
+	logger := logging.Component("app")
+	payload := strings.Repeat("x", 4096)
+	const records = 2000
+	for i := range records {
+		logger.Info("rotating record", "index", i, "payload", payload)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat the active log file: %v", err)
+	}
+	if info.Size() >= int64(records*len(payload)) {
+		t.Fatalf("the active log file holds %d bytes, want a file that rotated", info.Size())
+	}
+
+	matches, err := filepath.Glob(path + "*")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("retained %d log files (%v), want only the active file", len(matches), matches)
+	}
+}
+
 // TestDefaultLogPathDoesNotCreateAnything proves that the default log path
 // is a per-user path and that asking for it creates nothing.
 func TestDefaultLogPathDoesNotCreateAnything(t *testing.T) {

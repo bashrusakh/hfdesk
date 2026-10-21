@@ -346,11 +346,16 @@ func splitAddrHostPort(addr net.Addr) (string, int) {
 // logStartup records the startup information that used to be printed as a
 // banner: the listening address, the dashboard and API URLs, and the fact
 // that authentication is enabled.
+//
+// The dashboard URL comes from BrowserURL, the same source the application
+// opens and the runtime API reports, so the product has exactly one spelling
+// of the dashboard URL. A server that binds a routable address reports that
+// address, because the loopback name of the machine is not the address a
+// user reaches.
 func (s *Server) logStartup(addr net.Addr) {
 	cfg := s.snapshotConfig()
-	_, port := splitAddrHostPort(addr)
 	listenURL := "http://" + addr.String()
-	dashboardURL := "http://localhost:" + strconv.Itoa(port)
+	dashboardURL := s.BrowserURL()
 	serverLog.Info("server starting",
 		"addr", listenURL,
 		"dashboard", dashboardURL,
