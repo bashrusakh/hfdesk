@@ -34,22 +34,55 @@ import (
 	"time"
 )
 
-type cancelOnErrCallContext struct {
+// postProofCancelContext observes the single-path publication boundary
+// without counting context consultations.
+//
+// finalizeSinglePartial closes the partial handle after the content proof
+// succeeds and immediately before the publication rename, so a closed handle
+// is the product's own observable "proof done, not yet published" state. This
+// context reports cancellation only from that state onwards, which places the
+// cancellation strictly between the proof and the rename.
+//
+// Counting ctx.Err() calls cannot do that: the number of consultations
+// depends on how the standard library implements context.Cause (Go 1.25 only
+// consults Err when no cancellation cause is recorded, Go 1.26 always does),
+// so a counted threshold lands on a different guard per toolchain.
+//
+// An armed context cancels the parent the first time the boundary is
+// observed; an unarmed one only records that the boundary was reached.
+type postProofCancelContext struct {
 	context.Context
-	cancelAt int
-	calls    int
+	boundary func() bool
 	cancel   context.CancelFunc
+	armed    bool
+	observed atomic.Bool
 }
 
-func (c *cancelOnErrCallContext) Err() error {
-	c.calls++
-	if c.cancelAt > 0 && c.calls >= c.cancelAt {
-		if c.cancel != nil {
+func (c *postProofCancelContext) Err() error {
+	if !c.observed.Load() && c.boundary() {
+		c.observed.Store(true)
+		if c.armed {
 			c.cancel()
+			if err := c.Context.Err(); err != nil {
+				return err
+			}
+			return context.Canceled
 		}
-		return context.Canceled
 	}
 	return c.Context.Err()
+}
+
+// closedFileBoundary reports whether the product has closed the given
+// handle. A Stat on a handle the product already closed fails on every
+// supported platform (os.ErrClosed on Unix, an invalid-handle error on
+// Windows), while a Stat on a live handle of this regular file succeeds, so
+// the probe observes the product's own transition instead of racing it: it
+// never polls and never sleeps.
+func closedFileBoundary(f *os.File) func() bool {
+	return func() bool {
+		_, err := f.Stat()
+		return err != nil
+	}
 }
 
 func singleTestSHA(full []byte) string {
@@ -475,6 +508,18 @@ func TestDownloadSingle_CancelAtFinalizeBeforeRename(t *testing.T) {
 	}
 }
 
+// TestFinalizeSinglePartial_CancelAfterProofBeforeRename pins the
+// single-path publication invariant: a cancellation observed after the
+// content proof succeeded but before the rename must not publish the final
+// file.
+//
+// The cancellation is placed on the product's own post-proof transition
+// rather than on a counted number of context consultations, so the test
+// behaves identically on every supported Go version (see
+// postProofCancelContext). The guard this exercises is the pre-rename one:
+// it is the last check before os.Rename, and it is the one that enforces
+// "cancellation observed before publication must not rename the final
+// file".
 func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 	const size = 64 * 1024
 	full := rangedTestPayload(size)
@@ -484,9 +529,10 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 	it := PlanItem{RelativePath: "post-hash-cancel.bin", Size: size, SHA256: sha}
 	emit := func(ProgressEvent) {}
 
-	// First run measures the deterministic number of context checks through a
-	// successful proof. The cancellation run returns context.Canceled on the
-	// next-to-last check: the pre-rename guard immediately after hashing.
+	// The first run establishes that the boundary is observable: the product
+	// closes the partial handle after the content proof and before the
+	// publication rename, so an unusable handle is the "proof done, not yet
+	// published" state. Nothing is canceled here; the run must publish.
 	tmp := filepath.Join(dir, "calibrate.part")
 	dst := filepath.Join(dir, "calibrate.bin")
 	if err := os.WriteFile(tmp, full, 0o644); err != nil {
@@ -496,19 +542,28 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	calibration := &cancelOnErrCallContext{Context: context.Background()}
+	calibration := &postProofCancelContext{
+		Context:  context.Background(),
+		boundary: closedFileBoundary(out),
+	}
 	verified, err := finalizeSinglePartial(calibration, out, tmp, dst, it, configure, false, emit)
 	if err != nil || !verified {
 		t.Fatalf("calibration finalization = (%v,%v)", verified, err)
 	}
-	checks := calibration.calls
-	if checks < 4 {
-		t.Fatalf("unexpected context-check count through hash/publish: %d", checks)
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("calibration run did not publish the destination: %v", err)
+	}
+	if !calibration.observed.Load() {
+		t.Fatal("the product never consulted the context between the content proof and the rename, " +
+			"so the pre-rename publication guard is missing")
 	}
 	if err := os.Remove(dst); err != nil {
 		t.Fatal(err)
 	}
 
+	// The second run arms the same boundary. The cancellation is therefore
+	// observed strictly after the content proof succeeded and before the
+	// rename, without depending on how many times the context is consulted.
 	tmp = filepath.Join(dir, "post-hash-cancel.part")
 	dst = filepath.Join(dir, "post-hash-cancel.bin")
 	if err := os.WriteFile(tmp, full, 0o644); err != nil {
@@ -520,14 +575,19 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx := &cancelOnErrCallContext{Context: baseCtx, cancelAt: checks - 1, cancel: cancel}
+	ctx := &postProofCancelContext{
+		Context:  baseCtx,
+		boundary: closedFileBoundary(out),
+		cancel:   cancel,
+		armed:    true,
+	}
 	hashPassCount.Store(0)
 	verified, err = finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, emit)
 	if !errors.Is(err, context.Canceled) || verified {
 		t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
 	}
-	if ctx.calls != ctx.cancelAt+1 {
-		t.Fatalf("context cancellation did not reach the post-hash guard (calls=%d cancelAt=%d)", ctx.calls, ctx.cancelAt)
+	if !ctx.observed.Load() {
+		t.Fatal("cancellation did not reach the post-proof boundary")
 	}
 	if hashPassCount.Load() != 1 {
 		t.Errorf("prepublication proof passes=%d, want one", hashPassCount.Load())
@@ -537,5 +597,72 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 	}
 	if got, err := os.ReadFile(tmp); err != nil || !bytes.Equal(got, full) {
 		t.Fatalf("pause failed to preserve proven partial: read err=%v", err)
+	}
+}
+
+// TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy pins the
+// cleanup policy at the SAME post-proof boundary the publication guard uses:
+// a pause preserves the proven partial, an explicit cancel removes it, and
+// neither publishes the destination. It uses the same count-free boundary
+// as TestFinalizeSinglePartial_CancelAfterProofBeforeRename so it does not
+// depend on the standard library's context.Cause implementation.
+func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) {
+	const size = 32 * 1024
+	full := rangedTestPayload(size)
+	sha := singleTestSHA(full)
+
+	for _, cleanup := range []bool{false, true} {
+		name := "pause preserves partial"
+		if cleanup {
+			name = "explicit cancel cleans partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			configure := Settings{Verify: "sha256", CleanupPartialsOnCancel: func() bool { return cleanup }}
+			it := PlanItem{RelativePath: "post-hash-policy.bin", Size: size, SHA256: sha}
+			emit := func(ProgressEvent) {}
+
+			// The single path's partial is always dst+".part"; the cleanup
+			// policy removes that exact name.
+			dst := filepath.Join(dir, "post-hash-policy.bin")
+			tmp := dst + ".part"
+			if err := os.WriteFile(tmp, full, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out, err := os.OpenFile(tmp, os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx := &postProofCancelContext{
+				Context:  baseCtx,
+				boundary: closedFileBoundary(out),
+				cancel:   cancel,
+				armed:    true,
+			}
+			hashPassCount.Store(0)
+			verified, err := finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, emit)
+			if !errors.Is(err, context.Canceled) || verified {
+				t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
+			}
+			if !ctx.observed.Load() {
+				t.Fatal("cancellation did not reach the post-proof boundary")
+			}
+			if hashPassCount.Load() != 1 {
+				t.Errorf("prepublication proof passes=%d, want one", hashPassCount.Load())
+			}
+			if _, err := os.Stat(dst); !os.IsNotExist(err) {
+				t.Fatalf("destination published after post-proof cancellation: %v", err)
+			}
+			got, partErr := os.ReadFile(tmp)
+			if cleanup {
+				if !os.IsNotExist(partErr) {
+					t.Errorf("explicit cancel retained the proven partial: %v", partErr)
+				}
+			} else if partErr != nil || !bytes.Equal(got, full) {
+				t.Errorf("pause failed to preserve the proven partial: len=%d err=%v", len(got), partErr)
+			}
+		})
 	}
 }
