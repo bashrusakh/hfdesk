@@ -92,11 +92,11 @@ jobs:
       # window. The subsystem is a build time property, so CI checks it
       # instead of trusting the build script.
       #
-      # Not covered automatically: the notification area icon, the WebView2
-      # window and the interaction with them. They need an interactive
-      # Windows session, which a CI agent does not provide. The PE subsystem
-      # assertion is what mechanically guarantees "no console window" for
-      # the desktop launch.
+      # The desktop host itself is covered by the test of the package below:
+      # the notification area host and the Runtime / Logs window are created
+      # and reported ready. A machine that cannot host them (no interactive
+      # window station, no WebView2 runtime) skips that coverage instead of
+      # failing the job.
       - name: Install rsrc
         run: |
           go install github.com/akavel/rsrc@v0.10.2
@@ -121,8 +121,8 @@ jobs:
         run: |
           Remove-Item -Force -ErrorAction SilentlyContinue cmd/hfdesk/resource_windows_amd64.syso, cmd/hfdesk/hfdesk.ico, cmd/hfdesk-desktop/resource_windows_amd64.syso
 
-      # The desktop host without a visible desktop: the single instance lock
-      # and the server lifecycle are exercised, the tray and the WebView2
-      # window are not, because they need an interactive session.
+      # The desktop host: the single instance lock, the server lifecycle, the
+      # notification area host and the Runtime / Logs window. The last two
+      # skip themselves on a machine that cannot host them.
       - name: Test the desktop host lifecycle
         run: go test ./internal/desktop -count=1 -v

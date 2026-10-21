@@ -7,9 +7,17 @@
 // process, and adds the desktop shell: a system tray icon, a small
 // Runtime / Logs window and the single instance lock.
 //
-// The binary is built with the Windows GUI subsystem, so it has no console:
-// every problem is reported in a native message box and written to the log
-// file.
+// The binary has to be linked with the Windows GUI subsystem, so it has no
+// console: every problem is reported in a native message box and written to
+// the log file. The subsystem is a build time property of the linker, so the
+// binary is built with the flag -H=windowsgui:
+//
+//	go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
+//
+// A binary that was built without the flag is a console subsystem program: it
+// opens a console window next to the notification area icon. The host reads
+// the PE header of its own executable at startup and tells the user how to
+// rebuild the binary when it was built wrong. It keeps running either way.
 package main
 
 import (

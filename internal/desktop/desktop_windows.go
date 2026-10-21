@@ -32,6 +32,15 @@ var desktopLog = logging.NewComponentLogger("desktop")
 // non-zero exit instead of a silent process.
 const trayStartupTimeout = 20 * time.Second
 
+// gracefulShutdownTimeout bounds the wait for the graceful shutdown of the
+// server.
+//
+// The shutdown itself is bounded: the HTTP drain and the close of the job
+// manager each get their own budget. This budget only covers the case where
+// the server does not stop at all, so a stuck server cannot keep the host
+// from ending.
+const gracefulShutdownTimeout = 30 * time.Second
+
 // Run starts the desktop host and blocks until the user quits it.
 //
 // The sequence is the one of the shared application layer: the logging
@@ -46,12 +55,61 @@ func Run(o Options) error {
 	if logPath == "" {
 		logPath = app.DefaultLogPath()
 	}
+	return run(o, logPath)
+}
 
-	pipeline, err := setupLogging(o.App.LogLevel, logPath)
+// run performs the desktop startup.
+//
+// A panic of the host is caught here: the desktop host has no console, so a
+// panic that is not caught ends the process without an explanation and
+// without a log record. The panic is recorded in the log file, shown to the
+// user in a native message box and ends the host through the returned error,
+// so the process still ends.
+func run(o Options, logPath string) (err error) {
+	var pipeline *logging.Pipeline
+	var shutdown func()
+	var statePath string
+
+	// The guard ends the host after a panic: it removes the published
+	// state, stops the server through the normal path and closes the log
+	// pipeline.
+	guard := panicGuard{
+		logPath: logPath,
+		end: func() {
+			removePublishedState(statePath)
+			if shutdown != nil {
+				stopServer(shutdown)
+			}
+			closePipeline(pipeline)
+		},
+	}
+
+	// The panic handler is registered before the startup runs, so a panic
+	// of the startup is caught as well. The other deferred cleanups run
+	// before it (the defers run in reverse order of their registration),
+	// so the handler closes the log pipeline itself and the panic still
+	// reaches the log file.
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			closePipeline(pipeline)
+			return
+		}
+		detail := guard.report(recovered)
+		guard.end()
+		err = fmt.Errorf("desktop: the desktop host stopped after a panic: %s", detail)
+	}()
+
+	pipeline, err = setupLogging(o.App.LogLevel, logPath)
 	if err != nil {
 		return err
 	}
-	defer pipeline.Close()
+
+	// The GUI subsystem is a build time property of the linker. A binary
+	// that was built without it opens a console window next to the
+	// notification area icon, so the user is told how to rebuild it. The
+	// check only reports the problem: the host starts either way.
+	checkSubsystem()
 
 	// The third party libraries report their problems through the
 	// standard library logger, and one of them ends the process on its
@@ -95,12 +153,37 @@ func Run(o Options) error {
 		return err
 	}
 
+	// The runtime window is created further down; the shutdown closes it
+	// when it exists.
+	var window *runtimeWindow
+
+	// The shutdown stops the server and waits for the graceful shutdown
+	// to finish. It runs once, whoever asks for it.
+	//
+	// It exists from the moment the server runs, so every path that ends
+	// the host while the server is running can stop it through the normal
+	// path.
+	var shutdownOnce sync.Once
+	shutdown = func() {
+		shutdownOnce.Do(func() {
+			cancel()
+			if err := application.Wait(); err != nil {
+				desktopLog.Error("the server did not stop cleanly", "error", err)
+			}
+			// The runtime window is closed after the server stopped, so
+			// it never shows a page of a server that is gone.
+			if window != nil {
+				window.Close()
+			}
+		})
+	}
+
 	url := application.URL()
 	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	// The effective URL is published, so a second launch can open the web
 	// UI of this instance.
-	statePath := publishedStatePath()
+	statePath = publishedStatePath()
 	if err := publishState(statePath, url); err != nil {
 		desktopLog.Warn("could not publish the effective URL", "path", statePath, "error", err)
 	}
@@ -117,7 +200,7 @@ func Run(o Options) error {
 		desktopLog.Warn("could not build the product icon", "error", err)
 	}
 
-	window := newRuntimeWindow(runtimePageURL(url), iconBytes)
+	window = newRuntimeWindow(runtimePageURL(url), iconBytes)
 	webview2Ready, webview2Version := webview2Available()
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "url", url)
@@ -126,33 +209,18 @@ func Run(o Options) error {
 		desktopLog.Info("the WebView2 runtime is available", "version", webview2Version)
 	}
 
-	// The shutdown stops the server and waits for the graceful shutdown
-	// to finish. It runs once, whoever asks for it.
-	var shutdownOnce sync.Once
-	shutdown := func() {
-		shutdownOnce.Do(func() {
-			cancel()
-			if err := application.Wait(); err != nil {
-				desktopLog.Error("the server did not stop cleanly", "error", err)
-			}
-			// The runtime window is closed after the server stopped, so
-			// it never shows a page of a server that is gone.
-			window.Close()
-		})
-	}
-
 	// The quit action hands the shutdown off to a goroutine and returns:
 	// the message loop of the tray keeps running until the shutdown has
 	// finished, so the process never exits in the middle of it.
 	requestQuit := func() {
-		go func() {
+		go guard.runBackground(func() {
 			shutdown()
 			systray.Quit()
-		}()
+		})
 	}
 
 	ready := make(chan struct{})
-	go func() {
+	go guard.runBackground(func() {
 		select {
 		case <-ready:
 		case <-time.After(trayStartupTimeout):
@@ -163,10 +231,16 @@ func Run(o Options) error {
 					"The desktop host needs the icon in the notification area to be reachable, so it stops.",
 				windows.MB_ICONERROR)
 			removePublishedState(statePath)
+			// The server is already serving: it is stopped through the
+			// normal path, so the jobs are quiesced, the HTTP drain
+			// runs and the job state is flushed. The wait is bounded,
+			// so a server that does not stop cannot keep the host from
+			// ending.
+			stopServer(shutdown)
 			_ = pipeline.Close()
 			os.Exit(1)
 		}
-	}()
+	})
 
 	// The tray loop runs on the main thread until the user quits the host.
 	runTray(iconBytes, "HFDesk - running", trayActions{
@@ -182,7 +256,9 @@ func Run(o Options) error {
 			// creation takes a moment. It runs in a goroutine, so the
 			// message loop of the tray keeps running while the window
 			// comes up.
-			go showRuntimeWindow(window, url, webview2Ready)
+			go guard.runBackground(func() {
+				showRuntimeWindow(window, url, webview2Ready)
+			})
 		},
 		quit: requestQuit,
 	}, ready)
@@ -192,6 +268,49 @@ func Run(o Options) error {
 	// action.
 	shutdown()
 	return nil
+}
+
+// stopServer runs the graceful shutdown and waits for it with a bound.
+//
+// The shutdown cancels the context of the application, waits for the server
+// to stop and closes the runtime window. The wait is bounded, so a server
+// that does not stop cannot keep the host from ending.
+//
+// The shutdown runs in a goroutine of its own, so the caller waits with the
+// bound instead of blocking on the shutdown.
+func stopServer(shutdown func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// A shutdown that panics must not take the process
+				// with it: the host still has to end.
+				desktopLog.Error("the graceful shutdown panicked",
+					"panic", fmt.Sprintf("%v", recovered))
+			}
+		}()
+		shutdown()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(gracefulShutdownTimeout):
+		desktopLog.Error("the server did not stop within the shutdown budget",
+			"timeout", gracefulShutdownTimeout)
+	}
+}
+
+// closePipeline closes the log pipeline.
+//
+// The pipeline is closed by the panic handler of the host, because the
+// handler runs after the other deferred cleanups and the panic still has to
+// reach the log file. Closing it twice is harmless.
+func closePipeline(pipeline *logging.Pipeline) {
+	if pipeline == nil {
+		return
+	}
+	_ = pipeline.Close()
 }
 
 // setupLogging installs the logging pipeline of the desktop host.
