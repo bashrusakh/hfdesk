@@ -43,7 +43,64 @@ func TestOpenCreatesRestrictiveDirAndFile(t *testing.T) {
 	}
 }
 
-func TestOpenTightensExistingPermissions(t *testing.T) {
+func TestOpenCreatesMissingParentsOwnerOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "a", "b", "logs")
+
+	sink, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	for _, path := range []string{dir, filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("dir %s mode = %04o, want 0700", path, got)
+		}
+	}
+}
+
+func TestOpenKeepsExistingDirMode(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sink, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	// The mode of a directory that already exists belongs to whoever
+	// named it: the instance writes there and leaves the mode alone.
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("log dir mode = %04o, want 0755", got)
+	}
+
+	if _, err := sink.Write([]byte("line\n")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(sink.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "line\n"; got != want {
+		t.Errorf("log content = %q, want %q", got, want)
+	}
+}
+
+func TestOpenKeepsExistingFileMode(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "logs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -65,19 +122,21 @@ func TestOpenTightensExistingPermissions(t *testing.T) {
 	}
 	defer sink.Close()
 
-	dirInfo, err := os.Stat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := dirInfo.Mode().Perm(); got != 0o700 {
-		t.Errorf("log dir mode = %04o, want 0700", got)
-	}
+	// The mode of a file that already exists belongs to whoever owns it:
+	// the instance appends to it and leaves the mode alone.
 	fileInfo, err := os.Stat(logFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := fileInfo.Mode().Perm(); got != 0o600 {
-		t.Errorf("log file mode = %04o, want 0600", got)
+	if got := fileInfo.Mode().Perm(); got != 0o644 {
+		t.Errorf("log file mode = %04o, want 0644", got)
+	}
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o755 {
+		t.Errorf("log dir mode = %04o, want 0755", got)
 	}
 
 	// Existing content is kept and new writes are appended.

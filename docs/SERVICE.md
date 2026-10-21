@@ -131,6 +131,9 @@ over from the owner it already has. A machine-wide instance grants the
 service account only the directories it created itself; a directory that
 already existed has to be writable by that account already (see
 [The identity of a machine-wide instance](#the-identity-of-a-machine-wide-instance)).
+The running instance follows the same rule for its log directory and its log
+file: it creates them owner-only when they are missing and never changes the
+mode of a directory or of a file that already exists.
 
 ### Lifecycle flags
 
@@ -245,9 +248,13 @@ with bounded rotation:
 
 The active file is rotated before a write would exceed 2 MiB, and three
 rotated generations are kept, so the on-disk size of the log stays bounded.
-The log directory and the log files are owner-only (`0700` / `0600` on Unix):
-the running instance tightens its own log directory and its own log files to
-those modes.
+The instance creates its log directory and its log files owner-only (`0700` /
+`0600` on Unix) when they are missing. It never changes the mode of a
+directory or of a file that already exists: the log directory may be a
+directory that existed before the installation and that belongs to someone
+else, and the instance may only be able to write there. Tightening it needs
+an ownership the installation never checked, and it would keep the instance
+from starting at all.
 
 The standard output and the standard error of the process also reach the
 supervisor: the systemd journal on Linux. On macOS the property list sets
