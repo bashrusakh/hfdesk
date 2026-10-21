@@ -88,6 +88,10 @@
     // cursorValid tells a fresh cursor from a cursor that still reads as
     // zero, so a replayed record is never mistaken for a new one.
     cursorValid: false,
+    // runId is the run of the server the view is talking to. It is empty
+    // while the run of the server is unknown, which is the case for a
+    // server that does not report a run id.
+    runId: '',
     // records is the buffer of the retained records, oldest first.
     records: [],
     // renderedSeq is the sequence number of the last record the view
@@ -104,6 +108,19 @@
     cleared: false,
     // source is the open event stream, null while there is none.
     source: null,
+    // hidden marks a page the browser put away. The browser shows it
+    // again when the user comes back from its back/forward cache, and the
+    // view resumes what it was doing.
+    hidden: false,
+    // resumeSource is the live source the view resumes when it is shown
+    // again: "stream" when it followed the event stream, "poll" when it
+    // fell back to polling. The pagehide handler remembers it and the
+    // pageshow handler reads it.
+    resumeSource: 'stream',
+    // resumeReconnect marks a reconnect that was pending when the page was
+    // hidden. It is armed again when the page is shown, so the view tries
+    // the event stream again like it did before.
+    resumeReconnect: false,
     // streamState is the state of the log feed: connecting, live,
     // reconnecting or polling.
     streamState: 'connecting',
@@ -335,57 +352,90 @@
       logErrorOnce(state.statusError);
     }
 
-    // The status carries the head of the log of the running server, so it
-    // is where a restart of the server shows up. A failed read keeps the
-    // previous status, whose head can be older than the cursor of the
-    // client, so the check only runs on a status that was really read.
+    // The status carries the run of the server, so it is where a restart
+    // of the server shows up. A failed read keeps the previous status,
+    // whose run can be the one of an earlier run of the server, so the
+    // check only runs on a status that was really read.
     if (read) await checkServerRestart();
   }
 
-  // serverRestarted reports whether the head of the server belongs to a
-  // different run than the cursor of the client.
+  // readRunID returns the run id a status reports.
   //
-  // The sequence numbers of the log are assigned by the logging pipeline of
-  // the running process, so they start over with every run of the server. A
-  // head that is lower than the cursor of the client therefore means that
-  // the client is talking to another run of the server: the records it
-  // waits for will never arrive, because their sequence numbers start over.
-  function serverRestarted(head) {
-    if (!state.cursorValid) return false;
-    if (head === null || head === undefined) return false;
-
-    const cursor = Number(state.cursor) || 0;
-    const serverHead = Number(head);
-    if (!Number.isFinite(serverHead)) return false;
-
-    return serverHead < cursor;
+  // A server that does not report a run id has an unknown run: the empty
+  // string says so. An unknown run is never a restart.
+  function readRunID(status) {
+    const runId = status?.runId;
+    if (typeof runId !== 'string') return '';
+    return runId.trim();
   }
 
-  // resyncReason picks the message of a re-sync.
+  // serverRestarted reports whether the server is a different run than the
+  // one the view is talking to.
   //
-  // The cause decides the message: a cursor of the server that is lower than
-  // the cursor of the client means that the server restarted, so the message
-  // names the restart instead of the records the server dropped.
+  // The run id of the server identifies its run: it is stable for the whole
+  // life of the process and different in another process, so a run id that
+  // changed means that the server restarted.
   //
-  // A page that carried no record at all tells the same story: the cursor of
-  // the client is then ahead of every record the server holds, which only
-  // happens when the sequence numbers of the server start over, that is when
-  // the server restarted. The cursor of the page cannot be used for that: a
-  // page without records keeps the cursor of the client.
-  function resyncReason(fallback, serverCursor, emptyPage) {
-    if (emptyPage || serverRestarted(serverCursor)) return RESTART_MESSAGE;
-    return fallback;
+  // The head of the log cannot answer that question. The status is a
+  // snapshot that was taken before the request itself was written to the
+  // log, so the head it reports is behind the records the client already
+  // received, and comparing it with the cursor of the client reports a
+  // restart on every refresh.
+  //
+  // An unknown run is never a restart: a server that does not report a run
+  // id cannot be compared with the run the view knows.
+  function serverRestarted(status) {
+    const runId = readRunID(status);
+    if (!runId) return false;
+    if (!state.runId) return false;
+
+    return state.runId !== runId;
   }
 
-  // checkServerRestart re-syncs the view when the server restarted.
+  // adoptRunID remembers the run of the server.
+  //
+  // The run is only remembered when the server reports one: an unknown run
+  // says nothing about the run of the server.
+  function adoptRunID(status) {
+    const runId = readRunID(status);
+    if (!runId) return;
+    state.runId = runId;
+  }
+
+  // checkServerRestart re-syncs the view when the server is a different run.
   //
   // The check runs after every status refresh. The re-sync it triggers puts
   // the cursor of the client back at the head of the server, so a restart is
   // reported once and not on every poll.
   async function checkServerRestart() {
-    if (state.resyncing) return;
-    if (!serverRestarted(state.status?.logCursor)) return;
+    const runId = readRunID(state.status);
+    if (!runId) {
+      // The server does not report a run id: the run of the server is
+      // unknown, so it cannot be compared with the run of the view.
+      return;
+    }
+    if (state.resyncing) {
+      // A re-sync is already in flight. It reads the log of the server
+      // that runs now, so it adopts the run of that server itself.
+      return;
+    }
 
+    const known = state.runId;
+    if (!known) {
+      // The view did not know the run of the server yet: it adopts it
+      // without reporting a restart.
+      state.runId = runId;
+      return;
+    }
+    if (known === runId) {
+      // The same run: the server kept running.
+      return;
+    }
+
+    // The server is a different run: the view starts over and tells the
+    // user about it. The run is adopted by the re-sync itself, and only
+    // when it worked, so a re-sync that failed is tried again with the
+    // next refresh.
     await resync(RESTART_MESSAGE, 'info');
   }
 
@@ -607,6 +657,17 @@
     }
   }
 
+  // hasPendingRecords tells whether the buffer holds records the view did
+  // not render yet.
+  //
+  // The rendered sequence number is the sequence number of the last record
+  // the view accounted for, so the records above it are still waiting for
+  // their batch.
+  function hasPendingRecords() {
+    if (!state.records.length) return false;
+    return state.records[state.records.length - 1].seq > state.renderedSeq;
+  }
+
   // renderAll rebuilds the view from the buffer. It runs when the filters
   // change, not when a record arrives.
   function renderAll() {
@@ -737,12 +798,21 @@
   // the records the server still holds and the user is told about it. The
   // filters and the follow mode are kept: only the records and the cursor
   // are replaced.
+  //
+  // The message names a restart of the server when the server is a
+  // different run than the one the view was talking to. The status the
+  // re-sync reads is fresh, so the run of the server is known then, and
+  // the run id decides that: the head of the log cannot, because it is a
+  // snapshot that is behind the records the client already has.
   async function resync(reason, type = 'error') {
     if (state.resyncing) return;
     state.resyncing = true;
 
     try {
       await refreshStatus();
+
+      // The status is fresh now, so the run of the server is known.
+      const message = serverRestarted(state.status) ? RESTART_MESSAGE : reason;
 
       const head = Number(state.status?.logCursor) || 0;
       const after = head > PAGE_SIZE ? head - PAGE_SIZE : 0;
@@ -758,13 +828,16 @@
         state.cursorValid = true;
       }
 
+      // The cursor of the view belongs to the run the server reports now.
+      adoptRunID(state.status);
+
       renderAll();
       state.logError = '';
       renderError();
 
-      if (reason) {
-        showToast(reason, type);
-        announce(reason);
+      if (message) {
+        showToast(message, type);
+        announce(message);
       }
     } catch (err) {
       state.logError = `The log could not be re-synced: ${err.message}`;
@@ -785,7 +858,7 @@
 
       if (page.truncated) {
         state.resyncing = false;
-        await resync(resyncReason(reason, page.cursor, page.records.length === 0));
+        await resync(reason);
         return;
       }
 
@@ -888,14 +961,18 @@
   }
 
   // scheduleReconnect reconnects the stream with the last known cursor.
+  //
+  // The delay of the reconnect grows with every attempt, so a server that
+  // stays down is contacted less and less often. The delay grows when the
+  // reconnect runs, so a reconnect that was cancelled before it ran keeps
+  // the delay it had.
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
 
     const delay = state.reconnectDelay;
-    state.reconnectDelay = Math.min(state.reconnectDelay * 2, RECONNECT_MAX);
-
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
+      state.reconnectDelay = Math.min(delay * 2, RECONNECT_MAX);
       connectStream();
     }, delay);
   }
@@ -967,8 +1044,6 @@
     state.polling = true;
 
     let truncated = false;
-    let serverCursor = null;
-    let emptyPage = false;
 
     try {
       const page = await readLogs(state.cursor, PAGE_SIZE);
@@ -977,10 +1052,6 @@
         // The window of the cursor fell out of the ring: the history has a
         // hole and cannot be continued.
         truncated = true;
-        serverCursor = page.cursor;
-        // A page without a record means that the cursor of the client is
-        // ahead of every record the server holds: the server restarted.
-        emptyPage = page.records.length === 0;
       } else {
         ingest(page.records);
         if (page.cursor !== null && page.cursor > state.cursor) {
@@ -1006,10 +1077,52 @@
     }
 
     if (truncated) {
-      await resync(resyncReason('The server dropped older log records, re-syncing', serverCursor, emptyPage));
+      await resync('The server dropped older log records, re-syncing');
     }
 
     if (!state.source) schedulePoll(state.pollDelay);
+  }
+
+  // =========================================
+  // Resume
+  // =========================================
+
+  // resumeLive starts the live source of the view again.
+  //
+  // The view remembers the source it used before the page was hidden, so
+  // the same one is started again: a view that followed the event stream
+  // follows it again and a view that fell back to polling polls again.
+  function resumeLive() {
+    if (state.resumeSource === 'poll') {
+      // The poll comes back first, so the records flow again even when
+      // the stream stays down.
+      startPolling();
+
+      // The pending reconnect comes back with it, so the view tries the
+      // event stream again like it did before the page was hidden.
+      if (state.resumeReconnect) scheduleReconnect();
+      return;
+    }
+
+    connectStream();
+  }
+
+  // resumeView resumes the view after the browser shows the page again.
+  //
+  // The page was hidden, so the view closed its live source and cancelled
+  // its timers. The live source it used is started again, the status is
+  // refreshed and the records that waited for their batch are drawn.
+  function resumeView() {
+    resumeLive();
+
+    // The status refresh runs again: the page was hidden for an unknown
+    // time, so the status of the view can be stale.
+    state.statusTimer = setInterval(refreshStatus, STATUS_INTERVAL);
+    refreshStatus();
+
+    // The records that waited for their batch when the page was hidden
+    // are drawn again, so no record is lost across the round trip.
+    if (hasPendingRecords()) scheduleFlush();
   }
 
   // =========================================
@@ -1239,12 +1352,43 @@
     el.openLogsButton.addEventListener('click', openLogs);
 
     window.addEventListener('pagehide', () => {
+      // The view remembers the live source it used, so it can resume the
+      // same one when the browser shows the page again.
+      state.resumeSource = state.source ? 'stream' : 'poll';
+      state.resumeReconnect = state.reconnectTimer !== null;
+      state.hidden = true;
+
       closeStream();
       stopPolling();
-      if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-      if (state.flushTimer) clearTimeout(state.flushTimer);
-      if (state.renderTimer) clearTimeout(state.renderTimer);
-      if (state.statusTimer) clearInterval(state.statusTimer);
+
+      // The handles are released with the timers they belong to. A handle
+      // that outlives its timer makes the view skip its next batch, so the
+      // records that arrive after the page is shown again are never drawn.
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
+      if (state.flushTimer) {
+        clearTimeout(state.flushTimer);
+        state.flushTimer = null;
+      }
+      if (state.renderTimer) {
+        clearTimeout(state.renderTimer);
+        state.renderTimer = null;
+      }
+      if (state.statusTimer) {
+        clearInterval(state.statusTimer);
+        state.statusTimer = null;
+      }
+    });
+
+    window.addEventListener('pageshow', () => {
+      // The browser shows the page again after it was put into its
+      // back/forward cache. The view resumes what it was doing before.
+      if (!state.hidden) return;
+
+      state.hidden = false;
+      resumeView();
     });
   }
 

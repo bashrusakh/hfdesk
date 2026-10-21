@@ -122,6 +122,12 @@ type Server struct {
 	// BrowserURL, which must work before the server finished starting.
 	boundAddrMu sync.RWMutex
 	boundAddr   net.Addr
+	// runID identifies the run of the server. It is generated once, when
+	// the server is asked for it the first time, and it never changes
+	// afterwards: a client compares it to tell a restart of the server
+	// from a continued run.
+	runIDMu sync.Mutex
+	runID   string
 	// pipelineProvider resolves the logging pipeline the runtime and log
 	// endpoints read their records from. It is nil in production, where
 	// the process wide default is used; the tests set it to install a

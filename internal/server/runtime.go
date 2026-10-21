@@ -47,7 +47,7 @@ var runtimeLogStreamActive atomic.Int64
 //
 // It describes the running server: the application version, the runtime
 // status, the browser-safe URL, the effective bound address, the active job
-// counts and the cursor of the log.
+// counts, the run of the server and the cursor of the log.
 type RuntimeStatusResponse struct {
 	// Version is the application version.
 	Version string `json:"version"`
@@ -60,6 +60,13 @@ type RuntimeStatusResponse struct {
 	Address string `json:"address"`
 	// ActiveJobs counts the running and the queued jobs.
 	ActiveJobs RuntimeJobCounts `json:"activeJobs"`
+	// RunID identifies the run of the server. It is stable for the whole
+	// life of the process and different in another process, so a client
+	// can tell that the server it is talking to is a different run.
+	//
+	// The value is random: it carries no information about the machine,
+	// the user or the files of the host, and it is not a secret.
+	RunID string `json:"runId"`
 	// LogCursor is the sequence number of the most recent log record. It
 	// is the cursor a client sends to read the records emitted after it.
 	LogCursor uint64 `json:"logCursor"`
@@ -118,10 +125,14 @@ type RuntimeLogsResponse struct {
 	Records []RuntimeLogRecord `json:"records"`
 	// Cursor is the cursor to send for the next page.
 	//
-	// It is the sequence number of the last record the page carried, so a
-	// client never skips a record it did not receive. An empty page keeps
-	// the cursor of the client: the page taught the client nothing, so
-	// the cursor of the client does not move.
+	// It is the sequence number of the last record the server consumed.
+	// Without a level filter that is the last record the page carried, so
+	// a client never skips a record it did not receive. With a level
+	// filter the server also consumes the records it filtered out, so the
+	// cursor can name a record the page did not carry and the client does
+	// not have to ask for those records again. A page that consumed no
+	// record keeps the cursor of the client: the page taught the client
+	// nothing, so the cursor does not move.
 	Cursor uint64 `json:"cursor"`
 	// Truncated reports that the caller cannot be served a complete answer
 	// for the requested cursor and has to start over.
@@ -145,8 +156,10 @@ type RuntimeLogResync struct {
 	// the number is unknown, which is the case for a window that had
 	// already fallen out of the bounded ring.
 	Dropped uint64 `json:"dropped"`
-	// Cursor is the sequence number of the last record the client
-	// received.
+	// Cursor is the cursor the client re-syncs from: the sequence number
+	// of the last record the stream consumed. Without a level filter that
+	// is the last record the client received, and with one it can name a
+	// record the stream filtered out.
 	Cursor uint64 `json:"cursor"`
 }
 
@@ -183,6 +196,7 @@ func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 		URL:        s.BrowserURL(),
 		Address:    address,
 		ActiveJobs: RuntimeJobCounts{Running: running, Queued: queued},
+		RunID:      s.RunID(),
 		LogCursor:  cursor,
 		LogFile:    logFile,
 	})
@@ -261,10 +275,13 @@ func (s *Server) handleRuntimeOpenLogs(w http.ResponseWriter, r *http.Request) {
 // and a client can never ask for an unbounded amount of data.
 //
 // The cursor of the response is the sequence number of the last record the
-// page carried, so a client never skips a record it did not receive. An
-// empty page keeps the cursor of the client, and a cursor that belongs to
-// an earlier run of the server is reported by the truncated flag, so the
-// client starts over.
+// server consumed. Without a level filter that is the last record the page
+// carried, so a client never skips a record it did not receive. With a
+// level filter the server also consumes the records it filtered out, so the
+// cursor can name a record the page did not carry and the client does not
+// have to ask for those records again. A page that consumed no record keeps
+// the cursor of the client, and a cursor that belongs to an earlier run of
+// the server is reported by the truncated flag, so the client starts over.
 func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	query, err := parseRuntimeLogQuery(r)
 	if err != nil {
@@ -283,9 +300,10 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	records, truncated := pipeline.Records(query.after, logging.OldestFirst)
 
 	page := make([]RuntimeLogRecord, 0, len(records))
-	// The cursor of the response follows the records the page consumed. An
-	// empty page leaves the cursor of the client where it is: the page
-	// taught the client nothing, so the cursor does not move.
+	// The cursor of the response follows the records the server consumed.
+	// A page that consumed no record leaves the cursor of the client where
+	// it is: the page taught the client nothing, so the cursor does not
+	// move.
 	cursor := query.after
 	for _, record := range records {
 		// The cursor follows the records the server consumed, so a page
@@ -421,10 +439,12 @@ func (st *runtimeLogStream) close() {
 // A nil pipeline means that no pipeline is installed, so there is nothing
 // to replay.
 //
-// The position of the stream only follows the records the replay consumed,
-// so it never names a record the client did not receive. A replay that
-// delivered no record keeps the cursor of the client, and the gap event
-// carries it, so the client starts over from the place it knows.
+// The position of the stream moves over the records the replay consumed, so
+// the cursor it reports follows the same rule as the page: without a level
+// filter it never names a record the client did not receive, and with one
+// it can name a record the stream filtered out. A replay that consumed no
+// record keeps the cursor of the client, and the gap event carries it, so
+// the client starts over from the place it knows.
 func (st *runtimeLogStream) replay(pipeline *logging.Pipeline) error {
 	if pipeline == nil {
 		return nil

@@ -208,8 +208,8 @@ func TestRuntimeOriginGuard(t *testing.T) {
 }
 
 // TestRuntimeStatusResponse proves that the status endpoint reports the
-// version, the status, the browser-safe URL, the effective bound address, the
-// active job counts and the log cursor.
+// version, the status, the browser-safe URL, the effective bound address,
+// the active job counts, the run of the server and the log cursor.
 func TestRuntimeStatusResponse(t *testing.T) {
 	pipeline, logger := newRuntimeTestPipeline(t, 16)
 	logger.Info("hello")
@@ -234,7 +234,7 @@ func TestRuntimeStatusResponse(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode status payload %q: %v", recorder.Body.String(), err)
 	}
-	for _, key := range []string{"version", "status", "url", "address", "activeJobs", "logCursor"} {
+	for _, key := range []string{"version", "status", "url", "address", "activeJobs", "runId", "logCursor"} {
 		if _, ok := payload[key]; !ok {
 			t.Errorf("status payload %v does not carry %q", payload, key)
 		}
@@ -259,9 +259,58 @@ func TestRuntimeStatusResponse(t *testing.T) {
 	if status.ActiveJobs.Running != 1 || status.ActiveJobs.Queued != 1 {
 		t.Errorf("active jobs = %+v, want 1 running and 1 queued", status.ActiveJobs)
 	}
+	if status.RunID == "" {
+		t.Error("run id is empty, want the run of the server")
+	}
 	if status.LogCursor != pipeline.Cursor() {
 		t.Errorf("log cursor = %d, want %d", status.LogCursor, pipeline.Cursor())
 	}
+}
+
+// TestRuntimeStatusRunID proves that the run id of the status identifies
+// the run of the server: it stays the same for the whole life of the
+// server, and another server reports another one.
+//
+// The client of the runtime view compares the run id to tell a restart of
+// the server from a continued run. The head of the log cannot answer that
+// question, because it is a snapshot that is taken before the request
+// itself is written to the log.
+func TestRuntimeStatusRunID(t *testing.T) {
+	pipeline, _ := newRuntimeTestPipeline(t, 16)
+	first := newRuntimeTestServer(pipeline)
+	second := newRuntimeTestServer(pipeline)
+
+	runID := runtimeStatusRunID(t, first)
+	if runID == "" {
+		t.Fatal("run id is empty, want the run of the server")
+	}
+
+	// The run of a server does not change while it runs.
+	if again := runtimeStatusRunID(t, first); again != runID {
+		t.Errorf("run id = %q, want %q: the run of a server does not change", again, runID)
+	}
+
+	// Another server is another run.
+	if other := runtimeStatusRunID(t, second); other == runID {
+		t.Errorf("run id = %q, want another run than %q", other, runID)
+	}
+}
+
+// runtimeStatusRunID reads the run id of the status of a server.
+func runtimeStatusRunID(t *testing.T, s *Server) string {
+	t.Helper()
+
+	recorder := httptest.NewRecorder()
+	s.handler().ServeHTTP(recorder, runtimeRequest(http.MethodGet, "/api/runtime", "127.0.0.1:5555"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var status RuntimeStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status response: %v", err)
+	}
+	return status.RunID
 }
 
 // TestRuntimeLogsCursor proves that a log page carries only the records

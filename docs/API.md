@@ -68,6 +68,7 @@ loopback origin as the API, so it keeps working.
   "url": "http://127.0.0.1:8080",
   "address": "127.0.0.1:8080",
   "activeJobs": { "running": 1, "queued": 2 },
+  "runId": "3f8a1c06b27d4e59a0c1d8b47e2f6095",
   "logCursor": 42,
   "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log"
 }
@@ -79,6 +80,19 @@ and `logCursor` is the sequence number of the most recent log record, the
 cursor a client sends to read the records emitted after it. `logFile` is the
 path of the rotating log file; it is an empty string when the application does
 not write a log file.
+
+`runId` identifies the run of the server: it is generated once per server
+and it never changes afterwards, so it is stable for the whole life of the
+process and different in another process. A client compares it to tell a
+restart of the server from a continued run, because the sequence numbers of
+the log belong to the run of the process that emits them and start over with
+every run. The head of the log cannot answer that question: the status is a
+snapshot that was taken before the request itself was written to the log, so
+the head it reports is behind the records the client already has. The value
+is random: it carries no information about the machine, the user or the
+files of the host, and it is not a secret. A server that does not report a
+run id (an older build) leaves the run of the client unknown, which is never
+read as a restart.
 
 `GET /api/runtime/logs` returns a bounded page of the retained records:
 
@@ -109,9 +123,13 @@ not write a log file.
   invalid value is rejected with `400`.
 
 `cursor` is the cursor to send for the next page. It is the sequence number
-of the last record the page carried, so a client never skips a record it did
-not receive. An empty page keeps the cursor of the client: the page taught
-the client nothing, so the cursor does not move.
+of the last record the server consumed. Without a `level` filter that is the
+last record the page carried, so a client never skips a record it did not
+receive. With a `level` filter the server also consumes the records it
+filtered out, so the cursor can name a record the page did not carry and the
+client does not have to ask for those records again. A page that consumed no
+record keeps the cursor of the client: the page taught the client nothing, so
+the cursor does not move.
 
 `truncated` reports that
 the caller cannot be served a complete answer for the requested cursor and
@@ -140,9 +158,11 @@ events:
   records, or the cursor was ahead of every record the server holds:
   `{"dropped": 0, "cursor": 42}`. The client re-syncs the same way.
 
-The stream only moves its position over the records it delivered, so the
-cursor it reports never names a record the client did not receive. A replay
-that delivered no record keeps the cursor of the client.
+The stream moves its position over the records it consumed, so the cursor it
+reports follows the same rule as the page: without a `level` filter it never
+names a record the client did not receive, and with one it can name a record
+the stream filtered out. A replay that consumed no record keeps the cursor of
+the client.
 
 The stream ends when the client goes away, and a keep-alive comment is sent
 while it is idle. Log traffic does not use the job WebSocket of `/api/ws`.

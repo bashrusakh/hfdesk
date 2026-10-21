@@ -66,6 +66,8 @@ func runtimeUIFixtureForTest() runtimeUIFixture {
 // runRuntimeUIHarness runs the runtime view harness with the given
 // scenario group.
 //
+// An empty group runs every group in one process.
+//
 // The harness needs Node: without it the test is skipped, because the
 // view is browser code and only the browser can run it.
 func runRuntimeUIHarness(t *testing.T, group string) {
@@ -99,6 +101,9 @@ func runRuntimeUIHarness(t *testing.T, group string) {
 // emits them and start over with every run, so a view that keeps its cursor
 // across a restart of the server waits for records that will never arrive.
 // The view has to notice the restart, start over and tell the user about it.
+// The run id of the server is what tells it: the head of the log cannot,
+// because it is a snapshot that is behind the records the client already
+// has.
 //
 // Node's built-in VM drives the shipped runtime.js with DOM and fetch
 // stubs, so the harness exercises the view itself and not a copy of its
@@ -120,4 +125,69 @@ func TestRuntimeUIRestartResync(t *testing.T) {
 // in the view itself and not in a copy of its rules.
 func TestRuntimeUIFlushesEveryRecord(t *testing.T) {
 	runRuntimeUIHarness(t, "flush")
+}
+
+// TestRuntimeUIHiddenPage proves that the Runtime / Logs view still draws
+// the records that arrive after the page was hidden and shown again.
+//
+// A page that is hidden cancels its timers, and a browser that keeps the
+// page in its back/forward cache shows it again later. The handles of the
+// cancelled timers have to be released with them: a handle that outlives
+// its timer makes the view skip its next batch, so the records that arrive
+// after the page was shown again are never drawn.
+//
+// The harness drives the shipped runtime.js, so the regression is caught in
+// the view itself and not in a copy of its rules.
+func TestRuntimeUIHiddenPage(t *testing.T) {
+	runRuntimeUIHarness(t, "hidden")
+}
+
+// TestRuntimeUIHiddenPageResumesTheLiveFeed proves that the Runtime / Logs
+// view resumes its live feed after the browser showed the page again.
+//
+// A browser that keeps the page in its back/forward cache shows it again
+// when the user comes back. The view closed its live source when the page
+// was hidden, so it has to start it again: the event stream when the view
+// followed the stream, the fallback poll when the view fell back to
+// polling. The status has to be refreshed as well, because the page was
+// hidden for an unknown time.
+//
+// The harness drives the shipped runtime.js, so the regression is caught in
+// the view itself and not in a copy of its rules.
+func TestRuntimeUIHiddenPageResumesTheLiveFeed(t *testing.T) {
+	runRuntimeUIHarness(t, "restore")
+}
+
+// TestRuntimeUIRunID proves that the Runtime / Logs view tells a restart of
+// the server from a continued run by the run id of the server.
+//
+// The head of the log cannot answer that question. The status is a snapshot
+// that was taken before the request itself was written to the log, so the
+// head it reports is behind the records the client already has, and
+// comparing the two reports a restart on every refresh. The run id of the
+// server answers it: it is stable for the whole life of the process and
+// different in another process. A server that does not report a run id
+// leaves the run of the client unknown, which is never read as a restart.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIRunID(t *testing.T) {
+	runRuntimeUIHarness(t, "run")
+}
+
+// TestRuntimeUIAllScenarioGroups proves that the Runtime / Logs view works
+// when every scenario of the harness runs in one process.
+//
+// The other tests run one group per process, so a state that a group leaves
+// behind cannot break the group that runs after it. The harness resets the
+// view between the scenarios, so running all of them in one process proves
+// that the reset really restores the view: a reset that keeps the handle of
+// a dropped timer makes the view skip the next batch, and the records that
+// wait in the buffer are never rendered.
+//
+// Node's built-in VM drives the shipped runtime.js, so the harness
+// exercises the view itself and not a copy of its rules.
+func TestRuntimeUIAllScenarioGroups(t *testing.T) {
+	runRuntimeUIHarness(t, "")
 }

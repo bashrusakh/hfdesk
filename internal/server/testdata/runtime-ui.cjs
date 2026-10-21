@@ -1,4 +1,5 @@
-// Run through TestRuntimeUIRestartResync: the real runtime.js view.
+// Run through the runtime UI tests of internal/server: the real runtime.js
+// view.
 //
 // The harness loads the shipped runtime.js inside Node's VM with DOM and
 // fetch stubs. It drives the actual owners of the view (the status refresh,
@@ -166,7 +167,12 @@ const server = {
   head: 0,
   records: [],
   truncated: false,
-  statusFails: false
+  statusFails: false,
+  version: 'test',
+  // runId is the run of the server. The status reports it, the way the
+  // server does. A null value means that the server does not report a run
+  // id at all, the way an older build answers.
+  runId: 'run-1'
 };
 
 const calls = [];
@@ -179,9 +185,63 @@ function jsonResponse(body) {
   };
 }
 
+// =========================================
+// Event stream
+// =========================================
+
+// The streams the view opened.
+//
+// The harness counts them, so a view that opens a second stream is caught.
+const streams = [];
+
+// FakeEventSource is the event stream of the browser.
+//
+// The view opens it with the cursor it holds and closes it when it does
+// not need it anymore. The harness opens the stream and hands the records
+// to the view the way the server sends them.
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.onopen = null;
+    this.onerror = null;
+    this.closed = false;
+    this.listeners = new Map();
+    streams.push(this);
+  }
+
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+
+  close() { this.closed = true; }
+
+  // open reports that the stream is established.
+  open() { if (this.onopen) this.onopen({}); }
+
+  // fail reports an error on the stream.
+  fail() { if (this.onerror) this.onerror({}); }
+
+  // deliver hands a record to the view, the way the server sends it.
+  deliver(record) {
+    for (const fn of this.listeners.get('log') || []) {
+      fn({ data: JSON.stringify(record) });
+    }
+  }
+}
+
+// openStreams returns the streams that are still open.
+function openStreams() {
+  return streams.filter(stream => !stream.closed);
+}
+
+// The window records its event handlers, so the harness can hide and show
+// the view the way a browser does it.
 const window = {
   location: { protocol: 'http:', host: 'hfdesk.test', search: '', hash: '', pathname: '/runtime.html' },
-  addEventListener() {}
+  handlers: {},
+  EventSource: FakeEventSource,
+  addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); }
 };
 
 const context = {
@@ -190,6 +250,7 @@ const context = {
   console,
   URL,
   URLSearchParams,
+  EventSource: FakeEventSource,
   setTimeout: fakeSetTimeout,
   clearTimeout: fakeClearTimeout,
   setInterval: fakeSetInterval,
@@ -207,15 +268,21 @@ const context = {
       if (server.statusFails) {
         throw new Error('the server is not reachable');
       }
-      return jsonResponse({
-        version: 'test',
+      const status = {
+        version: server.version,
         status: 'ok',
         url: 'http://127.0.0.1:8080',
         address: '127.0.0.1:8080',
         activeJobs: { running: 0, queued: 0 },
         logCursor: server.head,
         logFile: ''
-      });
+      };
+      // A server that does not report a run id leaves the field out, the
+      // way an older build answers.
+      if (server.runId !== null && server.runId !== undefined) {
+        status.runId = server.runId;
+      }
+      return jsonResponse(status);
     }
     if (rawPath.startsWith('/api/runtime/logs?')) {
       // The server answers with the cursor of the last record it
@@ -245,8 +312,8 @@ if (!source.includes(marker)) {
   process.exit(1);
 }
 
-// The hook only names the owners the view already had, so the harness also
-// runs against a view that does not know about a restart of the server.
+// The hook names the owners the harness drives, so the harness runs against
+// the shipped view and not a copy of its rules.
 const hook = `
   window.test = {
     state,
@@ -255,12 +322,21 @@ const hook = `
     resync,
     resyncAfterGap,
     readLogs,
-    ingest
+    ingest,
+    connectStream,
+    startPolling,
+    wireEvents
   };
 `;
 source = source.replace(marker, hook + '\n' + marker);
 vm.runInNewContext(source, context);
 const ui = window.test;
+
+// The view registers the handlers of its events when it starts, and the
+// harness does not start the view: it drives the owners of the view one by
+// one. The handler of the pagehide event is registered here, so the
+// scenario of the hidden page can hide the view.
+ui.wireEvents();
 
 // =========================================
 // Helpers
@@ -270,20 +346,75 @@ async function settle() {
   for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
 }
 
+// isFeedTimer tells whether a timer belongs to the live feed of the view.
+//
+// The poll schedules itself, so running it would never stop, and the
+// reconnect replaces the poll with the event stream. A scenario that
+// settles the view leaves both of them alone.
+function isFeedTimer(timer) {
+  return timer.id === ui.state.pollTimer || timer.id === ui.state.reconnectTimer;
+}
+
 // runPendingTimers runs the pending timers of the view, oldest first.
 //
 // The view batches its DOM updates with a timer, so a scenario that wants
 // to see the settled view runs the timers instead of waiting for the wall
 // clock. The timers run one after the other, because a flush that leaves
 // records in the buffer schedules the next batch.
+//
+// The timers of the live feed are left in the queue, see isFeedTimer.
 async function runPendingTimers(budget = 100) {
   for (let i = 0; i < budget; i++) {
-    const timer = timers.shift();
-    if (!timer) return;
+    const index = timers.findIndex(timer => !isFeedTimer(timer));
+    if (index < 0) return;
+    const [timer] = timers.splice(index, 1);
     timer.fn();
     await settle();
   }
   throw new Error(`the view scheduled more than ${budget} timers`);
+}
+
+// runPoll runs the pending poll of the fallback once.
+//
+// The poll schedules the next poll, so it runs once and not again.
+async function runPoll() {
+  const id = ui.state.pollTimer;
+  const index = timers.findIndex(timer => timer.id === id);
+  if (index < 0) return false;
+
+  const [timer] = timers.splice(index, 1);
+  timer.fn();
+  await settle();
+  return true;
+}
+
+// runPendingTimersOnce runs every pending timer exactly once and returns
+// the number of log reads the timers made.
+//
+// The timers that a timer schedules while it runs stay in the queue, so a
+// poll loop does not run again and again.
+async function runPendingTimersOnce() {
+  const pending = timers.splice(0, timers.length);
+  let reads = 0;
+
+  for (const timer of pending) {
+    const before = countLogReads();
+    timer.fn();
+    await settle();
+    reads += countLogReads() - before;
+  }
+
+  return reads;
+}
+
+// countLogReads returns the number of log reads the view did.
+function countLogReads() {
+  return calls.filter(path => path.startsWith('/api/runtime/logs?')).length;
+}
+
+// countStatusReads returns the number of status reads the view did.
+function countStatusReads() {
+  return calls.filter(path => path === '/api/runtime').length;
 }
 
 // logRows returns the rows of the log view.
@@ -317,10 +448,20 @@ function announcement() {
   return nodes.get('#liveRegion').textContent;
 }
 
+// dispatchWindow fires an event of the window at the view.
+//
+// The browser hides a page before it puts it into its back/forward cache
+// and shows it again when the user comes back, so the harness does the same
+// to drive the view through that round trip.
+function dispatchWindow(type, event = {}) {
+  for (const handler of window.handlers[type] || []) handler(event);
+}
+
 function resetView() {
   ui.state.status = null;
   ui.state.cursor = 0;
   ui.state.cursorValid = false;
+  ui.state.runId = '';
   ui.state.records = [];
   ui.state.renderedSeq = 0;
   ui.state.level = 'all';
@@ -333,6 +474,36 @@ function resetView() {
   ui.state.logError = '';
   ui.state.statusError = '';
   ui.state.loggedErrors = new Set();
+
+  // The live source of the previous scenario is closed, so the scenarios do
+  // not share a stream.
+  streams.forEach(stream => stream.close());
+  streams.length = 0;
+  ui.state.source = null;
+  ui.state.streamState = 'connecting';
+  ui.state.hidden = false;
+  ui.state.resumeSource = 'stream';
+  ui.state.resumeReconnect = false;
+
+  // The view keeps the handle of its pending timer and skips the next batch
+  // while the handle is set, so the handles are cleared together with the
+  // timers the reset drops. A handle that outlives its timer would make the
+  // view skip the batch, and the records that wait in the buffer would never
+  // be rendered.
+  ui.state.flushTimer = null;
+  ui.state.renderTimer = null;
+  ui.state.pollTimer = null;
+  ui.state.reconnectTimer = null;
+  ui.state.statusTimer = null;
+
+  // The server of the previous scenario is reset, so the scenarios do not
+  // share its records.
+  server.head = 0;
+  server.records = [];
+  server.truncated = false;
+  server.statusFails = false;
+  server.version = 'test';
+  server.runId = 'run-1';
 
   nodes.get('#toastContainer').replaceChildren();
   nodes.get('#liveRegion').textContent = '';
@@ -357,20 +528,54 @@ function seedClient(cursor) {
   }]);
 }
 
+// runtimeUIRecord builds a log record for the scenarios.
+//
+// The record has the shape the server delivers, so the view takes it
+// through the same path as a record of a running page.
+function runtimeUIRecord(seq, message) {
+  return {
+    seq,
+    time: '2026-10-21T10:00:00Z',
+    level: 'INFO',
+    component: 'server',
+    message,
+    attrs: {}
+  };
+}
+
 // =========================================
 // Scenarios
 // =========================================
 
-// A server that restarted emits fewer records than the client has seen: its
-// head is lower than the cursor of the client. The view has to notice the
+// A server that restarted reports another run. The view has to notice the
 // restart, start over and tell the user about it.
+//
+// The run of the server is what tells a restart from a continued run: the
+// sequence numbers of the log belong to the run of the process that emits
+// them and start over with every run, so a view that keeps its cursor
+// across a restart of the server waits for records that will never arrive.
 async function scenarioRestart() {
   resetView();
   seedClient(fixture.clientCursor);
 
+  // The view learns the run of the server. A run the view did not know yet
+  // is not a restart.
+  server.runId = 'run-before';
+  server.head = fixture.continuedHead;
+  server.records = [];
+  server.truncated = false;
+
+  await ui.refreshStatus();
+  await settle();
+
+  eq(ui.state.runId, 'run-before', 'the view knows the run of the server');
+  eq(toastMessages().length, 0,
+    'the view does not report a restart for the run it learns');
+
+  // The server restarted: it reports another run.
+  server.runId = 'run-after';
   server.head = fixture.restartHead;
   server.records = fixture.records;
-  server.truncated = false;
 
   await ui.refreshStatus();
   await settle();
@@ -390,8 +595,8 @@ async function scenarioRestart() {
   eq(ui.state.follow, true, 'the follow mode survives the re-sync');
   eq(ui.state.level, 'all', 'the level filter survives the re-sync');
 
-  // A restart is reported once: the cursor of the view is the head of the
-  // server now, so the next status refresh does not re-sync again.
+  // A restart is reported once: the view knows the run of the server now,
+  // so the next status refresh does not re-sync again.
   await ui.refreshStatus();
   await settle();
 
@@ -484,12 +689,23 @@ async function scenarioUnreachableStatus() {
 
 // A cursor of an earlier run of the server is ahead of every record the
 // server holds. The server reports the loss, and the view has to name the
-// restart: the cursor of the client cannot be used for that, because a
-// page without records keeps the cursor of the client.
+// restart: the run of the server is another one.
 async function scenarioEarlierRun() {
   resetView();
   seedClient(fixture.clientCursor);
 
+  // The view knows the run of the server.
+  server.runId = 'run-before';
+  server.head = fixture.continuedHead;
+  server.records = [];
+  server.truncated = false;
+
+  await ui.refreshStatus();
+  await settle();
+
+  // The server restarted: the cursor of the client belongs to the earlier
+  // run, so the server cannot serve it.
+  server.runId = 'run-after';
   server.head = fixture.restartHead;
   server.records = [];
   server.truncated = true;
@@ -499,6 +715,77 @@ async function scenarioEarlierRun() {
 
   ok(toastMessages().some(message => /restart/i.test(message)),
     `the view tells the user that the server restarted (${JSON.stringify(toastMessages())})`);
+}
+
+// The head of the server is behind the cursor of the view, and the run of
+// the server did not change: the server kept running.
+//
+// The head of the status is a snapshot that was taken before the request
+// itself was written to the log, so it is always behind the records the
+// client already received. The view must not mistake that for a restart of
+// the server: a restart that is reported on every refresh is worse than
+// the restart it was meant to catch.
+async function scenarioRunUnchanged() {
+  resetView();
+
+  // The view knows the run of the server.
+  server.runId = 'run-1';
+  server.head = 6;
+  server.records = [];
+
+  await ui.refreshStatus();
+  await settle();
+
+  eq(ui.state.runId, 'run-1', 'the view knows the run of the server');
+
+  // The live feed delivers the newest record before the next status reads
+  // the head of the log.
+  ui.ingest([runtimeUIRecord(7, 'the newest record')]);
+  eq(ui.state.cursor, 7, 'the view received the newest record of the server');
+
+  // The status is a snapshot from before that record, so its head is
+  // behind the cursor of the view.
+  server.head = 6;
+
+  await ui.refreshStatus();
+  await settle();
+
+  eq(ui.state.cursor, 7,
+    'the view keeps its cursor when the head of the server is behind it');
+  eq(ui.state.records.length, 1,
+    'the view keeps its records when the head of the server is behind it');
+  eq(toastMessages().length, 0,
+    'the view does not report a restart when the run of the server did not change');
+  eq(countLogReads(), 0,
+    'the view does not re-sync when the run of the server did not change');
+}
+
+// The server does not report a run id: the run of the server is unknown,
+// so the view cannot tell a restart from a continued run and must not
+// report one.
+async function scenarioRunMissing() {
+  resetView();
+
+  // The view received the newest record of the server.
+  ui.ingest([runtimeUIRecord(7, 'the newest record')]);
+  eq(ui.state.cursor, 7, 'the view received the newest record of the server');
+
+  // The server does not report a run id, and the head of its status is
+  // behind the cursor of the view.
+  server.runId = null;
+  server.head = 6;
+  server.records = [];
+
+  await ui.refreshStatus();
+  await settle();
+
+  eq(ui.state.runId, '', 'the run of the server stays unknown');
+  eq(ui.state.cursor, 7,
+    'the view keeps its cursor when the run of the server is unknown');
+  eq(ui.state.records.length, 1,
+    'the view keeps its records when the run of the server is unknown');
+  eq(toastMessages().length, 0,
+    'the view does not report a restart when the run of the server is unknown');
 }
 
 // A burst of records that is larger than one batch leaves records in the
@@ -540,11 +827,207 @@ async function scenarioLargeBatch() {
   }
 }
 
+// A page that is hidden and shown again has to draw the records that arrive
+// after it.
+//
+// The view cancels its timers when the page is hidden, and a browser that
+// keeps the page in its back/forward cache shows it again later. The
+// handles of the cancelled timers have to be released with them: a handle
+// that outlives its timer makes the view skip its next batch, so the
+// records that arrive after the page was shown again are never drawn.
+//
+// The record is delivered the way the stream delivers it, so the view takes
+// it through the same path as a record of a running page.
+async function scenarioHiddenPage() {
+  resetView();
+
+  // The head of the server is ahead of the records of the client, so the
+  // status refresh does not mistake the round trip for a restart.
+  server.head = 2;
+
+  // The view has a pending batch when the page is hidden.
+  ui.ingest([runtimeUIRecord(1, 'record before the page was hidden')]);
+  ok(ui.state.flushTimer, 'the view has a pending batch before the page is hidden');
+  eq(logRows().length, 0, 'the record waits for its batch');
+
+  // The page is hidden: the stream is closed, the poll stops and the
+  // pending timers are cancelled.
+  dispatchWindow('pagehide', { persisted: true });
+  eq(ui.state.source, null, 'the stream is closed while the page is hidden');
+  eq(ui.state.pollTimer, null, 'the poll stops while the page is hidden');
+  eq(timers.length, 0, 'the pending timers are cancelled while the page is hidden');
+
+  // Every timer the view cancelled is released with it, so the view can
+  // schedule its next batch.
+  eq(ui.state.flushTimer, null, 'the handle of the cancelled batch is released');
+  eq(ui.state.reconnectTimer, null, 'the handle of the cancelled reconnect is released');
+  eq(ui.state.renderTimer, null, 'the handle of the cancelled re-render is released');
+  eq(ui.state.statusTimer, null, 'the handle of the cancelled status refresh is released');
+
+  // The browser shows the page again. The view resumes what it was doing,
+  // so the status refresh runs again.
+  dispatchWindow('pageshow', { persisted: true });
+  await settle();
+  ok(ui.state.statusTimer, 'the status refresh runs again after the page was shown again');
+
+  // A record arrives after the page was shown again.
+  ui.ingest([runtimeUIRecord(2, 'record after the page was shown again')]);
+  await runPendingTimers();
+
+  const rows = logRows();
+  ok(rows.some(row => Number(row.dataset.seq) === 2),
+    'the record that arrived after the page was shown again is drawn');
+  eq(rows.length, 2, 'the record that waited in the buffer is drawn as well');
+}
+
+// A page that is hidden and shown again has to follow the event stream
+// again.
+//
+// The browser puts a page into its back/forward cache and shows it again
+// when the user comes back. The view closed its live source and cancelled
+// its timers when the page was hidden, so it has to start the event stream
+// again: exactly one stream, and the records that arrive after the restore
+// have to be drawn.
+//
+// The record is delivered the way the stream delivers it, so the view takes
+// it through the same path as a record of a running page.
+async function scenarioHiddenPageStream() {
+  resetView();
+
+  // The browser shows a page that was not hidden, for example after the
+  // first load. The view is already running then, so it does not resume.
+  dispatchWindow('pageshow', { persisted: false });
+  eq(streams.length, 0, 'the view does not resume a page that was not hidden');
+
+  // The view follows the event stream.
+  ui.connectStream();
+  const stream = streams[streams.length - 1];
+  stream.open();
+  eq(ui.state.streamState, 'live', 'the view follows the event stream');
+  eq(openStreams().length, 1, 'the view holds one stream');
+
+  // A record arrives while the page is visible.
+  stream.deliver(runtimeUIRecord(1, 'record before the page was hidden'));
+  server.head = 1;
+  await runPendingTimers();
+  eq(logRows().length, 1, 'the record of the stream is drawn');
+
+  // The page is hidden: the stream is closed and the pending timers are
+  // cancelled.
+  dispatchWindow('pagehide', { persisted: true });
+  eq(ui.state.source, null, 'the stream is closed while the page is hidden');
+  eq(openStreams().length, 0, 'no stream is open while the page is hidden');
+  eq(ui.state.pollTimer, null, 'the poll stops while the page is hidden');
+  eq(timers.length, 0, 'the pending timers are cancelled while the page is hidden');
+
+  // The browser shows the page again.
+  const statusReads = countStatusReads();
+  server.version = 'restored';
+  dispatchWindow('pageshow', { persisted: true });
+  await settle();
+
+  // The stream is open again, and it is the only live source of the view.
+  eq(openStreams().length, 1, 'the stream is open again after the page was shown again');
+  eq(streams.length, 2, 'the view opens the stream again instead of a second one');
+  eq(ui.state.pollTimer, null, 'the view does not poll while the stream is open');
+
+  // The status is refreshed and the refresh runs again.
+  ok(countStatusReads() > statusReads, 'the status is refreshed after the page was shown again');
+  eq(nodes.get('#versionLabel').textContent, 'Version restored',
+    'the status of the view is the status of the server after the restore');
+  ok(ui.state.statusTimer, 'the status refresh runs again after the page was shown again');
+
+  // A record arrives after the page was shown again.
+  const restored = streams[streams.length - 1];
+  restored.open();
+  restored.deliver(runtimeUIRecord(2, 'record after the page was shown again'));
+  server.head = 2;
+  await runPendingTimers();
+
+  const rows = logRows();
+  ok(rows.some(row => Number(row.dataset.seq) === 2),
+    'the record that arrived after the page was shown again is drawn');
+  eq(rows.length, 2, 'no record is drawn twice');
+}
+
+// A page that is hidden while the view falls back to polling has to poll
+// again when the browser shows it.
+//
+// The view decides from its own state which live source it resumes: the
+// event stream when it followed the stream, the fallback poll when it fell
+// back to polling. The poll is the source that has to come back here, and
+// the view must not open a stream and a poll at the same time.
+async function scenarioHiddenPagePoll() {
+  resetView();
+
+  // The view follows the event stream first.
+  ui.connectStream();
+  const stream = streams[streams.length - 1];
+  stream.open();
+  eq(ui.state.streamState, 'live', 'the view follows the event stream');
+
+  // The stream fails, so the view falls back to polling.
+  stream.fail();
+  await settle();
+  eq(ui.state.source, null, 'the stream is closed when it fails');
+  eq(ui.state.streamState, 'polling', 'the view falls back to polling');
+  ok(ui.state.pollTimer, 'the poll of the fallback runs');
+  ok(ui.state.reconnectTimer, 'the view tries the event stream again');
+
+  // A record arrives while the page is visible.
+  server.records = [runtimeUIRecord(1, 'record before the page was hidden')];
+  server.head = 1;
+  await runPoll();
+  await runPendingTimers();
+  eq(logRows().length, 1, 'the record of the poll is drawn');
+
+  // The page is hidden: the poll stops and the pending timers are
+  // cancelled.
+  dispatchWindow('pagehide', { persisted: true });
+  eq(ui.state.pollTimer, null, 'the poll stops while the page is hidden');
+  eq(ui.state.reconnectTimer, null, 'the reconnect stops while the page is hidden');
+  eq(openStreams().length, 0, 'no stream is open while the page is hidden');
+  eq(timers.length, 0, 'the pending timers are cancelled while the page is hidden');
+
+  // The browser shows the page again.
+  const statusReads = countStatusReads();
+  server.version = 'restored';
+  dispatchWindow('pageshow', { persisted: true });
+  await settle();
+
+  // The poll comes back and the view does not open a stream.
+  ok(ui.state.pollTimer, 'the poll runs again after the page was shown again');
+  ok(ui.state.reconnectTimer, 'the view tries the event stream again after the page was shown again');
+  eq(openStreams().length, 0, 'the view opens no stream while it polls');
+  ok(countStatusReads() > statusReads, 'the status is refreshed after the page was shown again');
+  eq(nodes.get('#versionLabel').textContent, 'Version restored',
+    'the status of the view is the status of the server after the restore');
+
+  // A record that arrives after the page was shown again is drawn.
+  server.records = [
+    runtimeUIRecord(1, 'record before the page was hidden'),
+    runtimeUIRecord(2, 'record after the page was shown again')
+  ];
+  server.head = 2;
+  await runPoll();
+  await runPendingTimers();
+
+  const rows = logRows();
+  ok(rows.some(row => Number(row.dataset.seq) === 2),
+    'the record that arrived after the page was shown again is drawn');
+  eq(rows.length, 2, 'no record is drawn twice');
+
+  // Exactly one poll loop is running: one tick reads the log once.
+  const reads = await runPendingTimersOnce();
+  eq(reads, 1, 'the view reads the log once per tick after the page was shown again');
+}
+
 // The groups of the scenarios of the harness.
 //
 // The group is picked with the HFDESK_RUNTIME_SCENARIO environment
 // variable, so every Go test runs the group it is about. An empty value
-// runs every group.
+// runs every group in one process, so the reset between the groups is
+// exercised as well.
 const scenarioGroups = {
   restart: [
     scenarioRestart,
@@ -553,8 +1036,19 @@ const scenarioGroups = {
     scenarioUnreachableStatus,
     scenarioEarlierRun
   ],
+  run: [
+    scenarioRunUnchanged,
+    scenarioRunMissing
+  ],
   flush: [
     scenarioLargeBatch
+  ],
+  hidden: [
+    scenarioHiddenPage
+  ],
+  restore: [
+    scenarioHiddenPageStream,
+    scenarioHiddenPagePoll
   ]
 };
 
