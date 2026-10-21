@@ -38,7 +38,17 @@ func fullInstallOptions(t *testing.T) InstallOptions {
 
 func TestRunArgsMatchesCanonicalArgv(t *testing.T) {
 	got := RunArgs(fullInstallOptions(t))
-	want := []string{
+	want := canonicalRunArgs()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("RunArgs() =\n%v\nwant\n%v", got, want)
+	}
+}
+
+// canonicalRunArgs is the exact argument vector of the installation of
+// fullInstallOptions: the paths of the instance and its bind address, and
+// nothing else.
+func canonicalRunArgs() []string {
+	return []string{
 		"service",
 		"run",
 		"--config", "/opt/hfdesk/etc/hfdesk.json",
@@ -48,9 +58,6 @@ func TestRunArgsMatchesCanonicalArgv(t *testing.T) {
 		"--cache-dir", "/opt/hfdesk/cache",
 		"--hub-dir", "/opt/hfdesk/cache/hub",
 		"--local-dir", "/opt/hfdesk/models",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("RunArgs() =\n%v\nwant\n%v", got, want)
 	}
 }
 
@@ -92,21 +99,55 @@ func TestRunArgsUsesDefaultListenWhenUnset(t *testing.T) {
 	}
 }
 
-func TestRunArgsCarriesNoCredential(t *testing.T) {
-	const secret = "hf_SECRETTOKEN_zzz"
+// installOptionStringFields are the string fields of InstallOptions.
+//
+// Every one of them carries the scope, a path or the bind address of an
+// instance. The type carries no credential field at all, so a registration
+// can never carry one.
+var installOptionStringFields = map[string]bool{
+	"Scope":      true,
+	"Executable": true,
+	"Listen":     true,
+	"CacheDir":   true,
+	"HubDir":     true,
+	"LocalDir":   true,
+}
 
-	opts := fullInstallOptions(t)
-	// InstallOptions has no credential field today. Every field that looks
-	// like one is filled with the sentinel, so the check keeps its meaning
-	// when such a field is added.
-	setCredentialFields(&opts, secret)
-
-	args := RunArgs(opts)
-	for _, arg := range args {
-		if strings.Contains(arg, secret) {
-			t.Errorf("RunArgs() leaks a credential: %v", args)
+// TestInstallOptionsCarryNoCredentialField checks that the options of an
+// installation carry no credential.
+//
+// The check reads the actual fields of the type instead of filling the
+// fields that look like a credential: a type without a credential field has
+// nothing to fill, so a fill would prove nothing. A credential field that
+// is added later fails this test.
+func TestInstallOptionsCarryNoCredentialField(t *testing.T) {
+	typ := reflect.TypeOf(InstallOptions{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type.Kind() != reflect.String {
+			continue
+		}
+		if !installOptionStringFields[field.Name] {
+			t.Errorf("InstallOptions.%s is a string field that is neither the scope, a path nor the bind address: the type must carry no credential field", field.Name)
 		}
 	}
+}
+
+func TestRunArgsCarriesNoCredential(t *testing.T) {
+	opts := fullInstallOptions(t)
+
+	// The argument vector holds the paths of the instance and its bind
+	// address and nothing else. The exact vector is asserted, so a value
+	// that is not part of it cannot reach a registration.
+	args := RunArgs(opts)
+	want := canonicalRunArgs()
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("RunArgs() =\n%v\nwant\n%v", args, want)
+	}
+
+	// The options carry no credential field (see
+	// TestInstallOptionsCarryNoCredentialField), so no value of the vector
+	// can be a credential in the first place.
 	for _, arg := range args {
 		if looksLikeCredential(arg) {
 			t.Errorf("RunArgs() contains the credential-looking argument %q: %v", arg, args)
@@ -447,6 +488,73 @@ func containsValue(args []string, value string) bool {
 	return false
 }
 
+// TestEffectiveCacheDir checks the cache root of an instance: the cache-dir
+// of the config file of the instance wins over the registered cache
+// directory, and the registration is the fallback.
+func TestEffectiveCacheDir(t *testing.T) {
+	root := t.TempDir()
+	etc := filepath.Join(root, "etc")
+	if err := os.MkdirAll(etc, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	withCacheDir := filepath.Join(etc, "with-cache.json")
+	if err := os.WriteFile(withCacheDir, []byte(`{"cache-dir":"/from/config/file"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withoutCacheDir := filepath.Join(etc, "without-cache.json")
+	if err := os.WriteFile(withoutCacheDir, []byte(`{"local-dir":"/from/config/file/models"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A path that cannot be read: a directory is not a config file.
+	unreadable := filepath.Join(etc, "unreadable.json")
+	if err := os.Mkdir(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name       string
+		configFile string
+		registered string
+		want       string
+	}{
+		{
+			name:       "the config file of the instance wins",
+			configFile: withCacheDir,
+			registered: "/registered/cache",
+			want:       "/from/config/file",
+		},
+		{
+			name:       "the registration is the fallback",
+			configFile: withoutCacheDir,
+			registered: "/registered/cache",
+			want:       "/registered/cache",
+		},
+		{
+			name:       "a missing config file falls back",
+			configFile: filepath.Join(etc, "missing.json"),
+			registered: "/registered/cache",
+			want:       "/registered/cache",
+		},
+		{
+			name:       "an unreadable config file falls back",
+			configFile: unreadable,
+			registered: "/registered/cache",
+			want:       "/registered/cache",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EffectiveCacheDir(tc.configFile, tc.registered)
+			if got != tc.want {
+				t.Errorf("EffectiveCacheDir(%q, %q) = %q, want %q", tc.configFile, tc.registered, got, tc.want)
+			}
+		})
+	}
+}
+
 // credentialMarkers are the fragments a credential carries.
 var credentialMarkers = []string{"hf_", "token", "password", "passwd", "secret", "credential", "bearer"}
 
@@ -463,6 +571,11 @@ func looksLikeCredential(value string) bool {
 
 // setCredentialFields fills every credential-looking string field of opts
 // with the sentinel.
+//
+// The options of an installation carry no credential field today, so the
+// fill has nothing to fill. The registrations of the platform managers use
+// the helper so their check keeps its meaning when such a field is added.
+// The service level test asserts that the type carries none.
 func setCredentialFields(opts *InstallOptions, sentinel string) {
 	value := reflect.ValueOf(opts).Elem()
 	typ := value.Type()

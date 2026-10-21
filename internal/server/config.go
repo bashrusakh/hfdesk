@@ -93,12 +93,26 @@ func ConfigPath() string {
 // LoadConfigFile loads configuration from the config file.
 // Returns empty config if file doesn't exist (not an error).
 func LoadConfigFile() (*ConfigFile, error) {
-	configMu.Lock()
-	defer configMu.Unlock()
 	return loadConfigFile(ConfigPath())
 }
 
+// loadConfigFile loads the configuration from the given path under the
+// config lock. The callers that already hold the lock read the file with
+// LoadConfigFileAt directly.
 func loadConfigFile(path string) (*ConfigFile, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return LoadConfigFileAt(path)
+}
+
+// LoadConfigFileAt loads the configuration from the given path. It returns
+// an empty configuration when the file does not exist.
+//
+// The load does not take the config lock: the file is written atomically (a
+// temporary file and a rename), so a reader sees either the previous or the
+// new file. A caller outside the package therefore reads the config file of
+// an instance without taking the lock of the writer.
+func LoadConfigFileAt(path string) (*ConfigFile, error) {
 	if path == "" {
 		return &ConfigFile{}, nil
 	}
@@ -148,7 +162,7 @@ func saveSettingsConfig(cfg *ConfigFile, tokenWrite *string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 	path := ConfigPath()
-	stored, err := loadConfigFile(path)
+	stored, err := LoadConfigFileAt(path)
 	if err != nil {
 		return err
 	}
@@ -168,9 +182,12 @@ func saveConfigFile(path string, cfg *ConfigFile) error {
 		return errors.New("cannot save a redacted token as a credential")
 	}
 
-	// Ensure config directory exists
+	// Ensure the config directory exists. It is owner-only: the config
+	// directory of an instance holds the job list, the download history,
+	// the mirror targets and the credentials of the instance, so nobody
+	// else has to be able to read it.
 	configDir := filepath.Dir(path)
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return err
 	}
 

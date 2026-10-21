@@ -49,7 +49,10 @@ func saveJobsStateLocked(path string, jobs []*Job) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// The state directory is owner-only: it holds the job list, the download
+	// history and the mirror targets of the instance, so nobody else has to
+	// be able to read it.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	return replaceJobsStateFile(path, data, defaultStateFileOps{})
@@ -245,8 +248,10 @@ func AppendHistory(job *Job) error {
 		return err
 	}
 	// The state directory comes from the effective runtime path model, so a
-	// supervised instance writes its history into its own state root.
-	if err := os.MkdirAll(runtimepaths.Current().StateDir, 0o755); err != nil {
+	// supervised instance writes its history into its own state root. The
+	// directory is owner-only: it holds the job list, the download history
+	// and the mirror targets of the instance.
+	if err := os.MkdirAll(runtimepaths.Current().StateDir, 0o700); err != nil {
 		return err
 	}
 	return os.WriteFile(HistoryPath(), data, 0o644)

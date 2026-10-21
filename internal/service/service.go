@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
@@ -99,6 +100,10 @@ type Status struct {
 	Listen string
 	// Paths are the absolute runtime paths of the instance.
 	Paths runtimepaths.Paths
+	// CacheDir is the Hugging Face cache root the instance uses: the cache
+	// directory of the instance's own config file when it defines one,
+	// otherwise the cache directory recorded in the registration.
+	CacheDir string
 	// Detail is a human-readable detail, e.g. the last error.
 	Detail string
 }
@@ -119,10 +124,6 @@ type InstallOptions struct {
 	HubDir string
 	// LocalDir is the absolute flat output dir. It may be empty.
 	LocalDir string
-	// User is the target user name of a user scope installation.
-	User string
-	// UID is the launchd gui/<uid> target of a user scope installation.
-	UID string
 }
 
 // Manager drives the platform supervisor. The common layer owns the command
@@ -416,6 +417,22 @@ func DefaultCacheDirs(scope Scope, paths runtimepaths.Paths) (string, string) {
 
 	root := absolutePath(filepath.Join(paths.StateDir, "cache"))
 	return root, filepath.Join(root, "hub")
+}
+
+// EffectiveCacheDir returns the Hugging Face cache root of an instance: the
+// cache-dir of the instance's own config file when it defines one,
+// otherwise the registered cache directory. A config file that cannot be
+// read falls back to the registered value.
+//
+// The config file of an instance wins over its registration: the user
+// changes the cache directory in the settings of the instance, and the
+// instance has to use the changed value after the next start.
+func EffectiveCacheDir(configFile, registered string) string {
+	fileCfg, err := server.LoadConfigFileAt(configFile)
+	if err != nil || fileCfg == nil || fileCfg.CacheDir == "" {
+		return registered
+	}
+	return fileCfg.CacheDir
 }
 
 // absolutePath returns the absolute form of path. A path that cannot be

@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 func TestRunInstallsRuntimeModelAndStopsOnCancel(t *testing.T) {
@@ -178,6 +180,371 @@ func TestBuildConfigUsesTheServiceOwnedPaths(t *testing.T) {
 	}
 }
 
+// serviceInstance writes the config file of a service instance with the given
+// fields and installs the runtime path model that owns it. The model is
+// restored when the test ends.
+func serviceInstance(t *testing.T, fields map[string]string) runtimepaths.Paths {
+	t.Helper()
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimepaths.Install(model)
+	t.Cleanup(runtimepaths.Reset)
+	return model
+}
+
+// TestBuildConfigPrefersTheConfigFileOfTheInstance checks the coherence
+// rule of a service instance: the config file of the instance wins over the
+// registration.
+//
+// The user changes the cache directory and the output directory in the
+// settings of the instance, so the next start of the instance has to use the
+// changed value. The registration is only the fallback.
+func TestBuildConfigPrefersTheConfigFileOfTheInstance(t *testing.T) {
+	model := serviceInstance(t, map[string]string{
+		"cache-dir": "/from/config/file",
+		"local-dir": "/from/config/file/models",
+	})
+	t.Setenv("HF_HOME", "/stale/home")
+	t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+	cfg, err := buildConfig(RunOptions{
+		Paths:    model,
+		CacheDir: "/registered/cache",
+		HubDir:   "/registered/cache/hub",
+		LocalDir: "/registered/models",
+	}, "127.0.0.1", 8080)
+	if err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+
+	if cfg.CacheDir != "/from/config/file" {
+		t.Errorf("CacheDir = %q, want the cache dir of the config file %q", cfg.CacheDir, "/from/config/file")
+	}
+	if cfg.LocalDir != "/from/config/file/models" {
+		t.Errorf("LocalDir = %q, want the local dir of the config file %q", cfg.LocalDir, "/from/config/file/models")
+	}
+	if got := os.Getenv("HF_HOME"); got != "/from/config/file" {
+		t.Errorf("HF_HOME = %q, want the cache dir of the config file %q", got, "/from/config/file")
+	}
+	if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/from/config/file", "hub"); got != want {
+		t.Errorf("HF_HUB_CACHE = %q, want %q", got, want)
+	}
+}
+
+// TestBuildConfigKeepsTheRegistrationWithoutAConfigFileValue checks the
+// fallback of the coherence rule: an instance whose config file does not
+// define a directory uses the directory of its registration.
+func TestBuildConfigKeepsTheRegistrationWithoutAConfigFileValue(t *testing.T) {
+	model := serviceInstance(t, map[string]string{})
+	t.Setenv("HF_HOME", "/stale/home")
+	t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+	cfg, err := buildConfig(RunOptions{
+		Paths:    model,
+		CacheDir: "/registered/cache",
+		HubDir:   "/registered/cache/hub",
+		LocalDir: "/registered/models",
+	}, "127.0.0.1", 8080)
+	if err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+
+	if cfg.CacheDir != "/registered/cache" {
+		t.Errorf("CacheDir = %q, want the registered cache dir %q", cfg.CacheDir, "/registered/cache")
+	}
+	if cfg.LocalDir != "/registered/models" {
+		t.Errorf("LocalDir = %q, want the registered local dir %q", cfg.LocalDir, "/registered/models")
+	}
+	if got := os.Getenv("HF_HOME"); got != "/registered/cache" {
+		t.Errorf("HF_HOME = %q, want the registered cache dir %q", got, "/registered/cache")
+	}
+	if got := os.Getenv("HF_HUB_CACHE"); got != "/registered/cache/hub" {
+		t.Errorf("HF_HUB_CACHE = %q, want the registered hub dir %q", got, "/registered/cache/hub")
+	}
+}
+
+// TestBuildConfigDerivesTheHubDir checks the hub rule of an instance.
+//
+// A config file that defines the cache root owns the whole cache layout, so
+// the hub directory is the "hub" child of that root. Without a cache root
+// from the config file the registration keeps its hub directory, and a
+// registration without one falls back to the "hub" child of the effective
+// cache root.
+func TestBuildConfigDerivesTheHubDir(t *testing.T) {
+	t.Run("the config file owns the hub directory", func(t *testing.T) {
+		model := serviceInstance(t, map[string]string{"cache-dir": "/from/config/file"})
+		t.Setenv("HF_HOME", "/stale/home")
+		t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+		if _, err := buildConfig(RunOptions{
+			Paths:    model,
+			CacheDir: "/registered/cache",
+			HubDir:   "/registered/cache/hub",
+		}, "127.0.0.1", 8080); err != nil {
+			t.Fatalf("buildConfig() = %v, want nil", err)
+		}
+		if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/from/config/file", "hub"); got != want {
+			t.Errorf("HF_HUB_CACHE = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("the registration keeps its hub directory", func(t *testing.T) {
+		model := serviceInstance(t, map[string]string{})
+		t.Setenv("HF_HOME", "/stale/home")
+		t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+		if _, err := buildConfig(RunOptions{
+			Paths:    model,
+			CacheDir: "/registered/cache",
+			HubDir:   "/registered/hub",
+		}, "127.0.0.1", 8080); err != nil {
+			t.Fatalf("buildConfig() = %v, want nil", err)
+		}
+		if got := os.Getenv("HF_HUB_CACHE"); got != "/registered/hub" {
+			t.Errorf("HF_HUB_CACHE = %q, want the registered hub dir %q", got, "/registered/hub")
+		}
+	})
+
+	t.Run("the cache root owns the hub directory", func(t *testing.T) {
+		model := serviceInstance(t, map[string]string{})
+		t.Setenv("HF_HOME", "/stale/home")
+		t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+		if _, err := buildConfig(RunOptions{
+			Paths:    model,
+			CacheDir: "/registered/cache",
+		}, "127.0.0.1", 8080); err != nil {
+			t.Fatalf("buildConfig() = %v, want nil", err)
+		}
+		if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/registered/cache", "hub"); got != want {
+			t.Errorf("HF_HUB_CACHE = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestBuildConfigAppliesTheLocalDirRule checks the output directory of an
+// instance: the local-dir of the config file of the instance wins over the
+// registered output directory.
+func TestBuildConfigAppliesTheLocalDirRule(t *testing.T) {
+	t.Run("the config file wins", func(t *testing.T) {
+		model := serviceInstance(t, map[string]string{"local-dir": "/from/config/file/models"})
+		t.Setenv("HF_HOME", "/stale/home")
+		t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+		cfg, err := buildConfig(RunOptions{
+			Paths:    model,
+			CacheDir: "/registered/cache",
+			LocalDir: "/registered/models",
+		}, "127.0.0.1", 8080)
+		if err != nil {
+			t.Fatalf("buildConfig() = %v, want nil", err)
+		}
+		if cfg.LocalDir != "/from/config/file/models" {
+			t.Errorf("LocalDir = %q, want the local dir of the config file %q", cfg.LocalDir, "/from/config/file/models")
+		}
+	})
+
+	t.Run("the registration is the fallback", func(t *testing.T) {
+		model := serviceInstance(t, map[string]string{})
+		t.Setenv("HF_HOME", "/stale/home")
+		t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+		cfg, err := buildConfig(RunOptions{
+			Paths:    model,
+			CacheDir: "/registered/cache",
+			LocalDir: "/registered/models",
+		}, "127.0.0.1", 8080)
+		if err != nil {
+			t.Fatalf("buildConfig() = %v, want nil", err)
+		}
+		if cfg.LocalDir != "/registered/models" {
+			t.Errorf("LocalDir = %q, want the registered local dir %q", cfg.LocalDir, "/registered/models")
+		}
+	})
+}
+
+// TestBuildConfigPinsTheCacheEnvironment checks that the cache environment
+// of the process carries the effective values of the instance.
+//
+// A supervisor hands over whatever environment it happens to have, so the
+// pinning has to replace it with the values of the instance. The pinning
+// happens after the configuration was loaded, so the values are the ones
+// the instance really uses.
+func TestBuildConfigPinsTheCacheEnvironment(t *testing.T) {
+	model := serviceInstance(t, map[string]string{"cache-dir": "/from/config/file"})
+	t.Setenv("HF_HOME", "/stale/home")
+	t.Setenv("HF_HUB_CACHE", "/stale/hub")
+
+	if _, err := buildConfig(RunOptions{
+		Paths:    model,
+		CacheDir: "/registered/cache",
+		HubDir:   "/registered/cache/hub",
+	}, "127.0.0.1", 8080); err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+
+	if got := os.Getenv("HF_HOME"); got != "/from/config/file" {
+		t.Errorf("HF_HOME = %q, want the effective cache root %q", got, "/from/config/file")
+	}
+	if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/from/config/file", "hub"); got != want {
+		t.Errorf("HF_HUB_CACHE = %q, want the effective hub dir %q", got, want)
+	}
+}
+
+// TestRunUsesTheConfigFileOfTheInstance checks the coherence rule of a
+// running instance.
+//
+// The config file of the instance wins over the registration, so the cache
+// root, the hub directory and the output directory the instance reports are
+// the ones the user changed in the settings of the instance.
+func TestRunUsesTheConfigFileOfTheInstance(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(root, "from-config-file")
+	localDir := filepath.Join(root, "from-config-file", "models")
+	data, err := json.Marshal(map[string]string{
+		"cache-dir": cacheRoot,
+		"local-dir": localDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The supervisor handed over a stale environment and a registration
+	// with other directories: neither of them may win over the config file.
+	t.Setenv("HF_HOME", filepath.Join(root, "stale-home"))
+	t.Setenv("HF_HUB_CACHE", filepath.Join(root, "stale-hub"))
+	t.Cleanup(runtimepaths.Reset)
+
+	port := freePort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RunOptions{
+			Paths:    model,
+			Listen:   addr,
+			CacheDir: filepath.Join(root, "registered", "cache"),
+			HubDir:   filepath.Join(root, "registered", "cache", "hub"),
+			LocalDir: filepath.Join(root, "registered", "models"),
+		})
+	}()
+
+	settings, settingsErr := waitForSettings(t, addr)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+	if settingsErr != nil {
+		t.Fatalf("the settings of the instance: %v", settingsErr)
+	}
+
+	if settings.CacheDir != cacheRoot {
+		t.Errorf("the cache dir of the instance = %q, want the cache dir of the config file %q", settings.CacheDir, cacheRoot)
+	}
+	if settings.ConfiguredCacheDir != cacheRoot {
+		t.Errorf("the configured cache dir of the instance = %q, want the cache dir of the config file %q", settings.ConfiguredCacheDir, cacheRoot)
+	}
+	if want := filepath.Join(cacheRoot, "hub"); settings.EffectiveHubDir != want {
+		t.Errorf("the effective hub dir of the instance = %q, want %q", settings.EffectiveHubDir, want)
+	}
+	if settings.LocalDir != localDir {
+		t.Errorf("the local dir of the instance = %q, want the local dir of the config file %q", settings.LocalDir, localDir)
+	}
+}
+
+// waitForSettings reads the settings a running instance reports.
+func waitForSettings(t *testing.T, addr string) (server.SettingsResponse, error) {
+	t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://" + addr + "/api/settings"
+	var lastErr error
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		body, status, err := get(client, url)
+		switch {
+		case err != nil:
+			lastErr = err
+		case status != http.StatusOK:
+			lastErr = fmt.Errorf("status %d: %s", status, body)
+		default:
+			var settings server.SettingsResponse
+			if err := json.Unmarshal([]byte(body), &settings); err != nil {
+				return settings, fmt.Errorf("decode the settings: %w", err)
+			}
+			return settings, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return server.SettingsResponse{}, fmt.Errorf("the settings endpoint never answered: %v", lastErr)
+}
+
+// TestServiceDirectoriesAreOwnerOnly checks that the state directory and the
+// config directory of an instance are created owner-only.
+//
+// They hold the job list, the download history, the mirror targets and the
+// credentials of the instance, so a directory that is missing at the start
+// of an instance must not be recreated world-readable.
+func TestServiceDirectoriesAreOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mode bits are emulated and do not represent DACL permissions")
+	}
+
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	runtimepaths.Install(model)
+	t.Cleanup(runtimepaths.Reset)
+
+	if err := server.SaveConfigFile(&server.ConfigFile{CacheDir: "/from/config/file"}); err != nil {
+		t.Fatalf("SaveConfigFile() = %v, want nil", err)
+	}
+	if err := server.SaveJobsState(nil); err != nil {
+		t.Fatalf("SaveJobsState() = %v, want nil", err)
+	}
+	if err := server.AppendHistory(&server.Job{ID: "job", Status: server.JobStatusCompleted}); err != nil {
+		t.Fatalf("AppendHistory() = %v, want nil", err)
+	}
+
+	for _, dir := range []string{filepath.Dir(model.ConfigFile), model.StateDir} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat %s: %v", dir, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("the mode of %s = %04o, want 0700", dir, got)
+		}
+	}
+}
+
 func TestBuildConfigKeepsIPv6HostsBracketed(t *testing.T) {
 	root := t.TempDir()
 	model := runtimepaths.Paths{
@@ -245,6 +612,75 @@ func TestBuildConfigTakesTheTokenFromTheConfigFile(t *testing.T) {
 	if got := os.Getenv("HF_TOKEN"); got != "" {
 		t.Errorf("HF_TOKEN = %q, want it dropped from the service environment", got)
 	}
+}
+
+// TestServiceBindsLoopbackWhileTheInteractiveServerKeepsItsDefault checks
+// the contrast the service mode is built on.
+//
+// The interactive server keeps its own default: it binds every interface, so
+// the dashboard of an interactive run is reachable. A service instance binds
+// loopback instead: a supervised instance has no user sitting in front of it
+// and must not expose the dashboard to the network by accident.
+func TestServiceBindsLoopbackWhileTheInteractiveServerKeepsItsDefault(t *testing.T) {
+	// The interactive default is intentionally unchanged by the service
+	// mode: an interactive run of the server still binds 0.0.0.0.
+	if got := server.DefaultConfig().Addr; got != "0.0.0.0" {
+		t.Errorf("server.DefaultConfig().Addr = %q, want %q", got, "0.0.0.0")
+	}
+
+	// The default listen address of a service instance is loopback.
+	host, port, err := ParseListen(DefaultListen)
+	if err != nil {
+		t.Fatalf("ParseListen(%q) = %v, want nil", DefaultListen, err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("the host of the default listen address %q = %q, want %q", DefaultListen, host, "127.0.0.1")
+	}
+	if !IsLoopbackListen(DefaultListen) {
+		t.Errorf("the default listen address %q is not a loopback address", DefaultListen)
+	}
+
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	runtimepaths.Install(model)
+	t.Cleanup(runtimepaths.Reset)
+
+	// The configuration a service instance builds binds loopback, even
+	// though the interactive default of the server binds every interface.
+	cfg, err := buildConfig(RunOptions{Paths: model}, host, port)
+	if err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+	if cfg.Addr != "127.0.0.1" {
+		t.Errorf("the address of the service configuration = %q, want %q", cfg.Addr, "127.0.0.1")
+	}
+	if cfg.Port != port {
+		t.Errorf("the port of the service configuration = %d, want %d", cfg.Port, port)
+	}
+
+	// The registered argument vector carries the loopback address, so the
+	// instance the supervisor starts binds loopback as well.
+	if got := listenArg(""); got != DefaultListen {
+		t.Errorf("listenArg(\"\") = %q, want the default listen address %q", got, DefaultListen)
+	}
+	args := RunArgs(InstallOptions{Paths: model})
+	if got := argumentValue(args, "--listen"); got != DefaultListen {
+		t.Errorf("the listen address of the argument vector = %q, want %q", got, DefaultListen)
+	}
+}
+
+// argumentValue returns the value of a flag of an argument vector.
+func argumentValue(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // guiLaunchMarkers are the markers of a browser or a tray launcher. No file
