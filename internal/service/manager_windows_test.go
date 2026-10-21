@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -532,6 +533,12 @@ func TestSCMLifecycle(t *testing.T) {
 	if status.State != StateStopped {
 		t.Errorf("the state = %q, want %q", status.State, StateStopped)
 	}
+	// The instance never ran: the service control manager reports the
+	// code of a service that was never started for it, and that code is
+	// no failure of the instance.
+	if status.Detail != "" {
+		t.Errorf("the detail = %q, want none for an instance that never ran", status.Detail)
+	}
 	if status.Name != ServiceName {
 		t.Errorf("the name = %q, want %q", status.Name, ServiceName)
 	}
@@ -739,6 +746,41 @@ func TestSCMStatusFromACleanlyStoppedInstanceIsStopped(t *testing.T) {
 	facts := scmRegistrationFacts{
 		present:     true,
 		state:       svc.Stopped,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateStopped {
+		t.Errorf("the state = %q, want %q", status.State, StateStopped)
+	}
+	if status.Detail != "" {
+		t.Errorf("the detail = %q, want none", status.Detail)
+	}
+}
+
+// TestSCMStatusFromANeverStartedInstanceIsStopped checks that an instance
+// that never ran is reported as stopped and not as failed.
+//
+// The service control manager reports the code of a service that was never
+// started (ERROR_SERVICE_NEVER_STARTED) as the exit code of an instance
+// that never ran. That code is no failure of the instance: it never ran, the
+// way a unit that never ran is reported as stopped by the managers of the
+// other platforms.
+func TestSCMStatusFromANeverStartedInstanceIsStopped(t *testing.T) {
+	root := t.TempDir()
+	opts := scmTestOptions()
+	opts.Executable = filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
+		t.Fatalf("WriteFile() = %v, want nil", err)
+	}
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Stopped,
+		exitCode:    uint32(windows.ERROR_SERVICE_NEVER_STARTED),
 		commandLine: scmCommandLine(opts),
 	}
 
@@ -1043,6 +1085,16 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 	}
 }
 
+// scmTestNamesPath reports whether a message of the manager names a path.
+//
+// The messages of the manager quote the path they talk about, so the
+// backslashes of a Windows path are escaped in them: the path of a message
+// is the quoted form of the path, not the path itself. The check looks for
+// both forms, so it does not depend on the way a message renders the path.
+func scmTestNamesPath(message, path string) bool {
+	return strings.Contains(message, path) || strings.Contains(message, strconv.Quote(path))
+}
+
 // TestPreflightDataPathRefusesAFile checks that a file where the instance
 // needs a directory is refused.
 func TestPreflightDataPathRefusesAFile(t *testing.T) {
@@ -1059,7 +1111,7 @@ func TestPreflightDataPathRefusesAFile(t *testing.T) {
 	if !strings.Contains(err.Error(), "not a directory") {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the reason", path, err)
 	}
-	if !strings.Contains(err.Error(), path) {
+	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
 	}
 }
@@ -1086,7 +1138,7 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	if err == nil {
 		t.Fatalf("preflightDataPath(%q) = nil, want an error", path)
 	}
-	if !strings.Contains(err.Error(), path) {
+	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
 	}
 	if !strings.Contains(err.Error(), scmServiceIdentityName) {
@@ -1414,7 +1466,7 @@ func TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse(t *testing.T) {
 	if err == nil {
 		t.Fatal("restrictInstanceState() = nil, want the refusal of the state directory")
 	}
-	if !strings.Contains(err.Error(), stateDir) {
+	if !scmTestNamesPath(err.Error(), stateDir) {
 		t.Errorf("restrictInstanceState() = %v, want an error that names the path", err)
 	}
 	if !strings.Contains(err.Error(), scmServiceIdentityName) {

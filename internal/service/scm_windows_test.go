@@ -135,14 +135,29 @@ func TestSCMHandlerFailsWithoutAUsableArgumentVector(t *testing.T) {
 	}
 }
 
+// TestSCMArgumentCandidates checks the argument vectors the handler of the
+// service tries to read the options of the instance from.
+//
+// The candidates are tried in the order they are assembled: the start
+// parameters of the start request first, then the whole vector of the
+// handler and last the command line of the process, which is the registered
+// command line of the instance.
+//
+// The whole vector of the handler starts with the name of the service or
+// with the path of the program, so the parser reads the options from it
+// only when the handler carries the command tokens of the invocation
+// itself.
 func TestSCMArgumentCandidates(t *testing.T) {
 	args := []string{ServiceName, "service", "run", "--config", `C:\hfdesk\hfdesk.json`}
 	process := []string{`C:\hfdesk\hfdesk.exe`, "service", "run", "--config", `C:\hfdesk\hfdesk.json`}
 
 	candidates := scmArgumentCandidates(args, process)
 	want := [][]string{
+		// The start parameters of the start request.
 		{"service", "run", "--config", `C:\hfdesk\hfdesk.json`},
-		{"service", "run", "--config", `C:\hfdesk\hfdesk.json`},
+		// The whole vector of the handler.
+		{ServiceName, "service", "run", "--config", `C:\hfdesk\hfdesk.json`},
+		// The command line of the process.
 		{"service", "run", "--config", `C:\hfdesk\hfdesk.json`},
 	}
 	if !reflect.DeepEqual(candidates, want) {
@@ -150,10 +165,45 @@ func TestSCMArgumentCandidates(t *testing.T) {
 	}
 
 	// A process without an argument vector of its own has no candidate
-	// besides the ones of the handler.
-	if got := scmArgumentCandidates([]string{ServiceName}, nil); len(got) != 2 {
-		t.Errorf("the candidates = %q, want the two vectors of the handler", got)
+	// besides the one of the handler: there are no start parameters
+	// without a second element and no command line of the process.
+	if got := scmArgumentCandidates([]string{ServiceName}, nil); len(got) != 1 {
+		t.Errorf("the candidates = %q, want the one vector of the handler", got)
 	}
+}
+
+// TestSCMArgumentCandidatesCarryTheOptionsOfTheInstance checks that the
+// handler of the service finds the options of the instance in one of the
+// candidates.
+//
+// The instance runs with the options of its registration, no matter how the
+// process was started: the service control manager hands the handler the
+// argument vector of the service process, and the command line of the
+// process is the registered command line. One of the candidates has to carry
+// the options, or the instance would run without them.
+func TestSCMArgumentCandidatesCarryTheOptionsOfTheInstance(t *testing.T) {
+	// The argument vector of the service process: the path of the
+	// program and the arguments of the registration.
+	process := []string{
+		`C:\hfdesk\hfdesk.exe`,
+		"service", "run",
+		"--config", `C:\hfdesk\hfdesk.json`,
+		"--state-dir", `C:\hfdesk\var`,
+		"--log-dir", `C:\hfdesk\logs`,
+	}
+	// The vector the handler receives: the name of the service and the
+	// arguments of the process.
+	args := append([]string{ServiceName}, process[1:]...)
+
+	candidates := scmArgumentCandidates(args, process)
+	for _, candidate := range candidates {
+		if _, err := ParseRunArgs(candidate); err == nil {
+			// One of the candidates carries the options of the
+			// registration: the handler finds them.
+			return
+		}
+	}
+	t.Errorf("the candidates = %q, want one that carries the options of the instance", candidates)
 }
 
 func TestResolveOptionsFallsBackToTheHandedOverOptions(t *testing.T) {

@@ -691,6 +691,10 @@ func scmLookupError(what string, err error) error {
 // manager has no state of its own for a failure and reports a crashed
 // instance as stopped, so the exit code is what tells a failed instance
 // from a cleanly stopped one.
+//
+// An instance that never ran is reported as stopped: the manager reports
+// the code of a service that was never started for it, and that code is no
+// failure of the instance.
 func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 	status := scmBaseStatus(scope)
 	if !facts.present {
@@ -711,17 +715,33 @@ func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 	}
 
 	status.State = scmState(facts.state)
-	if status.State == StateStopped && facts.exitCode != 0 {
+	if status.State == StateStopped && scmFailedExit(facts.exitCode) {
 		// The service control manager has no state of its own for a
 		// failure: an instance that crashed is reported as stopped
 		// there, like an instance that ended cleanly. The exit code is
 		// what tells the two apart, so a stopped instance that ended
-		// with a non-zero code is reported as failed, the way the
-		// managers of the other platforms report the same crash.
+		// with the code of a failed run is reported as failed, the way
+		// the managers of the other platforms report the same crash.
 		status.State = StateFailed
 		status.Detail = fmt.Sprintf("the instance exited with the code %d", facts.exitCode)
 	}
 	return status, nil
+}
+
+// scmFailedExit reports whether the exit code of the instance is the code of
+// a failed run.
+//
+// The service control manager has no state of its own for a failure: it
+// reports a crashed instance as stopped, like a cleanly stopped one, so the
+// exit code is what tells the two apart.
+//
+// A service that never ran carries the code of a service that was never
+// started (ERROR_SERVICE_NEVER_STARTED): the manager reports it for every
+// service that was never started, and it is no failure of the instance. The
+// instance is stopped, the way a unit that never ran is reported as stopped
+// by the manager of the other platforms.
+func scmFailedExit(exitCode uint32) bool {
+	return exitCode != 0 && exitCode != uint32(windows.ERROR_SERVICE_NEVER_STARTED)
 }
 
 // scmBrokenRegistration reports whether the registration points at an
