@@ -313,6 +313,42 @@ The commands are idempotent where the wanted state is already reached:
 on a service that is not installed they fail with a readable "not installed"
 error.
 
+### Stopping an instance
+
+A stop is a **graceful** shutdown, in two phases:
+
+- The HTTP server is drained: it accepts no new request any more, and the
+  requests that are already running finish — up to **10 s**.
+- The job manager is closed: the running jobs are cancelled and drained, and
+  the job list is written back to the state file — up to **10 s** again.
+
+The orderly path therefore needs up to **20 s**.
+
+The service layer publishes that budget and sizes every supervisor-side wait
+after it, with a margin for the work the process still has to do around the
+shutdown. The shared budget is **25 s**.
+
+| Platform | Where the budget is published |
+|---|---|
+| Linux (systemd) | `TimeoutStopSec=25s` in the generated unit. |
+| macOS (launchd) | `ExitTimeOut` 25 in the generated property list. |
+| Windows (Service Control Manager) | the bounded wait of the service handler. |
+
+launchd's own default of 20 s was exactly the total of the orderly path, so
+the property list carries the budget of the service layer instead: the
+deadline of a supervisor must never be shorter than the shutdown it waits
+for.
+
+The instance is **never killed to make a stop succeed**. The deadline of the
+supervisor is the only hard stop, and it is larger than the orderly path
+needs, so an instance that shuts down in time is never interrupted while it
+saves its state.
+
+A stop of an instance that is not running is a **clean success**: there is
+nothing running to stop. A stop deletes nothing either: the stopped instance
+keeps its job list and its download history, and the next start finds both
+again.
+
 ## Exit codes
 
 Every command of the service family ends with one of three exit codes:
