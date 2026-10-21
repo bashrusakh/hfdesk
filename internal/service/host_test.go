@@ -4,10 +4,13 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/logsink"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
@@ -976,4 +980,112 @@ func stripComments(src string) string {
 		out.WriteString("\n")
 	}
 	return out.String()
+}
+
+// failingWriter is a writer that fails on every write.
+type failingWriter struct {
+	err error
+}
+
+// Write fails with the error of the writer.
+func (w failingWriter) Write(p []byte) (int, error) {
+	return 0, w.err
+}
+
+// TestLogFanOutWritesTheDestinationsIndependently checks that the two
+// destinations of the log of an instance are written independently.
+//
+// A Windows instance is started by the service control manager and has no
+// valid standard output there. The failure of one destination must never
+// suppress the other one: the log file of the instance still has to receive
+// every line.
+func TestLogFanOutWritesTheDestinationsIndependently(t *testing.T) {
+	t.Run("both destinations receive the line", func(t *testing.T) {
+		file := &bytes.Buffer{}
+		stdout := &bytes.Buffer{}
+
+		fanOut := logFanOut{file: file, stdout: stdout}
+		if _, err := fanOut.Write([]byte("a line\n")); err != nil {
+			t.Fatalf("write = %v, want nil", err)
+		}
+		if got := file.String(); got != "a line\n" {
+			t.Errorf("the log file = %q, want %q", got, "a line\n")
+		}
+		if got := stdout.String(); got != "a line\n" {
+			t.Errorf("the standard output = %q, want %q", got, "a line\n")
+		}
+	})
+
+	t.Run("the standard output fails", func(t *testing.T) {
+		file := &bytes.Buffer{}
+		stdout := failingWriter{err: errors.New("the service control manager has no standard output")}
+
+		fanOut := logFanOut{file: file, stdout: stdout}
+		if _, err := fanOut.Write([]byte("a line\n")); err != nil {
+			t.Fatalf("write = %v, want nil: the standard output is not the log", err)
+		}
+		if got := file.String(); got != "a line\n" {
+			t.Errorf("the log file = %q, want %q", got, "a line\n")
+		}
+	})
+
+	t.Run("the log file fails", func(t *testing.T) {
+		file := failingWriter{err: errors.New("the log file is gone")}
+		stdout := &bytes.Buffer{}
+
+		fanOut := logFanOut{file: file, stdout: stdout}
+		if _, err := fanOut.Write([]byte("a line\n")); err == nil {
+			t.Error("write = nil, want the error of the log file")
+		}
+		if got := stdout.String(); got != "a line\n" {
+			t.Errorf("the standard output = %q, want %q", got, "a line\n")
+		}
+	})
+}
+
+// TestInstallLogOutputKeepsTheLogFileWhenTheStandardOutputFails checks the
+// log of a running instance against a broken standard output.
+//
+// The instance writes its log to the log file of the instance and to the
+// standard output of the process. A Windows instance has no valid standard
+// output under the service control manager, and the log file of the
+// instance still has to receive every line.
+func TestInstallLogOutputKeepsTheLogFileWhenTheStandardOutputFails(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := logsink.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	stdout := failingWriter{err: errors.New("the service control manager has no standard output")}
+	restore := installLogOutput(sink, stdout)
+	defer restore()
+
+	log.Print("a line of the instance")
+
+	data, err := os.ReadFile(sink.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "a line of the instance") {
+		t.Errorf("the log file of the instance = %q, want the line of the instance", data)
+	}
+}
+
+// TestInstallLogOutputKeepsTheStandardOutputWhenTheLogFileFails checks the
+// other direction: the supervisor of the instance still receives the log
+// when the log file of the instance cannot be written.
+func TestInstallLogOutputKeepsTheStandardOutputWhenTheLogFileFails(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	file := failingWriter{err: errors.New("the log file is gone")}
+
+	restore := installLogOutput(file, stdout)
+	defer restore()
+
+	log.Print("a line of the instance")
+
+	if got := stdout.String(); !strings.Contains(got, "a line of the instance") {
+		t.Errorf("the standard output = %q, want the line of the instance", got)
+	}
 }

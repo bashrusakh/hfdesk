@@ -50,15 +50,18 @@ func Run(ctx context.Context, opts RunOptions) error {
 	runtimepaths.Install(opts.Paths)
 
 	// The process log goes to the supervisor (systemd journal, launchd log
-	// files) and into the bounded rotating log file of the instance.
+	// files) and into the bounded rotating log file of the instance. The
+	// two destinations are written independently: a Windows instance is
+	// started by the service control manager and has no valid standard
+	// output, and the log file of the instance still has to receive every
+	// line.
 	sink, err := logsink.Open(opts.Paths.LogDir)
 	if err != nil {
 		return fmt.Errorf("service: open log sink: %w", err)
 	}
 	defer sink.Close()
-	previousLogOutput := log.Writer()
-	log.SetOutput(io.MultiWriter(os.Stdout, sink))
-	defer log.SetOutput(previousLogOutput)
+	restoreLogOutput := installLogOutput(sink, os.Stdout)
+	defer restoreLogOutput()
 
 	// Resolve the bind address of the instance.
 	listen := opts.Listen
@@ -92,6 +95,46 @@ type destinations struct {
 	HubDir string
 	// LocalDir is the flat output directory of the instance.
 	LocalDir string
+}
+
+// installLogOutput points the standard logger at the log file of the
+// instance and at the standard output of the process. It returns the
+// function that restores the previous output of the logger.
+func installLogOutput(file io.Writer, stdout io.Writer) func() {
+	previous := log.Writer()
+	log.SetOutput(logFanOut{file: file, stdout: stdout})
+	return func() { log.SetOutput(previous) }
+}
+
+// logFanOut writes a log line to the log file of the instance and to the
+// standard output of the process.
+//
+// The destinations are independent: the failure of one must never suppress
+// the other. A Windows instance is started by the service control manager
+// and has no valid standard output there, and the log file of the instance
+// still has to receive every line.
+//
+// The standard output is a secondary destination: its error is not the
+// error of the write. The log file of the instance is the log, and a
+// missing standard output is not a failure of it.
+type logFanOut struct {
+	// file is the log file of the instance. Its error is the error of
+	// the write.
+	file io.Writer
+	// stdout is the standard output of the process. It reaches the
+	// supervisor of the instance.
+	stdout io.Writer
+}
+
+// Write writes p to the log file of the instance and to the standard
+// output of the process.
+func (w logFanOut) Write(p []byte) (int, error) {
+	n, err := w.file.Write(p)
+	// The standard output is written on its own: its failure must not
+	// stop the log file from receiving the line, and it is not the
+	// failure of the write.
+	_, _ = w.stdout.Write(p)
+	return n, err
 }
 
 // buildConfig assembles the server configuration of a service instance.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -344,5 +345,141 @@ func TestCloseStopsWrites(t *testing.T) {
 func TestOpenRejectsEmptyDir(t *testing.T) {
 	if _, err := Open(""); err == nil {
 		t.Error("Open(\"\") must fail")
+	}
+}
+
+// TestAFailedRotationRecoversOnTheNextWrite checks that a rotation that
+// cannot create the active file again does not silence the log.
+//
+// The failure is reproducible on every platform: the active file of the
+// sink is pointed at a directory that does not exist, so the rotation
+// cannot create it again. The path is restored afterwards, the way a
+// transient failure (a full disk, a momentarily locked file) comes and
+// goes, and the next write has to land in the log again.
+func TestAFailedRotationRecoversOnTheNextWrite(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	if _, err := sink.Write([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The active file cannot be created again: the path of the sink
+	// points into a directory that does not exist.
+	path := sink.path
+	sink.path = filepath.Join(dir, "gone", FileName)
+
+	// The write is bigger than the limit, so the sink rotates first and
+	// the rotation fails.
+	big := bytes.Repeat([]byte("z"), int(MaxFileSize)+1)
+	if _, err := sink.Write(big); err == nil {
+		t.Fatal("write through a failed rotation = nil, want an error")
+	}
+
+	// The condition is gone: the next write has to reach the log file.
+	sink.path = path
+	if _, err := sink.Write([]byte("after the failed rotation\n")); err != nil {
+		t.Fatalf("write after a failed rotation: %v", err)
+	}
+
+	data, err := os.ReadFile(sink.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The content of the log before the failure is kept.
+	want := "first\nafter the failed rotation\n"
+	if string(data) != want {
+		t.Errorf("log content = %q, want %q", data, want)
+	}
+}
+
+// TestAFailedRotationRecoversWhenTheLogDirectoryIsGone checks the same
+// recovery against a real filesystem condition.
+//
+// The log directory disappears while the sink holds the active file open,
+// so the rotation cannot replace the active file. The directory comes back
+// afterwards and the next write has to land in the log again.
+//
+// Windows refuses to remove a directory that holds an open file, so the
+// condition cannot be built there.
+func TestAFailedRotationRecoversWhenTheLogDirectoryIsGone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows refuses to remove a directory that holds an open file")
+	}
+
+	dir := filepath.Join(t.TempDir(), "logs")
+	sink, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	if _, err := sink.Write([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The log directory is gone: the rotation cannot create the active
+	// file again.
+	if err := os.Remove(filepath.Join(dir, FileName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// The write is bigger than the limit, so the sink rotates first and
+	// the rotation fails.
+	big := bytes.Repeat([]byte("z"), int(MaxFileSize)+1)
+	if _, err := sink.Write(big); err == nil {
+		t.Fatal("write through a failed rotation = nil, want an error")
+	}
+
+	// The directory is back: the next write has to reach the log file.
+	if err := os.Mkdir(dir, DirMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("after the failed rotation\n")); err != nil {
+		t.Fatalf("write after a failed rotation: %v", err)
+	}
+
+	data, err := os.ReadFile(sink.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "after the failed rotation\n") {
+		t.Errorf("log content = %q, want the line after the failed rotation", data)
+	}
+}
+
+// TestAClosedSinkStaysClosedAfterAFailedRotation checks that the recovery
+// of a failed rotation never revives a closed sink.
+func TestAClosedSinkStaysClosedAfterAFailedRotation(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := sink.path
+	if _, err := sink.Write([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+	// The active file cannot be created again.
+	sink.path = filepath.Join(dir, "gone", FileName)
+	big := bytes.Repeat([]byte("z"), int(MaxFileSize)+1)
+	if _, err := sink.Write(big); err == nil {
+		t.Fatal("write through a failed rotation = nil, want an error")
+	}
+	sink.path = path
+
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("after the close\n")); err == nil {
+		t.Error("write after close must fail")
 	}
 }

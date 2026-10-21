@@ -38,6 +38,10 @@ type Sink struct {
 	path string
 	file *os.File
 	size int64
+	// closed reports that Close was called. A closed sink never writes
+	// again and never recovers: the log of the instance ends with the
+	// shutdown of the instance.
+	closed bool
 }
 
 // Open creates dir (0700) if needed and opens <dir>/hfdesk.log (0600).
@@ -160,11 +164,20 @@ func (s *Sink) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.file == nil {
+	if s.closed {
 		return 0, os.ErrClosed
 	}
 	if len(p) == 0 {
 		return 0, nil
+	}
+	// A failed rotation leaves the sink without an active file. The sink
+	// recovers here: a transient failure of a rotation (a full disk, a
+	// momentarily locked file) must not silence the log of the instance
+	// for the rest of the lifetime of the process.
+	if s.file == nil {
+		if err := s.recover(); err != nil {
+			return 0, err
+		}
 	}
 	// An empty active file has nothing to rotate: an oversized single write
 	// is written whole rather than looping forever.
@@ -186,11 +199,12 @@ func (s *Sink) Path() string {
 	return s.path
 }
 
-// Close flushes and closes the file.
+// Close flushes and closes the file. A closed sink never writes again.
 func (s *Sink) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.closed = true
 	if s.file == nil {
 		return nil
 	}
@@ -202,6 +216,10 @@ func (s *Sink) Close() error {
 // rotate shifts the generations: the active file becomes .1, .1 becomes .2
 // and .2 becomes .3. The oldest generation is discarded, so the on-disk size
 // stays bounded. The caller must hold the mutex.
+//
+// Every failure after the active file was closed leaves the sink recoverable:
+// the sink reopens the active file, and a write that comes later lands in the
+// log of the instance again.
 func (s *Sink) rotate() error {
 	if err := os.Remove(s.generation(MaxRotatedFiles)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("logsink: remove oldest log: %w", err)
@@ -213,18 +231,27 @@ func (s *Sink) rotate() error {
 	}
 
 	if err := s.file.Close(); err != nil {
+		// The file is closed even when the close reports an error, so the
+		// sink reopens the active file and stays usable.
+		s.file = nil
+		_ = s.recover()
 		return fmt.Errorf("logsink: close log before rotation: %w", err)
 	}
 	s.file = nil
 
 	if err := os.Rename(s.path, s.generation(1)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		// The active file was not replaced: keep the sink usable.
-		s.reopenActive()
+		_ = s.recover()
 		return fmt.Errorf("logsink: rotate log: %w", err)
 	}
 
 	file, err := createFile(s.path, os.O_WRONLY|os.O_TRUNC|os.O_APPEND)
 	if err != nil {
+		// The active file could not be created again: the sink reopens
+		// the active file, so the next write lands in the log of the
+		// instance instead of failing for the rest of the lifetime of
+		// the process.
+		_ = s.recover()
 		return fmt.Errorf("logsink: reopen log after rotation: %w", err)
 	}
 	s.file = file
@@ -232,17 +259,21 @@ func (s *Sink) rotate() error {
 	return nil
 }
 
-// reopenActive reopens the active file for appending after a failed
-// rotation. The caller must hold the mutex.
-func (s *Sink) reopenActive() {
+// recover reopens the active file for appending after a failed rotation.
+//
+// The file that was active before the failure is reopened when it is still
+// there, so the log of the instance keeps its content. The caller must hold
+// the mutex.
+func (s *Sink) recover() error {
 	file, err := createFile(s.path, os.O_WRONLY|os.O_APPEND)
 	if err != nil {
-		return
+		return fmt.Errorf("logsink: reopen log: %w", err)
 	}
 	s.file = file
 	if info, err := file.Stat(); err == nil {
 		s.size = info.Size()
 	}
+	return nil
 }
 
 // generation returns the path of a rotated generation of the active file.
