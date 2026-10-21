@@ -40,6 +40,127 @@ Returns server status, version, timestamp, and the effective configured Hugging 
 when no custom endpoint is configured, never ends with a trailing slash, and
 preserves any configured path prefix (for example `https://mirror.example/hf`).
 
+## Runtime and Logs
+
+```http
+GET /api/runtime
+GET /api/runtime/logs?after=<cursor>&level=<level>&limit=<n>
+GET /api/runtime/logs/stream?after=<cursor>&level=<level>
+POST /api/runtime/open-logs
+POST /api/runtime/open-ui
+```
+
+These endpoints report the status and the log of the running server. They
+expose local process diagnostics, so they stay local: whatever address the
+server binds to, a request whose peer is not a loopback address (`127.0.0.0/8`
+or `::1`) is rejected with `403`, and so is a request that carries an
+`Origin` header of another site. A forwarded header such as
+`X-Forwarded-For` is ignored, and a request without an `Origin` header (a
+native client) is allowed. The Runtime window is served from the same
+loopback origin as the API, so it keeps working.
+
+`GET /api/runtime` returns:
+
+```json
+{
+  "version": "1.3.0",
+  "status": "ok",
+  "url": "http://127.0.0.1:8080",
+  "address": "127.0.0.1:8080",
+  "activeJobs": { "running": 1, "queued": 2 },
+  "logCursor": 42,
+  "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log"
+}
+```
+
+`url` is the browser-safe URL of the running server, `address` is the
+effective address it is bound to (empty while the server is not bound yet)
+and `logCursor` is the sequence number of the most recent log record, the
+cursor a client sends to read the records emitted after it. `logFile` is the
+path of the rotating log file; it is an empty string when the application does
+not write a log file.
+
+`GET /api/runtime/logs` returns a bounded page of the retained records:
+
+```json
+{
+  "records": [
+    {
+      "seq": 42,
+      "time": "2026-10-21T10:11:12Z",
+      "level": "INFO",
+      "component": "server",
+      "message": "request",
+      "attrs": { "method": "GET", "path": "/api/health" }
+    }
+  ],
+  "cursor": 42,
+  "truncated": false
+}
+```
+
+- `after` — a cursor; only the records with a higher sequence number are
+  returned. The default is `0`, which returns the whole retained history.
+- `level` — the minimum severity of the returned records: `debug`, `info`,
+  `warn` or `error`. An absent value or `all` returns every record. An
+  unknown value is rejected with `400`.
+- `limit` — the maximum number of returned records. The default is `200`
+  and the maximum is `1000`; a larger value is clamped to the maximum. An
+  invalid value is rejected with `400`.
+
+`cursor` is the cursor to send for the next page. `truncated` reports that
+the requested window is no longer fully covered by the retained records, so
+the client must not assume that the page continues the history it has. The
+records come from a bounded in-memory ring: the log file is never read, so
+a reconnect does not re-read it and a single request cannot ask for an
+unbounded amount of data.
+
+`GET /api/runtime/logs/stream` is a Server-Sent Events stream of the same
+records. It replays the retained records after `after` first and then
+continues with the live records. The response carries `Content-Type:
+text/event-stream` and `Cache-Control: no-cache`, and it carries these
+events:
+
+- `log` — a record, with the payload of a record of the page above.
+- `dropped` — the subscription lost records because the client did not keep
+  up: `{"dropped": 3, "cursor": 42}`. The client re-syncs by reading
+  `GET /api/runtime/logs` after the reported cursor.
+- `gap` — the requested window had already fallen out of the retained
+  records: `{"dropped": 0, "cursor": 42}`. The client re-syncs the same
+  way.
+
+The stream ends when the client goes away, and a keep-alive comment is sent
+while it is idle. Log traffic does not use the job WebSocket of `/api/ws`.
+
+`POST /api/runtime/open-logs` opens the folder of the active log file with
+the file manager of the operating system. It takes no path: the endpoint opens
+the log location of the running application and nothing else, so it can never
+be used to open another location. It is a POST, because it changes the state
+of the desktop, and it is guarded by the same local-only rule as the other
+runtime endpoints. It answers `404` when the application does not write a log
+file, and `500` when the operating system did not open the folder.
+
+```json
+{
+  "ok": true,
+  "path": "/home/user/.cache/HFDesk/logs"
+}
+```
+
+`POST /api/runtime/open-ui` opens the web UI of the running server in the
+default browser of the operating system. It takes no parameters: the endpoint
+opens the URL of the running server and nothing else, so it can never be used
+to open another location. It is a POST, because it changes the state of the
+desktop, and it is guarded by the same local-only rule as the other runtime
+endpoints. It answers `404` when the server is not bound yet, and `500` when
+the operating system did not open the browser.
+
+```json
+{
+  "ok": true
+}
+```
+
 ## Search
 
 ```http
