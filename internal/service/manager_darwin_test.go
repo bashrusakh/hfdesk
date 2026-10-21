@@ -1790,7 +1790,11 @@ func TestLaunchdGrantInstanceDirsRefusesBeforeItGrants(t *testing.T) {
 func TestLaunchdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T) {
 	account := darwinOtherAccount(t)
 
-	root := darwinTraversableTempDir(t)
+	root := darwinScratchDir(t)
+	// The precondition of the fixtures below: the account of the instance
+	// reaches the scratch directory, so a refusal of the installation is
+	// about the directories themselves.
+	darwinAssertReachable(t, account, root)
 	opts := InstallOptions{
 		Scope:  ScopeSystem,
 		Listen: DefaultListen,
@@ -2159,7 +2163,7 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 // group of its directories, so the group permissions are the ones that
 // apply to it.
 func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
-	root := darwinTraversableTempDir(t)
+	root := darwinScratchDir(t)
 
 	// The group of the directories of the test is the group of the test
 	// process, so the other identity reaches them through the group.
@@ -2185,6 +2189,13 @@ func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 		GID:    group,
 		Group:  "hfdesk-access-test",
 		Groups: []int{group},
+	}
+
+	// The precondition of the cases below: every account reaches the
+	// scratch directory, so a refusal of the check is about the directory
+	// of the case and not about the scratch directory.
+	for _, account := range []*serviceAccount{owner, other} {
+		darwinAssertReachable(t, account, root)
 	}
 
 	cases := []struct {
@@ -2298,7 +2309,7 @@ func TestLaunchdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 	if !ok {
 		t.Skip("skipping: the account of the test belongs to no group besides its primary one")
 	}
-	root := darwinTraversableTempDir(t)
+	root := darwinScratchDir(t)
 
 	dir := filepath.Join(root, "supplementary")
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -2317,6 +2328,10 @@ func TestLaunchdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 		Group:  "hfdesk-access-test",
 		Groups: []int{os.Getgid(), supplementary},
 	}
+
+	// The precondition of the checks below: the account reaches the scratch
+	// directory, so a refusal of the check is about the directory itself.
+	darwinAssertReachable(t, account, root)
 
 	// The group permissions apply to the account: it can create entries
 	// in the directory and it can reach it.
@@ -2522,24 +2537,65 @@ func darwinOwner(t *testing.T, path string) (int, int) {
 	return int(stat.Uid), int(stat.Gid)
 }
 
-// darwinTraversableTempDir returns a temporary directory the account of the
-// test can pass through.
+// darwinMachineTempRoot is the temporary directory of the machine that every
+// account can pass through.
 //
 // The temporary directory of a test is owner-only, so an account that is not
 // the owner of the test never reaches a directory below it. The access check
 // of the service layer asks for the same: a directory below a parent
 // without the execute permission is out of reach of the account.
-func darwinTraversableTempDir(t *testing.T) string {
+//
+// The fixtures of the access checks therefore live in the temporary directory
+// of the machine: /tmp is of the mode 1777 on Linux and on macOS, where it
+// resolves to /private/tmp. A fixture is then out of the reach of the account
+// only because of its own permissions, which is what the checks are about.
+const darwinMachineTempRoot = "/tmp"
+
+// darwinScratchDir returns a scratch directory in the temporary directory of
+// the machine.
+//
+// The directory is traversable by every account, and it is removed when the
+// test ends.
+func darwinScratchDir(t *testing.T) string {
 	t.Helper()
-	root := t.TempDir()
+	root, err := os.MkdirTemp(darwinMachineTempRoot, "hfdesk-darwin-test-")
+	if err != nil {
+		t.Fatalf("create the scratch directory in %q: %v", darwinMachineTempRoot, err)
+	}
 	// The mode of a create call is filtered by the umask of the process,
 	// so the mode is set explicitly.
-	for _, path := range []string{root, filepath.Dir(root)} {
-		if err := os.Chmod(path, 0o711); err != nil {
-			t.Fatalf("make %q traversable: %v", path, err)
-		}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatalf("make the scratch directory %q traversable: %v", root, err)
 	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove the scratch directory %q: %v", root, err)
+		}
+	})
 	return root
+}
+
+// darwinAssertReachable asserts that the account reaches the scratch
+// directory.
+//
+// The precondition of every fixture of an access check: the account has to
+// pass through the scratch directory, otherwise a refusal of the check tells
+// more about the scratch directory than about the fixture itself. The
+// assertion names the account and the directory, so a broken precondition is
+// diagnosable instead of looking like a wrong verdict of the check.
+func darwinAssertReachable(t *testing.T, account *serviceAccount, root string) {
+	t.Helper()
+	ok, err := accountCanTraverse(root, accessAccount{
+		UID:    account.UID,
+		GID:    account.GID,
+		Groups: account.Groups,
+	})
+	if err != nil {
+		t.Fatalf("the account %q cannot pass through the scratch directory %q: %v", account.Name, root, err)
+	}
+	if !ok {
+		t.Fatalf("the account %q cannot pass through the scratch directory %q: the fixture below it would be out of the reach of the account for a reason that has nothing to do with the fixture itself", account.Name, root)
+	}
 }
 
 // darwinSupplementaryGroup returns the id of a supplementary group of the
