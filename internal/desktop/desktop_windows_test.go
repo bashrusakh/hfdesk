@@ -326,7 +326,7 @@ func TestStartupFailureIsRecordedInTheLogFile(t *testing.T) {
 		slog.SetDefault(previous)
 	}()
 
-	closePipelineWithFailure(pipeline, errors.New("the local server could not be started"))
+	closePipelineWithFailure(pipeline, errors.New("the local server could not be started"), nil)
 
 	logged, err := os.ReadFile(logFile)
 	if err != nil {

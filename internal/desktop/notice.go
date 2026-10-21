@@ -11,12 +11,21 @@ const (
 	// alreadyRunningCaption is the caption of the notice that tells the
 	// user that HFDesk is already running.
 	alreadyRunningCaption = "HFDesk is already running"
-
-	// alreadyRunningOpenFailedCaption is the caption of the notice that
-	// tells the user that the web UI of the running instance could not be
-	// opened.
-	alreadyRunningOpenFailedCaption = "HFDesk could not open the web UI"
 )
+
+// logFailureCaption is the caption of the message box that reports a failure
+// of the persistent log.
+//
+// The desktop host has no console: a log file that stopped working is only
+// visible to the user in a message box.
+const logFailureCaption = "HFDesk - the log file failed"
+
+// browserOpenFailedCaption is the caption of the message box that reports a
+// failed browser launch.
+//
+// Every caller of the browser reports the failure the same way, so the user
+// always reads the same notice, whatever asked for the browser.
+const browserOpenFailedCaption = "HFDesk could not open the web UI"
 
 // alreadyRunningText returns the text of the notice of a launch that found
 // a running instance and opened the web UI of it.
@@ -48,11 +57,21 @@ func alreadyRunningUnreachableText() string {
 // record. The notice names what could not be opened, the reason of the
 // failure and the way to reach the running instance anyway.
 func alreadyRunningOpenFailedText(url string, openErr error) string {
-	text := fmt.Sprintf("HFDesk is already running.\n\n"+
-		"The running instance serves %s, but HFDesk could not open the web UI in your default browser.\n\n",
-		url)
+	return "HFDesk is already running.\n\n" +
+		browserOpenFailedText(url, openErr) +
+		"\n\nUse the icon in the notification area to open the Runtime / Logs window."
+}
+
+// browserOpenFailedText returns the text of the notice of a failed browser
+// launch.
+//
+// The text names the URL and the reason of the failure, and it never claims
+// that the web UI was opened. Every caller of the browser uses it, so the
+// user reads the same notice, whatever asked for the browser.
+func browserOpenFailedText(url string, openErr error) string {
+	text := fmt.Sprintf("HFDesk could not open the web UI in your default browser.\n\n%s", url)
 	if openErr != nil {
-		text += openErr.Error() + "\n\n"
+		text += "\n\n" + openErr.Error()
 	}
-	return text + "Use the icon in the notification area to open the Runtime / Logs window."
+	return text
 }

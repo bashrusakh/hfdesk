@@ -4,43 +4,60 @@
 package app
 
 import (
-	"runtime"
-	"strings"
+	"errors"
+	"reflect"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/internal/opener"
 )
 
-// TestBrowserCommandUsesThePlatformOpener proves that the browser is opened
-// with the opener of the current platform.
-func TestBrowserCommandUsesThePlatformOpener(t *testing.T) {
-	cmd := browserCommand("http://127.0.0.1:8080")
+// TestOpenBrowserUsesTheSharedOpener proves that the browser is opened
+// through the shared implementation of the package that owns the platform
+// behavior.
+//
+// The application layer has no platform behavior of its own: the mechanism
+// that opens a URL lives in the opener package, so the console host, the
+// desktop host and the server reach the browser the same way.
+func TestOpenBrowserUsesTheSharedOpener(t *testing.T) {
+	const url = "http://127.0.0.1:34567"
 
-	switch runtime.GOOS {
-	case "windows":
-		if len(cmd.Args) < 3 || cmd.Args[0] != "rundll32" || cmd.Args[1] != "url.dll,FileProtocolHandler" {
-			t.Errorf("command = %v, want the windows protocol handler", cmd.Args)
-		}
-	case "darwin":
-		if len(cmd.Args) < 2 || cmd.Args[0] != "open" {
-			t.Errorf("command = %v, want the mac opener", cmd.Args)
-		}
-	default:
-		if len(cmd.Args) < 2 || cmd.Args[0] != "xdg-open" {
-			t.Errorf("command = %v, want xdg-open", cmd.Args)
-		}
+	// The seam of the tests is the shared implementation itself.
+	if reflect.ValueOf(openURL).Pointer() != reflect.ValueOf(opener.OpenURL).Pointer() {
+		t.Error("the browser of the application layer is not the shared implementation of the opener")
 	}
 
-	if len(cmd.Args) == 0 || cmd.Args[len(cmd.Args)-1] != "http://127.0.0.1:8080" {
-		t.Errorf("command = %v, want it to carry the url", cmd.Args)
+	var opened []string
+	previous := openURL
+	openURL = func(target string) error {
+		opened = append(opened, target)
+		return nil
+	}
+	defer func() { openURL = previous }()
+
+	if err := OpenBrowser(url); err != nil {
+		t.Fatalf("OpenBrowser: %v", err)
+	}
+
+	if len(opened) != 1 || opened[0] != url {
+		t.Errorf("opened = %v, want the url %q", opened, url)
 	}
 }
 
-// TestBrowserCommandCarriesTheURL proves that the URL is passed to the
-// opener unchanged, so the running server is opened and not a rebuilt one.
-func TestBrowserCommandCarriesTheURL(t *testing.T) {
-	const url = "http://127.0.0.1:34567"
-	cmd := browserCommand(url)
+// TestOpenBrowserReportsTheFailureOfTheOpener proves that the failure of
+// the browser reaches the caller unchanged, so every caller reports the same
+// failure of the same launch.
+func TestOpenBrowserReportsTheFailureOfTheOpener(t *testing.T) {
+	failure := errors.New("the browser is missing")
 
-	if !strings.Contains(strings.Join(cmd.Args, " "), url) {
-		t.Errorf("command = %v, want it to carry %q", cmd.Args, url)
+	previous := openURL
+	openURL = func(string) error { return failure }
+	defer func() { openURL = previous }()
+
+	err := OpenBrowser("http://127.0.0.1:34567")
+	if err == nil {
+		t.Fatal("OpenBrowser returned no error for a failed launch")
+	}
+	if !errors.Is(err, failure) {
+		t.Errorf("error = %v, want the failure of the opener", err)
 	}
 }

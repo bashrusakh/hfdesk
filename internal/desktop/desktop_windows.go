@@ -79,6 +79,12 @@ func run(o Options, logPath string) (err error) {
 	var pipeline *logging.Pipeline
 	var shutdown func()
 
+	// logFailure reports the failure of the persistent log to the user. It
+	// is assigned when the pipeline is installed, and it is called before
+	// the pipeline is closed, so the failure of the log file is still
+	// available.
+	var logFailure *app.LogFailureReporter
+
 	// The state path is the path of the published state file. It is
 	// computed before anything of the host starts, so every goroutine of
 	// the host reads a path that never changes.
@@ -100,7 +106,7 @@ func run(o Options, logPath string) (err error) {
 			if shutdown != nil {
 				stopServer(shutdown)
 			}
-			closePipeline(pipeline)
+			closePipeline(pipeline, logFailure)
 		},
 	}
 
@@ -112,7 +118,7 @@ func run(o Options, logPath string) (err error) {
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
-			closePipelineWithFailure(pipeline, err)
+			closePipelineWithFailure(pipeline, err, logFailure)
 			return
 		}
 		detail := guard.report(recovered)
@@ -151,6 +157,19 @@ func run(o Options, logPath string) (err error) {
 	if err != nil {
 		return err
 	}
+
+	// The failure of the persistent log is reported to the user in a native
+	// message box: the desktop host has no console, so a failure that is
+	// only written to the log file leaves the user with a log file that
+	// silently stopped working.
+	//
+	// The subscription reports the failure while the host runs, and the
+	// report at the shutdown covers the failure that was recorded before
+	// the subscription started. The failure is reported once.
+	logFailure = app.NewLogFailureReporter(pipeline, func(text string) {
+		showMessage(logFailureCaption, text, windows.MB_ICONERROR)
+	})
+	logFailure.Subscribe()
 
 	// The GUI subsystem is a build time property of the linker. A binary
 	// that was built without it opens a console window next to the
@@ -273,7 +292,7 @@ func run(o Options, logPath string) (err error) {
 
 	if o.App.ShouldOpenUI() {
 		if err := application.OpenBrowser(); err != nil {
-			desktopLog.Warn("could not open the web UI", "error", err)
+			reportBrowserFailure(url, err)
 		}
 	}
 
@@ -335,7 +354,7 @@ func run(o Options, logPath string) (err error) {
 			// so a server that does not stop cannot keep the host from
 			// ending.
 			stopServer(shutdown)
-			_ = pipeline.Close()
+			closePipeline(pipeline, logFailure)
 			os.Exit(1)
 		}
 	})
@@ -346,7 +365,7 @@ func run(o Options, logPath string) (err error) {
 			// The URL comes from the application, so it is the very URL
 			// the startup opened and the two cannot drift apart.
 			if err := application.OpenBrowser(); err != nil {
-				desktopLog.Warn("could not open the web UI", "error", err)
+				reportBrowserFailure(url, err)
 			}
 		},
 		runtime: func() {
@@ -434,12 +453,20 @@ func stopServer(shutdown func()) {
 
 // closePipeline closes the log pipeline.
 //
+// The failure of the persistent log is reported to the user before the
+// pipeline is closed: the error of the pipeline is still available then.
+// The report is the last chance to tell the user that the log file stopped
+// working.
+//
 // The pipeline is closed by the panic handler of the host, because the
 // handler runs after the other deferred cleanups and the panic still has to
 // reach the log file. Closing it twice is harmless.
-func closePipeline(pipeline *logging.Pipeline) {
+func closePipeline(pipeline *logging.Pipeline, logFailure *app.LogFailureReporter) {
 	if pipeline == nil {
 		return
+	}
+	if logFailure != nil {
+		logFailure.Report()
 	}
 	_ = pipeline.Close()
 }
@@ -454,11 +481,11 @@ func closePipeline(pipeline *logging.Pipeline) {
 // the user is asked to attach to a bug report.
 //
 // A start that ends without a failure records nothing.
-func closePipelineWithFailure(pipeline *logging.Pipeline, err error) {
+func closePipelineWithFailure(pipeline *logging.Pipeline, err error, logFailure *app.LogFailureReporter) {
 	if err != nil {
 		desktopLog.Error("the desktop host could not start", "error", err)
 	}
-	closePipeline(pipeline)
+	closePipeline(pipeline, logFailure)
 }
 
 // setupLogging installs the logging pipeline of the desktop host.
@@ -512,8 +539,8 @@ func reportAlreadyRunning() {
 	}
 
 	if err := openBrowser(url); err != nil {
-		desktopLog.Warn("could not open the web UI of the running instance", "url", url, "error", err)
-		showMessage(alreadyRunningOpenFailedCaption,
+		desktopLog.Warn("could not open the web UI", "url", url, "error", err)
+		showMessage(browserOpenFailedCaption,
 			alreadyRunningOpenFailedText(url, err),
 			windows.MB_ICONERROR)
 		return
@@ -522,6 +549,23 @@ func reportAlreadyRunning() {
 	showMessage(alreadyRunningCaption,
 		alreadyRunningText(url),
 		windows.MB_ICONINFORMATION)
+}
+
+// reportBrowserFailure reports a failed browser launch to the user.
+//
+// The desktop host has no console: a failure that is only written to the log
+// file leaves the user with a click that did nothing. The failure is
+// therefore shown in a native message box, and it is recorded in the log
+// file as well.
+//
+// Every caller of the browser reports the failure this way, so the user
+// always learns that the web UI was not opened, and the notice never claims
+// that it was.
+func reportBrowserFailure(url string, err error) {
+	desktopLog.Warn("could not open the web UI", "url", url, "error", err)
+	showMessage(browserOpenFailedCaption,
+		browserOpenFailedText(url, err),
+		windows.MB_ICONERROR)
 }
 
 // showRuntimeWindow shows the Runtime / Logs window.

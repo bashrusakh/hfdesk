@@ -9,10 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/internal/opener"
 )
 
 // openBrowserURLStub records the URLs the open-ui action opened.
@@ -62,6 +64,19 @@ func runtimeOpenUIRequest(remoteAddr, origin, body string) *http.Request {
 		r.Header.Set("Origin", origin)
 	}
 	return r
+}
+
+// TestRuntimeOpenUIUsesTheSharedBrowser proves that the endpoint opens the
+// URL with the shared implementation of the opener package.
+//
+// The "Open HFDesk" button of the Runtime window, the browser launch of the
+// console host and the tray of the desktop host have to reach the browser
+// the same way: a URL is opened with the default handler of the operating
+// system, not with the file manager.
+func TestRuntimeOpenUIUsesTheSharedBrowser(t *testing.T) {
+	if reflect.ValueOf(openBrowserURL).Pointer() != reflect.ValueOf(opener.OpenURL).Pointer() {
+		t.Error("the endpoint does not use the shared implementation of the opener")
+	}
 }
 
 // TestRuntimeOpenUIRejectsNonLocalClients proves that the open-ui action is

@@ -158,6 +158,19 @@ events:
   records, or the cursor was ahead of every record the server holds:
   `{"dropped": 0, "cursor": 42}`. The client re-syncs the same way.
 
+The stream takes `after` and `level`, like the page. It takes **no**
+`limit`: a request that carries a limit value is rejected with `400` and an
+error that names the parameter. A limit on a stream is ambiguous — it could
+cap the replay, the live records or both — and a client cannot tell a stream
+that ignored the limit from a complete answer, so the stream refuses the
+parameter instead of accepting it and ignoring it. The page is the endpoint
+that bounds the size of an answer.
+
+The replay of the stream is bounded by the retained records of the in-memory
+ring: the log file is never read, so a stream replays at most the records
+the ring still holds. A window that already fell out of the ring is reported
+by the `gap` event, and the client re-syncs it with the page.
+
 The stream moves its position over the records it consumed, so the cursor it
 reports follows the same rule as the page: without a `level` filter it never
 names a record the client did not receive, and with one it can name a record
@@ -189,6 +202,10 @@ to open another location. It is a POST, because it changes the state of the
 desktop, and it is guarded by the same local-only rule as the other runtime
 endpoints. It answers `404` when the server is not bound yet, and `500` when
 the operating system did not open the browser.
+
+The URL is handed to the default handler of the operating system, the very
+mechanism the console host and the desktop host use to open the web UI, so
+every caller reaches the browser the same way.
 
 ```json
 {

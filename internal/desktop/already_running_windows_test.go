@@ -93,7 +93,7 @@ func TestSecondLaunchReportsAFailedBrowserOpen(t *testing.T) {
 
 	// The failure is recorded as well: the record is not the only place
 	// where the failure appears, but it stays.
-	if !records.contains("could not open the web UI of the running instance") {
+	if !records.contains("could not open the web UI") {
 		t.Errorf("the records of the second launch are %v, want the record of the failed open",
 			records.messages)
 	}

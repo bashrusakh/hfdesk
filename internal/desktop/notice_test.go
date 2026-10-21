@@ -73,3 +73,42 @@ func TestAlreadyRunningUnreachableTextClaimsNoOpenedWebUI(t *testing.T) {
 		t.Errorf("text = %q, want it to name the notification area icon", text)
 	}
 }
+
+// TestBrowserOpenFailedTextNamesTheFailure proves that the notice of a
+// failed browser launch names the URL and the reason of the failure.
+//
+// Every caller of the browser reports the failure the same way, so the user
+// always learns that the web UI was not opened, and why it was not opened.
+func TestBrowserOpenFailedTextNamesTheFailure(t *testing.T) {
+	text := browserOpenFailedText("http://127.0.0.1:8080",
+		errors.New("the browser could not be started"))
+
+	for _, want := range []string{
+		"could not open the web UI",
+		"http://127.0.0.1:8080",
+		"the browser could not be started",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text = %q, want it to mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "is opened in your default browser") {
+		t.Errorf("text = %q, want it to not claim that the web UI was opened", text)
+	}
+}
+
+// TestAlreadyRunningOpenFailedTextUsesTheBrowserNotice proves that the
+// notice of a second launch that could not open the web UI carries the same
+// browser failure as every other caller of the browser.
+//
+// The second launch adds the way to reach the running instance, but it
+// reports the failure of the browser the same way.
+func TestAlreadyRunningOpenFailedTextUsesTheBrowserNotice(t *testing.T) {
+	text := alreadyRunningOpenFailedText("http://127.0.0.1:8080",
+		errors.New("the browser could not be started"))
+
+	if !strings.Contains(text, browserOpenFailedText("http://127.0.0.1:8080",
+		errors.New("the browser could not be started"))) {
+		t.Errorf("text = %q, want it to carry the notice of the browser failure", text)
+	}
+}

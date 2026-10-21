@@ -392,3 +392,134 @@ func TestFileSinkRequiresWritablePath(t *testing.T) {
 		t.Fatalf("log file was not created: %v", err)
 	}
 }
+
+// newFailingFilePipeline builds a pipeline whose file sink fails to rotate
+// the log file.
+//
+// The rotation renames the active file next to the rotated one. A directory
+// in the place of the rotated file cannot be renamed over, and it cannot be
+// removed either, so the rotation fails on every platform. It is the
+// failure a user sees on Windows, where another process holds the log file
+// open while the rotation renames it.
+func newFailingFilePipeline(t *testing.T, path string) *Pipeline {
+	t.Helper()
+
+	backup := path + ".1"
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatalf("create the blocking rotated file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("fill the blocking rotated file: %v", err)
+	}
+
+	p, err := New(Options{
+		File:           true,
+		FilePath:       path,
+		FileMaxSize:    512,
+		FileMaxBackups: 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	return p
+}
+
+// TestPipelineNotifiesTheWatcherOfAFailure proves that the pipeline tells a
+// watcher that it recorded a failure.
+//
+// The failure of a sink is the failure of the whole log: the file sink can
+// stop rotating the log file, and the pipeline keeps working with a log
+// that no longer grows. The failure has to leave the pipeline, so a host can
+// report it to the user.
+func TestPipelineNotifiesTheWatcherOfAFailure(t *testing.T) {
+	p := newFailingFilePipeline(t, filepath.Join(t.TempDir(), "hfdesk.log"))
+
+	failures := make(chan error, 4)
+	p.OnError(func(err error) { failures <- err })
+
+	// The records are large enough to push the log file past its maximum
+	// size, so the sink rotates and the rotation fails.
+	logger := p.Logger()
+	payload := strings.Repeat("x", 256)
+	for i := range 10 {
+		logger.Info("rotating record", "index", i, "payload", payload)
+	}
+
+	select {
+	case err := <-failures:
+		if !strings.Contains(err.Error(), "file sink") {
+			t.Errorf("failure = %v, want it to name the sink that failed", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failure of the file sink was not reported to the watcher")
+	}
+
+	if p.Err() == nil {
+		t.Error("the pipeline holds no failure after the rotation failed")
+	}
+}
+
+// TestPipelineNotifiesALateWatcherOfAFailure proves that a watcher that
+// starts watching after the failure was recorded still learns about it.
+//
+// The failure can happen before the host starts watching, for example while
+// the pipeline is installed. A watcher that missed it would never report it.
+func TestPipelineNotifiesALateWatcherOfAFailure(t *testing.T) {
+	p := newFailingFilePipeline(t, filepath.Join(t.TempDir(), "hfdesk.log"))
+
+	// The failure happens before the watcher is registered.
+	logger := p.Logger()
+	payload := strings.Repeat("x", 256)
+	for i := range 10 {
+		logger.Info("rotating record", "index", i, "payload", payload)
+	}
+	if p.Err() == nil {
+		t.Fatal("the pipeline holds no failure after the rotation failed")
+	}
+
+	failures := make(chan error, 4)
+	p.OnError(func(err error) { failures <- err })
+
+	select {
+	case err := <-failures:
+		if err == nil {
+			t.Error("the watcher was told about a failure that is not an error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the late watcher was not told about the failure")
+	}
+}
+
+// TestPipelineReportsAFailureOnlyOnce proves that the pipeline records the
+// first failure of a sink and keeps it, so the failure is reported once and
+// not repeated for every record that follows.
+func TestPipelineReportsAFailureOnlyOnce(t *testing.T) {
+	p := newFailingFilePipeline(t, filepath.Join(t.TempDir(), "hfdesk.log"))
+
+	failures := make(chan error, 8)
+	p.OnError(func(err error) { failures <- err })
+
+	logger := p.Logger()
+	payload := strings.Repeat("x", 256)
+	for i := range 10 {
+		logger.Info("rotating record", "index", i, "payload", payload)
+	}
+
+	select {
+	case <-failures:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failure of the file sink was not reported to the watcher")
+	}
+
+	// The pipeline holds the first failure, and the watcher is not told
+	// about it again.
+	if p.Err() == nil {
+		t.Error("the pipeline holds no failure")
+	}
+	select {
+	case err := <-failures:
+		t.Errorf("the failure was reported again: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

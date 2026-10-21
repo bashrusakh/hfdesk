@@ -212,9 +212,13 @@ var openLogDirectory = opener.Open
 // openBrowserURL hands a URL to the default browser of the operating
 // system.
 //
+// It is the one implementation of "open a URL with the default handler", so
+// this endpoint, the browser launch of the hosts and the tray of the desktop
+// host all reach the browser the same way.
+//
 // It is a package level variable so the tests can replace it: the real
 // opener starts a browser, which a test must not do.
-var openBrowserURL = opener.Open
+var openBrowserURL = opener.OpenURL
 
 // handleRuntimeOpenUI opens the web UI of the running server in the default
 // browser.
@@ -332,7 +336,7 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 // first and then continues with the live records. It ends when the client
 // goes away and releases its subscription on the way out.
 func (s *Server) handleRuntimeLogStream(w http.ResponseWriter, r *http.Request) {
-	query, err := parseRuntimeLogQuery(r)
+	query, err := parseRuntimeLogStreamQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid query", err.Error())
 		return
@@ -618,6 +622,30 @@ func parseRuntimeLogQuery(r *http.Request) (runtimeLogQuery, error) {
 	}
 
 	return parsed, nil
+}
+
+// parseRuntimeLogStreamQuery parses the query parameters of the log stream.
+//
+// The stream takes no limit, and a request that carries one is rejected
+// instead of being served without it.
+//
+// A limit on a stream is ambiguous: it could cap the replay, the live
+// records or both, and every one of those readings leaves out records the
+// client asked for. A stream that accepted the parameter and ignored it
+// would let the client believe that it received every record, and a stream
+// that honored it in one of the readings would let the client believe the
+// same about the other readings. Neither can be told apart by the client,
+// so the stream rejects the parameter with an error that names it: a
+// request that fails is never mistaken for a complete answer.
+func parseRuntimeLogStreamQuery(r *http.Request) (runtimeLogQuery, error) {
+	// The limit is checked before the other parameters: the stream does
+	// not take it, so the answer says so whatever the value is.
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		return runtimeLogQuery{limit: runtimeLogsDefaultLimit}, fmt.Errorf("the parameter %q is not accepted by the log stream: "+
+			"the stream replays every retained record and takes no limit", "limit")
+	}
+
+	return parseRuntimeLogQuery(r)
 }
 
 // newRuntimeLogRecord converts a pipeline record into its wire shape.

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/assets"
 	"github.com/bashrusakh/hfdesk/internal/logging"
 )
 
@@ -889,6 +891,115 @@ func TestRuntimeLogStreamSurvivesServerWriteTimeout(t *testing.T) {
 	}
 	if late.Message != "late record" {
 		t.Errorf("late message = %q, want %q", late.Message, "late record")
+	}
+}
+
+// TestRuntimeLogStreamRejectsALimit proves that the log stream does not
+// accept a limit it does not honor.
+//
+// A limit on a stream is ambiguous: it could cap the replay, the live
+// records or both, and a client cannot tell a stream that ignored the limit
+// from a complete answer. The request is therefore rejected with an error
+// that names the parameter, so a client never mistakes a partial answer for
+// a complete one.
+func TestRuntimeLogStreamRejectsALimit(t *testing.T) {
+	pipeline, logger := newRuntimeTestPipeline(t, 16)
+	logger.Info("retained record")
+
+	handler := newRuntimeTestServer(pipeline).handler()
+
+	for _, query := range []string{"limit=10", "after=0&limit=10", "limit=not-a-number"} {
+		t.Run(query, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, runtimeRequest(http.MethodGet, "/api/runtime/logs/stream?"+query, "127.0.0.1:5555"))
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "limit") {
+				t.Errorf("the body %q does not name the rejected parameter", body)
+			}
+			if !strings.Contains(body, "stream") {
+				t.Errorf("the body %q does not say that the stream does not take the parameter", body)
+			}
+			if got := recorder.Header().Get("Content-Type"); got == "text/event-stream" {
+				t.Errorf("content type = %q, want the rejected request not to be a stream", got)
+			}
+		})
+	}
+}
+
+// TestRuntimeLogStreamAcceptsTheShippedClientRequest proves that the request
+// of the shipped client is still accepted.
+//
+// The shipped view connects to the stream with the cursor it holds and sends
+// no limit, so the rejection of a limit does not touch it.
+func TestRuntimeLogStreamAcceptsTheShippedClientRequest(t *testing.T) {
+	pipeline, logger := newRuntimeTestPipeline(t, 32)
+	logger.Info("first")
+	logger.Info("second")
+
+	s := newRuntimeTestServer(pipeline)
+	server := httptest.NewServer(s.handler())
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/runtime/logs/stream?after=1", nil)
+	if err != nil {
+		t.Fatalf("build stream request: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("open log stream: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %q)", response.StatusCode, http.StatusOK, response.Body)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("content type = %q, want %q", got, "text/event-stream")
+	}
+
+	// The stream replays the records after the cursor of the client.
+	event := readRuntimeLogEvent(t, bufio.NewReader(response.Body))
+	if event.Name != "log" {
+		t.Fatalf("event = %q, want a log event", event.Name)
+	}
+	var replayed RuntimeLogRecord
+	if err := json.Unmarshal([]byte(event.Data), &replayed); err != nil {
+		t.Fatalf("decode replayed record %q: %v", event.Data, err)
+	}
+	if replayed.Message != "second" {
+		t.Errorf("replayed message = %q, want the record after the cursor", replayed.Message)
+	}
+}
+
+// TestShippedRuntimeViewSendsNoLimitToTheStream proves that the shipped view
+// does not send a limit to the log stream.
+//
+// The stream rejects a limit, and the shipped view has to keep working: it
+// connects to the stream with the cursor it holds and sends nothing else.
+func TestShippedRuntimeViewSendsNoLimitToTheStream(t *testing.T) {
+	source, err := fs.ReadFile(assets.StaticFS(), "js/runtime.js")
+	if err != nil {
+		t.Fatalf("read the shipped runtime view: %v", err)
+	}
+
+	found := false
+	for _, line := range strings.Split(string(source), "\n") {
+		if !strings.Contains(line, "/api/runtime/logs/stream") {
+			continue
+		}
+		found = true
+		if strings.Contains(line, "limit") {
+			t.Errorf("the shipped view sends a limit to the log stream: %q", strings.TrimSpace(line))
+		}
+	}
+	if !found {
+		t.Error("the shipped view does not open the log stream at all")
 	}
 }
 

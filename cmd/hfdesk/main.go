@@ -61,6 +61,19 @@ func run() (err error) {
 		reportFailure(err)
 		return err
 	}
+
+	// The failure of the persistent log is reported to the user: the file
+	// sink can fail to rotate the log file, and a log file that stopped
+	// working is a problem the user has to know about.
+	//
+	// The console host has a console, so the failure goes to standard
+	// error. The subscription reports it while the application runs, and
+	// the report at the shutdown covers the failure that was recorded
+	// before the subscription started. The failure is reported once.
+	logFailure := app.NewLogFailureReporter(pipeline, func(text string) {
+		fmt.Fprintln(os.Stderr, text)
+	})
+	logFailure.Subscribe()
 	defer func() {
 		// The failure is recorded through the pipeline before the pipeline
 		// is closed: a closed file sink drops the records that are emitted
@@ -68,6 +81,13 @@ func run() (err error) {
 		if err != nil {
 			reportFailure(err)
 		}
+		// The failure of the log file is reported before the pipeline is
+		// closed, so the error of the pipeline is still available.
+		//
+		// The failure of the log file never changes the exit code of the
+		// host: a log file that could not be rotated is not a reason to
+		// fail a download that otherwise succeeded.
+		logFailure.Report()
 		_ = pipeline.Close()
 	}()
 
@@ -85,7 +105,11 @@ func run() (err error) {
 
 	if opts.ShouldOpenUI() {
 		if err := application.OpenBrowser(); err != nil {
-			logging.Component("app").Warn("could not open the web UI", "error", err)
+			// The failure of the browser is reported the same way for
+			// every caller: the same message, the URL that could not be
+			// opened and the reason of the failure.
+			logging.Component("app").Warn("could not open the web UI",
+				"url", application.URL(), "error", err)
 		}
 	}
 

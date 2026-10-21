@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/server"
@@ -92,6 +93,98 @@ func parseLogLevel(value string) (slog.Level, error) {
 		return slog.LevelInfo, fmt.Errorf("invalid log level %q: expected one of debug, info, warn or error", value)
 	}
 	return level, nil
+}
+
+// LogFailureText returns the text that reports the failure of the persistent
+// log to the user.
+//
+// The text names the problem and the log file, so the user can tell that the
+// log stopped working and can find the file that stopped working. Both hosts
+// use it, so the console and the desktop host tell the user the same thing
+// about the same failure.
+func LogFailureText(err error, logPath string) string {
+	if err == nil {
+		return ""
+	}
+	text := "HFDesk could not keep writing its log.\n\n" + err.Error()
+	if logPath != "" {
+		text += "\n\nThe log file is at " + logPath + "."
+	}
+	return text
+}
+
+// LogFailureReporter reports the failure of the persistent log to the user.
+//
+// The reporter is the single place where the "reported once" rule lives: the
+// subscription and the check at the shutdown share one guard, so the user is
+// never told twice about the same failure.
+type LogFailureReporter struct {
+	// once guards the report, so the failure is reported once.
+	once sync.Once
+	// pipeline holds the failure of the persistent log.
+	pipeline *logging.Pipeline
+	// logPath is the path of the log file. It is named in the report.
+	logPath string
+	// report shows the failure to the user.
+	report func(text string)
+}
+
+// NewLogFailureReporter returns a reporter for the failures of the given
+// pipeline.
+//
+// The reporter does nothing on its own: the host subscribes it to the
+// pipeline and reports the pending failure before it closes the pipeline.
+func NewLogFailureReporter(pipeline *logging.Pipeline, report func(text string)) *LogFailureReporter {
+	reporter := &LogFailureReporter{report: report}
+	if pipeline != nil {
+		reporter.pipeline = pipeline
+		reporter.logPath = pipeline.FilePath()
+	}
+	return reporter
+}
+
+// Subscribe reports the failure of the persistent log as soon as the
+// pipeline records it.
+//
+// The pipeline records the failure of a sink when it happens, so the
+// subscription is event driven: the reporter never polls the pipeline, and a
+// user whose log file died does not have to quit the application to learn
+// about it.
+//
+// The report happens on a goroutine of the pipeline, so the reporting never
+// blocks the pipeline.
+func (r *LogFailureReporter) Subscribe() {
+	if r == nil || r.pipeline == nil {
+		return
+	}
+	r.pipeline.OnError(func(err error) {
+		r.reportFailure(err)
+	})
+}
+
+// Report reports the failure the pipeline holds, when nothing reported it
+// yet.
+//
+// The host calls it before it closes the pipeline: the error of the pipeline
+// is still available then, and a closed pipeline cannot report it anymore.
+func (r *LogFailureReporter) Report() {
+	if r == nil || r.pipeline == nil {
+		return
+	}
+	r.reportFailure(r.pipeline.Err())
+}
+
+// reportFailure shows the failure to the user, once.
+func (r *LogFailureReporter) reportFailure(err error) {
+	if err == nil {
+		return
+	}
+	r.once.Do(func() {
+		if r.report == nil {
+			return
+		}
+		r.report(LogFailureText(err, r.logPath))
+	})
 }
 
 // DefaultLogPath returns a per-user path for the rotating log file, e.g.

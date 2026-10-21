@@ -4,10 +4,18 @@
 package app
 
 import (
-	"fmt"
-	"os/exec"
-	"runtime"
+	"github.com/bashrusakh/hfdesk/internal/opener"
 )
+
+// openURL hands a URL to the default browser of the operating system.
+//
+// The mechanism lives in the package that owns the platform behavior, so
+// every caller of the browser uses the very same one.
+//
+// It is a package level variable so the tests can replace it: the browser of
+// the machine is not the browser of a test, and the path that reports a
+// failed open needs a browser that fails.
+var openURL = opener.OpenURL
 
 // OpenBrowser opens the application URL in the user's default browser.
 //
@@ -22,26 +30,8 @@ func (a *App) OpenBrowser() error {
 // It is exported so a host can open an arbitrary URL if it ever needs to.
 //
 // The browser is started, not waited for, so opening it never blocks the
-// server.
+// server. The failure is reported the same way for every caller: the error
+// of the opener names the URL that could not be opened.
 func OpenBrowser(url string) error {
-	cmd := browserCommand(url)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("open browser: %w", err)
-	}
-	// Reap the helper process, so it does not stay behind as a zombie.
-	go func() { _ = cmd.Wait() }()
-	return nil
-}
-
-// browserCommand returns the command that opens a URL in the default
-// browser of the current platform.
-func browserCommand(url string) *exec.Cmd {
-	switch runtime.GOOS {
-	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		return exec.Command("open", url)
-	default:
-		return exec.Command("xdg-open", url)
-	}
+	return openURL(url)
 }

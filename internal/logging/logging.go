@@ -92,8 +92,9 @@ type Pipeline struct {
 	subs      map[*Subscription]struct{}
 	subBuffer int
 
-	errMu sync.Mutex
-	err   error
+	errMu    sync.Mutex
+	err      error
+	errHooks []func(error)
 }
 
 // defaultPipeline holds the pipeline installed as the process wide default.
@@ -246,12 +247,50 @@ func (p *Pipeline) Err() error {
 	return p.err
 }
 
-// recordErr stores the first error a sink reported.
+// OnError registers a callback that is called when the pipeline records its
+// first error.
+//
+// The callback runs on a goroutine of its own, so a callback that reports the
+// failure to the user never blocks the pipeline: the pipeline keeps writing
+// its records while the user reads the report.
+//
+// The callback is called once, with the first error the pipeline recorded. A
+// callback that is registered after the pipeline already recorded an error
+// is called with that error, so a caller never misses a failure that
+// happened before it started watching.
+func (p *Pipeline) OnError(fn func(error)) {
+	if fn == nil {
+		return
+	}
+
+	p.errMu.Lock()
+	p.errHooks = append(p.errHooks, fn)
+	err := p.err
+	p.errMu.Unlock()
+
+	if err != nil {
+		go fn(err)
+	}
+}
+
+// recordErr stores the first error a sink reported and tells the watchers.
+//
+// The watchers run on goroutines of their own: a watcher that reports the
+// failure to the user may wait for the user, and the pipeline must not stop
+// writing its records because of that.
 func (p *Pipeline) recordErr(err error) {
 	p.errMu.Lock()
-	defer p.errMu.Unlock()
-	if p.err == nil {
-		p.err = err
+	if p.err != nil {
+		p.errMu.Unlock()
+		return
+	}
+	p.err = err
+	hooks := make([]func(error), len(p.errHooks))
+	copy(hooks, p.errHooks)
+	p.errMu.Unlock()
+
+	for _, hook := range hooks {
+		go hook(err)
 	}
 }
 
@@ -287,12 +326,14 @@ func (p *Pipeline) emit(rec Record) {
 	rec.Seq = p.seq.Add(1)
 	if p.console != nil {
 		if err := p.console.Write(rec); err != nil {
-			p.recordErr(err)
+			// The name of the sink is part of the error, so a report of
+			// the failure tells the user which part of the logging died.
+			p.recordErr(fmt.Errorf("logging: the console sink failed: %w", err))
 		}
 	}
 	if p.file != nil {
 		if err := p.file.Write(rec); err != nil {
-			p.recordErr(err)
+			p.recordErr(fmt.Errorf("logging: the file sink failed: %w", err))
 		}
 	}
 	p.ring.Append(rec)
