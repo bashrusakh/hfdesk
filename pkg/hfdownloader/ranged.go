@@ -1427,7 +1427,12 @@ type stagingDownload struct {
 	// record carrying it forces the proof in every mode except Verify="none".
 	proofPending bool
 
-	metaMu sync.Mutex // guards ranges + meta rewrites
+	// metaMu guards the range layout and every meta rewrite. The layout's
+	// mutable fields (RangeProgress.Committed/Done) are owner-shared state:
+	// the claim heartbeat normalizes them in place, and every range worker
+	// advances its own range's committed prefix. They are therefore only
+	// read or written while this gate is held.
+	metaMu sync.Mutex
 
 	// progress counts bytes written this run; emitted progress is
 	// baseCommitted + progress, and never decreases within a run.
@@ -1439,7 +1444,21 @@ type stagingDownload struct {
 
 	// seqHash, when non-nil, is fed every staging write in order: strict
 	// hash-on-write for the single fresh sequential transfer.
+	//
+	// It is owner-shared state: every range worker inspects it on each write
+	// and may invalidate it when a response's framing cannot be trusted. It
+	// is therefore only read or written while seqMu is held, and the hash
+	// itself is only fed while seqMu is held, so the hash's internal state
+	// and the nil/non-nil decision can never be observed inconsistently.
+	//
+	// It is only ever non-nil for a strictly sequential transfer (one task
+	// covering the whole payload from offset 0), which also means only one
+	// worker exists while it is live.
 	seqHash hashWriter
+	// seqMu guards seqHash: its nil/non-nil state, the hash's own bytes,
+	// and the invalidation that switches the transfer over to the single
+	// final full-file pass. It is never held across network I/O.
+	seqMu sync.Mutex
 
 	// One heartbeat goroutine per download keeps the claim record fresh
 	// through every post-claim phase: transfers, retry/Retry-After waits, the
@@ -1554,6 +1573,24 @@ func (d *stagingDownload) heartbeatError() error {
 	d.heartbeatMu.Lock()
 	defer d.heartbeatMu.Unlock()
 	return d.heartbeatErr
+}
+
+// seqHashDigest returns the hex digest of the hash-on-write state and
+// whether that state was usable. The decision and the digest are taken
+// together under seqMu, so the digest can never be read from a hash that a
+// worker invalidated concurrently, and the hash's internal state is never
+// summed while another worker is feeding it.
+//
+// A false result means the caller must fall back to the single final
+// full-file pass: the hash-on-write state is absent, or it was invalidated
+// because a response's framing could not be trusted.
+func (d *stagingDownload) seqHashDigest() (string, bool) {
+	d.seqMu.Lock()
+	defer d.seqMu.Unlock()
+	if d.seqHash == nil {
+		return "", false
+	}
+	return hex.EncodeToString(d.seqHash.Sum(nil)), true
 }
 
 // closeOut closes the staging handle exactly once so Windows can unlink the
@@ -2009,8 +2046,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		d.proofPending = true
 	}
 	proofPendingForFlush := d.proofPending
-	d.metaMu.Unlock()
+	// The committed baseline is read from the shared layout, so it is
+	// derived under the same gate that guards the layout. The heartbeat
+	// rewrites the layout concurrently; reading it unlocked would race
+	// with the heartbeat's in-place normalization.
 	d.baseCommitted = committedTotal(d.ranges)
+	d.metaMu.Unlock()
 
 	if err := d.flushMeta(); err != nil {
 		d.applyCancelCleanup()
@@ -2048,6 +2089,14 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// bytes and never invalidates committed ones. Completion is normalized
 	// defensively here too: a complete-prefix range is never turned into a
 	// bytes=End+1-End request.
+	//
+	// The layout is owner-shared state: the claim heartbeat normalizes the
+	// same Committed/Done fields in place while this download derives its
+	// work. The derivation therefore runs under the metadata gate, so the
+	// heartbeat's normalization and this read-modify-write of the same
+	// fields are serialized. The gate is released before any network work:
+	// the derived task list is a private snapshot of the layout.
+	d.metaMu.Lock()
 	tasks := make([]rangeTask, 0, len(d.ranges))
 	for i := range d.ranges {
 		r := &d.ranges[i]
@@ -2059,6 +2108,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}
 		tasks = append(tasks, rangeTask{idx: i, from: r.Start + r.Committed})
 	}
+	// The strict hash-on-write precondition reads the layout's bounds for
+	// the single derived task; it is read under the same gate.
+	seqHashEligible := cfg.Verify == "sha256" && it.LFS && it.SHA256 != "" &&
+		len(tasks) == 1 && d.baseCommitted == 0 &&
+		d.ranges[tasks[0].idx].Start == 0 && d.ranges[tasks[0].idx].End == it.Size-1
+	d.metaMu.Unlock()
 
 	// Strict hash-on-write is only possible when this run writes the whole
 	// payload sequentially from offset 0: one task covering [0, size) with
@@ -2066,10 +2121,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// to the single pre-publish full-file pass below. Only Verify=sha256
 	// feeds the hash on write; Verify=etag uses the same single final pass
 	// (at most one full-file read either way).
-	if cfg.Verify == "sha256" && it.LFS && it.SHA256 != "" &&
-		len(tasks) == 1 && d.baseCommitted == 0 &&
-		d.ranges[tasks[0].idx].Start == 0 && d.ranges[tasks[0].idx].End == it.Size-1 {
+	if seqHashEligible {
+		d.seqMu.Lock()
 		d.seqHash = sha256.New()
+		d.seqMu.Unlock()
 	}
 
 	// partErr records the first permanent range error so the caller
@@ -2281,11 +2336,18 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	contentVerified := false
 	if needContentProof {
 		sum := ""
-		if cfg.Verify == "sha256" && it.LFS && d.seqHash != nil {
+		usedSeqHash := false
+		if cfg.Verify == "sha256" && it.LFS {
 			// The single sequential task fed the hash with every staging
-			// write, in order, from offset 0.
-			sum = hex.EncodeToString(d.seqHash.Sum(nil))
-		} else {
+			// write, in order, from offset 0. The digest and the decision to
+			// use it are taken together, so a hash that a worker invalidated
+			// (untrusted framing) is never summed.
+			if digest, ok := d.seqHashDigest(); ok {
+				sum = digest
+				usedSeqHash = true
+			}
+		}
+		if !usedSeqHash {
 			// One sequential full-file pass over the completed staging file,
 			// bounded by the part context so a user cancel, a heartbeat failure
 			// or a sibling abort stops the pass promptly; computeSHA256Ctx
@@ -2549,9 +2611,17 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 						d.progress.Add(end - countedUpTo)
 						countedUpTo = end
 					}
+					// The hash-on-write state is owner-shared: another worker
+					// may invalidate it concurrently. The decision and the
+					// hash's own bytes are taken together under seqMu, so a
+					// byte is never fed into a hash that is being dropped,
+					// and the hash's internal state is never mutated
+					// concurrently with a read of its digest.
+					d.seqMu.Lock()
 					if d.seqHash != nil {
 						_, _ = d.seqHash.Write(p)
 					}
+					d.seqMu.Unlock()
 				}
 				_, cerr := io.Copy(w, paced)
 				rs.Body.Close()
@@ -2592,7 +2662,12 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 						accepted--
 						// The hash consumed this byte, and the retry will feed it
 						// again. Drop hash-on-write for one final full-file pass.
+						// The invalidation is a shared-state write, so it
+						// happens under seqMu like every other access to the
+						// hash-on-write state.
+						d.seqMu.Lock()
 						d.seqHash = nil
+						d.seqMu.Unlock()
 					}
 					pos += accepted
 					d.metaMu.Lock()
@@ -2617,8 +2692,14 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				// re-requests this same range and would feed its bytes into the
 				// same hash a second time, so no valid retry could ever verify.
 				// Drop it and fall back to exactly one final full-file pass.
+				//
+				// The invalidation is a shared-state write: parallel workers
+				// can reach this branch concurrently, so it happens under
+				// seqMu like every other access to the hash-on-write state.
 				if overflow {
+					d.seqMu.Lock()
 					d.seqHash = nil
+					d.seqMu.Unlock()
 				}
 			}
 		default:
