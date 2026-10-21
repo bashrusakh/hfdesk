@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,6 +24,54 @@ import (
 // interactiveFlagPattern matches the registration of a flag of the
 // interactive command line, e.g. `flag.IntVar(&port, "port", 8080, ...)`.
 var interactiveFlagPattern = regexp.MustCompile(`flag\.\w+Var\(&\w+, "([^"]+)"`)
+
+// fakeManager is a service.Manager that answers with a fixed status.
+//
+// The command family is exercised without touching the system of the test
+// run: the manager of the platform supervisor is replaced by this one.
+type fakeManager struct {
+	status service.Status
+	err    error
+}
+
+func (m fakeManager) Install(context.Context, service.InstallOptions) error { return nil }
+
+func (m fakeManager) Uninstall(context.Context) error { return nil }
+
+func (m fakeManager) Start(context.Context) error { return nil }
+
+func (m fakeManager) Stop(context.Context) error { return nil }
+
+func (m fakeManager) Restart(context.Context) error { return nil }
+
+func (m fakeManager) Status(context.Context) (service.Status, error) {
+	return m.status, m.err
+}
+
+// personalCacheRoot returns the Hugging Face cache of the user that runs
+// the test.
+//
+// It is the cache a user scope instance used to be reported with, even when
+// the instance used another one, so it is the value the reports must never
+// name.
+func personalCacheRoot(t *testing.T) string {
+	t.Helper()
+	root, _ := service.DefaultCacheDirs(service.ScopeUser, runtimepaths.Paths{})
+	return root
+}
+
+// writeConfigFile writes the config file of an instance with the given
+// cache root.
+func writeConfigFile(t *testing.T, path, cacheRoot string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"cache-dir": cacheRoot})
+	if err != nil {
+		t.Fatalf("encode the config file: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write the config file: %v", err)
+	}
+}
 
 func TestServiceUsageListsEverySubcommand(t *testing.T) {
 	var buf bytes.Buffer
@@ -278,6 +328,264 @@ func TestRenderStatusReportsTheInstance(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("the status does not report %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestRenderStatusReportsTheCacheRootOfTheInstance checks that the status
+// reports the cache root the instance uses, and not the cache of the user
+// that runs the command.
+func TestRenderStatusReportsTheCacheRootOfTheInstance(t *testing.T) {
+	status := service.Status{
+		State:      service.StateRunning,
+		Scope:      service.ScopeUser,
+		Name:       service.ServiceName,
+		UnitPath:   "/etc/systemd/user/hfdesk.service",
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		CacheDir: "/srv/instance-cache",
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, service.ScopeUser, status)
+
+	out := buf.String()
+	if !strings.Contains(out, "/srv/instance-cache") {
+		t.Errorf("the status does not report the cache root of the instance:\n%s", out)
+	}
+	if personal := personalCacheRoot(t); personal != "" && strings.Contains(out, personal) {
+		t.Errorf("the status reports the personal cache of the invoking user %q:\n%s", personal, out)
+	}
+}
+
+// TestRenderStatusFallsBackToTheConfigFileOfTheInstance checks that the
+// status reports the cache root of the config file of the instance when the
+// supervisor does not report one.
+func TestRenderStatusFallsBackToTheConfigFileOfTheInstance(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "hfdesk.json")
+	cacheRoot := filepath.Join(dir, "instance-cache")
+	writeConfigFile(t, configFile, cacheRoot)
+
+	status := service.Status{
+		State: service.StateRunning,
+		Scope: service.ScopeUser,
+		Paths: runtimepaths.Paths{
+			ConfigFile: configFile,
+			StateDir:   filepath.Join(dir, "state"),
+			LogDir:     filepath.Join(dir, "logs"),
+		},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, service.ScopeUser, status)
+
+	out := buf.String()
+	if !strings.Contains(out, cacheRoot) {
+		t.Errorf("the status does not report the cache root %q of the config file:\n%s", cacheRoot, out)
+	}
+	if personal := personalCacheRoot(t); personal != "" && strings.Contains(out, personal) {
+		t.Errorf("the status reports the personal cache of the invoking user %q:\n%s", personal, out)
+	}
+}
+
+// TestRenderStatusReportsAnUnrecordedCacheRoot checks that a cache root
+// that no source names is reported as unknown instead of the default of the
+// scope or the personal cache of the invoking user.
+func TestRenderStatusReportsAnUnrecordedCacheRoot(t *testing.T) {
+	dir := t.TempDir()
+	status := service.Status{
+		State: service.StateNotInstalled,
+		Scope: service.ScopeUser,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(dir, "missing.json"),
+			StateDir:   filepath.Join(dir, "state"),
+			LogDir:     filepath.Join(dir, "logs"),
+		},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, service.ScopeUser, status)
+
+	out := buf.String()
+	if !strings.Contains(out, "not recorded") {
+		t.Errorf("the status does not report that the cache root is not recorded:\n%s", out)
+	}
+	if personal := personalCacheRoot(t); personal != "" && strings.Contains(out, personal) {
+		t.Errorf("the status reports the personal cache of the invoking user %q:\n%s", personal, out)
+	}
+}
+
+// TestInstallSummaryReportsTheStateOfTheInstance checks that the summary of
+// the installation reports the state the instance reached and that the hint
+// that starts the instance is printed for every state that is not an active
+// one.
+func TestInstallSummaryReportsTheStateOfTheInstance(t *testing.T) {
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		CacheDir: "/srv/cache",
+	}
+
+	for _, tc := range []struct {
+		state    service.State
+		wantHint bool
+	}{
+		{service.StateRunning, false},
+		{service.StateStarting, false},
+		{service.StateStopped, true},
+		{service.StateFailed, true},
+	} {
+		var buf bytes.Buffer
+		mgr := fakeManager{status: service.Status{
+			State:    tc.state,
+			Scope:    service.ScopeUser,
+			UnitPath: "/etc/systemd/user/hfdesk.service",
+		}}
+		writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+		out := buf.String()
+		if !strings.Contains(out, "State:") || !strings.Contains(out, string(tc.state)) {
+			t.Errorf("the install summary does not report the state %q:\n%s", tc.state, out)
+		}
+		hint := strings.Contains(out, "Start it with: hfdesk service start")
+		if hint != tc.wantHint {
+			t.Errorf("the install summary prints the start hint for the state %q: %v, want %v:\n%s",
+				tc.state, hint, tc.wantHint, out)
+		}
+		if strings.Contains(out, "not started") {
+			t.Errorf("the install summary claims that the instance was not started:\n%s", out)
+		}
+	}
+}
+
+// TestInstallSummaryReportsAFailedStatusQuery checks that a state that could
+// not be determined is reported as such, and that the successful
+// registration is reported nevertheless.
+func TestInstallSummaryReportsAFailedStatusQuery(t *testing.T) {
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		CacheDir: "/srv/cache",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{err: errors.New("the supervisor is not reachable")}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+	out := buf.String()
+	if !strings.Contains(out, "The service was registered.") {
+		t.Errorf("the install summary does not report the successful registration:\n%s", out)
+	}
+	if !strings.Contains(out, "could not be determined") {
+		t.Errorf("the install summary does not report the failed status query:\n%s", out)
+	}
+	for _, state := range []string{"running", "stopped", "starting"} {
+		if strings.Contains(out, state) {
+			t.Errorf("the install summary claims the state %q it could not determine:\n%s", state, out)
+		}
+	}
+}
+
+// TestInstallSummaryReportsTheEffectiveCacheRoot checks that the summary of
+// the installation names the cache root of the config file of the instance
+// when it defines one.
+func TestInstallSummaryReportsTheEffectiveCacheRoot(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "hfdesk.json")
+	cacheRoot := filepath.Join(dir, "instance-cache")
+	writeConfigFile(t, configFile, cacheRoot)
+
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: configFile,
+			StateDir:   filepath.Join(dir, "state"),
+			LogDir:     filepath.Join(dir, "logs"),
+		},
+		CacheDir: "/srv/cache",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+	out := buf.String()
+	if !strings.Contains(out, cacheRoot) {
+		t.Errorf("the install summary does not report the cache root %q of the config file:\n%s", cacheRoot, out)
+	}
+}
+
+// TestUninstallSummaryNamesTheEffectiveCacheRoot checks that the summary of
+// the uninstall names the cache root the instance uses.
+func TestUninstallSummaryNamesTheEffectiveCacheRoot(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "hfdesk.json")
+	cacheRoot := filepath.Join(dir, "instance-cache")
+	writeConfigFile(t, configFile, cacheRoot)
+
+	for _, tc := range []struct {
+		name   string
+		status service.Status
+		want   string
+	}{
+		{
+			name: "the cache root of the config file of the instance",
+			status: service.Status{
+				Paths: runtimepaths.Paths{
+					ConfigFile: configFile,
+					StateDir:   filepath.Join(dir, "state"),
+					LogDir:     filepath.Join(dir, "logs"),
+				},
+			},
+			want: cacheRoot,
+		},
+		{
+			name: "the cache root of the registration",
+			status: service.Status{
+				Paths: runtimepaths.Paths{
+					ConfigFile: filepath.Join(dir, "missing.json"),
+					StateDir:   filepath.Join(dir, "state"),
+					LogDir:     filepath.Join(dir, "logs"),
+				},
+				CacheDir: "/srv/registered-cache",
+			},
+			want: "/srv/registered-cache",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := fakeManager{status: tc.status}
+			paths, reported := instanceDataPaths(context.Background(), mgr, service.ScopeUser)
+
+			var buf bytes.Buffer
+			writeUninstallSummary(&buf, service.ScopeUser, paths, reported)
+
+			out := buf.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("the uninstall summary does not name the cache root %q:\n%s", tc.want, out)
+			}
+			if personal := personalCacheRoot(t); personal != "" && strings.Contains(out, personal) {
+				t.Errorf("the uninstall summary reports the personal cache of the invoking user %q:\n%s", personal, out)
+			}
+		})
 	}
 }
 

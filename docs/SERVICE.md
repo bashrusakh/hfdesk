@@ -79,6 +79,10 @@ The path flags override the default locations of the scope. Every path of an
 installation must be absolute; a relative path is rejected instead of being
 resolved against the working directory of the supervisor.
 
+A cache or output directory recorded in the registration is the **fallback**
+of the instance: the config file the instance owns wins over it (see
+[The effective cache root of an instance](#the-effective-cache-root-of-an-instance)).
+
 `install` validates the installation before it writes anything: the
 executable must exist, be a regular file and be executable, the bind address
 must be usable, and the runtime paths must be absolute. A failed installation
@@ -120,6 +124,36 @@ platform, for example `~/.config/HFDesk` on Linux and
 The state root holds the mutable runtime state of the instance: the job list,
 the download history and the mirror targets. The config file is the settings
 file of the instance and holds its credentials.
+
+## The effective cache root of an instance
+
+An instance has two sources for its storage locations: the registration it
+was installed with and the config file it owns. The **config file of the
+instance wins**:
+
+- When the config file defines a `cache-dir`, that is the cache root the
+  instance uses. The cache root recorded in the registration is the fallback
+  for an instance whose config file does not define one.
+- The same holds for the flat output directory (`local-dir`).
+- The hub directory follows the cache root: it is the `hub` child
+  (`<cache root>/hub`) of the cache root the config file of the instance
+  defines. Without a cache root from the config file, the hub directory
+  recorded in the registration is used, and a registration without one falls
+  back to the `hub` child of the effective cache root.
+
+By default the registration records the cache root of the scope: the
+Hugging Face cache of the user (`HF_HOME`, otherwise `~/.cache/huggingface`)
+for a user-scope instance, and `<state dir>/cache` for a machine-wide one
+(`/var/lib/hfdesk/cache` on Linux and macOS, `%ProgramData%\HFDesk\cache` on
+Windows).
+
+**Consequence for the user:** changing the cache directory in the settings of
+the service (`POST /api/settings`) is honoured by the next start of the
+service, because those settings are written into the config file of the
+instance and that file wins over the registration.
+
+The interactive CLI is unchanged: there a `--cache-dir` flag still wins over
+the config file, exactly like a `--local-dir` flag.
 
 ## Network exposure
 
@@ -180,12 +214,18 @@ supervisor: the systemd journal on Linux, the launchd log files on macOS.
 | `start` | Starts the registered service. |
 | `stop` | Stops the registered service. |
 | `restart` | Stops and starts the registered service. |
-| `status` | Reports scope, state, registration path, executable, bind address and runtime paths. |
+| `status` | Reports scope, state, registration path, executable, bind address, runtime paths and the effective cache root. |
 
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the
 history, not the logs. Removing the state of an instance is a separate,
 deliberate action.
+
+The `Cache root` line of `status` and of `uninstall` is the **effective**
+cache root of the instance — the one the instance actually uses (see
+[The effective cache root of an instance](#the-effective-cache-root-of-an-instance)).
+It is not necessarily the cache root that was recorded in the registration:
+an instance whose own config file defines a `cache-dir` uses that one.
 
 The commands are idempotent where the wanted state is already reached:
 
@@ -248,6 +288,33 @@ hfdesk service install            # re-registers the current binary
 - The property list holds the label, the program arguments and the environment
   of the instance — no credential.
 
+#### Future app-bundle packaging
+
+HFDesk ships a standalone CLI binary today. The LaunchAgent and the
+LaunchDaemon are therefore registered by writing a property list into
+`~/Library/LaunchAgents` or `/Library/LaunchDaemons`. That is the
+**transitional path**.
+
+On macOS 13 and later, Apple's
+[`SMAppService`](https://developer.apple.com/documentation/servicemanagement/smappservice)
+is the preferred API for registering a LaunchAgent or a LaunchDaemon that
+**lives inside an application bundle**: the registration becomes part of the
+bundle instead of a loose property list in a Library directory.
+
+If HFDesk later gains a proper `.app`, the registration path must **migrate**
+to `SMAppService`. The legacy property-list installation must not stay alive
+inside the app-bundle flow, so the two mechanisms never register the same
+service at the same time.
+
+The migration is deliberately **not** implemented now: it would require a
+Swift helper and an app bundle, and this work explicitly does not force
+either.
+
+**Consequence for the user:** a registration made by the current CLI keeps
+working. A future app bundle takes the registration over through
+`SMAppService`, and the app bundle and the CLI must not both register the
+same service at the same time.
+
 ### Windows (Service Control Manager)
 
 - The Service Control Manager is used **directly through the Go API**, never
@@ -260,6 +327,30 @@ hfdesk service install            # re-registers the current binary
   service does **not** recursively re-ACL or re-own an existing model or cache
   tree: changing the ownership of a large, possibly shared tree is an explicit
   decision of an administrator, not a side effect of an install.
+
+### The identity of a machine-wide instance
+
+A machine-wide (`--system`) instance runs as a deliberate, documented identity
+of its platform. It never inherits the home directory of the user who runs the
+install command, and it never inherits the personal profile of root.
+
+| Platform | The instance runs as | Why |
+|---|---|---|
+| Linux (systemd, `--system`) | **root** — the unit sets no `User=`, so the instance runs with the identity of the system manager itself | The installer creates no dedicated account. The unit owns the machine-level paths (`/etc/hfdesk/hfdesk.json`, `/var/lib/hfdesk`, `/var/log/hfdesk`) and sets `HOME=/var/lib/hfdesk`, so the instance inherits neither the home of root nor the cache of the invoking user. |
+| macOS (launchd, `--system`) | **root:wheel** (`UserName`/`GroupName` of the property list) | The same machine-level paths (`/etc/hfdesk/hfdesk.json`, `/var/lib/hfdesk`, `/var/log/hfdesk`) and the same `HOME` rule: the daemon uses `/var/lib/hfdesk` as its home, not the personal home of root. |
+| Windows (Service Control Manager) | **LocalService** (`NT AUTHORITY\LocalService`) | A documented minimum-privilege Windows service account. It is deliberately **not** `LocalSystem`: the instance needs no machine-wide privilege, and `LocalSystem` would give it more access than it uses. |
+
+**Consequences:**
+
+- A machine-wide instance on Linux and macOS can read and write everything
+  the root account can. Use one only on a machine that is dedicated to
+  serving models, and place the cache on a volume whose ownership fits the
+  identity of the instance.
+- The Windows instance has a profile and a filesystem access of its own: it
+  does not reuse `%APPDATA%` and it does not point at the model or cache
+  directories of the interactive user.
+- The **user-scope** instance is the one that keeps the identity of the user
+  and the access to their own Hugging Face cache.
 
 ### Privileged operations
 

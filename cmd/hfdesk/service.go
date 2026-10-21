@@ -44,6 +44,15 @@ const (
 
 	// serviceFailureExitCode is the exit code of an operation that failed.
 	serviceFailureExitCode = 1
+
+	// cacheRootNotRecorded is the wording of a cache root that no source
+	// names.
+	//
+	// The default of the scope and the personal cache of the invoking user
+	// are never reported instead: an instance that does not name a cache
+	// root does not use them, so naming them would send the reader to the
+	// wrong directory.
+	cacheRootNotRecorded = "not recorded (unknown)"
 )
 
 // serviceSubcommands lists the subcommands of the family in the order the
@@ -371,7 +380,9 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 // scope.
 //
 // The command validates its own arguments before it touches the system. It
-// never starts the instance: starting is a separate, explicit command.
+// never starts the instance itself: the supervisor may start a registration
+// that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
+// reports the state that was reached instead of a fixed claim.
 func serviceInstall(args []string, stdout io.Writer) error {
 	flags := installFlags{}
 	fs := flag.NewFlagSet("hfdesk service install", flag.ContinueOnError)
@@ -387,7 +398,7 @@ func serviceInstall(args []string, stdout io.Writer) error {
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			writeSubcommandUsage(stdout, fs, "Register HFDesk with the platform supervisor of the scope.\n\nThe registration is written, the instance is not started.")
+			writeSubcommandUsage(stdout, fs, "Register HFDesk with the platform supervisor of the scope.\n\nThe registration is written. The summary reports the state the supervisor\nreached: a registration that starts the instance starts it.")
 			return errHelpRequested
 		}
 		return fmt.Errorf("invalid command line: %w", err)
@@ -444,18 +455,24 @@ func serviceInstall(args []string, stdout io.Writer) error {
 
 // writeInstallSummary prints what was registered.
 //
-// The path of the registration is known only after the installation, so it
-// is read back from the supervisor.
+// The path of the registration and the state of the instance are known only
+// after the installation, so both are read back from the supervisor.
+//
+// The cache root is the effective one: the config file of the instance wins
+// over the registered value, because the cache directory is changed in the
+// settings of the instance and the change has to survive a restart.
 func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, scope service.Scope, opts service.InstallOptions) {
+	status, statusErr := mgr.Status(ctx)
+
 	writeField(w, "Service", service.ServiceName)
 	writeField(w, "Scope", string(scope))
-	writeField(w, "Registration", registrationPath(ctx, mgr))
+	writeField(w, "Registration", registrationPath(status))
 	writeField(w, "Executable", opts.Executable)
 	writeField(w, "Listen", opts.Listen)
 	writeField(w, "Config file", opts.Paths.ConfigFile)
 	writeField(w, "State dir", opts.Paths.StateDir)
 	writeField(w, "Log dir", opts.Paths.LogDir)
-	writeField(w, "Cache root", opts.CacheDir)
+	writeField(w, "Cache root", service.EffectiveCacheDir(opts.Paths.ConfigFile, opts.CacheDir))
 
 	if warning := nonLoopbackWarning(opts.Listen); warning != "" {
 		fmt.Fprintln(w)
@@ -467,13 +484,39 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "The service was registered but not started.")
-	fmt.Fprintln(w, "Start it with: hfdesk service start")
+	fmt.Fprintln(w, "The service was registered.")
+	writeInstallState(w, status, statusErr)
 }
 
-// registrationPath returns the path of the supervisor registration.
-func registrationPath(ctx context.Context, mgr service.Manager) string {
-	status, _ := mgr.Status(ctx)
+// writeInstallState prints the state the instance reached after the
+// registration and the hint that starts it.
+//
+// The state is read back from the supervisor: a registration of some
+// platforms starts the instance, so the summary cannot claim that the
+// instance was not started. A state the supervisor did not report is
+// reported as unknown, and the successful registration is reported
+// nevertheless.
+func writeInstallState(w io.Writer, status service.Status, statusErr error) {
+	switch {
+	case statusErr != nil:
+		writeField(w, "State", fmt.Sprintf("unknown (the state could not be determined: %s)", serviceErrorText(statusErr)))
+	case status.State == "":
+		writeField(w, "State", "unknown (the supervisor did not report a state)")
+	default:
+		writeField(w, "State", string(status.State))
+	}
+
+	// The hint is printed for every state that is not an active one. The
+	// instance then has to be started by the user, and a state that could
+	// not be read back at all does not say that the instance runs.
+	if status.State != service.StateRunning && status.State != service.StateStarting {
+		fmt.Fprintln(w, "Start it with: hfdesk service start")
+	}
+}
+
+// registrationPath returns the path of the supervisor registration, or
+// "unknown" when the supervisor did not report one.
+func registrationPath(status service.Status) string {
 	if status.UnitPath == "" {
 		return "unknown"
 	}
@@ -503,13 +546,22 @@ func serviceUninstall(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintf(stdout, "The registration of %s (%s scope) was removed.\n", service.ServiceName, scope)
-	fmt.Fprintln(stdout, "The user data was kept: models, cache, config, jobs/history and logs are still there.")
-	writeField(stdout, "Config file", paths.ConfigFile)
-	writeField(stdout, "State dir", paths.StateDir)
-	writeField(stdout, "Log dir", paths.LogDir)
-	writeField(stdout, "Cache root", cacheRoot)
+	writeUninstallSummary(stdout, scope, paths, cacheRoot)
 	return nil
+}
+
+// writeUninstallSummary prints what was removed and what was kept.
+//
+// The directories of the kept data are named, so the reader knows where the
+// models, the cache, the config file, the job history and the logs of the
+// instance stay.
+func writeUninstallSummary(w io.Writer, scope service.Scope, paths runtimepaths.Paths, cacheRoot string) {
+	fmt.Fprintf(w, "The registration of %s (%s scope) was removed.\n", service.ServiceName, scope)
+	fmt.Fprintln(w, "The user data was kept: models, cache, config, jobs/history and logs are still there.")
+	writeField(w, "Config file", paths.ConfigFile)
+	writeField(w, "State dir", paths.StateDir)
+	writeField(w, "Log dir", paths.LogDir)
+	writeField(w, "Cache root", cacheRoot)
 }
 
 // instanceDataPaths returns the runtime paths and the cache root of the
@@ -518,11 +570,16 @@ func serviceUninstall(args []string, stdout io.Writer) error {
 // The registration is read first, so the report names the directories the
 // data of the registration stays in. A registration that cannot be read
 // falls back to the default paths of the scope.
+//
+// The cache root is the effective one of the instance: the default of the
+// scope and the personal cache of the invoking user are never reported
+// instead, because the instance does not use them.
 func instanceDataPaths(ctx context.Context, mgr service.Manager, scope service.Scope) (runtimepaths.Paths, string) {
 	paths, err := service.DefaultPaths(scope)
 	if err != nil {
 		paths = runtimepaths.Paths{}
 	}
+	cacheRoot := cacheRootNotRecorded
 	if status, statusErr := mgr.Status(ctx); statusErr == nil {
 		if status.Paths.ConfigFile != "" {
 			paths.ConfigFile = status.Paths.ConfigFile
@@ -533,9 +590,27 @@ func instanceDataPaths(ctx context.Context, mgr service.Manager, scope service.S
 		if status.Paths.LogDir != "" {
 			paths.LogDir = status.Paths.LogDir
 		}
+		cacheRoot = effectiveCacheRoot(status)
 	}
-	cacheRoot, _ := service.DefaultCacheDirs(scope, paths)
 	return paths, cacheRoot
+}
+
+// effectiveCacheRoot returns the Hugging Face cache root the instance uses.
+//
+// The supervisor reports the cache root of the registration, and the config
+// file of the instance wins over it: the cache directory is changed in the
+// settings of the instance, and the changed value has to survive a restart
+// of the instance.
+//
+// A cache root that neither source names is not recorded. The default of
+// the scope and the personal cache of the invoking user are never reported
+// instead: the instance does not use them, so naming them would send the
+// reader to the wrong directory.
+func effectiveCacheRoot(status service.Status) string {
+	if dir := service.EffectiveCacheDir(status.Paths.ConfigFile, status.CacheDir); dir != "" {
+		return dir
+	}
+	return cacheRootNotRecorded
 }
 
 // newLifecycleManager prepares a lifecycle command: it parses the scope
@@ -689,7 +764,11 @@ func renderStatus(w io.Writer, scope service.Scope, status service.Status) {
 			paths = defaults
 		}
 	}
-	cacheRoot, _ := service.DefaultCacheDirs(scope, paths)
+	// The cache root is not derived from the paths above: the defaults of
+	// the scope describe the paths such an instance would use, not the
+	// cache root it uses. The effective cache root of the instance is
+	// reported instead.
+	cacheRoot := effectiveCacheRoot(status)
 
 	writeField(w, "Service", name)
 	writeField(w, "Scope", string(reportedScope))
