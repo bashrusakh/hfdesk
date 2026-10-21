@@ -56,9 +56,13 @@ const (
 	cacheRootNotRecorded = "not recorded (unknown)"
 
 	// windowsServiceAccount is the identity of a machine-wide instance on
-	// Windows. The service control manager registers the built-in
-	// LocalService account, which has no name of its own.
-	windowsServiceAccount = "LocalService"
+	// Windows.
+	//
+	// The service control manager registers the built-in LocalService
+	// account, which has no name of its own: the value is the name the
+	// registration carries, so the summary names the account the instance
+	// really runs as and not the one a command line asked for.
+	windowsServiceAccount = `NT AUTHORITY\LocalService`
 )
 
 // serviceSubcommands lists the subcommands of the family in the order the
@@ -231,8 +235,9 @@ Options of the "install" subcommand:
                 bind address of the instance (default %s)
   --service-user ACCOUNT
                 account a machine-wide instance runs as
-                (the machine-wide scope only; default: the service
-                account of the platform)
+                (the machine-wide scope of Linux and macOS; the
+                account cannot be chosen on Windows; default: the
+                service account of the platform)
   --executable PATH
                 absolute path of the binary to register
                 (default: the invoked binary)
@@ -270,14 +275,17 @@ func writeField(w io.Writer, key, value string) {
 	fmt.Fprintf(w, "%-14s %s\n", key+":", value)
 }
 
-// isWindows reports whether the process runs on Windows.
+// platformGOOS is the operating system the command line decides for.
+//
+// The variable is the seam of the tests: the decisions of the command line
+// that depend on the platform (the default scope, the account of an
+// instance) are checked on every platform, so the behaviour of a Windows
+// instance is covered by a test that runs on Linux as well.
+var platformGOOS = runtime.GOOS
+
+// isWindows reports whether the command line behaves as on Windows.
 func isWindows() bool {
-	switch runtime.GOOS {
-	case "windows":
-		return true
-	default:
-		return false
-	}
+	return platformGOOS == "windows"
 }
 
 // defaultScope returns the scope of an installation that does not ask for
@@ -508,9 +516,21 @@ type installFlags struct {
 //
 // A named account of a user scope instance is a command line that could not
 // be understood, so the error carries that kind.
+//
+// The account of a machine-wide instance cannot be chosen on Windows: the
+// service control manager registers the instance as the built-in
+// LocalService account, and a service under a user account would need a
+// credential, which must never reach the command line of an installation.
+// A named account there is a command line that could not be understood as
+// well, so its error carries that kind too.
 func buildInstallOptions(scope service.Scope, flags installFlags, executable string) (service.InstallOptions, error) {
-	if flags.serviceUser != "" && scope == service.ScopeUser {
-		return service.InstallOptions{}, newServiceUsageError(errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system"))
+	if flags.serviceUser != "" {
+		if scope == service.ScopeUser {
+			return service.InstallOptions{}, newServiceUsageError(errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system"))
+		}
+		if isWindows() {
+			return service.InstallOptions{}, newServiceUsageError(fmt.Errorf("--service-user is not available on windows: the machine-wide instance runs as the built-in %s account and the account cannot be chosen on this platform (a service under a user account needs a credential, and a credential must never reach a command line), drop the option", windowsServiceAccount))
+		}
 	}
 
 	paths, err := service.DefaultPaths(scope)
@@ -574,7 +594,7 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	fs.StringVar(&flags.cacheDir, "cache-dir", "", "absolute path of the Hugging Face cache root")
 	fs.StringVar(&flags.hubDir, "hub-dir", "", "absolute path of the Hugging Face hub cache directory")
 	fs.StringVar(&flags.localDir, "local-dir", "", "absolute path of the flat output directory")
-	fs.StringVar(&flags.serviceUser, "service-user", "", "account the machine-wide instance runs as (the machine-wide scope only)")
+	fs.StringVar(&flags.serviceUser, "service-user", "", "account the machine-wide instance runs as (the machine-wide scope of Linux and macOS; the account cannot be chosen on Windows)")
 	fs.StringVar(&flags.executable, "executable", "", "absolute path of the binary to register (default: the invoked binary)")
 
 	if err := fs.Parse(args); err != nil {
@@ -684,15 +704,17 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 // A machine-wide instance runs as the dedicated service account of the
 // platform: the account the user named, or the default of the platform.
 // Windows registers the built-in LocalService account, which has no name
-// of its own.
+// of its own: there the account of the registration is the one that is
+// reported, and an account of the command line is never reported, because
+// the registration does not use it.
 func installAccount(scope service.Scope, serviceUser string) string {
 	switch {
 	case scope == service.ScopeUser:
 		return invokingUser()
-	case serviceUser != "":
-		return serviceUser
 	case isWindows():
 		return windowsServiceAccount
+	case serviceUser != "":
+		return serviceUser
 	default:
 		return service.DefaultServiceUser()
 	}

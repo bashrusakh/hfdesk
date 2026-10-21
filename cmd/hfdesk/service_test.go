@@ -66,6 +66,19 @@ func useFakeManager(t *testing.T, mgr service.Manager) {
 	t.Cleanup(func() { newServiceManager = previous })
 }
 
+// usePlatform makes the command line behave as on the given platform for
+// the duration of the test.
+//
+// The platform is the seam of the tests: a decision of the command line
+// about Windows is checked on every platform, so the behaviour of a
+// Windows instance is covered by a test that runs on Linux as well.
+func usePlatform(t *testing.T, goos string) {
+	t.Helper()
+	previous := platformGOOS
+	platformGOOS = goos
+	t.Cleanup(func() { platformGOOS = previous })
+}
+
 // personalCacheRoot returns the Hugging Face cache of the user that runs
 // the test.
 //
@@ -121,6 +134,35 @@ func usageOptionOwner(out, option string) string {
 			}
 			return heading
 		}
+	}
+	return ""
+}
+
+// usageOptionText returns the description of an option in a usage block:
+// the line that names the option and the lines below it that belong to it.
+//
+// The option is named with the dashes it is written with, so the option of
+// the family ("--service-user") and the option of the flag set of a
+// subcommand ("-service-user") are two different names.
+func usageOptionText(out, option string) string {
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), option) {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		text := strings.TrimSpace(line)
+		for j := i + 1; j < len(lines); j++ {
+			next := lines[j]
+			if strings.TrimSpace(next) == "" {
+				break
+			}
+			if len(next)-len(strings.TrimLeft(next, " ")) <= indent {
+				break
+			}
+			text += " " + strings.TrimSpace(next)
+		}
+		return text
 	}
 	return ""
 }
@@ -223,6 +265,58 @@ func TestServiceUserIsRejectedForTheUserScope(t *testing.T) {
 	}
 }
 
+// TestServiceUserIsRejectedOnWindows checks that the account of a
+// machine-wide instance cannot be chosen on Windows.
+//
+// The service control manager registers the instance as the built-in
+// LocalService account, and a service under a user account would need a
+// credential, which must never reach the command line of an installation:
+// the account is not a choice of the command line on this platform, so a
+// command line that names one is refused.
+func TestServiceUserIsRejectedOnWindows(t *testing.T) {
+	usePlatform(t, "windows")
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--system", "--service-user", "hfdesk-svc"}, &stdout, &stderr)
+	if code != serviceUsageExitCode {
+		t.Fatalf("the machine-wide installation must refuse --service-user with the exit code %d, got %d:\n%s",
+			serviceUsageExitCode, code, stderr.String())
+	}
+
+	errText := stderr.String()
+	if !strings.Contains(errText, "--service-user") {
+		t.Errorf("the error does not name the rejected option:\n%s", errText)
+	}
+	if !strings.Contains(errText, windowsServiceAccount) {
+		t.Errorf("the error does not name the account the instance really runs as (%q):\n%s", windowsServiceAccount, errText)
+	}
+	if !strings.Contains(errText, "cannot be chosen") {
+		t.Errorf("the error does not say that the account cannot be chosen:\n%s", errText)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("a refused installation must not report a registration:\n%s", stdout.String())
+	}
+}
+
+// TestServiceUserIsRejectedForTheUserScopeOnWindows checks that a user scope
+// installation with a named account is refused on Windows.
+//
+// The user scope does not exist on Windows, so the scope itself is refused
+// before the account is looked at: the command line is refused either way.
+func TestServiceUserIsRejectedForTheUserScopeOnWindows(t *testing.T) {
+	usePlatform(t, "windows")
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--user", "--service-user", "hfdesk-svc"}, &stdout, &stderr)
+	if code != serviceUsageExitCode {
+		t.Fatalf("the user scope must be refused with the exit code %d, got %d:\n%s",
+			serviceUsageExitCode, code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("a refused installation must not report a registration:\n%s", stdout.String())
+	}
+}
+
 // TestBuildInstallOptionsCarriesTheServiceUser checks that the account
 // reaches the options of the installation.
 //
@@ -257,6 +351,64 @@ func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope(t *testing.T) {
 	}
 	if _, err := buildInstallOptions(service.ScopeUser, installFlags{serviceUser: "hfdesk"}, "/usr/local/bin/hfdesk"); err == nil {
 		t.Error("the user scope must reject a service account")
+	}
+}
+
+// TestBuildInstallOptionsRejectsTheServiceUserOnWindows checks that a
+// machine-wide installation never carries a named account on Windows.
+//
+// The registration of a Windows instance runs as the built-in LocalService
+// account, so an account in the options would be a promise the
+// registration cannot keep.
+func TestBuildInstallOptionsRejectsTheServiceUserOnWindows(t *testing.T) {
+	usePlatform(t, "windows")
+
+	_, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, "/usr/local/bin/hfdesk")
+	if err == nil {
+		t.Fatal("the machine-wide scope must reject a service account on windows")
+	}
+	if !isServiceUsageError(err) {
+		t.Errorf("the refusal must be a command line that could not be understood: %v", err)
+	}
+	if !strings.Contains(err.Error(), windowsServiceAccount) {
+		t.Errorf("the refusal does not name the account the instance really runs as (%q): %v", windowsServiceAccount, err)
+	}
+}
+
+// TestBuildInstallOptionsKeepsTheServiceUserOnLinuxAndMacOS checks that the
+// account of a machine-wide instance is honoured on the platforms that have
+// a named service account.
+func TestBuildInstallOptionsKeepsTheServiceUserOnLinuxAndMacOS(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Run(goos, func(t *testing.T) {
+			usePlatform(t, goos)
+
+			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, "/usr/local/bin/hfdesk")
+			if err != nil {
+				t.Fatalf("build the install options: %v", err)
+			}
+			if opts.ServiceUser != "hfdesk-svc" {
+				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
+			}
+		})
+	}
+}
+
+// TestBuildInstallOptionsRejectsTheServiceUserForTheUserScopeEverywhere
+// checks that a user scope instance never carries a service account, on
+// every platform.
+//
+// A user scope instance runs as the user itself, so an account name would
+// be a promise the installation cannot keep.
+func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScopeEverywhere(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			usePlatform(t, goos)
+
+			if _, err := buildInstallOptions(service.ScopeUser, installFlags{serviceUser: "hfdesk"}, "/usr/local/bin/hfdesk"); err == nil {
+				t.Error("the user scope must reject a service account")
+			}
+		})
 	}
 }
 
@@ -311,6 +463,182 @@ func TestInstallSummaryReportsTheDefaultAccountOfThePlatform(t *testing.T) {
 	}
 	if want := service.DefaultServiceUser(); want != "" && got != want {
 		t.Errorf("the account of the summary is %q, want the default account of the platform %q:\n%s", got, want, out)
+	}
+}
+
+// TestServiceUsageDescribesTheServiceUserOption checks that the usage
+// block of the family says where the account of a machine-wide instance
+// can be named.
+//
+// The option is not available on every platform: the account of a Windows
+// instance cannot be chosen, so a usage block that offers it everywhere
+// promises more than the command line can keep.
+func TestServiceUsageDescribesTheServiceUserOption(t *testing.T) {
+	var buf bytes.Buffer
+	writeServiceUsage(&buf)
+
+	out := buf.String()
+	text := usageOptionText(out, "--service-user")
+	if text == "" {
+		t.Fatalf("the usage block does not describe --service-user:\n%s", out)
+	}
+	for _, want := range []string{"Linux", "macOS", "Windows"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the description of --service-user does not mention %q:\n%s", want, text)
+		}
+	}
+}
+
+// TestServiceInstallHelpDescribesTheServiceUserOption checks that the help
+// of the install subcommand says where the account of a machine-wide
+// instance can be named.
+func TestServiceInstallHelpDescribesTheServiceUserOption(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the help of the install subcommand must succeed, got exit code %d:\n%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	text := usageOptionText(out, "-service-user")
+	if text == "" {
+		t.Fatalf("the help of the install subcommand does not describe --service-user:\n%s", out)
+	}
+	for _, want := range []string{"Linux", "macOS", "Windows"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the description of --service-user does not mention %q:\n%s", want, text)
+		}
+	}
+}
+
+// TestWindowsServiceAccountIsTheNameOfTheRegistration checks that the
+// account the command line names for a Windows instance is the account the
+// registration uses.
+//
+// The service control manager registers the instance with the built-in
+// LocalService account under its full name (the platform manager of the
+// service layer carries the same name). A summary that names another
+// account describes an identity the registration does not have.
+func TestWindowsServiceAccountIsTheNameOfTheRegistration(t *testing.T) {
+	const want = `NT AUTHORITY\LocalService`
+	if windowsServiceAccount != want {
+		t.Errorf("the account of a Windows instance is %q, want %q", windowsServiceAccount, want)
+	}
+}
+
+// TestInstallSummaryReportsTheWindowsAccount checks that the summary of a
+// machine-wide installation names the account the registration uses on
+// Windows.
+//
+// The registration runs as the built-in LocalService account, so the
+// summary names that account and never the one a command line named: a
+// summary that reports an account the instance does not run as sends the
+// reader to the wrong identity.
+func TestInstallSummaryReportsTheWindowsAccount(t *testing.T) {
+	usePlatform(t, "windows")
+
+	for _, tc := range []struct {
+		name        string
+		serviceUser string
+	}{
+		{name: "without a named account"},
+		{name: "with a named account", serviceUser: "hfdesk-svc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := service.InstallOptions{
+				Scope:      service.ScopeSystem,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/etc/hfdesk/hfdesk.json",
+					StateDir:   "/var/lib/hfdesk",
+					LogDir:     "/var/log/hfdesk",
+				},
+				ServiceUser: tc.serviceUser,
+			}
+
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+
+			out := buf.String()
+			if got := summaryField(out, "Account"); got != windowsServiceAccount {
+				t.Errorf("the account of the summary is %q, want %q:\n%s", got, windowsServiceAccount, out)
+			}
+			if tc.serviceUser != "" && strings.Contains(out, tc.serviceUser) {
+				t.Errorf("the summary reports the account %q the registration does not use:\n%s", tc.serviceUser, out)
+			}
+		})
+	}
+}
+
+// TestInstallSummaryReportsTheNamedAccountOnLinuxAndMacOS checks that the
+// summary names the account of the command line on the platforms that
+// honour it.
+func TestInstallSummaryReportsTheNamedAccountOnLinuxAndMacOS(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Run(goos, func(t *testing.T) {
+			usePlatform(t, goos)
+
+			opts := service.InstallOptions{
+				Scope:      service.ScopeSystem,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/etc/hfdesk/hfdesk.json",
+					StateDir:   "/var/lib/hfdesk",
+					LogDir:     "/var/log/hfdesk",
+				},
+				ServiceUser: "hfdesk-svc",
+			}
+
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+
+			out := buf.String()
+			if got := summaryField(out, "Account"); got != "hfdesk-svc" {
+				t.Errorf("the account of the summary is %q, want %q:\n%s", got, "hfdesk-svc", out)
+			}
+		})
+	}
+}
+
+// TestInstallSummaryReportsTheInvokingUserForTheUserScope checks that the
+// summary of a user scope installation names the user the instance runs as.
+//
+// A user scope instance runs as the user itself, so the summary names that
+// user and never an account of a command line.
+func TestInstallSummaryReportsTheInvokingUserForTheUserScope(t *testing.T) {
+	usePlatform(t, "linux")
+
+	opts := service.InstallOptions{
+		Scope:      service.ScopeUser,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		ServiceUser: "hfdesk-svc",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+	out := buf.String()
+	got := summaryField(out, "Account")
+	want := invokingUser()
+	if want == "" {
+		want = "unknown"
+	}
+	if got != want {
+		t.Errorf("the account of the summary is %q, want the invoking user %q:\n%s", got, want, out)
+	}
+	if strings.Contains(out, "hfdesk-svc") {
+		t.Errorf("the summary reports an account the instance does not run as:\n%s", out)
 	}
 }
 
