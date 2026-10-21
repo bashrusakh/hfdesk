@@ -112,6 +112,23 @@ func usePlatform(t *testing.T, goos string) {
 	t.Cleanup(func() { hostPlatform = previous })
 }
 
+// scopeOfPlatform returns the scope an installation uses on the given
+// platform.
+//
+// The scope is resolved by the command line itself, so a test states the
+// scope of a platform the same way an installation does: the user scope on
+// Linux and macOS, the machine-wide scope on Windows.
+func scopeOfPlatform(t *testing.T, goos string) service.Scope {
+	t.Helper()
+
+	usePlatform(t, goos)
+	scope, err := resolveScope(false, false)
+	if err != nil {
+		t.Fatalf("the default scope of %s must resolve: %v", goos, err)
+	}
+	return scope
+}
+
 // personalCacheRoot returns the Hugging Face cache of the user that runs
 // the test.
 //
@@ -279,22 +296,43 @@ func TestServiceLifecycleSubcommandsRejectTheInstallOnlyOptions(t *testing.T) {
 //
 // A user scope instance runs as the user itself, so an account name would
 // be a promise the installation cannot keep.
+//
+// The scope itself does not exist on the platform that has no per-user
+// installation: the service control manager of Windows registers
+// machine-wide services only, so the scope is refused there before the
+// account is looked at.
 func TestServiceUserIsRejectedForTheUserScope(t *testing.T) {
-	if !service.SupportsUserScope() {
-		t.Skip("the user scope does not exist on this platform")
-	}
+	for _, tc := range []struct {
+		goos      string
+		userScope bool
+	}{
+		{goos: "linux", userScope: true},
+		{goos: "darwin", userScope: true},
+		{goos: "windows"},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			usePlatform(t, tc.goos)
 
-	var stdout, stderr bytes.Buffer
-	code := runServiceCommand([]string{"install", "--user", "--service-user", "hfdesk"}, &stdout, &stderr)
-	if code != serviceUsageExitCode {
-		t.Fatalf("the user scope must reject --service-user with the exit code %d, got %d", serviceUsageExitCode, code)
-	}
-	errText := stderr.String()
-	if !strings.Contains(errText, "--service-user") {
-		t.Errorf("the error does not name the rejected option:\n%s", errText)
-	}
-	if !strings.Contains(errText, "user") {
-		t.Errorf("the error does not explain the scope of the option:\n%s", errText)
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand([]string{"install", "--user", "--service-user", "hfdesk"}, &stdout, &stderr)
+			if code != serviceUsageExitCode {
+				t.Fatalf("the user scope must reject --service-user with the exit code %d, got %d", serviceUsageExitCode, code)
+			}
+
+			errText := stderr.String()
+			if !tc.userScope {
+				if !strings.Contains(errText, "--user") {
+					t.Errorf("the error does not name the rejected selector:\n%s", errText)
+				}
+				return
+			}
+			if !strings.Contains(errText, "--service-user") {
+				t.Errorf("the error does not name the rejected option:\n%s", errText)
+			}
+			if !strings.Contains(errText, "user") {
+				t.Errorf("the error does not explain the scope of the option:\n%s", errText)
+			}
+		})
 	}
 }
 
@@ -356,32 +394,63 @@ func TestServiceUserIsRejectedForTheUserScopeOnWindows(t *testing.T) {
 // The account is empty when the command line does not name one: the default
 // of the platform is resolved by the platform manager, which knows the
 // accounts of the machine.
+//
+// The account reaches the options only on the platforms that have a named
+// service account: on Windows the machine-wide instance runs as the built-in
+// LocalService account, so an account of the command line is refused there
+// with the message that names the account the instance really runs as.
 func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 	const executable = "/usr/local/bin/hfdesk"
 
-	opts, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, executable)
-	if err != nil {
-		t.Fatalf("build the install options: %v", err)
-	}
-	if opts.ServiceUser != "hfdesk-svc" {
-		t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
-	}
+	for _, tc := range []struct {
+		goos      string
+		namedUser bool
+	}{
+		{goos: "linux", namedUser: true},
+		{goos: "darwin", namedUser: true},
+		{goos: "windows"},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			usePlatform(t, tc.goos)
 
-	opts, err = buildInstallOptions(service.ScopeSystem, installFlags{}, executable)
-	if err != nil {
-		t.Fatalf("build the install options: %v", err)
-	}
-	if opts.ServiceUser != "" {
-		t.Errorf("the service account is %q, want it to be unset", opts.ServiceUser)
+			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{}, executable)
+			if err != nil {
+				t.Fatalf("build the install options: %v", err)
+			}
+			if opts.ServiceUser != "" {
+				t.Errorf("the service account is %q, want it to be unset", opts.ServiceUser)
+			}
+
+			opts, err = buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, executable)
+			if !tc.namedUser {
+				if err == nil {
+					t.Fatalf("the machine-wide scope must refuse a named account on %s", tc.goos)
+				}
+				if !isServiceUsageError(err) {
+					t.Errorf("the refusal must be a command line that could not be understood: %v", err)
+				}
+				if !strings.Contains(err.Error(), windowsServiceAccount) {
+					t.Errorf("the refusal does not name the account the instance really runs as (%q): %v", windowsServiceAccount, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("build the install options: %v", err)
+			}
+			if opts.ServiceUser != "hfdesk-svc" {
+				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
+			}
+		})
 	}
 }
 
 // TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope checks that
 // a user scope instance never carries a service account.
+//
+// The refusal does not depend on the platform: a user scope instance runs as
+// the user itself, so an account name would be a promise the installation
+// cannot keep.
 func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope(t *testing.T) {
-	if !service.SupportsUserScope() {
-		t.Skip("the user scope does not exist on this platform")
-	}
 	if _, err := buildInstallOptions(service.ScopeUser, installFlags{serviceUser: "hfdesk"}, "/usr/local/bin/hfdesk"); err == nil {
 		t.Error("the user scope must reject a service account")
 	}
@@ -446,27 +515,71 @@ func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScopeEverywhere(t *te
 }
 
 // TestInstallSummaryReportsTheAccountOfTheInstance checks that the summary
-// names the account the instance runs as.
+// names the account the instance really runs as.
+//
+// A machine-wide instance runs as the account the command line named on the
+// platforms that have a named service account, and as the built-in
+// LocalService account on Windows, where the account of the command line
+// cannot be chosen and is never reported.
+//
+// A user scope instance runs as the invoking user, on the platforms that
+// have the scope at all.
 func TestInstallSummaryReportsTheAccountOfTheInstance(t *testing.T) {
-	opts := service.InstallOptions{
-		Scope:      service.ScopeSystem,
-		Executable: "/usr/local/bin/hfdesk",
-		Listen:     "127.0.0.1:8080",
-		Paths: runtimepaths.Paths{
-			ConfigFile: "/etc/hfdesk/hfdesk.json",
-			StateDir:   "/var/lib/hfdesk",
-			LogDir:     "/var/log/hfdesk",
-		},
-		ServiceUser: "hfdesk-svc",
-	}
+	for _, tc := range []struct {
+		goos      string
+		namedUser bool
+		userScope bool
+	}{
+		{goos: "linux", namedUser: true, userScope: true},
+		{goos: "darwin", namedUser: true, userScope: true},
+		{goos: "windows"},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			usePlatform(t, tc.goos)
 
-	var buf bytes.Buffer
-	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
-	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+			opts := service.InstallOptions{
+				Scope:      service.ScopeSystem,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/etc/hfdesk/hfdesk.json",
+					StateDir:   "/var/lib/hfdesk",
+					LogDir:     "/var/log/hfdesk",
+				},
+				ServiceUser: "hfdesk-svc",
+			}
 
-	out := buf.String()
-	if got := summaryField(out, "Account"); got != "hfdesk-svc" {
-		t.Errorf("the account of the summary is %q, want %q:\n%s", got, "hfdesk-svc", out)
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+
+			out := buf.String()
+			want := "hfdesk-svc"
+			if !tc.namedUser {
+				want = windowsServiceAccount
+			}
+			if got := summaryField(out, "Account"); got != want {
+				t.Errorf("the account of the summary is %q, want %q:\n%s", got, want, out)
+			}
+			if !tc.namedUser && strings.Contains(out, "hfdesk-svc") {
+				t.Errorf("the summary reports the account %q the instance does not run as:\n%s", "hfdesk-svc", out)
+			}
+
+			if !tc.userScope {
+				return
+			}
+			buf.Reset()
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+			out = buf.String()
+			want = invokingUser()
+			if want == "" {
+				want = "unknown"
+			}
+			if got := summaryField(out, "Account"); got != want {
+				t.Errorf("the account of the summary is %q, want the invoking user %q:\n%s", got, want, out)
+			}
+		})
 	}
 }
 
@@ -776,35 +889,62 @@ func TestServiceRunRejectsAnInvalidVector(t *testing.T) {
 	}
 }
 
+// TestServiceScopeDefaults checks that the default scope of an installation
+// is the scope of the platform.
+//
+// The user scope is the default on Linux and macOS, the system scope on
+// Windows: the service control manager of Windows registers machine-wide
+// services only. The user scope does not exist there, so asking for it is
+// refused instead of answered.
 func TestServiceScopeDefaults(t *testing.T) {
-	scope, err := resolveScope(false, false)
-	if err != nil {
-		t.Fatalf("the default scope must resolve: %v", err)
-	}
-	// The default scope of an installation is the scope of the platform:
-	// the user scope on Linux and macOS, the system scope on Windows.
-	want := service.ScopeUser
-	if runtime.GOOS == "windows" {
-		want = service.ScopeSystem
-	}
-	if scope != want {
-		t.Errorf("the default scope is %q, want %q", scope, want)
-	}
+	for _, tc := range []struct {
+		goos      string
+		scope     service.Scope
+		userScope bool
+	}{
+		{goos: "linux", scope: service.ScopeUser, userScope: true},
+		{goos: "darwin", scope: service.ScopeUser, userScope: true},
+		{goos: "windows", scope: service.ScopeSystem},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			usePlatform(t, tc.goos)
 
-	user, err := resolveScope(true, false)
-	if err != nil {
-		t.Fatalf("the user scope must resolve: %v", err)
-	}
-	if user != service.ScopeUser {
-		t.Errorf("the user scope is %q, want %q", user, service.ScopeUser)
-	}
+			scope, err := resolveScope(false, false)
+			if err != nil {
+				t.Fatalf("the default scope must resolve: %v", err)
+			}
+			if scope != tc.scope {
+				t.Errorf("the default scope on %s is %q, want %q", tc.goos, scope, tc.scope)
+			}
 
-	system, err := resolveScope(false, true)
-	if err != nil {
-		t.Fatalf("the system scope must resolve: %v", err)
-	}
-	if system != service.ScopeSystem {
-		t.Errorf("the system scope is %q, want %q", system, service.ScopeSystem)
+			system, err := resolveScope(false, true)
+			if err != nil {
+				t.Fatalf("the system scope must resolve: %v", err)
+			}
+			if system != service.ScopeSystem {
+				t.Errorf("the system scope is %q, want %q", system, service.ScopeSystem)
+			}
+
+			user, err := resolveScope(true, false)
+			if !tc.userScope {
+				if err == nil {
+					t.Fatalf("the user scope must be refused on %s", tc.goos)
+				}
+				if !isServiceUsageError(err) {
+					t.Errorf("the refusal must be a command line that could not be understood: %v", err)
+				}
+				if !strings.Contains(err.Error(), "--user") {
+					t.Errorf("the refusal does not name the rejected selector: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("the user scope must resolve: %v", err)
+			}
+			if user != service.ScopeUser {
+				t.Errorf("the user scope is %q, want %q", user, service.ScopeUser)
+			}
+		})
 	}
 }
 
@@ -848,40 +988,69 @@ func TestServiceRelativePathsAreRejected(t *testing.T) {
 	}
 }
 
+// TestBuildInstallOptionsUsesTheDefaultsOfTheScope checks that the options
+// of an installation carry the defaults of its scope.
+//
+// The scope is the scope of the platform: the user scope on Linux and macOS,
+// the machine-wide scope on Windows. The defaults themselves belong to the
+// service layer of the host, so the test states that the command line uses
+// the defaults of the scope and not which paths these are.
+//
+// A scope the host does not have has no defaults to carry: the service layer
+// refuses it, so the options of an instance of that scope cannot be built.
 func TestBuildInstallOptionsUsesTheDefaultsOfTheScope(t *testing.T) {
 	const executable = "/usr/local/bin/hfdesk"
 
-	defaults, err := service.DefaultPaths(service.ScopeUser)
-	if err != nil {
-		t.Fatalf("the default paths of the scope: %v", err)
-	}
-	cacheRoot, hubDir := service.DefaultCacheDirs(service.ScopeUser, defaults)
+	for _, tc := range []struct {
+		goos  string
+		scope service.Scope
+	}{
+		{goos: "linux", scope: service.ScopeUser},
+		{goos: "darwin", scope: service.ScopeUser},
+		{goos: "windows", scope: service.ScopeSystem},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			scope := scopeOfPlatform(t, tc.goos)
+			if scope != tc.scope {
+				t.Fatalf("the scope of %s is %q, want %q", tc.goos, scope, tc.scope)
+			}
 
-	opts, err := buildInstallOptions(service.ScopeUser, installFlags{}, executable)
-	if err != nil {
-		t.Fatalf("build the install options: %v", err)
-	}
+			defaults, err := service.DefaultPaths(scope)
+			if err != nil {
+				if _, err := buildInstallOptions(scope, installFlags{}, executable); err == nil {
+					t.Fatalf("the scope %q does not exist on this host, so the options of an instance of it cannot be built", scope)
+				}
+				return
+			}
+			cacheRoot, hubDir := service.DefaultCacheDirs(scope, defaults)
 
-	if opts.Scope != service.ScopeUser {
-		t.Errorf("the scope is %q, want %q", opts.Scope, service.ScopeUser)
-	}
-	if opts.Executable != executable {
-		t.Errorf("the executable is %q, want %q", opts.Executable, executable)
-	}
-	if opts.Listen != service.DefaultListen {
-		t.Errorf("the listen address is %q, want %q", opts.Listen, service.DefaultListen)
-	}
-	if opts.Paths != defaults {
-		t.Errorf("the paths are %+v, want %+v", opts.Paths, defaults)
-	}
-	if opts.CacheDir != cacheRoot {
-		t.Errorf("the cache root is %q, want %q", opts.CacheDir, cacheRoot)
-	}
-	if opts.HubDir != hubDir {
-		t.Errorf("the hub dir is %q, want %q", opts.HubDir, hubDir)
-	}
-	if opts.LocalDir != "" {
-		t.Errorf("the local dir is %q, want it to be unset", opts.LocalDir)
+			opts, err := buildInstallOptions(scope, installFlags{}, executable)
+			if err != nil {
+				t.Fatalf("build the install options: %v", err)
+			}
+
+			if opts.Scope != scope {
+				t.Errorf("the scope is %q, want %q", opts.Scope, scope)
+			}
+			if opts.Executable != executable {
+				t.Errorf("the executable is %q, want %q", opts.Executable, executable)
+			}
+			if opts.Listen != service.DefaultListen {
+				t.Errorf("the listen address is %q, want %q", opts.Listen, service.DefaultListen)
+			}
+			if opts.Paths != defaults {
+				t.Errorf("the paths are %+v, want %+v", opts.Paths, defaults)
+			}
+			if opts.CacheDir != cacheRoot {
+				t.Errorf("the cache root is %q, want %q", opts.CacheDir, cacheRoot)
+			}
+			if opts.HubDir != hubDir {
+				t.Errorf("the hub dir is %q, want %q", opts.HubDir, hubDir)
+			}
+			if opts.LocalDir != "" {
+				t.Errorf("the local dir is %q, want it to be unset", opts.LocalDir)
+			}
+		})
 	}
 }
 
@@ -937,56 +1106,80 @@ func TestBuildInstallOptionsAppliesTheOverrides(t *testing.T) {
 // A registration that names a cache root and the hub of another tree would
 // write the blobs of the instance into a directory its own cache root does
 // not contain.
+//
+// The layout is the one of the scope of the platform: the user scope on
+// Linux and macOS, the machine-wide scope on Windows. A scope the host does
+// not have has no layout to keep: the service layer refuses it, so the
+// options of an instance of that scope cannot be built.
 func TestBuildInstallOptionsKeepsTheCacheLayoutTogether(t *testing.T) {
 	const executable = "/usr/local/bin/hfdesk"
 
-	defaults, err := service.DefaultPaths(service.ScopeUser)
-	if err != nil {
-		t.Fatalf("the default paths of the scope: %v", err)
-	}
-	defaultRoot, defaultHub := service.DefaultCacheDirs(service.ScopeUser, defaults)
-
 	for _, tc := range []struct {
-		name     string
-		flags    installFlags
-		wantRoot string
-		wantHub  string
+		goos  string
+		scope service.Scope
 	}{
-		{
-			name:     "a cache root alone moves the hub directory with it",
-			flags:    installFlags{cacheDir: "/srv/cache"},
-			wantRoot: "/srv/cache",
-			wantHub:  "/srv/cache/hub",
-		},
-		{
-			name:     "a hub directory alone is honoured as given",
-			flags:    installFlags{hubDir: "/mnt/hub"},
-			wantRoot: defaultRoot,
-			wantHub:  "/mnt/hub",
-		},
-		{
-			name:     "both directories are honoured as given",
-			flags:    installFlags{cacheDir: "/srv/cache", hubDir: "/mnt/hub"},
-			wantRoot: "/srv/cache",
-			wantHub:  "/mnt/hub",
-		},
-		{
-			name:     "without an override the pair of the scope is kept",
-			flags:    installFlags{},
-			wantRoot: defaultRoot,
-			wantHub:  defaultHub,
-		},
+		{goos: "linux", scope: service.ScopeUser},
+		{goos: "darwin", scope: service.ScopeUser},
+		{goos: "windows", scope: service.ScopeSystem},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			opts, err := buildInstallOptions(service.ScopeUser, tc.flags, executable)
+		t.Run(tc.goos, func(t *testing.T) {
+			scope := scopeOfPlatform(t, tc.goos)
+			if scope != tc.scope {
+				t.Fatalf("the scope of %s is %q, want %q", tc.goos, scope, tc.scope)
+			}
+
+			defaults, err := service.DefaultPaths(scope)
 			if err != nil {
-				t.Fatalf("build the install options: %v", err)
+				if _, err := buildInstallOptions(scope, installFlags{}, executable); err == nil {
+					t.Fatalf("the scope %q does not exist on this host, so the options of an instance of it cannot be built", scope)
+				}
+				return
 			}
-			if opts.CacheDir != tc.wantRoot {
-				t.Errorf("the cache root is %q, want %q", opts.CacheDir, tc.wantRoot)
-			}
-			if opts.HubDir != tc.wantHub {
-				t.Errorf("the hub dir is %q, want %q", opts.HubDir, tc.wantHub)
+			defaultRoot, defaultHub := service.DefaultCacheDirs(scope, defaults)
+
+			for _, c := range []struct {
+				name     string
+				flags    installFlags
+				wantRoot string
+				wantHub  string
+			}{
+				{
+					name:     "a cache root alone moves the hub directory with it",
+					flags:    installFlags{cacheDir: "/srv/cache"},
+					wantRoot: "/srv/cache",
+					wantHub:  filepath.Join("/srv/cache", "hub"),
+				},
+				{
+					name:     "a hub directory alone is honoured as given",
+					flags:    installFlags{hubDir: "/mnt/hub"},
+					wantRoot: defaultRoot,
+					wantHub:  "/mnt/hub",
+				},
+				{
+					name:     "both directories are honoured as given",
+					flags:    installFlags{cacheDir: "/srv/cache", hubDir: "/mnt/hub"},
+					wantRoot: "/srv/cache",
+					wantHub:  "/mnt/hub",
+				},
+				{
+					name:     "without an override the pair of the scope is kept",
+					flags:    installFlags{},
+					wantRoot: defaultRoot,
+					wantHub:  defaultHub,
+				},
+			} {
+				t.Run(c.name, func(t *testing.T) {
+					opts, err := buildInstallOptions(scope, c.flags, executable)
+					if err != nil {
+						t.Fatalf("build the install options: %v", err)
+					}
+					if opts.CacheDir != c.wantRoot {
+						t.Errorf("the cache root is %q, want %q", opts.CacheDir, c.wantRoot)
+					}
+					if opts.HubDir != c.wantHub {
+						t.Errorf("the hub dir is %q, want %q", opts.HubDir, c.wantHub)
+					}
+				})
 			}
 		})
 	}
