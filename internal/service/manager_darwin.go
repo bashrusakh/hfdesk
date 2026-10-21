@@ -109,6 +109,16 @@ type launchdManager struct {
 	// property list of a user scope instance and it is the reference that
 	// keeps a machine-wide instance away from the state of a user.
 	home string
+	// run runs the commands of the supervisor. It is nil in production,
+	// where launchctl is called directly, and a test sets it to a
+	// recorder: a lifecycle can then be driven without a supervisor and
+	// the commands the manager issues can be asserted.
+	run func(ctx context.Context, args ...string) (string, error)
+	// stopBudget is the time the manager waits for the graceful shutdown
+	// of the instance. It is zero in production, where the wait uses the
+	// shared budget of the service layer, and a test shortens it to drive
+	// the timeout of the wait.
+	stopBudget time.Duration
 }
 
 // newPlatformManager returns the launchd manager of the given scope.
@@ -274,9 +284,9 @@ func (m *launchdManager) register(ctx context.Context, opts InstallOptions, acco
 		return err
 	}
 
-	bootstrapped, err := m.load(ctx, path, changed)
+	state, err := m.load(ctx, path, changed)
 	if err != nil {
-		return m.rollback(ctx, backup, bootstrapped, err)
+		return m.rollback(ctx, backup, state, err)
 	}
 	return nil
 }
@@ -314,7 +324,7 @@ func (m *launchdManager) Uninstall(ctx context.Context) error {
 	// never keeps a registration whose file is gone. A job that is not
 	// loaded any more is not an error: the registration is removed either
 	// way.
-	if _, err := runLaunchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+	if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 		return fmt.Errorf("service: bootout %s: %w", m.target(), err)
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -354,7 +364,7 @@ func (m *launchdManager) Start(ctx context.Context) error {
 	if err := m.ensureLoaded(ctx, path); err != nil {
 		return err
 	}
-	if _, err := runLaunchctl(ctx, "kickstart", m.target()); err != nil {
+	if _, err := m.launchctl(ctx, "kickstart", m.target()); err != nil {
 		return fmt.Errorf("service: kickstart %s: %w", m.target(), err)
 	}
 	return nil
@@ -372,6 +382,10 @@ func (m *launchdManager) Start(ctx context.Context) error {
 //
 // Stopping an instance that does not run is a stable no-op: the state the
 // caller asked for already holds.
+//
+// An instance that did not finish its shutdown within the budget of the
+// service layer is reported: the stop unloads the job anyway, but a caller
+// never sees a plain success for a shutdown that did not complete.
 //
 // A machine-wide instance needs an elevated shell: the LaunchDaemon is
 // unloaded from the system domain, and the system domain belongs to the
@@ -402,22 +416,39 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 	}
 	_, _, pid := launchdPrintFields(output)
 
-	if _, err := runLaunchctl(ctx, "kill", "SIGTERM", m.target()); err != nil && !isServiceMissing(err) {
+	if _, err := m.launchctl(ctx, "kill", "SIGTERM", m.target()); err != nil && !isServiceMissing(err) {
 		return fmt.Errorf("service: kill SIGTERM %s: %w", m.target(), err)
 	}
-	if err := m.waitForExit(ctx, pid); err != nil {
-		return err
-	}
-	if _, err := runLaunchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+	// The wait reports the overrun of the budget: an instance that is
+	// still there when the budget is over did not shut down in an orderly
+	// way.
+	waitErr := m.waitForExit(ctx, pid)
+	// The job is unloaded even when the instance did not finish its
+	// shutdown: a process that is still there would be restarted by
+	// launchd under the KeepAlive policy of the registration.
+	if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+		if waitErr != nil {
+			return fmt.Errorf("%w (the registration could not be unloaded: %v)", waitErr, err)
+		}
 		return fmt.Errorf("service: bootout %s: %w", m.target(), err)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("%w (the instance was unloaded anyway)", waitErr)
 	}
 	return nil
 }
 
 // Restart restarts the registered instance.
 //
-// The job is restarted with "launchctl kickstart -k": the running process
-// is replaced by a new one instead of waiting for it to end.
+// The restart is the graceful stop followed by the start: SIGTERM lets the
+// server quiesce, drain its connections and close the job manager, and the
+// job is unloaded before the replacement is registered and started. The
+// replacement is never started while the old instance is still draining, so
+// the two never compete for the bind address.
+//
+// The replacement is started only when the stop succeeded: an instance that
+// did not shut down in an orderly way is not covered by a new one, and the
+// failure is reported instead.
 //
 // A machine-wide instance needs an elevated shell: the LaunchDaemon is
 // registered in /Library/LaunchDaemons and it is started by the system
@@ -433,17 +464,20 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
-	// The elevation requirement is checked before the job is started: a
-	// permission error of the machine is a much less readable answer than
-	// the real reason.
+	// The elevation requirement is checked before the job is stopped and
+	// before the job is started: a permission error of the machine is a
+	// much less readable answer than the real reason.
 	if err := m.requireElevated("a restart"); err != nil {
 		return err
 	}
-	if err := m.ensureLoaded(ctx, path); err != nil {
-		return err
+	// The instance is stopped the way a stop stops it: the graceful
+	// shutdown of the server, the bounded wait for it and the unload of
+	// the job. The replacement is started only when that succeeded.
+	if err := m.Stop(ctx); err != nil {
+		return fmt.Errorf("service: restart %s: %w", m.target(), err)
 	}
-	if _, err := runLaunchctl(ctx, "kickstart", "-k", m.target()); err != nil {
-		return fmt.Errorf("service: kickstart -k %s: %w", m.target(), err)
+	if err := m.Start(ctx); err != nil {
+		return fmt.Errorf("service: restart %s: %w", m.target(), err)
 	}
 	return nil
 }
@@ -984,44 +1018,156 @@ func accountCanWrite(path string, account *serviceAccount) (bool, error) {
 	})
 }
 
-// load registers the property list with launchd and reports whether the job
-// was loaded by this call.
+// load registers the property list with launchd and reports what it did to
+// the registration of the instance.
 //
 // A job that is not loaded yet is bootstrapped. A job that is already loaded
 // keeps its registration: an installation that does not change the property
 // list must not restart the running instance. An installation that does
 // change the property list loads the job again, so the new configuration
 // takes effect instead of waiting for the next boot of the machine.
-func (m *launchdManager) load(ctx context.Context, path string, changed bool) (bool, error) {
-	loaded, _, err := m.printState(ctx)
+//
+// The report tells a rollback what the attempt did to the supervisor: the
+// state the registration had before it, whether the attempt loaded the job
+// and whether it took over the registration of a job that was loaded
+// already.
+func (m *launchdManager) load(ctx context.Context, path string, changed bool) (launchdLoadState, error) {
+	previous, err := m.supervisorState(ctx)
 	if err != nil {
-		return false, err
+		return launchdLoadState{}, err
 	}
+	state := launchdLoadState{previous: previous}
 
-	bootstrapped := false
 	switch {
-	case !loaded:
-		if _, err := runLaunchctl(ctx, "bootstrap", m.domain(), path); err != nil {
-			return false, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
+	case !previous.loaded:
+		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
+			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 		}
-		bootstrapped = true
+		state.bootstrapped = true
 	case changed:
-		if _, err := runLaunchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
-			return false, fmt.Errorf("service: bootout %s: %w", m.target(), err)
+		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+			return state, fmt.Errorf("service: bootout %s: %w", m.target(), err)
 		}
-		if _, err := runLaunchctl(ctx, "bootstrap", m.domain(), path); err != nil {
-			return false, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
+		// The job is unloaded now: it holds no registration of its
+		// own, so the restored file has to be loaded again by a
+		// rollback.
+		state.replaced = true
+		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
+			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 		}
-		bootstrapped = true
+		state.bootstrapped = true
 	}
 
 	// A job that was disabled in the override database of launchd would
 	// never start, so the disabled flag is cleared explicitly. The job is
 	// loaded at this point, so the command can address it.
-	if _, err := runLaunchctl(ctx, "enable", m.target()); err != nil {
-		return bootstrapped, fmt.Errorf("service: enable %s: %w", m.target(), err)
+	if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+		return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
 	}
-	return bootstrapped, nil
+	return state, nil
+}
+
+// launchdLoadState is what an installation did to the registration of the
+// instance in the supervisor.
+type launchdLoadState struct {
+	// previous is the state the registration had before the attempt.
+	previous launchdSupervisorState
+	// bootstrapped reports whether the attempt loaded the job into its
+	// domain.
+	bootstrapped bool
+	// replaced reports whether the attempt took over the registration of
+	// a job that was loaded already: the job holds the registration of
+	// the attempt now, or it holds none at all.
+	replaced bool
+}
+
+// launchdSupervisorState is the state of the registration of the instance in
+// the supervisor.
+type launchdSupervisorState struct {
+	// loaded reports whether the job is loaded into its domain.
+	loaded bool
+	// disabled reports whether the job is disabled in the override
+	// database of launchd.
+	disabled bool
+}
+
+// supervisorState reports the state of the registration of the instance in
+// the supervisor: whether the job is loaded into its domain and whether it
+// is disabled in the override database of launchd.
+func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisorState, error) {
+	loaded, _, err := m.printState(ctx)
+	if err != nil {
+		return launchdSupervisorState{}, err
+	}
+	return launchdSupervisorState{
+		loaded:   loaded,
+		disabled: m.jobDisabled(ctx),
+	}, nil
+}
+
+// jobDisabled reports whether the job of the instance is disabled in the
+// override database of launchd.
+//
+// The database of the domain is asked, because that is where the disabled
+// flag of a job lives. The question is best effort: a supervisor that cannot
+// answer it is treated as one that knows no disabled job, so an installation
+// never fails because of it.
+func (m *launchdManager) jobDisabled(ctx context.Context) bool {
+	output, err := m.launchctl(ctx, "print-disabled", m.domain())
+	if err != nil {
+		return false
+	}
+	return launchdDisabledLabel(output, launchdLabel())
+}
+
+// launchdDisabledLabel reports whether the output of "launchctl
+// print-disabled" says that the job of the given label is disabled.
+//
+// The output of launchd is not an API: a disabled job is listed as
+// "<label> => disabled", and a job that carries further overrides is listed
+// as a block that names the disabled flag. Both forms are read. A job that
+// is not listed at all is not disabled.
+func launchdDisabledLabel(output, label string) bool {
+	lines := strings.Split(output, "\n")
+	for i, line := range lines {
+		sep := strings.Index(line, "=>")
+		if sep < 0 {
+			continue
+		}
+		if strings.TrimSpace(line[:sep]) != label {
+			continue
+		}
+		value := strings.TrimSpace(line[sep+2:])
+		if value == "" || value == "{" {
+			// The job carries a block of overrides: the flags of the
+			// block are read.
+			return launchdDisabledBlock(lines[i+1:])
+		}
+		return strings.Contains(strings.ToLower(value), "disabled")
+	}
+	return false
+}
+
+// launchdDisabledBlock reports whether a block of overrides of a job names
+// the disabled flag.
+func launchdDisabledBlock(lines []string) bool {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "}" {
+			return false
+		}
+		sep := strings.Index(line, "=>")
+		if sep < 0 {
+			continue
+		}
+		key := strings.Trim(strings.TrimSpace(line[:sep]), `"`)
+		if launchdPrintKey(key) != "disabled" {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(line[sep+2:]), `"`)
+		return strings.EqualFold(value, "true")
+	}
+	return false
 }
 
 // ensureLoaded registers the job with launchd when it is not loaded into its
@@ -1034,7 +1180,7 @@ func (m *launchdManager) ensureLoaded(ctx context.Context, path string) error {
 	if loaded {
 		return nil
 	}
-	if _, err := runLaunchctl(ctx, "bootstrap", m.domain(), path); err != nil {
+	if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
 		return fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 	}
 	return nil
@@ -1043,7 +1189,7 @@ func (m *launchdManager) ensureLoaded(ctx context.Context, path string) error {
 // printState reports whether the job is loaded into its domain and returns
 // the output of "launchctl print".
 func (m *launchdManager) printState(ctx context.Context) (bool, string, error) {
-	output, err := runLaunchctl(ctx, "print", m.target())
+	output, err := m.launchctl(ctx, "print", m.target())
 	if err != nil {
 		if isServiceMissing(err) {
 			return false, "", nil
@@ -1056,9 +1202,12 @@ func (m *launchdManager) printState(ctx context.Context) (bool, string, error) {
 // waitForExit waits until the registered process is gone.
 //
 // The wait is bounded: a process that ignores the signal must not block the
-// caller forever. The unload that follows ends it in that case.
+// caller forever. The bound is the shared budget of the service layer, and
+// an instance that is still there when the budget is over is reported: the
+// caller has to know that the orderly shutdown did not happen.
 func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
-	deadline := time.Now().Add(stopWaitTimeout)
+	budget := m.shutdownBudget()
+	deadline := time.Now().Add(budget)
 	for {
 		loaded, output, err := m.printState(ctx)
 		if err != nil {
@@ -1077,7 +1226,9 @@ func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return nil
+			// The instance is still there: the shutdown did not
+			// happen in an orderly way.
+			return &stopTimeoutError{budget: budget}
 		}
 		select {
 		case <-ctx.Done():
@@ -1087,16 +1238,72 @@ func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 	}
 }
 
-// rollback undoes a failed installation: the job is unloaded again and the
-// property list is restored to the state it had before the installation.
-func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, bootstrapped bool, cause error) error {
-	if bootstrapped {
-		if _, err := runLaunchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+// shutdownBudget returns the time the manager waits for the graceful
+// shutdown of the instance.
+//
+// The budget is the shared budget of the service layer, so the wait never
+// ends before the shutdown it waits for.
+func (m *launchdManager) shutdownBudget() time.Duration {
+	if m.stopBudget > 0 {
+		return m.stopBudget
+	}
+	return stopWaitTimeout
+}
+
+// stopTimeoutError reports that the instance did not finish its graceful
+// shutdown within the budget of the service layer.
+type stopTimeoutError struct {
+	// budget is the time the manager waited for the shutdown.
+	budget time.Duration
+}
+
+// Error names the budget the graceful shutdown of the instance exceeded.
+func (e *stopTimeoutError) Error() string {
+	return fmt.Sprintf("service: the instance did not finish its graceful shutdown within the %s budget of the service layer", e.budget)
+}
+
+// rollback undoes a failed installation: the job is unloaded again, the
+// property list is restored to the state it had before the installation and
+// the supervisor is given the state of the registration back.
+//
+// The state of the supervisor is restored as well: the instance may have
+// been running before the installation, and a rollback that only restores the
+// file would leave a registration that claims to be running while nothing
+// runs. A state that cannot be restored is reported, so the failure of the
+// installation never hides the failure of the rollback.
+func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) error {
+	// The registration of the failed attempt is unloaded when the attempt
+	// loaded the job or took over the registration of a job that was
+	// loaded already: launchd must not keep the registration of an
+	// installation that failed, and the restored file has to be loaded
+	// again.
+	unload := state.replaced || (state.bootstrapped && !state.previous.loaded)
+	if unload {
+		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 			return fmt.Errorf("%w (the registration could not be unloaded: %v)", cause, err)
 		}
 	}
 	if err := backup.restore(); err != nil {
 		return fmt.Errorf("%w (the property list could not be restored: %v)", cause, err)
+	}
+	if state.replaced {
+		// The attempt took over the registration of a job that was
+		// loaded before it: the restored file is loaded again, so the
+		// instance runs like it did before.
+		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), backup.path); err != nil {
+			return fmt.Errorf("%w (the restored registration could not be loaded: %v)", cause, err)
+		}
+	}
+	// The enable state of the registration is restored: the failed
+	// attempt may have enabled a job that was disabled before it.
+	if state.previous.disabled {
+		if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
+			return fmt.Errorf("%w (the restored registration could not be disabled: %v)", cause, err)
+		}
+	} else if state.previous.loaded {
+		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+			return fmt.Errorf("%w (the restored registration could not be enabled: %v)", cause, err)
+		}
 	}
 	return cause
 }
@@ -1180,6 +1387,19 @@ func writePlist(path string, content []byte, mode os.FileMode) error {
 		return fmt.Errorf("service: install the property list %q: %w", path, err)
 	}
 	return nil
+}
+
+// launchctl runs a command of the supervisor and returns its standard
+// output.
+//
+// The runner of the manager is used when there is one: a test drives the
+// manager through it and records the commands the manager issues, so a
+// lifecycle can be checked without a supervisor.
+func (m *launchdManager) launchctl(ctx context.Context, args ...string) (string, error) {
+	if m.run != nil {
+		return m.run(ctx, args...)
+	}
+	return runLaunchctl(ctx, args...)
 }
 
 // runLaunchctl runs launchctl with the given arguments and returns its

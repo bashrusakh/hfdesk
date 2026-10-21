@@ -2371,6 +2371,11 @@ func TestLaunchdStopWaitCoversTheShutdownOfTheServer(t *testing.T) {
 	if stopWaitTimeout != ShutdownBudget {
 		t.Errorf("the stop wait of the manager = %s, want the shared budget %s", stopWaitTimeout, ShutdownBudget)
 	}
+	// The wait of the manager itself uses the shared budget, so a stop
+	// never ends before the shutdown it waits for.
+	if budget := (&launchdManager{}).shutdownBudget(); budget != ShutdownBudget {
+		t.Errorf("the shutdown budget of the manager = %s, want the shared budget %s", budget, ShutdownBudget)
+	}
 
 	opts := darwinUserOptions(t)
 	rendered, err := renderPlist(opts, nil)
@@ -3098,4 +3103,427 @@ func TestLaunchdMachineWideLifecycleNeedsAnElevatedShell(t *testing.T) {
 			t.Errorf("requireElevated() = %v, want the decision of requireElevatedFor(%d) = %v", err, os.Geteuid(), forced)
 		}
 	})
+}
+
+// darwinFakePID is the process id the fake supervisor reports for a job
+// that runs.
+//
+// The id is above every id a process of a machine can have, so a test that
+// reads the state of the fake job never depends on a process of the machine
+// that happens to carry the same id.
+const darwinFakePID = 999999999
+
+// darwinFakeLaunchd is a fake supervisor that records the commands the
+// manager issues.
+//
+// The fake models the state of a launchd job: whether it is loaded into its
+// domain, whether it runs and whether it is disabled in the override
+// database of launchd. Every command is recorded, so a test can assert the
+// sequence the manager issued, and a rule can make a command fail, so a
+// test can drive a failure of the supervisor.
+//
+// The fake never touches the machine: it answers the commands of launchd
+// from its own state.
+type darwinFakeLaunchd struct {
+	// loaded reports whether the job is loaded into its domain.
+	loaded bool
+	// running reports whether the job runs.
+	running bool
+	// pid is the process id of the job while it runs.
+	pid int
+	// disabled reports whether the job is disabled in the override
+	// database of launchd.
+	disabled bool
+	// keepRunning makes the fake ignore the signal of a stop: the
+	// instance stays alive, so the wait of the manager runs into its
+	// budget.
+	keepRunning bool
+	// commands holds every command the manager issued, in order.
+	commands []string
+	// failures maps the first word of a command to the error the fake
+	// returns for it.
+	failures map[string]error
+}
+
+// run answers a command of the supervisor.
+func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, error) {
+	if len(args) == 0 {
+		return "", errors.New("service: launchctl: the fake supervisor got no command")
+	}
+	command := strings.Join(args, " ")
+	f.commands = append(f.commands, command)
+	if err, ok := f.failures[args[0]]; ok {
+		return "", err
+	}
+	switch args[0] {
+	case "print":
+		if !f.loaded {
+			return "", fmt.Errorf("service: launchctl %s: exit status 1: Could not find service", command)
+		}
+		return f.printOutput(), nil
+	case "print-disabled":
+		if f.disabled {
+			return launchdLabel() + " => disabled\n", nil
+		}
+		return "", nil
+	case "kill":
+		if !f.keepRunning {
+			f.running = false
+			f.pid = 0
+		}
+		return "", nil
+	case "bootout":
+		f.loaded = false
+		f.running = false
+		f.pid = 0
+		return "", nil
+	case "bootstrap":
+		f.loaded = true
+		f.running = true
+		f.pid = darwinFakePID
+		return "", nil
+	case "enable":
+		f.disabled = false
+		return "", nil
+	case "disable":
+		f.disabled = true
+		return "", nil
+	case "kickstart":
+		f.loaded = true
+		f.running = true
+		f.pid = darwinFakePID
+		return "", nil
+	default:
+		return "", fmt.Errorf("service: launchctl %s: the fake supervisor does not know the command", command)
+	}
+}
+
+// printOutput renders the output of "launchctl print" for the fake job.
+func (f *darwinFakeLaunchd) printOutput() string {
+	state := "not running"
+	pid := 0
+	if f.running {
+		state = "running"
+		pid = f.pid
+	}
+	return fmt.Sprintf("%s = {\n\tstate = %s\n\tpid = %d\n}", launchdLabel(), state, pid)
+}
+
+// TestLaunchdRestartStopsTheInstanceBeforeItStartsTheReplacement checks
+// that a restart is the graceful stop followed by the start.
+//
+// The instance has to drain its connections and save its state before the
+// replacement starts: a restart that kills the running process and starts
+// the replacement at the same time loses the state of the instance and lets
+// the two instances compete for the bind address.
+//
+// The commands the manager issues are asserted, so the check needs no
+// supervisor: the fake records them.
+func TestLaunchdRestartStopsTheInstanceBeforeItStartsTheReplacement(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+	launchd.run = fake.run
+	darwinWriteRegistration(t, launchd, darwinTempInstallOptions(t, t.TempDir()))
+
+	if err := launchd.Restart(context.Background()); err != nil {
+		t.Fatalf("Restart(): %v", err)
+	}
+
+	want := []string{
+		// The state of the job is read, the instance is asked to stop
+		// and the manager waits for it.
+		"print " + launchd.target(),
+		"kill SIGTERM " + launchd.target(),
+		"print " + launchd.target(),
+		// The job is unloaded, so launchd does not restart the
+		// instance that is gone.
+		"bootout " + launchd.target(),
+		// The replacement is registered again and started.
+		"print " + launchd.target(),
+		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
+		"kickstart " + launchd.target(),
+	}
+	if !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+	}
+	// The running instance is never killed and replaced: "kickstart -k"
+	// does exactly that.
+	for _, command := range fake.commands {
+		if strings.Contains(command, "kickstart -k") {
+			t.Errorf("the manager issued %q, want the graceful stop of the instance", command)
+		}
+	}
+}
+
+// TestLaunchdRestartDoesNotStartTheReplacementWhenTheStopFailed checks that
+// a restart whose stop failed does not start the replacement.
+//
+// An instance that did not stop is not covered by a new one: the two would
+// compete for the bind address, and the state of the instance that is still
+// there would be lost without a report.
+func TestLaunchdRestartDoesNotStartTheReplacementWhenTheStopFailed(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{
+		loaded:  true,
+		running: true,
+		pid:     darwinFakePID,
+		failures: map[string]error{
+			"kill": errors.New("service: launchctl kill SIGTERM: exit status 1: the supervisor refuses the signal"),
+		},
+	}
+	launchd.run = fake.run
+	darwinWriteRegistration(t, launchd, darwinTempInstallOptions(t, t.TempDir()))
+
+	err := launchd.Restart(context.Background())
+	if err == nil {
+		t.Fatal("Restart() = nil, want the failure of the stop")
+	}
+	if !strings.Contains(err.Error(), "the supervisor refuses the signal") {
+		t.Errorf("Restart() = %v, want the reason of the failed stop", err)
+	}
+	// The replacement is not started.
+	for _, command := range fake.commands {
+		if strings.HasPrefix(command, "bootstrap") || strings.HasPrefix(command, "kickstart") {
+			t.Errorf("the manager issued %q, want no start of the replacement", command)
+		}
+	}
+}
+
+// TestLaunchdStopReportsTheOverrunOfTheShutdownBudget checks that a stop
+// whose instance did not finish its graceful shutdown is reported.
+//
+// The instance is unloaded even then, because a process that is still there
+// would be restarted by launchd, but the caller never sees a plain success
+// for a shutdown that did not complete.
+func TestLaunchdStopReportsTheOverrunOfTheShutdownBudget(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	// The instance ignores the signal: the wait of the manager runs
+	// into its budget.
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID, keepRunning: true}
+	launchd.run = fake.run
+	// The wait is shortened, so the test does not wait for the whole
+	// budget of the service layer.
+	launchd.stopBudget = 250 * time.Millisecond
+	darwinWriteRegistration(t, launchd, darwinTempInstallOptions(t, t.TempDir()))
+
+	err := launchd.Stop(context.Background())
+	if err == nil {
+		t.Fatal("Stop() = nil, want the report of the overrun of the budget")
+	}
+	message := err.Error()
+	// The message names the budget and says that the instance was
+	// unloaded anyway.
+	for _, want := range []string{
+		launchd.shutdownBudget().String(),
+		"graceful shutdown",
+		"unloaded anyway",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("Stop() = %q, want a message that mentions %q", message, want)
+		}
+	}
+	// The job is unloaded even though the instance did not shut down.
+	unloaded := false
+	for _, command := range fake.commands {
+		if command == "bootout "+launchd.target() {
+			unloaded = true
+		}
+	}
+	if !unloaded {
+		t.Errorf("the commands of the manager = %v, want the unload of the job", fake.commands)
+	}
+}
+
+// TestLaunchdRollbackReloadsTheRestoredRegistration checks that a failed
+// installation gives the supervisor the state of the registration back.
+//
+// The instance may have been running before the attempt: a rollback that
+// only restores the property list would leave a registration that claims to
+// be running while nothing runs.
+func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
+	const previous = "<plist>the registration of the instance</plist>"
+	const changed = "<plist>the registration of the failed installation</plist>"
+
+	// writeRegistration writes the registration of the instance and
+	// returns the backup of it.
+	writeRegistration := func(t *testing.T, launchd *launchdManager) (*plistBackup, string) {
+		t.Helper()
+		path := launchd.plistPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create the registration directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(previous), plistMode); err != nil {
+			t.Fatalf("write the registration: %v", err)
+		}
+		backup, err := backupPlist(path)
+		if err != nil {
+			t.Fatalf("backupPlist(): %v", err)
+		}
+		// The installation wrote another registration and failed.
+		if err := os.WriteFile(path, []byte(changed), plistMode); err != nil {
+			t.Fatalf("write the registration of the failed installation: %v", err)
+		}
+		return backup, path
+	}
+
+	t.Run("a registration that ran is loaded again", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+		backup, path := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:     launchdSupervisorState{loaded: true},
+			bootstrapped: true,
+			replaced:     true,
+		}
+		err := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+
+		// The property list is restored.
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read the registration: %v", err)
+		}
+		if string(content) != previous {
+			t.Errorf("the restored registration = %q, want %q", content, previous)
+		}
+		// The registration is loaded again, so the instance runs like it
+		// did before the attempt.
+		want := []string{
+			"bootout " + launchd.target(),
+			"bootstrap " + launchd.domain() + " " + path,
+			"enable " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+	})
+
+	t.Run("a registration that was disabled stays disabled", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+		backup, path := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:     launchdSupervisorState{loaded: true, disabled: true},
+			bootstrapped: true,
+			replaced:     true,
+		}
+		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+
+		want := []string{
+			"bootout " + launchd.target(),
+			"bootstrap " + launchd.domain() + " " + path,
+			"disable " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+	})
+
+	t.Run("a registration that cannot be loaded again is reported", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{
+			loaded:  true,
+			running: true,
+			pid:     darwinFakePID,
+			failures: map[string]error{
+				"bootstrap": errors.New("service: launchctl bootstrap: exit status 1: the supervisor refuses the registration"),
+			},
+		}
+		launchd.run = fake.run
+		backup, path := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:     launchdSupervisorState{loaded: true},
+			bootstrapped: true,
+			replaced:     true,
+		}
+		err := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+		if !strings.Contains(err.Error(), "could not be loaded") {
+			t.Errorf("rollback() = %v, want a message that names the failed restore of the registration", err)
+		}
+		// The property list is restored even then.
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read the registration: %v", err)
+		}
+		if string(content) != previous {
+			t.Errorf("the restored registration = %q, want %q", content, previous)
+		}
+	})
+
+	t.Run("a registration that did not run stays unloaded", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		// The failed attempt loaded the job: the rollback unloads it
+		// again, because it did not run before.
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+		backup, _ := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		// The failed attempt loaded the job: the rollback unloads it
+		// again, because it did not run before.
+		state := launchdLoadState{
+			previous:     launchdSupervisorState{loaded: false},
+			bootstrapped: true,
+		}
+		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+
+		want := []string{"bootout " + launchd.target()}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+	})
+}
+
+// TestLaunchdDisabledLabel checks the reading of the database of the
+// disabled jobs of launchd.
+//
+// The output of launchd is not an API: a disabled job is listed as
+// "<label> => disabled", and a job that carries further overrides is listed
+// as a block that names the disabled flag. Both forms are read.
+func TestLaunchdDisabledLabel(t *testing.T) {
+	label := launchdLabel()
+	cases := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "an empty database", output: "", want: false},
+		{name: "a disabled job", output: label + " => disabled\n", want: true},
+		{name: "another disabled job", output: "com.example.other => disabled\n", want: false},
+		{
+			name:   "a job with a block of overrides",
+			output: label + " => {\n\t\"Disabled\" => true\n\t\"ThrottleInterval\" => 10\n}\n",
+			want:   true,
+		},
+		{
+			name:   "a block without the disabled flag",
+			output: label + " => {\n\t\"ThrottleInterval\" => 10\n}\n",
+			want:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := launchdDisabledLabel(tc.output, label); got != tc.want {
+				t.Errorf("launchdDisabledLabel() = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
