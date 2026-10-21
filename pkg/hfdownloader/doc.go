@@ -126,6 +126,9 @@ staging file (blobs/<sha>.incomplete in HF cache mode) and persist their
 committed byte ranges in versioned metadata next to it, so an interrupted
 transfer resumes from its durable high-water marks without re-downloading
 valid bytes — even when the connection count changes between runs. Skip
+Range-record version 3 marks ranges Done only after the response body reaches clean EOF;
+version-2 Done records reserve the final byte for revalidation because the
+older writer could infer completion from bytes written alone. Skip
 decisions are filesystem-based:
 
   - LFS files: Compared by SHA-256 hash (if available in metadata)
@@ -140,19 +143,21 @@ target under the ownership locks and never overwrites one that appeared while
 the transfer was in flight: it discards its own staging pair and reports the
 item as complete.
 
-Staging identity includes the resolved commit from the plan. When the endpoint
-does not provide one, the planner resolves the requested revision before
-building the plan; resume is pinned to that resolved commit.
+Staging identity includes `plan.Commit`. If fetching repository info fails or
+returns an empty SHA, the planner uses the requested revision string as the
+fallback commit identity; that value is not necessarily an immutable commit.
 
 Existing multipart resume state survives a threshold change. Before routing an
 item to the single-request path, the downloader detects a usable pre-#140
-`.part-NN`/`.parts.json` layout and a valid v2 `<staging>.incomplete`/`.meta`
-pair (including the blob-keyed staging pair for LFS cache items). A ranged-
+`.part-NN`/`.parts.json` layout and a valid versioned
+`<staging>.incomplete`/`.meta` pair (including the blob-keyed staging pair for
+LFS cache items). Version-2 records are migrated conservatively by re-fetching
+the final byte of completed ranges to validate response framing. A ranged-
 capable item keeps the multipart route regardless of `MultipartThreshold`, so
 the state is consumed through the existing migration/resume and content-proof
 rules; a fresh item with no state keeps the configured routing. If the server or
 plan does not support ranges, the downloader emits an explicit warning,
-downloads the full file through the single path, and removes the obsolete v2
+downloads the full file through the single path, and removes the obsolete
 pair only after the final file is durable (claim-checked); the legacy family is
 removed by the single-path success cleanup.
 
@@ -191,12 +196,25 @@ data; this runtime error does not declare permanent platform support policy.
 Age never authorizes transition recovery. An unfenced legacy record is
 protected unless its same-host owner is provably dead.
 
+A claim record is always installed as a complete, valid document. The record
+is staged in a sibling temp file and then installed by one atomic operation: a
+hard link of the staged inode, which is atomic and never replaces a record
+that already appeared, or — on a filesystem that cannot create hard links — an
+atomic rename, used only while no record is present. Hard-link support is
+therefore not a prerequisite for downloading. The staged copy is always a
+fresh file, so a staged path left behind by an interrupted operation, which
+may share the authoritative record's inode, is never written through and can
+never empty the authoritative record before it is replaced.
+
 The single-request path follows the same validation model. A resumed `.part` is
 a sequential prefix with no record, so it is never assumed complete: every
 ranged (206) response must match the exact requested Content-Range, expected
 total and body length, writes are bounded to the requested range, and the file
-must have exactly the expected size before the rename. When the expected size
-is unknown, the partial is discarded rather than guessed at. Known-digest
+must have exactly the expected size before the rename. A reader/copy error after
+the final requested byte was written is not successful framing: publication is
+refused, and the last byte is left uncommitted for a nonempty retry/restart
+range. When the expected size is unknown, the partial is discarded rather than
+guessed at. Known-digest
 verification happens before publication on this path too: in Verify "sha256"
 and "etag" modes a fresh or resumed transfer is proven with one full-file
 SHA-256 pass before the rename, and in "size" mode inherited `.part` bytes are
@@ -223,10 +241,11 @@ It is set and flushed before any known-digest proof starts (fresh sha256/etag,
 migrated bytes) and cleared and flushed only after the proof succeeds,
 immediately before publication. On resume the flag forces the proof in every
 mode except "none" — including "size" — whenever the item carries a known
-digest, so a crash mid-proof, a mismatch whose cleanup cannot take the
-transition lock, or a later Verify-mode change cannot publish unproven all-Done
+digest, so a crash mid-proof, a mismatch whose cleanup fails, or a later
+Verify-mode change cannot publish unproven all-Done
 ranges. On a mismatch the flag stays set, poison (a zero-length payload) is
-attempted only while the claim is still owned under the transition lock, and
+attempted only while the claim is still owned under the metadata gate and
+lifetime OS lock, and
 the owned discard is attempted; if ownership cannot be verified the poison is
 skipped and the durable flag remains the guard, so the next run re-proves or
 discards. Publication itself is refused while a known digest's proof is still

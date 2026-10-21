@@ -308,8 +308,8 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 		})
 	}
 
-	// A complete-prefix range written by an older record is normalized to
-	// Done rather than replayed as a bytes=End+1-End request.
+	// A range whose byte count is full but whose Done marker is absent has no
+	// clean-framing proof; retain all but the final byte for revalidation.
 	unnormalized := base
 	unnormalized.SHA256 = "" // item below has no SHA: both-or-neither
 	unnormalized.Ranges = []RangeProgress{{Start: 0, End: 499, Committed: 500}, {Start: 500, End: 999}}
@@ -317,8 +317,8 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("normalizable record was rejected")
 	}
-	if !ranges[0].Done || ranges[0].Committed != 500 {
-		t.Errorf("complete-prefix range was not normalized: %+v", ranges[0])
+	if ranges[0].Done || ranges[0].Committed != 499 {
+		t.Errorf("unframed full prefix was not reduced to a nonempty revalidation suffix: %+v", ranges[0])
 	}
 
 	overclaim := base

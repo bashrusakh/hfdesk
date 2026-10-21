@@ -127,8 +127,11 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   errors.
 - Multipart part files are only reusable when their byte-range layout is known
   to match the current file size and connection count.
-- If resume metadata is missing, invalid, or mismatched, discard stale part files
-  and restart that file rather than guessing.
+- If legacy per-part resume metadata is invalid or mismatched, discard only the
+  incompatible part files and restart rather than guessing. For a current
+  `.incomplete.meta` claim, discard identity-mismatched data only while holding
+  lifetime ownership; preserve unreadable or ambiguous legacy claims unless
+  same-host owner death is proven.
 - `Settings.Verify` governs LFS verification too: `none` performs no
   post-download content hash; `size` (default) checks exact size plus complete
   validated transfer coverage on both the ranged and single-request paths and
@@ -151,6 +154,11 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   and never publish on a mismatch. A fresh transfer in `sha256`/`etag` mode is
   likewise proven before the rename. Without a known expected size, discard the
   partial rather than guessing a resume layout.
+- Written byte count alone does not prove a response ended cleanly. If a body
+  errors after delivering the requested final byte, never mark the range Done or
+  rename the single-path partial; preserve its validated prefix and reserve the
+  final byte for a nonempty retry/restart range until a response completes clean
+  framing. Keep progress unique across that revalidation.
 - Durable proof gate: a multipart staging record carries `ProofPending`, set and
   flushed before any known-digest proof starts and cleared and flushed only
   after it succeeds. On resume it forces the proof in every mode except `none`
@@ -194,12 +202,13 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the ownership lock file: never unlink it (that would let two processes own
   different inodes).
 - Before routing an item to the single-request path, detect usable multipart
-  resume state: a valid v2 `<staging>.incomplete`/`.meta` pair (including the
-  blob-keyed LFS pair) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
+  resume state: a valid versioned `<staging>.incomplete`/`.meta` pair
+  (including the blob-keyed LFS pair; v2 completed ranges revalidate the final
+  byte) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
   ranged-capable item keeps the multipart route even below the configured
   threshold so migration/resume consumes the state; a fresh item with no state
   keeps the configured routing. Without range support, warn, download the full
-  file through the single path, and remove the obsolete v2 pair only after the
+  file through the single path, and remove the obsolete versioned pair only after the
   final file is durable and claim-checked; the legacy family is removed by the
   single-path success cleanup.
 - Serialize current-process record transitions with the per-staging metadata
@@ -208,6 +217,15 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   still own. Re-read claim identity before mutation; cleanup and publish require
   the lifetime capability, and publish checks cancellation immediately before
   rename. A missing or foreign record is refused, never renamed.
+- Install a claim record only as a complete, valid document, atomically and
+  without replacing a record that already appeared. Stage it in a sibling temp
+  and install it with a hard link (atomic, no-replace), falling back to an
+  atomic rename — used only while no record is present — on a filesystem that
+  cannot create hard links. Hard-link support is not a prerequisite for
+  downloading. The staged copy must always be a fresh file: a staged path left
+  behind by an interrupted operation may share the authoritative record's
+  inode, and writing through it would empty the authoritative record before it
+  was replaced.
 - Size checks are only a fallback for files without a trusted hash.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to

@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +31,26 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+type cancelOnErrCallContext struct {
+	context.Context
+	cancelAt int
+	calls    int
+	cancel   context.CancelFunc
+}
+
+func (c *cancelOnErrCallContext) Err() error {
+	c.calls++
+	if c.cancelAt > 0 && c.calls >= c.cancelAt {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
 
 func singleTestSHA(full []byte) string {
 	sum := sha256.Sum256(full)
@@ -302,8 +322,10 @@ func TestDownloadSingle_OversizedSuffixIsNotTrustedOnRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	var requests atomic.Int32
+	var lastRange atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		lastRange.Store(r.Header.Get("Range"))
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", prefix, size-1, size))
 		w.WriteHeader(http.StatusPartialContent)
 		if requests.Load() == 1 {
@@ -332,5 +354,188 @@ func TestDownloadSingle_OversizedSuffixIsNotTrustedOnRestart(t *testing.T) {
 	assertExactFile(t, dst, full)
 	if got := requests.Load(); got != 2 {
 		t.Errorf("GET count=%d, want first rejection plus suffix refetch", got)
+	}
+	if got, _ := lastRange.Load().(string); got != fmt.Sprintf("bytes=%d-%d", prefix, size-1) {
+		t.Errorf("restart range=%q, want the missing suffix", got)
+	}
+}
+
+func TestDownloadSingle_FinalBytesRequireFramingEOF(t *testing.T) {
+	const size, prefix = 8192, 4096
+	full := rangedTestPayload(size)
+	for _, lateOverflow := range []bool{false, true} {
+		name := "exact bytes without timely EOF"
+		if lateOverflow {
+			name = "overflow delayed beyond stall deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), "framing.bin")
+			if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var gets atomic.Int32
+			var secondRange atomic.Value
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var start, end int
+				if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+					http.Error(w, "range required", http.StatusBadRequest)
+					return
+				}
+				request := gets.Add(1)
+				if request == 2 {
+					secondRange.Store(r.Header.Get("Range"))
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(full[start : end+1])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				if request == 1 {
+					// No Content-Length: the HTTP body is chunked and remains
+					// unterminated beyond the stall watchdog.
+					time.Sleep(200 * time.Millisecond)
+					if lateOverflow {
+						_, _ = w.Write([]byte("late overflow"))
+					}
+				}
+			}))
+			defer srv.Close()
+			it := PlanItem{RelativePath: "framing.bin", URL: srv.URL, Size: size}
+			cfg := Settings{Verify: "none", Retries: 0, StallTimeout: "40ms"}
+			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err == nil {
+				t.Fatal("unterminated/overflowing response published after writing all requested bytes")
+			}
+			if _, err := os.Stat(dst); !os.IsNotExist(err) {
+				t.Fatalf("destination was published before framing EOF: %v", err)
+			}
+			part := dst + ".part"
+			if got, err := os.ReadFile(part); err != nil || !bytes.Equal(got, full[:size-1]) {
+				t.Fatalf("failed attempt must preserve the valid prefix and reserve the final byte: len=%d err=%v", len(got), err)
+			}
+			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+				t.Fatalf("healthy final-byte restart: %v", err)
+			}
+			assertExactFile(t, dst, full)
+			if got, _ := secondRange.Load().(string); got != fmt.Sprintf("bytes=%d-%d", size-1, size-1) {
+				t.Fatalf("restart range=%q, want only the unframed final byte", got)
+			}
+			if got := gets.Load(); got != 2 {
+				t.Errorf("GET count=%d, want failed framing plus clean final-byte retry", got)
+			}
+		})
+	}
+}
+
+func TestDownloadSingle_CancelAtFinalizeBeforeRename(t *testing.T) {
+	const size = 4096
+	full := rangedTestPayload(size)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(full)
+	}))
+	defer srv.Close()
+
+	for _, cleanup := range []bool{false, true} {
+		name := "pause preserves partial"
+		if cleanup {
+			name = "explicit cancel cleans partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), "cancel-finalize.bin")
+			old := []byte("previous destination")
+			if err := os.WriteFile(dst, old, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := Settings{Verify: "none", Retries: 0, StallTimeout: "0", CleanupPartialsOnCancel: func() bool { return cleanup }}
+			it := PlanItem{RelativePath: "cancel-finalize.bin", URL: srv.URL, Size: size}
+			_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ev ProgressEvent) {
+				if ev.Event == "file_finalizing" {
+					cancel()
+				}
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("download error=%v, want canceled", err)
+			}
+			if got, readErr := os.ReadFile(dst); readErr != nil || !bytes.Equal(got, old) {
+				t.Fatalf("pre-existing destination changed on cancel: %q, %v", got, readErr)
+			}
+			part := dst + ".part"
+			gotPart, partErr := os.ReadFile(part)
+			if cleanup {
+				if !os.IsNotExist(partErr) {
+					t.Errorf("explicit cancel retained partial: %v", partErr)
+				}
+			} else if partErr != nil || !bytes.Equal(gotPart, full) {
+				t.Errorf("pause failed to preserve complete partial: len=%d err=%v", len(gotPart), partErr)
+			}
+		})
+	}
+}
+
+func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
+	const size = 64 * 1024
+	full := rangedTestPayload(size)
+	sha := singleTestSHA(full)
+	dir := t.TempDir()
+	configure := Settings{Verify: "sha256", CleanupPartialsOnCancel: func() bool { return false }}
+	it := PlanItem{RelativePath: "post-hash-cancel.bin", Size: size, SHA256: sha}
+	emit := func(ProgressEvent) {}
+
+	// First run measures the deterministic number of context checks through a
+	// successful proof. The cancellation run returns context.Canceled on the
+	// next-to-last check: the pre-rename guard immediately after hashing.
+	tmp := filepath.Join(dir, "calibrate.part")
+	dst := filepath.Join(dir, "calibrate.bin")
+	if err := os.WriteFile(tmp, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.OpenFile(tmp, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calibration := &cancelOnErrCallContext{Context: context.Background()}
+	verified, err := finalizeSinglePartial(calibration, out, tmp, dst, it, configure, false, emit)
+	if err != nil || !verified {
+		t.Fatalf("calibration finalization = (%v,%v)", verified, err)
+	}
+	checks := calibration.calls
+	if checks < 4 {
+		t.Fatalf("unexpected context-check count through hash/publish: %d", checks)
+	}
+	if err := os.Remove(dst); err != nil {
+		t.Fatal(err)
+	}
+
+	tmp = filepath.Join(dir, "post-hash-cancel.part")
+	dst = filepath.Join(dir, "post-hash-cancel.bin")
+	if err := os.WriteFile(tmp, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = os.OpenFile(tmp, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelOnErrCallContext{Context: baseCtx, cancelAt: checks - 1, cancel: cancel}
+	hashPassCount.Store(0)
+	verified, err = finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, emit)
+	if !errors.Is(err, context.Canceled) || verified {
+		t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
+	}
+	if ctx.calls != ctx.cancelAt+1 {
+		t.Fatalf("context cancellation did not reach the post-hash guard (calls=%d cancelAt=%d)", ctx.calls, ctx.cancelAt)
+	}
+	if hashPassCount.Load() != 1 {
+		t.Errorf("prepublication proof passes=%d, want one", hashPassCount.Load())
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("destination published after post-hash cancellation: %v", err)
+	}
+	if got, err := os.ReadFile(tmp); err != nil || !bytes.Equal(got, full) {
+		t.Fatalf("pause failed to preserve proven partial: read err=%v", err)
 	}
 }

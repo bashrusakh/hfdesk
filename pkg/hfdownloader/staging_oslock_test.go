@@ -438,8 +438,8 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Pre-condition: the record is already older than the former grace threshold;
-	// its timestamp is diagnostic and cannot grant another process ownership.
+	// Pre-condition: the record is already older than the former lease grace;
+	// its timestamp cannot grant another process ownership.
 	metaBefore, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("helper record: %v", err)

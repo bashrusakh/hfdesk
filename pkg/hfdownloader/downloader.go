@@ -618,6 +618,10 @@ LOOP:
 			}
 
 			var dlErr error
+			directBlobPublished := blobDirect
+			if blobDirect && multipartRan {
+				mpOpts.DirectBlobPublished = &directBlobPublished
+			}
 			// contentVerified reports that the downloader already proved the
 			// payload against it.SHA256 inside this call, before the publish
 			// rename (one pass at most): the ranged path's hash-on-write/final/
@@ -632,6 +636,12 @@ LOOP:
 				contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
 			} else {
 				contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			}
+			if blobDirect && multipartRan && !directBlobPublished {
+				// downloadMultipart delegated an unknown-size item to the
+				// single-request temp path, so storage must move that temp into
+				// the blob and create this item's links.
+				multipartRan = false
 			}
 
 			// A staging file owned by another live writer — or already
@@ -1567,16 +1577,18 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					} else {
 						// Advance by bytes actually written so the next retry
 						// resumes from the durable offset instead of
-						// duplicating them. Overflow writes are excluded above.
-						pos = base + w.written
-						// A transport/stall error after the final requested byte
-						// already reached disk must not plan bytes=size-(size-1)
-						// (a 416). Finalize the exact-size file instead. A genuine
-						// caller cancellation still takes the ctx path below.
-						if it.Size > 0 && pos >= it.Size && ctx.Err() == nil {
-							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
-								Downloaded: it.Size, Total: it.Size})
-							return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
+						// duplicating them. Reaching the requested byte count is
+						// not proof of clean body framing: reserve the last byte
+						// and truncate it so retry/restart requests a non-empty range.
+						accepted := w.written
+						if it.Size > 0 && accepted == limit {
+							accepted--
+							pos = base + accepted
+							if err := out.Truncate(pos); err != nil {
+								return false, fmt.Errorf("retain unframed response prefix: %w", err)
+							}
+						} else {
+							pos = base + accepted
 						}
 					}
 				}
@@ -1640,6 +1652,19 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 // before the slow proof so the UI sees the local-finalization window.
 func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool, emit func(ProgressEvent)) (bool, error) {
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "verifying"})
+	cancelBeforePublish := func() error {
+		if err := ctx.Err(); err != nil {
+			_ = out.Close()
+			if !abortPartAttempt(ctx) {
+				cleanupPartialsOnCancel(cfg, dst, "")
+			}
+			return err
+		}
+		return nil
+	}
+	if err := cancelBeforePublish(); err != nil {
+		return false, err
+	}
 	if it.Size > 0 {
 		fi, err := out.Stat()
 		if err != nil {
@@ -1667,6 +1692,9 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 			}
 			return false, err
 		}
+		if err := cancelBeforePublish(); err != nil {
+			return false, err
+		}
 		if !strings.EqualFold(sum, it.SHA256) {
 			// Unproven bytes must never be published: the partial is removed so
 			// a retry starts from a clean prefix, and dst is left untouched.
@@ -1677,6 +1705,9 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 		verified = true
 	}
 	if err := out.Close(); err != nil {
+		return false, err
+	}
+	if err := cancelBeforePublish(); err != nil {
 		return false, err
 	}
 	if err := os.Rename(tmp, dst); err != nil {

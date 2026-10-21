@@ -27,8 +27,8 @@ package hfdownloader
 //
 // A record is trusted only when its repo/path/size/resolved-commit identity
 // matches, its blob SHA is present on both sides or neither, its ranges tile
-// [0,size) with normalized completion (Done exactly when the range is fully
-// committed), and the staging payload exists at the expected logical size
+// [0,size) with normalized completion (Done means all bytes arrived under a
+// response whose framing ended cleanly), and the staging payload exists at the expected logical size
 // before any create/truncate. A record whose payload vanished is discarded and
 // re-downloaded; it is never allowed to publish a preallocated zero file.
 //
@@ -87,26 +87,41 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 // stagingMetaVersion is the IncompleteMeta.Version value written by this
-// downloader. A record without it (0) carries no range state and cannot be
-// trusted to describe a staging file's valid bytes.
-const stagingMetaVersion = 2
+// downloader. Version 3 marks range completion only after clean response
+// framing; version 2 checkpoints are migrated with their last byte reserved
+// for revalidation.
+const stagingMetaVersion = 3
 
-// claimGracePeriod is how recently a staging meta file must have been
-// created or rewritten for an unreadable/empty record — or for a live
-// foreign owner's still-absent payload — to be treated as "another writer
-// is mid-claim" instead of stale. The O_EXCL claim creates the file empty
-// and writes the record immediately after, so this only covers the window
-// in between.
+const priorStagingMetaVersion = 2
+
+// linkStagingClaimRecord atomically publishes a complete fresh record without
+// replacing an existing path. Tests replace it to exercise the crash/error
+// boundary between temp completion and final claim installation, and to
+// simulate a filesystem that cannot create hard links at all.
+var linkStagingClaimRecord = os.Link
+
+// renameStagingClaimRecord installs a staged record over an existing one. It
+// is the replacement primitive and the install used on filesystems that cannot
+// create hard links. Tests replace it to exercise the failure boundary between
+// staging a complete record and installing it.
+var renameStagingClaimRecord = os.Rename
+
+// stagingRecordTempSuffix is the suffix of the staged-record path beside the
+// authoritative staging record. The staged file holds a complete record that
+// is installed by an atomic link or rename; it is never authoritative itself.
+const stagingRecordTempSuffix = ".tmp"
+
+// claimGracePeriod is the maximum diagnostic heartbeat interval before an
+// owner rewrites its metadata. It is not ownership authority: only the lifetime
+// OS lock permits or excludes a current-version mutation.
 const claimGracePeriod = 10 * time.Second
 
-// claimHeartbeatEvery is how often an owner rewrites its claim record. It is
-// derived from claimGracePeriod so the record cannot go staler than the grace
-// window a claimant uses to decide a live foreign owner still owns the
-// staging file.
+// claimHeartbeatEvery is how often an owner rewrites diagnostic/resume metadata.
 const claimHeartbeatEvery = claimGracePeriod / 2
 
 // stagingHeartbeatEvery is the running heartbeat cadence. It is a variable so
@@ -274,6 +289,11 @@ type multipartOpts struct {
 	// existing publish target is stale bytes the claim must not skip: the
 	// caller's pre-download skip decision is authoritative for that path.
 	ContentAddressed bool
+	// DirectBlobPublished reports whether this call actually published to
+	// Publish. When size remains unknown after HEAD, downloadMultipart falls
+	// back to the single-path temp destination instead; the caller must then
+	// pass that temp through the normal cache-store owner.
+	DirectBlobPublished *bool
 }
 
 // stagingClaimState is what a successful claim produced.
@@ -447,7 +467,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	var meta IncompleteMeta
 	if json.Unmarshal(raw, &meta) != nil {
 		// Unreadable record. With the OS ownership lock held, no live
-		// format-2 writer can be mid-claim: every current writer creates
+		// current-version writer can be mid-claim: every current writer creates
 		// this record while holding the lifetime lock. An unreadable legacy
 		// record cannot establish that its owner is dead, regardless of age.
 		return nil, false, errBlobIncompleteOwned
@@ -471,11 +491,9 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		removeStagingArtifactsLocked(staging, metaPath)
 		return nil, true, nil
 	}
-	// Remove only the record we validated, then win the exclusive create
-	// ourselves. No other lock-holding writer can intervene between the two.
-	if rmErr := os.Remove(metaPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-		return nil, false, rmErr
-	}
+	// Atomically replace the validated predecessor. Until the rename installs
+	// the complete new record, the old resume authority remains intact; a crash
+	// during temp creation cannot leave a new empty/partial claim at metaPath.
 	take := newClaimMeta(it, job, commit)
 	take.StartedAt = meta.StartedAt
 	take.Ranges = ranges
@@ -486,54 +504,202 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// Record the ownership mode of THIS claim, not the predecessor's: the
 	// current process holds the required OS lifetime lock.
 	take.LockFenced = osExclusive
-	state, retry, err := createStagingClaim(metaPath, take)
-	if err != nil || retry {
-		return nil, retry, err
-	}
-	return state, false, nil
-}
-
-// createStagingClaim exclusively creates the record for a claim. A fresh
-// record has no Ranges yet (the caller persists the layout after opening the
-// payload); a taken-over record carries the validated layout. retry=true means
-// an older, lock-unaware writer created the record first, so the caller must
-// re-evaluate rather than overwrite it.
-func createStagingClaim(metaPath string, meta IncompleteMeta) (*stagingClaimState, bool, error) {
-	f, err := os.OpenFile(metaPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if errors.Is(err, os.ErrExist) {
-		return nil, true, nil
-	}
-	if err != nil {
+	if err := writeStagingMetaFile(metaPath, &take); err != nil {
 		return nil, false, err
 	}
-	if werr := writeClaimRecord(f, metaPath, meta); werr != nil {
-		return nil, false, werr
-	}
-	// Read-back verification: the record must still carry our instance token.
 	if !claimRecordOurs(metaPath) {
 		return nil, false, errStagingClaimLost
 	}
+	return stagingClaimStateFromMeta(take), false, nil
+}
+
+// createStagingClaim atomically installs a complete record for a fresh claim
+// without replacing a record that appeared after the caller's absent check.
+//
+// The complete JSON is staged in the sibling temp file <meta>.tmp and then
+// installed by one atomic operation:
+//
+//   - a hard link of the staged inode to metaPath. Link creation is atomic and
+//     no-replace, so a record that appeared after the caller's absent check is
+//     never replaced.
+//   - when the filesystem cannot create hard links at all, an atomic rename of
+//     the staged file to metaPath. A rename does replace an existing target, so
+//     it is used only after confirming that no record is present, and it is
+//     safe because the lifetime ownership lock and the local metadata gate
+//     exclude every foreign mutator for the whole transition.
+//
+// The staged file is created with O_EXCL, so it is always a fresh inode. A
+// staged path left behind by an interrupted operation is therefore never
+// written through: it may still be a hard link to the authoritative record
+// (an install that crashed before removing its staged name), and truncating it
+// would empty the authoritative record before it was replaced.
+//
+// A crash during staging leaves no authoritative claim; retry=true means
+// another writer installed the record first and the caller must re-evaluate it.
+func createStagingClaim(metaPath string, meta IncompleteMeta) (*stagingClaimState, bool, error) {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return nil, false, err
+	}
+	tmp, err := stageStagingClaimRecord(metaPath, data)
+	if err != nil {
+		return nil, false, err
+	}
+	installed, retry, err := installStagedClaimRecord(metaPath, tmp)
+	if !installed {
+		// The staged copy was not installed: remove it so the residue cannot
+		// be mistaken for an authoritative record. A removal failure is not
+		// fatal: the staged path is never authoritative.
+		if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			log.Printf("warning: remove staged claim record %s: %v", tmp, rmErr)
+		}
+		return nil, retry, err
+	}
+	// The staged name is dropped after the install. A hard-link install leaves
+	// both names on one inode, so the staged name must not survive as an alias
+	// of the authoritative record: a later run would clear and rewrite it.
+	// A rename install already moved the staged file away.
+	if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		log.Printf("warning: remove staged claim record %s: %v", tmp, rmErr)
+	}
+	// Read-back verification: the atomically installed record must still carry
+	// our instance token.
+	if !claimRecordOurs(metaPath) {
+		return nil, false, errStagingClaimLost
+	}
+	return stagingClaimStateFromMeta(meta), false, nil
+}
+
+// stageStagingClaimRecord writes the complete record bytes to the sibling temp
+// file <meta>.tmp and returns its path.
+//
+// The staged path is cleared first and then created with O_EXCL, so the staged
+// file is always a fresh inode. A staged path that survived an interrupted
+// operation may be a hard link to the authoritative record (an install that
+// crashed between linking and removing its staged name); writing through it
+// would truncate the authoritative record before it was replaced. Clearing the
+// staged PATH never touches the authoritative record: unlinking an alias drops
+// only the extra name, and the record keeps its own name and its bytes.
+//
+// A staged path that is not a regular file (a directory, say) is an error
+// rather than something to clear: it cannot hold a staged record, and the
+// operation must fail without touching the authoritative record.
+func stageStagingClaimRecord(metaPath string, data []byte) (string, error) {
+	tmp := metaPath + stagingRecordTempSuffix
+	if err := clearStagingRecordTemp(tmp); err != nil {
+		return "", err
+	}
+	// O_EXCL: the staged file is a fresh inode, never a truncation of a file
+	// left by an earlier operation.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
+	}
+	return tmp, nil
+}
+
+// clearStagingRecordTemp removes a staged-record residue so the path can be
+// recreated as a fresh file. It reports an error when the path holds
+// something that cannot be a staged record.
+func clearStagingRecordTemp(tmp string) error {
+	info, err := os.Lstat(tmp)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect staged claim record %s: %w", tmp, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 && !info.Mode().IsRegular() {
+		return fmt.Errorf("staged claim record %s is not a regular file", tmp)
+	}
+	// lgtm[go/path-injection]
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear staged claim record %s: %w", tmp, err)
+	}
+	return nil
+}
+
+// installStagedClaimRecord installs the staged record at metaPath.
+//
+// The hard-link path is atomic and no-replace: a record that appeared after
+// the caller's absent check is reported as "not installed" (retry) and is
+// never replaced. When the filesystem cannot create hard links, the install
+// falls back to an atomic rename, which does replace the target; it is used
+// only when no record is present, and it is safe because the lifetime
+// ownership lock and the local metadata gate exclude every foreign mutator
+// for the whole transition.
+//
+// A hard-link failure that is NOT a lack of hard-link support is a real
+// failure: it is reported, never silently downgraded to a replacing rename.
+func installStagedClaimRecord(metaPath, tmp string) (installed bool, retry bool, err error) {
+	linkErr := linkStagingClaimRecord(tmp, metaPath)
+	if linkErr == nil {
+		return true, false, nil
+	}
+	if errors.Is(linkErr, os.ErrExist) {
+		// Another writer installed a record first. It is authoritative.
+		return false, true, nil
+	}
+	if !stagingHardLinkUnsupported(linkErr) {
+		return false, false, fmt.Errorf("install initial claim record %s: %w", metaPath, linkErr)
+	}
+	// This filesystem cannot create hard links. Install by rename instead,
+	// but only while no record is present: a record that appeared is
+	// authoritative and must not be replaced.
+	if _, statErr := os.Lstat(metaPath); statErr == nil {
+		return false, true, nil
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return false, false, fmt.Errorf("install initial claim record %s: %w", metaPath, statErr)
+	}
+	if renameErr := renameStagingClaimRecord(tmp, metaPath); renameErr != nil {
+		return false, false, fmt.Errorf("install initial claim record %s: %w", metaPath, renameErr)
+	}
+	return true, false, nil
+}
+
+// stagingHardLinkUnsupported reports whether err means the filesystem cannot
+// create hard links at all, as opposed to a transient or specific failure
+// (a full disk, an I/O error). Only the former justifies the rename-based
+// install; every other failure must surface.
+//
+// The errnos are matched through the portable error interface, so the check
+// behaves the same on Unix and on Windows without a platform-specific file.
+func stagingHardLinkUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	// ENOSYS/ENOTSUP/EOPNOTSUPP: the filesystem has no hard links.
+	if errors.Is(err, errors.ErrUnsupported) {
+		return true
+	}
+	// EPERM: the filesystem refuses hard links (common on FAT/exFAT and on
+	// Windows volumes mounted without link support).
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	// EMLINK: the link count of the staged inode is already at its maximum.
+	if errors.Is(err, syscall.EMLINK) {
+		return true
+	}
+	return false
+}
+
+func stagingClaimStateFromMeta(meta IncompleteMeta) *stagingClaimState {
 	return &stagingClaimState{
 		ranges:         meta.Ranges,
 		fresh:          meta.Ranges == nil,
 		legacyMigrated: meta.LegacyMigrated,
 		proofPending:   meta.ProofPending,
-	}, false, nil
-}
-
-// writeClaimRecord writes the claim record into the exclusively created
-// meta file and closes it.
-func writeClaimRecord(f *os.File, metaPath string, meta IncompleteMeta) error {
-	data, err := json.Marshal(meta)
-	if err != nil {
-		f.Close()
-		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 // claimRecordOurs re-reads the claim record and reports whether it still
@@ -581,7 +747,7 @@ func stagingArtifactsAbsent(staging, metaPath string) bool {
 	if _, err := os.Stat(metaPath); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	if _, err := os.Stat(metaPath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(metaPath + stagingRecordTempSuffix); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	return true
@@ -599,12 +765,13 @@ func stagingPayloadSizeOK(staging string, size int64) bool {
 
 // stagingMetaResumable validates a staging record against the exact remote
 // object and returns its normalized range layout. It is resumable only when
-// the version, repo, path, size and resolved commit match, the blob SHA is
+// version 2 or the current version, repo, path, size and resolved commit match,
+// the blob SHA is
 // present on both sides or neither (and equal when present), and every range
-// carries a normalized completion marker: Done means the whole range is
-// committed, and Committed == range length means Done.
+// carries a conservative completion marker. Version 2 completion is migrated
+// by reserving its final byte for clean-framing revalidation.
 func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string) ([]RangeProgress, bool) {
-	if meta.Version != stagingMetaVersion || meta.Size != it.Size || meta.Size <= 0 {
+	if (meta.Version != stagingMetaVersion && meta.Version != priorStagingMetaVersion) || meta.Size != it.Size || meta.Size <= 0 {
 		return nil, false
 	}
 	if meta.Repo != job.Repo || meta.Path != it.RelativePath || meta.Commit != commit {
@@ -619,14 +786,30 @@ func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit stri
 	if meta.SHA256 != "" && !strings.EqualFold(meta.SHA256, it.SHA256) {
 		return nil, false
 	}
-	return normalizedRangeLayout(meta.Ranges, meta.Size)
+	ranges, ok := normalizedRangeLayout(meta.Ranges, meta.Size)
+	if !ok {
+		return nil, false
+	}
+	if meta.Version == priorStagingMetaVersion {
+		// Version 2 could mark a range Done after every requested byte was
+		// written even when response framing/EOF failed. Preserve its validated
+		// prefix, but re-fetch each range's final byte before trusting completion.
+		for i := range ranges {
+			if ranges[i].Done {
+				length := ranges[i].End - ranges[i].Start + 1
+				ranges[i].Committed = length - 1
+				ranges[i].Done = false
+			}
+		}
+	}
+	return ranges, true
 }
 
 // normalizedRangeLayout returns a normalized copy of ranges when they exactly
 // tile [0, size), with in-range committed prefixes and no byte claimed past a
-// range end. Completion is normalized so Done and Committed agree:
-//   - Done=true means the entire range is committed (Committed=length);
-//   - Committed=length means the range is done (Done=true).
+// range end. Done=true means the full range is committed after clean response
+// framing. A full Committed prefix without Done is not framing proof and is
+// reduced to length-1 so retry always requests a nonempty suffix.
 //
 // A record that cannot be normalized is not trustworthy resume data.
 func normalizedRangeLayout(ranges []RangeProgress, size int64) ([]RangeProgress, bool) {
@@ -657,8 +840,8 @@ func normalizeRangesInPlace(ranges []RangeProgress, size int64) bool {
 		if r.Committed < 0 || r.Committed > want {
 			return false
 		}
-		if r.Committed == want {
-			r.Done = true
+		if r.Committed == want && !r.Done {
+			r.Committed = want - 1
 		}
 		off = r.End + 1
 	}
@@ -696,8 +879,8 @@ func removeStagingArtifactsLocked(staging, metaPath string) {
 	// between create and rename leaves that transient artifact behind. It is
 	// never a blob and must not survive cleanup.
 	// lgtm[go/path-injection]
-	if err := os.Remove(metaPath + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("warning: cleanup staging meta temp %s: %v", metaPath+".tmp", err)
+	if err := os.Remove(metaPath + stagingRecordTempSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("warning: cleanup staging meta temp %s: %v", metaPath+stagingRecordTempSuffix, err)
 	}
 	// lgtm[go/path-injection]
 	if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -758,16 +941,28 @@ func readStagingMeta(metaPath string) (*IncompleteMeta, error) {
 // writeStagingMetaFile atomically rewrites the staging record (stage in the
 // same directory, then rename) so a crash never leaves a partial record. The
 // caller must hold the staging metadata gate (see staging_lock.go).
+//
+// The staged copy is written to a fresh inode at the sibling temp path, so a
+// staged path left behind by an interrupted operation is never written
+// through: it may still be a hard link to the authoritative record, and
+// truncating it would empty the authoritative record before the rename
+// replaced it.
 func writeStagingMetaFile(metaPath string, meta *IncompleteMeta) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
-	tmp := metaPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp, err := stageStagingClaimRecord(metaPath, data)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, metaPath)
+	if err := renameStagingClaimRecord(tmp, metaPath); err != nil {
+		if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			log.Printf("warning: remove staged claim record %s: %v", tmp, rmErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // buildRangeLayout partitions [0, size) into n contiguous ranges, matching
@@ -1632,6 +1827,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}
 	}
 	if it.Size == 0 {
+		if opts.DirectBlobPublished != nil {
+			*opts.DirectBlobPublished = false
+		}
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
@@ -1646,8 +1844,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	metaPath := stg + ".meta"
 
 	// Claim the staging file exclusively: the in-process registry, the
-	// OS-level ownership lock held for the whole interval, and the serialized
-	// record transition (O_EXCL claim). A live owner — including a suspended
+	// OS-level ownership lock held for the whole interval, the local metadata
+	// gate, and atomic complete-record installation. A live owner — including a suspended
 	// one that stopped heartbeating — short-circuits the file to a skip in the
 	// caller; only a content-addressed publish target is treated as already
 	// complete.
@@ -2386,31 +2584,25 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 					// pos advances by the bytes actually written, so the next
 					// retry's Range request resumes from the durable offset and
 					// the committed checkpoint never passes the written bytes.
-					// Completion is normalized here: a failure after the final
-					// chunk (stall, cancel before EOF) has written every requested
-					// byte and must persist Done=true, never Done=false with
-					// Committed==length (which would plan bytes=End+1-End).
-					pos += w.written
+					// Written bytes do not prove response framing: if the final
+					// requested byte arrived but EOF/framing failed, keep that byte
+					// uncommitted so retry requests a non-empty suffix.
+					accepted := w.written
+					if accepted == wantLen {
+						accepted--
+						// The hash consumed this byte, and the retry will feed it
+						// again. Drop hash-on-write for one final full-file pass.
+						d.seqHash = nil
+					}
+					pos += accepted
 					d.metaMu.Lock()
 					r.Committed = commit0 + pos
-					want := r.End - r.Start + 1
-					if r.Committed >= want {
-						r.Committed = want
-						r.Done = true
-					}
-					done := r.Done
+					r.Done = false
 					ferr := d.flushMetaLocked()
 					d.metaMu.Unlock()
 					if ferr != nil {
 						attemptCancel()
 						return ferr
-					}
-					if done {
-						// The failure happened after the final requested byte was
-						// written. The range is complete; retrying would plan
-						// bytes=End+1-End and wedge the file behind a 416.
-						attemptCancel()
-						return nil
 					}
 				}
 				// An oversized response is never completion, even when every

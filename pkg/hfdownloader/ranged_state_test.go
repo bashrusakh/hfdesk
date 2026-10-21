@@ -7,8 +7,9 @@ package hfdownloader
 // machine (issue #140 correction set). Each blocker test is written to fail
 // against the pre-correction implementation:
 //
-//   - a failure after the final chunk must persist Done=true, not
-//     Done=false with Committed==length (which planned bytes=End+1-End);
+//   - a body error after the final requested byte must leave a nonempty
+//     revalidation suffix, never publish an unframed response or request an
+//     impossible bytes=End+1-End range;
 //   - a completed-looking record with a missing/wrong-sized payload must be
 //     discarded and re-downloaded, never published as zeros;
 //   - a foreign instance token with our own PID is not self-ownership;
@@ -115,12 +116,11 @@ func TestRangedMultipart_ZeroConcurrencyStillCompletes(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_FinalChunkFailureNormalizesDone reproduces blocker 1
-// with a cancel after the final byte: the caller cancels the job while the
-// response is still open, but every requested byte has already been written.
-// The persisted record must normalize to Done=true; the next run must finish
-// without ever issuing a bytes=End+1-End request (416).
-func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
+// TestRangedMultipart_FinalChunkFailureRequiresFramingRevalidation cancels
+// after every requested byte is written but before the chunked response ends.
+// The unframed last byte stays uncommitted; a restart requests that byte and
+// only then publishes after a clean response.
+func TestRangedMultipart_FinalChunkFailureRequiresFramingRevalidation(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -208,9 +208,8 @@ func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first run never served the body")
 	}
-	// The progress counter reaches Total only after every byte was written
-	// to the staging file. Wait for that reading, then cancel while the
-	// response is still open (the server holds it until cancellation).
+	// The progress counter reaches Total after every byte was written. Cancel
+	// while the chunked response is still open: bytes alone are not framing EOF.
 	select {
 	case <-reachedFull:
 	case err := <-done:
@@ -222,6 +221,9 @@ func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("first run error = %v, want context.Canceled", err)
 	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("unframed response was published before recovery: %v", err)
+	}
 
 	meta, err := readStagingMeta(staging + ".meta")
 	if err != nil {
@@ -230,8 +232,8 @@ func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
 	if len(meta.Ranges) != 1 {
 		t.Fatalf("unexpected range layout: %+v", meta.Ranges)
 	}
-	if !meta.Ranges[0].Done || meta.Ranges[0].Committed != total {
-		t.Fatalf("final-chunk cancellation persisted non-normalized completion: %+v (want Done=true, Committed=%d)", meta.Ranges[0], total)
+	if meta.Ranges[0].Done || meta.Ranges[0].Committed != total-1 {
+		t.Fatalf("unframed final byte was committed: %+v (want Done=false, Committed=%d)", meta.Ranges[0], total-1)
 	}
 
 	recoveryCfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}
@@ -242,6 +244,9 @@ func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	if len(rangeHdrs) != 2 || rangeHdrs[1] != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
+		t.Fatalf("recovery should re-request only the unframed final byte, ranges=%v", rangeHdrs)
+	}
 	for _, rh := range rangeHdrs {
 		var start, end int64
 		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &start, &end); err != nil {
@@ -253,14 +258,15 @@ func TestRangedMultipart_FinalChunkFailureNormalizesDone(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_FinalChunkFailureDoesNotRetryPastEnd covers the retry
-// variant of blocker 1: with a non-zero retry budget, a post-final-chunk
-// failure must still complete the range instead of issuing bytes=End+1-End on
-// the next attempt.
-func TestRangedMultipart_FinalChunkFailureDoesNotRetryPastEnd(t *testing.T) {
+// TestRangedMultipart_FinalChunkFailureRetriesLastByteUntilFramed covers the
+// retry variant: all bytes arrive, but the first chunked response remains open
+// past the stall deadline. The retry must request the final byte, not publish
+// the unframed attempt or plan an empty range.
+func TestRangedMultipart_FinalChunkFailureRetriesLastByteUntilFramed(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8000
 	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
 	dst := filepath.Join(tmpDir, "final-chunk-retry.bin")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
@@ -299,33 +305,46 @@ func TestRangedMultipart_FinalChunkFailureDoesNotRetryPastEnd(t *testing.T) {
 				f.Flush()
 			}
 			time.Sleep(400 * time.Millisecond)
+			_, _ = w.Write([]byte("late overflow after stall deadline"))
 			return
 		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 	}))
 	defer srv.Close()
 
-	it := PlanItem{RelativePath: "final-chunk-retry.bin", URL: srv.URL + "/final-chunk-retry.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: 1, Retries: 2, StallTimeout: "80ms", BackoffInitial: "1ms", BackoffMax: "1ms"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart retried past the completed range: %v", err)
+	it := PlanItem{RelativePath: "final-chunk-retry.bin", URL: srv.URL + "/final-chunk-retry.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
+	cfg := Settings{Concurrency: 1, Retries: 2, StallTimeout: "80ms", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "sha256"}
+	var progress []int64
+	hashPassCount.Store(0)
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ev ProgressEvent) {
+		if ev.Event == "file_progress" {
+			progress = append(progress, ev.Downloaded)
+		}
+	}); err != nil {
+		t.Fatalf("downloadMultipart did not complete after a clean final-byte retry: %v", err)
 	}
 	assertExactFile(t, dst, full)
+	if got := hashPassCount.Load(); got != 1 {
+		t.Errorf("strict retry performed %d full-file passes, want one after invalidating hash-on-write", got)
+	}
+	for i, n := range progress {
+		if n > total || (i > 0 && n < progress[i-1]) {
+			t.Errorf("progress was not monotonic unique bytes: %v", progress)
+			break
+		}
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	for _, rh := range rangeHdrs {
-		var start, end int64
-		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &start, &end); err == nil && start > end {
-			t.Errorf("retry issued an impossible range %q", rh)
-		}
+	if len(rangeHdrs) != 2 || rangeHdrs[1] != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
+		t.Errorf("unframed completion did not retry the last byte: ranges=%v", rangeHdrs)
 	}
 }
 
-// TestRangedMultipart_CompletePrefixRecordIsNormalizedNotReplayed seeds the
-// exact pre-correction state blocker 1 produced (Committed==length with
-// Done=false). Trust/normalization must turn it into a completed range at
-// planning time and publish without any bytes=End+1-End request.
-func TestRangedMultipart_CompletePrefixRecordIsNormalizedNotReplayed(t *testing.T) {
+// TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte seeds the
+// version-2 Done state produced when all bytes were written but response
+// framing failed. Migration keeps the prefix and re-fetches the final byte
+// before publication.
+func TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
 	host, _ := os.Hostname()
@@ -339,7 +358,7 @@ func TestRangedMultipart_CompletePrefixRecordIsNormalizedNotReplayed(t *testing.
 		t.Fatal(err)
 	}
 	raw := fmt.Sprintf(
-		`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"complete-prefix.bin","ranges":[{"start":0,"end":%d,"committed":%d,"done":false}]}`,
+		`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"complete-prefix.bin","ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
 		host, total, total-1, total)
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
@@ -357,8 +376,8 @@ func TestRangedMultipart_CompletePrefixRecordIsNormalizedNotReplayed(t *testing.
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	if len(*gotRanges) != 0 {
-		t.Errorf("complete-prefix record was not normalized; requests=%v", *gotRanges)
+	if len(*gotRanges) != 1 || (*gotRanges)[0] != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
+		t.Errorf("unframed complete-prefix record did not revalidate exactly its final byte; requests=%v", *gotRanges)
 	}
 }
 
@@ -491,8 +510,8 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	}
 
 	// Stale heartbeat + provably dead same-host owner and no ownership lock:
-	// take-over must still recover the committed bytes rather than locking the
-	// file forever.
+	// take-over resumes its validated prefix, while the version-2 completed
+	// range revalidates its final byte under the newer framing contract.
 	staleMeta := fmt.Sprintf(
 		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
 		host, total, total-1)
@@ -522,8 +541,21 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatalf("take-over of a dead same-host owner failed: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	if len(*gotRanges) == 0 || (*gotRanges)[0] != "bytes=800-7999" {
-		t.Errorf("take-over did not resume the committed prefix: %v", *gotRanges)
+	wantRanges := map[string]bool{"bytes=799-799": false, "bytes=800-7999": false}
+	for _, rh := range *gotRanges {
+		if _, ok := wantRanges[rh]; !ok {
+			t.Errorf("unexpected take-over range %q (all ranges=%v)", rh, *gotRanges)
+			continue
+		}
+		wantRanges[rh] = true
+	}
+	if len(*gotRanges) != len(wantRanges) {
+		t.Errorf("take-over ranges=%v, want prefix revalidation plus missing suffix", *gotRanges)
+	}
+	for rh, seen := range wantRanges {
+		if !seen {
+			t.Errorf("take-over did not fetch %s; ranges=%v", rh, *gotRanges)
+		}
 	}
 }
 

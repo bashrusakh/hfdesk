@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,32 +230,45 @@ func TestPoisonStagingSkipsLostUnfencedClaim(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_FinalByteTransportErrorFinalizes covers M1: all expected
-// bytes reached disk before the transport error; the single path must finalize
-// rather than retrying an invalid bytes=size-(size-1) range (416).
-func TestDownloadSingle_FinalByteTransportErrorFinalizes(t *testing.T) {
+// TestDownloadSingle_FinalByteRequiresResponseFraming covers the single-path
+// framing correction: all requested bytes arrive but the chunked response is
+// aborted before its terminal chunk, so the last byte must be re-requested.
+func TestDownloadSingle_FinalByteRequiresResponseFraming(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	var requests atomic.Int32
 	var badRanges atomic.Int32
+	var lastRange atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		if rng := r.Header.Get("Range"); rng != "" {
+		if requests.Add(1) == 1 {
+			if r.Header.Get("Range") != "" {
+				badRanges.Add(1)
+				http.Error(w, "unexpected initial range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			// Chunked body: deliver all bytes, then abort without the
+			// terminating chunk so the final byte lacks framing proof.
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write(full)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		rng := r.Header.Get("Range")
+		lastRange.Store(rng)
+		if rng != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
 			badRanges.Add(1)
-			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			http.Error(w, "unexpected retry range", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		// Chunked body: deliver all bytes, then abort without the terminating
-		// chunk so the client sees a transport error after the final byte.
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		_, _ = w.Write(full)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		panic(http.ErrAbortHandler)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", total-1, total-1, total))
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(full[total-1:])
 	}))
 	defer srv.Close()
 
@@ -263,14 +277,17 @@ func TestDownloadSingle_FinalByteTransportErrorFinalizes(t *testing.T) {
 	it := PlanItem{RelativePath: "final-byte.bin", URL: srv.URL, Size: total}
 	cfg := Settings{Verify: "size", Retries: 1, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
 	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadSingle: %v (the final-byte error must finalize, not retry a bad range)", err)
+		t.Fatalf("downloadSingle: %v (clean final-byte framing retry should recover)", err)
 	}
 	assertExactFile(t, dst, full)
-	if got := requests.Load(); got != 1 {
-		t.Errorf("issued %d requests; want 1 (no retry after the final byte)", got)
+	if got := requests.Load(); got != 2 {
+		t.Errorf("issued %d requests; want initial unframed body plus final-byte revalidation", got)
+	}
+	if got, _ := lastRange.Load().(string); got != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
+		t.Errorf("retry range=%q, want only the unframed final byte", got)
 	}
 	if got := badRanges.Load(); got != 0 {
-		t.Errorf("issued %d invalid bytes=size-(size-1) ranges; want 0", got)
+		t.Errorf("issued %d invalid ranges; want 0", got)
 	}
 }
 
@@ -512,6 +529,114 @@ func TestDownloadSingle_UnknownSizeKnownDigestRequiresProof(t *testing.T) {
 				t.Error("unknown-size proof did not report contentVerified")
 			}
 			assertExactFile(t, dst, good)
+		})
+	}
+}
+
+func TestDownloadUnknownSizeLFSStoresSinglePathFallbackCorrectly(t *testing.T) {
+	const total = 4096
+	good := rangedTestPayload(total)
+	bad := corruptSameSize(good)
+	sha := singleTestSHA(good)
+	cases := []struct {
+		name      string
+		verify    string
+		body      []byte
+		wantError bool
+	}{
+		{name: "size mode known digest", verify: "size", body: good},
+		{name: "sha256 mode", verify: "sha256", body: good},
+		{name: "digest mismatch stays unpublished", verify: "sha256", body: bad, wantError: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			var gets atomic.Int32
+			var heads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/revision/main"):
+					_, _ = w.Write([]byte(`{"sha":"commit-unknown-size"}`))
+				case strings.HasSuffix(r.URL.Path, "/tree/main"):
+					// Both tree Size and LFS.Size are intentionally omitted.
+					node := fmt.Sprintf(`{"type":"file","path":"unknown.bin","lfs":{"oid":%q,"sha256":%q}}`, sha, sha)
+					_, _ = w.Write([]byte("[" + node + "]"))
+				case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodHead:
+					// The HEAD advertises range support but omits Content-Length too.
+					heads.Add(1)
+					w.Header().Set("Accept-Ranges", "bytes")
+				case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodGet:
+					gets.Add(1)
+					if r.Header.Get("Range") != "" {
+						http.Error(w, "unknown-size single fallback must not range", http.StatusBadRequest)
+						return
+					}
+					w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)))
+					_, _ = w.Write(tc.body)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			cfg := Settings{
+				CacheDir: cacheDir, Endpoint: srv.URL, MultipartThreshold: "0",
+				Concurrency: 2, MaxActiveDownloads: 1, Verify: tc.verify, Retries: 0,
+			}
+			job := Job{Repo: "owner/model", Revision: "main"}
+			var completedPlan Plan
+			cfg.OnPlanComplete = func(plan Plan) { completedPlan = plan }
+			hashPassCount.Store(0)
+			err := Download(context.Background(), job, cfg, nil)
+			if len(completedPlan.Items) != 1 || completedPlan.Items[0].Size != 0 {
+				t.Fatalf("fixture did not retain unknown plan size: %+v", completedPlan.Items)
+			}
+			if gets.Load() != 1 {
+				t.Fatalf("GET count=%d, want one non-ranged fetch", gets.Load())
+			}
+			if heads.Load() == 0 {
+				t.Fatal("unknown-size multipart probe did not exercise a HEAD response without Content-Length")
+			}
+			if hashPassCount.Load() != 1 {
+				t.Fatalf("unknown-size known-digest verification performed %d passes, want one", hashPassCount.Load())
+			}
+
+			repo, rerr := NewHFCache(cacheDir, DefaultStaleTimeout).Repo(job.Repo, RepoTypeModel)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			blob := repo.BlobPath(sha)
+			snapshot, rerr := repo.SnapshotPath("commit-unknown-size", "unknown.bin")
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			friendly := filepath.Join(repo.FriendlyPath(), "unknown.bin")
+			tmp := filepath.Join(repo.BlobsDir(), "tmp-"+sha)
+			for _, p := range []string{tmp, tmp + ".part", repo.IncompletePath(sha), repo.IncompleteMetaPath(sha)} {
+				if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+					t.Errorf("temporary artifact %s remains (err=%v)", p, statErr)
+				}
+			}
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
+					t.Fatalf("mismatch error=%v, want prepublication SHA failure", err)
+				}
+				for _, p := range []string{blob, snapshot, friendly} {
+					if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+						t.Errorf("mismatched content published at %s (err=%v)", p, statErr)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Download: %v", err)
+			}
+			for _, p := range []string{blob, snapshot, friendly} {
+				if _, statErr := os.Stat(p); statErr != nil {
+					t.Errorf("expected cache destination %s missing: %v", p, statErr)
+				}
+			}
+			assertExactFile(t, blob, good)
 		})
 	}
 }

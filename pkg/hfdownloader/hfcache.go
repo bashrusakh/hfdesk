@@ -245,17 +245,17 @@ func (r *RepoDir) EnsureDirs() error {
 // state used by CheckBlob and the claim/take-over logic. PID alone is only a
 // hint: a reused PID or two containers reporting PID 1 must not be treated as
 // the same owner. The Version/Ranges fields extend the record into the
-// ranged-download resume state (issue #140): a Version 2 meta describes a
-// direct-write staging file whose valid bytes are exactly the committed
-// prefixes of the listed ranges. Ranges is the authoritative byte contract for
-// an existing incomplete download, deliberately decoupled from the worker
-// count so a changed Settings.Concurrency re-fetches only missing bytes instead
-// of invalidating valid ones. Crash-safety contract: payload data is written
-// before Committed is advanced, the metadata file may lag the payload, and
-// Committed must never claim bytes that were not successfully written. The
-// staging file is preallocated, so its on-disk length is never evidence of
-// completion — only Ranges is, and only after the payload's existence and
-// logical size have been checked and completion has been normalized.
+// ranged-download resume state (issue #140): versioned metadata describes a
+// direct-write staging file whose valid bytes are the committed prefixes of
+// the listed ranges. Ranges is the authoritative byte contract for an existing
+// incomplete download, deliberately decoupled from worker count so changed
+// Settings.Concurrency re-fetches only missing bytes. Crash-safety contract:
+// payload data is written before Committed is advanced, and Committed must not
+// claim bytes that were not written. Version 3 Done additionally requires clean
+// response framing; a version-2 Done range is migrated with its final byte
+// reserved for revalidation. The staging file is preallocated, so its length
+// is never evidence of completion — only Ranges is, after payload existence and
+// logical size have been checked.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
@@ -322,9 +322,9 @@ type IncompleteMeta struct {
 }
 
 // RangeProgress is the durable state of one persisted download range.
-// Bytes [Start, Start+Committed) are valid; Done marks the whole range
-// [Start, End] as committed. Committed is always a prefix of the range, so
-// an interrupted transfer resumes from its durable high-water point.
+// Bytes [Start, Start+Committed) are the durable range prefix. Done marks the
+// whole range [Start, End] as committed after clean response framing. A full
+// prefix with Done=false reserves the last byte for framing revalidation.
 type RangeProgress struct {
 	Start     int64 `json:"start"`
 	End       int64 `json:"end"`

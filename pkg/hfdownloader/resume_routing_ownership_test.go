@@ -150,7 +150,7 @@ func TestClaimStaging_LockFencedFreeLockIsTakenOver(t *testing.T) {
 	staging := filepath.Join(dir, "fenced.bin.incomplete")
 	metaPath := staging + ".meta"
 	pub := filepath.Join(dir, "fenced.bin")
-	ranges := []RangeProgress{{Start: 0, End: total/2 - 1, Committed: total / 2}, {Start: total / 2, End: total - 1}}
+	ranges := []RangeProgress{{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true}, {Start: total / 2, End: total - 1}}
 	seedRangedState(t, staging, "o/r", "fenced.bin", total, ranges, full)
 	meta, err := readStagingMeta(metaPath)
 	if err != nil {

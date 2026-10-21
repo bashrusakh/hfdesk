@@ -83,7 +83,7 @@ func rangedTestServer(t *testing.T, full []byte) (*httptest.Server, *[]string) {
 	return srv, &gotRanges
 }
 
-// seedRangedState writes a v2 staging record plus a preallocated staging
+// seedRangedState writes a current-version staging record plus a preallocated staging
 // file whose committed intervals hold the correct payload bytes (and
 // garbage everywhere else), simulating an interrupted previous run.
 func seedRangedState(t *testing.T, staging, repo, path string, size int64, ranges []RangeProgress, full []byte) {
@@ -1120,19 +1120,9 @@ func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 	}
 }
 
-// A live foreign owner parked in a long legitimate wait must keep its
-// claim: a maximal server-requested Retry-After (up to
-// DefaultMaxRetryAfter, which equals the default stale timeout) produces
-// no payload writes, so without a claim heartbeat both the staging
-// payload and its record would go stale and a second process would take
-// over the staging file while the owner keeps writing — two writers on
-// one payload (issue #140, criterion 12). Discriminating window: after
-// more than claimGracePeriod of waiting with zero payload writes, the
-// claim record must still have been rewritten recently, because the owner
-// heartbeats it during the wait. Together with the fresh-record refusal
-// below (a live owner with a stale payload but a fresh record is not
-// taken over), this closes the takeover window compositionally for
-// arbitrarily long waits.
+// A live owner parked in a long Retry-After wait continues to refresh its
+// diagnostic claim record. The held lifetime OS lock, not record age, is the
+// exclusion fence; the test also preserves prompt cancellation of the wait.
 func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8_000
@@ -1143,9 +1133,9 @@ func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// HEAD resolves the size; every range GET is throttled with a
-	// Retry-After larger than the claim grace period, so the owner spends
-	// the whole test inside one long retry wait with no payload writes.
+	// HEAD resolves the size; every range GET is throttled with a Retry-After
+	// larger than the diagnostic heartbeat interval, so the owner spends the
+	// test inside a wait with no payload writes.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", strconv.Itoa(total))
@@ -1192,9 +1182,7 @@ func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Past the claim grace period with zero payload writes: without a
-	// heartbeat, the record would now be stale (and after a full stale
-	// timeout the payload too, making the owner look dead).
+	// Wait past the diagnostic heartbeat interval with zero payload writes.
 	time.Sleep(claimGracePeriod + 2*time.Second)
 
 	metaAfter, err := os.Stat(metaPath)
@@ -1205,7 +1193,7 @@ func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
 		t.Errorf("claim record was not rewritten while the live owner waited: mtime still %v", metaAfter.ModTime())
 	}
 	if !metaFreshWithin(metaPath, claimGracePeriod) {
-		t.Error("claim record went stale while a live owner was parked in a legitimate retry wait; another process would take over the staging file (two writers)")
+		t.Error("claim metadata was not refreshed during the retry wait")
 	}
 
 	// The heartbeat wait stays cancellation-prompt.

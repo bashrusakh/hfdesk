@@ -215,8 +215,9 @@ type Settings struct {
 	//     proof after a crash or mode change (see the durable proof gate below).
 	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
 	//     At most one full-file read is performed per file, always before
-	//     publication when the item carries a known digest: a fresh sequential
-	//     multipart transfer hashes while writing; every other transfer
+	//     publication when the item carries a known digest: only an eligible
+	//     fresh sequential LFS ranged transfer (one task covers the whole file)
+	//     hashes while writing; every other transfer
 	//     (including the single-request path, fresh or resumed) performs one
 	//     sequential pass before the destination/blob is renamed into place, so
 	//     a mismatch never publishes corrupt bytes.
