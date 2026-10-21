@@ -1134,12 +1134,13 @@ func TestSCMBrokenRegistration(t *testing.T) {
 // The access control lists are the SDDL strings the platform writes: the
 // trustees appear as raw SIDs and not as aliases.
 //
-// The set of the trustees that cover the account is the certain subset: the
-// account itself and everybody. It is the set the check falls back to when
-// the platform refuses the logon of the account, and the effective
-// membership of the account is checked by TestSDDLGrantsIdentityWithTheEffectiveGroups.
+// The set of the trustees that cover the account is the documented
+// membership: the account itself, everybody and the authenticated users. It
+// is the set the check falls back to when the platform refuses every form of
+// the logon of the account, and the effective membership of the account is
+// checked by TestSDDLGrantsIdentityWithTheEffectiveGroups.
 func TestSDDLGrantsIdentity(t *testing.T) {
-	identity := scmCertainIdentitySIDs(errors.New("the test checks the certain subset"))
+	identity := scmDocumentedIdentitySIDs(errors.New("the test checks the documented membership"))
 	cases := []struct {
 		name    string
 		sddl    string
@@ -1152,7 +1153,8 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 		{"the interactive users group", "D:P(A;;FA;;;S-1-5-4)", true},
 		{"the alias of the interactive users group", "D:P(A;;FA;;;IU)", true},
 		{"the users group", "D:P(A;;FA;;;S-1-5-32-545)", true},
-		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", true},
+		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", false},
+		{"the alias of the authenticated users group", "D:P(A;;FA;;;AU)", false},
 		{"an unrelated account", "D:P(A;;FA;;;S-1-5-18)", true},
 		{"an unrelated group", "D:P(A;;FA;;;S-1-5-32-544)", true},
 		{"a denied entry next to an allowed one", "D:P(D;;GA;;;S-1-5-19)(A;;FA;;;S-1-1-0)", true},
@@ -1180,17 +1182,18 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 // list of a path against the effective membership of the account the
 // instance runs as.
 //
-// The membership comes from a token of the account, so a group the account
-// really carries covers it and a group it does not carry does not.
+// The membership comes from a token of the account when the platform grants
+// the logon, and from the membership the documentation of the platform grants
+// to the account when it refuses every form of the logon. A group the
+// account really carries covers it and a group it does not carry does not.
+//
+// The test never skips: both sources answer the question the test asks.
 func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
-	identity := scmTestEffectiveIdentitySIDs(t)
+	identity := scmTestIdentitySIDs(t)
 
-	// The membership the check is made against: it is the effective one,
-	// it carries the account itself and everybody, and it never carries
-	// the interactive users, because the instance runs a service logon.
-	if !identity.exact {
-		t.Fatal("the membership of the account is not the effective one, want the membership of a token")
-	}
+	// The membership the check is made against: it carries the account
+	// itself and everybody, and it never carries the interactive users,
+	// because the instance runs a service logon.
 	if !identity.covers(scmServiceIdentitySID) {
 		t.Fatalf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
 	}
@@ -1236,7 +1239,7 @@ func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
 // the account of the instance is an inherit only one is a directory the
 // instance can never use.
 func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
-	identity := scmCertainIdentitySIDs(errors.New("the test checks the certain subset"))
+	identity := scmDocumentedIdentitySIDs(errors.New("the test checks the documented membership"))
 
 	// The entry is about the children of the directory: it grants the
 	// account nothing on the directory itself.
@@ -1269,17 +1272,46 @@ func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
 	}
 }
 
-// TestSCMEffectiveIdentitySIDs checks the membership the implementation
-// derives out of a token of the account the instance runs as.
+// TestSCMEffectiveIdentitySIDs checks the membership of the account the
+// instance runs as.
 //
-// The membership is the effective one: the account itself is in it, everybody
-// is in it, and the interactive users are never in it, because the instance
-// runs a service logon.
+// The membership is the effective one when the platform grants the logon of
+// the account, and the membership the documentation of the platform grants to
+// the account when it refuses every form of the logon. Either way the
+// account itself is in it, everybody is in it, and the interactive users are
+// never in it, because the instance runs a service logon.
 func TestSCMEffectiveIdentitySIDs(t *testing.T) {
-	identity := scmTestEffectiveIdentitySIDs(t)
+	identity := scmTestIdentitySIDs(t)
+
+	if !identity.covers(scmServiceIdentitySID) {
+		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
+	}
+	if !identity.covers(scmEveryoneSID) {
+		t.Errorf("the membership %v does not carry everybody", identity.sids)
+	}
+	if identity.covers(scmInteractiveUsersSID) {
+		t.Errorf("the membership %v carries the interactive users, want a membership without them", identity.sids)
+	}
+}
+
+// TestSCMTokenIdentitySIDs checks the membership the implementation derives
+// out of a token of the account the instance runs as.
+//
+// The test needs a token of the account: the platform has to grant the logon
+// of the account to the shell of the test. A platform that refuses every
+// form of the logon cannot answer the question, and the test skips then.
+//
+// The refusal of the platform is carried by the message of the skip: a
+// broken call of the logon is never mistaken for a platform that cannot
+// answer the question.
+func TestSCMTokenIdentitySIDs(t *testing.T) {
+	identity, err := scmReadServiceIdentitySIDs()
+	if err != nil {
+		t.Skipf("the platform refused the logon of the account %s: %v", scmServiceIdentityName, err)
+	}
 
 	if !identity.exact {
-		t.Error("the membership of the account is not the effective one, want the membership of a token")
+		t.Error("the membership of the account is not the one of a token")
 	}
 	if !identity.covers(scmServiceIdentitySID) {
 		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
@@ -1292,45 +1324,47 @@ func TestSCMEffectiveIdentitySIDs(t *testing.T) {
 	}
 }
 
-// TestSddlGrantsIdentityNamesTheCertainSubset checks that a check that was
-// made against the certain subset says so.
+// TestSddlGrantsIdentityNamesTheDocumentedMembership checks that a check
+// that was made against the documented membership says so.
 //
-// The platform can refuse the logon of the account. The check then falls
-// back to the subset that is certain, and the user has to know that the
-// groups of the account were not known.
-func TestSddlGrantsIdentityNamesTheCertainSubset(t *testing.T) {
-	identity := scmCertainIdentitySIDs(errors.New("the logon of the account was refused"))
+// The platform can refuse every form of the logon of the account. The check
+// then falls back to the membership the documentation of the platform grants
+// to the account, and the user has to know that the groups of the account
+// were not read from a token of it.
+func TestSddlGrantsIdentityNamesTheDocumentedMembership(t *testing.T) {
+	identity := scmDocumentedIdentitySIDs(errors.New("the logon of the account was refused"))
 
 	err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-32-544)", identity)
 	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a group outside the certain subset")
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a group outside the documented membership")
 	}
-	if !strings.Contains(err.Error(), "everybody only") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the certain subset", err)
+	if !strings.Contains(err.Error(), "documentation of the platform") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the documented membership", err)
 	}
 	if !strings.Contains(err.Error(), "the logon of the account was refused") {
 		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the reason", err)
 	}
 }
 
-// scmTestEffectiveIdentitySIDs returns the effective membership of the
-// account the instance runs as.
+// scmTestIdentitySIDs returns the membership of the account the instance
+// runs as, the way the implementation derives it.
 //
-// The membership is a property of the machine: the test skips when the
-// platform refuses the logon of the account, because the machine cannot
-// answer the question then.
+// The membership comes from a token of the account when the platform grants
+// the logon, and from the membership the documentation of the platform grants
+// to the account when it refuses every form of the logon. The test never
+// skips: both sources answer the question the test asks.
 //
-// The refusal of the platform is carried by the message of the skip: a
-// broken call of the logon is never mistaken for a platform that cannot
-// answer the question. Nothing else skips the test: the logon of the
-// account is the only thing the platform is asked for.
-func scmTestEffectiveIdentitySIDs(t *testing.T) scmIdentitySIDs {
+// The token path itself is the subject of a test of its own: it skips when
+// the platform grants no token at all.
+func scmTestIdentitySIDs(t *testing.T) scmIdentitySIDs {
 	t.Helper()
 	identity, err := scmReadServiceIdentitySIDs()
-	if err != nil {
-		t.Skipf("the platform refused the logon of the account %s: %v", scmServiceIdentityName, err)
+	if err == nil {
+		return identity
 	}
-	return identity
+	// The platform refused every form of the logon: the implementation
+	// falls back to the membership of the documentation of the platform.
+	return scmDocumentedIdentitySIDs(err)
 }
 
 // scmTestUncarriedSID returns a SID the account of the instance does not
@@ -1456,9 +1490,10 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 // directory the account of the instance cannot reach is refused before the
 // registration is written.
 //
-// The directory does not exist yet: the nearest existing ancestor has to
-// grant the account the access, otherwise the installation would leave a
-// directory behind that the instance cannot use.
+// The directory does not exist: the installation never creates a directory the
+// user named, so the refusal names the missing directory and tells the user
+// what to do. The guidance names the account of the instance, because the
+// access rights of the directory have to be granted to that account.
 func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
@@ -1466,7 +1501,8 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
 	// The directory grants the machine and its administrators the access,
-	// not the account the instance runs as.
+	// not the account the instance runs as: the account of the instance
+	// could not use the directory either, if it existed.
 	scmTestSetDACL(t, parent, fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t)))
 
 	path := filepath.Join(parent, "cache")
@@ -1479,6 +1515,15 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), scmServiceIdentityName) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the missing directory", path, err)
+	}
+	if !strings.Contains(err.Error(), "never creates a directory the user named") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user that the installation creates no directory of its own", path, err)
+	}
+	if !strings.Contains(err.Error(), "create it and grant the account read and write access to it") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
 	}
 	// The refused directory is not created behind the back of the user.
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
@@ -2131,9 +2176,9 @@ func scmTestRefuseLocalDir(t *testing.T, opts InstallOptions) {
 // installation removes: the directories are listed in the order they are
 // created, so a parent is always removed after its children.
 //
-// The directories of the instance come first, the directories the
-// installation reuses come afterwards: the preflight creates them once the
-// directories of the instance exist.
+// The installation creates the directories of the instance only: a named data
+// directory belongs to whoever named it, and the instance creates the cache
+// tree it needs inside its own directories when it runs.
 func TestSCMCreatedDirOrder(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestInstallOptions(t, root)
@@ -2153,9 +2198,6 @@ func TestSCMCreatedDirOrder(t *testing.T) {
 		filepath.Join(root, "var", "lib", "hfdesk"),
 		filepath.Join(root, "var", "log"),
 		filepath.Join(root, "var", "log", "hfdesk"),
-		filepath.Join(root, "var", "lib", "hfdesk", "cache"),
-		filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
-		filepath.Join(root, "models"),
 	}
 	if strings.Join(order, "\n") != strings.Join(want, "\n") {
 		t.Errorf("createdDirOrder() =\n%s\nwant\n%s", strings.Join(order, "\n"), strings.Join(want, "\n"))
@@ -2183,9 +2225,10 @@ func TestSCMFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
 		t.Fatal("Install() = nil, want the refusal of the local directory")
 	}
 
-	// Every directory the installation created is gone again: the cache
-	// root of the instance is removed before the state directory that
-	// holds it.
+	// Every directory the installation created is gone again: the
+	// directories of the instance are removed before the parents that
+	// hold them. The cache root and the hub directory are not created by
+	// the installation at all, so they are gone as well.
 	for _, dir := range []string{
 		filepath.Join(root, "etc"),
 		filepath.Join(root, "etc", "hfdesk"),
@@ -2346,6 +2389,11 @@ func TestSCMFailedInstallReportsTheOriginalError(t *testing.T) {
 // installation never touches the directories of an instance that is
 // installed.
 //
+// The installation creates the directories of the instance only: the cache
+// root and the hub directory live in the state directory of the instance and
+// are created by the instance when it runs, and the local directory belongs
+// to whoever named it.
+//
 // The test registers the instance in the service control manager of the
 // machine, so it needs an elevated shell. The registration never survives
 // the test.
@@ -2398,10 +2446,10 @@ func TestSCMSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 		filepath.Join(root, "var"),
 		filepath.Join(root, "var", "lib"),
 		filepath.Join(root, "var", "lib", "hfdesk"),
-		filepath.Join(root, "var", "lib", "hfdesk", "cache"),
-		filepath.Join(root, "var", "lib", "hfdesk", "cache", "hub"),
 		filepath.Join(root, "var", "log"),
 		filepath.Join(root, "var", "log", "hfdesk"),
+		// The local directory belongs to whoever named it: the
+		// installation reuses it and never removes it.
 		filepath.Join(root, "models"),
 	} {
 		info, err := os.Stat(dir)
@@ -2411,6 +2459,15 @@ func TestSCMSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 		}
 		if !info.IsDir() {
 			t.Errorf("the path %q is not a directory after the successful installation", dir)
+		}
+	}
+
+	// The cache root and the hub directory are not created by the
+	// installation: the instance creates the cache tree it needs inside
+	// its own state directory when it runs.
+	for _, dir := range []string{opts.CacheDir, opts.HubDir} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q exists after the successful installation (stat error: %v), want none: the instance creates it when it runs", dir, err)
 		}
 	}
 }

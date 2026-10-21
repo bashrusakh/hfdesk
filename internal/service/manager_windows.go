@@ -1076,6 +1076,14 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 // interactive logon. A descriptor that grants the access to the interactive
 // users only is a descriptor the instance can never use, and the
 // installation has to refuse it.
+//
+// A platform that refuses the logon of the account cannot answer the
+// question with a token. The membership of the documentation of the platform
+// is used then: the built-in service accounts are treated as local
+// authenticated users, so the token of such a logon carries the account
+// itself, everybody and the authenticated users. The fallback is never
+// silent: the log and the message of a refusal name it and name the refusal
+// of the platform.
 const (
 	// scmServiceIdentitySID is the SID of the account the instance runs
 	// as: LocalService (S-1-5-19).
@@ -1091,6 +1099,12 @@ const (
 	// access to everybody grants it to the account of the instance as
 	// well.
 	scmEveryoneSID = "S-1-1-0"
+
+	// scmAuthenticatedUsersSID is the SID of the Authenticated Users
+	// group. The documentation of the platform treats the built-in
+	// service accounts as local authenticated users, so the token of a
+	// service logon of the account carries this group as well.
+	scmAuthenticatedUsersSID = "S-1-5-11"
 
 	// scmInteractiveUsersSID is the SID of the Interactive Users group.
 	// It is the group of an interactive logon: the instance runs a
@@ -1123,15 +1137,22 @@ func (i scmIdentitySIDs) covers(sid string) bool {
 }
 
 // note returns the note that tells the caller that the check was made
-// against a subset of the groups of the account.
+// against the documented membership of the account and not against the
+// groups of a token of it.
 //
 // The note is empty for an exact set: the caller has nothing to say about a
 // check that was made against the whole membership of the account.
+//
+// The note names the refusal of the platform: the user has to know that the
+// groups of the account were not read from a token of it.
 func (i scmIdentitySIDs) note() string {
 	if i.exact {
 		return ""
 	}
-	return fmt.Sprintf(": the effective groups of the account %s are unknown (%s), so the check was made against the account itself and everybody only", scmServiceIdentityName, i.reason)
+	return fmt.Sprintf(
+		": the effective groups of the account %s are unknown, the platform refused the logon of the account (%s), so the check was made against the membership the documentation of the platform grants to the account: the account itself, everybody and the authenticated users",
+		scmServiceIdentityName, i.reason,
+	)
 }
 
 // scmNormalizeSID returns the canonical form of a SID.
@@ -1163,16 +1184,8 @@ const (
 	// runs as.
 	//
 	// The built-in service accounts are named without their domain: the
-	// platform reads the account from the domain "NT AUTHORITY". The
-	// documentation of the platform shows the call that opens a token of
-	// the account:
-	//
-	//	LogonUser(L"LocalService", L"NT AUTHORITY", NULL,
-	//	          LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, &hToken)
-	//
-	// The full name of the account ("NT AUTHORITY\LocalService") is not
-	// a user name of a logon: the platform reads it as a user of the
-	// domain "NT AUTHORITY" and refuses the logon.
+	// platform reads the account from the local namespace of the
+	// machine.
 	scmServiceIdentityUser = "LocalService"
 
 	// scmServiceIdentityDomain is the domain of the built-in service
@@ -1180,27 +1193,92 @@ const (
 	scmServiceIdentityDomain = "NT AUTHORITY"
 )
 
+// scmLogonForm is one documented form of the logon of the account the
+// instance runs as.
+//
+// The platform documents the built-in service accounts in more than one way,
+// and the local security authority of a machine does not accept every one of
+// them: a form that names a domain is looked up in that domain, so a machine
+// that has no domain of that name refuses the logon of an account of the
+// local namespace. Every documented form is therefore tried, and the first
+// one the platform accepts is used.
+type scmLogonForm struct {
+	// name names the form in a log message.
+	name string
+	// user is the user name of the logon.
+	user string
+	// domain is the domain of the logon. It is empty when the form
+	// carries no domain at all.
+	domain string
+}
+
+// scmLogonForms are the documented forms of the logon of the account the
+// instance runs as, in the order they are tried.
+//
+// Every form logs the account on without a password and with the logon type
+// of a service, so the token of the logon carries the groups the account
+// really has while it runs as the instance.
+//
+// The first form names the account by its own name and lets the platform look
+// it up in the local namespace. The second one is the form the documentation
+// of the platform shows for the built-in service accounts, with the domain of
+// the built-in accounts next to the name. The third one names the account
+// with its full name.
+var scmLogonForms = []scmLogonForm{
+	{name: `the user "LocalService" without a domain`, user: scmServiceIdentityUser},
+	{name: `the user "LocalService" and the domain "NT AUTHORITY"`, user: scmServiceIdentityUser, domain: scmServiceIdentityDomain},
+	{name: `the user "NT AUTHORITY\LocalService" without a domain`, user: scmServiceIdentityName},
+}
+
 // scmLogonServiceToken logs the account of the instance on as a service and
 // returns the token of the logon.
 //
-// The call is the one the platform documents for a built-in service account:
-// the user name "LocalService", the domain "NT AUTHORITY", no password at
-// all and the logon type of a service. The password is a null pointer and
-// not an empty string: the built-in service accounts have no password, and
-// the platform refuses an empty one.
+// The documented forms of the call are tried in the order of scmLogonForms
+// and the first one the platform accepts is used. The form that worked is
+// logged, so a machine that refuses every form of the logon is diagnosable.
+//
+// The password is a null pointer and not an empty string in every form: the
+// built-in service accounts have no password, and the platform refuses an
+// empty one.
 //
 // The caller needs the right to log on as a service, which the
 // administrators of the machine hold.
 //
 // The token is a real token and has to be closed.
 func scmLogonServiceToken() (windows.Token, error) {
-	username, err := windows.UTF16PtrFromString(scmServiceIdentityUser)
+	var refusals []string
+	for _, form := range scmLogonForms {
+		token, err := scmLogonTokenWith(form)
+		if err == nil {
+			log.Printf("service: the account %s was logged on as a service with %s", scmServiceIdentityName, form.name)
+			return token, nil
+		}
+		refusals = append(refusals, fmt.Sprintf("%s: %v", form.name, err))
+	}
+	return 0, fmt.Errorf(
+		"the account %s cannot be logged on as a service: the platform refused every documented form of the logon: %s",
+		scmServiceIdentityName, strings.Join(refusals, "; "),
+	)
+}
+
+// scmLogonTokenWith logs the account of the instance on with one form of the
+// call and returns the token of the logon.
+//
+// The error the caller gets is the refusal of the platform itself, so the
+// reason of the refusal is never lost.
+func scmLogonTokenWith(form scmLogonForm) (windows.Token, error) {
+	username, err := windows.UTF16PtrFromString(form.user)
 	if err != nil {
 		return 0, fmt.Errorf("the name of the account cannot be read: %w", err)
 	}
-	domain, err := windows.UTF16PtrFromString(scmServiceIdentityDomain)
-	if err != nil {
-		return 0, fmt.Errorf("the domain of the account cannot be read: %w", err)
+	// The domain of a form that carries none is a null pointer: the
+	// platform reads the account in the local namespace then.
+	var domain *uint16
+	if form.domain != "" {
+		domain, err = windows.UTF16PtrFromString(form.domain)
+		if err != nil {
+			return 0, fmt.Errorf("the domain of the account cannot be read: %w", err)
+		}
 	}
 	var handle windows.Handle
 	result, _, callErr := scmLogonUserW.Call(
@@ -1218,9 +1296,9 @@ func scmLogonServiceToken() (windows.Token, error) {
 			// The platform refused the logon without an error code:
 			// the reason is unknown, and the message says so instead
 			// of naming an error that never happened.
-			return 0, fmt.Errorf("the account %s cannot be logged on as a service: the platform refused the logon without an error code", scmServiceIdentityName)
+			return 0, errors.New("the platform refused the logon without an error code")
 		}
-		return 0, fmt.Errorf("the account %s cannot be logged on as a service: %w", scmServiceIdentityName, callErr)
+		return 0, callErr
 	}
 	return windows.Token(handle), nil
 }
@@ -1272,10 +1350,10 @@ func scmIdentitySIDsFromToken(token windows.Token) (scmIdentitySIDs, error) {
 // as a service, so the token carries the groups the account really has
 // while it runs as the instance.
 //
-// A platform that refuses the logon of the account leaves the membership
-// unknown, and the caller falls back to the certain subset. The refusal
-// carries the error of the platform, so a broken call is never mistaken for
-// a platform that cannot answer the question.
+// A platform that refuses every form of the logon leaves the membership
+// unknown, and the caller falls back to the documented membership. The
+// refusal carries the error of the platform, so a broken call is never
+// mistaken for a platform that cannot answer the question.
 func scmReadServiceIdentitySIDs() (scmIdentitySIDs, error) {
 	token, err := scmLogonServiceToken()
 	if err != nil {
@@ -1290,28 +1368,32 @@ func scmReadServiceIdentitySIDs() (scmIdentitySIDs, error) {
 	// A token that belongs to another account is not the token of the
 	// identity: the membership is unknown then.
 	if !identity.covers(scmServiceIdentitySID) {
-		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s does not belong to the account %s", scmServiceIdentityUser, scmServiceIdentityName)
+		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s does not belong to the account %s", scmServiceIdentityName, scmServiceIdentityName)
 	}
 	return identity, nil
 }
 
-// scmCertainIdentitySIDs returns the subset of the membership of the account
-// that is certain.
+// scmDocumentedIdentitySIDs returns the membership the documentation of the
+// platform grants to the account of the instance.
 //
-// The instance runs as the account itself, so the account covers it, and
-// everybody covers every account. The rest of the membership is unknown when
-// the platform refuses the logon, so it is not used: a check against the
-// certain subset can refuse a path the account could use, and it never
-// grants a path the account cannot use.
+// The documentation of the platform treats LocalService and NetworkService as
+// local authenticated users: they belong to the same class as the
+// Authenticated Users group, and the default security descriptors of the
+// system grant that class its rights. The token of such a logon therefore
+// carries the account itself, everybody and the authenticated users.
 //
-// The subset is used only when the token of the account is not available,
-// and the fact is reported: the message of a refusal names it, and the
-// installation logs it.
-func scmCertainIdentitySIDs(reason error) scmIdentitySIDs {
+// The Interactive Users group is never part of the set: it is the group of an
+// interactive logon, and the account of the instance runs a service logon.
+//
+// The set is used only when the platform refuses every form of the logon of
+// the account, and the fact is reported: the message of a refusal names it
+// and names the refusal of the platform, and the installation logs it.
+func scmDocumentedIdentitySIDs(reason error) scmIdentitySIDs {
 	return scmIdentitySIDs{
 		sids: map[string]bool{
-			scmNormalizeSID(scmServiceIdentitySID): true,
-			scmNormalizeSID(scmEveryoneSID):        true,
+			scmNormalizeSID(scmServiceIdentitySID):    true,
+			scmNormalizeSID(scmEveryoneSID):           true,
+			scmNormalizeSID(scmAuthenticatedUsersSID): true,
 		},
 		exact:  false,
 		reason: reason.Error(),
@@ -1321,15 +1403,23 @@ func scmCertainIdentitySIDs(reason error) scmIdentitySIDs {
 // scmServiceIdentitySIDs returns the effective membership of the account the
 // instance runs as.
 //
-// A platform that refuses the logon of the account leaves the certain
-// subset: the account itself and everybody. The refusal is reported, so the
-// user knows that the check of a path was made against a subset of the
-// groups of the account.
+// The membership is the one of a token of the account: the account is logged
+// on as a service, and the groups of the token are the groups the account
+// really has while it runs as the instance.
+//
+// A platform that refuses every form of the logon leaves the membership
+// unknown, and the membership of the documentation of the platform is used
+// then. The refusal is reported, so the user knows that the check of a path
+// was made against the documented membership of the account and not against
+// the groups of a token.
 func scmServiceIdentitySIDs() scmIdentitySIDs {
 	identity, err := scmReadServiceIdentitySIDs()
 	if err != nil {
-		log.Printf("service: the effective groups of the account %s are unknown: %v: the access of a path is checked against the account itself and everybody only", scmServiceIdentityName, err)
-		return scmCertainIdentitySIDs(err)
+		log.Printf(
+			"service: the platform refused the logon of the account %s (%v): the effective groups of the account are unknown, so the access of a path is checked against the membership the documentation of the platform grants to the account: the account itself, everybody and the authenticated users",
+			scmServiceIdentityName, err,
+		)
+		return scmDocumentedIdentitySIDs(err)
 	}
 	return identity
 }
@@ -1412,7 +1502,14 @@ func preflightDataPath(name, path string) error {
 	// directory the user named: the directory and the access rights of
 	// it belong to whoever named it, and an installation that created
 	// one would take a tree of models over without being asked to.
-	return fmt.Errorf("service: the %s %q does not exist: the installation never creates a directory the user named: create it and grant the account read and write access to it, or install the instance without this path", name, path)
+	//
+	// The message names the account of the instance: the user has to
+	// grant the access to it, and the name of the account is what makes
+	// the guidance actionable.
+	return fmt.Errorf(
+		"service: the %s %q does not exist: the installation never creates a directory the user named: create it and grant the account read and write access to it, or install the instance without this path: the account %s has to be granted that access",
+		name, path, scmServiceIdentityName,
+	)
 }
 
 // checkServiceAccess reads the access control list of a path and checks

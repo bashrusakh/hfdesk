@@ -184,6 +184,10 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 		close(changes)
 	}()
 
+	// Every state the handler reports is recorded, so the states of the
+	// instance are the ones the test asserts on.
+	var states []svc.State
+
 	// The host of the instance runs.
 	select {
 	case <-started:
@@ -194,6 +198,7 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// The instance reports that it starts.
 	select {
 	case status := <-changes:
+		states = append(states, status.State)
 		if status.State != svc.StartPending {
 			t.Fatalf("the first reported state = %v, want %v", status.State, svc.StartPending)
 		}
@@ -212,6 +217,7 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// The instance is not reported as stopped while the host still runs.
 	select {
 	case status := <-changes:
+		states = append(states, status.State)
 		t.Fatalf("the handler reported the state %v while the host of the instance was still running", status.State)
 	case <-time.After(200 * time.Millisecond):
 	}
@@ -219,7 +225,6 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// The host ends: the instance is reported as stopped afterwards.
 	releaseHost()
 
-	var states []svc.State
 	for status := range changes {
 		states = append(states, status.State)
 	}
