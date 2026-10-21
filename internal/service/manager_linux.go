@@ -277,7 +277,14 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 			if !errors.Is(err, errNotWritable) {
 				return fmt.Errorf("service: the %s directory %q of the machine-wide instance is not usable: %w", dir.kind, dir.path, err)
 			}
-			return fmt.Errorf("service: the service account %q cannot write to the %s directory %q: grant it access (for example %q or by adding it to the group that owns the directory) and install again", account.Username, dir.kind, dir.path, "chown -R "+account.Username+" "+dir.path)
+			// The guidance never names a recursive ownership change:
+			// the tree of a model or a cache directory belongs to the
+			// user who named it, and the installation never walks it.
+			// The account is either made a member of the group that
+			// owns the directory, or the directory itself is given to
+			// the account.
+			return fmt.Errorf("service: the service account %q cannot write to the %s directory %q: grant it access and install again (for example add the account to the group that owns the directory, or give the directory itself to the account with %q; for a directory that holds a lot of data, granting group access is preferable to changing the owner)",
+				account.Username, dir.kind, dir.path, "chown "+account.Username+" "+dir.path)
 		}
 	}
 	return nil
@@ -668,7 +675,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		return err
 	}
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, account)
 	if err != nil {
 		return err
 	}
@@ -1208,15 +1215,19 @@ WantedBy=%s
 
 // renderUnit renders the systemd unit of an installation.
 //
-// The function is pure: it renders the text of the unit and never touches
-// the system. The command of the unit is the canonical argument vector of
+// The function renders the text of the unit and never changes anything on
+// the machine. The command of the unit is the canonical argument vector of
 // the shared contract, so every platform registers the same command.
-func renderUnit(opts InstallOptions) (string, error) {
+//
+// The account is the service account the installation resolved for a
+// machine-wide instance. It is nil for a user scope instance, which runs as
+// the user of the session.
+func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 	home, err := unitHomeDir(opts)
 	if err != nil {
 		return "", err
 	}
-	identity, err := unitIdentity(opts)
+	identity, err := unitIdentity(opts, account)
 	if err != nil {
 		return "", err
 	}
@@ -1248,17 +1259,40 @@ func renderUnit(opts InstallOptions) (string, error) {
 // starts the instance with the least privilege it needs and not with the
 // identity of the administrator who installed it.
 //
+// The group of the unit is the primary group of the account, never the name
+// of the account: an account whose primary group is named after it only by
+// accident (a wheel group, a shared group, a group of a directory server)
+// would otherwise name a group that does not exist, and the unit would fail
+// to start with a group error the installation never sees.
+//
+// A group that cannot be resolved is left out of the unit: the supervisor
+// then uses the default group of the account, which is the primary group of
+// the account itself. A name is never guessed.
+//
 // A user scope instance runs as the user of the session, so it names no
 // account at all.
-func unitIdentity(opts InstallOptions) (string, error) {
+func unitIdentity(opts InstallOptions, account *user.User) (string, error) {
 	if opts.Scope != ScopeSystem {
 		return "", nil
 	}
-	account := serviceAccountName(opts)
-	if account == "" {
+	name := serviceAccountName(opts)
+	if name == "" {
 		return "", errors.New("service: the machine-wide instance needs a service account")
 	}
-	return fmt.Sprintf("User=%s\nGroup=%s\n", systemdQuote(account), systemdQuote(account)), nil
+	identity := "User=" + systemdQuote(name) + "\n"
+	if account == nil {
+		// The account of the instance is unknown: the unit names the
+		// account of the command line and no group at all.
+		return identity, nil
+	}
+	group, err := user.LookupGroupId(account.Gid)
+	if err != nil || group.Name == "" {
+		// The primary group of the account cannot be resolved: the
+		// unit names no group, and the supervisor uses the default
+		// group of the account.
+		return identity, nil
+	}
+	return identity + "Group=" + systemdQuote(group.Name) + "\n", nil
 }
 
 // unitHomeDir returns the HOME of the registered process.

@@ -63,6 +63,25 @@ func unitDirectives(unit string) []string {
 	return directives
 }
 
+// unitDirective returns the value of one directive of a unit file, e.g. the
+// account of a "User=" directive.
+//
+// An empty string is returned when the unit holds no such directive, so a
+// caller can tell a directive that is absent from one that carries an empty
+// value.
+func unitDirective(unit, key string) string {
+	for _, directive := range unitDirectives(unit) {
+		name, value, ok := strings.Cut(directive, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(name) == key {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 // systemdTestExecutable writes a program that can be registered and returns
 // its path. An installation refuses a program that does not exist, so every
 // test of an installation needs one.
@@ -78,7 +97,7 @@ func systemdTestExecutable(t *testing.T) string {
 func TestSystemdRenderUnitUserScope(t *testing.T) {
 	opts := systemdTestOptions(t, ScopeUser)
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -143,9 +162,14 @@ func TestSystemdRenderUnitUserScope(t *testing.T) {
 }
 
 func TestSystemdRenderUnitSystemScope(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeSystem)
+	// The account of a machine-wide instance is an account of the machine:
+	// the unit names it and the primary group of it.
+	account := systemdSecondAccount(t)
 
-	unit, err := renderUnit(opts)
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.ServiceUser = account.Username
+
+	unit, err := renderUnit(opts, account)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -169,12 +193,17 @@ func TestSystemdRenderUnitSystemScope(t *testing.T) {
 	}
 	// A machine wide instance runs as the dedicated service account of
 	// the platform, never as the user who runs the install command.
-	account := DefaultServiceUser()
-	if !strings.Contains(unit, "User="+account+"\n") {
-		t.Errorf("the unit does not run as the service account %q:\n%s", account, unit)
+	if want := "User=" + systemdQuote(account.Username) + "\n"; !strings.Contains(unit, want) {
+		t.Errorf("the unit does not run as the service account %q:\n%s", account.Username, unit)
 	}
-	if !strings.Contains(unit, "Group="+account+"\n") {
-		t.Errorf("the unit does not run in the group of the service account %q:\n%s", account, unit)
+	// The group of the unit is the primary group of the account, never the
+	// name of the account.
+	group, err := user.LookupGroupId(account.Gid)
+	if err != nil {
+		t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
+	}
+	if want := "Group=" + systemdQuote(group.Name) + "\n"; !strings.Contains(unit, want) {
+		t.Errorf("the unit does not run in the primary group %q of the service account %q:\n%s", group.Name, account.Username, unit)
 	}
 	if current, err := user.Current(); err == nil && current.Username != "" {
 		for _, directive := range unitDirectives(unit) {
@@ -194,7 +223,7 @@ func TestSystemdRenderUnitCarriesNoCredential(t *testing.T) {
 	// added.
 	setCredentialFields(&opts, sentinel)
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -226,7 +255,7 @@ func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
 	opts.Executable = "/opt/HF Desk/bin/hfdesk"
 	opts.Paths.StateDir = "/var/lib/HF Desk"
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -364,7 +393,7 @@ func TestSystemdParseShowReadsTheProperties(t *testing.T) {
 func TestSystemdParseUnitRecoversTheRegistration(t *testing.T) {
 	opts := systemdTestOptions(t, ScopeUser)
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -418,7 +447,7 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -443,8 +472,8 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 //
 // The unit of the test names the account of the test process, which is what
 // a machine-wide installation names when the operator names their own
-// account. The template names the account and its group with the same name,
-// so the machine has to know a group of that name as well.
+// account. The template names the primary group of that account, so the
+// machine has to know that group as well.
 //
 // The executable of the unit is the test binary, so the verifier finds an
 // executable that really exists, and the working directory of the unit is the
@@ -472,10 +501,10 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 	if _, err := user.Lookup(account.Username); err != nil {
 		t.Skipf("skipping: the machine knows no account %q: %v", account.Username, err)
 	}
-	// The template names the group of the unit with the name of the
-	// account as well.
-	if _, err := user.LookupGroup(account.Username); err != nil {
-		t.Skipf("skipping: the machine knows no group %q: %v", account.Username, err)
+	// The template names the primary group of the account, so the machine
+	// has to resolve that group the way the supervisor resolves it.
+	if _, err := user.LookupGroupId(account.Gid); err != nil {
+		t.Skipf("skipping: the machine knows no primary group for the account %q: %v", account.Username, err)
 	}
 
 	root := t.TempDir()
@@ -487,7 +516,7 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 	// stays the machine level path of the template.
 	opts.Paths.StateDir = root
 
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, account)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
@@ -1039,10 +1068,7 @@ func systemdStatusOf(t *testing.T, words ...string) Status {
 // write into is a directory it really cannot write into.
 func systemdSecondAccount(t *testing.T) *user.User {
 	t.Helper()
-	current, err := user.Current()
-	if err != nil {
-		t.Skipf("skipping: the account of the test process is unknown: %v", err)
-	}
+	current := systemdCurrentAccount(t)
 	for _, name := range []string{"nobody", "daemon", "bin", "sys", "games"} {
 		account, err := user.Lookup(name)
 		if err != nil {
@@ -1054,6 +1080,88 @@ func systemdSecondAccount(t *testing.T) *user.User {
 		return account
 	}
 	t.Skip("skipping: the machine has no second account the test could use")
+	return nil
+}
+
+// systemdCurrentAccount returns the account of the test process.
+func systemdCurrentAccount(t *testing.T) *user.User {
+	t.Helper()
+	account, err := user.Current()
+	if err != nil {
+		t.Skipf("skipping: the account of the test process is unknown: %v", err)
+	}
+	return account
+}
+
+// systemdAccountsOfTheMachine returns the accounts of the machine.
+//
+// The accounts are read from the password database of the machine, so the
+// test works on every machine and needs no privilege.
+func systemdAccountsOfTheMachine(t *testing.T) []*user.User {
+	t.Helper()
+	content, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		t.Skipf("skipping: the password database of the machine cannot be read: %v", err)
+	}
+	var accounts []*user.User
+	for _, line := range strings.Split(string(content), "\n") {
+		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok || name == "" {
+			continue
+		}
+		account, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		accounts = append(accounts, account)
+	}
+	if len(accounts) == 0 {
+		t.Skip("skipping: the machine knows no account the test could use")
+	}
+	return accounts
+}
+
+// systemdAccountWithAnotherPrimaryGroup returns an account of the machine
+// whose primary group carries another name than the account itself.
+//
+// Such an account is the case that shows the difference between the primary
+// group of an account and the name of the account. The second result is
+// false when the machine knows no such account.
+func systemdAccountWithAnotherPrimaryGroup(t *testing.T) (*user.User, bool) {
+	t.Helper()
+	for _, account := range systemdAccountsOfTheMachine(t) {
+		group, err := user.LookupGroupId(account.Gid)
+		if err != nil || group.Name == "" {
+			continue
+		}
+		if group.Name != account.Username {
+			return account, true
+		}
+	}
+	return nil, false
+}
+
+// systemdUnresolvableAccount returns an account whose primary group the
+// machine does not know.
+//
+// The group of a unit is never guessed: an account whose group cannot be
+// resolved leaves the group out of the unit, so the supervisor uses the
+// default group of the account.
+func systemdUnresolvableAccount(t *testing.T) *user.User {
+	t.Helper()
+	for _, gid := range []string{"4294967294", "999999999", "999999998"} {
+		if _, err := user.LookupGroupId(gid); err == nil {
+			continue
+		}
+		return &user.User{
+			Username: "hfdesk-svc",
+			Uid:      "999999999",
+			Gid:      gid,
+			Name:     "HFDesk service account",
+			HomeDir:  systemServiceHome,
+		}
+	}
+	t.Skip("skipping: the machine knows a group for every id the test could use")
 	return nil
 }
 
@@ -1169,38 +1277,58 @@ func TestSystemdInstallRefusesAMissingServiceAccount(t *testing.T) {
 }
 
 // TestSystemdRenderUnitNamesTheServiceAccount checks that the unit of a
-// machine-wide instance names the service account and its group, and that
-// the unit of a user scope instance names no account at all.
+// machine-wide instance names the service account, and that the group of the
+// unit is the primary group of that account and never the name of the
+// account. The unit of a user scope instance names no account at all.
 func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 	t.Run("the machine-wide scope names the account of the user", func(t *testing.T) {
 		opts := systemdTestOptions(t, ScopeSystem)
 		opts.ServiceUser = "hfdesk-svc"
 
-		unit, err := renderUnit(opts)
+		// The account is not on the machine, so no group of it can be
+		// resolved: the unit names the account and no group at all.
+		unit, err := renderUnit(opts, nil)
 		if err != nil {
 			t.Fatalf("renderUnit() = %v, want nil", err)
 		}
-		if !strings.Contains(unit, "User=hfdesk-svc\n") {
-			t.Errorf("the unit does not run as the service account:\n%s", unit)
+		if got := unitDirective(unit, "User"); got != "hfdesk-svc" {
+			t.Errorf("the account of the unit = %q, want %q", got, "hfdesk-svc")
 		}
-		if !strings.Contains(unit, "Group=hfdesk-svc\n") {
-			t.Errorf("the unit does not run in the group of the service account:\n%s", unit)
+		if got := unitDirective(unit, "Group"); got != "" {
+			t.Errorf("the unit names the group %q of an account the machine does not know", got)
 		}
 	})
 
 	t.Run("the machine-wide scope falls back to the default of the platform", func(t *testing.T) {
 		opts := systemdTestOptions(t, ScopeSystem)
 
-		unit, err := renderUnit(opts)
+		// The default account of the platform may or may not be on this
+		// machine: the unit names it either way, and the group of the
+		// unit is the primary group of the account when the machine
+		// knows the account.
+		account, err := user.Lookup(DefaultServiceUser())
+		if err != nil {
+			account = nil
+		}
+
+		unit, err := renderUnit(opts, account)
 		if err != nil {
 			t.Fatalf("renderUnit() = %v, want nil", err)
 		}
-		account := DefaultServiceUser()
-		if !strings.Contains(unit, "User="+account+"\n") {
-			t.Errorf("the unit does not run as the default service account %q:\n%s", account, unit)
+		name := DefaultServiceUser()
+		if got := unitDirective(unit, "User"); got != name {
+			t.Errorf("the account of the unit = %q, want the default service account %q", got, name)
 		}
-		if !strings.Contains(unit, "Group="+account+"\n") {
-			t.Errorf("the unit does not run in the group of the default service account %q:\n%s", account, unit)
+		wantGroup := ""
+		if account != nil {
+			group, err := user.LookupGroupId(account.Gid)
+			if err != nil {
+				t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
+			}
+			wantGroup = group.Name
+		}
+		if got := unitDirective(unit, "Group"); got != wantGroup {
+			t.Errorf("the group of the unit = %q, want %q", got, wantGroup)
 		}
 	})
 
@@ -1208,7 +1336,7 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 		opts := systemdTestOptions(t, ScopeUser)
 		opts.ServiceUser = "hfdesk-svc"
 
-		unit, err := renderUnit(opts)
+		unit, err := renderUnit(opts, nil)
 		if err != nil {
 			t.Fatalf("renderUnit() = %v, want nil", err)
 		}
@@ -1217,7 +1345,80 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 				t.Errorf("a user scope unit names an account: %q", directive)
 			}
 		}
+		if got := unitDirective(unit, "User"); got != "" {
+			t.Errorf("the account of a user scope unit = %q, want none", got)
+		}
+		if got := unitDirective(unit, "Group"); got != "" {
+			t.Errorf("the group of a user scope unit = %q, want none", got)
+		}
 	})
+}
+
+// TestSystemdRenderUnitNamesThePrimaryGroupOfTheAccount checks that the
+// group of a machine-wide unit is the primary group of its service account
+// and never the name of the account.
+//
+// The account of the test is an account whose primary group carries another
+// name than the account, whenever the machine knows one: that is the case
+// that shows the difference. A machine whose accounts all carry the name of
+// their primary group is checked against the resolved primary group instead.
+func TestSystemdRenderUnitNamesThePrimaryGroupOfTheAccount(t *testing.T) {
+	account, other := systemdAccountWithAnotherPrimaryGroup(t)
+	if !other {
+		account = systemdCurrentAccount(t)
+	}
+	group, err := user.LookupGroupId(account.Gid)
+	if err != nil {
+		t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
+	}
+
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.ServiceUser = account.Username
+
+	unit, err := renderUnit(opts, account)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
+
+	if got := unitDirective(unit, "User"); got != account.Username {
+		t.Errorf("the account of the unit = %q, want %q", got, account.Username)
+	}
+	if got := unitDirective(unit, "Group"); got != group.Name {
+		t.Errorf("the group of the unit = %q, want the primary group %q of the account %q", got, group.Name, account.Username)
+	}
+	// The name of the account is never the group of the unit: an account
+	// whose primary group carries another name would name a group that
+	// does not exist.
+	if group.Name != account.Username {
+		if got := unitDirective(unit, "Group"); got == account.Username {
+			t.Errorf("the group of the unit = %q, want the primary group %q of the account %q", got, group.Name, account.Username)
+		}
+	}
+}
+
+// TestSystemdRenderUnitOmitsAnUnresolvableGroup checks that a machine-wide
+// unit names no group at all when the primary group of its service account
+// cannot be resolved: the supervisor then uses the default group of the
+// account, and no group name is ever guessed.
+func TestSystemdRenderUnitOmitsAnUnresolvableGroup(t *testing.T) {
+	account := systemdUnresolvableAccount(t)
+
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.ServiceUser = account.Username
+
+	unit, err := renderUnit(opts, account)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
+
+	if got := unitDirective(unit, "User"); got != account.Username {
+		t.Errorf("the account of the unit = %q, want %q", got, account.Username)
+	}
+	if got := unitDirective(unit, "Group"); got != "" {
+		t.Errorf("the unit names the group %q of an account whose group cannot be resolved", got)
+	}
 }
 
 // TestSystemdGrantInstanceDirs checks that the directories an installation
@@ -1677,10 +1878,23 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the cache directory")
 	}
-	want := fmt.Sprintf("service: the service account %q cannot write to the cache directory %q: grant it access (for example %q or by adding it to the group that owns the directory) and install again",
-		account.Username, cache, "chown -R "+account.Username+" "+cache)
+	want := fmt.Sprintf("service: the service account %q cannot write to the cache directory %q: grant it access and install again (for example add the account to the group that owns the directory, or give the directory itself to the account with %q; for a directory that holds a lot of data, granting group access is preferable to changing the owner)",
+		account.Username, cache, "chown "+account.Username+" "+cache)
 	if err.Error() != want {
 		t.Errorf("Install() = %q, want %q", err, want)
+	}
+	// The refusal names the directory, the account and the missing write
+	// access.
+	for _, part := range []string{account.Username, cache, "cannot write to"} {
+		if !strings.Contains(err.Error(), part) {
+			t.Errorf("Install() = %q, want the %q in the refusal", err, part)
+		}
+	}
+	// The refusal never names a recursive ownership change: the tree of a
+	// model or a cache directory belongs to the user who named it, and the
+	// installation never walks it.
+	if strings.Contains(err.Error(), "-R") {
+		t.Errorf("Install() = %q, want no recursive ownership change in the refusal", err)
 	}
 
 	// The refused installation never changes the ownership of the cache
@@ -1727,7 +1941,7 @@ func TestSystemdUserScopeNeedsNoServiceAccount(t *testing.T) {
 
 	// The unit of a user scope instance names no account, even when the
 	// command line named one.
-	unit, err := renderUnit(opts)
+	unit, err := renderUnit(opts, nil)
 	if err != nil {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
