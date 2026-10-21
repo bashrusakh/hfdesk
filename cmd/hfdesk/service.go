@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -53,6 +54,11 @@ const (
 	// root does not use them, so naming them would send the reader to the
 	// wrong directory.
 	cacheRootNotRecorded = "not recorded (unknown)"
+
+	// windowsServiceAccount is the identity of a machine-wide instance on
+	// Windows. The service control manager registers the built-in
+	// LocalService account, which has no name of its own.
+	windowsServiceAccount = "LocalService"
 )
 
 // serviceSubcommands lists the subcommands of the family in the order the
@@ -176,6 +182,13 @@ Scope:
 Options of the "install" subcommand:
   --listen HOST:PORT
                 bind address of the instance (default %s)
+  --service-user ACCOUNT
+                account a machine-wide instance runs as
+                (the machine-wide scope only; default: the service
+                account of the platform)
+  --executable PATH
+                absolute path of the binary to register
+                (default: the invoked binary)
 
 Exit codes:
   0  the operation succeeded
@@ -301,12 +314,30 @@ func validateListen(listen string) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
-// resolveExecutable returns the absolute path of the running binary.
+// resolveExecutable returns the absolute path of the binary the
+// registration points at.
 //
-// The registration points at that exact path, so it must be absolute: a
-// relative path would be resolved against the working directory of the
-// supervisor.
-func resolveExecutable() (string, error) {
+// An explicit path wins: the user names the stable path of the
+// installation, which may differ from the binary they happen to run.
+//
+// Without an explicit path the invocation path is preferred: the path the
+// user typed is the name the installation is known by, and a symbolic link
+// on that path keeps its name in the registration. The invocation path is
+// only usable when it names a file: a bare name ("hfdesk") comes from the
+// search path of the shell and must not be resolved against the working
+// directory of the install command.
+//
+// The resolved path of the running binary (os.Executable) is the fallback.
+// It is always a real file, but it is the target of a symbolic link, so a
+// registration that uses it points at a version-stamped release artifact
+// instead of at the stable name of the installation.
+func resolveExecutable(explicit, invocation string) (string, error) {
+	if explicit != "" {
+		return validateExecutablePath(explicit)
+	}
+	if path, ok := invocationExecutable(invocation); ok {
+		return path, nil
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("the path of the running binary is unknown: %w", err)
@@ -318,16 +349,72 @@ func resolveExecutable() (string, error) {
 	return abs, nil
 }
 
+// invocationExecutable returns the absolute path of the invoked binary when
+// the invocation path is usable.
+//
+// The invocation path is usable when it names a path (it contains a
+// separator), so a bare name from the search path of the shell is never
+// resolved against the working directory, and when it is an existing
+// regular file.
+func invocationExecutable(invocation string) (string, bool) {
+	if invocation == "" || !hasPathSeparator(invocation) {
+		return "", false
+	}
+	abs, err := filepath.Abs(invocation)
+	if err != nil {
+		return "", false
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return abs, true
+}
+
+// hasPathSeparator reports whether the path names a file instead of a
+// command of the search path.
+//
+// Both separators are accepted, so a path written with the separator of the
+// other platform is not mistaken for a bare name.
+func hasPathSeparator(path string) bool {
+	return strings.ContainsRune(path, '/') || strings.ContainsRune(path, filepath.Separator)
+}
+
+// validateExecutablePath checks that the path can be registered as the
+// program of the instance and returns it.
+//
+// The path must be absolute (a supervised process must not resolve a
+// relative path against the working directory of the supervisor), it must
+// exist, it must be a regular file and it must be executable.
+func validateExecutablePath(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("the executable %q must be an absolute path", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("the executable %q is not usable: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("the executable %q is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("the executable %q is not executable", path)
+	}
+	return path, nil
+}
+
 // installFlags holds the flags of the "service install" command.
 type installFlags struct {
 	scopeFlags
-	listen   string
-	config   string
-	stateDir string
-	logDir   string
-	cacheDir string
-	hubDir   string
-	localDir string
+	listen      string
+	config      string
+	stateDir    string
+	logDir      string
+	cacheDir    string
+	hubDir      string
+	localDir    string
+	serviceUser string
+	executable  string
 }
 
 // buildInstallOptions assembles the options of an installation from the
@@ -348,7 +435,15 @@ type installFlags struct {
 // into a directory its own cache root does not contain. A hub directory that
 // was named explicitly is honoured as given: it separates the two locations
 // on purpose, the same independence HF_HOME and HF_HUB_CACHE have.
+//
+// The service account belongs to the machine-wide scope only: a user scope
+// instance runs as the user itself, so naming an account there is a
+// mistake of the command line and not a default.
 func buildInstallOptions(scope service.Scope, flags installFlags, executable string) (service.InstallOptions, error) {
+	if flags.serviceUser != "" && scope == service.ScopeUser {
+		return service.InstallOptions{}, errors.New("--service-user applies to a machine-wide installation only: a user scope instance runs as the user itself, drop the option or use --system")
+	}
+
 	paths, err := service.DefaultPaths(scope)
 	if err != nil {
 		return service.InstallOptions{}, err
@@ -380,13 +475,14 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	}
 
 	return service.InstallOptions{
-		Scope:      scope,
-		Executable: executable,
-		Listen:     listen,
-		Paths:      paths,
-		CacheDir:   cacheRoot,
-		HubDir:     hubDir,
-		LocalDir:   flags.localDir,
+		Scope:       scope,
+		Executable:  executable,
+		Listen:      listen,
+		Paths:       paths,
+		CacheDir:    cacheRoot,
+		HubDir:      hubDir,
+		LocalDir:    flags.localDir,
+		ServiceUser: flags.serviceUser,
 	}, nil
 }
 
@@ -409,6 +505,8 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	fs.StringVar(&flags.cacheDir, "cache-dir", "", "absolute path of the Hugging Face cache root")
 	fs.StringVar(&flags.hubDir, "hub-dir", "", "absolute path of the Hugging Face hub cache directory")
 	fs.StringVar(&flags.localDir, "local-dir", "", "absolute path of the flat output directory")
+	fs.StringVar(&flags.serviceUser, "service-user", "", "account the machine-wide instance runs as (the machine-wide scope only)")
+	fs.StringVar(&flags.executable, "executable", "", "absolute path of the binary to register (default: the invoked binary)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -441,7 +539,9 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	}
 	flags.listen = listen
 
-	executable, err := resolveExecutable()
+	// The registration points at the path the user knows the installation
+	// by: the invoked binary, or the path the user named explicitly.
+	executable, err := resolveExecutable(flags.executable, os.Args[0])
 	if err != nil {
 		return err
 	}
@@ -483,6 +583,7 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 
 	writeField(w, "Service", service.ServiceName)
 	writeField(w, "Scope", string(scope))
+	writeField(w, "Account", installAccount(scope, opts.ServiceUser))
 	writeField(w, "Registration", registrationPath(status))
 	writeField(w, "Executable", opts.Executable)
 	writeField(w, "Listen", opts.Listen)
@@ -504,6 +605,42 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The service was registered.")
 	writeInstallState(w, status, statusErr)
+}
+
+// installAccount returns the account the registered instance runs as.
+//
+// A user scope instance runs as the user itself: it keeps the identity of
+// the session and the access to the own cache of the user.
+//
+// A machine-wide instance runs as the dedicated service account of the
+// platform: the account the user named, or the default of the platform.
+// Windows registers the built-in LocalService account, which has no name
+// of its own.
+func installAccount(scope service.Scope, serviceUser string) string {
+	switch {
+	case scope == service.ScopeUser:
+		return invokingUser()
+	case serviceUser != "":
+		return serviceUser
+	case isWindows():
+		return windowsServiceAccount
+	default:
+		return service.DefaultServiceUser()
+	}
+}
+
+// invokingUser returns the name of the user that runs the command.
+//
+// The name is empty when it cannot be determined: a summary that names no
+// account says "unknown" instead of guessing one.
+func invokingUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if name := os.Getenv("USER"); name != "" {
+		return name
+	}
+	return ""
 }
 
 // effectiveCacheDirs returns the cache root and the hub directory the

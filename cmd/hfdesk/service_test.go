@@ -154,6 +154,148 @@ func TestServiceLifecycleSubcommandsRejectTheListenOption(t *testing.T) {
 	}
 }
 
+// TestServiceLifecycleSubcommandsRejectTheInstallOnlyOptions checks that
+// the options of the install subcommand are options of that subcommand
+// only.
+//
+// The account of a machine-wide instance and the binary the registration
+// points at belong to the installation: a lifecycle command has nothing to
+// do with them and must not accept them.
+func TestServiceLifecycleSubcommandsRejectTheInstallOnlyOptions(t *testing.T) {
+	for _, sub := range []string{"uninstall", "start", "stop", "restart", "status", "run"} {
+		for _, option := range [][]string{
+			{"--service-user", "hfdesk"},
+			{"--executable", "/usr/local/bin/hfdesk"},
+		} {
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(append([]string{sub}, option...), &stdout, &stderr)
+			if code == 0 {
+				t.Errorf("the %q subcommand must reject %s, got exit code %d", sub, option[0], code)
+			}
+			// The parser names the option without its leading dashes.
+			name := strings.TrimPrefix(option[0], "--")
+			if !strings.Contains(stderr.String(), name) {
+				t.Errorf("the error of the %q subcommand does not name the rejected option %s:\n%s", sub, option[0], stderr.String())
+			}
+		}
+	}
+}
+
+// TestServiceUserIsRejectedForTheUserScope checks that the account of a
+// machine-wide instance cannot be named for a user scope instance.
+//
+// A user scope instance runs as the user itself, so an account name would
+// be a promise the installation cannot keep.
+func TestServiceUserIsRejectedForTheUserScope(t *testing.T) {
+	if isWindows() {
+		t.Skip("the user scope does not exist on windows")
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--user", "--service-user", "hfdesk"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("the user scope must reject --service-user, got exit code %d", code)
+	}
+	errText := stderr.String()
+	if !strings.Contains(errText, "--service-user") {
+		t.Errorf("the error does not name the rejected option:\n%s", errText)
+	}
+	if !strings.Contains(errText, "user") {
+		t.Errorf("the error does not explain the scope of the option:\n%s", errText)
+	}
+}
+
+// TestBuildInstallOptionsCarriesTheServiceUser checks that the account
+// reaches the options of the installation.
+//
+// The account is empty when the command line does not name one: the default
+// of the platform is resolved by the platform manager, which knows the
+// accounts of the machine.
+func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
+	const executable = "/usr/local/bin/hfdesk"
+
+	opts, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, executable)
+	if err != nil {
+		t.Fatalf("build the install options: %v", err)
+	}
+	if opts.ServiceUser != "hfdesk-svc" {
+		t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
+	}
+
+	opts, err = buildInstallOptions(service.ScopeSystem, installFlags{}, executable)
+	if err != nil {
+		t.Fatalf("build the install options: %v", err)
+	}
+	if opts.ServiceUser != "" {
+		t.Errorf("the service account is %q, want it to be unset", opts.ServiceUser)
+	}
+}
+
+// TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope checks that
+// a user scope instance never carries a service account.
+func TestBuildInstallOptionsRejectsTheServiceUserForTheUserScope(t *testing.T) {
+	if isWindows() {
+		t.Skip("the user scope does not exist on windows")
+	}
+	if _, err := buildInstallOptions(service.ScopeUser, installFlags{serviceUser: "hfdesk"}, "/usr/local/bin/hfdesk"); err == nil {
+		t.Error("the user scope must reject a service account")
+	}
+}
+
+// TestInstallSummaryReportsTheAccountOfTheInstance checks that the summary
+// names the account the instance runs as.
+func TestInstallSummaryReportsTheAccountOfTheInstance(t *testing.T) {
+	opts := service.InstallOptions{
+		Scope:      service.ScopeSystem,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+		ServiceUser: "hfdesk-svc",
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+
+	out := buf.String()
+	if got := summaryField(out, "Account"); got != "hfdesk-svc" {
+		t.Errorf("the account of the summary is %q, want %q:\n%s", got, "hfdesk-svc", out)
+	}
+}
+
+// TestInstallSummaryReportsTheDefaultAccountOfThePlatform checks that the
+// summary names the account of the platform when the command line does not
+// name one.
+func TestInstallSummaryReportsTheDefaultAccountOfThePlatform(t *testing.T) {
+	opts := service.InstallOptions{
+		Scope:      service.ScopeSystem,
+		Executable: "/usr/local/bin/hfdesk",
+		Listen:     "127.0.0.1:8080",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/etc/hfdesk/hfdesk.json",
+			StateDir:   "/var/lib/hfdesk",
+			LogDir:     "/var/log/hfdesk",
+		},
+	}
+
+	var buf bytes.Buffer
+	mgr := fakeManager{status: service.Status{State: service.StateRunning}}
+	writeInstallSummary(&buf, context.Background(), mgr, service.ScopeSystem, opts)
+
+	out := buf.String()
+	got := summaryField(out, "Account")
+	if got == "" {
+		t.Fatalf("the summary does not name an account:\n%s", out)
+	}
+	if want := service.DefaultServiceUser(); want != "" && got != want {
+		t.Errorf("the account of the summary is %q, want the default account of the platform %q:\n%s", got, want, out)
+	}
+}
+
 func TestServiceHelpSucceeds(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"--help"}, &stdout, &stderr)
@@ -816,6 +958,266 @@ func TestUpgradeWarning(t *testing.T) {
 	}
 	if got := upgradeWarning(filepath.Join(os.TempDir(), "hfdesk", "hfdesk")); got == "" {
 		t.Error("a temporary path must produce a warning")
+	}
+}
+
+// TestUpgradeWarningDescribesTheRegisteredPath checks that the warning is
+// about the path the registration points at.
+//
+// The registration keeps the name the installation is known by, so a stable
+// name stays quiet even when the file behind it is a version-stamped
+// release artifact: the next release replaces the file, the registration
+// does not change.
+func TestUpgradeWarningDescribesTheRegisteredPath(t *testing.T) {
+	if got := upgradeWarning("/usr/local/bin/hfdesk"); got != "" {
+		t.Errorf("a stable registered path must not produce a warning, got:\n%s", got)
+	}
+	if got := upgradeWarning("/opt/hfdesk-1.2.3/hfdesk"); got == "" {
+		t.Error("a version-stamped registered path must produce a warning")
+	}
+}
+
+// TestServiceInstallRejectsAnUnusableExecutable checks that the
+// installation is refused when the named binary cannot be registered.
+//
+// The registration points at that exact path, so a path that is not a
+// program would break the instance at the first start.
+func TestServiceInstallRejectsAnUnusableExecutable(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"a relative path", "bin/hfdesk", "absolute"},
+		{"a missing file", filepath.Join(dir, "missing"), "not usable"},
+		{"a directory", dir, "regular file"},
+		{"a file that is not executable", plain, "not executable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand([]string{"install", "--system", "--executable", tc.path}, &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("the installation must be refused, got exit code %d", code)
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("the error does not report %q:\n%s", tc.want, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused installation must not report a registration:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestResolveExecutableKeepsTheStableNameOfTheInvocation checks that the
+// registration points at the name the user invoked.
+//
+// os.Executable() resolves a symbolic link and returns its target, so a
+// registration built from it points at the version-stamped release artifact
+// instead of at the stable name of the installation. The invocation path
+// keeps the name.
+func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
+	root := t.TempDir()
+	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
+	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stable := filepath.Join(root, "bin", "hfdesk")
+	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(release, stable); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveExecutable("", stable)
+	if err != nil {
+		t.Fatalf("resolveExecutable() = %v, want nil", err)
+	}
+	if got != stable {
+		t.Errorf("the registered executable is %q, want the invoked path %q", got, stable)
+	}
+}
+
+// TestUpgradeWarningStaysQuietForAStableName checks the whole chain: a
+// stable name that points at a version-stamped file does not produce a
+// warning.
+//
+// The registration keeps the name the installation is known by, and the next
+// release replaces the file behind that name.
+func TestUpgradeWarningStaysQuietForAStableName(t *testing.T) {
+	root := treeOutsideTempDir(t)
+	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
+	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stable := filepath.Join(root, "bin", "hfdesk")
+	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(release, stable); err != nil {
+		t.Fatal(err)
+	}
+
+	registered, err := resolveExecutable("", stable)
+	if err != nil {
+		t.Fatalf("resolveExecutable() = %v, want nil", err)
+	}
+	if registered != stable {
+		t.Fatalf("the registered executable is %q, want the invoked path %q", registered, stable)
+	}
+	if got := upgradeWarning(registered); got != "" {
+		t.Errorf("a stable registered path must not produce a warning, got:\n%s", got)
+	}
+	// The version-stamped path itself is a warning: it does not survive
+	// the next upgrade.
+	if got := upgradeWarning(release); got == "" {
+		t.Error("a version-stamped registered path must produce a warning")
+	}
+}
+
+// treeOutsideTempDir returns a directory that is not inside the temporary
+// directory of the process.
+//
+// The upgrade warning treats a path inside the temporary directory as a path
+// that does not survive an upgrade, so a test of the warning needs a tree
+// outside of it.
+func treeOutsideTempDir(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	// The temporary directory of the process moves next to the tree, so
+	// the tree is not inside it.
+	moved := filepath.Join(base, "tmp")
+	t.Setenv("TMPDIR", moved)
+	t.Setenv("TMP", moved)
+	t.Setenv("TEMP", moved)
+	return filepath.Join(base, "tree")
+}
+
+// TestResolveExecutablePrefersTheInvocationPath checks that the path the
+// user typed is the one the registration points at.
+func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "hfdesk")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveExecutable("", bin)
+	if err != nil {
+		t.Fatalf("resolveExecutable() = %v, want nil", err)
+	}
+	if got != bin {
+		t.Errorf("the registered executable is %q, want the invoked path %q", got, bin)
+	}
+}
+
+// TestResolveExecutableFallsBackToTheRunningBinary checks that a bare name
+// from the search path of the shell is never resolved against the working
+// directory.
+//
+// The name of a command of the search path says nothing about the file the
+// user wants to register: it is resolved against the working directory of
+// the install command, which is not where the binary lives.
+func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
+	root := t.TempDir()
+	// A file with the name of the command in the working directory.
+	if err := os.WriteFile(filepath.Join(root, "hfdesk"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+
+	got, err := resolveExecutable("", "hfdesk")
+	if err != nil {
+		t.Fatalf("resolveExecutable() = %v, want nil", err)
+	}
+	if got == filepath.Join(root, "hfdesk") {
+		t.Errorf("the registered executable is %q, want the path of the running binary", got)
+	}
+
+	running, err := os.Executable()
+	if err != nil {
+		t.Fatalf("the path of the running binary: %v", err)
+	}
+	want, err := filepath.Abs(running)
+	if err != nil {
+		t.Fatalf("the absolute path of the running binary: %v", err)
+	}
+	if got != want {
+		t.Errorf("the registered executable is %q, want the path of the running binary %q", got, want)
+	}
+}
+
+// TestResolveExecutableRejectsAnUnusableExplicitPath checks that an
+// explicit path has to be a program that can be started.
+func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
+	root := t.TempDir()
+	program := filepath.Join(root, "hfdesk")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"a relative path", "bin/hfdesk", "absolute"},
+		{"a missing file", filepath.Join(root, "missing"), "not usable"},
+		{"a directory", root, "regular file"},
+		{"a file that is not executable", plain, "not executable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveExecutable(tc.path, "")
+			if err == nil {
+				t.Fatalf("resolveExecutable(%q) = %q, want an error", tc.path, got)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error of resolveExecutable(%q) = %v, want it to mention %q", tc.path, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveExecutableUsesTheExplicitPath checks that an explicit path
+// wins over the invoked binary.
+func TestResolveExecutableUsesTheExplicitPath(t *testing.T) {
+	root := t.TempDir()
+	program := filepath.Join(root, "hfdesk")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveExecutable(program, filepath.Join(root, "other"))
+	if err != nil {
+		t.Fatalf("resolveExecutable() = %v, want nil", err)
+	}
+	if got != program {
+		t.Errorf("the registered executable is %q, want the explicit path %q", got, program)
 	}
 }
 
