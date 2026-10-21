@@ -218,9 +218,15 @@ const context = {
       });
     }
     if (rawPath.startsWith('/api/runtime/logs?')) {
+      // The server answers with the cursor of the last record it
+      // delivered. A page without records keeps the cursor of the client:
+      // the page taught the client nothing, so the cursor does not move.
+      const after = Number(new URL(rawPath, 'http://hfdesk.test').searchParams.get('after')) || 0;
+      const records = server.records;
+      const cursor = records.length ? Number(records[records.length - 1].seq) : after;
       return jsonResponse({
-        records: server.records,
-        cursor: server.head,
+        records,
+        cursor,
         truncated: server.truncated
       });
     }
@@ -264,6 +270,41 @@ async function settle() {
   for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
 }
 
+// runPendingTimers runs the pending timers of the view, oldest first.
+//
+// The view batches its DOM updates with a timer, so a scenario that wants
+// to see the settled view runs the timers instead of waiting for the wall
+// clock. The timers run one after the other, because a flush that leaves
+// records in the buffer schedules the next batch.
+async function runPendingTimers(budget = 100) {
+  for (let i = 0; i < budget; i++) {
+    const timer = timers.shift();
+    if (!timer) return;
+    timer.fn();
+    await settle();
+  }
+  throw new Error(`the view scheduled more than ${budget} timers`);
+}
+
+// logRows returns the rows of the log view.
+//
+// The DOM stub keeps the rows in the fragment they were built in, so the
+// rows are collected from the whole tree of the log body.
+function logRows() {
+  const rows = [];
+  const visit = (node) => {
+    for (const child of node.children) {
+      if (child.dataset && child.dataset.seq !== undefined) {
+        rows.push(child);
+        continue;
+      }
+      visit(child);
+    }
+  };
+  visit(nodes.get('#logBody'));
+  return rows;
+}
+
 function toastMessages() {
   const container = nodes.get('#toastContainer');
   return container.children.map(toast => {
@@ -295,6 +336,7 @@ function resetView() {
 
   nodes.get('#toastContainer').replaceChildren();
   nodes.get('#liveRegion').textContent = '';
+  nodes.get('#logBody').replaceChildren();
   timers = [];
   calls.length = 0;
 }
@@ -440,11 +482,94 @@ async function scenarioUnreachableStatus() {
     'the view does not re-sync when the status cannot be read');
 }
 
+// A cursor of an earlier run of the server is ahead of every record the
+// server holds. The server reports the loss, and the view has to name the
+// restart: the cursor of the client cannot be used for that, because a
+// page without records keeps the cursor of the client.
+async function scenarioEarlierRun() {
+  resetView();
+  seedClient(fixture.clientCursor);
+
+  server.head = fixture.restartHead;
+  server.records = [];
+  server.truncated = true;
+
+  await ui.pollOnce();
+  await settle();
+
+  ok(toastMessages().some(message => /restart/i.test(message)),
+    `the view tells the user that the server restarted (${JSON.stringify(toastMessages())})`);
+}
+
+// A burst of records that is larger than one batch leaves records in the
+// buffer. The view has to render them anyway: a flush that leaves records
+// unrendered schedules the next batch, so the view converges to showing
+// everything that is in the buffer, without another event to arrive.
+async function scenarioLargeBatch() {
+  for (const count of [501, 1000]) {
+    resetView();
+
+    const records = [];
+    for (let seq = 1; seq <= count; seq++) {
+      records.push({
+        seq,
+        time: '2026-10-21T10:00:00Z',
+        level: 'INFO',
+        component: 'server',
+        message: `record ${seq}`,
+        attrs: {}
+      });
+    }
+
+    // The whole burst arrives before the first flush.
+    ui.ingest(records);
+
+    eq(logRows().length, 0,
+      `the records of a burst of ${count} are not rendered before the first flush`);
+
+    // The view settles: the pending batches run.
+    await runPendingTimers();
+
+    const rows = logRows();
+    eq(rows.length, count,
+      `every record of a burst of ${count} is on the screen after the view settled`);
+    eq(Number(rows[0]?.dataset.seq), 1,
+      `the first row of a burst of ${count} is the first record`);
+    eq(Number(rows[rows.length - 1]?.dataset.seq), count,
+      `the last row of a burst of ${count} is the last record`);
+  }
+}
+
+// The groups of the scenarios of the harness.
+//
+// The group is picked with the HFDESK_RUNTIME_SCENARIO environment
+// variable, so every Go test runs the group it is about. An empty value
+// runs every group.
+const scenarioGroups = {
+  restart: [
+    scenarioRestart,
+    scenarioContinued,
+    scenarioTruncated,
+    scenarioUnreachableStatus,
+    scenarioEarlierRun
+  ],
+  flush: [
+    scenarioLargeBatch
+  ]
+};
+
 (async () => {
-  await scenarioRestart();
-  await scenarioContinued();
-  await scenarioTruncated();
-  await scenarioUnreachableStatus();
+  const wanted = (process.env.HFDESK_RUNTIME_SCENARIO || '').trim();
+  const groups = wanted ? wanted.split(',').map(name => name.trim()).filter(Boolean) : Object.keys(scenarioGroups);
+
+  for (const group of groups) {
+    const scenarios = scenarioGroups[group];
+    if (!scenarios) {
+      console.error(`runtime-ui: unknown scenario group ${group}`);
+      process.exit(1);
+    }
+    for (const scenario of scenarios) await scenario();
+  }
 
   console.log(`runtime-ui: ${assertions} assertions passed`);
 })().catch(err => {

@@ -108,7 +108,12 @@ not write a log file.
   and the maximum is `1000`; a larger value is clamped to the maximum. An
   invalid value is rejected with `400`.
 
-`cursor` is the cursor to send for the next page. `truncated` reports that
+`cursor` is the cursor to send for the next page. It is the sequence number
+of the last record the page carried, so a client never skips a record it did
+not receive. An empty page keeps the cursor of the client: the page taught
+the client nothing, so the cursor does not move.
+
+`truncated` reports that
 the caller cannot be served a complete answer for the requested cursor and
 has to start over. It is true when the requested window is no longer fully
 covered by the retained records, so the client must not assume that the page
@@ -134,6 +139,10 @@ events:
 - `gap` — the requested window had already fallen out of the retained
   records, or the cursor was ahead of every record the server holds:
   `{"dropped": 0, "cursor": 42}`. The client re-syncs the same way.
+
+The stream only moves its position over the records it delivered, so the
+cursor it reports never names a record the client did not receive. A replay
+that delivered no record keeps the cursor of the client.
 
 The stream ends when the client goes away, and a keep-alive comment is sent
 while it is idle. Log traffic does not use the job WebSocket of `/api/ws`.

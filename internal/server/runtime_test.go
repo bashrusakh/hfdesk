@@ -433,8 +433,11 @@ func TestRuntimeLogsTruncationForACursorOfAnEarlierRun(t *testing.T) {
 	if len(page.Records) != 0 {
 		t.Fatalf("records = %d, want 0", len(page.Records))
 	}
-	if page.Cursor != pipeline.Cursor() {
-		t.Errorf("cursor = %d, want the head of the server (%d)", page.Cursor, pipeline.Cursor())
+	// The empty page teaches the client nothing, so the cursor of the
+	// client stays where it is. The truncated flag is what tells the
+	// client that it has to start over.
+	if page.Cursor != 99 {
+		t.Errorf("cursor = %d, want the cursor the client sent (99)", page.Cursor)
 	}
 
 	// A cursor at the head is not truncated: there is nothing new after it.
@@ -446,7 +449,7 @@ func TestRuntimeLogsTruncationForACursorOfAnEarlierRun(t *testing.T) {
 		t.Fatalf("records = %d, want 0", len(page.Records))
 	}
 	if page.Cursor != pipeline.Cursor() {
-		t.Errorf("cursor = %d, want the head of the server (%d)", page.Cursor, pipeline.Cursor())
+		t.Errorf("cursor = %d, want the cursor the client sent (%d)", page.Cursor, pipeline.Cursor())
 	}
 }
 

@@ -117,6 +117,11 @@ type RuntimeLogsResponse struct {
 	// Records holds the page of records, oldest first.
 	Records []RuntimeLogRecord `json:"records"`
 	// Cursor is the cursor to send for the next page.
+	//
+	// It is the sequence number of the last record the page carried, so a
+	// client never skips a record it did not receive. An empty page keeps
+	// the cursor of the client: the page taught the client nothing, so
+	// the cursor of the client does not move.
 	Cursor uint64 `json:"cursor"`
 	// Truncated reports that the caller cannot be served a complete answer
 	// for the requested cursor and has to start over.
@@ -254,6 +259,12 @@ func (s *Server) handleRuntimeOpenLogs(w http.ResponseWriter, r *http.Request) {
 // The page is served from the bounded in-memory ring of the logging
 // pipeline. The log file is never read, so a reconnect does not re-read it
 // and a client can never ask for an unbounded amount of data.
+//
+// The cursor of the response is the sequence number of the last record the
+// page carried, so a client never skips a record it did not receive. An
+// empty page keeps the cursor of the client, and a cursor that belongs to
+// an earlier run of the server is reported by the truncated flag, so the
+// client starts over.
 func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	query, err := parseRuntimeLogQuery(r)
 	if err != nil {
@@ -270,9 +281,11 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	records, truncated := pipeline.Records(query.after, logging.OldestFirst)
-	head := pipeline.Cursor()
 
 	page := make([]RuntimeLogRecord, 0, len(records))
+	// The cursor of the response follows the records the page consumed. An
+	// empty page leaves the cursor of the client where it is: the page
+	// taught the client nothing, so the cursor does not move.
 	cursor := query.after
 	for _, record := range records {
 		// The cursor follows the records the server consumed, so a page
@@ -286,12 +299,6 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 		if len(page) == query.limit {
 			break
 		}
-	}
-	if len(records) == 0 {
-		// There is nothing new. The cursor stays at the head of the
-		// pipeline, so a client that sent a cursor from an earlier run of
-		// the server does not get stuck on it.
-		cursor = head
 	}
 
 	writeJSON(w, http.StatusOK, RuntimeLogsResponse{
@@ -413,6 +420,11 @@ func (st *runtimeLogStream) close() {
 //
 // A nil pipeline means that no pipeline is installed, so there is nothing
 // to replay.
+//
+// The position of the stream only follows the records the replay consumed,
+// so it never names a record the client did not receive. A replay that
+// delivered no record keeps the cursor of the client, and the gap event
+// carries it, so the client starts over from the place it knows.
 func (st *runtimeLogStream) replay(pipeline *logging.Pipeline) error {
 	if pipeline == nil {
 		return nil

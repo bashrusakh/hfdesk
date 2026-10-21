@@ -366,8 +366,14 @@
   // The cause decides the message: a cursor of the server that is lower than
   // the cursor of the client means that the server restarted, so the message
   // names the restart instead of the records the server dropped.
-  function resyncReason(fallback, serverCursor) {
-    if (serverRestarted(serverCursor)) return RESTART_MESSAGE;
+  //
+  // A page that carried no record at all tells the same story: the cursor of
+  // the client is then ahead of every record the server holds, which only
+  // happens when the sequence numbers of the server start over, that is when
+  // the server restarted. The cursor of the page cannot be used for that: a
+  // page without records keeps the cursor of the client.
+  function resyncReason(fallback, serverCursor, emptyPage) {
+    if (emptyPage || serverRestarted(serverCursor)) return RESTART_MESSAGE;
     return fallback;
   }
 
@@ -538,6 +544,12 @@
   // The rows are built in a single fragment and appended once. The rows
   // that fell out of the buffer are removed in one step, so the tree is
   // touched once per flush and not once per record.
+  //
+  // A flush never renders more than MAX_ROWS_PER_FLUSH rows, so a burst
+  // cannot lock the window. The records that did not fit into the batch
+  // stay in the buffer and the next batch is scheduled, so the view
+  // converges to showing everything that is in the buffer without waiting
+  // for another record to arrive.
   function flush() {
     trimBuffer();
     const records = state.records;
@@ -555,6 +567,7 @@
     const fragment = document.createDocumentFragment();
     let added = 0;
     let rendered = state.renderedSeq;
+    let pending = false;
 
     for (let i = 0; i < records.length; i += 1) {
       const record = records[i];
@@ -567,7 +580,12 @@
         continue;
       }
 
-      if (added >= MAX_ROWS_PER_FLUSH) break;
+      if (added >= MAX_ROWS_PER_FLUSH) {
+        // The batch is full. The records that are left are rendered by
+        // the next batch, which this flush schedules.
+        pending = true;
+        break;
+      }
 
       fragment.appendChild(buildRow(record));
       rendered = record.seq;
@@ -580,6 +598,13 @@
     updateCounts();
     updateEmptyState();
     if (state.follow) scrollToBottom();
+
+    if (pending) {
+      // Records are still waiting in the buffer. The next batch is
+      // scheduled through the usual batching, so the view stays
+      // responsive and no busy loop is started.
+      scheduleFlush();
+    }
   }
 
   // renderAll rebuilds the view from the buffer. It runs when the filters
@@ -760,7 +785,7 @@
 
       if (page.truncated) {
         state.resyncing = false;
-        await resync(resyncReason(reason, page.cursor));
+        await resync(resyncReason(reason, page.cursor, page.records.length === 0));
         return;
       }
 
@@ -943,6 +968,7 @@
 
     let truncated = false;
     let serverCursor = null;
+    let emptyPage = false;
 
     try {
       const page = await readLogs(state.cursor, PAGE_SIZE);
@@ -952,6 +978,9 @@
         // hole and cannot be continued.
         truncated = true;
         serverCursor = page.cursor;
+        // A page without a record means that the cursor of the client is
+        // ahead of every record the server holds: the server restarted.
+        emptyPage = page.records.length === 0;
       } else {
         ingest(page.records);
         if (page.cursor !== null && page.cursor > state.cursor) {
@@ -977,7 +1006,7 @@
     }
 
     if (truncated) {
-      await resync(resyncReason('The server dropped older log records, re-syncing', serverCursor));
+      await resync(resyncReason('The server dropped older log records, re-syncing', serverCursor, emptyPage));
     }
 
     if (!state.source) schedulePoll(state.pollDelay);

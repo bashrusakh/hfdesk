@@ -25,24 +25,9 @@ type runtimeUIFixture struct {
 	ContinuedHead uint64 `json:"continuedHead"`
 }
 
-// TestRuntimeUIRestartResync proves that the Runtime / Logs view notices
-// that the server it is talking to is a different run.
-//
-// The sequence numbers of the log belong to the run of the process that
-// emits them and start over with every run, so a view that keeps its cursor
-// across a restart of the server waits for records that will never arrive.
-// The view has to notice the restart, start over and tell the user about it.
-//
-// Node's built-in VM drives the shipped runtime.js with DOM and fetch
-// stubs, so the harness exercises the view itself and not a copy of its
-// rules.
-func TestRuntimeUIRestartResync(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node unavailable: run testdata/runtime-ui.cjs with Node to verify the runtime view")
-	}
-
-	fixture := runtimeUIFixture{
+// runtimeUIFixtureForTest returns the fixture of the runtime view harness.
+func runtimeUIFixtureForTest() runtimeUIFixture {
+	return runtimeUIFixture{
 		Records: []map[string]any{
 			{
 				"seq":       1,
@@ -76,17 +61,63 @@ func TestRuntimeUIRestartResync(t *testing.T) {
 		// The server kept running and emitted more than the client saw.
 		ContinuedHead: 150,
 	}
+}
 
-	payload, err := json.Marshal(fixture)
+// runRuntimeUIHarness runs the runtime view harness with the given
+// scenario group.
+//
+// The harness needs Node: without it the test is skipped, because the
+// view is browser code and only the browser can run it.
+func runRuntimeUIHarness(t *testing.T, group string) {
+	t.Helper()
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node unavailable: run testdata/runtime-ui.cjs with Node to verify the runtime view")
+	}
+
+	payload, err := json.Marshal(runtimeUIFixtureForTest())
 	if err != nil {
 		t.Fatalf("encode runtime UI fixture: %v", err)
 	}
 
 	cmd := exec.Command(node, "testdata/runtime-ui.cjs")
-	cmd.Env = append(os.Environ(), "HFDESK_RUNTIME_FIXTURE="+string(payload))
+	cmd.Env = append(os.Environ(),
+		"HFDESK_RUNTIME_FIXTURE="+string(payload),
+		"HFDESK_RUNTIME_SCENARIO="+group)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("runtime UI regression: %v\n%s", err, out)
 	}
 	t.Log(string(out))
+}
+
+// TestRuntimeUIRestartResync proves that the Runtime / Logs view notices
+// that the server it is talking to is a different run.
+//
+// The sequence numbers of the log belong to the run of the process that
+// emits them and start over with every run, so a view that keeps its cursor
+// across a restart of the server waits for records that will never arrive.
+// The view has to notice the restart, start over and tell the user about it.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIRestartResync(t *testing.T) {
+	runRuntimeUIHarness(t, "restart")
+}
+
+// TestRuntimeUIFlushesEveryRecord proves that the Runtime / Logs view
+// shows every record that is in its buffer.
+//
+// A flush renders a bounded number of rows, so a burst of records is
+// rendered over several flushes. A flush that leaves records unrendered
+// has to schedule the next batch: otherwise the records that did not fit
+// into the batch stay invisible until another record arrives, and the
+// count in the header reports more records than the user sees.
+//
+// The harness drives the shipped runtime.js, so the regression is caught
+// in the view itself and not in a copy of its rules.
+func TestRuntimeUIFlushesEveryRecord(t *testing.T) {
+	runRuntimeUIHarness(t, "flush")
 }
