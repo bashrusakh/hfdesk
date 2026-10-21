@@ -70,6 +70,15 @@ func Reset() {
 	installed = nil
 }
 
+// IsInstalled reports whether an explicit runtime path model is installed
+// for this process. A supervised instance installs one; an interactive run
+// resolves its paths per call and installs nothing.
+func IsInstalled() bool {
+	installedMu.RLock()
+	defer installedMu.RUnlock()
+	return installed != nil
+}
+
 // Current returns the effective path model. Without an installed model the
 // interactive defaults are resolved again on every call, so a changed HOME,
 // XDG_CONFIG_HOME, APPDATA or working directory takes effect immediately.

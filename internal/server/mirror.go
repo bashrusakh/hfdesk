@@ -102,7 +102,7 @@ func (s *Server) handleMirrorTargetAdd(w http.ResponseWriter, r *http.Request) {
 
 	cfg.Add(req.Name, absPath, req.Description)
 
-	if err := cfg.Save(runtimepaths.Current().TargetsFile()); err != nil {
+	if err := saveMirrorTargets(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
 		return
 	}
@@ -137,7 +137,7 @@ func (s *Server) handleMirrorTargetRemove(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := cfg.Save(runtimepaths.Current().TargetsFile()); err != nil {
+	if err := saveMirrorTargets(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
 		return
 	}
@@ -403,6 +403,20 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helper types and functions ---
+
+// saveMirrorTargets writes the mirror targets into the state directory.
+//
+// The downloader package creates the parent directory of the targets file
+// with its own mode, so the server creates the state directory with the mode
+// it owns before the file is written: the mode of the directory must not
+// depend on which code path created it.
+func saveMirrorTargets(cfg *hfdownloader.TargetsConfig) error {
+	targetsFile := runtimepaths.Current().TargetsFile()
+	if err := os.MkdirAll(filepath.Dir(targetsFile), serverDirMode()); err != nil {
+		return err
+	}
+	return cfg.Save(targetsFile)
+}
 
 type mirrorEntry struct {
 	Type   string

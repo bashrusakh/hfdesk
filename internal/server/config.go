@@ -182,12 +182,12 @@ func saveConfigFile(path string, cfg *ConfigFile) error {
 		return errors.New("cannot save a redacted token as a credential")
 	}
 
-	// Ensure the config directory exists. It is owner-only: the config
-	// directory of an instance holds the job list, the download history,
-	// the mirror targets and the credentials of the instance, so nobody
-	// else has to be able to read it.
+	// Ensure the config directory exists. It is created with the mode the
+	// server owns: an owner-only directory for a supervised instance, which
+	// holds the credentials of the instance, and the historical mode for an
+	// interactive run.
 	configDir := filepath.Dir(path)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	if err := os.MkdirAll(configDir, serverDirMode()); err != nil {
 		return err
 	}
 

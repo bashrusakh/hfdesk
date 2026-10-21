@@ -77,6 +77,29 @@ func TestDerivedFileNamesLiveInStateDir(t *testing.T) {
 	}
 }
 
+func TestIsInstalledTracksTheInstalledModel(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+
+	if IsInstalled() {
+		t.Fatalf("IsInstalled() = true before a model was installed")
+	}
+
+	Install(Paths{
+		ConfigFile: filepath.Join("/etc", "hfdesk", "hfdesk.json"),
+		StateDir:   filepath.Join("/var", "lib", "hfdesk"),
+		LogDir:     filepath.Join("/var", "log", "hfdesk"),
+	})
+	if !IsInstalled() {
+		t.Fatalf("IsInstalled() = false after Install")
+	}
+
+	Reset()
+	if IsInstalled() {
+		t.Fatalf("IsInstalled() = true after Reset")
+	}
+}
+
 func TestResetRestoresInteractiveResolution(t *testing.T) {
 	model := Paths{
 		ConfigFile: filepath.Join("/etc", "hfdesk", "hfdesk.json"),

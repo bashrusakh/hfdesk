@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -108,8 +109,204 @@ func TestSettingsReportInstalledRuntimeModel(t *testing.T) {
 	}
 }
 
+func TestServerDirectoryModeFollowsTheInstalledRuntimeModel(t *testing.T) {
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+
+	// Without an installed model the interactive run keeps the historical
+	// mode of its per-user directories.
+	if got, want := serverDirMode(), os.FileMode(0o755); got != want {
+		t.Errorf("serverDirMode() without an installed model = %o, want %o", got, want)
+	}
+
+	runtimepaths.Install(runtimepaths.Paths{
+		ConfigFile: filepath.Join(t.TempDir(), "hfdesk.json"),
+		StateDir:   filepath.Join(t.TempDir(), "state"),
+		LogDir:     filepath.Join(t.TempDir(), "logs"),
+	})
+
+	// A supervised instance owns its directories.
+	if got, want := serverDirMode(), os.FileMode(0o700); got != want {
+		t.Errorf("serverDirMode() with an installed model = %o, want %o", got, want)
+	}
+}
+
+func TestServerDirectoriesKeepTheHistoricalModeWithoutAnInstalledModel(t *testing.T) {
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+	setServerSandboxEnv(t, t.TempDir())
+
+	configDir := filepath.Join(t.TempDir(), "config")
+	if err := saveConfigFile(filepath.Join(configDir, "hfdesk.json"), &ConfigFile{}); err != nil {
+		t.Fatalf("save config file: %v", err)
+	}
+	assertDirMode(t, configDir, 0o755)
+
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := saveJobsState(filepath.Join(stateDir, "jobs_state.json"), nil); err != nil {
+		t.Fatalf("save jobs state: %v", err)
+	}
+	assertDirMode(t, stateDir, 0o755)
+
+	// The history is written into the state directory of the effective
+	// runtime path model, which is the per-user directory of an interactive
+	// run.
+	if err := AppendHistory(&Job{ID: "1", Repo: "owner/model"}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	assertDirMode(t, AppConfigDir(), 0o755)
+}
+
+func TestServerDirectoriesAreOwnerOnlyWithAnInstalledModel(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "hfdesk.json"),
+		StateDir:   filepath.Join(root, "state"),
+		LogDir:     filepath.Join(root, "logs"),
+	}
+	runtimepaths.Install(model)
+	t.Cleanup(runtimepaths.Reset)
+
+	configDir := filepath.Join(t.TempDir(), "config")
+	if err := saveConfigFile(filepath.Join(configDir, "hfdesk.json"), &ConfigFile{}); err != nil {
+		t.Fatalf("save config file: %v", err)
+	}
+	assertDirMode(t, configDir, 0o700)
+
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := saveJobsState(filepath.Join(stateDir, "jobs_state.json"), nil); err != nil {
+		t.Fatalf("save jobs state: %v", err)
+	}
+	assertDirMode(t, stateDir, 0o700)
+
+	if err := AppendHistory(&Job{ID: "1", Repo: "owner/model"}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	assertDirMode(t, model.StateDir, 0o700)
+}
+
+func TestServerDirectoriesKeepTheModeOfAnExistingDirectory(t *testing.T) {
+	runtimepaths.Reset()
+	t.Cleanup(runtimepaths.Reset)
+
+	// MkdirAll never changes the mode of a directory that already exists,
+	// so an existing directory keeps its mode.
+	configDir := filepath.Join(t.TempDir(), "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfigFile(filepath.Join(configDir, "hfdesk.json"), &ConfigFile{}); err != nil {
+		t.Fatalf("save config file: %v", err)
+	}
+	assertDirMode(t, configDir, 0o755)
+
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveJobsState(filepath.Join(stateDir, "jobs_state.json"), nil); err != nil {
+		t.Fatalf("save jobs state: %v", err)
+	}
+	assertDirMode(t, stateDir, 0o755)
+}
+
+func TestMirrorTargetsSaveCreatesTheStateDirectoryWithTheServerMode(t *testing.T) {
+	t.Run("interactive", func(t *testing.T) {
+		runtimepaths.Reset()
+		t.Cleanup(runtimepaths.Reset)
+		setServerSandboxEnv(t, t.TempDir())
+
+		addMirrorTarget(t)
+
+		// The state directory of an interactive run keeps the historical
+		// mode, so the targets save cannot introduce a different one.
+		assertDirMode(t, AppConfigDir(), 0o755)
+		if _, err := os.Stat(filepath.Join(AppConfigDir(), "targets.yaml")); err != nil {
+			t.Fatalf("stat targets file: %v", err)
+		}
+	})
+
+	t.Run("installed", func(t *testing.T) {
+		root := t.TempDir()
+		stateDir := filepath.Join(root, "state")
+		runtimepaths.Install(runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "hfdesk.json"),
+			StateDir:   stateDir,
+			LogDir:     filepath.Join(root, "logs"),
+		})
+		t.Cleanup(runtimepaths.Reset)
+
+		addMirrorTarget(t)
+
+		assertDirMode(t, stateDir, 0o700)
+		if _, err := os.Stat(filepath.Join(stateDir, "targets.yaml")); err != nil {
+			t.Fatalf("stat targets file: %v", err)
+		}
+	})
+}
+
+// addMirrorTarget adds a mirror target through the API.
+func addMirrorTarget(t *testing.T) {
+	t.Helper()
+
+	s := newTestServer(t)
+	req := httptest.NewRequest("POST", "/api/mirror/targets", strings.NewReader(`{"name":"backup","path":"/tmp/hfdesk-backup"}`))
+	w := httptest.NewRecorder()
+	s.handleMirrorTargetAdd(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// --- helpers ---
+
+// setServerSandboxEnv points every platform specific config location at a
+// temporary root, so an interactive run resolves its per-user directories
+// inside the sandbox of the test.
+func setServerSandboxEnv(t *testing.T, root string) {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("USERPROFILE", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	t.Setenv("APPDATA", filepath.Join(root, "appdata"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(root, "localappdata"))
+}
+
+// assertDirMode checks the permission bits of a directory. The umask of the
+// process masks the mode bits of a created directory, so the expected mode is
+// masked the same way.
+func assertDirMode(t *testing.T, dir string, want os.FileMode) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not support POSIX permission bits")
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %s: %v", dir, err)
+	}
+	if got, expected := info.Mode().Perm(), want&^processUmask(t); got != expected {
+		t.Errorf("%s mode = %o, want %o", dir, got, expected)
+	}
+}
+
+// processUmask returns the permission bits the umask of the process removes
+// from a created file or directory.
+func processUmask(t *testing.T) os.FileMode {
+	t.Helper()
+
+	probe := filepath.Join(t.TempDir(), "umask-probe")
+	if err := os.Mkdir(probe, 0o777); err != nil {
+		t.Fatalf("create umask probe: %v", err)
+	}
+	info, err := os.Stat(probe)
+	if err != nil {
+		t.Fatalf("stat umask probe: %v", err)
+	}
+	return os.FileMode(0o777) &^ info.Mode().Perm()
+}
+
 // --- reference implementation ---
-//
 // The helpers below re-implement the documented interactive resolution without
 // using the runtime path model, so the tests compare behaviour instead of
 // comparing a function with itself.
