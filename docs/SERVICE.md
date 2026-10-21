@@ -38,9 +38,12 @@ The dashboard is then served on <http://127.0.0.1:8080>.
 - Administrator rights for a machine-wide (`--system`) installation, and for
   the machine-wide `start`, `stop` and `restart`. HFDesk never elevates
   itself.
-- The **service account** of a machine-wide installation, already created (see
+- The **service account** of a machine-wide installation on Linux and macOS,
+  already created (see
   [The identity of a machine-wide instance](#the-identity-of-a-machine-wide-instance)).
   A user-scope installation needs no account: it runs as the user itself.
+  Windows needs none either: the instance runs as the built-in `LocalService`
+  account.
 - A writable state root for the chosen scope (see
   [Where the state lives](#where-the-state-lives)).
 
@@ -78,7 +81,7 @@ never opens a browser.
 | `--cache-dir DIR` | Absolute path of the Hugging Face cache root. Without `--hub-dir`, the hub directory follows it: `<cache root>/hub`. |
 | `--hub-dir DIR` | Absolute path of the Hugging Face hub cache directory. Given explicitly, it separates the hub from the cache root on purpose. |
 | `--local-dir DIR` | Absolute path of the flat output directory. |
-| `--service-user ACCOUNT` | Account a **machine-wide** instance runs as. Default: the service account of the platform. Rejected for the user scope. |
+| `--service-user ACCOUNT` | Account a **machine-wide** instance runs as on Linux and macOS. Default: the service account of the platform (`hfdesk` on Linux, `_hfdesk` on macOS). Rejected for the user scope, and rejected on Windows, where the instance always runs as the built-in `LocalService` account and the identity cannot be chosen. |
 | `--executable PATH` | Absolute path of the binary the registration points at. Default: the binary that is invoked. |
 
 The path flags override the default locations of the scope. Every path of an
@@ -100,8 +103,10 @@ instead.
 
 `--service-user` names the account of a machine-wide instance (see
 [The identity of a machine-wide instance](#the-identity-of-a-machine-wide-instance)).
-It applies to the machine-wide scope only: a user-scope instance runs as the
-user itself, so the option is rejected there instead of being ignored.
+It applies to the machine-wide scope on Linux and macOS: a user-scope instance
+runs as the user itself, so the option is rejected there instead of being
+ignored. Windows has no account to name: the instance always runs as the
+built-in `LocalService` account, so the option is rejected there as well.
 
 The cache root and the hub directory are **one layout**: the cache root holds
 the friendly views (`models/`, `datasets/`), the hub directory holds the
@@ -380,8 +385,9 @@ hfdesk service install            # re-registers the current binary
 - The **macOS CI job** is narrowed to the service package: the launchd
   manager and the property list rendering are darwin-only code, so the job
   runs `go test ./internal/service` (plus the build and the vet of the whole
-  module) on a macOS runner. The full macOS suite has separate pre-existing
-  macOS-compatibility gaps; the job stays narrowed until they are resolved.
+  module) on a macOS runner. The repository has never run its full suite on
+  macOS, so the job covers the darwin-only code only; widening it to the full
+  suite is a separate, deliberate step.
 
 #### Future app-bundle packaging
 
@@ -417,7 +423,9 @@ same service at the same time.
 - Installing, removing, starting, stopping and restarting the service needs an
   **elevated shell**. HFDesk does not self-elevate and never invokes UAC.
 - The service identity is `LocalService`, a least-privilege Windows service
-  account, not `LocalSystem`.
+  account, not `LocalSystem`. It is **not configurable**: the built-in account
+  has no name of its own and needs no credential, so a Windows instance
+  cannot run as another account.
 - The service-owned state under `%ProgramData%\HFDesk` is ACL-restricted. The
   service does **not** recursively re-ACL or re-own an existing model or cache
   tree: changing the ownership of a large, possibly shared tree is an explicit
@@ -425,27 +433,36 @@ same service at the same time.
 
 ### The identity of a machine-wide instance
 
-A machine-wide (`--system`) instance runs as a **dedicated, stable and
-unprivileged service account** of its platform. It never runs as root, it
-never inherits the home directory of the user who runs the install command,
-and it never inherits the personal profile of root.
+A machine-wide (`--system`) instance runs as a **stable and unprivileged
+service account** of its platform: a dedicated one on Linux and macOS, the
+built-in `LocalService` account on Windows. It never runs as root, it never
+inherits the home directory of the user who runs the install command, and it
+never inherits the personal profile of root.
 
 | Platform | The instance runs as | The account |
 |---|---|---|
 | Linux (systemd, `--system`) | the account **`hfdesk`** | a dedicated system account; it must exist before the installation |
 | macOS (launchd, `--system`) | the account **`_hfdesk`** | a dedicated system account (the underscore prefix is the macOS convention for a service account); it must exist before the installation |
-| Windows (Service Control Manager) | **LocalService** (`NT AUTHORITY\LocalService`) | a documented minimum-privilege Windows service account. It is deliberately **not** `LocalSystem`: the instance needs no machine-wide privilege, and `LocalSystem` would give it more access than it uses. |
+| Windows (Service Control Manager) | **LocalService** (`NT AUTHORITY\LocalService`) | a documented minimum-privilege Windows service account. It is deliberately **not** `LocalSystem`: the instance needs no machine-wide privilege, and `LocalSystem` would give it more access than it uses. The identity **cannot be chosen**: the built-in account has no name of its own and needs no credential, so it is the identity every Windows instance runs as. |
 
 The account is **stable** on purpose: the files it owns have to stay writable
 across reboots, so an ephemeral identity would break the instance at the next
 restart. It is also **unprivileged**: the instance serves a dashboard and
 downloads models, it does not administer the machine.
 
-The name is the default of the platform and can be changed with
-`--service-user ACCOUNT`. The option applies to the machine-wide scope only:
-a user-scope instance runs as the user itself and never names an account.
+On Linux and macOS the name is the default of the platform and can be changed
+with `--service-user ACCOUNT`. The option applies to the machine-wide scope
+only: a user-scope instance runs as the user itself and never names an
+account.
 
-**The account must already exist.** HFDesk is a service manager, not a system
+**Windows has no account to choose.** The instance runs as the built-in,
+passwordless `LocalService` account, and `--service-user` is rejected there: a
+service under a user account would need a credential, and a credential must
+never reach the command line of an installation.
+
+**The account must already exist.** That is a statement about Linux and
+macOS: the Windows identity is an account of the operating system and is
+therefore always there. HFDesk is a service manager, not a system
 provisioner: it never creates an account, never calls `useradd` or `dscl`,
 never runs `sudo` and never elevates itself. An installation whose account
 does not exist is **refused**, and the error names the account and the exact

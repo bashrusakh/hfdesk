@@ -154,9 +154,10 @@ jobs:
   # (plutil -lint) and the launchctl integration cycle where the runner
   # allows it.
   #
-  # The full suite has separate pre-existing macOS-compatibility gaps, so the
-  # job stays narrowed to the service package. The full macOS suite can be
-  # enabled once the pre-existing platform gaps are resolved.
+  # The repository has never run its full suite on macOS, so the job covers
+  # the darwin-only code only: the launchd manager, the property list
+  # rendering, the plutil validation and the launchctl lifecycle. Widening
+  # it to the full suite is a separate, deliberate step.
   go-macos:
     name: Go checks (macOS)
     runs-on: macos-latest
