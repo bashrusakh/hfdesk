@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 // TestSCMHandlerReportsTheLifecycle drives the handler of the service
@@ -132,6 +133,33 @@ func TestSCMHandlerFailsWithoutAUsableArgumentVector(t *testing.T) {
 	want := []svc.State{svc.StartPending, svc.Stopped}
 	if !reflect.DeepEqual(states, want) {
 		t.Errorf("the reported states = %v, want %v", states, want)
+	}
+}
+
+// TestSCMShutdownWaitCoversTheShutdownOfTheServer checks that the bounded
+// wait of the service handler covers the graceful shutdown of the server.
+//
+// The server publishes the budget of its own orderly shutdown: the drain of
+// the HTTP server and the close of the job manager, each with its own
+// budget. The handler has to wait at least the total of those budgets, or
+// the service control manager gives up while the instance is still saving
+// its state.
+//
+// The wait is the shared budget of the service layer, so the platforms
+// cannot drift apart: a number of its own in the handler would be a second
+// copy of the same decision.
+func TestSCMShutdownWaitCoversTheShutdownOfTheServer(t *testing.T) {
+	if ShutdownBudget < server.GracefulShutdownTimeout {
+		t.Errorf("the shared budget of the service layer = %s, want at least %s", ShutdownBudget, server.GracefulShutdownTimeout)
+	}
+
+	handler := newSCMHandler(RunOptions{})
+	wait := handler.shutdownTimeout
+	if wait < server.GracefulShutdownTimeout {
+		t.Errorf("the bounded wait of the handler = %s, want at least %s: the wait of the supervisor has to cover the graceful shutdown of the server", wait, server.GracefulShutdownTimeout)
+	}
+	if wait != ShutdownBudget {
+		t.Errorf("the bounded wait of the handler = %s, want the shared budget %s", wait, ShutdownBudget)
 	}
 }
 

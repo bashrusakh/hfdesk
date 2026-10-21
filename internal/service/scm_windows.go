@@ -68,10 +68,6 @@ const (
 	// scmReadinessInterval is the pause between two readiness probes.
 	scmReadinessInterval = 100 * time.Millisecond
 
-	// scmShutdownTimeout bounds the wait for the graceful shutdown of the
-	// instance.
-	scmShutdownTimeout = 30 * time.Second
-
 	// scmProbeTimeout bounds a single readiness probe.
 	scmProbeTimeout = 2 * time.Second
 )
@@ -113,6 +109,12 @@ type scmHandler struct {
 	readinessInterval time.Duration
 
 	// shutdownTimeout bounds the wait for the graceful shutdown.
+	//
+	// The wait is the shared budget of the service layer: the server
+	// publishes the budget of its own orderly shutdown and the supervisor
+	// waits for that total plus a margin. A number of its own here would
+	// be a second copy of the same decision, and the platforms would drift
+	// apart.
 	shutdownTimeout time.Duration
 }
 
@@ -123,7 +125,7 @@ func newSCMHandler(opts RunOptions) *scmHandler {
 		opts:              opts,
 		readinessTimeout:  scmReadinessTimeout,
 		readinessInterval: scmReadinessInterval,
-		shutdownTimeout:   scmShutdownTimeout,
+		shutdownTimeout:   ShutdownBudget,
 	}
 }
 
@@ -234,10 +236,14 @@ func (h *scmHandler) stopInstance(cancel context.CancelFunc, hostErr <-chan erro
 //
 // The wait is bounded: a server that does not finish its drain must not
 // keep the instance in the stopping state forever.
+//
+// The bound is the shared budget of the service layer, so the handler
+// never gives up before the server had the time to finish its own
+// shutdown.
 func (h *scmHandler) waitForShutdown(cancel context.CancelFunc, hostErr <-chan error) error {
 	timeout := h.shutdownTimeout
 	if timeout <= 0 {
-		timeout = scmShutdownTimeout
+		timeout = ShutdownBudget
 	}
 	cancel()
 	select {

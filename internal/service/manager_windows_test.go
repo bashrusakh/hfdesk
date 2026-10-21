@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 // secretSentinel is an obviously secret value. It is put into every field
@@ -461,6 +462,30 @@ func TestSCMStartAndStopOfAnAbsentRegistration(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not installed") {
 		t.Errorf("Start() = %v, want an error that names the missing registration", err)
+	}
+}
+
+// TestSCMStopWaitCoversTheShutdownOfTheServer checks that the wait of the
+// manager for the stopped instance covers the graceful shutdown of the
+// server.
+//
+// The server publishes the budget of its own orderly shutdown: the drain of
+// the HTTP server and the close of the job manager, each with its own budget.
+// The manager has to wait at least the total of those budgets, or it reports
+// a failed stop while the instance is still saving its state.
+//
+// The wait is the shared budget of the service layer and not a number of its
+// own: a second copy of the same decision would drift below the budget of
+// the server.
+func TestSCMStopWaitCoversTheShutdownOfTheServer(t *testing.T) {
+	if ShutdownBudget < server.GracefulShutdownTimeout {
+		t.Errorf("the shared budget of the service layer = %s, want at least %s", ShutdownBudget, server.GracefulShutdownTimeout)
+	}
+	if scmStopTimeout < server.GracefulShutdownTimeout {
+		t.Errorf("the stop wait of the manager = %s, want at least %s: the wait of the manager has to cover the graceful shutdown of the server", scmStopTimeout, server.GracefulShutdownTimeout)
+	}
+	if scmStopTimeout != ShutdownBudget {
+		t.Errorf("the stop wait of the manager = %s, want the shared budget %s", scmStopTimeout, ShutdownBudget)
 	}
 }
 
@@ -1048,24 +1073,30 @@ func TestSCMBrokenRegistration(t *testing.T) {
 //
 // The access control lists are the SDDL strings the platform writes: the
 // trustees appear as raw SIDs and not as aliases.
+//
+// The set of the trustees that cover the account is the certain subset: the
+// account itself and everybody. It is the set the check falls back to when
+// the platform refuses the logon of the account, and the effective
+// membership of the account is checked by TestSDDLGrantsIdentityWithTheEffectiveGroups.
 func TestSDDLGrantsIdentity(t *testing.T) {
+	identity := scmCertainIdentitySIDs(errors.New("the test checks the certain subset"))
 	cases := []struct {
 		name    string
 		sddl    string
 		wantErr bool
 	}{
 		{"the account itself", "D:P(A;;FA;;;S-1-5-19)", false},
+		{"the alias of the account", "D:P(A;;FA;;;LS)", false},
 		{"everyone", "D:P(A;;FA;;;S-1-1-0)", false},
-		{"the users group", "D:P(A;;FA;;;S-1-5-32-545)", false},
-		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", false},
-		{"the interactive users group", "D:P(A;;FA;;;S-1-5-4)", false},
+		{"the alias of everyone", "D:P(A;;FA;;;WD)", false},
+		{"the interactive users group", "D:P(A;;FA;;;S-1-5-4)", true},
+		{"the alias of the interactive users group", "D:P(A;;FA;;;IU)", true},
+		{"the users group", "D:P(A;;FA;;;S-1-5-32-545)", true},
+		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", true},
 		{"an unrelated account", "D:P(A;;FA;;;S-1-5-18)", true},
 		{"an unrelated group", "D:P(A;;FA;;;S-1-5-32-544)", true},
-		{"the alias of the account", "D:P(A;;FA;;;LS)", false},
-		{"the alias of everyone", "D:P(A;;FA;;;WD)", false},
-		{"the alias of the users group", "D:P(A;;FA;;;BU)", false},
 		{"a denied entry next to an allowed one", "D:P(D;;GA;;;S-1-5-19)(A;;FA;;;S-1-1-0)", true},
-		{"a denied entry for a group of the account", "D:P(D;;GA;;;S-1-1-0)(A;;FA;;;S-1-5-19)", true},
+		{"a denied entry for everybody", "D:P(D;;GA;;;S-1-1-0)(A;;FA;;;S-1-5-19)", true},
 		{"read only rights", "D:P(A;;FR;;;S-1-5-19)", true},
 		{"write only rights", "D:P(A;;FW;;;S-1-5-19)", true},
 		{"the generic rights", "D:P(A;;0xC0000000;;;S-1-5-19)", false},
@@ -1074,7 +1105,7 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := sddlGrantsIdentity(tc.sddl)
+			err := sddlGrantsIdentity(tc.sddl, identity)
 			if tc.wantErr && err == nil {
 				t.Errorf("sddlGrantsIdentity(%q) = nil, want an error", tc.sddl)
 			}
@@ -1083,6 +1114,125 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSDDLGrantsIdentityWithTheEffectiveGroups checks the access control
+// list of a path against the effective membership of the account the
+// instance runs as.
+//
+// The membership comes from a token of the account, so a group the account
+// really carries covers it and a group it does not carry does not.
+func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
+	identity := scmTestEffectiveIdentitySIDs(t)
+
+	// The account itself.
+	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-19)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil for the account itself", err)
+	}
+	// Everybody.
+	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-1-0)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil for everybody", err)
+	}
+	// The interactive users: the instance runs a service logon and is
+	// never an interactive user.
+	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-4)", identity); err == nil {
+		t.Error("sddlGrantsIdentity() = nil, want the refusal of the interactive users")
+	}
+	// A group the account does not carry.
+	uncarried := scmTestUncarriedSID(t, identity)
+	if err := sddlGrantsIdentity("D:P(A;;FA;;;"+uncarried+")", identity); err == nil {
+		t.Errorf("sddlGrantsIdentity() = nil, want the refusal of the group %s", uncarried)
+	}
+	// Every group of the membership covers the account.
+	for group := range identity.sids {
+		if err := sddlGrantsIdentity("D:P(A;;FA;;;"+group+")", identity); err != nil {
+			t.Errorf("sddlGrantsIdentity() = %v, want nil for the group %s the account carries", err, group)
+		}
+	}
+}
+
+// TestSCMEffectiveIdentitySIDs checks the membership the implementation
+// derives out of a token of the account the instance runs as.
+//
+// The membership is the effective one: the account itself is in it, everybody
+// is in it, and the interactive users are never in it, because the instance
+// runs a service logon.
+func TestSCMEffectiveIdentitySIDs(t *testing.T) {
+	identity := scmTestEffectiveIdentitySIDs(t)
+
+	if !identity.exact {
+		t.Error("the membership of the account is not the effective one, want the membership of a token")
+	}
+	if !identity.covers(scmServiceIdentitySID) {
+		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
+	}
+	if !identity.covers(scmEveryoneSID) {
+		t.Errorf("the membership %v does not carry everybody", identity.sids)
+	}
+	if identity.covers(scmInteractiveUsersSID) {
+		t.Errorf("the membership %v carries the interactive users, want a membership without them", identity.sids)
+	}
+}
+
+// TestSddlGrantsIdentityNamesTheCertainSubset checks that a check that was
+// made against the certain subset says so.
+//
+// The platform can refuse the logon of the account. The check then falls
+// back to the subset that is certain, and the user has to know that the
+// groups of the account were not known.
+func TestSddlGrantsIdentityNamesTheCertainSubset(t *testing.T) {
+	identity := scmCertainIdentitySIDs(errors.New("the logon of the account was refused"))
+
+	err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-32-544)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a group outside the certain subset")
+	}
+	if !strings.Contains(err.Error(), "everybody only") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the certain subset", err)
+	}
+	if !strings.Contains(err.Error(), "the logon of the account was refused") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the reason", err)
+	}
+}
+
+// scmTestEffectiveIdentitySIDs returns the effective membership of the
+// account the instance runs as.
+//
+// The membership is a property of the machine: the test skips when the
+// platform refuses the logon of the account, because the machine cannot
+// answer the question then.
+func scmTestEffectiveIdentitySIDs(t *testing.T) scmIdentitySIDs {
+	t.Helper()
+	if !isElevatedProcess() {
+		t.Skip("the logon of a service account needs an elevated shell, run the test as an administrator")
+	}
+	identity, err := scmReadServiceIdentitySIDs()
+	if err != nil {
+		t.Skipf("the account %s cannot be logged on as a service: %v", scmServiceIdentityName, err)
+	}
+	return identity
+}
+
+// scmTestUncarriedSID returns a SID the account of the instance does not
+// carry.
+//
+// The candidates are the groups of the machine that the account of the
+// instance is not a member of.
+func scmTestUncarriedSID(t *testing.T, identity scmIdentitySIDs) string {
+	t.Helper()
+	for _, candidate := range []string{
+		"S-1-5-32-544", // Administrators
+		"S-1-5-18",     // LocalSystem
+		"S-1-5-20",     // NetworkService
+		"S-1-5-32-546", // Guests
+		"S-1-5-4",      // Interactive Users
+	} {
+		if !identity.covers(candidate) {
+			return candidate
+		}
+	}
+	t.Skip("the account of the instance carries every candidate group")
+	return ""
 }
 
 // scmTestNamesPath reports whether a message of the manager names a path.
@@ -1147,6 +1297,41 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	// The refused directory is not created behind the back of the user.
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the refused directory %q exists: %v", path, statErr)
+	}
+}
+
+// TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheInteractiveUsers
+// checks that a directory the instance can never use is refused.
+//
+// The instance runs a service logon and is never an interactive user, so a
+// descriptor that grants the access to the interactive users of the machine
+// only grants the access to the users of an interactive session. The
+// preflight has to refuse the directory instead of accepting it.
+func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheInteractiveUsers(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cache")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	// The directory grants the access to the interactive users of the
+	// machine, to the machine itself and to the account of the test: the
+	// test has to keep the access to the directory it restricted.
+	scmTestSetDACL(t, path, fmt.Sprintf(
+		"D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;%s)",
+		scmInteractiveUsersSID, scmTestCurrentUserSID(t)))
+
+	err := preflightDataPath("cache dir", path)
+	if err == nil {
+		t.Fatalf("preflightDataPath(%q) = nil, want the refusal of a directory that grants the access to the interactive users only", path)
+	}
+	if !scmTestNamesPath(err.Error(), path) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
+	}
+	if !strings.Contains(err.Error(), "grant the account") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
 	}
 }
 

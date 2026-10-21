@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -83,7 +84,14 @@ const (
 const (
 	// scmStopTimeout bounds the wait for the graceful stop of the
 	// instance.
-	scmStopTimeout = 30 * time.Second
+	//
+	// The wait is the shared budget of the service layer: the server
+	// publishes the budget of its own orderly shutdown and the manager
+	// waits for that total plus a margin, so the manager never reports a
+	// failed stop while the instance is still saving its state. A number
+	// of its own here would be a second copy of the same decision, and
+	// the manager could drift below the budget of the server.
+	scmStopTimeout = ShutdownBudget
 
 	// scmStopPollInterval is the pause between two checks of the state of
 	// the instance.
@@ -1036,6 +1044,15 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 // directory the installation reuses has to grant that account the access
 // the instance needs, otherwise the instance fails later with an opaque
 // access error.
+//
+// The membership of the account is the effective one: it is read from a
+// token of the account itself. A static list of presumed groups cannot
+// answer the question, because the groups of an account are a property of
+// the machine and not of the code: the Interactive Users group (S-1-5-4) is
+// the group of an interactive logon, and the instance never runs an
+// interactive logon. A descriptor that grants the access to the interactive
+// users only is a descriptor the instance can never use, and the
+// installation has to refuse it.
 const (
 	// scmServiceIdentitySID is the SID of the account the instance runs
 	// as: LocalService (S-1-5-19).
@@ -1045,18 +1062,255 @@ const (
 	// as. The name is part of the message of a failed installation, so
 	// the user knows which account needs the access.
 	scmServiceIdentityName = `NT AUTHORITY\LocalService`
+
+	// scmEveryoneSID is the SID of the Everyone group. Every token of
+	// the platform carries it, so an access control list that grants the
+	// access to everybody grants it to the account of the instance as
+	// well.
+	scmEveryoneSID = "S-1-1-0"
+
+	// scmInteractiveUsersSID is the SID of the Interactive Users group.
+	// It is the group of an interactive logon: the instance runs a
+	// service logon and is never an interactive user, so the group never
+	// covers the account of the instance.
+	scmInteractiveUsersSID = "S-1-5-4"
 )
 
-// scmIdentityGroups are the groups the account of the instance belongs to.
+// scmIdentitySIDs is the set of security identifiers that cover the account
+// the instance runs as.
 //
-// An access control list that grants access to one of them grants the
-// access to the account of the instance as well.
-var scmIdentityGroups = []string{
-	"S-1-1-0",      // Everyone
-	"S-1-5-32-545", // Users
-	"S-1-5-11",     // Authenticated Users
-	"S-1-5-4",      // Interactive Users
+// The set is the effective membership of the account: the account itself and
+// the groups of a token of the account. An access control list that grants
+// the access to one of them grants it to the account of the instance as
+// well.
+type scmIdentitySIDs struct {
+	// sids holds the SIDs of the set in their canonical form.
+	sids map[string]bool
+	// exact reports whether the set is the effective membership of the
+	// account, read from a token of the account itself.
+	exact bool
+	// reason names why the set is not the effective membership of the
+	// account. It is empty when the set is exact.
+	reason string
 }
+
+// covers reports whether a SID covers the account of the instance.
+func (i scmIdentitySIDs) covers(sid string) bool {
+	return i.sids[scmNormalizeSID(sid)]
+}
+
+// note returns the note that tells the caller that the check was made
+// against a subset of the groups of the account.
+//
+// The note is empty for an exact set: the caller has nothing to say about a
+// check that was made against the whole membership of the account.
+func (i scmIdentitySIDs) note() string {
+	if i.exact {
+		return ""
+	}
+	return fmt.Sprintf(": the effective groups of the account %s are unknown (%s), so the check was made against the account itself and everybody only", scmServiceIdentityName, i.reason)
+}
+
+// scmNormalizeSID returns the canonical form of a SID.
+//
+// The trustees of an access control entry and the SIDs of a token are both
+// written in the canonical form, but a descriptor that was written by hand
+// can carry another case and spaces around the SID.
+func scmNormalizeSID(sid string) string {
+	return strings.ToUpper(strings.TrimSpace(sid))
+}
+
+// scmLogonUserW logs an account on and returns the token of the logon.
+//
+// The procedure is not exported by the platform library of Go: it is called
+// through the dynamic library of the platform, the way the platform itself
+// calls it. No tool of the platform is called, and no shell is started.
+var scmLogonUserW = windows.NewLazySystemDLL("advapi32.dll").NewProc("LogonUserW")
+
+const (
+	// scmLogon32LogonService is the logon type of a service: the token
+	// of the logon carries the groups the account has when it runs as a
+	// service.
+	scmLogon32LogonService uintptr = 5
+
+	// scmLogon32ProviderDefault is the logon provider of the platform.
+	scmLogon32ProviderDefault uintptr = 0
+)
+
+// scmLogonServiceToken logs the account of the instance on as a service and
+// returns the token of the logon.
+//
+// The built-in service accounts have no password, so the logon needs no
+// credential of the user. The caller needs the right to log on as a service,
+// which the administrators of the machine hold.
+//
+// The token is a real token and has to be closed.
+func scmLogonServiceToken(account string) (windows.Token, error) {
+	username, err := windows.UTF16PtrFromString(account)
+	if err != nil {
+		return 0, fmt.Errorf("the name of the account cannot be read: %w", err)
+	}
+	password, err := windows.UTF16PtrFromString("")
+	if err != nil {
+		return 0, fmt.Errorf("the empty password of the account cannot be read: %w", err)
+	}
+	var handle windows.Handle
+	result, _, callErr := scmLogonUserW.Call(
+		uintptr(unsafe.Pointer(username)),
+		// The domain of a service logon is empty.
+		0,
+		uintptr(unsafe.Pointer(password)),
+		scmLogon32LogonService,
+		scmLogon32ProviderDefault,
+		uintptr(unsafe.Pointer(&handle)),
+	)
+	if result == 0 {
+		if callErr == nil {
+			callErr = windows.ERROR_INVALID_FUNCTION
+		}
+		return 0, fmt.Errorf("the account %s cannot be logged on as a service: %w", account, callErr)
+	}
+	return windows.Token(handle), nil
+}
+
+// scmIdentitySIDsFromToken reads the effective membership of an account out
+// of the access token of the account.
+//
+// The set is the account of the token and the groups of the token: the
+// groups of a token carry the membership of the account, the nested members
+// included.
+//
+// The Interactive Users group is never part of the set: it is the group of
+// an interactive logon, and the account of the instance runs a service
+// logon.
+func scmIdentitySIDsFromToken(token windows.Token) (scmIdentitySIDs, error) {
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return scmIdentitySIDs{}, fmt.Errorf("the account of the token cannot be read: %w", err)
+	}
+	if user.User.Sid == nil {
+		return scmIdentitySIDs{}, errors.New("the account of the token carries no SID")
+	}
+	groups, err := token.GetTokenGroups()
+	if err != nil {
+		return scmIdentitySIDs{}, fmt.Errorf("the groups of the token cannot be read: %w", err)
+	}
+	sids := make(map[string]bool, groups.GroupCount+1)
+	if sid := scmNormalizeSID(user.User.Sid.String()); sid != "" {
+		sids[sid] = true
+	}
+	for _, group := range groups.AllGroups() {
+		if group.Sid == nil {
+			continue
+		}
+		sid := scmNormalizeSID(group.Sid.String())
+		if sid == "" {
+			continue
+		}
+		sids[sid] = true
+	}
+	delete(sids, scmNormalizeSID(scmInteractiveUsersSID))
+	return scmIdentitySIDs{sids: sids, exact: true}, nil
+}
+
+// scmServiceIdentityAccounts are the names the account of the instance can be
+// logged on with.
+//
+// The account is a well-known account of the machine: the platform knows it
+// under its full name and under its short name, and the logon of a service
+// accepts both of them.
+var scmServiceIdentityAccounts = []string{
+	`NT AUTHORITY\LocalService`,
+	`LocalService`,
+}
+
+// scmReadServiceIdentitySIDs reads the effective membership of the account
+// the instance runs as out of a token of the account.
+//
+// The account is logged on the way the service control manager logs it on,
+// as a service, so the token carries the groups the account really has
+// while it runs as the instance.
+//
+// A platform that refuses the logon of the account leaves the membership
+// unknown, and the caller falls back to the certain subset.
+func scmReadServiceIdentitySIDs() (scmIdentitySIDs, error) {
+	var reasons []string
+	for _, account := range scmServiceIdentityAccounts {
+		identity, err := scmServiceIdentityOfAccount(account)
+		if err == nil {
+			return identity, nil
+		}
+		reasons = append(reasons, err.Error())
+	}
+	return scmIdentitySIDs{}, fmt.Errorf("the account %s cannot be logged on as a service: %s", scmServiceIdentityName, strings.Join(reasons, "; "))
+}
+
+// scmServiceIdentityOfAccount logs an account on as a service and reads its
+// effective membership out of the token of the logon.
+//
+// A token that belongs to another account is not the token of the identity:
+// the membership is unknown then.
+func scmServiceIdentityOfAccount(account string) (scmIdentitySIDs, error) {
+	token, err := scmLogonServiceToken(account)
+	if err != nil {
+		return scmIdentitySIDs{}, err
+	}
+	defer token.Close()
+	identity, err := scmIdentitySIDsFromToken(token)
+	if err != nil {
+		return scmIdentitySIDs{}, err
+	}
+	if !identity.covers(scmServiceIdentitySID) {
+		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s belongs to another account than %s", account, scmServiceIdentityName)
+	}
+	return identity, nil
+}
+
+// scmCertainIdentitySIDs returns the subset of the membership of the account
+// that is certain.
+//
+// The instance runs as the account itself, so the account covers it, and
+// everybody covers every account. The rest of the membership is unknown when
+// the platform refuses the logon, so it is not used: a check against the
+// certain subset can refuse a path the account could use, and it never
+// grants a path the account cannot use.
+//
+// The subset is used only when the token of the account is not available,
+// and the fact is reported: the message of a refusal names it, and the
+// installation logs it.
+func scmCertainIdentitySIDs(reason error) scmIdentitySIDs {
+	return scmIdentitySIDs{
+		sids: map[string]bool{
+			scmNormalizeSID(scmServiceIdentitySID): true,
+			scmNormalizeSID(scmEveryoneSID):        true,
+		},
+		exact:  false,
+		reason: reason.Error(),
+	}
+}
+
+// scmServiceIdentitySIDs returns the effective membership of the account the
+// instance runs as.
+//
+// A platform that refuses the logon of the account leaves the certain
+// subset: the account itself and everybody. The refusal is reported, so the
+// user knows that the check of a path was made against a subset of the
+// groups of the account.
+func scmServiceIdentitySIDs() scmIdentitySIDs {
+	identity, err := scmReadServiceIdentitySIDs()
+	if err != nil {
+		log.Printf("service: the effective groups of the account %s are unknown: %v: the access of a path is checked against the account itself and everybody only", scmServiceIdentityName, err)
+		return scmCertainIdentitySIDs(err)
+	}
+	return identity
+}
+
+// scmServiceIdentity is the effective membership of the account the instance
+// runs as.
+//
+// The membership is read once per process: it is a property of the account
+// and not of the path that is checked.
+var scmServiceIdentity = sync.OnceValue(scmServiceIdentitySIDs)
 
 // preflightDataPaths checks the directories an installation reuses: the
 // cache root, the hub directory and the local output directory.
@@ -1167,7 +1421,7 @@ func checkServiceAccess(label, path string) error {
 	if sddl == "" {
 		return fmt.Errorf("service: the access rights of the %s %q cannot be read: the installation cannot tell whether the account %s can use the path", label, path, scmServiceIdentityName)
 	}
-	if err := sddlGrantsIdentity(sddl); err != nil {
+	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
 		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %w: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, err)
 	}
 	return nil
@@ -1178,25 +1432,30 @@ func checkServiceAccess(label, path string) error {
 //
 // The check is a permission preflight, not a simulation of the access check
 // of the operating system: it reads the access control list of the path
-// itself, it does not resolve the inheritance of a parent directory, the
-// privileges of a token or the membership of a group that is not listed
-// here.
+// itself, it does not resolve the inheritance of a parent directory or the
+// privileges of a token.
+//
+// The trustees that cover the account are the ones of the effective
+// membership of the account, the one a token of the account carries. The
+// Interactive Users group is never one of them: the instance runs a service
+// logon and is never an interactive user, so a descriptor that grants the
+// access to the interactive users only is refused.
 //
 // A denied entry wins over an allowed one, so a directory that grants the
 // account the access and denies it as well is refused.
-func sddlGrantsIdentity(sddl string) error {
+func sddlGrantsIdentity(sddl string, identity scmIdentitySIDs) error {
 	var (
 		allowed bool
 		read    bool
 		write   bool
 	)
 	for _, ace := range parseSDDLAces(sddl) {
-		if !ace.coversIdentity() {
+		if !ace.coversIdentity(identity) {
 			continue
 		}
 		switch ace.kind {
 		case "D", "OD":
-			return fmt.Errorf("the access control list denies the account %s", scmServiceIdentityName)
+			return fmt.Errorf("the access control list denies the account %s%s", scmServiceIdentityName, identity.note())
 		case "A", "OA":
 			allowed = true
 			read = read || maskGrantsRead(ace.rights)
@@ -1205,11 +1464,11 @@ func sddlGrantsIdentity(sddl string) error {
 	}
 	switch {
 	case !allowed:
-		return fmt.Errorf("the access control list grants the account %s no access", scmServiceIdentityName)
+		return fmt.Errorf("the access control list grants the account %s no access%s", scmServiceIdentityName, identity.note())
 	case !read:
-		return fmt.Errorf("the access control list grants the account %s no read access", scmServiceIdentityName)
+		return fmt.Errorf("the access control list grants the account %s no read access%s", scmServiceIdentityName, identity.note())
 	case !write:
-		return fmt.Errorf("the access control list grants the account %s no write access", scmServiceIdentityName)
+		return fmt.Errorf("the access control list grants the account %s no write access%s", scmServiceIdentityName, identity.note())
 	}
 	return nil
 }
@@ -1231,24 +1490,26 @@ type sddlACE struct {
 // The trustees of an SDDL string are raw SIDs. The aliases of the platform
 // are accepted as well, so a descriptor that was written by hand is read
 // the same way.
-func (ace sddlACE) coversIdentity() bool {
+//
+// The membership of the account decides: an alias is only another way to
+// write a SID, and the SID is one of the ones of the effective membership of
+// the account or it is not one of them.
+func (ace sddlACE) coversIdentity(identity scmIdentitySIDs) bool {
 	trustee := strings.ToUpper(strings.TrimSpace(ace.trustee))
 	if sid, ok := sddlTrusteeAliases[trustee]; ok {
 		trustee = sid
 	}
-	if trustee == scmServiceIdentitySID {
-		return true
-	}
-	for _, group := range scmIdentityGroups {
-		if trustee == group {
-			return true
-		}
-	}
-	return false
+	return identity.covers(trustee)
 }
 
 // sddlTrusteeAliases maps the aliases of a trustee of an SDDL access
 // control entry onto the SID they stand for.
+//
+// The map resolves the aliases of the platform, it does not grant any
+// access: a resolved trustee covers the account of the instance only when
+// the effective membership of the account carries it. The alias of the
+// Interactive Users (IU) therefore never covers the account of the
+// instance, which runs a service logon.
 var sddlTrusteeAliases = map[string]string{
 	"WD": "S-1-1-0",      // Everyone
 	"BU": "S-1-5-32-545", // Users
