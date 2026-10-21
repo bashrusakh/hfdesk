@@ -35,8 +35,9 @@ The dashboard is then served on <http://127.0.0.1:8080>.
   [Upgrades](#upgrades)).
 - The platform supervisor: `systemd` on Linux, `launchd` on macOS, the Service
   Control Manager on Windows.
-- Administrator rights for a machine-wide (`--system`) installation. HFDesk
-  never elevates itself.
+- Administrator rights for a machine-wide (`--system`) installation, and for
+  the machine-wide `start`, `stop` and `restart`. HFDesk never elevates
+  itself.
 - The **service account** of a machine-wide installation, already created (see
   [The identity of a machine-wide instance](#the-identity-of-a-machine-wide-instance)).
   A user-scope installation needs no account: it runs as the user itself.
@@ -265,14 +266,19 @@ directory of the instance is the real log sink on macOS.
 
 ## Lifecycle commands
 
-| Command | Effect |
-|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is overwritten. |
-| `uninstall` | Removes the **registration only**. |
-| `start` | Starts the registered service. |
-| `stop` | Stops the registered service. |
-| `restart` | Stops and starts the registered service. |
-| `status` | Reports scope, state, registration path, executable, bind address, runtime paths and the effective cache root. |
+| Command | Effect | A service that is not installed |
+|---|---|---|
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is overwritten. | It creates the registration. |
+| `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
+| `start` | Starts the registered service. | **Error** that says the service is not installed. |
+| `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
+| `restart` | Stops and starts the registered service. | **Error** that says the service is not installed. |
+| `status` | Reports scope, state, registration path, executable, bind address, runtime paths and the effective cache root. | Reports the state `not-installed` and exits with `1`. |
+
+The **machine-wide scope** needs an **elevated shell** for `start`, `stop` and
+`restart`, exactly as it needs one for `install` and `uninstall` (see
+[Privileged operations](#privileged-operations)). The user scope needs no
+elevation: the instance belongs to the user who runs the command.
 
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the
@@ -294,10 +300,32 @@ The commands are idempotent where the wanted state is already reached:
 - `uninstall` on a service that is not installed succeeds; the registration is
   already gone.
 - `start` on a service that already runs succeeds.
-- `stop` on a service that is already stopped succeeds.
+- `stop` on a service that is already stopped succeeds, and so does a `stop` on
+  a service that is not installed at all: there is nothing running to stop.
 - `install` over an existing registration replaces it.
-- `start`, `stop` and `restart` on a service that is not installed fail with a
-  readable "not installed" error.
+
+`start` and `restart` are the two commands that need a registration to work on:
+on a service that is not installed they fail with a readable "not installed"
+error.
+
+## Exit codes
+
+Every command of the service family ends with one of three exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | The operation succeeded. |
+| `1` | The operation failed: the service is not installed, the elevation is missing, the supervisor refused the operation, or the installation or the removal failed. |
+| `2` | The command line could not be understood: an unknown or a missing subcommand, an unknown flag, mutually exclusive scope selectors, a relative path, an unusable `--executable` or an unparsable `--listen`. |
+
+`status` uses the same codes with a narrower meaning: it exits with `0` when the
+state of the service is `running`, `stopped`, `starting` or `stopping`, and with
+`1` when the state is `not-installed`, `broken`, `failed` or `unknown`, so a
+script can branch on it.
+
+The internal `run` mode is the exception in practice: it is the foreground host
+of the instance, so it only ends when the supervisor stops the instance. It ends
+with the same three codes.
 
 ## Diagnosing a broken registration
 
@@ -386,8 +414,8 @@ same service at the same time.
 
 - The Service Control Manager is used **directly through the Go API**, never
   `sc.exe` and never PowerShell.
-- Installing or removing the service needs an **elevated shell**. HFDesk does
-  not self-elevate and never invokes UAC.
+- Installing, removing, starting, stopping and restarting the service needs an
+  **elevated shell**. HFDesk does not self-elevate and never invokes UAC.
 - The service identity is `LocalService`, a least-privilege Windows service
   account, not `LocalSystem`.
 - The service-owned state under `%ProgramData%\HFDesk` is ACL-restricted. The
@@ -474,6 +502,14 @@ Scope changes are operating-system operations performed by an administrator.
 HFDesk never invokes `sudo`, `su`, `pkexec` or a UAC prompt. A `--system`
 installation that lacks the rights fails with a permission error instead of
 escalating on its own.
+
+The **machine-wide scope** needs an **elevated shell** (root on Linux) for
+`install`, `uninstall`, `start`, `stop` and `restart`: the registration lives
+in a machine-wide location and the supervisor starts and stops the instance as
+the system, not as the user who runs the command. A shell that is not elevated
+fails with a permission error that names the requirement instead of escalating
+on its own. The user scope needs no elevation: the instance belongs to the user
+who runs the command.
 
 ## Upgrades
 
