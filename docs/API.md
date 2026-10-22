@@ -878,6 +878,11 @@ describing H's derivation. Environment paths/defaults are captured at server
 startup, not re-read by getters or runners. Editing R with ENV H set changes
 friendly views, not Hub storage, and does not move existing files.
 
+Service mode: the order above does not apply. The config file the instance owns
+wins over the cache root recorded in its registration, because the settings an
+administrator changes through the settings API of a supervised instance have to
+survive a restart of the instance.
+
 When `localDir` is set, downloads use real files under
 `<localDir>/<owner>/<model>`, which matches LM Studio-style model roots.
 `localScanDirs` are independent model roots scanned as `<owner>/<model>` folders

@@ -23,6 +23,10 @@ type TargetsConfig struct {
 }
 
 // DefaultTargetsPath returns the default path for targets config.
+//
+// The server resolves the targets file through its runtime path model and
+// passes the path explicitly, so this function is the fallback for the
+// callers that do not resolve a path themselves.
 func DefaultTargetsPath() string {
 	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
 		return filepath.Join(dir, "HFDesk", "targets.yaml")

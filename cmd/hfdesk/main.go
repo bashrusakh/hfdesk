@@ -23,12 +23,21 @@ import (
 var Version = "dev"
 
 func main() {
+	// The service command family is a command of its own. It is dispatched
+	// before the interactive startup, so "hfdesk" without a "service" token
+	// keeps its exact behaviour: same flags, same defaults, same browser
+	// launch.
+	if isServiceCommand(os.Args[1:]) {
+		os.Exit(runServiceCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	// The rebuild-only flags are a separate command of the binary, so they
 	// are handled before the normal startup: they must not start the server
 	// and they must not open the web UI.
 	if handled, code := runRebuildCLI(os.Args[1:], os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}
+
 	if err := run(); err != nil {
 		os.Exit(1)
 	}

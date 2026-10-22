@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
@@ -424,7 +425,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		LocalScanDirs:      cfg.LocalScanDirs,
 		DownloadRoutes:     cfg.DownloadRoutes,
 		ConfigFile:         ConfigPath(),
-		TargetsFile:        hfdownloader.DefaultTargetsPath(),
+		TargetsFile:        runtimepaths.Current().TargetsFile(),
 	}
 
 	// Add proxy settings (without password for security)

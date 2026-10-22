@@ -234,6 +234,24 @@ Proxy example:
 }
 ```
 
+## Service mode
+
+HFDesk can also run as a supervised background service instead of an
+interactive process: systemd on Linux, launchd on macOS, the Windows Service
+Control Manager on Windows. The supervisor owns the lifecycle, and HFDesk stays
+a headless foreground process inside it.
+
+```bash
+hfdesk service install
+hfdesk service status
+```
+
+Service mode binds loopback by default (`127.0.0.1:8080`). Exposing the
+dashboard to the network needs an explicit `--listen 0.0.0.0:8080`.
+
+See [docs/SERVICE.md](docs/SERVICE.md) for the full reference: scopes, runtime
+paths, credentials, logs, and per-platform notes.
+
 ## API
 
 HFDesk's web UI is backed by a local JSON API. See [docs/API.md](docs/API.md) for endpoints, request shapes, and response formats.

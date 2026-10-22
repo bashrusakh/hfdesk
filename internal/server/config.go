@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"gopkg.in/yaml.v3"
 )
@@ -20,23 +21,25 @@ import (
 // RunDir returns the directory where state files (config, jobs, history)
 // should be stored. Priority: current working directory → executable dir → ".".
 func RunDir() string {
-	if cwd, err := os.Getwd(); err == nil {
-		return cwd
-	}
-	if exe, err := os.Executable(); err == nil {
-		return filepath.Dir(exe)
-	}
-	return "."
+	return runtimepaths.RunDir()
 }
 
-// JobsStatePath returns the path to jobs_state.json in the app config directory.
+// JobsStatePath returns the path to jobs_state.json in the state directory
+// of the effective runtime path model.
 func JobsStatePath() string {
-	return filepath.Join(AppConfigDir(), "jobs_state.json")
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.JobsStateFileName)
 }
 
-// HistoryPath returns the path to download_history.json in the app config directory.
+// HistoryPath returns the path to download_history.json in the state
+// directory of the effective runtime path model.
 func HistoryPath() string {
-	return filepath.Join(AppConfigDir(), "download_history.json")
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.HistoryFileName)
+}
+
+// TargetsFilePath returns the path to targets.yaml in the state directory of
+// the effective runtime path model.
+func TargetsFilePath() string {
+	return filepath.Join(runtimepaths.StateDir(), runtimepaths.TargetsFileName)
 }
 
 // ConfigFile represents the persistent configuration file format.
@@ -84,67 +87,41 @@ func isRedactedToken(token string) bool {
 
 // AppConfigDir returns the normal per-user HFDesk configuration directory.
 func AppConfigDir() string {
-	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
-		return filepath.Join(dir, "HFDesk")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".config", "hfdesk")
-	}
-	return RunDir()
-}
-
-func isTempDir(path string) bool {
-	path = filepath.Clean(path)
-	temp := filepath.Clean(os.TempDir())
-	lower := strings.ToLower(path)
-	if strings.HasPrefix(strings.ToLower(path), strings.ToLower(temp)) {
-		return true
-	}
-	return strings.Contains(lower, "rar$") || strings.Contains(lower, ".rartemp")
+	return runtimepaths.AppConfigDir()
 }
 
 // ConfigPath returns the path to the config file.
 // Search order: existing config next to the current/executable folder, then the
 // normal per-user config directory. New saves go to the per-user directory so
 // running an unpacked archive does not create config in a temp extraction path.
+// A supervised instance resolves the path from its installed runtime model.
 func ConfigPath() string {
-	dirs := []string{RunDir()}
-	if exe, err := os.Executable(); err == nil {
-		dirs = append(dirs, filepath.Dir(exe))
-	}
-
-	for _, dir := range dirs {
-		if isTempDir(dir) {
-			continue
-		}
-		for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
-			p := filepath.Join(dir, name)
-			if _, err := os.Stat(p); err == nil {
-				return p
-			}
-		}
-	}
-
-	configDir := AppConfigDir()
-	for _, name := range []string{"hfdesk.json", "hfdesk.yaml", "hfdesk.yml"} {
-		p := filepath.Join(configDir, name)
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-
-	return filepath.Join(configDir, "hfdesk.json")
+	return runtimepaths.Current().ConfigFile
 }
 
 // LoadConfigFile loads configuration from the config file.
 // Returns empty config if file doesn't exist (not an error).
 func LoadConfigFile() (*ConfigFile, error) {
-	configMu.Lock()
-	defer configMu.Unlock()
 	return loadConfigFile(ConfigPath())
 }
 
+// loadConfigFile loads the configuration from the given path under the
+// config lock. The callers that already hold the lock read the file with
+// LoadConfigFileAt directly.
 func loadConfigFile(path string) (*ConfigFile, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return LoadConfigFileAt(path)
+}
+
+// LoadConfigFileAt loads the configuration from the given path. It returns
+// an empty configuration when the file does not exist.
+//
+// The load does not take the config lock: the file is written atomically (a
+// temporary file and a rename), so a reader sees either the previous or the
+// new file. A caller outside the package therefore reads the config file of
+// an instance without taking the lock of the writer.
+func LoadConfigFileAt(path string) (*ConfigFile, error) {
 	if path == "" {
 		return &ConfigFile{}, nil
 	}
@@ -194,7 +171,7 @@ func saveSettingsConfig(cfg *ConfigFile, tokenWrite *string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 	path := ConfigPath()
-	stored, err := loadConfigFile(path)
+	stored, err := LoadConfigFileAt(path)
 	if err != nil {
 		return err
 	}
@@ -220,9 +197,12 @@ func saveConfigFile(path string, cfg *ConfigFile) error {
 		return errors.New("cannot save a redacted token as a credential")
 	}
 
-	// Ensure config directory exists
+	// Ensure the config directory exists. It is created with the mode the
+	// server owns: an owner-only directory for a supervised instance, which
+	// holds the credentials of the instance, and the historical mode for an
+	// interactive run.
 	configDir := filepath.Dir(path)
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	if err := os.MkdirAll(configDir, serverDirMode()); err != nil {
 		return err
 	}
 

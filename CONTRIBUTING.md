@@ -70,6 +70,17 @@ hfdesk --port 9090
 hfdesk --token hf_xxx
 ```
 
+**install the service** — working directory `.`; evidence: `README.md`
+
+```bash
+hfdesk service install
+hfdesk service status
+```
+
+The `hfdesk service` command family (`install`, `uninstall`, `start`, `stop`,
+`restart`, `status`) registers HFDesk with the native supervisor of the
+platform. See `docs/SERVICE.md` for the full reference.
+
 ## Before Submitting
 **run all tests** — working directory `.`; evidence: `README.md`
 
@@ -167,6 +178,8 @@ Components and important paths observed in the repository:
 - **hfdesk binary** — Compiled Go binary built in Dockerfile (paths: `Dockerfile`; evidence: `Dockerfile`)
 - **cmd/hfdesk/main.go** — Application entrypoint CLI/server (paths: `cmd/hfdesk/main.go`; evidence: `README.md`)
 - **internal/server package** — HTTP API, job scheduling, settings handling (paths: `internal/server`; evidence: `AGENTS.md`)
+- **internal/service package** — Service mode: installation scopes, lifecycle, and the systemd/launchd/Windows SCM managers (paths: `internal/service`; evidence: `AGENTS.md`)
+- **internal/runtimepaths package** — Runtime path model for the config file, state root, and log directory (paths: `internal/runtimepaths`; evidence: `AGENTS.md`)
 - **pkg/hfdownloader package** — Hugging Face cache scan and resumable download logic (paths: `pkg/hfdownloader`; evidence: `AGENTS.md`)
 - **pkg/smartdl package** — Model analysis and download recommendation utilities (paths: `pkg/smartdl`; evidence: `AGENTS.md`)
 
