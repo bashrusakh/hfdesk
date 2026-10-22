@@ -86,6 +86,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
+		return
+	}
 
 	// If dry-run, return the plan
 	if req.DryRun {
@@ -102,6 +106,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, errInvalidRouteKey) {
 			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+			return
+		}
+		if errors.Is(err, errInvalidBranchVariant) {
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
 			return
 		}
 		if errors.Is(err, errSelectionWriterBusy) {
@@ -146,7 +154,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
-
 	// Parse filters from repo:filter syntax
 	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
 		parts := strings.SplitN(req.Repo, ":", 2)
@@ -160,6 +167,10 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 			}
 		}
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
+		return
+	}
 
 	revision := req.Revision
 	if revision == "" {
@@ -170,6 +181,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	dlJob := hfdownloader.Job{
 		Repo:               req.Repo,
 		Revision:           revision,
+		BranchVariant:      req.BranchVariant,
 		IsDataset:          req.Dataset,
 		Filters:            req.Filters,
 		Excludes:           req.Excludes,
@@ -950,6 +962,11 @@ type localCacheRoot struct {
 
 // skipsOwner applies the root's exclusion policy only to a top-level owner.
 func (root localCacheRoot) skipsOwner(owner string) bool {
+	if pathIdentityKey(owner) == pathIdentityKey(hfdownloader.BranchVariantServiceDirName) {
+		if owned, err := hfdownloader.BranchVariantServiceOwned(root.Path); err == nil && owned {
+			return true
+		}
+	}
 	if root.SkipSpecial {
 		switch strings.ToLower(owner) {
 		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
@@ -1148,6 +1165,15 @@ func walkLocalCacheRepo(dir string, excluded []string, walkFn filepath.WalkFunc)
 					}
 					return nil
 				}
+			}
+		}
+		if err == nil && info.IsDir() && pathIdentityKey(info.Name()) == pathIdentityKey(hfdownloader.BranchVariantServiceDirName) {
+			owned, ownerErr := hfdownloader.IsOwnedBranchVariantServicePath(path)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			if owned {
+				return filepath.SkipDir
 			}
 		}
 		return walkFn(path, info, err)
@@ -1595,6 +1621,26 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	// The qualified branch-variant query is selected by its selector value, not
+	// by the presence of the parameter. An absent selector and an explicit
+	// branchVariant=false both keep the documented legacy cache response; only
+	// branchVariant=true selects the qualified handler.
+	if selector, supplied := r.URL.Query()["branchVariant"]; supplied {
+		if len(selector) != 1 {
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant selector", "Expected exactly one branchVariant=true")
+			return
+		}
+		switch selector[0] {
+		case "true":
+			s.handleBranchVariantPresence(w, r, repo)
+			return
+		case "false":
+			// An explicit opt-out keeps the legacy response.
+		default:
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant selector", "Expected exactly one branchVariant=true")
+			return
+		}
+	}
 
 	repoTypeValue, suppliedType := r.URL.Query()["type"]
 	repoType := hfdownloader.RepoTypeModel
@@ -1786,15 +1832,62 @@ type RebuildResponse struct {
 	Message         string   `json:"message,omitempty"`
 }
 
+// cacheRebuildLeaseBudget bounds one lease wait of the cache rebuild.
+//
+// A running download holds the cache mutation lease for the whole transfer,
+// so an unbounded wait leaves the rebuild request hanging until that transfer
+// ends. The budget ends the wait with a clear conflict error instead; the
+// ordinary rebuild, where nothing else holds the lease, is unaffected.
+//
+// It is a variable so a focused test can shorten the wait.
+var cacheRebuildLeaseBudget = 5 * time.Second
+
+// cacheDeleteLeaseBudget bounds one lease wait of the cache deletion.
+//
+// The deletion waits for the same cache mutation leases an in-flight
+// download holds for its whole transfer, so an unbounded wait leaves the
+// delete request hanging until that transfer ends. The budget ends the wait
+// with the same clear conflict answer the rebuild gives; the ordinary delete,
+// where nothing else holds the lease, is unaffected.
+//
+// It is a variable so a focused test can shorten the wait.
+var cacheDeleteLeaseBudget = 5 * time.Second
+
+// cacheLeaseWaitContext bounds one cache lease wait with the server-side
+// budget. The budget applies to every wait separately, so a slow first wait
+// does not shorten the next one.
+func cacheLeaseWaitContext(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if budget <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, budget)
+}
+
+// cacheLeaseWaitExpired reports that a lease wait ended because its budget
+// or its request context ran out, not because the lease was refused.
+func cacheLeaseWaitExpired(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	release, ok := s.jobs.beginCacheMutation(
-		filepath.Join(cfg.cacheRoot(), "models"),
-		filepath.Join(cfg.cacheRoot(), "datasets"),
+	cacheRoot := cfg.cacheRoot()
+	serviceRoot, err := hfdownloader.BranchVariantServiceRoot(cacheRoot)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Cache destination cannot be resolved", err.Error())
+		return
+	}
+	release, ok := s.jobs.reserveSelectedHF(
+		filepath.Join(cacheRoot, "models"),
+		filepath.Join(cacheRoot, "datasets"),
+		serviceRoot,
 	)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "Cache is busy", "A download or cache mutation overlaps the friendly or EXL branch service tree")
 		return
 	}
 	defer release()
@@ -1806,7 +1899,20 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	_ = readJSON(r, &req) // Ignore errors, use defaults
 
 	cache := cfg.cache()
-	if _, err := cache.WriteRebuildScript(); err != nil {
+	// The rebuild waits for the same mutation leases an in-flight download
+	// holds for its whole transfer. A disconnected client must not leave this
+	// handler blocked behind that transfer, and a rebuild requested during a
+	// long transfer must fail with a clear error instead of hanging, so every
+	// lease wait is bounded by the request context and by one server-side
+	// budget.
+	rebuildCtx, cancelRebuild := context.WithTimeout(r.Context(), cacheRebuildLeaseBudget)
+	defer cancelRebuild()
+	if _, err := cache.WriteRebuildScriptContext(rebuildCtx); err != nil {
+		if rebuildCtx.Err() != nil {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the rebuild when it finishes")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to write rebuild script", err.Error())
 		return
 	}
@@ -1814,10 +1920,23 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	opts := hfdownloader.SyncOptions{
 		Clean:   req.Clean,
 		Verbose: false,
+		// The rebuild waits for the same mutation leases an in-flight branch
+		// variant transfer holds. A disconnected client must not leave this
+		// handler blocked behind that transfer.
+		Context: r.Context(),
+		// Each lease wait of the rebuild is bounded on its own, so a running
+		// transfer ends the wait with an error instead of holding the
+		// request for its whole duration.
+		LeaseBudget: cacheRebuildLeaseBudget,
 	}
 
 	result, err := cache.Sync(opts)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the rebuild when it finishes")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Rebuild failed", err.Error())
 		return
 	}
@@ -1903,6 +2022,16 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	hubPath := repoDir.Path()
 	friendlyPath := repoDir.FriendlyPath()
+	branchControlRepo, err := hfdownloader.BranchVariantControlRepoPath(cache.Root, repoType, repo)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant storage path", err.Error())
+		return
+	}
+	branchPayloadRepo, err := hfdownloader.BranchVariantPayloadRepoPath(cache.Root, repoType, repo)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant storage path", err.Error())
+		return
+	}
 
 	// Security Layer 5: Resolve absolute paths
 	absCacheDir, err := filepath.Abs(cacheDir)
@@ -1910,8 +2039,6 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to resolve cache path", err.Error())
 		return
 	}
-	// Ensure cache dir ends with separator to prevent /cache/huggingface-evil matching /cache/huggingface
-	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
 	absHubDir, err := filepath.Abs(cache.HubDir())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to resolve Hub path", err.Error())
@@ -1971,19 +2098,84 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		// Keep the existing escape guard: a Hub/ancestor link must not
 		// redefine the trusted deletion root. Compare to selected H, not
 		// its parent and not a freshly trusted symlink target.
-		if !hfdownloader.PathInside(absHubDir, realHubPath) || realHubPath == absHubDir {
+		//
+		// The comparison uses one canonical spelling of H. A cache root
+		// that is reached through a linked ancestor (the usual macOS
+		// /var -> /private/var spelling) names the same physical Hub as
+		// its resolved form, and comparing the resolved repository path
+		// against the lexical spelling of H would report that ordinary
+		// cache content as an escape.
+		realHubDir := canonicalDirForComparison(absHubDir)
+		if !hfdownloader.PathInside(realHubDir, realHubPath) || realHubPath == realHubDir {
 			writeError(w, http.StatusBadRequest, "Invalid path", "Resolved path outside cache directory")
 			return
 		}
 	}
 
-	// All security checks passed - proceed with deletion
-	release, ok := s.jobs.beginCacheMutation(absHubPath, friendlyPath)
+	// All security checks passed - reserve in-process jobs, then lease the
+	// complete physical cache root. Branch downloads hold shared destination
+	// ancestry; the generated rebuild script and recursive delete take the same
+	// root exclusively, so their ownership preflight cannot go stale.
+	release, ok := s.jobs.reserveSelectedHF(absHubPath, friendlyPath, branchControlRepo, branchPayloadRepo)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "HF cache is busy", "A download, selected-file mutation, or app-owned branch artifact operation overlaps this repository")
 		return
 	}
 	defer release()
+	if _, err := os.Lstat(absHubPath); errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
+		return
+	}
+	// The deletion waits for the same cache mutation leases an in-flight
+	// download holds for its whole transfer. A wait without a server-side
+	// budget stays blocked for the whole transfer, so every lease wait is
+	// bounded by the request context and by one server-side budget, and a
+	// contended lease ends the wait with the same clear conflict answer the
+	// cache rebuild gives.
+	coordinationWaitCtx, cancelCoordinationWait := cacheLeaseWaitContext(r.Context(), cacheDeleteLeaseBudget)
+	defer cancelCoordinationWait()
+	coordinationRelease, err := cache.AcquireRebuildCoordinationLeaseContext(coordinationWaitCtx, true)
+	if err != nil {
+		if cacheLeaseWaitExpired(err) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the deletion when it finishes")
+			return
+		}
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with rebuild activity", err.Error())
+		return
+	}
+	defer coordinationRelease()
+	mutationWaitCtx, cancelMutationWait := cacheLeaseWaitContext(r.Context(), cacheDeleteLeaseBudget)
+	defer cancelMutationWait()
+	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(mutationWaitCtx, cache.Root, true)
+	if err != nil {
+		if cacheLeaseWaitExpired(err) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the deletion when it finishes")
+			return
+		}
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant activity", err.Error())
+		return
+	}
+	defer mutationRelease()
+	if _, err := os.Lstat(absHubPath); errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
+		return
+	}
+	if err := hfdownloader.RejectBranchVariantTreeEffects(absHubPath, friendlyPath); err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant storage", err.Error())
+		return
+	}
+	if err := hfdownloader.RebindBranchVariantServiceRootUnderLease(cache.Root); err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant ownership", err.Error())
+		return
+	}
 	if err := os.RemoveAll(absHubPath); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 		return
@@ -1991,12 +2183,20 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Delete the friendly view directory (symlinks) with same security checks
 	if friendlyPath != "" {
-		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
+		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDir); err != nil {
 			if !os.IsNotExist(err) {
 				writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Hub repository deleted; friendly view removal failed", "errors": []string{err.Error()}})
 				return
 			}
 		}
+	}
+	if _, err := hfdownloader.RemoveOwnedBranchVariantRepoUnderLease(cache.Root, repoType, repo); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": false,
+			"message": "Hub repository deleted; app-owned branch variant cleanup was partial",
+			"errors":  []string{err.Error()},
+		})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2028,14 +2228,25 @@ func isValidRepoComponent(s string) bool {
 }
 
 // safeDeleteFriendlyPath safely deletes the friendly view path with security checks.
-func safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep string) error {
+// The friendly path and the cache directory are compared in one spelling per
+// side: the requested path against the lexical cache directory, and a
+// resolved path against the canonical one. A cache root that is reached
+// through a linked ancestor is therefore not mistaken for an escape from its
+// own cache, while a friendly path that resolves outside the canonical cache
+// directory is still refused.
+func safeDeleteFriendlyPath(friendlyPath, absCacheDir string) error {
 	absFriendlyPath, err := filepath.Abs(friendlyPath)
 	if err != nil {
 		return err
 	}
+	separator := string(filepath.Separator)
+	// The cache dir ends with a separator so /cache/huggingface-evil does not
+	// match /cache/huggingface.
+	absCacheDirWithSep := absCacheDir + separator
+	canonicalCacheDirWithSep := canonicalDirForComparison(absCacheDir) + separator
 
 	// Check it's within cache
-	if !strings.HasPrefix(absFriendlyPath+string(filepath.Separator), absCacheDirWithSep) {
+	if !strings.HasPrefix(absFriendlyPath+separator, absCacheDirWithSep) {
 		return fmt.Errorf("friendly path outside cache")
 	}
 
@@ -2051,12 +2262,29 @@ func safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep string) error {
 	// Resolve symlinks and verify again
 	realPath, err := filepath.EvalSymlinks(absFriendlyPath)
 	if err == nil && realPath != absFriendlyPath {
-		if !strings.HasPrefix(realPath+string(filepath.Separator), absCacheDirWithSep) {
+		if !strings.HasPrefix(realPath+separator, canonicalCacheDirWithSep) {
 			return fmt.Errorf("resolved friendly path outside cache")
 		}
 	}
 
 	return os.RemoveAll(absFriendlyPath)
+}
+
+// canonicalDirForComparison resolves the parent chain of a directory and keeps
+// the directory itself lexical. A resolved path and the directory it is
+// compared against must use one canonical spelling, otherwise a cache root
+// that is reached through a linked ancestor (the usual macOS /var ->
+// /private/var spelling) looks like an escape from its own cache.
+//
+// Resolving only the parent chain keeps the link guard: a directory that is
+// itself a link keeps its own name, so a path that resolves through that link
+// is still outside the compared spelling.
+func canonicalDirForComparison(dir string) string {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
+	if err != nil {
+		return dir
+	}
+	return filepath.Join(parent, filepath.Base(dir))
 }
 
 // parseCommandFilters extracts filter information from a manifest command string.

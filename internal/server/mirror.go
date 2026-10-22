@@ -602,6 +602,29 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 		result.Message = "Nothing to do - destination is in sync"
 		return result, nil
 	}
+	coordinationRelease, err := hfdownloader.AcquireRebuildCoordinationLeases([]string{dstCache}, false)
+	if err != nil {
+		return nil, fmt.Errorf("lease mirror destination coordination: %w", err)
+	}
+	defer coordinationRelease()
+	// Preflight every recursive destination before the first copy/delete so
+	// mirror operations cannot replace or remove the app-owned coordination
+	// carrier (or a protected branch service descendant) embedded beneath an
+	// otherwise selected Hub path.
+	for _, entry := range toCopy {
+		dstPath, err := mirrorRepoDestination(entry.Path, srcCache, dstCache)
+		if err != nil {
+			return nil, err
+		}
+		if err := hfdownloader.RejectBranchVariantTreeEffects(dstPath); err != nil {
+			return nil, fmt.Errorf("mirror destination conflicts with app-owned storage: %w", err)
+		}
+	}
+	for _, entry := range toDelete {
+		if err := hfdownloader.RejectBranchVariantTreeEffects(entry.Path); err != nil {
+			return nil, fmt.Errorf("mirror deletion conflicts with app-owned storage: %w", err)
+		}
+	}
 
 	// Copy each repo
 	for _, e := range toCopy {
@@ -644,6 +667,9 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
+	}
+	if err := hfdownloader.RejectBranchVariantTreeEffects(dstPath); err != nil {
+		return fmt.Errorf("mirror destination conflicts with app-owned storage: %w", err)
 	}
 
 	// Create destination directory

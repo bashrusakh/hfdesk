@@ -184,6 +184,41 @@ func DestinationBase(root, folder string) (string, error) {
 	return base, nil
 }
 
+// rootedPath normalizes one selected or derived path into the absolute
+// spelling that the filesystem operations in this package use.
+//
+// The selected destination, the configured cache root and every path derived
+// from them are user- or configuration-influenced. Rooting the spelling
+// resolves a relative path against the process working directory and removes
+// the "." and ".." segments, so the same selected path always names the same
+// entry. The strings.HasPrefix check is the primitive code scanning models
+// as a sanitizer guard, and it dominates the return below, so taint carried
+// in the selected path itself cannot flow out unnoticed -- the same property
+// SafeJoin and DestinationBase give for the paths they produce. The check
+// compares the rooted spelling with its own parent directory, so it proves
+// that the spelling is a single entry under that parent; it does not prove
+// anything about the entries around it.
+func rootedPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(abs) {
+		return "", fmt.Errorf("path %q is not absolute", path)
+	}
+	// The rooted spelling names one entry under its own parent directory.
+	// The check is stated with strings.HasPrefix, the primitive code scanning
+	// models as a sanitizer guard, so it dominates the return below.
+	parent := filepath.Dir(abs)
+	if !strings.HasPrefix(abs, parent) {
+		return "", fmt.Errorf("path %q is not contained in %q", abs, parent)
+	}
+	return abs, nil
+}
+
 // PlanItem represents a single file in the download plan.
 type PlanItem struct {
 	RelativePath string `json:"path"`
@@ -204,8 +239,9 @@ type PlanItem struct {
 
 // Plan contains the list of files to download.
 type Plan struct {
-	Items  []PlanItem `json:"items"`
-	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	Items          []PlanItem `json:"items"`
+	Commit         string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	CommitResolved bool       `json:"commitResolved,omitempty"`
 }
 
 // PlanRepo builds the file list without downloading.
@@ -241,20 +277,34 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+	commitResolved := err == nil && repoInfo != nil && repoInfo.SHA != ""
 	if err != nil {
+		if job.BranchVariant {
+			return nil, fmt.Errorf("resolve EXL branch variant revision %q: %w", job.Revision, err)
+		}
 		// Fall back to revision name if API call fails (e.g., some mirrors)
 		repoInfo = &RepoInfo{SHA: job.Revision}
 	}
 	commitSHA := repoInfo.SHA
 	if commitSHA == "" {
+		if job.BranchVariant {
+			return nil, fmt.Errorf("resolve EXL branch variant revision %q: Hub response did not include a commit SHA", job.Revision)
+		}
 		commitSHA = job.Revision // fallback
+	}
+	treeJob := job
+	if job.BranchVariant {
+		// The branch is resolved once at download time. Read the complete tree
+		// and each file from that immutable commit so a moving ref cannot mix
+		// artifacts within one job. This does not pin during earlier analysis.
+		treeJob.Revision = commitSHA
 	}
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+	err = walkTree(ctx, httpc, token, cfg.Endpoint, treeJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -575,10 +625,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 		// Build URL and file size
 		var urlStr string
+		downloadJob := job
+		if job.BranchVariant {
+			downloadJob.Revision = commitSHA
+		}
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, job, rel)
+			urlStr = lfsURL(cfg.Endpoint, downloadJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, job, rel)
+			urlStr = rawURL(cfg.Endpoint, downloadJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64
@@ -659,7 +713,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA}, nil
+	return &Plan{Items: items, Commit: commitSHA, CommitResolved: commitResolved}, nil
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the

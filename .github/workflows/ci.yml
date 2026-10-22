@@ -41,7 +41,11 @@ jobs:
 
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
-  # argument validation cannot regress silently.
+  # argument validation cannot regress silently. The smoke test also takes the
+  # per-account coordination carrier lease under a numeric UID that has no NSS
+  # entry, which is the configuration the official image runs in, and it runs
+  # two such accounts against one shared data root, so the first account
+  # cannot lock the next one out of the shared cache area.
   docker:
     name: Docker entrypoint
     runs-on: ubuntu-latest
@@ -155,6 +159,12 @@ jobs:
       - name: Test command layer
         run: go test ./cmd/hfdesk -v
 
+      - name: Test rebuild leases and native CLI coordination
+        run: go test ./pkg/hfdownloader -run '^Test(RebuildCoordinationLeaseProcessExitAndStableObject|RebuildCoordinationRefusesForeignCarrierRecord|RebuildCoordinationDoesNotAdoptUnownedDirectoryCandidate|RebuildCoordinationTreePreflightProtectsOwnedCoordinator|RebuildCoordinationPathIgnoresPerProcessCacheOverride|SameUIDDifferentEnvironmentChildSharesExclusiveRootLease|RebuildCoordinationConcurrentBootstrapAcrossProcesses|FirstBranchClaimWaitsForCrossProcessOrdinaryAdmission|SyncCleanKeepsStableRootLeaseObject|SyncCleanRefusesToRemoveOwnedCoordinationScope|SyncCleanLeavesProfileCoordinatorOutsideCacheScope|OrdinaryDownloadCannotReplaceOwnedCoordinationCarrier|OrdinaryHFWriterPreservesNestedCoordinationCarrier|OrdinaryLocalWriterUsesUnownedServiceOwnerSpelling|OrdinaryWriteWinsBeforeFirstBranchServiceClaim|FirstBranchServiceClaimWinsBeforeOrdinaryWriter|OrdinaryHFDownloadIgnoresUnownedRootServiceCandidateAndClaimRefuses|RebuildCoordinationLeavesLegacyRootSidecarUnclaimed|BranchVariantMutationGuardDistinguishesEntryFromReferent|BranchVariantPartialCleanupKeepsOwnershipAndCompletion|WindowsGoCLIRebuildWaitsForAppDownloadAcrossRootAlias|OrdinaryDownloadsIgnoreUnmarkedServiceCandidateRoot|CopiedLocalRootKeepsCompleteArtifactWithIncompleteSibling|UnverifiableServiceCandidateFailsClosedForIntersectingWrites|CoordinationCarrierKeepsASharedAccountParentUsable|CreatePrivateCoordinationBaseLeavesTheParentAlone|BranchVariantWaitsForAContendedSharedBlob)$' -count=1 -v
+
+      - name: Test server proof mutators
+        run: go test ./internal/server -run '^Test(CopiedLocalRootRebindSurvivesFailedSecondArtifact|SameUIDDifferentHomeCLIWaitsForOrdinaryAPIDownload|CopiedHFAndLocalRootsRetainBranchPresence|FailedTrustedSHAStableRetryRevokesOldPresenceProof|CacheDeleteRefusesNestedForeignBranchServiceBeforeAnyRemoval|CopiedLocalRootPresenceSurvivesIncompleteSiblingArtifact|CacheDeleteFailsFastBehindRunningDownload)$' -count=1 -v
+
   # The launchd manager and the property list rendering are darwin-only code,
   # so they need a macOS runner. The run executes the plist validation
   # (plutil -lint) and the launchctl integration cycle where the runner
@@ -202,3 +212,8 @@ jobs:
       - name: Test command layer
         run: go test ./cmd/hfdesk -v
 
+      - name: Test rebuild leases, CLI coordination, and wrapper
+        run: go test ./pkg/hfdownloader -run '^Test(RebuildCoordinationLeaseProcessExitAndStableObject|RebuildCoordinationRefusesForeignCarrierRecord|RebuildCoordinationDoesNotAdoptUnownedDirectoryCandidate|RebuildCoordinationTreePreflightProtectsOwnedCoordinator|RebuildCoordinationPathIgnoresPerProcessCacheOverride|SameUIDDifferentEnvironmentChildSharesExclusiveRootLease|RebuildCoordinationConcurrentBootstrapAcrossProcesses|FirstBranchClaimWaitsForCrossProcessOrdinaryAdmission|SyncCleanKeepsStableRootLeaseObject|SyncCleanRefusesToRemoveOwnedCoordinationScope|SyncCleanLeavesProfileCoordinatorOutsideCacheScope|OrdinaryDownloadCannotReplaceOwnedCoordinationCarrier|OrdinaryHFWriterPreservesNestedCoordinationCarrier|OrdinaryLocalWriterUsesUnownedServiceOwnerSpelling|OrdinaryWriteWinsBeforeFirstBranchServiceClaim|FirstBranchServiceClaimWinsBeforeOrdinaryWriter|OrdinaryHFDownloadIgnoresUnownedRootServiceCandidateAndClaimRefuses|RebuildCoordinationLeavesLegacyRootSidecarUnclaimed|BranchVariantMutationGuardDistinguishesEntryFromReferent|BranchVariantPartialCleanupKeepsOwnershipAndCompletion|GoCLIRebuildWaitsForAppDownloadAcrossRootAlias|RebuildWrapperUsesGoWithoutPythonAndForwardsCleanVerbose|RebuildWrapperFailsClosedWithoutCompatibleBinary|CoordinationCarrierKeepsASharedAccountParentUsable|CreatePrivateCoordinationBaseLeavesTheParentAlone|BranchVariantWaitsForAContendedSharedBlob)$' -count=1 -v
+
+      - name: Test server proof mutators
+        run: go test ./internal/server -run '^Test(CopiedLocalRootRebindSurvivesFailedSecondArtifact|SameUIDDifferentHomeCLIWaitsForOrdinaryAPIDownload|CopiedHFAndLocalRootsRetainBranchPresence|CopiedLocalRootPresenceSurvivesIncompleteSiblingArtifact|FailedTrustedSHAStableRetryRevokesOldPresenceProof|CacheDeleteRefusesNestedForeignBranchServiceBeforeAnyRemoval|CacheDeleteFailsFastBehindRunningDownload)$' -count=1 -v

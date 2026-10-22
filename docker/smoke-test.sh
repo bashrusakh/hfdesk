@@ -6,6 +6,7 @@ IMG="${1:-hfdesk:ci}"
 PREFIX="hfdesk-smoke-$(date +%s)-$$"
 CONTAINER="$PREFIX-app"
 VOLUME="$PREFIX-data"
+SHARED_VOLUME="$PREFIX-shared"
 cleanup() {
     code=$?
     trap - EXIT
@@ -15,6 +16,9 @@ cleanup() {
     fi
     if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
         docker volume rm "$VOLUME" >/dev/null || code=1
+    fi
+    if docker volume inspect "$SHARED_VOLUME" >/dev/null 2>&1; then
+        docker volume rm "$SHARED_VOLUME" >/dev/null || code=1
     fi
     exit "$code"
 }
@@ -55,10 +59,115 @@ assert_identity() {
     ' sh "$1" "$2"
     assert_accounts
 }
+# The per-account coordination carrier resolves its base from the operating
+# system account. The image creates no user or group, sets no USER, and runs
+# the app under a numeric uid, so the documented NAS configuration has no
+# /etc/passwd entry for the app at all. The cache rebuild takes that
+# coordination lease before it touches the filesystem, so it exercises the
+# resolution without any Hub access and without downloading a model.
+assert_coordination_lease() {
+    response=$(docker exec --user "$1:$2" "$CONTAINER" wget -q -T 60 -O - \
+        --header='Content-Type: application/json' --post-data='{"clean":false}' \
+        http://127.0.0.1:8080/api/cache/rebuild 2>&1) || {
+        printf 'FAIL coordination lease under %s:%s: %s\n' "$1" "$2" "$response" >&2
+        dump_rebuild_response "$1:$2"
+        exit 1
+    }
+    if ! printf '%s\n' "$response" | grep -q '"success":true'; then
+        printf 'FAIL coordination lease under %s:%s: %s\n' "$1" "$2" "$response" >&2
+        dump_rebuild_response "$1:$2"
+        exit 1
+    fi
+    # A successful answer alone does not prove the account was resolved: a
+    # carrier the app cannot establish is reported as a degraded coordination
+    # and the request still succeeds. The lease objects on disk are what prove
+    # it: they live in a private directory owned by the app account, under the
+    # data root that is the account's private base in the container.
+    #
+    # The objects are located by the account that owns them, so the assertion
+    # is about this account's carrier and not about an arbitrary lock file
+    # that happens to exist under the data root. The carrier is private: its
+    # own directory, and no access to it or to its objects for any other
+    # account. The mode is asserted as that property rather than as one exact
+    # number, so the assertion states what the carrier must guarantee instead
+    # of how it happens to be spelled today.
+    if ! docker exec --user "$1:$2" "$CONTAINER" /bin/sh -ec '
+        uid=$1
+        dirs=
+        for object in $(find /data -type f -name "*.lock" 2>/dev/null); do
+            [ "$(stat -c %u "$object" 2>/dev/null)" = "$uid" ] || continue
+            dir=$(dirname "$object")
+            case " $dirs " in
+                *" $dir "*) ;;
+                *) dirs="$dirs $dir" ;;
+            esac
+        done
+        test -n "$dirs"
+        for dir in $dirs; do
+            test "$(stat -c %u "$dir")" = "$uid"
+            case "$(stat -c %a "$dir")" in
+                *00) ;;
+                *) exit 1 ;;
+            esac
+            for object in "$dir"/*.lock; do
+                test -f "$object"
+                test "$(stat -c %u "$object")" = "$uid"
+                case "$(stat -c %a "$object")" in
+                    *00) ;;
+                    *) exit 1 ;;
+                esac
+            done
+        done
+    ' sh "$1"; then
+        printf 'FAIL coordination carrier under %s:%s: no private per-account carrier under /data\n' "$1" "$2" >&2
+        exit 1
+    fi
+}
+# Print the coordination carrier directory of one account: the directory that
+# holds the lease objects this account owns.
+#
+# The lookup is scoped to the carrier's own location by the ownership of its
+# objects. An unrelated object elsewhere under the data root therefore cannot
+# satisfy it, and a carrier that belongs to another account is never mistaken
+# for this account's own. A coordination that degraded to the in-process half
+# leaves no object on disk, so an empty answer is the degraded case.
+coordination_carrier_path() {
+    docker exec --user "$1:$2" "$CONTAINER" /bin/sh -ec '
+        uid=$1
+        for object in $(find /data -type f -name "*.lock" 2>/dev/null); do
+            [ "$(stat -c %u "$object" 2>/dev/null)" = "$uid" ] || continue
+            dirname "$object"
+        done | sort -u
+        exit 0
+    ' sh "$1"
+}
+# BusyBox wget drops the body of an error response, so the failed request is
+# repeated verbatim to show the server's own reason in the job log. The
+# connection is held open while the answer is read: a client that closes it
+# right away cancels the request, and the server then reports the cancelled
+# request instead of the reason the request failed.
+dump_rebuild_response() {
+    docker exec --user "$1" "$CONTAINER" /bin/sh -ec '
+        command -v nc >/dev/null 2>&1 || exit 0
+        { printf "POST /api/cache/rebuild HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"clean\":false}"; sleep 3; } | nc 127.0.0.1 8080
+    ' >&2 || true
+}
 stop_app() {
     docker stop -t 15 "$CONTAINER" >/dev/null
     test "$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER")" = 0
     docker rm "$CONTAINER" >/dev/null
+}
+# Stop the container of a shared data root run.
+#
+# The app's own state directory under a shared data root belongs to the
+# account that ran first, so the next account cannot persist its job snapshot
+# there and its shutdown reports that error. That is the state directory of
+# the app and not the coordination carrier, which this case does not cover:
+# the container is only stopped so the next account can run against the same
+# data root.
+stop_app_shared() {
+    docker stop -t 15 "$CONTAINER" >/dev/null || true
+    docker rm -f "$CONTAINER" >/dev/null || true
 }
 
 # Account immutability and actual process identity: default, arbitrary, one-ID
@@ -84,6 +193,19 @@ done
 # and falls back to "/" when there is none, so the app must re-pin it. Read HOME
 # from the real app process (/proc/1/environ), not a docker-exec shell, which
 # would report its own environment.
+#
+# The same numeric UID must also be able to take the per-account coordination
+# lease. The lease base is resolved from the operating system account, and a
+# numeric UID without an NSS entry has no account record to resolve it from,
+# so this is the configuration that broke the image's downloads. Two numeric
+# accounts of one image must not share a carrier either: the container gives
+# every UID the same HOME, so a shared carrier would not be a per-account one.
+#
+# These two probes run in separate containers with separate data roots, so
+# they establish that the carrier path is derived per account. That two
+# accounts really get separate carriers over one shared data root is the
+# shared data root case below.
+previous_carrier=''
 for probe in 1026 568; do
     start_app -e PUID="$probe" -e PGID=100
     # exec as the app UID: an exec-root shell without CAP_SYS_PTRACE cannot read
@@ -91,16 +213,110 @@ for probe in 1026 568; do
     docker exec --user "$probe:100" "$CONTAINER" /bin/sh -ec '
         tr "\0" "\n" < /proc/1/environ | grep -qx "HOME=/data"
     '
+    # The premise of this case: the app UID really has no account record, so
+    # the coordination base cannot come from /etc/passwd.
+    docker exec "$CONTAINER" /bin/sh -ec "! getent passwd $probe"
     assert_identity "$probe" 100
+    assert_coordination_lease "$probe" 100
+    carrier=$(coordination_carrier_path "$probe" 100)
+    if [ -z "$carrier" ]; then
+        printf 'FAIL coordination carrier: PUID=%s has no carrier under /data\n' "$probe" >&2
+        exit 1
+    fi
+    if [ -n "$previous_carrier" ] && [ "$carrier" = "$previous_carrier" ]; then
+        printf 'FAIL coordination carrier: PUID=%s shares the carrier %s with another account\n' "$probe" "$carrier" >&2
+        exit 1
+    fi
+    previous_carrier=$carrier
     stop_app
-    echo "PASS root startup NSS-less PUID=$probe: PID 1 HOME=/data"
+    echo "PASS root startup NSS-less PUID=$probe: PID 1 HOME=/data, coordination carrier lease"
 done
+# Two numeric accounts must be able to work against ONE shared data root. The
+# data root is world-writable so that every account can create its own state
+# there, and the per-account coordination carrier is one of those states: a
+# private directory of a single account under the shared cache area of the
+# data root.
+#
+# The account that runs first must not tighten the shared cache area. The
+# coordination carrier is created with the private mode of its own leaf, and a
+# shared parent created with that mode becomes a private directory of the
+# first account: the next account can no longer resolve the app's cache under
+# that root, cannot create a carrier of its own, and its coordination request
+# is refused. The data root is world-writable precisely so that any account
+# can create its own state there.
+docker volume create "$SHARED_VOLUME" >/dev/null
+shared_state=''
+first_carrier=''
+for probe in 1026 568; do
+    start_app -e PUID="$probe" -e PGID=100 -v "$SHARED_VOLUME:/data"
+    assert_identity "$probe" 100
+    # The coordination request is the one that takes the cross-process lease.
+    # It must be answered for every account that shares the data root.
+    assert_coordination_lease "$probe" 100
+    carrier=$(coordination_carrier_path "$probe" 100)
+    if [ -z "$carrier" ]; then
+        printf 'FAIL shared data root: PUID=%s has no coordination carrier of its own\n' "$probe" >&2
+        exit 1
+    fi
+    if [ -n "$first_carrier" ] && [ "$carrier" = "$first_carrier" ]; then
+        printf 'FAIL shared data root: PUID=%s shares the carrier %s with another account\n' "$probe" "$carrier" >&2
+        exit 1
+    fi
+    first_carrier=$carrier
+    # The account must be able to reach the app's cache under the shared cache
+    # area, not only the data root itself.
+    if ! docker exec --user "$probe:100" "$CONTAINER" /bin/sh -ec '
+        test -x "$(dirname "$HF_HOME")"
+        test -d "$HF_HOME"
+        test -x "$HF_HOME"
+    '; then
+        printf 'FAIL shared data root: PUID=%s cannot reach the app cache under the shared cache area\n' "$probe" >&2
+        exit 1
+    fi
+    # The shared cache area keeps the mode and the ownership the first account
+    # found: the next account must not take it over either.
+    state=$(docker exec "$CONTAINER" /bin/sh -ec 'stat -c "%u:%g:%a" "$(dirname "$HF_HOME")"') || state=''
+    if [ -z "$state" ]; then
+        printf 'FAIL shared data root: the shared cache area of PUID=%s cannot be inspected\n' "$probe" >&2
+        exit 1
+    fi
+    if [ -z "$shared_state" ]; then
+        shared_state=$state
+    elif [ "$state" != "$shared_state" ]; then
+        printf 'FAIL shared data root: the shared cache area changed from %s to %s\n' "$shared_state" "$state" >&2
+        exit 1
+    fi
+    stop_app_shared
+    echo "PASS shared data root PUID=$probe: own carrier $carrier, shared cache area $state"
+done
+# The shared cache area must not be private to the account that created it:
+# every account has to be able to create its own state there, and the data
+# root is world-writable for exactly that reason. A private shared area locks
+# every other account out of the data root.
+shared_mode=${shared_state##*:}
+case "$shared_mode" in
+    *00)
+        printf 'FAIL shared data root: the shared cache area is private to one account (%s)\n' "$shared_state" >&2
+        exit 1
+        ;;
+esac
 for ids in 568:568 65534:100; do
     start_app --user "$ids" -e PUID=4321 -e PGID=4322
     assert_identity "${ids%:*}" "${ids#*:}"
     stop_app
     echo "PASS non-root startup $ids: caller identity overrides PUID/PGID, unchanged accounts"
 done
+# The same coordination resolution on the direct non-root exec path (docker run
+# --user, k8s runAsUser), where the app inherits the image's HOME=/data and no
+# privilege drop happens. uid 568 has no NSS entry here either. The container
+# has no network at all, so this case also proves the exercised path needs
+# neither the public Hub nor a model download.
+start_app --network none --user 568:568
+docker exec "$CONTAINER" /bin/sh -ec '! getent passwd 568'
+assert_identity 568 568
+assert_coordination_lease 568 568
+stop_app
+echo 'PASS non-root startup NSS-less 568:568: PID 1 identity, coordination carrier lease'
 
 # No NSS entry, writable fresh persistent /data, read-only root, no capabilities,
 # no privilege escalation. Save actual settings, inspect durable paths, recreate.

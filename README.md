@@ -208,9 +208,18 @@ The Settings API separately exposes raw preference, effective Hub path, and its
 source; see [API storage fields](docs/API.md#settings). Library `NewHFCache`
 captures ENV per construction, while `Settings.HubDir` / `NewHFCacheResolved`
 allow callers to reuse an already resolved association without reinterpreting
-Hub ENV. Generated rebuild scripts preserve that association; ordinary app-root
-scripts remain portable with the complete root, while external-H scripts retain
-the selected absolute Hub location.
+Hub ENV. The HTTP rebuild and `hfdesk --rebuild` use the same Go cache-sync
+implementation:
+
+```bash
+hfdesk --rebuild [--cache-dir R] [--hub-dir H] [--clean] [--verbose]
+```
+
+The generated `R/rebuild.sh` is only a wrapper for that Go command. It requires
+a compatible `hfdesk` binary beside the script or on `PATH`; set `HFDESK_BIN`
+to select another binary. It does not require Python. Default `R/hub` scripts
+remain portable when the complete root moves, while scripts using an external
+Hub retain the selected absolute H location.
 
 Proxy example:
 

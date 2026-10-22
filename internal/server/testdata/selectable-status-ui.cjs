@@ -68,15 +68,51 @@ const localStorage = {
 };
 
 const cacheRequests = [];
+const branchPresenceRequests = [];
 function lastCacheRequest() { return cacheRequests[cacheRequests.length - 1] || ''; }
 
 let cacheState = { status: 200, files: [], error: null, parseError: null };
+let branchState = { status: 200, error: null, parseError: null, overrides: {} };
 const fetch = async (rawPath) => {
   const requestPath = String(rawPath);
   if (!requestPath.startsWith('/api/cache/')) {
     throw new Error('unexpected fetch: ' + rawPath);
   }
   cacheRequests.push(requestPath);
+  const url = new URL(requestPath, 'http://hfdesk.test');
+  if (url.searchParams.has('branchVariant')) {
+    branchPresenceRequests.push(requestPath);
+    if (branchState.error) throw branchState.error;
+    if (branchState.waitForResponse) {
+      const payload = await branchState.waitForResponse(url, requestPath);
+      return { status: 200, ok: true, json: async () => payload };
+    }
+    return {
+      status: branchState.status,
+      ok: branchState.status >= 200 && branchState.status < 300,
+      json: async () => {
+        if (branchState.parseError) throw branchState.parseError;
+        const repo = url.pathname.replace(/^\/api\/cache\//, '');
+        const base = {
+          repo,
+          type: 'model',
+          branchVariant: true,
+          revision: url.searchParams.get('revision'),
+          downloaded: false,
+          downloadStatus: 'unknown',
+          storageMode: 'hf-cache',
+          destinationRoot: '/cache',
+          variantPath: '/cache/models/owner/model/variants/example',
+          expectedFiles: 0,
+          files: []
+        };
+        const overrides = typeof branchState.overrides === 'function'
+          ? branchState.overrides(url, base)
+          : branchState.overrides;
+        return { ...base, ...(overrides || {}) };
+      }
+    };
+  }
   if (cacheState.error) throw cacheState.error;
   return {
     status: cacheState.status,
@@ -135,10 +171,18 @@ const hook = `
     syncLocalAnalysisStatus,
     renderSelectableItems,
     updateSelectableRowStatuses,
+    getConfiguredRouteOptions,
+    selectableDestinationContext,
+    selectableRowKey,
+    routeSelectValue,
+    renderRouteSelect,
+    handleSelectableDestinationChange,
+    refreshSelectableDestinationAfterSettings,
     handleWSMessage,
     reconcileAnalysisAfterLoad,
     getDlStatus,
     selectableStatusKey,
+    resetBranchPresenceMaps() { branchDestinationRoots.clear(); branchArtifactPaths.clear(); },
     hasLiveReconcileTimer() { return liveStatusReconcileTimer !== null; },
     setCurrentAnalysis(value) { currentAnalysis = value; },
     async flushLiveReconcile() {
@@ -161,25 +205,29 @@ vm.runInNewContext(source, context);
 const ui = window.test;
 ui.state.settings = {};
 
-function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {}, dataset = false, items = [] } = {}) {
+function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {}, dataset = false, items = [], settings = { cacheDir: '/cache' }, branchStatus = 200, branchError = null, branchParseError = null, branchOverrides = {}, branchWaitForResponse = null } = {}) {
   ui.state.jobs.clear();
   jobs.forEach((job, index) => ui.state.jobs.set(job.id || `job-${index}`, job));
-  ui.state.settings = {};
+  ui.state.settings = settings;
   ui.setCurrentAnalysis({ repo: REPO, is_dataset: dataset, selectable_items: items });
   ui.resetLiveReconcile();
   domNodes.delete('#selectableItems');
+  domNodes.delete('#quantRouteSelect');
+  ui.resetBranchPresenceMaps();
   cacheRequests.length = 0;
+  branchPresenceRequests.length = 0;
   storage.clear();
   if (Object.keys(initial).length) {
     storage.set(dataset ? DATASET_STORAGE : MODEL_STORAGE, JSON.stringify(initial));
   }
   cacheState = { status: cacheStatus, files: cacheFiles, error: cacheError, parseError: cacheParseError };
+  branchState = { status: branchStatus, error: branchError, parseError: branchParseError, overrides: branchOverrides, waitForResponse: branchWaitForResponse };
 }
 
 async function reconcile(items, { dataset = false } = {}) {
   const isDataset = !!dataset;
-  ui.setCurrentAnalysis({ repo: REPO, is_dataset: isDataset, selectable_items: items });
   const data = { repo: REPO, is_dataset: isDataset, selectable_items: items };
+  ui.setCurrentAnalysis(data);
   ui.refreshDlStatusFromJobs(REPO, items, isDataset);
   await ui.syncLocalAnalysisStatus(data);
   ui.refreshDlStatusFromJobs(REPO, items, isDataset);
@@ -192,7 +240,7 @@ async function reconcile(items, { dataset = false } = {}) {
 // surface updateSelectableRowStatuses uses.
 function installRows(items, initialStatuses = {}) {
   const rows = items.map(item => {
-    const statusKey = ui.selectableStatusKey(item);
+    const statusKey = ui.selectableRowKey(item);
     let chipHtml = '';
     const chip = {};
     Object.defineProperty(chip, 'outerHTML', {
@@ -233,6 +281,46 @@ function artifactItem(files, label = 'Q4_0', filterValue = 'q4_0') {
     filter_value: filterValue,
     label,
     files
+  };
+}
+
+function branchItem(revision, label = revision) {
+  return {
+    category: 'quantization',
+    id: `exl-branch:${revision}`,
+    revision,
+    branch_variant: true,
+    label
+  };
+}
+
+function selectQuantRoute(key, routes, extraSettings = {}) {
+  ui.state.settings = { cacheDir: '/cache', ...extraSettings, downloadRoutes: routes };
+  const html = ui.renderRouteSelect('quantRouteSelect');
+  const options = ui.getConfiguredRouteOptions();
+  const index = key ? options.findIndex(option => option.key === key) : -1;
+  domNodes.set('#quantRouteSelect', {
+    value: String(index),
+    dataset: { optionCount: String(options.length) }
+  });
+  return { html, key: ui.routeSelectValue('quantRouteSelect') };
+}
+
+function completePresence(revision, destinationRoot = '/cache', repo = REPO) {
+  return {
+    repo,
+    type: 'model',
+    branchVariant: true,
+    revision,
+    downloaded: true,
+    downloadStatus: 'complete',
+    storageMode: destinationRoot === '/cache' ? 'hf-cache' : 'local',
+    destinationRoot,
+    variantPath: `${destinationRoot}/owner/model/variants/exl`,
+    artifactPath: `${destinationRoot}/owner/model/variants/exl/commit`,
+    commit: 'commit123',
+    expectedFiles: 2,
+    files: [{ name: 'config.json', size: 1 }, { name: 'weights.safetensors', size: 2 }]
   };
 }
 
@@ -454,6 +542,349 @@ scenario('legacy token status survives cache 404', async () => {
   const { map, html } = await reconcile([item]);
   eq(map['Q4_K_M'], 'done', 'legacy token remains done after 404 reconciliation');
   assertDone(html, '', 'legacy 404 token row');
+});
+
+scenario('branch variants use exact qualified presence for each revision', async () => {
+  const branchA = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const branchB = branchItem('refs/bpw/5.0', 'EXL3 5.0 BPW');
+  reset({
+    branchOverrides: url => url.searchParams.get('revision') === branchA.revision
+      ? completePresence(branchA.revision)
+      : {}
+  });
+  let result = await reconcile([branchA, branchB]);
+  const keyA = ui.selectableStatusKey(branchA);
+  const keyB = ui.selectableStatusKey(branchB);
+  eq(keyA !== keyB, true, 'different branch revisions have independent status keys');
+  eq(result.map[keyA], 'done', 'exact branch A presence marks only branch A done');
+  eq(result.map[keyB], undefined, 'branch B remains idle without its own proof');
+  assertDone(result.html, branchA.label, 'branch A exact presence');
+  assertIdle(result.html, branchB.label, 'branch B without exact presence');
+  match(rowFor(result.html, branchA.label), /Verified model files at \/cache\/owner\/model\/variants\/exl\/commit/, 'done chip exposes the verified artifact root in its tooltip');
+  eq(branchPresenceRequests.length, 2, 'each selectable branch gets a qualified query');
+  for (const request of branchPresenceRequests) {
+    const url = new URL(request, 'http://hfdesk.test');
+    eq(url.searchParams.get('type'), 'model');
+    eq(url.searchParams.get('branchVariant'), 'true');
+    eq(url.searchParams.has('routeKey'), false, 'default destination remains the server default');
+  }
+  eq(cacheRequests.filter(request => !new URL(request, 'http://hfdesk.test').searchParams.has('branchVariant')).length, 0,
+    'branch completion does not use an unqualified cache read');
+});
+
+scenario('branch miss, wrong identity, destination, incomplete proof, and errors clear stale done', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const seedDone = () => {
+    const key = ui.selectableStatusKey(item);
+    storage.set(MODEL_STORAGE, JSON.stringify({ [key]: 'done' }));
+    return key;
+  };
+
+  reset({ items: [item], branchOverrides: { ...completePresence('refs/bpw/other'), revision: 'refs/bpw/other' } });
+  let key = seedDone();
+  let result = await reconcile([item]);
+  eq(result.map[key], undefined, 'wrong revision response cannot retain branch done');
+  assertIdle(result.html, item.label, 'wrong revision response');
+
+  reset({ items: [item], branchOverrides: { ...completePresence(item.revision, '/elsewhere') } });
+  key = seedDone();
+  result = await reconcile([item]);
+  eq(result.map[key], undefined, 'wrong destination root cannot retain branch done');
+  assertIdle(result.html, item.label, 'wrong destination root');
+
+  reset({ items: [item], branchOverrides: {
+    ...completePresence(item.revision), files: [{ name: 'config.json', size: 1 }]
+  } });
+  key = seedDone();
+  result = await reconcile([item]);
+  eq(result.map[key], undefined, 'incomplete expected-file evidence cannot retain branch done');
+  assertIdle(result.html, item.label, 'incomplete branch presence');
+
+  reset({ items: [item], branchError: new Error('presence lookup failed') });
+  key = seedDone();
+  result = await reconcile([item]);
+  eq(result.map[key], undefined, 'presence error clears stale branch done');
+  assertIdle(result.html, item.label, 'branch presence error');
+
+  reset({ items: [item], branchStatus: 503 });
+  key = seedDone();
+  result = await reconcile([item]);
+  eq(result.map[key], undefined, 'non-success response clears stale branch done');
+  assertIdle(result.html, item.label, 'branch presence HTTP error');
+});
+
+scenario('branch active jobs require branch flag, revision, full-tree request, and exact destination', async () => {
+  const branchA = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const branchB = branchItem('refs/bpw/5.0', 'EXL3 5.0 BPW');
+
+  // Only a full-branch job at the exact revision marks the matching row active.
+  reset({
+    jobs: [liveJob({ status: 'running', branchVariant: true, outputDir: '/cache', revision: branchA.revision, filters: [] })],
+    items: [branchA, branchB]
+  });
+  let result = await reconcile([branchA, branchB]);
+  const keyA = ui.selectableStatusKey(branchA);
+  const keyB = ui.selectableStatusKey(branchB);
+  eq(result.map[keyA], 'running', 'matching revision job marks branch A running');
+  eq(result.map[keyB], undefined, 'branch A job does not mark branch B running');
+  match(rowFor(result.html, branchA.label), /quant-dl-btn-running/, 'matching branch row shows running');
+  assertIdle(result.html, branchB.label, 'different branch row stays downloadable');
+
+  reset({
+    jobs: [liveJob({ status: 'running', outputDir: '/cache', revision: branchA.revision, filters: [] })],
+    items: [branchA]
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[ui.selectableStatusKey(branchA)], undefined, 'revision match without branchVariant does not mark an EXL row active');
+  assertIdle(result.html, branchA.label, 'non-branch job with the same revision');
+
+  reset({
+    jobs: [liveJob({ status: 'queued', branchVariant: true, outputDir: '/cache', revision: branchB.revision, filters: [] })],
+    items: [branchA, branchB]
+  });
+  result = await reconcile([branchA, branchB]);
+  eq(result.map[keyA], undefined, 'branch B queued job does not mark branch A');
+  eq(result.map[keyB], 'queued', 'matching revision job marks branch B queued');
+  assertQueued(rowFor(result.html, branchB.label), 'matching branch row shows queued');
+
+  // A filtered request is not the whole selected branch and must not be
+  // represented as downloading the branch-backed selectable row.
+  reset({
+    jobs: [liveJob({ status: 'queued', branchVariant: true, outputDir: '/cache', revision: branchA.revision, filters: ['config.json'] })],
+    items: [branchA]
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'filtered job does not mark a full-branch row queued');
+  assertIdle(result.html, branchA.label, 'filtered job leaves the full-branch row downloadable');
+
+  reset({
+    jobs: [liveJob({ status: 'queued', branchVariant: true, outputDir: '/cache', revision: branchA.revision, filters: [], excludes: ['*.md'] })],
+    items: [branchA]
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'job excluding branch support files does not mark the full-branch row queued');
+
+  // Completion is not revision-specific cache evidence; it clears the active
+  // chip but does not make the branch row permanently done.
+  reset({
+    jobs: [liveJob({ status: 'completed', branchVariant: true, outputDir: '/cache', revision: branchA.revision, filters: [] })],
+    initial: { [keyA]: 'queued' },
+    items: [branchA]
+  });
+  result = await reconcile([branchA]);
+  eq(result.map[keyA], undefined, 'completed branch job does not infer done without revision-specific cache evidence');
+  assertIdle(result.html, branchA.label, 'completed branch row remains available');
+
+  // A matching revision/flag at a different configured route is not active for
+  // the row's selected destination.
+  const routes = { 'llm/safetensors': '/route-a' };
+  reset({
+    jobs: [liveJob({ status: 'running', branchVariant: true, outputDir: '/route-b', routeKey: 'llm/safetensors', revision: branchA.revision, filters: [] })],
+    items: [branchA],
+    settings: { cacheDir: '/cache', downloadRoutes: routes },
+    branchOverrides: url => ({ destinationRoot: url.searchParams.get('routeKey') ? '/route-a' : '/cache' })
+  });
+  selectQuantRoute('llm/safetensors', routes);
+  result = await reconcile([branchA]);
+  eq(result.map[ui.selectableStatusKey(branchA)], undefined, 'another route cannot mark the selected branch active');
+  assertIdle(result.html, branchA.label, 'branch job at another route');
+});
+
+scenario('completed branch jobs recheck qualified presence instead of inferring Done', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  reset({ items: [item] });
+  const rows = installRows([item]);
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ id: 'branch-completed', status: 'completed', branchVariant: true, outputDir: '/cache', revision: item.revision, filters: [], excludes: [] })
+  });
+  await ui.flushLiveReconcile();
+  const key = ui.selectableStatusKey(item);
+  eq(branchPresenceRequests.length, 1, 'completion triggers one qualified presence query');
+  eq(new URL(lastCacheRequest(), 'http://hfdesk.test').searchParams.get('branchVariant'), 'true');
+  eq(ui.getDlStatus(REPO, false)[key], undefined, 'completed job plus a presence miss is not Done');
+  eq(rows[0].dataset.dlStatus, '', 'presence miss restores the Download row');
+  assertIdle(ui.renderSelectableItems([item], 'selectableItems'), item.label, 'completed job without presence');
+
+  branchState.overrides = url => completePresence(item.revision, '/cache');
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ id: 'branch-completed', status: 'completed', branchVariant: true, outputDir: '/cache', revision: item.revision, filters: [], excludes: [] })
+  });
+  await ui.flushLiveReconcile();
+  eq(branchPresenceRequests.length, 2, 'the follow-up completion event rechecks the artifact');
+  eq(ui.getDlStatus(REPO, false)[key], 'done', 'only positive qualified presence marks Done');
+  eq(rows[0].dataset.dlStatus, 'done', 'positive presence updates the existing row');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-done/, 'verified branch uses the existing Done chip');
+});
+
+scenario('branch presence and persisted status follow the selected route and settings destination', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const routes = { 'llm/safetensors': '/route-a', 'llm/gguf': '/route-b' };
+  reset({
+    items: [item],
+    settings: { cacheDir: '/cache', downloadRoutes: routes },
+    branchOverrides: url => completePresence(item.revision,
+      url.searchParams.get('routeKey') === 'llm/safetensors' ? '/route-a' : '/route-b')
+  });
+  const analysis = { repo: REPO, type: 'generic', is_dataset: false, selectable_items: [item] };
+  ui.setCurrentAnalysis(analysis);
+  selectQuantRoute('llm/safetensors', routes);
+  const rows = installRows([item]);
+  const destinationA = ui.selectableDestinationContext(analysis);
+  await ui.handleSelectableDestinationChange();
+  const keyA = ui.selectableStatusKey(item, analysis, destinationA);
+  eq(ui.getDlStatus(REPO, false)[keyA], 'done', 'route A positive proof is stored independently');
+  eq(rows[0].dataset.dlStatus, 'done', 'selected route A row updates to Done');
+  eq(new URL(branchPresenceRequests.at(-1), 'http://hfdesk.test').searchParams.get('routeKey'), 'llm/safetensors');
+
+  selectQuantRoute('llm/gguf', routes);
+  const destinationB = ui.selectableDestinationContext(analysis);
+  await ui.handleSelectableDestinationChange();
+  const keyB = ui.selectableStatusKey(item, analysis, destinationB);
+  eq(keyA !== keyB, true, 'different route destinations use different persisted status keys');
+  eq(ui.getDlStatus(REPO, false)[keyB], 'done', 'route B is done only from its own positive response');
+  eq(rows[0].dataset.dlStatus, 'done', 'route B row uses the route B proof');
+  eq(new URL(branchPresenceRequests.at(-1), 'http://hfdesk.test').searchParams.get('routeKey'), 'llm/gguf');
+
+  const previousSettingsSignature = ui.selectableDestinationContext(analysis).signature;
+  ui.state.settings.downloadRoutes['llm/gguf'] = '/route-b2';
+  branchState.overrides = url => ({
+    destinationRoot: '/route-b2', downloaded: false, downloadStatus: 'unknown',
+    expectedFiles: 0, files: []
+  });
+  await ui.refreshSelectableDestinationAfterSettings(previousSettingsSignature);
+  const keyB2 = ui.selectableStatusKey(item, analysis);
+  eq(keyB2 !== keyB, true, 'changing the configured path invalidates the old destination identity');
+  eq(ui.getDlStatus(REPO, false)[keyB2], undefined, 'new configured destination remains not-done on a miss');
+  eq(ui.getDlStatus(REPO, false)[keyB], 'done', 'old route proof remains scoped to its old destination');
+  eq(rows[0].dataset.dlStatus, '', 'settings change restores Download for the new destination');
+  eq(new URL(branchPresenceRequests.at(-1), 'http://hfdesk.test').searchParams.get('routeKey'), 'llm/gguf');
+  assertIdle(ui.renderSelectableItems([item], 'selectableItems'), item.label, 'new settings destination miss');
+});
+
+scenario('late branch presence cannot mark a newly selected destination done', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const routes = { 'llm/safetensors': '/route-a', 'llm/gguf': '/route-b' };
+  const pendingResponses = [];
+  reset({
+    items: [item],
+    settings: { cacheDir: '/cache', downloadRoutes: routes },
+    branchWaitForResponse: url => new Promise(resolve => pendingResponses.push({ url, resolve }))
+  });
+  const analysis = { repo: REPO, type: 'generic', is_dataset: false, selectable_items: [item] };
+  ui.setCurrentAnalysis(analysis);
+  selectQuantRoute('llm/safetensors', routes);
+  const rows = installRows([item]);
+  const destinationA = ui.selectableDestinationContext(analysis);
+  const syncA = ui.syncLocalAnalysisStatus(analysis, destinationA);
+  await Promise.resolve();
+
+  selectQuantRoute('llm/gguf', routes);
+  const keyB = ui.selectableStatusKey(item, analysis);
+  const syncB = ui.handleSelectableDestinationChange();
+  await Promise.resolve();
+  eq(pendingResponses.length, 2, 'both destination checks are outstanding independently');
+
+  pendingResponses[0].resolve(completePresence(item.revision, '/route-a'));
+  pendingResponses[1].resolve({
+    ...completePresence(item.revision, '/route-b'), downloaded: false,
+    downloadStatus: 'unknown', expectedFiles: 0, files: []
+  });
+  await Promise.all([syncA, syncB]);
+  const keyA = ui.selectableStatusKey(item, analysis, destinationA);
+  eq(ui.getDlStatus(REPO, false)[keyA], 'done', 'late response is retained only under its captured route A key');
+  eq(ui.getDlStatus(REPO, false)[keyB], undefined, 'late route A proof cannot mark route B done');
+  eq(rows[0].dataset.dlStatus, '', 'currently selected route B stays downloadable');
+  assertIdle(ui.renderSelectableItems([item], 'selectableItems'), item.label, 'late previous-destination proof');
+});
+
+scenario('older positive branch lookup cannot override a newer miss for the same destination', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const pendingResponses = [];
+  reset({
+    items: [item],
+    branchWaitForResponse: url => new Promise(resolve => pendingResponses.push({ url, resolve }))
+  });
+  const analysis = { repo: REPO, type: 'generic', is_dataset: false, selectable_items: [item] };
+  ui.setCurrentAnalysis(analysis);
+  const older = ui.syncLocalAnalysisStatus(analysis);
+  await Promise.resolve();
+  const newer = ui.syncLocalAnalysisStatus(analysis);
+  await Promise.resolve();
+  eq(pendingResponses.length, 2, 'same-key checks are concurrently in flight');
+
+  pendingResponses[1].resolve({
+    ...completePresence(item.revision, '/cache'), downloaded: false,
+    downloadStatus: 'unknown', expectedFiles: 0, files: []
+  });
+  await newer;
+  const key = ui.selectableStatusKey(item, analysis);
+  eq(ui.getDlStatus(REPO, false)[key], undefined, 'newer miss leaves branch not-done');
+
+  pendingResponses[0].resolve(completePresence(item.revision, '/cache'));
+  await older;
+  eq(ui.getDlStatus(REPO, false)[key], undefined, 'older positive reply is ignored after a newer miss');
+  assertIdle(ui.renderSelectableItems([item], 'selectableItems'), item.label, 'out-of-order branch presence replies');
+});
+
+scenario('branch lookup generations remain isolated by repository', async () => {
+  const item = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const pendingResponses = [];
+  reset({ branchWaitForResponse: url => new Promise(resolve => pendingResponses.push({ url, resolve })) });
+  const analysisA = { repo: 'owner/first', type: 'generic', is_dataset: false, selectable_items: [item] };
+  const analysisB = { repo: 'owner/second', type: 'generic', is_dataset: false, selectable_items: [item] };
+  ui.setCurrentAnalysis(analysisA);
+  const syncA = ui.syncLocalAnalysisStatus(analysisA);
+  await Promise.resolve();
+  ui.setCurrentAnalysis(analysisB);
+  const syncB = ui.syncLocalAnalysisStatus(analysisB);
+  await Promise.resolve();
+  eq(pendingResponses.length, 2, 'both repositories have independent pending lookups');
+
+  pendingResponses[0].resolve(completePresence(item.revision, '/cache', analysisA.repo));
+  pendingResponses[1].resolve({
+    ...completePresence(item.revision, '/cache', analysisB.repo), downloaded: false,
+    downloadStatus: 'unknown', expectedFiles: 0, files: []
+  });
+  await Promise.all([syncA, syncB]);
+  const keyA = ui.selectableStatusKey(item, analysisA);
+  const keyB = ui.selectableStatusKey(item, analysisB);
+  eq(keyA, keyB, 'repository is scoped by its own storage namespace, not folded into row identity');
+  eq(ui.getDlStatus(analysisA.repo, false)[keyA], 'done', 'first repo keeps its positive proof');
+  eq(ui.getDlStatus(analysisB.repo, false)[keyB], undefined, 'second repo miss does not cancel or inherit first repo proof');
+});
+
+scenario('revision-only rows keep legacy unqualified-cache behavior', async () => {
+  const item = { ...branchItem('refs/bpw/4.0', 'Legacy revision'), branch_variant: false };
+  reset({ cacheFiles: ['config.json', 'weights.safetensors'] });
+  const { map, html } = await reconcile([item]);
+  eq(map[ui.selectableStatusKey(item)], undefined, 'unqualified cache does not claim a legacy revision-only row');
+  eq(branchPresenceRequests.length, 0, 'revision-only row does not call the new branch-presence endpoint');
+  eq(new URL(lastCacheRequest(), 'http://hfdesk.test').searchParams.get('type'), 'model', 'legacy row keeps the old cache lookup');
+  assertIdle(html, item.label, 'legacy revision-only row remains downloadable');
+});
+
+scenario('live branch job updates only its matching selectable row', async () => {
+  const branchA = branchItem('refs/bpw/4.0', 'EXL3 4.0 BPW');
+  const branchB = branchItem('refs/bpw/5.0', 'EXL3 5.0 BPW');
+  const keyA = ui.selectableStatusKey(branchA);
+  const keyB = ui.selectableStatusKey(branchB);
+  reset({ items: [branchA, branchB] });
+  const rows = installRows([branchA, branchB]);
+
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: liveJob({ id: 'branch-running', status: 'running', branchVariant: true, outputDir: '/cache', revision: branchA.revision, filters: [] })
+  });
+  await ui.flushLiveReconcile();
+
+  eq(ui.getDlStatus(REPO, false)[keyA], 'running', 'live matching revision updates its status key');
+  eq(ui.getDlStatus(REPO, false)[keyB], undefined, 'live job does not update another revision key');
+  eq(rows[0].dataset.dlStatus, 'running', 'live matching row is updated in place');
+  eq(rows[1].dataset.dlStatus, '', 'other branch row remains idle');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-running/, 'matching branch row shows running chip');
+  assertIdle(ui.renderSelectableItems([branchA, branchB], 'selectableItems'), branchB.label, 'other branch row remains downloadable');
 });
 
 scenario('distinct artifacts sharing a quant/filter stay independent', async () => {

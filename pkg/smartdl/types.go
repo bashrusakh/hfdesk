@@ -625,6 +625,23 @@ type SelectableItem struct {
 	// sourced from an upstream base-model repo (i.e. when MMProjUpstreamRepo is
 	// set). Empty means the download targets the current repo.
 	UpstreamRepo string `json:"upstream_repo,omitempty"`
+
+	// Revision is the branch/revision for a branch-backed model option. When
+	// set, selection is by revision rather than by Files or FilterValue; an
+	// unfiltered download includes the branch's model support files.
+	Revision string `json:"revision,omitempty"`
+	// BranchVariant marks an analyzer-recognized EXL2/EXL3 branch choice. It is
+	// separate from Revision so ordinary revision-backed downloads retain their
+	// existing storage behavior.
+	BranchVariant bool `json:"branch_variant,omitempty"`
+
+	// Method, BitsPerWeight, and HeadBits describe branch-backed EXL variants.
+	// BitsPerWeight is the bitrate named by the branch or declared in its
+	// quantization config; HeadBits is a tensor-group width, not a model-wide
+	// precision declaration.
+	Method        string  `json:"method,omitempty"`
+	BitsPerWeight float64 `json:"bits_per_weight,omitempty"`
+	HeadBits      float64 `json:"head_bits,omitempty"`
 }
 
 // RelatedDownload represents a related repository that may be needed.
@@ -654,11 +671,12 @@ type RelatedDownload struct {
 
 // DownloadSelection is the web/API representation of a repo download choice.
 type DownloadSelection struct {
-	Repo       string   `json:"repo"`
-	Dataset    bool     `json:"dataset,omitempty"`
-	Revision   string   `json:"revision,omitempty"`
-	Filters    []string `json:"filters,omitempty"`
-	ExactMatch bool     `json:"exactMatch,omitempty"`
+	Repo          string   `json:"repo"`
+	Dataset       bool     `json:"dataset,omitempty"`
+	Revision      string   `json:"revision,omitempty"`
+	Filters       []string `json:"filters,omitempty"`
+	ExactMatch    bool     `json:"exactMatch,omitempty"`
+	BranchVariant bool     `json:"branchVariant,omitempty"`
 }
 
 // RecommendedFilterValues returns filters for recommended selectable items.
@@ -672,10 +690,22 @@ type DownloadSelection struct {
 func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
+		if item.Recommended && item.UpstreamRepo == "" && item.Revision != "" {
+			// A revision-backed choice selects an entire branch, so filters from
+			// any other recommended row must not leak into that request.
+			return nil
+		}
+	}
+	for _, item := range r.SelectableItems {
 		if !item.Recommended {
 			continue
 		}
 		if item.UpstreamRepo != "" {
+			continue
+		}
+		if item.Revision != "" {
+			// Branch-backed choices select a complete branch, not a path or
+			// legacy filter token.
 			continue
 		}
 		if item.Category == "quantization" || item.Category == "vision_encoder" {
@@ -705,16 +735,30 @@ func exactArtifactFilter(repoPath string) string {
 // PopulateDownloadSelection sets recommended download fields for the web UI.
 func (r *RepoInfo) PopulateDownloadSelection() {
 	r.RecommendedFilters = r.RecommendedFilterValues()
+	var recommendedRevision string
+	var recommendedBranchVariant bool
+	for _, item := range r.SelectableItems {
+		if item.Recommended && item.UpstreamRepo == "" && item.Revision != "" {
+			recommendedRevision = item.Revision
+			recommendedBranchVariant = item.BranchVariant
+			break
+		}
+	}
+
 	r.RecommendedDownload = &DownloadSelection{
-		Repo:       r.Repo,
-		Dataset:    r.IsDataset,
-		Filters:    r.RecommendedFilters,
-		ExactMatch: r.IsDataset || r.Type == TypeGGUF,
+		Repo:          r.Repo,
+		Dataset:       r.IsDataset,
+		Filters:       r.RecommendedFilters,
+		ExactMatch:    r.IsDataset || r.Type == TypeGGUF,
+		BranchVariant: recommendedBranchVariant,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch
 	}
-	if len(r.RecommendedFilters) == 0 {
+	if recommendedRevision != "" {
+		r.RecommendedDownload.Revision = recommendedRevision
+	}
+	if len(r.RecommendedFilters) == 0 && recommendedRevision == "" {
 		r.RecommendedDownload = nil
 	}
 }

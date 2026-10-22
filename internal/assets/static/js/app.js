@@ -111,9 +111,9 @@
   // renderRouteSelect builds a labeled destination <select>. Option values are
   // indexes into the fixed option list, never raw keys, so keys stay out of the
   // rendered markup. An empty selection means "Default (server setting)".
-  function renderRouteSelect(id, { className = '', style = '', ariaLabel = '' } = {}) {
+  function renderRouteSelect(id, { className = '', style = '', ariaLabel = '', selectedKey } = {}) {
     const opts = getConfiguredRouteOptions();
-    const prefill = routeKeyForAnalysis(currentAnalysis);
+    const prefill = selectedKey === undefined ? routeKeyForAnalysis(currentAnalysis) : selectedKey;
     const selIdx = opts.findIndex(o => o.key === prefill);
     _routeSelectKeys.set(id, opts.map(o => o.key));
     const rows = opts.map((o, i) =>
@@ -147,6 +147,26 @@
     if (!renderedKeys || renderedKeys.length !== opts.length
         || renderedKeys.some((k, i) => k !== opts[i].key)) return '';
     return idx < opts.length ? opts[idx].key : '';
+  }
+
+  // Settings can be refreshed while an analysis is still mounted (for example
+  // after returning from Settings). Keep the existing semantic selection when
+  // it remains configured, and never leave a stale option index pointing at a
+  // different destination.
+  function refreshRouteSelectOptions(id, selectedKey = '') {
+    const select = $(`#${id}`);
+    if (!select) return;
+    const opts = getConfiguredRouteOptions();
+    const prefill = routeKeyForAnalysis(currentAnalysis);
+    const chosen = opts.some(o => o.key === selectedKey)
+      ? selectedKey
+      : (opts.some(o => o.key === prefill) ? prefill : '');
+    _routeSelectKeys.set(id, opts.map(o => o.key));
+    select.dataset.optionCount = String(opts.length);
+    select.innerHTML = `
+      <option value="-1"${chosen ? '' : ' selected'}>Default (server setting)</option>
+      ${opts.map((o, i) => `<option value="${i}"${o.key === chosen ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}`;
+    select.value = chosen ? String(opts.findIndex(o => o.key === chosen)) : '-1';
   }
 
   // =========================================
@@ -1528,13 +1548,14 @@ async function loadRepositoryDetails(entry) {
     // authority for artifact 'done' status. Job completion does not prove the
     // artifact is cached: a file can be skipped while another process is still
     // downloading it.
-    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
-    await syncLocalAnalysisStatus(data);
+    const analysisDestination = selectableDestinationContext(data, { useRenderedSelection: false });
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset, data, analysisDestination);
+    await syncLocalAnalysisStatus(data, analysisDestination);
     if (requestId !== analyzeRequestId) return;
     // Restore completed legacy token statuses after the cache check, matching
     // the previous behavior for non-artifact rows. Artifact keys stay owned by
     // cache presence, so a 404 or missing file still clears their done state.
-    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset, data, analysisDestination);
 
     currentAnalysis = data;
     currentSelectedRepo = data.repo;
@@ -1868,79 +1889,313 @@ async function loadRepositoryDetails(entry) {
   // Make analyzeRepo available globally for legacy/direct entry points.
   window.analyzeRepo = analyzeRepo;
 
-  async function syncLocalAnalysisStatus(data) {
+  const branchDestinationRoots = new Map();
+  const branchArtifactPaths = new Map();
+  const branchPresenceRequestState = new Map();
+  let branchPresenceRequestSequence = 0;
+
+  function beginBranchPresenceRequest(statusKey) {
+    const token = ++branchPresenceRequestSequence;
+    const current = branchPresenceRequestState.get(statusKey) || { latest: 0, pending: 0 };
+    current.latest = token;
+    current.pending++;
+    branchPresenceRequestState.set(statusKey, current);
+    return token;
+  }
+
+  function isCurrentBranchPresenceRequest(statusKey, token) {
+    return branchPresenceRequestState.get(statusKey)?.latest === token;
+  }
+
+  function finishBranchPresenceRequest(statusKey) {
+    const current = branchPresenceRequestState.get(statusKey);
+    if (!current) return;
+    current.pending--;
+    if (current.pending <= 0) branchPresenceRequestState.delete(statusKey);
+  }
+
+  function selectableRevision(item) {
+    return item?.category === 'quantization' && typeof item.revision === 'string'
+      ? item.revision
+      : '';
+  }
+
+  // A revision alone retains the legacy request/storage path. Only an
+  // analyzer-marked item opts into isolated branch materialization and its
+  // qualified presence endpoint.
+  function branchVariantRevision(item) {
+    const revision = selectableRevision(item);
+    return item?.branch_variant === true ? revision : '';
+  }
+
+  function selectableDestinationContext(analysis, { useRenderedSelection = true } = {}) {
+    const settings = state.settings || {};
+    let routeKey = '';
+    const currentSelectionIsRelevant = useRenderedSelection && analysis?.repo &&
+      currentAnalysis?.repo === analysis.repo &&
+      !!currentAnalysis.is_dataset === !!analysis.is_dataset &&
+      !!$('#quantRouteSelect');
+    if (!analysis?.is_dataset) {
+      if (currentSelectionIsRelevant) {
+        routeKey = routeSelectValue('quantRouteSelect');
+      } else {
+        const prefill = routeKeyForAnalysis(analysis);
+        if (getConfiguredRouteOptions().some(option => option.key === prefill)) routeKey = prefill;
+      }
+    }
+
+    const routes = settings.downloadRoutes || {};
+    let configuredRoot = '';
+    let signature;
+    if (routeKey) {
+      configuredRoot = String(routes[routeKey] || (routeKey.startsWith('llm/') ? routes.llm : '') || '').trim();
+      signature = JSON.stringify(['route', routeKey, configuredRoot]);
+    } else if (String(settings.localDir || '').trim()) {
+      configuredRoot = String(settings.localDir).trim();
+      signature = JSON.stringify(['default-local', configuredRoot]);
+    } else {
+      configuredRoot = String(settings.cacheDir || '').trim();
+      signature = JSON.stringify([
+        'default-cache', configuredRoot,
+        String(settings.effectiveHubDir || '').trim(),
+        String(settings.hubDirSource || '').trim()
+      ]);
+    }
+    return { routeKey, configuredRoot, signature };
+  }
+
+  function absoluteDestinationIdentity(value) {
+    let path = String(value || '').trim().replace(/\\/g, '/');
+    const windowsPath = /^[A-Za-z]:\//.test(path) || path.startsWith('//');
+    if (!path.startsWith('/') && !windowsPath) return '';
+    if (/^[A-Za-z]:\//.test(path) || path.startsWith('//')) path = path.toLowerCase();
+    path = path.replace(/\/+$/, '');
+    return path || '/';
+  }
+
+  function branchPresenceIdentityMatches(response, data, item, destination) {
+    const revision = branchVariantRevision(item);
+    if (!revision || !response || response.repo !== data.repo || response.type !== 'model' ||
+        response.branchVariant !== true || response.revision !== revision ||
+        typeof response.destinationRoot !== 'string' || !response.destinationRoot.trim()) return false;
+    const expectedRoot = absoluteDestinationIdentity(destination.configuredRoot);
+    if (expectedRoot && expectedRoot !== absoluteDestinationIdentity(response.destinationRoot)) return false;
+    return true;
+  }
+
+  function branchPresenceRequestPath(data, revision, destination) {
+    const query = new URLSearchParams({ type: 'model', branchVariant: 'true', revision });
+    if (destination.routeKey) query.set('routeKey', destination.routeKey);
+    return `/api/cache/${data.repo}?${query.toString()}`;
+  }
+
+  function branchArtifactPathKey(repo, statusKey) {
+    return `${repo}\n${statusKey}`;
+  }
+
+  async function syncLocalAnalysisStatus(data, destination = selectableDestinationContext(data, { useRenderedSelection: data === currentAnalysis })) {
     if (!data?.repo || !data.selectable_items?.length) return;
     const isDataset = !!data.is_dataset;
-    try {
-      const map = getDlStatus(data.repo, isDataset);
-      // /api/cache/<repo> without a type prefers the model namespace. A repo
-      // that exists as both model and dataset must be looked up in the
-      // namespace the open analysis actually represents.
-      const repoType = isDataset ? 'dataset' : 'model';
-      const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
-      let changed = false;
+    const branchItems = data.selectable_items.filter(item => !!branchVariantRevision(item));
+    const legacyItems = data.selectable_items.filter(item => !branchVariantRevision(item));
 
-      if (resp.status === 404) {
-        data.selectable_items.forEach(item => {
-          const key = selectableStatusKey(item);
-          if (!key || map[key] !== 'done') return;
+    // Revalidate persisted branch evidence for the currently selected
+    // destination before rendering it. A miss/error must not leave an old Done
+    // chip visible while the qualified request is pending.
+    const initialMap = getDlStatus(data.repo, isDataset);
+    let clearedDone = false;
+    branchItems.forEach(item => {
+      const key = selectableStatusKey(item, data, destination);
+      branchArtifactPaths.delete(branchArtifactPathKey(data.repo, key));
+      if (initialMap[key] === 'done') {
+        delete initialMap[key];
+        clearedDone = true;
+      }
+    });
+    if (clearedDone) saveDlStatus(data.repo, isDataset, initialMap);
+
+    const syncLegacyCacheStatus = async () => {
+      if (!legacyItems.length) return;
+      let status = 0;
+      let cachedFiles = new Set();
+      try {
+        // Preserve the legacy repository cache check for ordinary artifacts and
+        // token rows. It is deliberately not used to prove branch variants.
+        const repoType = isDataset ? 'dataset' : 'model';
+        const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
+        status = resp.status;
+        if (status !== 404) {
+          if (!resp.ok) throw new Error(`cache lookup failed: ${status}`);
+          const cached = await resp.json();
+          cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+        }
+      } catch {
+        // A transient lookup/parse failure clears only stale artifact/revision
+        // claims. Legacy token statuses retain their last-known-good value.
+        const map = getDlStatus(data.repo, isDataset);
+        let changed = false;
+        legacyItems.forEach(item => {
+          const key = selectableStatusKey(item, data, destination);
+          if ((!String(key).startsWith('artifact:') && !selectableRevision(item)) || map[key] !== 'done') return;
           delete map[key];
           changed = true;
         });
-      } else {
-        if (!resp.ok) throw new Error(`cache lookup failed: ${resp.status}`);
+        if (changed) saveDlStatus(data.repo, isDataset, map);
+        return;
+      }
 
-        const cached = await resp.json();
-        const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
-
-        data.selectable_items.forEach(item => {
-          const key = selectableStatusKey(item);
-          const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
-          if (!key || !files.length) return;
-
-          const isPresent = files.every(f => cachedFiles.has(f));
-          const isActive = map[key] === 'running' || map[key] === 'queued';
-          if (isPresent) {
-            if (map[key] !== 'done' && !isActive) {
-              map[key] = 'done';
-              changed = true;
-            }
-          } else if (map[key] === 'done') {
+      // Re-read after the network wait so concurrent branch status writes are
+      // not lost when legacy artifact reconciliation saves its own keys.
+      const map = getDlStatus(data.repo, isDataset);
+      let changed = false;
+      legacyItems.forEach(item => {
+        const key = selectableStatusKey(item, data, destination);
+        if (status === 404) {
+          if (!key || map[key] !== 'done') return;
+          delete map[key];
+          changed = true;
+          return;
+        }
+        // Legacy revision-only items still cannot claim revision presence from
+        // the unqualified repository snapshot.
+        if (selectableRevision(item)) {
+          if (map[key] === 'done') {
             delete map[key];
             changed = true;
           }
-        });
-      }
-
-      if (changed) saveDlStatus(data.repo, isDataset, map);
-    } catch {
-      // Cache lookup is best-effort; remote analysis should still render. Cache
-      // presence is nevertheless the only authority for artifact 'done', so a
-      // transient lookup/parse failure must not leave a stale downloaded
-      // artifact hiding its Download button. Legacy non-artifact token statuses
-      // keep their last-known-good value.
-      const map = getDlStatus(data.repo, isDataset);
-      let changed = false;
-      data.selectable_items.forEach(item => {
-        const key = selectableStatusKey(item);
-        if (!String(key).startsWith('artifact:') || map[key] !== 'done') return;
-        delete map[key];
-        changed = true;
+          return;
+        }
+        const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
+        if (!key || !files.length) return;
+        const isPresent = files.every(file => cachedFiles.has(file));
+        const isActive = map[key] === 'running' || map[key] === 'queued';
+        if (isPresent) {
+          if (map[key] !== 'done' && !isActive) {
+            map[key] = 'done';
+            changed = true;
+          }
+        } else if (map[key] === 'done') {
+          delete map[key];
+          changed = true;
+        }
       });
       if (changed) saveDlStatus(data.repo, isDataset, map);
+    };
+
+    const syncBranchPresence = async item => {
+      const revision = branchVariantRevision(item);
+      const key = selectableStatusKey(item, data, destination);
+      const requestKey = branchArtifactPathKey(data.repo, key);
+      const token = beginBranchPresenceRequest(requestKey);
+      try {
+        const resp = await fetch(branchPresenceRequestPath(data, revision, destination));
+        if (!resp.ok) throw new Error(`branch presence lookup failed: ${resp.status}`);
+        const presence = await resp.json();
+        if (!isCurrentBranchPresenceRequest(requestKey, token)) return;
+        if (!branchPresenceIdentityMatches(presence, data, item, destination)) {
+          branchArtifactPaths.delete(branchArtifactPathKey(data.repo, key));
+          const map = getDlStatus(data.repo, isDataset);
+          if (map[key] === 'done') {
+            delete map[key];
+            saveDlStatus(data.repo, isDataset, map);
+          }
+          return;
+        }
+        branchDestinationRoots.set(destination.signature, presence.destinationRoot);
+        const complete = presence.downloaded === true && presence.downloadStatus === 'complete' &&
+          typeof presence.artifactPath === 'string' && !!presence.artifactPath.trim() &&
+          Number.isInteger(presence.expectedFiles) && presence.expectedFiles > 0 &&
+          Array.isArray(presence.files) && presence.files.length === presence.expectedFiles;
+        const map = getDlStatus(data.repo, isDataset);
+        let changed = false;
+        if (complete) {
+          branchArtifactPaths.set(branchArtifactPathKey(data.repo, key), presence.artifactPath);
+          if (map[key] !== 'running' && map[key] !== 'queued' && map[key] !== 'done') {
+            map[key] = 'done';
+            changed = true;
+          }
+        } else {
+          branchArtifactPaths.delete(branchArtifactPathKey(data.repo, key));
+          if (map[key] === 'done') {
+            delete map[key];
+            changed = true;
+          }
+        }
+        if (changed) saveDlStatus(data.repo, isDataset, map);
+      } catch {
+        if (!isCurrentBranchPresenceRequest(requestKey, token)) return;
+        branchArtifactPaths.delete(branchArtifactPathKey(data.repo, key));
+        const map = getDlStatus(data.repo, isDataset);
+        if (map[key] === 'done') {
+          delete map[key];
+          saveDlStatus(data.repo, isDataset, map);
+        }
+      } finally {
+        finishBranchPresenceRequest(requestKey);
+      }
+    };
+
+    await Promise.all([
+      syncLegacyCacheStatus(),
+      ...branchItems.map(syncBranchPresence)
+    ]);
+  }
+
+  function refreshSelectableDestinationAfterSettings(previousSignature) {
+    const analysis = currentAnalysis;
+    if (previousSignature == null || !analysis?.repo ||
+        !analysis.selectable_items?.some(item => !!branchVariantRevision(item))) return;
+    const shouldShowRoutes = !analysis.is_dataset && getConfiguredRouteOptions().length > 0;
+    if (!!$('#quantRouteSelect') !== shouldShowRoutes) renderAnalysisResult(analysis);
+    if (selectableDestinationContext(analysis).signature !== previousSignature) {
+      handleSelectableDestinationChange();
     }
+  }
+
+  function handleSelectableDestinationChange() {
+    const analysis = currentAnalysis;
+    if (!analysis?.repo || !analysis.selectable_items?.some(item => !!branchVariantRevision(item))) return Promise.resolve();
+    const destination = selectableDestinationContext(analysis);
+    // Starting sync clears any persisted Done for this exact destination before
+    // the row is repainted; an old destination's result stays under its own key.
+    const pending = syncLocalAnalysisStatus(analysis, destination);
+    refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset, analysis, destination);
+    updateSelectableRowStatuses(analysis.selectable_items, true);
+    return pending.then(() => {
+      if (currentAnalysis !== analysis || selectableDestinationContext(analysis).signature !== destination.signature) return;
+      refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset, analysis, destination);
+      updateSelectableRowStatuses(analysis.selectable_items, true);
+    });
+  }
+
+  function bindSelectableDestinationChanges() {
+    document.addEventListener('change', event => {
+      if (event.target?.id === 'quantRouteSelect') handleSelectableDestinationChange();
+    });
   }
 
   function normalizeRepoPath(path) {
     return String(path || '').replace(/\\/g, '/').toLowerCase();
   }
 
-  function selectableStatusKey(item) {
+  function selectableStatusKey(item, analysis = currentAnalysis, destination) {
+    const branchRevision = branchVariantRevision(item);
+    if (branchRevision) {
+      const selectedDestination = destination || selectableDestinationContext(analysis);
+      return `branchVariant:${branchRevision}:${selectedDestination.signature}`;
+    }
+    const revision = selectableRevision(item);
+    if (revision) return `branch:${revision}`;
     const files = Array.isArray(item?.files) ? item.files : [];
     if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
       return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
     }
     return item?.filter_value || item?.id || '';
+  }
+
+  function selectableRowKey(item, analysis = currentAnalysis) {
+    const revision = selectableRevision(item);
+    return revision ? `revision:${revision}` : selectableStatusKey(item, analysis);
   }
 
   function artifactRequestPaths(files) {
@@ -2574,9 +2829,15 @@ async function loadRepositoryDetails(entry) {
     if (!badge) return;
     try {
       const s = await api('GET', '/settings');
+      const priorRouteKey = currentAnalysis?.repo ? routeSelectValue('quantRouteSelect') : '';
+      const priorDestination = currentAnalysis?.repo
+        ? selectableDestinationContext(currentAnalysis).signature
+        : null;
       // Keep the route map available to the download/quant modals, which can be
       // opened from the Models page without visiting Settings first.
       state.settings = s;
+      refreshRouteSelectOptions('quantRouteSelect', priorRouteKey);
+      refreshSelectableDestinationAfterSettings(priorDestination);
       rememberSettingsEndpoint(s);
       syncSelectedModelHeader();
       if (s.storageMode === 'local') {
@@ -4324,7 +4585,13 @@ async function loadRepositoryDetails(entry) {
       }
       return;
     }
+    const priorRouteKey = currentAnalysis?.repo ? routeSelectValue('quantRouteSelect') : '';
+    const priorDestination = currentAnalysis?.repo
+      ? selectableDestinationContext(currentAnalysis).signature
+      : null;
     state.settings = data;
+    refreshRouteSelectOptions('quantRouteSelect', priorRouteKey);
+    refreshSelectableDestinationAfterSettings(priorDestination);
     state.settingsLoadFailed = false;
     rememberSettingsEndpoint(data);
     // Settings are authoritative for the configured endpoint, so refresh the
@@ -5364,9 +5631,9 @@ async function loadRepositoryDetails(entry) {
   // every file the item needs must be selected by the job. A job that selects
   // only the quant shards therefore never marks the mmproj companion, and a
   // companion-only job never marks the quant.
-  function artifactActiveKeys(items, jobs) {
+  function artifactActiveKeys(items, jobs, analysis, destination) {
     const artifactItems = (items || []).map(item => {
-      const key = selectableStatusKey(item);
+      const key = selectableStatusKey(item, analysis, destination);
       if (!String(key).startsWith('artifact:')) return null;
       const files = (item.files || []).map(normalizeArtifactPath).filter(Boolean);
       return files.length ? { key, files } : null;
@@ -5386,7 +5653,47 @@ async function loadRepositoryDetails(entry) {
     return active;
   }
 
-  function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
+  // Branch-backed rows select a whole repository revision (no file filters),
+  // so only a live unfiltered job at that exact revision can mark one active.
+  // Job completion and repo-wide cache snapshots do not prove branch contents.
+  function branchJobMatchesDestination(job, destination) {
+    if ((job.routeKey || '') !== (destination.routeKey || '')) return false;
+    const actualRoot = job.outputDir || job.localDir || job.hubDir || '';
+    const expectedRoot = branchDestinationRoots.get(destination.signature) || destination.configuredRoot;
+    const expectedIdentity = absoluteDestinationIdentity(expectedRoot);
+    const actualIdentity = absoluteDestinationIdentity(actualRoot);
+    return !!expectedIdentity && expectedIdentity === actualIdentity;
+  }
+
+  function branchActiveKeys(items, jobs, analysis, destination) {
+    const branchItems = (items || []).map(item => {
+      const revision = selectableRevision(item);
+      if (!revision) return null;
+      return {
+        key: selectableStatusKey(item, analysis, destination),
+        revision,
+        isBranchVariant: !!branchVariantRevision(item)
+      };
+    }).filter(Boolean);
+    const active = {};
+    if (!branchItems.length) return active;
+    jobs.forEach(job => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
+      if ((job.filters || []).length > 0) return;
+      if ((job.excludes || []).length > 0) return;
+      branchItems.forEach(({ key, revision, isBranchVariant }) => {
+        if (job.revision !== revision) return;
+        if (isBranchVariant) {
+          if (job.branchVariant !== true || !branchJobMatchesDestination(job, destination)) return;
+        }
+        const status = job.status === 'running' ? 'running' : 'queued';
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
+  function refreshDlStatusFromJobs(repo, items = [], isDataset = false, analysis = currentAnalysis, destination) {
     // Reconcile per-quant status with the live job list. Active jobs set
     // running/queued; artifact completion is never inferred from job status,
     // because a completed job can include a shard skipped as "downloading by
@@ -5394,9 +5701,15 @@ async function loadRepositoryDetails(entry) {
     // 'done'. Stale running/queued entries (job gone, cancelled or failed) are
     // cleared so the Download button reappears. 'done' is kept.
     const map = getDlStatus(repo, isDataset);
+    const selectedDestination = destination || selectableDestinationContext(analysis, {
+      useRenderedSelection: analysis === currentAnalysis
+    });
     const jobs = Array.from(state.jobs.values())
       .filter(job => jobMatchesAnalysis(job, { repo, is_dataset: isDataset }));
-    const active = artifactActiveKeys(items, jobs);
+    const active = {
+      ...artifactActiveKeys(items, jobs, analysis, selectedDestination),
+      ...branchActiveKeys(items, jobs, analysis, selectedDestination)
+    };
     jobs.forEach(j => {
       const f = (j.filters || []).join(',') || '__all__';
       if (j.status === 'completed') active[f] = 'done';
@@ -5479,9 +5792,10 @@ async function loadRepositoryDetails(entry) {
     }
   }
 
-  function selectableStatusChip(status) {
+  function selectableStatusChip(status, artifactPath = '') {
     if (status === 'done') {
-      return `<span class="quant-dl-btn quant-dl-btn-done" title="Already downloaded">✓</span>`;
+      const title = artifactPath ? `Verified model files at ${artifactPath}` : 'Already downloaded';
+      return `<span class="quant-dl-btn quant-dl-btn-done" title="${escapeHtmlAttribute(title)}" aria-label="Already downloaded">✓</span>`;
     }
     if (status === 'queued') {
       return `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;
@@ -5492,48 +5806,58 @@ async function loadRepositoryDetails(entry) {
     return '';
   }
 
-  function selectableDownloadControl(item, status) {
-    const repo = currentAnalysis?.repo || '';
-    const fv = item.filter_value || item.id || '';
+  function selectableDownloadControl(item, status, analysis = currentAnalysis, destination) {
+    const repo = analysis?.repo || '';
+    const selectedDestination = destination || selectableDestinationContext(analysis);
+    const branchRevision = branchVariantRevision(item);
+    const itemRevision = selectableRevision(item);
+    const fv = branchRevision ? '' : (item.filter_value || item.id || '');
     const files = Array.isArray(item.files) ? item.files : [];
-    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
-    const statusKey = exactArtifact ? selectableStatusKey(item) : fv;
+    const exactArtifact = !branchRevision && files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+    const statusKey = exactArtifact || itemRevision ? selectableStatusKey(item, analysis, selectedDestination) : fv;
+    const rowKey = selectableRowKey(item, analysis);
     const dlRepo = item.upstream_repo || repo;
     const statusRepo = repo;
-    const chip = selectableStatusChip(status);
-    if (chip) return { statusKey, html: chip };
+    const artifactPath = branchRevision
+      ? branchArtifactPaths.get(branchArtifactPathKey(repo, statusKey)) || ''
+      : '';
+    const chip = selectableStatusChip(status, artifactPath);
+    if (chip) return { statusKey, rowKey, html: chip };
     const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                  <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
                </svg>`;
     return {
       statusKey,
+      rowKey,
       html: `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
-               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null}))}">${dlIcon}</button>`
+               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey: branchRevision ? '' : statusKey, isDataset: !!analysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null, ...(itemRevision ? {revision: itemRevision} : {}), ...(branchRevision ? {branchVariant: true} : {})}))}">${dlIcon}</button>`
     };
   }
 
   // Update the rendered rows for the open analysis without re-rendering the
-  // analysis or resetting scroll/focus. Rows carry their exact status key so
-  // distinct artifacts that share a filter_value stay independent.
-  function updateSelectableRowStatuses(items) {
+  // analysis or resetting scroll/focus. Rows carry a stable item identity while
+  // the stored branch status remains scoped to the selected destination.
+  function updateSelectableRowStatuses(items, force = false) {
     const analysis = currentAnalysis;
     const repo = analysis?.repo || '';
     if (!repo || !Array.isArray(items) || !items.length) return;
     const container = $('#selectableItems');
     if (!container || typeof container.querySelectorAll !== 'function') return;
+    const destination = selectableDestinationContext(analysis);
     const itemByKey = new Map();
-    items.forEach(item => itemByKey.set(selectableStatusKey(item), item));
+    items.forEach(item => itemByKey.set(selectableRowKey(item, analysis), item));
     const map = getDlStatus(repo, !!analysis.is_dataset);
     const rows = container.querySelectorAll('.quant-row[data-status-key]');
     for (const row of rows) {
-      let statusKey = '';
-      try { statusKey = decodeURIComponent(row.dataset?.statusKey || ''); } catch { continue; }
-      const item = itemByKey.get(statusKey);
+      let rowKey = '';
+      try { rowKey = decodeURIComponent(row.dataset?.statusKey || ''); } catch { continue; }
+      const item = itemByKey.get(rowKey);
       if (!item) continue;
+      const statusKey = selectableStatusKey(item, analysis, destination);
       const status = map[statusKey] || '';
-      if ((row.dataset?.dlStatus || '') === status) continue;
-      const control = selectableDownloadControl(item, status);
+      if (!force && (row.dataset?.dlStatus || '') === status) continue;
+      const control = selectableDownloadControl(item, status, analysis, destination);
       const controlNode = row.querySelector?.('.quant-dl-btn');
       if (controlNode) controlNode.outerHTML = control.html;
       if (row.dataset) row.dataset.dlStatus = status;
@@ -5547,6 +5871,7 @@ async function loadRepositoryDetails(entry) {
     // loadRepositoryDetails reconciles live jobs and cache presence before this
     // render. Artifact 'done' status comes only from that cache check; do not
     // infer it from job state here.
+    const destination = selectableDestinationContext(currentAnalysis, { useRenderedSelection: false });
     const dlMap = getDlStatus(repo, !!currentAnalysis?.is_dataset);
 
     const categories = {};
@@ -5599,17 +5924,18 @@ async function loadRepositoryDetails(entry) {
         const ram     = item.ram_human   ? `<span class="quant-ram">${escapeHtml(item.ram_human)} RAM</span>` : '';
         const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
 
-        const fv = item.filter_value || item.id || '';
-        const statusKey = selectableStatusKey(item);
+        const branchRevision = branchVariantRevision(item);
+        const fv = branchRevision ? '' : (item.filter_value || item.id || '');
+        const statusKey = selectableStatusKey(item, currentAnalysis, destination);
         const dlStatus = dlMap[statusKey] || '';
         // Left control: a Download button when idle; otherwise it is REPLACED by
         // a status chip reflecting the quant's state in the download queue
         // (done / downloading / queued) so it can't be started twice.
-        const control = selectableDownloadControl(item, dlStatus);
+        const control = selectableDownloadControl(item, dlStatus, currentAnalysis, destination);
 
         html += `
           <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}"
-               data-status-key="${escapeHtmlAttribute(encodeURIComponent(control.statusKey))}"
+               data-status-key="${escapeHtmlAttribute(encodeURIComponent(control.rowKey))}"
                data-dl-status="${escapeHtmlAttribute(dlStatus)}">
             ${control.html}
             <span class="quant-label">${escapeHtml(item.label)}</span>
@@ -5631,30 +5957,41 @@ async function loadRepositoryDetails(entry) {
   window.downloadQuantFromButton = function(button) {
     try {
       const args = JSON.parse(decodeURIComponent(button.dataset.download));
-      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey);
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey, args.revision, args.branchVariant === true);
     } catch (e) { console.error('Invalid selectable download data', e); }
   };
 
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey, selectedRevision, isBranchVariant = false) {
     try {
+      const branchVariant = isBranchVariant === true;
+      if (branchVariant && (!selectedRevision || repo !== currentAnalysis?.repo || isDataset)) {
+        throw new Error('A branch variant requires its analyzed model revision.');
+      }
+      const analysisAtRequest = currentAnalysis;
+      // Freeze the same existing route/default selector for the disk guard,
+      // download request, and resulting row identity.
+      const destination = selectableDestinationContext(currentAnalysis);
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
       // the repo being analyzed, not to its ancestors.
-      const revision = (repo === currentAnalysis?.repo)
-        ? (currentAnalysis?.branch || 'main')
-        : 'main';
+      const revision = branchVariant
+        ? selectedRevision
+        : ((repo === currentAnalysis?.repo)
+          ? (selectedRevision || currentAnalysis?.branch || 'main')
+          : 'main');
       const body = {
         repo,
         revision,
         dataset: isDataset,
-        filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
-        exactMatch: files ? true : !!filterValue
+        filters: branchVariant ? [] : (files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : [])),
+        exactMatch: branchVariant ? false : (files ? true : !!filterValue)
       };
+      if (branchVariant) body.branchVariant = true;
       // Send the labeled destination choice when type folders are configured.
       // For an upstream companion (mmproj) this still resolves to the analyzed
       // model's route, so companions land with the parent.
-      const routeKey = isDataset ? '' : routeSelectValue('quantRouteSelect');
+      const routeKey = isDataset ? '' : destination.routeKey;
       if (routeKey) body.routeKey = routeKey;
       // When downloading from an upstream repo (e.g. mmproj from a base model),
       // tell the server to store the file under the current model's folder.
@@ -5667,11 +6004,26 @@ async function loadRepositoryDetails(entry) {
         return;
       }
 
+      const resolvedStatusKey = branchVariant
+        ? `branchVariant:${revision}:${destination.signature}`
+        : (statusKey || filterValue);
+      if (branchVariant) {
+        if (data.repo !== repo || data.branchVariant !== true || data.revision !== revision ||
+            (data.routeKey || '') !== routeKey) {
+          throw new Error('The server did not confirm the selected branch destination.');
+        }
+        const actualRoot = data.outputDir || data.localDir || data.hubDir || '';
+        if (actualRoot) branchDestinationRoots.set(destination.signature, actualRoot);
+      }
+
       state.jobs.set(data.id, data);
-      setDlStatus(statusRepo || repo, isDataset, statusKey || filterValue, 'queued');
+      setDlStatus(statusRepo || repo, isDataset, resolvedStatusKey, 'queued');
       // Replace the download button with the queued chip immediately.
       const row = sourceRow || document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
-      if (row) {
+      const branchDestinationStillSelected = !branchVariant ||
+        (currentAnalysis === analysisAtRequest &&
+         selectableDestinationContext(currentAnalysis).signature === destination.signature);
+      if (row && branchDestinationStillSelected) {
         const btn = row.querySelector('.quant-dl-btn');
         if (btn) btn.outerHTML = selectableStatusChip('queued');
         if (row.dataset) row.dataset.dlStatus = 'queued';
@@ -6367,6 +6719,7 @@ async function loadRepositoryDetails(entry) {
 
   function init() {
     initNavigation();
+    bindSelectableDestinationChanges();
     initSidebarResize();
     initModelsListResize();
     if (!isFilePreview()) {

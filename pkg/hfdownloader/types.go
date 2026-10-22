@@ -129,6 +129,10 @@ type Job struct {
 	// model) but wanting the files saved alongside a different model's files.
 	// When empty, Repo is used for the destination path (default behaviour).
 	LocalRepo string
+
+	// BranchVariant marks an EXL2/EXL3 branch choice supplied by the analyzer.
+	// It isolates that complete branch artifact from ordinary revision downloads.
+	BranchVariant bool
 }
 
 // Settings configures download behavior.
@@ -166,6 +170,11 @@ type Settings struct {
 	// HubDir freezes the exact Hub storage directory when nonempty. Empty
 	// retains normal ENV resolution at cache construction, even with CacheDir.
 	HubDir string
+	// RebuildCoordinationRoots are additional app-owned cache roots whose
+	// generated wrapper/Go rebuild must serialize with this download. The server
+	// sets its HF root for routed/local outputs that may alias its rebuild effects;
+	// local destination folders do not receive a separate coordination file.
+	RebuildCoordinationRoots []string
 
 	// StaleTimeout is the duration after which an incomplete download
 	// with no writes is considered stale and can be taken over by
@@ -322,6 +331,11 @@ type Settings struct {
 	// used for snapshot paths. It is intended for callers that must reserve the
 	// concrete destinations for the full plan lifecycle.
 	OnPlanComplete func(plan Plan)
+
+	// BeforePlanWrite is an optional admission point called after planning and
+	// before OnPlanComplete or any destination mutation. Returning an error
+	// refuses the plan without creating cache directories or partial files.
+	BeforePlanWrite func(plan Plan) error
 }
 
 // ProgressEvent represents a progress update during download.

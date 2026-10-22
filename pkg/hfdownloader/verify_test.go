@@ -4,6 +4,9 @@
 package hfdownloader
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -268,6 +271,48 @@ func TestShouldSkipLocal(t *testing.T) {
 		// Actually, size 0 != 4, so it won't match
 		if skip {
 			t.Error("should not skip when expected size is 0")
+		}
+	})
+}
+
+func TestShouldSkipBranchVariantLocalRequiresExpectedHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	expected := []byte("expected bytes")
+	digest := sha256.Sum256(expected)
+	hash := hex.EncodeToString(digest[:])
+	path := filepath.Join(tmpDir, "file.bin")
+
+	t.Run("unknown identity is not reused by size", func(t *testing.T) {
+		if err := os.WriteFile(path, expected, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		skip, reason, err := shouldSkipBranchVariantLocalCtx(context.Background(), PlanItem{Size: int64(len(expected))}, path)
+		if err != nil || skip || reason != "" {
+			t.Fatalf("skip=%t reason=%q err=%v; want no reuse without expected hash", skip, reason, err)
+		}
+	})
+
+	t.Run("same-size wrong content fails trusted identity", func(t *testing.T) {
+		wrong := []byte("different data")
+		if len(wrong) != len(expected) {
+			t.Fatal("test bodies must have equal size")
+		}
+		if err := os.WriteFile(path, wrong, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		skip, reason, err := shouldSkipBranchVariantLocalCtx(context.Background(), PlanItem{Size: int64(len(expected)), SHA256: hash}, path)
+		if err != nil || skip || reason != "" {
+			t.Fatalf("skip=%t reason=%q err=%v; want no reuse for different content", skip, reason, err)
+		}
+	})
+
+	t.Run("matching expected identity is reusable", func(t *testing.T) {
+		if err := os.WriteFile(path, expected, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		skip, reason, err := shouldSkipBranchVariantLocalCtx(context.Background(), PlanItem{Size: int64(len(expected)), SHA256: hash}, path)
+		if err != nil || !skip || reason != "sha256 match" {
+			t.Fatalf("skip=%t reason=%q err=%v; want SHA-verified reuse", skip, reason, err)
 		}
 	})
 }

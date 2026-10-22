@@ -69,6 +69,12 @@ func (c *TargetsConfig) Save(path string) error {
 	if path == "" {
 		path = DefaultTargetsPath()
 	}
+	if err := rejectOwnedCoordinationMutationTargets(false, path); err != nil {
+		return err
+	}
+	if err := rejectOwnedCoordinationMutationTargets(true, path); err != nil {
+		return err
+	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(path)

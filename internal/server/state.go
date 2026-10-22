@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // jobsStateFile is the on-disk format for jobs_state.json.
@@ -34,6 +35,9 @@ func SaveJobsState(jobs []*Job) error {
 
 // saveJobsStateLocked persists jobs to path. stateMu must be held.
 func saveJobsStateLocked(path string, jobs []*Job) error {
+	if err := hfdownloader.RejectOwnedBranchVariantEntryWrites(path); err != nil {
+		return fmt.Errorf("jobs state path conflicts with app-owned storage: %w", err)
+	}
 	// Snapshot: clamp running/queued → paused so they appear resumable on next start
 	persisted := make([]*Job, 0, len(jobs))
 	for _, j := range jobs {
@@ -216,6 +220,12 @@ var historyMu sync.Mutex
 func AppendHistory(job *Job) error {
 	historyMu.Lock()
 	defer historyMu.Unlock()
+	if err := hfdownloader.RejectOwnedBranchVariantEntryWrites(HistoryPath()); err != nil {
+		return fmt.Errorf("history path conflicts with app-owned storage: %w", err)
+	}
+	if err := hfdownloader.RejectOwnedBranchVariantContentWrites(HistoryPath()); err != nil {
+		return fmt.Errorf("history target conflicts with app-owned storage: %w", err)
+	}
 
 	hf, err := loadHistoryLocked()
 	if err != nil {

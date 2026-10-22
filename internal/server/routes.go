@@ -15,6 +15,7 @@ import (
 // HTTP 400 rather than treating the value as a destination path.
 var errInvalidRouteKey = errors.New("invalid routeKey")
 var errInvalidDestination = errors.New("invalid destination")
+var errInvalidBranchVariant = errors.New("invalid branchVariant")
 
 // routeKeys is the closed, server-owned set of download-route keys. Keys are
 // an internal/advanced-API detail; the dashboard renders human labels for
@@ -45,6 +46,19 @@ func validatedRouteKey(req DownloadRequest) (string, error) {
 		return "", errInvalidRouteKey
 	}
 	return req.RouteKey, nil
+}
+
+// validateBranchVariantRequest keeps EXL branch storage opt-in through the
+// analyzer's explicit marker. A complete branch request is unfiltered and
+// targets the analyzed model repo; ordinary revisions keep legacy paths.
+func validateBranchVariantRequest(req DownloadRequest) error {
+	if !req.BranchVariant {
+		return nil
+	}
+	if req.Dataset || req.Revision == "" || len(req.Filters) != 0 || len(req.Excludes) != 0 || req.AppendFilterSubdir || req.LocalRepo != "" {
+		return errInvalidBranchVariant
+	}
+	return nil
 }
 
 // resolveDownloadDestination is the common destination owner for job creation

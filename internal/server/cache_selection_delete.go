@@ -177,6 +177,13 @@ func jobDestinationBase(job *Job) string {
 		if err != nil {
 			return ""
 		}
+		if job.BranchVariant {
+			repoType := hfdownloader.RepoTypeModel
+			base, err = hfdownloader.BranchVariantRevisionPayloadPath(root, repoType, repo, job.Revision)
+			if err != nil {
+				return ""
+			}
+		}
 		return base
 	}
 	repoID := job.Repo
@@ -193,6 +200,13 @@ func jobDestinationBase(job *Job) string {
 	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir, 0).Repo(repoID, repoType)
 	if err != nil {
 		return ""
+	}
+	if job.BranchVariant {
+		base, err := hfdownloader.BranchVariantRevisionPayloadPath(job.OutputDir, repoType, repoID, job.Revision)
+		if err != nil {
+			return ""
+		}
+		return base
 	}
 	return repo.FriendlyPath()
 }
@@ -998,7 +1012,45 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 			return nil, false
 		}
 	}
-	entries := make([]string, 0, len(plan.Items)*2)
+	if job.BranchVariant {
+		if !plan.CommitResolved {
+			return nil, false
+		}
+		var err error
+		if repo != nil {
+			base, err = hfdownloader.BranchVariantPath(job.OutputDir, hfdownloader.RepoTypeModel, job.Repo, job.Revision, plan.Commit)
+		} else {
+			root := job.LocalDir
+			if root == "" {
+				root = job.OutputDir
+			}
+			repoID := job.Repo
+			if job.LocalRepo != "" {
+				repoID = job.LocalRepo
+			}
+			base, err = hfdownloader.BranchVariantPath(root, hfdownloader.RepoTypeModel, repoID, job.Revision, plan.Commit)
+		}
+		if err != nil {
+			return nil, false
+		}
+	}
+	entries := make([]string, 0, len(plan.Items)*2+2)
+	if job.BranchVariant {
+		entries = append(entries, base)
+		root := job.LocalDir
+		if root == "" {
+			root = job.OutputDir
+		}
+		repoID := job.Repo
+		if job.LocalRepo != "" {
+			repoID = job.LocalRepo
+		}
+		metadata, err := hfdownloader.BranchVariantMetadataPath(root, hfdownloader.RepoTypeModel, repoID, job.Revision, plan.Commit)
+		if err != nil {
+			return nil, false
+		}
+		entries = append(entries, metadata, filepath.Join(metadata, hfdownloader.ManifestFilename))
+	}
 	complete := true
 	for _, item := range plan.Items {
 		friendly, err := hfdownloader.SafeJoin(base, item.RelativePath)
@@ -1017,6 +1069,128 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 		}
 	}
 	return entries, complete
+}
+
+func branchVariantServiceScope(job *Job) (frozenMutationPath, error) {
+	if job == nil || !job.BranchVariant {
+		return frozenMutationPath{}, fmt.Errorf("job does not own EXL branch storage")
+	}
+	root := job.OutputDir
+	if job.LocalDir != "" {
+		root = job.LocalDir
+	}
+	serviceRoot, err := hfdownloader.BranchVariantServiceRoot(root)
+	if err != nil {
+		return frozenMutationPath{}, err
+	}
+	return freezeMutationDirectory(serviceRoot)
+}
+
+func plannedPathsOverlapScope(planned map[string]frozenMutationPath, scope frozenMutationPath) bool {
+	for _, path := range planned {
+		if path.key == "" || pathKeysOverlap(path.key, scope.key) {
+			return true
+		}
+	}
+	return false
+}
+
+func plannedMapsOverlap(a, b map[string]frozenMutationPath) bool {
+	for _, left := range a {
+		for _, right := range b {
+			if left.key == "" || right.key == "" || pathKeysOverlap(left.key, right.key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func plannedPathsOverlapJobBases(planned map[string]frozenMutationPath, job *Job) bool {
+	bases := jobWritableBases(job)
+	if len(bases) == 0 {
+		return true
+	}
+	for _, base := range bases {
+		frozen, err := freezeMutationDirectory(base)
+		if err != nil {
+			return true
+		}
+		if plannedPathsOverlapScope(planned, frozen) {
+			return true
+		}
+	}
+	return false
+}
+
+// admitPlanWrite records one resolved run plan atomically with checks against
+// concurrent branch-service owners. Ordinary writers are rejected when their
+// concrete plan reaches a claimed/planned service tree; separate branch
+// artifacts continue to share the service root and remain independently
+// writable.
+func (m *JobManager) admitPlanWrite(job *Job, activityID uint64, plan hfdownloader.Plan) error {
+	paths, complete := jobPlannedWriteEntries(job, plan)
+	planned, frozenComplete := plannedDestinationSet(paths)
+	planComplete := complete && frozenComplete
+	if job.BranchVariant && !planComplete {
+		return fmt.Errorf("could not establish every destination in the download plan")
+	}
+	var currentService frozenMutationPath
+	if job.BranchVariant {
+		var err error
+		currentService, err = branchVariantServiceScope(job)
+		if err != nil {
+			return fmt.Errorf("could not establish branch service ownership scope: %w", err)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	activity := m.runActivities[activityID]
+	if activity == nil {
+		return fmt.Errorf("download run is no longer admitted")
+	}
+	for _, scopes := range m.hfRepoReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			return fmt.Errorf("download plan conflicts with a reserved HF repository or branch service tree")
+		}
+		for _, scope := range scopes {
+			for _, destination := range planned {
+				if mutationScopesOverlap(scope, destination) {
+					return fmt.Errorf("download plan conflicts with a reserved HF repository or branch service tree")
+				}
+			}
+		}
+	}
+	for otherID, other := range m.runActivities {
+		if otherID == activityID || other == nil || other.job == nil {
+			continue
+		}
+		if job.BranchVariant && !other.job.BranchVariant {
+			if other.planKnown && plannedPathsOverlapScope(other.planned, currentService) {
+				return fmt.Errorf("ordinary download plan conflicts with the app-owned EXL branch service tree")
+			}
+		}
+		if !job.BranchVariant && other.job.BranchVariant {
+			otherService, err := branchVariantServiceScope(other.job)
+			if err != nil || plannedPathsOverlapScope(planned, otherService) {
+				return fmt.Errorf("ordinary download plan conflicts with the app-owned EXL branch service tree")
+			}
+		}
+		if job.BranchVariant && other.job.BranchVariant {
+			if other.planKnown && plannedMapsOverlap(planned, other.planned) {
+				return fmt.Errorf("branch variant plan conflicts with another active artifact writer")
+			}
+			if !other.planComplete && (plannedPathsOverlapJobBases(planned, other.job) || plannedPathsOverlapJobBases(other.planned, job)) {
+				return fmt.Errorf("branch variant destination may overlap another active artifact writer")
+			}
+		}
+	}
+	activity.planned = planned
+	activity.planKnown = true
+	activity.planComplete = planComplete
+	m.signalWriteDecisionLocked()
+	return nil
 }
 
 func hfReservationConflictsJob(scopes []frozenMutationPath, job *Job) bool {
@@ -1044,9 +1218,9 @@ func hfReservationConflictsJob(scopes []frozenMutationPath, job *Job) bool {
 
 // reserveSelectedHF protects the complete selected HF repo-reference namespace
 // and the associated friendly view for the full scan/unlink interval.
-func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string) (func(), bool) {
-	scopes := make([]frozenMutationPath, 0, 2)
-	for _, scope := range []string{repoDir, friendlyDir} {
+func (m *JobManager) reserveSelectedHF(repoDir, friendlyDir string, additionalScopes ...string) (func(), bool) {
+	scopes := make([]frozenMutationPath, 0, 2+len(additionalScopes))
+	for _, scope := range append([]string{repoDir, friendlyDir}, additionalScopes...) {
 		frozen, err := freezeMutationDirectory(scope)
 		if err != nil {
 			return nil, false
@@ -1922,6 +2096,16 @@ func localSelectionFilesRoot(root *os.Root, physicalRepo string, excluded []stri
 				return fs.SkipDir
 			}
 			return nil
+		}
+		if entry.IsDir() && pathIdentityKey(entry.Name()) == pathIdentityKey(hfdownloader.BranchVariantServiceDirName) {
+			servicePath := filepath.Join(physicalRepo, filepath.FromSlash(name))
+			owned, ownerErr := hfdownloader.IsOwnedBranchVariantServicePath(servicePath)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			if owned {
+				return fs.SkipDir
+			}
 		}
 		if entry.IsDir() || !smartdl.IsGGUFFileName(entry.Name()) {
 			return nil

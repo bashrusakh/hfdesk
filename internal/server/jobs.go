@@ -41,6 +41,7 @@ type Job struct {
 	ID                 string            `json:"id"`
 	Repo               string            `json:"repo"`
 	Revision           string            `json:"revision"`
+	BranchVariant      bool              `json:"branchVariant,omitempty"`
 	IsDataset          bool              `json:"isDataset,omitempty"`
 	Filters            []string          `json:"filters,omitempty"`
 	Excludes           []string          `json:"excludes,omitempty"`
@@ -496,6 +497,9 @@ func stringSlicesEqual(a, b []string) bool {
 // destination, destination folder override, or matching mode creates a new
 // job.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
+	if err := validateBranchVariantRequest(req); err != nil {
+		return nil, false, err
+	}
 	reservationRetries := 0
 resolveRequest:
 	revision := req.Revision
@@ -555,6 +559,7 @@ resolveRequest:
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
+			existing.BranchVariant == req.BranchVariant &&
 			existing.IsDataset == req.Dataset &&
 			pathIdentityKey(existing.OutputDir) == reqDestKey &&
 			existing.Flat == flat &&
@@ -571,22 +576,23 @@ resolveRequest:
 	}
 
 	job := &Job{
-		ID:         generateID(),
-		Repo:       req.Repo,
-		Revision:   revision,
-		IsDataset:  req.Dataset,
-		Filters:    req.Filters,
-		Excludes:   req.Excludes,
-		OutputDir:  outputDir,
-		HubDir:     hubDir,
-		LocalDir:   effectiveLocalDir,
-		LocalRepo:  req.LocalRepo,
-		Flat:       flat,
-		ExactMatch: req.ExactMatch,
-		RouteKey:   routeKey,
-		Status:     JobStatusQueued,
-		CreatedAt:  time.Now(),
-		Progress:   JobProgress{},
+		ID:            generateID(),
+		Repo:          req.Repo,
+		Revision:      revision,
+		BranchVariant: req.BranchVariant,
+		IsDataset:     req.Dataset,
+		Filters:       req.Filters,
+		Excludes:      req.Excludes,
+		OutputDir:     outputDir,
+		HubDir:        hubDir,
+		LocalDir:      effectiveLocalDir,
+		LocalRepo:     req.LocalRepo,
+		Flat:          flat,
+		ExactMatch:    req.ExactMatch,
+		RouteKey:      routeKey,
+		Status:        JobStatusQueued,
+		CreatedAt:     time.Now(),
+		Progress:      JobProgress{},
 		// partialFilesMu is allocated at job creation so cloneJobLocked
 		// can read it without a nil check; the tracker map is left
 		// nil until runJob wires it.
@@ -653,7 +659,7 @@ resolveRequest:
 		// Re-run dedup while still holding the commit lock even when the
 		// inventory snapshot changed; an equal concurrent admission wins.
 		for _, existing := range m.jobs {
-			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
+			if existing.Repo == req.Repo && existing.Revision == revision && existing.BranchVariant == req.BranchVariant && existing.IsDataset == req.Dataset &&
 				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
 				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
 				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
@@ -1729,6 +1735,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	dlJob := hfdownloader.Job{
 		Repo:               job.Repo,
 		Revision:           job.Revision,
+		BranchVariant:      job.BranchVariant,
 		IsDataset:          job.IsDataset,
 		Filters:            job.Filters,
 		Excludes:           job.Excludes,
@@ -1745,19 +1752,20 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	cache := jobCache(cfg, job)
 
 	settings := hfdownloader.Settings{
-		CacheDir:           cache.Root,
-		HubDir:             cache.HubDir(),
-		Concurrency:        cfg.Concurrency,
-		MaxActiveDownloads: cfg.MaxActive,
-		Token:              cfg.Token,
-		MultipartThreshold: cfg.MultipartThreshold,
-		Verify:             cfg.Verify,
-		Retries:            cfg.Retries,
-		StallTimeout:       cfg.StallTimeout,
-		Endpoint:           cfg.Endpoint,
-		Proxy:              cfg.Proxy,
-		MaxSpeed:           cfg.MaxSpeed,
-		SpeedLimiter:       m.speedLimiter,
+		CacheDir:                 cache.Root,
+		HubDir:                   cache.HubDir(),
+		RebuildCoordinationRoots: []string{cfg.cacheRoot()},
+		Concurrency:              cfg.Concurrency,
+		MaxActiveDownloads:       cfg.MaxActive,
+		Token:                    cfg.Token,
+		MultipartThreshold:       cfg.MultipartThreshold,
+		Verify:                   cfg.Verify,
+		Retries:                  cfg.Retries,
+		StallTimeout:             cfg.StallTimeout,
+		Endpoint:                 cfg.Endpoint,
+		Proxy:                    cfg.Proxy,
+		MaxSpeed:                 cfg.MaxSpeed,
+		SpeedLimiter:             m.speedLimiter,
 	}
 
 	// When the downloader's context is cancelled, check whether this was
@@ -1824,18 +1832,8 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		settings.CacheDir = ""
 		settings.HubDir = ""
 	}
-	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
-		paths, complete := jobPlannedWriteEntries(job, plan)
-		planned, frozenComplete := plannedDestinationSet(paths)
-		complete = complete && frozenComplete
-		m.mu.Lock()
-		if activity := m.runActivities[activityID]; activity != nil {
-			activity.planned = planned
-			activity.planKnown = true
-			activity.planComplete = complete
-			m.signalWriteDecisionLocked()
-		}
-		m.mu.Unlock()
+	settings.BeforePlanWrite = func(plan hfdownloader.Plan) error {
+		return m.admitPlanWrite(job, activityID, plan)
 	}
 
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
@@ -1929,8 +1927,9 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 	cfg := m.snapshotConfig()
 	cache := jobCache(cfg, job)
 	settings := hfdownloader.Settings{
-		CacheDir: cache.Root,
-		HubDir:   cache.HubDir(),
+		CacheDir:                 cache.Root,
+		HubDir:                   cache.HubDir(),
+		RebuildCoordinationRoots: []string{cfg.cacheRoot()},
 	}
 	if job.LocalDir != "" {
 		settings.OutputDir = job.LocalDir
@@ -1939,8 +1938,14 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 	}
 	endObservedMutation := m.beginObservedMutation(dsts)
 	defer endObservedMutation()
-	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
-		jobsLog.Warn("cleanup part files for paused job", "job_id", job.ID, "error", err)
+	var cleanupErr error
+	if job.BranchVariant {
+		cleanupErr = hfdownloader.CleanupBranchVariantJobPartFiles(settings, dsts)
+	} else {
+		cleanupErr = hfdownloader.CleanupJobPartFiles(settings, dsts)
+	}
+	if cleanupErr != nil {
+		jobsLog.Warn("cleanup part files for paused job", "job_id", job.ID, "error", cleanupErr)
 	}
 }
 

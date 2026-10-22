@@ -68,6 +68,26 @@ func (cfg Config) cacheForRoot(root string) *hfdownloader.HFCache {
 
 func (cfg Config) cache() *hfdownloader.HFCache { return cfg.cacheForRoot(cfg.cacheRoot()) }
 
+// ResolveRebuildCache applies the same read-only config and environment
+// precedence as the running app, then applies explicit rebuild overrides.
+// It deliberately does not persist config or create a server/job manager.
+func ResolveRebuildCache(cacheDir, hubDir string) (*hfdownloader.HFCache, error) {
+	cfg := DefaultConfig()
+	if cacheDir == "" || hubDir == "" {
+		if err := ApplyConfigToServer(&cfg); err != nil {
+			return nil, err
+		}
+	}
+	if cacheDir != "" {
+		cfg.CacheDir = cacheDir
+	}
+	cache := cfg.cache()
+	if hubDir != "" {
+		cache = hfdownloader.NewHFCacheResolved(cache.Root, hubDir, 0)
+	}
+	return cache, nil
+}
+
 // jobCache is also used for manually constructed legacy jobs. Loaded jobs are
 // resolved once in LoadState, so normal runners/cleanup never take this fallback.
 func jobCache(cfg Config, job *Job) *hfdownloader.HFCache {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // SyncOptions configures the sync operation.
@@ -18,6 +19,41 @@ type SyncOptions struct {
 	Clean bool
 	// Verbose prints detailed progress
 	Verbose bool
+	// OnProgress receives verbose rebuild progress from the shared Go owner.
+	// It is only called when Verbose is true.
+	OnProgress func(string)
+	// Context bounds the mutation leases this operation waits for. A caller
+	// that owns a request context passes it so a disconnected client does not
+	// leave the handler blocked behind a competing artifact mutation. A nil
+	// context means context.Background().
+	Context context.Context
+	// LeaseBudget bounds each individual lease wait of the operation. A
+	// running download holds the cache mutation lease for the whole transfer,
+	// so a caller that must answer while that transfer runs passes a budget:
+	// the wait then ends with a clear error instead of lasting for the whole
+	// transfer. The budget applies to every wait separately, so a long rebuild
+	// is not cut short by the time an earlier wait consumed. A zero budget
+	// leaves the waits bounded only by Context.
+	LeaseBudget time.Duration
+}
+
+// leaseContext returns the context that bounds this operation's lease waits.
+func (o SyncOptions) leaseContext() context.Context {
+	if o.Context == nil {
+		return context.Background()
+	}
+	return o.Context
+}
+
+// leaseWaitContext bounds one lease wait with the operation's budget.
+func (o SyncOptions) leaseWaitContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if o.LeaseBudget <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, o.LeaseBudget)
 }
 
 // SyncResult contains statistics from a sync operation.
@@ -35,11 +71,71 @@ type SyncResult struct {
 // creates friendly-view entries pointing at snapshot files.
 func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	result := &SyncResult{}
-
+	leaseCtx := opts.leaseContext()
 	hubDir := c.HubDir()
 	if _, err := os.Stat(hubDir); errors.Is(err, os.ErrNotExist) {
 		return result, nil // Nothing to sync
 	}
+	waitCtx, cancelWait := opts.leaseWaitContext(leaseCtx)
+	coordinationRelease, err := acquireRebuildCoordinationLeases(waitCtx, []string{c.Root}, true, func() {
+		if opts.Verbose && opts.OnProgress != nil {
+			opts.OnProgress("Waiting for the HF cache mutation lease...")
+		}
+	})
+	cancelWait()
+	if err != nil {
+		return nil, fmt.Errorf("lease HF rebuild coordination for sync: %w", err)
+	}
+	defer coordinationRelease()
+	if _, err := os.Stat(hubDir); errors.Is(err, os.ErrNotExist) {
+		return result, nil // Hub disappeared while waiting; nothing to sync
+	} else if err != nil {
+		return nil, fmt.Errorf("inspect Hub cache before sync: %w", err)
+	}
+	if opts.Verbose && opts.OnProgress != nil {
+		opts.OnProgress("Rebuilding friendly view from: " + c.Root)
+	}
+	if opts.Clean {
+		// The cache root is the common admission scope for nested selected
+		// local roots; its exclusive lease fences the full recursive clean.
+		cleanWaitCtx, cancelCleanWait := opts.leaseWaitContext(leaseCtx)
+		cleanRelease, err := AcquireBranchVariantDirectoryLeaseContext(cleanWaitCtx, c.Root, true)
+		cancelCleanWait()
+		if err != nil {
+			return nil, fmt.Errorf("lease recursive orphan cleanup: %w", err)
+		}
+		if err := RejectBranchVariantTreeEffects(c.ModelsDir(), c.DatasetsDir()); err != nil {
+			cleanRelease()
+			return nil, err
+		}
+		if err := RebindBranchVariantServiceRootUnderLease(c.Root); err != nil {
+			cleanRelease()
+			return nil, fmt.Errorf("refresh copied branch variant owner before clean: %w", err)
+		}
+		removed := 0
+		for _, dir := range []string{c.ModelsDir(), c.DatasetsDir()} {
+			count, cleanErr := cleanOrphansInDirWithProgress(dir, func(message string) {
+				if opts.Verbose && opts.OnProgress != nil {
+					opts.OnProgress(message)
+				}
+			})
+			removed += count
+			if cleanErr != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("clean %s: %w", dir, cleanErr))
+			}
+		}
+		result.OrphansRemoved = removed
+		cleanRelease()
+	} else if err := RebindBranchVariantServiceRootUnderLease(c.Root); err != nil {
+		return nil, fmt.Errorf("refresh copied branch variant owner before sync: %w", err)
+	}
+	rootWaitCtx, cancelRootWait := opts.leaseWaitContext(leaseCtx)
+	rootRelease, err := AcquireBranchVariantDirectoryLeaseContext(rootWaitCtx, c.Root, false)
+	cancelRootWait()
+	if err != nil {
+		return nil, fmt.Errorf("lease HF cache for sync: %w", err)
+	}
+	defer rootRelease()
 
 	// Scan hub/ for repo directories
 	entries, err := os.ReadDir(hubDir)
@@ -59,6 +155,9 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 		}
 
 		result.ReposScanned++
+		if opts.Verbose && opts.OnProgress != nil {
+			opts.OnProgress("Processing: " + string(repoType) + "/" + owner + "/" + name)
+		}
 
 		repoDir, err := c.Repo(owner+"/"+name, repoType)
 		if err != nil {
@@ -74,15 +173,6 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 
 		result.SymlinksCreated += created
 		result.SymlinksUpdated += updated
-	}
-
-	// Clean orphaned symlinks if requested
-	if opts.Clean {
-		removed, err := c.cleanOrphanedSymlinks(opts)
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("clean orphans: %w", err))
-		}
-		result.OrphansRemoved = removed
 	}
 
 	return result, nil
@@ -122,6 +212,9 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	created := 0
 	updated := 0
 	var errs []error
+	if err := RejectOwnedBranchVariantDirectoryWrites(repoDir.Path(), repoDir.FriendlyPath()); err != nil {
+		return 0, 0, []error{err}
+	}
 
 	// Find the current commit from refs
 	// Try common refs: main, master
@@ -138,30 +231,38 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	}
 
 	if commit == "" {
-		// No refs found, try to find any snapshot
-		snapshots, err := repoDir.ListSnapshots()
-		if err != nil {
-			return 0, 0, []error{fmt.Errorf("list snapshots: %w", err)}
-		}
-		if len(snapshots) > 0 {
-			commit = snapshots[0] // Use first available snapshot
-		}
-	}
-
-	if commit == "" {
-		// Blobs-only cache (for example one downloaded on a filesystem where
-		// link creation was skipped entirely): the offline download manifest
-		// still names the commit its blobs belong to.
+		// A legacy repo manifest can identify an ordinary revision when there
+		// is no main/master ref. EXL branch manifests live in a separate Hub
+		// namespace and are handled below; they must never be projected into the
+		// shared repo root.
 		m, err := readRepoManifest(repoDir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("read download manifest: %w", err))
-		} else if m != nil {
+		} else if m != nil && !m.BranchVariant {
 			commit = m.Commit
 		}
 	}
 
 	if commit == "" {
-		return 0, 0, errs // Nothing to sync, but retain manifest read failures
+		// Preserve the historical first-snapshot fallback only for repositories
+		// without an owned branch control record. Otherwise snapshots may
+		// represent a selectable EXL variant, not the ordinary repo-root view.
+		hasVariants, variantErr := c.hasOwnedBranchVariants(repoDir)
+		if variantErr != nil {
+			errs = append(errs, variantErr)
+		} else if !hasVariants {
+			snapshots, readErr := repoDir.ListSnapshots()
+			if readErr != nil {
+				errs = append(errs, fmt.Errorf("list snapshots: %w", readErr))
+			} else if len(snapshots) > 0 {
+				commit = snapshots[0]
+			}
+		}
+	}
+
+	if commit == "" {
+		variantCreated, variantUpdated, variantErrs := c.syncBranchVariants(repoDir, opts)
+		return variantCreated, variantUpdated, append(errs, variantErrs...)
 	}
 
 	// Recreate snapshot entries a blobs-only or partially repaired cache is
@@ -173,10 +274,12 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 	// Get snapshot directory
 	snapshotDir, err := repoDir.SnapshotDir(commit)
 	if err != nil {
-		return created, updated, append(errs, err)
+		variantCreated, variantUpdated, variantErrs := c.syncBranchVariants(repoDir, opts)
+		return created + variantCreated, updated + variantUpdated, append(append(errs, err), variantErrs...)
 	}
 	if _, err := os.Stat(snapshotDir); errors.Is(err, os.ErrNotExist) {
-		return created, updated, errs // Snapshot doesn't exist
+		variantCreated, variantUpdated, variantErrs := c.syncBranchVariants(repoDir, opts)
+		return created + variantCreated, updated + variantUpdated, append(errs, variantErrs...)
 	}
 
 	// Ensure friendly directory exists
@@ -202,6 +305,10 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		}
 
 		friendlyPath := filepath.Join(repoDir.FriendlyPath(), relPath)
+		if guardErr := RejectOwnedBranchVariantEntryWrites(friendlyPath); guardErr != nil {
+			errs = append(errs, fmt.Errorf("ordinary friendly restore for %s: %w", relPath, guardErr))
+			return nil
+		}
 
 		snapshotPath, perr := repoDir.SnapshotPath(commit, relPath)
 		if perr != nil {
@@ -228,18 +335,24 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 
 		if statErr != nil {
 			created++
+			if opts.Verbose && opts.OnProgress != nil {
+				opts.OnProgress("  Created: " + relPath)
+			}
 		} else {
 			updated++
+			if opts.Verbose && opts.OnProgress != nil {
+				opts.OnProgress("  Updated: " + relPath)
+			}
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		return created, updated, append(errs, fmt.Errorf("walk snapshot: %w", err))
+		errs = append(errs, fmt.Errorf("walk snapshot: %w", err))
 	}
-
-	return created, updated, errs
+	variantCreated, variantUpdated, variantErrs := c.syncBranchVariants(repoDir, opts)
+	return created + variantCreated, updated + variantUpdated, append(errs, variantErrs...)
 }
 
 // readRepoManifest returns the offline download manifest at this repo's
@@ -257,6 +370,9 @@ func readRepoManifest(repoDir *RepoDir) (*DownloadManifest, error) {
 	if !strings.EqualFold(m.Repo, repoDir.RepoID()) {
 		return nil, nil
 	}
+	if m.BranchVariant {
+		return nil, nil
+	}
 	return m, nil
 }
 
@@ -272,13 +388,16 @@ func readRepoManifest(repoDir *RepoDir) (*DownloadManifest, error) {
 // untouched.
 // Returns (created, errors).
 func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
-	created := 0
-	var errs []error
-
 	m, err := readRepoManifest(r)
 	if err != nil {
 		return 0, []error{fmt.Errorf("read download manifest: %w", err)}
 	}
+	return r.repairSnapshotEntriesFromManifest(commit, m)
+}
+
+func (r *RepoDir) repairSnapshotEntriesFromManifest(commit string, m *DownloadManifest) (int, []error) {
+	created := 0
+	var errs []error
 	if m == nil || m.Commit != commit {
 		return 0, nil
 	}
@@ -325,6 +444,165 @@ func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 	return created, errs
 }
 
+// hasOwnedBranchVariants reports whether this exact repo has a durable app
+// ownership record in the selected root's service tree. It prevents the
+// historical first-snapshot fallback from projecting a branch snapshot into
+// the ordinary repo view.
+func (c *HFCache) hasOwnedBranchVariants(repoDir *RepoDir) (bool, error) {
+	owned, err := BranchVariantServiceOwned(c.Root)
+	if err != nil || !owned {
+		return false, err
+	}
+	controlRepo, err := BranchVariantControlRepoPath(c.Root, repoDir.Type(), repoDir.RepoID())
+	if err != nil {
+		return false, err
+	}
+	revisions, err := os.ReadDir(controlRepo)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, revisionEntry := range revisions {
+		if !revisionEntry.IsDir() {
+			continue
+		}
+		revisionRoot := filepath.Join(controlRepo, revisionEntry.Name())
+		commits, err := os.ReadDir(revisionRoot)
+		if err != nil {
+			continue
+		}
+		for _, commitEntry := range commits {
+			if !commitEntry.IsDir() {
+				continue
+			}
+			artifact, err := ReadBranchVariantArtifactAtControlAnyRevision(c.Root, repoDir.Type(), repoDir.RepoID(), filepath.Join(revisionRoot, commitEntry.Name()))
+			if err == nil && artifact != nil {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// syncBranchVariants restores only payloads backed by matching service-root
+// and artifact ownership records plus a complete commit-bound control manifest.
+func (c *HFCache) syncBranchVariants(repoDir *RepoDir, opts SyncOptions) (created, updated int, errs []error) {
+	owned, err := BranchVariantServiceOwned(c.Root)
+	if err != nil {
+		return 0, 0, []error{fmt.Errorf("verify EXL branch service ownership: %w", err)}
+	}
+	if !owned {
+		return 0, 0, nil
+	}
+	controlRepo, err := BranchVariantControlRepoPath(c.Root, repoDir.Type(), repoDir.RepoID())
+	if err != nil {
+		return 0, 0, []error{err}
+	}
+	revisions, err := os.ReadDir(controlRepo)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, []error{fmt.Errorf("read EXL branch variant controls: %w", err)}
+	}
+	for _, revisionEntry := range revisions {
+		if !revisionEntry.IsDir() {
+			continue
+		}
+		revisionRoot := filepath.Join(controlRepo, revisionEntry.Name())
+		commits, err := os.ReadDir(revisionRoot)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read EXL variant controls %s: %w", revisionEntry.Name(), err))
+			continue
+		}
+		for _, commitEntry := range commits {
+			if !commitEntry.IsDir() {
+				continue
+			}
+			controlRoot := filepath.Join(revisionRoot, commitEntry.Name())
+			artifact, err := ReadBranchVariantArtifactAtControlAnyRevision(c.Root, repoDir.Type(), repoDir.RepoID(), controlRoot)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("verify EXL branch artifact ownership %s: %w", controlRoot, err))
+				continue
+			}
+			if artifact == nil || revisionEntry.Name() != BranchVariantRevisionDirName(artifact.Revision) ||
+				commitEntry.Name() != BranchVariantCommitDirName(artifact.Commit) {
+				continue
+			}
+			variantCreated, variantUpdated, variantErrs := c.syncBranchVariantArtifact(repoDir, artifact, opts)
+			created += variantCreated
+			updated += variantUpdated
+			errs = append(errs, variantErrs...)
+		}
+	}
+	return created, updated, errs
+}
+
+func (c *HFCache) syncBranchVariantArtifact(repoDir *RepoDir, artifact *BranchVariantArtifact, opts SyncOptions) (created, updated int, errs []error) {
+	release, err := AcquireBranchVariantArtifactLeaseContext(opts.leaseContext(), artifact, true)
+	if err != nil {
+		return 0, 0, []error{fmt.Errorf("lease EXL branch artifact %s: %w", artifact.ControlRoot, err)}
+	}
+	defer release()
+
+	manifestInfo, err := os.Lstat(artifact.ManifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil || !manifestInfo.Mode().IsRegular() || manifestInfo.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, []error{fmt.Errorf("EXL branch control manifest is not a safe regular file: %s", artifact.ManifestPath)}
+	}
+	manifest, err := ReadManifest(artifact.ManifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, []error{fmt.Errorf("read EXL branch variant manifest %s: %w", artifact.ManifestPath, err)}
+	}
+	if !manifest.IsCompleteBranchVariant(repoDir.RepoID(), repoDir.Type(), artifact.Revision) || manifest.Commit != artifact.Commit {
+		return 0, 0, nil
+	}
+
+	repaired, repairErrs := repoDir.repairSnapshotEntriesFromManifest(manifest.Commit, manifest)
+	created += repaired
+	errs = append(errs, repairErrs...)
+	for _, file := range manifest.Files {
+		snapshotPath, err := repoDir.SnapshotPath(manifest.Commit, file.Name)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve EXL snapshot path %q: %w", file.Name, err))
+			continue
+		}
+		if info, statErr := os.Stat(snapshotPath); statErr != nil || !info.Mode().IsRegular() || info.Size() != file.Size {
+			errs = append(errs, fmt.Errorf("EXL snapshot entry %q is not complete", file.Name))
+			continue
+		}
+		payloadPath, err := SafeJoin(artifact.PayloadRoot, file.Name)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve EXL payload path %q: %w", file.Name, err))
+			continue
+		}
+		_, statErr := os.Lstat(payloadPath)
+		if err := repoDir.createBranchVariantEntryCtxLocked(context.Background(), artifact, file.Name); err != nil {
+			errs = append(errs, fmt.Errorf("restore EXL payload file %q: %w", file.Name, err))
+			continue
+		}
+		if errors.Is(statErr, os.ErrNotExist) {
+			created++
+			if opts.Verbose && opts.OnProgress != nil {
+				opts.OnProgress("  Created: " + file.Name)
+			}
+		} else {
+			updated++
+			if opts.Verbose && opts.OnProgress != nil {
+				opts.OnProgress("  Updated: " + file.Name)
+			}
+		}
+	}
+	return created, updated, errs
+}
+
 // snapshotEntryNeedsRepair reports whether the snapshot entry at linkPath is
 // missing or a dangling symlink. A hard link or copy carries its content and
 // is left alone; repair recreates absent entries, it does not second-guess
@@ -343,17 +621,25 @@ func snapshotEntryNeedsRepair(linkPath string) bool {
 
 // cleanOrphanedSymlinks removes symlinks in friendly view that point to non-existent files.
 func (c *HFCache) cleanOrphanedSymlinks(opts SyncOptions) (int, error) {
+	if err := RejectBranchVariantTreeEffects(c.ModelsDir(), c.DatasetsDir()); err != nil {
+		return 0, err
+	}
 	removed := 0
 
 	// Clean models/
-	modelsRemoved, err := cleanOrphansInDir(c.ModelsDir())
+	progress := func(message string) {
+		if opts.Verbose && opts.OnProgress != nil {
+			opts.OnProgress(message)
+		}
+	}
+	modelsRemoved, err := cleanOrphansInDirWithProgress(c.ModelsDir(), progress)
 	if err != nil {
 		return removed, fmt.Errorf("clean models: %w", err)
 	}
 	removed += modelsRemoved
 
 	// Clean datasets/
-	datasetsRemoved, err := cleanOrphansInDir(c.DatasetsDir())
+	datasetsRemoved, err := cleanOrphansInDirWithProgress(c.DatasetsDir(), progress)
 	if err != nil {
 		return removed, fmt.Errorf("clean datasets: %w", err)
 	}
@@ -364,6 +650,10 @@ func (c *HFCache) cleanOrphanedSymlinks(opts SyncOptions) (int, error) {
 
 // cleanOrphansInDir removes broken symlinks in a directory tree.
 func cleanOrphansInDir(dir string) (int, error) {
+	return cleanOrphansInDirWithProgress(dir, nil)
+}
+
+func cleanOrphansInDirWithProgress(dir string, progress func(string)) (int, error) {
 	removed := 0
 
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
@@ -398,6 +688,9 @@ func cleanOrphansInDir(dir string) (int, error) {
 				return nil // Skip errors
 			}
 			removed++
+			if progress != nil {
+				progress("  Removed orphan: " + path)
+			}
 		}
 
 		return nil

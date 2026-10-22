@@ -6,22 +6,40 @@ package server
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/runtimecoordination"
 )
 
+var serverTestTempRoot string
+
 func TestMain(m *testing.M) {
+	goModuleCache, _ := exec.Command("go", "env", "GOMODCACHE").Output()
+	goBuildCache, _ := exec.Command("go", "env", "GOCACHE").Output()
 	root, err := os.MkdirTemp("", "hfdesk-server-tests-")
 	if err != nil {
 		panic(err)
 	}
 	for key, value := range map[string]string{
-		"HOME":            root,
-		"XDG_CONFIG_HOME": filepath.Join(root, "config"),
-		"APPDATA":         filepath.Join(root, "appdata"),
-		"LOCALAPPDATA":    filepath.Join(root, "localappdata"),
-		"USERPROFILE":     root,
+		"HOME":                         root,
+		"TMPDIR":                       root,
+		"TMP":                          root,
+		"TEMP":                         root,
+		"XDG_CACHE_HOME":               filepath.Join(root, "cache"),
+		"XDG_CONFIG_HOME":              filepath.Join(root, "config"),
+		"XDG_DATA_HOME":                filepath.Join(root, "data"),
+		"XDG_STATE_HOME":               filepath.Join(root, "state"),
+		"XDG_RUNTIME_DIR":              filepath.Join(root, "runtime"),
+		"APPDATA":                      filepath.Join(root, "appdata"),
+		"LOCALAPPDATA":                 filepath.Join(root, "localappdata"),
+		"USERPROFILE":                  root,
+		"HFDESK_TEST_COORDINATION_DIR": filepath.Join(root, "coordination-runtime"),
+		"GOMODCACHE":                   strings.TrimSpace(string(goModuleCache)),
+		"GOCACHE":                      strings.TrimSpace(string(goBuildCache)),
 	} {
 		if err := os.Setenv(key, value); err != nil {
 			_ = os.RemoveAll(root)
@@ -34,6 +52,9 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}
+	serverTestTempRoot = root
+	coordinationBase := filepath.Join(root, "coordination-runtime")
+	runtimecoordination.SetBaseDirProvider(func() (string, error) { return coordinationBase, nil })
 
 	code := m.Run()
 	if err := os.RemoveAll(root); err != nil {

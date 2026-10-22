@@ -611,3 +611,118 @@ func TestIsValidModelNameRejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+// TestRootedPathRejectsEmptyAndRootsRelative pins the base-leg barrier the
+// selected-root paths rely on: an empty path is refused instead of silently
+// resolving to the process working directory, and a relative spelling is
+// rooted so it can never be re-read against a different working directory.
+func TestRootedPathRejectsEmptyAndRootsRelative(t *testing.T) {
+	if _, err := rootedPath(""); err == nil {
+		t.Error("rootedPath(\"\") expected error, got nil")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rootedPath(filepath.Join("relative", "root"))
+	if err != nil {
+		t.Fatalf("rootedPath: %v", err)
+	}
+	want := filepath.Join(cwd, "relative", "root")
+	if got != want {
+		t.Errorf("rootedPath = %q, want %q", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("rootedPath = %q, want an absolute path", got)
+	}
+}
+
+// TestBranchVariantServiceRootKeepsPhysicalLocation pins the branch-variant
+// service tree location after the path-safety barrier was applied: the
+// service root is the resolved spelling of the selected destination plus the
+// service component, it never leaves the selected destination, and an
+// ancestor symlink still resolves to the same physical store.
+func TestBranchVariantServiceRootKeepsPhysicalLocation(t *testing.T) {
+	root := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := BranchVariantServiceRoot(root)
+	if err != nil {
+		t.Fatalf("BranchVariantServiceRoot: %v", err)
+	}
+	want := filepath.Join(resolvedRoot, BranchVariantServiceDirName)
+	if got != want {
+		t.Errorf("BranchVariantServiceRoot(%q) = %q, want %q", root, got, want)
+	}
+	if !PathInside(resolvedRoot, got) {
+		t.Errorf("service root %q escaped the selected root %q", got, resolvedRoot)
+	}
+	if filepath.Base(got) != BranchVariantServiceDirName {
+		t.Errorf("service root %q does not end in the service component", got)
+	}
+}
+
+// TestBranchVariantServiceRootResolvesSymlinkedAncestor keeps the alias
+// identity the service tree depends on: a destination reached through a
+// linked ancestor names the same physical store as the target directory.
+func TestBranchVariantServiceRootResolvesSymlinkedAncestor(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	link := filepath.Join(base, "link")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	viaLink, err := BranchVariantServiceRoot(link)
+	if err != nil {
+		t.Fatalf("BranchVariantServiceRoot(link): %v", err)
+	}
+	viaTarget, err := BranchVariantServiceRoot(target)
+	if err != nil {
+		t.Fatalf("BranchVariantServiceRoot(target): %v", err)
+	}
+	if viaLink != viaTarget {
+		t.Errorf("linked ancestor resolved to %q, want %q", viaLink, viaTarget)
+	}
+}
+
+// TestBranchVariantServiceRootRejectsUnusableDestinations keeps the accepted
+// and rejected inputs of the service-root builder unchanged: an empty
+// destination is refused, and a destination that names an existing file is
+// not silently turned into a service tree.
+func TestBranchVariantServiceRootRejectsUnusableDestinations(t *testing.T) {
+	if _, err := BranchVariantServiceRoot(""); err == nil {
+		t.Error("BranchVariantServiceRoot(\"\") expected error, got nil")
+	}
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BranchVariantServiceRoot(file); err != nil {
+		t.Errorf("BranchVariantServiceRoot(%q) unexpected error: %v", file, err)
+	}
+}
+
+// TestBranchVariantPathsStayInsideSelectedRoot keeps the containment
+// guarantee of the branch-variant paths: every service-tree path is inside
+// the selected destination, and a repository identity that would escape it
+// is refused instead of producing a path.
+func TestBranchVariantPathsStayInsideSelectedRoot(t *testing.T) {
+	root := t.TempDir()
+	payload, err := BranchVariantPath(root, RepoTypeModel, "owner/model", "4.00bpw", "commit-a")
+	if err != nil {
+		t.Fatalf("BranchVariantPath: %v", err)
+	}
+	if !PathInside(root, payload) {
+		t.Errorf("payload path %q escaped the selected root %q", payload, root)
+	}
+	for _, repoID := range []string{"../escape", "owner/..", "..", "owner/na\x00me"} {
+		if _, err := BranchVariantPath(root, RepoTypeModel, repoID, "4.00bpw", "commit-a"); err == nil {
+			t.Errorf("BranchVariantPath(%q) expected error, got nil", repoID)
+		}
+	}
+}

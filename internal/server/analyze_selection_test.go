@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
 
 // TestAnalyzeExplicitNamespaceSelection pins the /api/analyze namespace
@@ -196,6 +197,107 @@ func TestAnalyzeExplicitNamespaceSelection(t *testing.T) {
 					modelTrees.Load(), datasetTrees.Load(), tt.wantModelTrees, tt.wantDatasetTrees)
 			}
 		})
+	}
+}
+
+func TestAnalyzeEXLBranchSelectionUsesBranchRevision(t *testing.T) {
+	const (
+		repo     = "owner/exl3-model"
+		revision = "SC_6.00bpw_H6_V6"
+	)
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			branch := strings.SplitN(r.URL.Path, "/tree/", 2)[1]
+			switch branch {
+			case "main":
+				io.WriteString(w, `[{"type":"file","path":"README.md","size":1},{"type":"file","path":"config.json","size":10}]`)
+			case revision:
+				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model-6.safetensors","size":600},{"type":"file","path":"tokenizer.json","size":20}]`)
+			default:
+				t.Errorf("unexpected model tree revision %q", branch)
+				http.NotFound(w, r)
+			}
+		case strings.HasSuffix(r.URL.Path, "/refs"):
+			io.WriteString(w, `{"branches":[{"name":"main","targetCommit":"main-sha"},{"name":"`+revision+`","targetCommit":"branch-sha"}],"tags":[{"name":"fp16","targetCommit":"tag-sha"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/auth-check"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/main/config.json"):
+				io.WriteString(w, `{"model_type":"llama"}`)
+			case strings.HasSuffix(r.URL.Path, "/"+revision+"/config.json"):
+				io.WriteString(w, `{"model_type":"llama","architectures":["LlamaForCausalLM"],"quantization_config":{"quant_method":"exl3","bits":4,"bits_per_weight":6,"head_bits":6}}`)
+			default:
+				http.NotFound(w, r)
+			}
+		default:
+			t.Errorf("unexpected Hub request: %s", r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	s := newTestServerWithConfig(t, Config{
+		Endpoint: hub.URL,
+		CacheDir: t.TempDir(),
+		Proxy:    &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	getAnalysis := func(query string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/api/analyze/"+repo+query, nil)
+		r.SetPathValue("repo", repo)
+		w := httptest.NewRecorder()
+		s.handleAnalyze(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("analyze %q status = %d body=%s", query, w.Code, w.Body.String())
+		}
+		return w
+	}
+
+	mainResponse := getAnalysis("?type=model")
+	var main struct {
+		SelectableItems []smartdl.SelectableItem   `json:"selectable_items"`
+		Recommended     *smartdl.DownloadSelection `json:"recommended_download"`
+	}
+	if err := json.Unmarshal(mainResponse.Body.Bytes(), &main); err != nil {
+		t.Fatalf("decode main analysis: %v", err)
+	}
+	if len(main.SelectableItems) != 1 || main.SelectableItems[0].Revision != revision || main.SelectableItems[0].Method != "exl3" || main.SelectableItems[0].BitsPerWeight != 6 || main.SelectableItems[0].HeadBits != 6 {
+		t.Fatalf("branch item API projection = %+v", main.SelectableItems)
+	}
+	if main.Recommended == nil || main.Recommended.Revision != revision || len(main.Recommended.Filters) != 0 {
+		t.Fatalf("recommended_download = %+v, want unfiltered revision %q", main.Recommended, revision)
+	}
+
+	branchResponse := getAnalysis("?type=model&revision=" + revision)
+	var selected struct {
+		Branch    string                 `json:"branch"`
+		Type      smartdl.RepoType       `json:"type"`
+		Files     []smartdl.FileInfo     `json:"files"`
+		Quantized *smartdl.QuantizedInfo `json:"quantized"`
+		Metadata  map[string]interface{} `json:"metadata"`
+	}
+	if err := json.Unmarshal(branchResponse.Body.Bytes(), &selected); err != nil {
+		t.Fatalf("decode selected branch analysis: %v", err)
+	}
+	if selected.Branch != revision || selected.Type != smartdl.TypeTransformers || len(selected.Files) != 3 {
+		t.Fatalf("selected branch response = branch %q type=%s files=%+v", selected.Branch, selected.Type, selected.Files)
+	}
+	for _, file := range selected.Files {
+		if file.Path == "README.md" {
+			t.Fatal("selected branch analysis returned main-only README")
+		}
+	}
+	if selected.Quantized == nil || selected.Quantized.Method != "exl3" || selected.Quantized.Bits != 0 || !selected.Quantized.MixedPrecision || selected.Quantized.BitsPerWeight != 6 || selected.Quantized.HeadBits != 6 {
+		t.Fatalf("selected branch API lost nested quantization projection: %+v", selected.Quantized)
+	}
+	outer, ok := selected.Metadata["config.json"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("selected branch API lost raw config.json: %+v", selected.Metadata)
+	}
+	nested, ok := outer["quantization_config"].(map[string]interface{})
+	if !ok || nested["bits"] != float64(4) || nested["head_bits"] != float64(6) {
+		t.Fatalf("selected branch API changed raw nested config: %+v", outer["quantization_config"])
 	}
 }
 
