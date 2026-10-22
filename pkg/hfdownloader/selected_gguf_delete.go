@@ -129,11 +129,27 @@ func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 		}
 		pathEqual = strings.EqualFold
 	}
+	if sha := trimSuffix(base, ".incomplete.meta.tmp"); sha != base &&
+		pathEqual(name, r.IncompleteMetaPath(sha)+".tmp") {
+		return true
+	}
 	if sha := trimSuffix(base, ".incomplete.meta"); sha != base && pathEqual(name, r.IncompleteMetaPath(sha)) {
 		return true
 	}
 	sha := trimSuffix(base, ".incomplete")
 	if sha != base && pathEqual(name, r.IncompletePath(sha)) {
+		return true
+	}
+	// The persistent lifetime ownership lock and any transition-lock artifact
+	// left by an older version sit beside the staging pair. They are staging
+	// artifacts, never blobs, so cache deletion must leave them alone even
+	// though they are zero-byte and content-free.
+	if sha := trimSuffix(base, ".incomplete.meta"+stagingLockSuffix); sha != base &&
+		pathEqual(name, r.IncompleteMetaPath(sha)+stagingLockSuffix) {
+		return true
+	}
+	if sha := trimSuffix(base, ".incomplete"+stagingLockSuffix); sha != base &&
+		pathEqual(name, r.IncompletePath(sha)+stagingLockSuffix) {
 		return true
 	}
 	// The downloader's verification/transfer destination is blobs/tmp-<sha-or-

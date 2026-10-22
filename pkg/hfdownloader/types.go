@@ -195,14 +195,73 @@ type Settings struct {
 	// If empty, defaults to "256MiB".
 	MultipartThreshold string
 
-	// Verify specifies how to verify non-LFS files after download.
-	// LFS files are always verified by SHA-256 when the hash is available.
+	// Verify specifies how to verify files after download. It controls LFS
+	// files too (issue #140):
 	//
-	// Options:
-	//   - "none": No verification (fastest)
-	//   - "size": Verify file size matches expected (default, fast)
-	//   - "etag": Compare ETag header from server
-	//   - "sha256": Full SHA-256 hash verification (most secure, slower)
+	//   - "none": No post-download content hash (fastest). HTTP and ranged
+	//     response validation still apply during the transfer.
+	//   - "size": (default, fast) Verify the exact expected size and complete
+	//     validated transfer coverage on both the single-request and ranged
+	//     paths: the ranged path requires every expected byte range to be
+	//     validated and written, and the single path requires an exact 206
+	//     Content-Range/body-length match and checks the on-disk size before
+	//     the rename. On the normal transfer path no full-file SHA-256 reread
+	//     is performed for LFS files. Four deliberate exceptions may still
+	//     hash: the pre-download skip check over an already-present
+	//     destination, the one-time legacy-migration content proof, the
+	//     content proof of inherited single-path .part bytes, and a
+	//     single-request transfer with a known digest but no known expected
+	//     size (see below). A resumed ProofPending record can also force the
+	//     proof after a crash or mode change (see the durable proof gate below).
+	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
+	//     At most one full-file read is performed per file, always before
+	//     publication when the item carries a known digest: only an eligible
+	//     fresh sequential LFS ranged transfer (one task covers the whole file)
+	//     hashes while writing; every other transfer
+	//     (including the single-request path, fresh or resumed) performs one
+	//     sequential pass before the destination/blob is renamed into place, so
+	//     a mismatch never publishes corrupt bytes.
+	//   - "etag": Historical compatibility mode. A known SHA-256 digest is
+	//     proven with one full-file pass before publication, reusing the same
+	//     engine proof as "sha256" (a ranged or single-path proof is never
+	//     repeated). Files without a known digest keep the historical
+	//     behavior: non-LFS ETag files perform no post-download content check.
+	//     (The HEAD-ETag fallback exists only in "sha256" mode; with no known
+	//     digest it remains a post-publication check.)
+	//
+	// Bytes migrated from a pre-#140 .part-NN/.parts.json partial or a single
+	// .part have layout/prefix structure but no validated provenance. When the
+	// item carries a known SHA-256 and Verify is not "none", they receive one
+	// full-file SHA-256 pass before publication even in "size" mode — the
+	// explicit one-time migration exception. The same rule applies to bytes a
+	// resumed single-request .part contributed before this run: a moved commit
+	// or a corrupt file can produce a size-correct prefix, so inherited .part
+	// bytes are content-proven once before the rename. A fresh single-request
+	// transfer in "sha256"/"etag" mode is likewise proven before the rename,
+	// and a known digest with no known expected size is proven too (only the
+	// digest can validate an unconstrained stream). A mismatch discards the
+	// partial/staging data and never publishes. With Verify "none" both inherit
+	// the mode's no-hash semantics; without a known digest only size and
+	// complete transfer coverage can be checked.
+	//
+	// Durable proof gate: a staging (multipart) record carries a persisted
+	// ProofPending flag that is set and flushed before any known-digest proof
+	// starts and cleared and flushed only after the proof succeeds, immediately
+	// before publication. On resume it forces the proof in every mode except
+	// "none" (including "size") whenever the item has a known digest, so a
+	// crash mid-proof, a mismatch whose cleanup fails,
+	// or a later Verify-mode change cannot publish unproven all-Done ranges. On
+	// a mismatch the flag stays set, poison is attempted only while the claim is
+	// still owned under lifetime exclusion and metadata serialization (an
+	// unfenced legacy writer must not truncate another owner's payload), and the owned discard
+	// is attempted; if either cannot verify ownership, the durable flag remains
+	// the guard and the next run re-proves or discards. Publish refuses while the
+	// flag is still set for a known digest. Verify "none" is the explicit
+	// no-hash opt-out. The single-request .part has no separate flag: when a
+	// proof is required (sha256/etag, inherited bytes, or a known digest with
+	// unknown size) it is renamed only after that proof, so every restart
+	// re-proves it; a fresh size transfer with a known size follows the size
+	// contract and may rename without a hash.
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.
@@ -288,10 +347,15 @@ type Settings struct {
 	SpeedLimiter *RateLimiter
 
 	// CleanupPartialsOnCancel, when non-nil, is called when the download
-	// context is cancelled. If it returns true, the downloader deletes any
-	// partial .part files (.part, .part-NN, .parts.json) before returning.
-	// When nil (default), partial files are preserved for resume (useful
-	// for pause/resume workflows).
+	// context is cancelled. If it returns true, the downloader deletes the
+	// partial files it produced before returning: dst+".part" (single
+	// path), the legacy dst+".part-NN"/dst+".parts.json" family, and the
+	// ranged staging file with its resume metadata
+	// (dst+".incomplete"/".incomplete.meta", or blobs/<sha>.incomplete in
+	// HF cache mode). The persistent `<staging>.lock` ownership file is not
+	// removed: it carries no payload and is reused by later claims. When nil
+	// (default), partial files are preserved for resume (useful for
+	// pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
 
 	// OnPartialFile, when non-nil, is called for every per-file

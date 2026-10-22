@@ -472,7 +472,18 @@ func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
 			t.Errorf("producer staging path %q was not classified", name)
 		}
 	}
-	for _, name := range []string{"model.part", "model.parts.json", "abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-"} {
+	// The persistent ownership lock, any legacy transition-lock file, and atomic record temp
+	// are staging artifacts, never deletable blobs.
+	for _, name := range []string{
+		strings.Repeat("c", 64) + ".incomplete.meta.tmp",
+		strings.Repeat("c", 64) + ".incomplete.lock",
+		strings.Repeat("c", 64) + ".incomplete.meta.lock",
+	} {
+		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); !got {
+			t.Errorf("staging lock path %q was not classified", name)
+		}
+	}
+	for _, name := range []string{"model.part", "model.parts.json", "abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-", "abc.lock", "opaque-key.lock"} {
 		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); got {
 			t.Errorf("ordinary/non-producer blob path %q was classified", name)
 		}

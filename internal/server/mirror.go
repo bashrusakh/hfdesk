@@ -470,7 +470,7 @@ func scanHubForMirror(hubDir string) ([]mirrorEntry, error) {
 		blobsDir := filepath.Join(hubDir, name, "blobs")
 		var totalSize int64
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 			}
 			return nil
@@ -662,6 +662,11 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 
 		dst := filepath.Join(dstPath, rel)
+		// Staging payloads, records, their atomic-write temp and ownership lock
+		// files are not stored content; mirrors copy only finished blobs.
+		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
 		// Existing destination directory links must never redirect writes
 		// outside the selected repository/Hub. Snapshot leaf links are replaced
 		// below, but their parents must be real directories.
@@ -743,6 +748,11 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 			return err
 		}
 		if info.IsDir() {
+			return nil
+		}
+		// Staging artifacts are not copied content and have no destination to
+		// verify.
+		if isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
 
@@ -841,7 +851,7 @@ func countBlobs(repoPath string) int {
 	blobsDir := filepath.Join(repoPath, "blobs")
 	count := 0
 	filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
+		if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 			count++
 		}
 		return nil

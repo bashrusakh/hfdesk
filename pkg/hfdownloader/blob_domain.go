@@ -1,0 +1,352 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package hfdownloader
+
+// The blob-key ownership domain (issue #140 / PR #151).
+//
+// A content-addressed blob key owns exactly ONE ownership domain. The domain
+// is keyed on the blob key, never on the staging path one particular route
+// happens to use, because two different routes write the same blob key:
+//
+//   - the ranged route stages in blobs/<sha>.incomplete and publishes with a
+//     rename onto blobs/<sha>;
+//   - the single-request route stages in blobs/tmp-<sha>.part and publishes
+//     through the cache store onto blobs/<sha>.
+//
+// Keying the domain on the staging path gave every route its own private
+// domain, so a "the blob does not exist yet" decision in one route could be
+// overtaken by the other route's placement, and one route could adopt the
+// other route's LIVE partial as if it were a pre-#140 leftover.
+//
+// The domain has two layers:
+//
+//   - an in-process slot, so two goroutines of one process never own the same
+//     blob key at the same time (the single-request route's partial
+//     blobs/tmp-<sha>.part is shared by every writer of that key);
+//   - the lifetime OS ownership lock on the persistent sibling
+//     blobs/tmp-<sha>.lock, so a writer in another process cannot own the
+//     same blob key either.
+//
+// The lock file is the sibling of the item's cache destination, so it needs no
+// new artifact name: every ".lock" entry is already persistent, never
+// unlinked, and excluded from cache statistics, listings, mirrors and cache
+// deletion.
+//
+// A writer holds the domain for its whole operation on the key: the partial
+// namespace (so no other route can adopt, migrate or delete a live partial of
+// the same key) and the publication (so the existence decision and the
+// placement that follows it cannot be overtaken).
+//
+// A writer that finds the key owned by a PROVEN live owner WAITS for it
+// (bounded, context-aware) and re-checks the published content-addressed
+// target afterwards, instead of skipping the item: the file is not present
+// while the owner holds the key, so a skip would report a success the cache
+// does not have. When the wait budget expires with the owner still there, the
+// item fails with an actionable error. The same protocol governs the CLEANUP
+// of a blob key's artifacts: they are removed only while the key's ownership
+// domain is held, so a cancelled job never deletes another live writer's
+// partial.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// blobOwnershipWaitBudget bounds how long a writer waits for a PROVEN live
+// owner of a blob key to release it.
+//
+// The budget reuses the existing ownership-lock convention: ONE acquisition
+// attempt is bounded by stagingOwnershipAcquireWait (5s - long enough for a
+// status probe to finish, short enough not to stall a download), while a live
+// owner is transferring a file and may hold the key for minutes. The budget is
+// therefore a multiple of that window, and it is FINITE: a suspended owner
+// keeps the lock for as long as its process lives, so the wait has to end in
+// an actionable error instead of blocking the job forever.
+//
+// It is a package-level knob, not a user setting: the wait is an internal
+// detail of the ownership protocol, so the Settings API stays unchanged. The
+// cleanup path uses the shorter, existing cleanup convention
+// (stagingLockCleanupWait) instead, because a cleanup is best-effort and must
+// not delay an explicit cancel.
+var blobOwnershipWaitBudget = 60 * stagingOwnershipAcquireWait
+
+// errBlobOwnedByLiveWriter reports that a PROVEN live writer still owns a
+// blob key (or its staging file) after the bounded wait for it expired.
+//
+// The file is NOT present in that state, so the item fails with this
+// actionable error instead of a successful skip: a job that reports success
+// must mean the requested files are present. Distinguishable via errors.Is.
+var errBlobOwnedByLiveWriter = errors.New("owned by another live writer")
+
+// blobLiveOwnerError is the actionable error of an item whose file is owned
+// by another live writer.
+//
+// The message names the blob key when the item has a known digest, and the
+// item's path otherwise (a legacy/output destination has no blob key). It
+// always names the retry action, because the condition is transient: the
+// owner may publish the file at any moment.
+func blobLiveOwnerError(sha, rel string) error {
+	if sha == "" {
+		return fmt.Errorf("%s is being downloaded by another process; try again later: %w", rel, errBlobOwnedByLiveWriter)
+	}
+	return fmt.Errorf("blob %s is being downloaded by another process; try again later: %w", sha, errBlobOwnedByLiveWriter)
+}
+
+// blobDomainEntry is one in-process holder of a blob key's domain. Its done
+// channel is closed when the holder releases the domain.
+type blobDomainEntry struct {
+	done chan struct{}
+}
+
+// blobDomainOwners is the in-process exclusion registry keyed by blob path.
+var blobDomainOwners = struct {
+	sync.Mutex
+	m map[string]*blobDomainEntry
+}{m: map[string]*blobDomainEntry{}}
+
+// blobDomain is a held ownership domain of one blob key.
+type blobDomain struct {
+	// key is the domain identity: the content-addressed blob path.
+	key string
+	// lock is the held lifetime OS ownership lock.
+	lock *stagingOwnershipLock
+	// entry is the in-process slot this holder owns.
+	entry *blobDomainEntry
+	// released guards the one-shot release.
+	released bool
+}
+
+// acquireBlobDomain takes the ownership domain of one blob key.
+//
+// The in-process slot is taken first: a second writer of the same key in this
+// process waits for the current holder to finish and then re-evaluates (the
+// holder may have published the blob in the meantime). The lifetime OS lock
+// then excludes writers in other processes.
+//
+// A PROVEN live owner in another process is WAITED FOR, not reported as a
+// skip: the file is not present while the owner holds the key, so a skip would
+// report a success the cache does not have. The wait is bounded
+// (blobOwnershipWaitBudget) and context-aware, and it is never a takeover: a
+// live owner keeps its lock. When the budget expires with the owner still
+// there, the acquisition reports errStagingOwnershipBusy, which the caller
+// turns into an actionable per-item error.
+//
+// An unresolvable contention is an actionable error too
+// (errStagingOwnershipUncertain or a lock error). Neither outcome is ever
+// reported as a successful skip of the key.
+func acquireBlobDomain(ctx context.Context, key, dst string) (*blobDomain, error) {
+	// The in-process slot wait is bounded by the caller's context only: its
+	// holder is a goroutine of this process that finishes or is cancelled,
+	// and the slot already implements the wait-then-re-evaluate shape the
+	// protocol needs. The cross-process wait is bounded by the budget.
+	return acquireBlobDomainWithin(ctx, key, dst, 0, blobOwnershipWaitBudget, true)
+}
+
+// acquireBlobDomainForCleanup takes the ownership domain of one blob key for a
+// cleanup operation.
+//
+// The cleanup uses the existing cleanup convention (a short, best-effort
+// window) instead of the download budget: a cleanup must not delay an
+// explicit cancel, and it must never displace or wait out a live owner. A
+// live owner - in this process or in another one - means the key's artifacts
+// belong to somebody else, so the caller leaves them alone.
+func acquireBlobDomainForCleanup(ctx context.Context, key, dst string) (*blobDomain, error) {
+	return acquireBlobDomainWithin(ctx, key, dst, stagingLockCleanupWait, stagingLockCleanupWait, false)
+}
+
+// blobDomainCleanupAcquire is the domain acquisition seam of the cleanup
+// path. It is a package variable so a regression test can install the
+// historical behavior (cleanup WITHOUT the blob key's ownership domain) and
+// prove that the cleanup regressions actually detect it.
+var blobDomainCleanupAcquire = acquireBlobDomainForCleanup
+
+// acquireBlobDomainWithin is acquireBlobDomain with explicit wait budgets.
+//
+// The two waits are deliberately different:
+//
+//   - the IN-PROCESS slot wait is bounded by slotWait (zero means: wait until
+//     the caller's context is done). Its holder is a goroutine of this process
+//     that finishes or is cancelled, and the domain slot already implements
+//     the wait-then-re-evaluate shape the protocol needs: the holder publishes
+//     the blob and releases, and the waiter re-evaluates the key from scratch.
+//     A budget here would fail a legitimate sibling download of a large file,
+//     so the download path leaves it unbounded and the cleanup path bounds it
+//     (a cleanup must not block on a live writer);
+//   - the CROSS-PROCESS OS lock wait is bounded by lockWait, because the
+//     holder is another process whose progress this one cannot observe. When
+//     the budget expires with the owner still there, the acquisition reports
+//     errStagingOwnershipBusy, which the caller turns into an actionable
+//     per-item error instead of a successful skip.
+//
+// tolerateLiveOwner selects what a PROVEN live owner in another process means:
+// with it true the owner is waited out (the download path: the file is not
+// present while it holds the key), with it false the contention is reported
+// at once (the cleanup path: the artifacts belong to the live owner).
+func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, lockWait time.Duration, tolerateLiveOwner bool) (*blobDomain, error) {
+	var entry *blobDomainEntry
+	for {
+		blobDomainOwners.Lock()
+		held, busy := blobDomainOwners.m[key]
+		if !busy {
+			held = &blobDomainEntry{done: make(chan struct{})}
+			blobDomainOwners.m[key] = held
+		}
+		blobDomainOwners.Unlock()
+		if !busy {
+			entry = held
+			break
+		}
+		if blobDomainContentionHook != nil {
+			blobDomainContentionHook(key)
+		}
+		// A nil timeout channel blocks forever, which is the unbounded
+		// (context-only) wait of the download path.
+		var timeout <-chan time.Time
+		var timer *time.Timer
+		if slotWait > 0 {
+			timer = time.NewTimer(slotWait)
+			timeout = timer.C
+		}
+		select {
+		case <-held.done:
+			// The holder finished: re-evaluate the domain from scratch.
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return nil, ctx.Err()
+		case <-timeout:
+			// The in-process holder of this blob key did not release it
+			// within the budget. The holder is not displaced: the caller
+			// reports the contention so it can leave the key's artifacts
+			// alone.
+			return nil, errStagingOwnershipBusy
+		}
+	}
+
+	var lock *stagingOwnershipLock
+	var err error
+	if tolerateLiveOwner {
+		lock, err = acquireStagingOwnershipLockWaiting(ctx, dst, lockWait)
+	} else {
+		lock, err = acquireStagingOwnershipLockWithin(ctx, dst, lockWait)
+	}
+	if err != nil {
+		blobDomainOwners.Lock()
+		if blobDomainOwners.m[key] == entry {
+			delete(blobDomainOwners.m, key)
+		}
+		blobDomainOwners.Unlock()
+		close(entry.done)
+		return nil, err
+	}
+	return &blobDomain{key: key, lock: lock, entry: entry}, nil
+}
+
+// blobDomainAcquire is the domain acquisition seam. It is a package variable
+// so a regression test can install the historical behavior (no shared domain
+// at all) and prove that the publication regressions actually detect it.
+var blobDomainAcquire = acquireBlobDomain
+
+// blobDomainContentionHook is called with the blob key whenever a domain
+// acquisition finds the key busy in this process. It is a test seam: it lets a
+// regression prove that a second writer really waited for the domain instead
+// of inferring it from a sleep.
+var blobDomainContentionHook func(key string)
+
+// blobDomainDst returns the cache destination whose persistent sibling
+// ".lock" file is the ownership domain lock of one blob key.
+//
+// It is the destination the downloader stages under (blobs/tmp-<sha>), so the
+// ranged route, the single-request route and the cache store all resolve the
+// SAME domain for the same key. The name is confined to the blobs directory
+// with SafeJoin, exactly like the downloader's own destination.
+func (r *RepoDir) blobDomainDst(sha string) (string, error) {
+	return SafeJoin(r.BlobsDir(), "tmp-"+sha)
+}
+
+// cacheDstDomainKey derives the ownership-domain key of a cache destination.
+//
+// The domain is keyed on the DESTINATION, not on the blob key the item may
+// end up in:
+//
+//   - a cache destination is the staging name the downloader allocates for an
+//     item: blobs/tmp-<name>;
+//   - its domain key is blobs/<name>;
+//   - its domain lock is the persistent sibling blobs/tmp-<name>.lock.
+//
+// For a content-addressed item the name is the SHA-256, so the derivation
+// yields exactly the blob key's domain of today: key blobs/<sha>, lock
+// blobs/tmp-<sha>.lock. The publication's holdsBlobKey check therefore keeps
+// working unchanged, and the cleanup of a blob key's artifacts keeps taking
+// the same domain the writer holds.
+//
+// For a path-derived destination (an item without a known digest) the same
+// derivation gives the destination its own domain, so a writer of that
+// destination and the cleanup of that destination agree on ONE identity
+// instead of protecting a domain nobody holds.
+//
+// A destination outside a blobs directory, or one that is not a tmp-<name>
+// staging name, has no domain key: it is not a cache destination and keeps
+// its historical behavior.
+func cacheDstDomainKey(dst string) (string, bool) {
+	dir := filepath.Dir(dst)
+	if filepath.Base(dir) != "blobs" {
+		return "", false
+	}
+	name, found := strings.CutPrefix(filepath.Base(dst), "tmp-")
+	if !found || name == "" {
+		return "", false
+	}
+	key, err := SafeJoin(dir, name)
+	if err != nil {
+		return "", false
+	}
+	return key, true
+}
+
+// holdsBlobKey reports whether this holder owns the ownership domain of the
+// given content-addressed blob path.
+//
+// The domain-exclusive publication tier needs exactly this answer: the
+// existence check and the placement that follows it are only exclusive to
+// the domain while the domain of THAT blob key is held, so the placement
+// verifies the domain instead of trusting the caller to have taken it. A
+// released or foreign domain does not hold the key.
+func (d *blobDomain) holdsBlobKey(key string) bool {
+	if d == nil || d.released || d.key == "" || key == "" {
+		return false
+	}
+	return filepath.Clean(d.key) == filepath.Clean(key)
+}
+
+// release drops the domain: the OS lock is closed and the in-process slot is
+// freed, which wakes a writer waiting for this key.
+func (d *blobDomain) release() {
+	if d == nil || d.released {
+		return
+	}
+	d.released = true
+	if d.lock != nil {
+		d.lock.release()
+	}
+	if d.entry == nil {
+		return
+	}
+	blobDomainOwners.Lock()
+	if blobDomainOwners.m[d.key] == d.entry {
+		delete(blobDomainOwners.m, d.key)
+	}
+	blobDomainOwners.Unlock()
+	close(d.entry.done)
+}

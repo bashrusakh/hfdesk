@@ -133,10 +133,289 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   errors.
 - Multipart part files are only reusable when their byte-range layout is known
   to match the current file size and connection count.
-- If resume metadata is missing, invalid, or mismatched, discard stale part files
-  and restart that file rather than guessing.
-- LFS files with known SHA-256 must be verified after download.
+- If legacy per-part resume metadata is invalid or mismatched, discard only the
+  incompatible part files and restart rather than guessing. For a current
+  `.incomplete.meta` claim, discard identity-mismatched data only while holding
+  lifetime ownership; preserve unreadable or ambiguous legacy claims unless
+  same-host owner death is proven.
+- `Settings.Verify` governs LFS verification too: `none` performs no
+  post-download content hash; `size` (default) checks exact size plus complete
+  validated transfer coverage on both the ranged and single-request paths and
+  performs no full-file SHA-256 pass on the normal path (the pre-download skip
+  check, the one-time legacy-migration content proof, the inherited
+  single-path `.part` proof, and a single-request known digest with no known
+  expected size may still hash); `sha256` performs at most one
+  full-file pass, always before the rename/publication when a known digest
+  exists, and never publishes a mismatch; `etag` proves a known digest with
+  that same single pre-publication pass and keeps the historical non-LFS ETag
+  behavior. A known digest is never hashed only after publication; HEAD-ETag-only
+  verification (no known digest) remains a post-publication check and can
+  report a mismatch then.
+- The single-request path is not exempt from the trust model: every 206 must
+  match the exact requested Content-Range, expected total and body length, its
+  writer is bounded to the requested range, and the file must have exactly the
+  expected size before the rename. `.part` bytes inherited from an earlier run
+  have no validated provenance: content-prove them with one full-file SHA-256
+  pass before publication when a known digest exists and `Verify != "none"`,
+  and never publish on a mismatch. A fresh transfer in `sha256`/`etag` mode is
+  likewise proven before the rename. Without a known expected size, discard the
+  partial rather than guessing a resume layout.
+- Written byte count alone does not prove a response ended cleanly. If a body
+  errors after delivering the requested final byte, never mark the range Done or
+  rename the single-path partial; preserve its validated prefix and reserve the
+  final byte for a nonempty retry/restart range until a response completes clean
+  framing. Keep progress unique across that revalidation.
+- Durable proof gate: a multipart staging record carries `ProofPending`, set and
+  flushed before any known-digest proof starts and cleared and flushed only
+  after it succeeds. On resume it forces the proof in every mode except `none`
+  (including `size`) whenever a known digest exists, so a crash mid-proof, a
+  mismatch whose cleanup failed, or a later mode
+  change cannot publish unproven all-Done ranges. A mismatch keeps the flag set,
+  attempts poison (truncate to zero) only while the claim is still owned under
+  lifetime ownership and local metadata serialization, and attempts the owned
+  discard; if ownership cannot be verified, poison is skipped and the durable
+  flag remains the guard, so the next run re-proves or discards. Publish refuses while a known digest's proof
+  is pending; `none` is the explicit opt-out. The single-path `.part` is its own
+  marker when a proof is required (sha256/etag, inherited bytes, or a known
+  digest with unknown size): it is renamed only after proof, so every restart
+  re-proves it. A fresh size transfer with a known size follows the size
+  contract and may rename without a hash.
+- Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
+  them LegacyMigrated, keep the marker durable across resume, and content-prove
+  them with one full-file SHA-256 pass before publication whenever a known
+  digest exists and `Verify != "none"`. An oversized single `.part` is invalid:
+  discard it, never clamp it. A multipart layout whose parts are all
+  missing/empty/oversized contributes no bytes and is not a migrated layout:
+  fall back to a valid single `.part`; set LegacyMigrated only when bytes were
+  actually copied.
+- A publish target's existence proves completion only when it is
+  content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
+  authoritative pre-download skip decision and are redownloaded and atomically
+  replaced when it declined them.
+- One blob key owns ONE publication domain, not one domain per staging path.
+  The ranged route (`blobs/<sha>.incomplete` -> `blobs/<sha>`) and the
+  single-request route (`blobs/tmp-<sha>.part` -> `blobs/tmp-<sha>` ->
+  `blobs/<sha>`) write the same key, so they must share one domain: an
+  in-process slot keyed by the blob key plus the lifetime OS lock on the
+  persistent sibling `blobs/tmp-<sha>.lock`, held for the whole operation on
+  that key. One domain means the other route can neither adopt, migrate nor
+  delete this route's LIVE partial (a live partial is never mistaken for a
+  pre-#140 leftover), and the "the blob does not exist yet" decision and the
+  placement that follows it cannot be overtaken. EVERY writer of `blobs/<sha>`
+  must take that domain and publish through the shared no-replace primitive —
+  including the exported `FinalizeBlob`, which must never rename over an
+  existing content-addressed blob. The domain lock file is
+  persistent, is never unlinked, and is excluded from cache statistics,
+  listings, mirrors and cache deletion like every other `.lock` artifact.
+- EVERY CACHE DESTINATION OWNS ONE OWNERSHIP DOMAIN, NOT ONLY THE
+  CONTENT-ADDRESSED ONES. The domain is keyed on the DESTINATION, and the
+  writer of a destination and the cleanup of that destination must agree on
+  ONE identity: destination `blobs/tmp-<name>` -> domain key `blobs/<name>`,
+  domain lock `blobs/tmp-<name>.lock`. For a content-addressed item the name
+  is the SHA-256, so the domain is exactly the blob key's domain described
+  above (key `blobs/<sha>`, lock `blobs/tmp-<sha>.lock`) and the publication's
+  `holdsBlobKey` check keeps working unchanged. An item WITHOUT a known digest
+  (the planner allows an empty SHA-256) gets a path-derived destination
+  (`blobs/tmp-<sanitized-relative-path>`), and a writer of that destination
+  MUST hold its domain too: otherwise two writers of the same destination are
+  not mutually excluded (in this process or in another one) and the cleanup's
+  protection is vacuous, because it derived the same key while NO writer ever
+  held it — so a cancelled job could delete another live job's `.part`/temp
+  for the same path. A writer that finds the destination owned by a PROVEN
+  live owner waits for it (bounded, context-aware, never a takeover) and then
+  obtains the file itself: a path-derived destination has no published
+  content-addressed target to re-check (its bytes are moved into a blob whose
+  name is the digest computed at store time, which the waiting writer cannot
+  know before it transfers the file), so the item re-downloads these small
+  non-LFS files and the store then reuses the already published blob instead
+  of replacing it. A writer of a cache destination that cannot take its
+  domain fails the item BEFORE it writes any payload, exactly like the
+  content-addressed case; the partial data of an earlier run is preserved.
+  The legacy/output (flat) mode has NO destination DOMAIN: that namespace has
+  no internal `blobs/`-style identity, so it has no destination-domain key and
+  no destination-domain lock file, and the wait/re-check protocol does not
+  apply there. It is NOT lock-free, though: the MULTIPART route stages at
+  `<destination>.incomplete` and takes the lifetime OS ownership lock on the
+  persistent sibling `<destination>.incomplete.lock` — a zero-byte artifact
+  next to the user's model file, never unlinked. A concurrent second writer of
+  the same flat destination on that route is therefore EXCLUDED: it fails its
+  item with the actionable live-owner error ("blob <sha> is being downloaded
+  by another process; try again later") instead of racing, which is safer than
+  the pre-#140 behavior, where two processes wrote the same `.part-NN` payload
+  files and could publish a silently corrupt model. The SINGLE-REQUEST route is
+  NOT excluded: it creates no lock artifact next to the destination (only
+  `<destination>.part`, removed on success) and takes no ownership lock, so two
+  writers of the same flat destination on that route still race over the same
+  `.part`.
+- JOB CONTRACT: "job completed successfully" MUST mean the requested files are
+  present AND reachable at their snapshot/friendly paths. A file owned by
+  another LIVE writer is NOT present, so it is NEVER a successful skip. When
+  the destination's ownership domain is held by a proven
+  live owner (another process, or another writer of this process), the item
+  WAITS for the domain — bounded, context-aware, never a takeover — and, once
+  it holds the domain, RE-CHECKS the published content-addressed target:
+  - the blob is present (the owner published it while the item waited): the
+    item completes as an ordinary skip ("blob exists"), with its own snapshot
+    and friendly entries created and NO additional network transfer;
+  - the owner released the domain without publishing: this writer downloads
+    the file itself and publishes it;
+  - the owner still holds the domain when the wait budget expires: the item
+    fails with an explicit, actionable error ("blob <sha> is being downloaded
+    by another process; try again later"), and the job does not report
+    success while that file is missing.
+  The re-check trusts the EXISTENCE of the published content-addressed blob as
+  completion proof, exactly like the pre-existing "blob exists" skip does, and
+  does not re-verify its content: in `size` mode a torn blob written by a
+  foreign writer is therefore accepted as complete — the same content-addressed
+  assumption the pre-existing skip already makes. Do not claim content
+  verification for the wait/re-check path.
+  A PATH-DERIVED destination (an item without a known digest) has no published
+  content-addressed target to re-check, so after it waited for the domain the
+  item OBTAINS the file itself — it re-downloads these small non-LFS files —
+  and the store then reuses the already published blob. A successful skip that
+  leaves the file missing is forbidden in every case.
+  The wait budget is bounded and derived from the existing ownership-lock
+  convention (the download budget is 60 times the 5s acquisition window, so
+  the effective budget is 5 MINUTES); it is a package-level knob, not a user
+  setting, and the in-process slot wait is bounded by the job's context only
+  (its holder is a goroutine of this process that finishes or is cancelled).
+  Cancellation stays prompt. COST: the wait happens INSIDE the item's
+  goroutine, and the item already holds its `MaxActiveDownloads` slot, so a
+  waiting item occupies a download slot for up to that budget — a job whose
+  item waits for a foreign owner can look stalled and holds a concurrency slot
+  it is not transferring with. What the operator sees: the item stays in
+  progress (no progress events are emitted while it waits, so its byte counter
+  does not move), and when the budget expires the item fails with the
+  actionable error above and the job's status is failed, not completed. The
+  existing "blob exists" skip (the file IS present) and the existing
+  unknown-ownership error (`BlobOwnershipUnknown`) are unchanged.
+- A LINK-CREATION FAILURE FAILS THE ITEM, IN EVERY PATH. A cached file is
+  reachable through its snapshot entry (and its friendly entry); the payload in
+  `blobs/` alone is not the requested path. The transfer path already treated
+  a failed link creation as fatal for the item, so the two SKIP paths (the
+  pre-download "blob exists" skip and the post-domain "blob exists" skip) must
+  agree with it: a link-creation failure makes the item FAIL with an
+  actionable error ("the file is in the cache but its cache path is not
+  reachable"), and the item emits NO `file_done` success. EVERY path that
+  creates the cache entries — both transfer paths and both skip paths —
+  returns the exported `ErrCacheLinkUnreachable` sentinel, so the failure is
+  uniform and detectable with `errors.Is`. The end-of-job
+  reconciliation that re-creates the links of skipped items surfaces its link
+  failures as a JOB error instead of only a warning, so a job cannot finish
+  "successful" with a missing path; its other duties are unchanged. The
+  friendly entry is deliberately ABSENT when `Settings.NoFriendlyView` is set,
+  so that is NOT an error.
+- CLEANUP PARTICIPATES IN THE SAME OWNERSHIP PROTOCOL. The artifacts of one
+  cache destination — the `blobs/tmp-<name>` staging name, its single-request
+  `.part`, the legacy `.part-NN` parts and the blob-keyed staging pair — are
+  removed only while that destination's ownership domain is held. The cleanup
+  derives the SAME domain identity the writer holds (destination
+  `blobs/tmp-<name>` -> key `blobs/<name>`, lock `blobs/tmp-<name>.lock`), so
+  the protection is real for a content-addressed AND for a path-derived
+  destination. A cleanup without the domain
+  could delete another live writer's LIVE partial: that writer would keep
+  writing to an unlinked inode and its later publication would fail with
+  ENOENT. When a live owner holds the destination (in this process or in
+  another one),
+  the artifacts are left alone and the contention is reported. A job CAN still
+  clean up its OWN artifacts: its writer releases the domain when it returns,
+  and the downloader's own cancel cleanup removes its staging while it still
+  holds the domain. The residual limitation: the cleanup cannot distinguish
+  "my own destination" from "another live owner of the same destination" beyond
+  the domain itself, so a destination that another writer owns is left alone
+  (safe) even when the cancelling job also had bytes for it. A legacy/output-mode
+  destination is not cache-scoped, so its cleanup holds NO destination domain:
+  that namespace has no internal `blobs/`-style identity. Its cleanup is
+  claim-checked instead: the versioned staging pair (`<destination>.incomplete`
+  and its `.meta`) is removed only while no live claim remains, and the single
+  `.part`, the legacy `.part-NN` parts and `.parts.json` are removed as before.
+  The persistent `<destination>.incomplete.lock` of the multipart route is
+  never unlinked.
+- A content-addressed publication has TWO tiers, and they guarantee different
+  things. The tier is chosen by the FILESYSTEM, not by the operating system.
+  - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
+    payload with a hard link, which fails when the name exists, so the
+    existence decision and the placement are ONE filesystem operation. An
+    existing `blobs/<sha>` is then never replaced, proven or not, by another
+    writer of the same key or by a writer outside the domain. The normal path
+    stays rename-only in cost (a hard link is a directory operation, not a
+    payload copy).
+  - DOMAIN-EXCLUSIVE (a filesystem that cannot create hard links): the Go
+    standard library exposes NO atomic no-replace rename on any supported
+    platform — `os.Rename` replaces an existing target on Unix and on
+    Windows, and `syscall` exports neither `renameat2(RENAME_NOREPLACE)` nor
+    `renamex_np(RENAME_EXCL)` — so the placement is a check-then-rename
+    performed while the blob key's ownership domain is held exclusively. The
+    property that holds there is "an existing `blobs/<sha>` is never replaced
+    by a domain participant", NOT "never replaced" unconditionally: a writer
+    outside the domain (the mirror writer) is not fenced by it. The placement
+    must refuse to run this tier without the ownership domain of the blob key
+    it publishes, so the weaker guarantee is never reached by accident.
+  Hard-link support is not a prerequisite for downloading: the fallback tier
+  publishes normally, and the two tiers differ in strength, not in
+  availability.
+- The ownership check reports three outcomes and never guesses: a PROVEN live
+  owner (the lock is held exclusively) is `BlobDownloading` and the caller
+  MUST NOT skip the item — the file is not present while the owner holds it, so
+  the item waits for the blob key's ownership domain and re-checks the
+  published target (see the job contract above); a PROVABLY dead owner is
+  `BlobStale` and may be resumed; an UNKNOWN ownership state (the probe failed,
+  or the platform cannot represent the lock) is `BlobOwnershipUnknown` plus an
+  error wrapping `ErrBlobOwnershipUnknown`, and the caller surfaces the
+  failure. An unknown state must never become a successful skip: the job would
+  report completion with the blob still missing. The incomplete payload is
+  preserved.
+- Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
+  (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
+  before the claim transition and held through transfer, hashing and
+  publish/cleanup. A busy lock is a live owner (the claim reports it as owned
+  and the caller fails the item with the actionable live-owner error, the
+  cleanup skips, `CheckBlob` reports downloading); a crashed process releases
+  it at death, and a suspended owner keeps it — there is deliberately no
+  takeover while it is alive. A free lock is authoritative only for a record
+  written under it (`LockFenced`). A fallback/legacy record is protected unless
+  its same-host owner is provably dead; age, ambiguous host/PID identity, or a
+  free new lock does not prove that an older writer cannot resume. If the lifetime lock cannot
+  be acquired (unsupported, denied, or filesystem error), fail the operation
+  before mutating claims or payloads and preserve partials; this is an
+  operation-time safety error, not a permanent platform-support policy. Keep
+  the ownership lock file: never unlink it (that would let two processes own
+  different inodes).
+- Before routing an item to the single-request path, detect usable multipart
+  resume state: a valid versioned `<staging>.incomplete`/`.meta` pair
+  (including the blob-keyed LFS pair; v2 completed ranges revalidate the final
+  byte) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
+  ranged-capable item keeps the multipart route even below the configured
+  threshold so migration/resume consumes the state; a fresh item with no state
+  keeps the configured routing. Without range support, warn, download the full
+  file through the single path, and remove the obsolete versioned pair only after the
+  final file is durable and claim-checked; the legacy family is removed by the
+  single-path success cleanup.
+- Serialize current-process record transitions with the per-staging metadata
+  mutex while the lifetime OS lock excludes foreign current-version mutators.
+  Never recover a transition by age or unlink a lock that a suspended holder may
+  still own. Re-read claim identity before mutation; cleanup and publish require
+  the lifetime capability, and publish checks cancellation immediately before
+  rename. A missing or foreign record is refused, never renamed.
+- Install a claim record only as a complete, valid document, atomically and
+  without replacing a record that already appeared. Stage it in a sibling temp
+  and install it with a hard link (atomic, no-replace), falling back to an
+  atomic rename — used only while no record is present — on a filesystem that
+  cannot create hard links. Hard-link support is not a prerequisite for
+  downloading. The staged copy must always be a fresh file: a staged path left
+  behind by an interrupted operation may share the authoritative record's
+  inode, and writing through it would empty the authoritative record before it
+  was replaced.
 - Size checks are only a fallback for files without a trusted hash.
+- Known limitation (not a downloader invariant): the mirror writer copies
+  destination blobs with a non-atomic truncate-and-write and a size-only check,
+  so it can tear or overwrite a blob a downloader is publishing, and the
+  selected-GGUF delete path removes blob payloads outside the blob key's
+  ownership domain. Neither path takes the domain lock, so neither is fenced
+  by the publication domain: they are the documented exception to "an existing
+  `blobs/<sha>` is never replaced" (and, on a filesystem without hard links,
+  to the domain-exclusive tier as well). The downloader's publication
+  invariant must not depend on either path's behavior.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to
   be stale or incompatible.
@@ -147,6 +426,24 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 
 - `JobManager` owns live job state; callers should receive snapshots, not shared
   mutable pointers.
+- A job that reports success must mean the requested files are present AND
+  reachable at their snapshot/friendly paths. A file
+  owned by another live writer is not present: it is waited for (bounded) and
+  re-checked, never reported as a completed skip. When the wait is exhausted
+  the item fails with an actionable error, and the job's status is failed, not
+  completed — see the downloader correctness rules for the ownership protocol.
+  The wait budget is 5 minutes, and the wait runs inside the item's goroutine,
+  which already holds one of the job's `MaxActiveDownloads` slots: a waiting
+  item therefore occupies a download slot for up to that budget, and a job
+  whose item waits for a foreign owner can look stalled. What the operator
+  sees: the item stays in progress (no progress events are emitted while it
+  waits, so its byte counter does not move), and when the budget expires the
+  item fails with the actionable error and the job's status is failed.
+  A failed link creation (the snapshot or friendly entry of a cached file
+  could not be created) also fails the item, in the transfer path and in both
+  skip paths alike: the payload may be in `blobs/`, but the requested path is
+  not reachable, so the job must not report success. A job that ends with such
+  a failure is `failed`, not `completed`.
 - Do not hold the job manager lock while broadcasting to listeners or WebSocket
   clients.
 - Scheduler changes must preserve `max-active` semantics: queued jobs start in

@@ -43,6 +43,25 @@ var (
 	// filters; path filters must use AppendFilterSubdir=false. Distinguishable
 	// via errors.Is.
 	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
+
+	// ErrBlobOwnershipUnknown is returned by CheckBlob when the ownership of
+	// an incomplete download cannot be determined: the OS-level ownership
+	// probe failed, or this platform cannot represent the lock. No live owner
+	// is proven in that case, so the caller must surface the failure instead
+	// of skipping the item - a skip would be reported as a successful
+	// download with the blob still missing. The incomplete payload is left
+	// untouched. Distinguishable via errors.Is.
+	ErrBlobOwnershipUnknown = errors.New("the owner of the incomplete download could not be determined")
+
+	// ErrCacheLinkUnreachable is returned when the payload of an item is
+	// present in the cache, but the requested path is not reachable through
+	// its snapshot entry (or its friendly entry). The transfer path always
+	// treated such a failure as fatal for the item; the skip paths now agree
+	// with it, because a job that reports success means the requested files
+	// are present AND reachable. The friendly entry is deliberately absent
+	// when Settings.NoFriendlyView is set, so that is not an error.
+	// Distinguishable via errors.Is.
+	ErrCacheLinkUnreachable = errors.New("the file is in the cache but its cache path is not reachable")
 )
 
 // DownloadError wraps an error with file context.

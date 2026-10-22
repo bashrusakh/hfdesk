@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -240,11 +239,98 @@ func (r *RepoDir) EnsureDirs() error {
 }
 
 // IncompleteMeta contains metadata about an incomplete download.
+//
+// The base fields (PID, StartedAt, Size, SHA256) describe the transfer, while
+// Instance and Host carry the cross-process ownership identity and staleness
+// state used by CheckBlob and the claim/take-over logic. PID alone is only a
+// hint: a reused PID or two containers reporting PID 1 must not be treated as
+// the same owner. The Version/Ranges fields extend the record into the
+// ranged-download resume state (issue #140): versioned metadata describes a
+// direct-write staging file whose valid bytes are the committed prefixes of
+// the listed ranges. Ranges is the authoritative byte contract for an existing
+// incomplete download, deliberately decoupled from worker count so changed
+// Settings.Concurrency re-fetches only missing bytes. Crash-safety contract:
+// payload data is written before Committed is advanced, and Committed must not
+// claim bytes that were not written. Version 3 Done additionally requires clean
+// response framing; a version-2 Done range is migrated with its final byte
+// reserved for revalidation. The staging file is preallocated, so its length
+// is never evidence of completion — only Ranges is, after payload existence and
+// logical size have been checked.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
+	// Instance is a random per-process identity token. It distinguishes an
+	// earlier run of this process instance from a different process that
+	// happens to report the same PID (PID reuse, containers sharing PID 1).
+	// PID and Host are hints; Instance is never inferred from them.
+	Instance string `json:"instance,omitempty"`
+	// Host is the hostname that wrote the record. It allows a same-host
+	// liveness check of PID; an empty or different host leaves heartbeat
+	// freshness as the only ownership signal.
+	Host string `json:"host,omitempty"`
+	// LockFenced records that this claim was made while holding the OS-level
+	// staging ownership lock (the persistent <staging>.lock). On a platform
+	// that supports the lock, its state is then authoritative for CheckBlob:
+	// busy means a live writer, and a free lock means the owner crashed or
+	// released the claim, so the record is stale and take-over-able regardless
+	// of PID reuse or heartbeat freshness. Records written on a fallback
+	// platform (or by an older version) carry false and keep the lease
+	// heuristic.
+	LockFenced bool `json:"lock_fenced,omitempty"`
+	// Version is 0 for legacy records (no range state) and 3 for the ranged
+	// staging records written by this downloader. Version 2 is still accepted
+	// and migrated: its completed ranges are revalidated rather than trusted.
+	Version int `json:"version,omitempty"`
+	// Repo, Path and Commit identify the resolved remote object the staging
+	// file belongs to, so a reused destination or moved branch cannot
+	// silently resume another revision's bytes. The commit is the resolved
+	// SHA from the plan, not the requested branch name.
+	Repo string `json:"repo,omitempty"`
+	// Revision is a legacy advisory field written by earlier records. It is
+	// not part of the resume identity (the resolved Commit is).
+	Revision string `json:"revision,omitempty"`
+	Commit   string `json:"commit,omitempty"`
+	Path     string `json:"path,omitempty"`
+	// Ranges lists the persisted range layout and per-range committed
+	// progress; see RangeProgress. Empty for legacy records.
+	Ranges []RangeProgress `json:"ranges,omitempty"`
+	// LegacyMigrated marks bytes imported from a pre-#140 partial
+	// (.part-NN/.parts.json family or a single .part). Such bytes have
+	// layout/prefix structure but no validated provenance, so the downloader
+	// performs one full-file SHA-256 content proof before publication whenever
+	// the item carries a known digest and Verify is not "none" — the explicit
+	// one-time migration exception to the size-mode "no reread" rule. The flag
+	// is persisted so a crash and resume repeat the proof instead of publishing
+	// unproven bytes.
+	LegacyMigrated bool `json:"legacy_migrated,omitempty"`
+	// ProofPending is the durable publication gate for known-digest
+	// verification. It is set (and flushed) before any pre-publication
+	// SHA-256 proof starts — a fresh sha256/etag multipart transfer or bytes
+	// migrated from a pre-#140 partial — and cleared (and flushed) only after
+	// that proof succeeds, immediately before the publish rename. A record that
+	// still carries the flag forces the proof on the next claim regardless of
+	// the current Verify mode (including "size") whenever the item has a known
+	// digest and Verify is not "none", so a crash mid-proof, a mismatch whose
+	// cleanup could not take the transition lock, or a later mode change cannot
+	// turn unproven all-Done ranges into a publishable blob. "none" is the
+	// explicit no-hash opt-out. On a mismatch the flag stays set and the
+	// payload is poisoned (truncated) in addition. The single-request path has
+	// no staging record: its .part is only renamed after the proof, so the
+	// .part itself is the durable pending marker.
+	ProofPending bool `json:"proof_pending,omitempty"`
+}
+
+// RangeProgress is the durable state of one persisted download range.
+// Bytes [Start, Start+Committed) are the durable range prefix. Done marks the
+// whole range [Start, End] as committed after clean response framing. A full
+// prefix with Done=false reserves the last byte for framing revalidation.
+type RangeProgress struct {
+	Start     int64 `json:"start"`
+	End       int64 `json:"end"`
+	Committed int64 `json:"committed"`
+	Done      bool  `json:"done"`
 }
 
 // BlobStatus represents the status of a blob in the cache.
@@ -262,6 +348,18 @@ const (
 
 	// BlobStale means an incomplete download exists but is stale (can be taken over).
 	BlobStale
+
+	// BlobOwnershipUnknown means the ownership of the incomplete download could
+	// not be determined: the OS-level ownership probe failed (or this platform
+	// cannot represent the lock), so neither "a live writer owns it" nor "its
+	// owner is gone" is proven.
+	//
+	// CheckBlob returns this status together with a non-nil error that wraps
+	// ErrBlobOwnershipUnknown. An unknown ownership state is an observable
+	// failure, never a successful skip: reporting it as "downloading by
+	// another process" would claim a live owner that was never proven, and the
+	// job would then report success with the blob still missing.
+	BlobOwnershipUnknown
 )
 
 // String returns a human-readable status.
@@ -275,6 +373,8 @@ func (s BlobStatus) String() string {
 		return "downloading"
 	case BlobStale:
 		return "stale"
+	case BlobOwnershipUnknown:
+		return "ownership-unknown"
 	default:
 		return "unknown"
 	}
@@ -282,6 +382,30 @@ func (s BlobStatus) String() string {
 
 // CheckBlob checks the status of a blob in the cache.
 // Returns the status and any existing incomplete metadata.
+//
+// The result distinguishes three ownership outcomes, and never guesses:
+//
+//   - a PROVEN live owner (the persistent <staging>.lock is held exclusively)
+//     is reported as BlobDownloading. The caller must NOT skip the item: the
+//     file is not present while that owner holds the key, so the caller waits
+//     for the blob key's ownership domain and re-checks the published
+//     content-addressed target afterwards;
+//   - a PROVABLY dead owner (a free lock plus a lock-fenced record, or
+//     same-host process evidence that the recorded owner is gone) is reported
+//     as BlobStale, so the caller may resume it;
+//   - an UNKNOWN ownership state (the ownership probe failed, or this
+//     platform cannot represent the lock) is reported as
+//     BlobOwnershipUnknown together with an error that wraps
+//     ErrBlobOwnershipUnknown. The caller must surface that error instead of
+//     skipping the item: no live owner is proven, so a skip would be an
+//     unproven claim that turns into a successful download with the blob
+//     still missing.
+//
+// A held OS-level staging ownership lock (the persistent <staging>.lock) means
+// a live writer owns the staging file and is reported as BlobDownloading before
+// any record heuristic: a suspended owner can stop heartbeating and still
+// resume writing through an open handle, so the lock, not the lease, decides
+// liveness wherever it is supported.
 func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) {
 	blobPath := r.BlobPath(sha256)
 	incompletePath := r.IncompletePath(sha256)
@@ -293,12 +417,39 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	}
 
 	// Check if incomplete download exists
-	incompleteStat, err := os.Stat(incompletePath)
+	_, err := os.Stat(incompletePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return BlobMissing, nil, nil
 	}
 	if err != nil {
 		return BlobMissing, nil, fmt.Errorf("stat incomplete file: %w", err)
+	}
+
+	// A busy OS ownership lock is the authoritative "a live writer owns this
+	// staging file" signal. It covers a suspended owner whose heartbeat went
+	// stale (and which could still resume writing through an open handle) and
+	// an in-process download whose record looks take-over-able. The probe never
+	// blocks, never creates the lock file, and releases immediately.
+	busy, probeErr := stagingOwnershipStatusProbe(incompletePath)
+	if probeErr == nil && busy {
+		// A PROVEN live writer owns this staging file.
+		return BlobDownloading, nil, nil
+	}
+	if probeErr != nil || !stagingOSLockAvailable {
+		// The ownership state is UNKNOWN: the probe failed, or this platform
+		// cannot represent the lifetime lock. Neither a live owner nor a dead
+		// owner is proven. The conservative reading ("somebody owns it") would
+		// be an unproven claim, and it becomes a successful skip with the blob
+		// still missing - the exact false completion this check must not
+		// report. Report an actionable error instead; the incomplete payload
+		// is left untouched so a retry can resume it.
+		meta, _ := r.readIncompleteMeta(metaPath)
+		cause := probeErr
+		if cause == nil {
+			cause = errStagingOSLockUnsupported
+		}
+		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot determine the owner of the incomplete download %s: %w",
+			ErrBlobOwnershipUnknown, incompletePath, cause)
 	}
 
 	// Read metadata
@@ -308,16 +459,16 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobStale, nil, nil
 	}
 
-	// Check if the process is still alive
-	if isProcessAlive(meta.PID) {
-		// Check if file was recently modified
-		if time.Since(incompleteStat.ModTime()) < r.cache.StaleTimeout {
-			return BlobDownloading, meta, nil
-		}
+	// A current-version record plus a free lifetime lock proves the owner is
+	// gone. A legacy/unfenced record is resumable only when same-host process
+	// evidence proves owner death; age or remote/ambiguous identity is not proof.
+	if meta.LockFenced {
+		return BlobStale, meta, nil
 	}
-
-	// Process is dead or file is stale
-	return BlobStale, meta, nil
+	if stagingOwnerProvablyDead(meta) {
+		return BlobStale, meta, nil
+	}
+	return BlobDownloading, meta, nil
 }
 
 // readIncompleteMeta reads the metadata file for an incomplete download.
@@ -337,6 +488,8 @@ func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
 	meta := IncompleteMeta{
 		PID:       os.Getpid(),
+		Instance:  processInstanceToken,
+		Host:      processHostname,
 		StartedAt: time.Now().UTC(),
 		Size:      size,
 		SHA256:    sha256,
@@ -348,13 +501,16 @@ func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
 	return os.WriteFile(r.IncompleteMetaPath(sha256), data, 0644)
 }
 
-// CleanupIncomplete removes the .incomplete and .incomplete.meta files.
+// CleanupIncomplete removes the .incomplete.meta and .incomplete files. The
+// metadata is removed first so a crash cannot leave a record claiming bytes
+// whose payload no longer exists.
 func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 	var errs []error
-	if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, err)
-	}
 	if err := os.Remove(r.IncompleteMetaPath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Do not delete the payload if its record could not be removed:
+		// that would leave a record claiming bytes that no longer exist.
+		errs = append(errs, err)
+	} else if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -364,33 +520,44 @@ func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 }
 
 // FinalizeBlob moves a completed .incomplete file to its final blob location.
+//
+// The publication participates in the blob key's ownership domain and runs
+// through the shared no-replace placement primitive, exactly like the ranged
+// publish and the cache store. An existing content-addressed blob is
+// therefore NEVER replaced: its bytes are the completion proof, the
+// .incomplete payload is left untouched for the caller to discard, and the
+// call reports the conflict instead of silently overwriting proven bytes.
 func (r *RepoDir) FinalizeBlob(sha256 string) error {
 	incompletePath := r.IncompletePath(sha256)
 	blobPath := r.BlobPath(sha256)
 
-	// Move incomplete to final location
-	if err := os.Rename(incompletePath, blobPath); err != nil {
-		return fmt.Errorf("rename incomplete to blob: %w", err)
+	// The blobs directory must exist before the domain's lock file can be
+	// created next to the destination.
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return fmt.Errorf("create blobs directory: %w", err)
+	}
+
+	// The publication runs inside the blob key's ownership domain, so it
+	// cannot race another writer of the same key.
+	dst, err := r.blobDomainDst(sha256)
+	if err != nil {
+		return fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, err)
+	}
+	domain, err := blobDomainAcquire(context.Background(), blobPath, dst)
+	if err != nil {
+		return fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, err)
+	}
+	defer domain.release()
+
+	// Move incomplete to final location without replacing an existing blob.
+	if err := blobPublishPlace(incompletePath, blobPath, domain); err != nil {
+		return fmt.Errorf("finalize blob %s: %w", sha256, err)
 	}
 
 	// Remove metadata file
 	_ = os.Remove(r.IncompleteMetaPath(sha256))
 
 	return nil
-}
-
-// isProcessAlive checks if a process with the given PID is still running.
-func isProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix, FindProcess always succeeds. We need to send signal 0 to check.
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
 }
 
 // FriendlyPath returns the path in the friendly view for this repo.
@@ -709,6 +876,19 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 // storeDownloadedFileCtx is the context-bounded implementation used by the
 // downloader; the existing public context-free API remains unchanged.
 func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
+	return r.storeDownloadedFileInDomain(ctx, tempFile, relativePath, commit, sha256, filterSubdir, noFriendly, nil)
+}
+
+// storeDownloadedFileInDomain is storeDownloadedFileCtx with an explicit
+// ownership domain.
+//
+// The domain is the blob key's single ownership domain (see blob_domain.go).
+// The downloader already holds it for the whole operation on that key and
+// passes it in; a direct caller passes nil and the store takes the domain
+// itself. The publication therefore always happens inside the domain, so the
+// "the blob does not exist yet" decision and the placement that follows it
+// cannot be overtaken by another writer of the same key.
+func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool, domain *blobDomain) (*StoreFileResult, error) {
 	// Compute SHA256 if not provided
 	if sha256 == "" {
 		computed, err := computeSHA256Ctx(ctx, tempFile)
@@ -720,37 +900,74 @@ func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relative
 
 	blobPath := r.BlobPath(sha256)
 
-	// Check if blob already exists (deduplication)
-	if _, err := os.Stat(blobPath); err == nil {
-		// Blob exists, just remove temp file
-		os.Remove(tempFile)
-	} else {
-		// Move temp file to blob location
-		if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
-			return nil, fmt.Errorf("create blobs directory: %w", err)
+	// The blobs directory must exist before the domain's lock file can be
+	// created next to the destination.
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return nil, fmt.Errorf("create blobs directory: %w", err)
+	}
+
+	// The publication runs inside the blob key's ownership domain.
+	if domain == nil || !domain.holdsBlobKey(blobPath) {
+		dst, derr := r.blobDomainDst(sha256)
+		if derr != nil {
+			return nil, fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, derr)
 		}
-		if err := os.Rename(tempFile, blobPath); err != nil {
-			// Rename failed (cross-device?), try an atomic copy: stage in a
-			// sibling temp file, then atomically rename it into place. A cancelled or
-			// failed copy must never leave a partial file at the FINAL blob
-			// path (which CheckBlob would report complete, poisoning the cache).
-			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
-				return nil, fmt.Errorf("move file to blob: %w", err)
-			}
+		d, derr := blobDomainAcquire(ctx, blobPath, dst)
+		if derr != nil {
+			return nil, fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, derr)
+		}
+		defer d.release()
+		domain = d
+	}
+
+	// Place the payload into the blob namespace. The placement never replaces
+	// an existing blob: a content-addressed blob that already exists is
+	// completion proof, so a concurrent publisher's bytes are not overwritten
+	// by ours (and ours are not published over theirs).
+	if err := blobPublishPlace(tempFile, blobPath, domain); err != nil {
+		switch {
+		case errors.Is(err, errBlobTargetExists):
+			// Another writer published this blob first. Its bytes are the
+			// completion proof; this payload is discarded.
 			os.Remove(tempFile)
+		case errors.Is(err, errBlobPublicationDomainRequired):
+			// The placement cannot prove that it will not replace an
+			// existing blob, and the copy fallback below is no stronger.
+			// The operation fails instead of guessing.
+			return nil, fmt.Errorf("move file to blob: %w", err)
+		default:
+			// The payload could not be placed by a link or a rename (a
+			// cross-device move, for example). Fall back to an atomic copy:
+			// stage in a sibling temp file, then atomically rename it into
+			// place. The copy is exclusive to the blob key's ownership
+			// domain this store holds, so no domain participant can create
+			// the target between the existence check and the copy. A
+			// cancelled or failed copy must never leave a partial file at
+			// the FINAL blob path (which CheckBlob would report complete,
+			// poisoning the cache).
+			if _, statErr := os.Stat(blobPath); statErr == nil {
+				// The blob appeared in the meantime: it is the completion
+				// proof, so this payload is discarded.
+				os.Remove(tempFile)
+			} else {
+				if cerr := copyFileAtomicCtx(ctx, tempFile, blobPath); cerr != nil {
+					return nil, fmt.Errorf("move file to blob: %w", cerr)
+				}
+				os.Remove(tempFile)
+			}
 		}
 	}
 
-	// Create snapshot entry
-	if err := r.createSnapshotSymlink(ctx, commit, relativePath, sha256); err != nil {
-		return nil, fmt.Errorf("create snapshot symlink: %w", err)
-	}
-
-	// Create friendly view entry (unless disabled)
-	if !noFriendly {
-		if err := r.createFriendlySymlinkCtx(ctx, commit, relativePath, filterSubdir); err != nil {
-			return nil, fmt.Errorf("create friendly symlink: %w", err)
-		}
+	// Create the snapshot entry and, unless the friendly view is disabled,
+	// the friendly entry. They are created through the SAME helper the skip
+	// paths use, so a link-creation failure carries the exported
+	// ErrCacheLinkUnreachable sentinel on every path that creates the cache
+	// entries: the payload may be in blobs/, but the requested path is not
+	// reachable through it, and the caller must not report the item as
+	// successful. The friendly entry stays deliberately absent when the
+	// friendly view is disabled, which is not an error.
+	if err := cacheEntryLinkCreate(ctx, r, commit, relativePath, filterSubdir, sha256, noFriendly); err != nil {
+		return nil, err
 	}
 
 	snapPath, err := r.SnapshotPath(commit, relativePath)
