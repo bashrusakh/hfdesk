@@ -4,10 +4,8 @@
 package server
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -252,10 +250,10 @@ func TestSettingsTokenExplicitSetClear(t *testing.T) {
 
 func TestSettingsTokenRedaction(t *testing.T) {
 	isolateTokenConfig(t)
-	var logs bytes.Buffer
-	old := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(old) })
+	// The settings handler logs through the application pipeline, so the
+	// pipeline is what has to be observed here: a token of any length must
+	// not reach the emitted records.
+	logs := installCapturingPipeline(t)
 	for _, token := range []string{"", "x", "xy", "xyz", "abcd", "hf_long_credential"} {
 		cfg := DefaultConfig()
 		cfg.Token = token
@@ -285,7 +283,11 @@ func TestSettingsTokenRedaction(t *testing.T) {
 			requireTokenState(t, s, token, "")
 		}
 	}
-	if strings.Contains(logs.String(), "hf_long_credential") || strings.Contains(logs.String(), "abcd") {
+	emitted := logs.String()
+	if !strings.Contains(emitted, "/api/settings") {
+		t.Fatalf("captured pipeline output does not contain the settings request: %q", emitted)
+	}
+	if strings.Contains(emitted, "hf_long_credential") || strings.Contains(emitted, "abcd") {
 		t.Error("settings logs expose a credential")
 	}
 }

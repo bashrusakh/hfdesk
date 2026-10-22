@@ -40,6 +40,209 @@ Returns server status, version, timestamp, and the effective configured Hugging 
 when no custom endpoint is configured, never ends with a trailing slash, and
 preserves any configured path prefix (for example `https://mirror.example/hf`).
 
+## Runtime and Logs
+
+```http
+GET /api/runtime
+GET /api/runtime/logs?after=<cursor>&level=<level>&limit=<n>
+GET /api/runtime/logs/stream?after=<cursor>&level=<level>
+POST /api/runtime/open-logs
+POST /api/runtime/open-ui
+```
+
+These endpoints report the status and the log of the running server. They
+expose local process diagnostics, so they stay local: whatever address the
+server binds to, a request is rejected with `403` unless every one of the
+following rules holds.
+
+- The peer address is a loopback address (`127.0.0.0/8` or `::1`). The peer
+  is taken from the connection alone, so a forwarded header such as
+  `X-Forwarded-For` is ignored and cannot be used to fake a loopback peer.
+- The `Origin` header, when the request carries one, names the local
+  machine: a loopback address (`127.0.0.0/8` or `::1`) or the name
+  `localhost`. A request without an `Origin` header is not rejected by this
+  rule, because a native client sends none.
+- The `Host` header names the local machine: the host part of the header is
+  a loopback address (`127.0.0.0/8` or `::1`) or exactly `localhost`. The
+  port is irrelevant and may be any port. An IPv6 literal is written in
+  brackets, with or without a port (`[::1]` and `[::1]:8080`). The match is
+  exact, so `evil.example`, `localhost.evil.example` and
+  `127.0.0.1.evil.example` are rejected, and so is an empty or malformed
+  `Host` header.
+
+The third rule closes the DNS rebinding hole. A name of another site can be
+pointed at `127.0.0.1`, and the request the browser then makes is same
+origin for the browser, so it carries no `Origin` header at all: the peer is
+loopback and there is no origin to check. The name the client asked for is
+what tells such a request apart from a native client.
+
+The Runtime window is served from the loopback address of the running
+server, so its own requests carry a loopback `Host` and keep working. A
+server that is reached through another name of the local machine (a name
+that resolves to `127.0.0.1` without being `localhost`) does not serve the
+runtime endpoints: the name has to be a loopback address or `localhost`.
+
+The requests of these endpoints are written to the log at `debug` level, not
+at `info` level. The Runtime window polls the status every few seconds, and
+at `info` level that polling filled the bounded history the window exists to
+show. Every other request keeps the `info` level, including a request that
+answers with an error. A user who asks for `debug` level still sees the
+requests of the runtime endpoints.
+
+`GET /api/runtime` returns:
+
+```json
+{
+  "version": "1.3.0",
+  "status": "ok",
+  "url": "http://127.0.0.1:8080",
+  "address": "127.0.0.1:8080",
+  "activeJobs": { "running": 1, "queued": 2 },
+  "runId": "3f8a1c06b27d4e59a0c1d8b47e2f6095",
+  "logCursor": 42,
+  "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log"
+}
+```
+
+`url` is the browser-safe URL of the running server, `address` is the
+effective address it is bound to (empty while the server is not bound yet)
+and `logCursor` is the sequence number of the most recent log record, the
+cursor a client sends to read the records emitted after it. `logFile` is the
+path of the rotating log file; it is an empty string when the application does
+not write a log file.
+
+`runId` identifies the run of the server: it is generated once per server
+and it never changes afterwards, so it is stable for the whole life of the
+process and different in another process. A client compares it to tell a
+restart of the server from a continued run, because the sequence numbers of
+the log belong to the run of the process that emits them and start over with
+every run. The head of the log cannot answer that question: the status is a
+snapshot that was taken before the request itself was written to the log, so
+the head it reports is behind the records the client already has. The value
+is random: it carries no information about the machine, the user or the
+files of the host, and it is not a secret. A server that does not report a
+run id (an older build) leaves the run of the client unknown, which is never
+read as a restart.
+
+`GET /api/runtime/logs` returns a bounded page of the retained records:
+
+```json
+{
+  "records": [
+    {
+      "seq": 42,
+      "time": "2026-10-21T10:11:12Z",
+      "level": "INFO",
+      "component": "server",
+      "message": "request",
+      "attrs": { "method": "GET", "path": "/api/health" }
+    }
+  ],
+  "cursor": 42,
+  "truncated": false
+}
+```
+
+- `after` — a cursor; only the records with a higher sequence number are
+  returned. The default is `0`, which returns the whole retained history.
+- `level` — the minimum severity of the returned records: `debug`, `info`,
+  `warn` or `error`. An absent value or `all` returns every record. An
+  unknown value is rejected with `400`.
+- `limit` — the maximum number of returned records. The default is `200`
+  and the maximum is `1000`; a larger value is clamped to the maximum. An
+  invalid value is rejected with `400`.
+
+`cursor` is the cursor to send for the next page. It is the sequence number
+of the last record the server consumed. Without a `level` filter that is the
+last record the page carried, so a client never skips a record it did not
+receive. With a `level` filter the server also consumes the records it
+filtered out, so the cursor can name a record the page did not carry and the
+client does not have to ask for those records again. A page that consumed no
+record keeps the cursor of the client: the page taught the client nothing, so
+the cursor does not move.
+
+`truncated` reports that
+the caller cannot be served a complete answer for the requested cursor and
+has to start over. It is true when the requested window is no longer fully
+covered by the retained records, so the client must not assume that the page
+continues the history it has. It is also true when the cursor is ahead of
+every record the server holds: the sequence numbers of the log belong to the
+run of the process that emits them and start over with every run, so such a
+cursor comes from an earlier run of the server. A cursor that is exactly at
+the newest record is not truncated, because there is simply nothing new after
+it. The records come from a bounded in-memory ring: the log file is never
+read, so a reconnect does not re-read it and a single request cannot ask for
+an unbounded amount of data.
+
+`GET /api/runtime/logs/stream` is a Server-Sent Events stream of the same
+records. It replays the retained records after `after` first and then
+continues with the live records. The response carries `Content-Type:
+text/event-stream` and `Cache-Control: no-cache`, and it carries these
+events:
+
+- `log` — a record, with the payload of a record of the page above.
+- `dropped` — the subscription lost records because the client did not keep
+  up: `{"dropped": 3, "cursor": 42}`. The client re-syncs by reading
+  `GET /api/runtime/logs` after the reported cursor.
+- `gap` — the requested window had already fallen out of the retained
+  records, or the cursor was ahead of every record the server holds:
+  `{"dropped": 0, "cursor": 42}`. The client re-syncs the same way.
+
+The stream takes `after` and `level`, like the page. It takes **no**
+`limit`: a request that carries a limit value is rejected with `400` and an
+error that names the parameter. A limit on a stream is ambiguous — it could
+cap the replay, the live records or both — and a client cannot tell a stream
+that ignored the limit from a complete answer, so the stream refuses the
+parameter instead of accepting it and ignoring it. The page is the endpoint
+that bounds the size of an answer.
+
+The replay of the stream is bounded by the retained records of the in-memory
+ring: the log file is never read, so a stream replays at most the records
+the ring still holds. A window that already fell out of the ring is reported
+by the `gap` event, and the client re-syncs it with the page.
+
+The stream moves its position over the records it consumed, so the cursor it
+reports follows the same rule as the page: without a `level` filter it never
+names a record the client did not receive, and with one it can name a record
+the stream filtered out. A replay that consumed no record keeps the cursor of
+the client.
+
+The stream ends when the client goes away, and a keep-alive comment is sent
+while it is idle. Log traffic does not use the job WebSocket of `/api/ws`.
+
+`POST /api/runtime/open-logs` opens the folder of the active log file with
+the file manager of the operating system. It takes no path: the endpoint opens
+the log location of the running application and nothing else, so it can never
+be used to open another location. It is a POST, because it changes the state
+of the desktop, and it is guarded by the same local-only rule as the other
+runtime endpoints. It answers `404` when the application does not write a log
+file, and `500` when the operating system did not open the folder.
+
+```json
+{
+  "ok": true,
+  "path": "/home/user/.cache/HFDesk/logs"
+}
+```
+
+`POST /api/runtime/open-ui` opens the web UI of the running server in the
+default browser of the operating system. It takes no parameters: the endpoint
+opens the URL of the running server and nothing else, so it can never be used
+to open another location. It is a POST, because it changes the state of the
+desktop, and it is guarded by the same local-only rule as the other runtime
+endpoints. It answers `404` when the server is not bound yet, and `500` when
+the operating system did not open the browser.
+
+The URL is handed to the default handler of the operating system, the very
+mechanism the console host and the desktop host use to open the web UI, so
+every caller reaches the browser the same way.
+
+```json
+{
+  "ok": true
+}
+```
+
 ## Search
 
 ```http
