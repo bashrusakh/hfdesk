@@ -1503,8 +1503,70 @@ func scmTestUncarriedSID(t *testing.T, identity scmIdentitySIDs) string {
 // backslashes of a Windows path are escaped in them: the path of a message
 // is the quoted form of the path, not the path itself. The check looks for
 // both forms, so it does not depend on the way a message renders the path.
+//
+// The manager judges a path by its real location: the platform follows the
+// links of a path before it uses it, and it reports the name a directory has
+// on the disk, so the name of a directory that is reached through a short
+// name is the long name of the same directory. A message can therefore name
+// the real location of a path instead of the path as it was written, and the
+// check looks for that form as well.
+//
+// The real location of a path that does not exist cannot be read: the path as
+// it was written is then the only form a message can name.
 func scmTestNamesPath(message, path string) bool {
-	return strings.Contains(message, path) || strings.Contains(message, strconv.Quote(path))
+	if strings.Contains(message, path) || strings.Contains(message, strconv.Quote(path)) {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(message, resolved) || strings.Contains(message, strconv.Quote(resolved))
+}
+
+// TestSCMTestNamesPathAcceptsTheRealLocationOfAPath checks that the
+// comparison of a path with a message accepts the real location of the path.
+//
+// The manager judges a path by its real location, and it names that location
+// in its messages: the platform reports the name a directory has on the disk,
+// so a directory that is reached through a short name is named by its long
+// name. A comparison that accepts only the path as it was written fails on a
+// machine that names the directory differently.
+//
+// The comparison keeps its meaning: the path as it was written is still
+// accepted, and a path the message does not name is not a path the message
+// names.
+func TestSCMTestNamesPathAcceptsTheRealLocationOfAPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "cache"), 0o700); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+
+	// The path as it was written names the directory with another case: the
+	// platform reports the name the directory has on the disk.
+	spelled := filepath.Join(root, "CACHE")
+	resolved, err := filepath.EvalSymlinks(spelled)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) = %v, want nil", spelled, err)
+	}
+	if resolved == spelled {
+		t.Skipf("the platform reports the path %q as it was written", spelled)
+	}
+
+	// The message names the real location of the path.
+	message := fmt.Sprintf("service: the cache dir %q does not exist", resolved)
+	if !scmTestNamesPath(message, spelled) {
+		t.Errorf("scmTestNamesPath(%q, %q) = false, want true: the message names the real location %q of the path", message, spelled, resolved)
+	}
+	// The path as it was written is still accepted.
+	if !scmTestNamesPath(fmt.Sprintf("service: the cache dir %q does not exist", spelled), spelled) {
+		t.Errorf("scmTestNamesPath() = false, want true: the message names the path %q", spelled)
+	}
+	// A path the message does not name is not a path the message names.
+	other := filepath.Join(root, "other")
+	if scmTestNamesPath(message, other) {
+		t.Errorf("scmTestNamesPath(%q, %q) = true, want false: the message does not name the path", message, other)
+	}
 }
 
 // TestPreflightDataPathRefusesAFile checks that a file where the instance
@@ -1930,6 +1992,11 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
 	}
+	// The manager names the real location of the ancestor: the platform
+	// reports the name the directory has on the disk, so a directory that is
+	// reached through a short name is named by its long name. The name of the
+	// ancestor is what makes the guidance actionable, and the check accepts
+	// the path as it was written and the real location of it.
 	if !scmTestNamesPath(err.Error(), parent) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the nearest existing ancestor %q", path, err, parent)
 	}
