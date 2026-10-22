@@ -922,6 +922,9 @@ func TestSelectedDeleteConflictsWithHFWriterSnapshotPrescan(t *testing.T) {
 	}
 	hf, started, release := blockingRevisionServer(t, "model-Q4_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
+	defer releaseGate()
 	s := newTestServerWithConfig(t, Config{CacheDir: storage, LocalScanDirs: []string{rd.SnapshotsDir()}, Endpoint: hf.URL})
 	releaseDelete, ok := s.jobs.reserveSelectedGGUF([]string{selected})
 	if !ok {
@@ -949,10 +952,15 @@ func TestSelectedDeleteConflictsWithHFWriterSnapshotPrescan(t *testing.T) {
 	if _, err := os.Stat(selected); err != nil {
 		t.Fatalf("selected snapshot was removed during active writer: %v", err)
 	}
-	release()
+	// Cancel while the prescan request is still blocked on the gate, so the
+	// cleanup cancel cannot race a prescan that already completed and would
+	// make the cancel report that there was nothing to cancel. The cancelled
+	// request unwinds the blocked handler, so releasing the gate afterwards is
+	// a no-op.
 	if !s.jobs.CancelJob(job.ID) {
 		t.Fatal("could not cancel prescan test job")
 	}
+	releaseGate()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
@@ -1013,10 +1021,15 @@ func TestCompletePlanUsesActualSnapshotDestinations(t *testing.T) {
 			} else if _, err := os.Lstat(selected); !os.IsNotExist(err) {
 				t.Fatalf("disjoint selected entry was not deleted: %v", err)
 			}
-			releaseGate()
+			// Cancel while the planned transfer is still blocked on the gate. The
+			// job is provably in flight here, so the cleanup cancel cannot race a
+			// download that already finished and would make the cancel report that
+			// there was nothing to cancel. The cancelled request unwinds the
+			// blocked handler, so releasing the gate afterwards is a no-op.
 			if !s.jobs.CancelJob(job.ID) {
 				t.Fatal("could not cancel planned transfer")
 			}
+			releaseGate()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := s.jobs.Close(ctx); err != nil {
@@ -2401,6 +2414,9 @@ func TestSelectedDeleteBlocksPrescanWriterWhenAliasChangesExcludedPath(t *testin
 	}
 	hf, started, release := blockingRevisionServer(t, "live/model-Q4_K_M.gguf")
 	defer hf.Close()
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
+	defer releaseGate()
 	s := newTestServerWithConfig(t, Config{CacheDir: storage, Endpoint: hf.URL})
 	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "o/m", Filters: []string{"Q4_K_M"}, Excludes: []string{"blocked"}})
 	if err != nil {
@@ -2419,12 +2435,17 @@ func TestSelectedDeleteBlocksPrescanWriterWhenAliasChangesExcludedPath(t *testin
 	if _, err := os.Stat(filepath.Join(blocked, "model-Q4_K_M.gguf")); err != nil {
 		t.Fatalf("pending writer's selected file was deleted: %v", err)
 	}
-	release()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Cancel while the prescan request is still blocked on the gate, so the
+	// cleanup cancel cannot race a prescan that already completed and would
+	// make the cancel report that there was nothing to cancel. The cancelled
+	// request unwinds the blocked handler, so releasing the gate afterwards is
+	// a no-op.
 	if !s.jobs.CancelJob(job.ID) {
 		t.Fatal("could not cancel prescan test job")
 	}
+	releaseGate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := s.jobs.Close(ctx); err != nil {
 		t.Fatalf("close test job manager: %v", err)
 	}
