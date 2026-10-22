@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -15,8 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// searchLog is the logger of the search subsystem. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var searchLog = logging.NewComponentLogger("search")
 
 // SearchResult is one model returned by /api/search.
 type SearchResult struct {
@@ -127,14 +132,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	httpClient, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
-		log.Printf("search: invalid proxy config: %v", err)
+		// The proxy URL can carry the proxy credentials, so only the reason
+		// of the failure reaches the log record.
+		searchLog.Info("invalid proxy config", "error", hfdownloader.ProxyErrorReason(err))
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
 		return
 	}
 	httpClient.Timeout = 20 * time.Second
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("search: upstream error: %v", err)
+		searchLog.Info("upstream error", "error", err)
 		writeError(w, http.StatusBadGateway, "Upstream request failed", err.Error())
 		return
 	}

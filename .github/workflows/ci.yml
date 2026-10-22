@@ -85,6 +85,57 @@ jobs:
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
 
+      # The Windows desktop host is a second binary of HFDesk. Its defining
+      # property is the PE subsystem of the produced file: the console host
+      # stays a console subsystem executable and the desktop host is a GUI
+      # subsystem executable, so a desktop launch never opens a console
+      # window. The subsystem is a build time property, so CI checks it
+      # instead of trusting the build script.
+      #
+      # The desktop host itself is covered by the test of the package below:
+      # the notification area host and the Runtime / Logs window are created
+      # and reported ready. A machine that cannot host them (no interactive
+      # window station, no WebView2 runtime) skips that coverage instead of
+      # failing the job.
+      - name: Install rsrc
+        run: |
+          go install github.com/akavel/rsrc@v0.10.2
+          echo "$(go env GOPATH)\bin" >> $env:GITHUB_PATH
+
+      - name: Build the Windows artifacts
+        env:
+          VERSION: ci
+          # The target of the step is stated here, so a runner default
+          # cannot change it. The desktop artifact is linked with
+          # -H=windowsgui, and that flag makes the linker emit a Windows
+          # PE image whatever the target is, so an unset or changed GOOS
+          # would silently produce a PE binary where a host binary was
+          # intended.
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+          go build -ldflags "-s -w -X main.Version=$env:VERSION" -o hfdesk_windows_amd64_ci.exe ./cmd/hfdesk
+          go build -ldflags "-s -w -X main.Version=$env:VERSION -H=windowsgui" -o hfdesk-desktop_windows_amd64_ci.exe ./cmd/hfdesk-desktop
+
+      - name: Check the PE subsystem of the Windows artifacts
+        run: |
+          go run .github/scripts/pesubsystem.go hfdesk_windows_amd64_ci.exe 3
+          go run .github/scripts/pesubsystem.go hfdesk-desktop_windows_amd64_ci.exe 2
+
+      - name: Cleanup Windows resources
+        run: |
+          Remove-Item -Force -ErrorAction SilentlyContinue cmd/hfdesk/resource_windows_amd64.syso, cmd/hfdesk/hfdesk.ico, cmd/hfdesk-desktop/resource_windows_amd64.syso
+
+      # The desktop host: the single instance lock, the server lifecycle, the
+      # notification area host and the Runtime / Logs window. The last two
+      # skip themselves on a machine that cannot host them.
+      - name: Test the desktop host lifecycle
+        run: go test ./internal/desktop -count=1 -v
+
       - name: Test rebuild leases and native CLI coordination
         run: go test ./pkg/hfdownloader -run '^Test('^Test(RebuildCoordinationLeaseProcessExitAndStableObject|RebuildCoordinationRefusesForeignCarrierRecord|RebuildCoordinationDoesNotAdoptUnownedDirectoryCandidate|RebuildCoordinationTreePreflightProtectsOwnedCoordinator|RebuildCoordinationPathIgnoresPerProcessCacheOverride|SameUIDDifferentEnvironmentChildSharesExclusiveRootLease|RebuildCoordinationConcurrentBootstrapAcrossProcesses|FirstBranchClaimWaitsForCrossProcessOrdinaryAdmission|SyncCleanKeepsStableRootLeaseObject|SyncCleanRefusesToRemoveOwnedCoordinationScope|SyncCleanLeavesProfileCoordinatorOutsideCacheScope|OrdinaryDownloadCannotReplaceOwnedCoordinationCarrier|OrdinaryHFWriterPreservesNestedCoordinationCarrier|OrdinaryLocalWriterUsesUnownedServiceOwnerSpelling|OrdinaryWriteWinsBeforeFirstBranchServiceClaim|FirstBranchServiceClaimWinsBeforeOrdinaryWriter|OrdinaryHFDownloadIgnoresUnownedRootServiceCandidateAndClaimRefuses|RebuildCoordinationLeavesLegacyRootSidecarUnclaimed|BranchVariantMutationGuardDistinguishesEntryFromReferent|BranchVariantPartialCleanupKeepsOwnershipAndCompletion|WindowsGoCLIRebuildWaitsForAppDownloadAcrossRootAlias|OrdinaryDownloadsIgnoreUnmarkedServiceCandidateRoot|CopiedLocalRootKeepsCompleteArtifactWithIncompleteSibling|UnverifiableServiceCandidateFailsClosedForIntersectingWrites)$')$' -count=1 -v
 

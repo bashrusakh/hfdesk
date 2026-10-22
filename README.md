@@ -82,6 +82,82 @@ hfdesk --cache-dir /mnt/ssd/huggingface
 hfdesk --local-dir /mnt/models
 ```
 
+## Windows desktop app
+
+A Windows release ships two binaries. They are the same program with the same
+configuration file and the same options, but they are built for different
+jobs:
+
+| Download | What it is | Use it for |
+|---|---|---|
+| `hfdesk_windows_amd64_v1.3.0.exe` | the console host | a terminal, output redirection, a script, a service |
+| `hfdesk-desktop_windows_amd64_v1.3.0.exe` | the desktop host | everyday use on a desktop |
+
+The name of a file carries the release tag, so a release of 1.3.0 ships
+`hfdesk_windows_amd64_v1.3.0.exe` and `hfdesk-desktop_windows_amd64_v1.3.0.exe`.
+
+A desktop user should launch `hfdesk-desktop_windows_amd64_v1.3.0.exe`. It
+is a GUI program and never opens a console window. The console binary is
+unchanged and stays the right one for a terminal, for redirecting the output
+into a file, for a script and for a service.
+
+The GUI subsystem is a build time property of the linker, so a local build of
+the desktop host needs the flag `-H=windowsgui`:
+
+```bash
+go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
+```
+
+A binary that was built without the flag opens a console window next to the
+notification area icon. The desktop host reads the PE header of its own
+executable at startup and tells you how to rebuild the binary when it was
+built wrong.
+
+The desktop host runs the very same HFDesk server in its own process and adds
+a desktop shell around it:
+
+- an icon in the notification area (the system tray),
+- a small **Runtime / Logs** window that shows the status of the server, the
+  number of active jobs and the live log records.
+
+The tray icon opens the Runtime / Logs window on a left click. Its menu has
+three actions: **Open HFDesk** opens the web UI in the default browser,
+**Runtime / Logs** shows the runtime window, and **Quit HFDesk** stops the
+server with a graceful shutdown and leaves the notification area.
+
+The desktop host is single-instance per user and session. A second launch
+detects the running instance, tells the user that HFDesk is already running
+and opens the web UI of the instance that is already there.
+
+The Runtime / Logs window needs the
+[Microsoft Edge WebView2 Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+When the runtime is missing, the desktop host shows a message that names the
+runtime and where to install it. The rest of the app keeps working: the
+server keeps running, the tray icon stays and the web UI is still available
+in the browser.
+
+The desktop host always writes a log file, because a GUI program has no
+console to write to. The file is
+`%LocalAppData%\HFDesk\logs\hfdesk.log` and it rotates. The Runtime / Logs
+window shows the same records live.
+
+Both hosts accept the logging options:
+
+```bash
+hfdesk --log-level debug
+hfdesk --log-file /var/log/hfdesk.log
+```
+
+`--log-level` sets the minimum level of the records (`debug`, `info`, `warn`
+or `error`, default `info`) and `--log-file` writes the records to a rotating
+file. The console host writes to the log file only when `--log-file` is
+given; the desktop host writes to its own log file by default and
+`--log-file` moves it somewhere else.
+
+The requests of the Runtime / Logs endpoints are written at `debug` level, so
+the polling of that window does not fill the log history the window shows.
+Every other request is written at `info` level as before.
+
 ## Configuration
 
 HFDesk reads `hfdesk.json`, `hfdesk.yaml`, or `hfdesk.yml` from the launch directory first, then from `~/.config`. Settings saved from the UI are written back to the launch directory.
@@ -169,6 +245,13 @@ git clone https://github.com/bashrusakh/hfdesk
 cd hfdesk
 go build -o hfdesk ./cmd/hfdesk
 ./hfdesk
+```
+
+The Windows desktop host is built with the GUI subsystem, so it never opens a
+console window:
+
+```bash
+GOOS=windows go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
 ```
 
 Run tests:

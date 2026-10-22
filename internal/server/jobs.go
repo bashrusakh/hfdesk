@@ -9,15 +9,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// jobsLog is the logger of the job manager subsystem. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var jobsLog = logging.NewComponentLogger("jobs")
 
 // JobStatus represents the state of a download job.
 type JobStatus string
@@ -239,7 +244,7 @@ func (m *JobManager) LoadState() {
 
 	jobs, err := m.loadStateFile(m.statePath)
 	if err != nil {
-		log.Printf("warning: could not load jobs state: %v", err)
+		jobsLog.Warn("could not load jobs state", "error", err)
 		return
 	}
 	if len(jobs) == 0 {
@@ -257,7 +262,7 @@ func (m *JobManager) LoadState() {
 			cache := m.config.cacheForRoot(j.OutputDir)
 			j.OutputDir, j.HubDir = cache.Root, cache.HubDir()
 			j.DestinationWarning = "Legacy job: historical Hub directory is unknown; destination resolved once from recorded app root and startup environment. No files were moved."
-			log.Printf("warning: job %s: %s", j.ID, j.DestinationWarning)
+			jobsLog.Warn("job destination warning", "job_id", j.ID, "detail", j.DestinationWarning)
 			legacyResolved = true
 		}
 		// Ensure no zombie running/queued jobs survive a restart
@@ -279,7 +284,7 @@ func (m *JobManager) LoadState() {
 	if legacyResolved {
 		m.saveStateAndLog()
 	}
-	log.Printf("restored %d job(s) from state file", len(jobs))
+	jobsLog.Info("restored jobs from state file", "count", len(jobs))
 }
 
 // saveState serializes snapshot creation and commit so an older snapshot
@@ -374,7 +379,7 @@ func (m *JobManager) finishClose() {
 
 func (m *JobManager) saveStateAndLog() {
 	if err := m.saveState(); err != nil {
-		log.Printf("warning: could not save jobs state: %v", err)
+		jobsLog.Warn("could not save jobs state", "error", err)
 	}
 }
 
@@ -1162,6 +1167,27 @@ func (m *JobManager) effectiveMaxActive() int {
 	return 3
 }
 
+// activeCounts returns how many jobs occupy an active slot and how many are
+// waiting in the queue.
+//
+// It uses the same notion of an active job as the dispatcher: a job that was
+// dispatched to a runner but is not marked running yet still occupies a slot,
+// so counting only the running status would under-report the load while a
+// download is starting up.
+func (m *JobManager) activeCounts() (running, queued int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, j := range m.jobs {
+		switch {
+		case j.Status == JobStatusRunning || j.starting:
+			running++
+		case j.Status == JobStatusQueued:
+			queued++
+		}
+	}
+	return running, queued
+}
+
 // dispatchLocked starts queued jobs (oldest first) until the number of
 // running-or-starting jobs reaches the max-active limit. It is the single
 // gate through which jobs become active, so the concurrent-download count
@@ -1436,7 +1462,7 @@ func (m *JobManager) UpdateConfig(cfg Config) {
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
-		log.Printf("warning: ignoring job manager config update while stopping")
+		jobsLog.Warn("ignoring job manager config update while stopping")
 		return
 	}
 	// Startup storage ENV/defaults are immutable across config snapshots;
@@ -1859,7 +1885,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	if endSnap.Status == JobStatusCompleted || endSnap.Status == JobStatusFailed {
 		go func() {
 			if err := AppendHistory(endSnap); err != nil {
-				log.Printf("warning: could not append history: %v", err)
+				jobsLog.Warn("could not append history", "error", err, "job_id", endSnap.ID)
 			}
 		}()
 	}
@@ -1919,7 +1945,7 @@ func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 		cleanupErr = hfdownloader.CleanupJobPartFiles(settings, dsts)
 	}
 	if cleanupErr != nil {
-		log.Printf("warning: cleanup part files for paused job %s: %v", job.ID, cleanupErr)
+		jobsLog.Warn("cleanup part files for paused job", "job_id", job.ID, "error", cleanupErr)
 	}
 }
 

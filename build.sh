@@ -27,6 +27,11 @@ mkdir -p "$OUTPUT_DIR"
 # Main package path
 MAIN_PKG="./cmd/hfdesk"
 
+# Desktop package path
+# The desktop host is the second Windows binary of HFDesk: it runs the same
+# server in the same process, behind a notification area icon.
+DESKTOP_PKG="./cmd/hfdesk-desktop"
+
 # Ldflags for version injection and optimized binary
 # Note: -s -w strips debug info (smaller binary but may trigger AV false positives on Windows)
 LDFLAGS_STRIP="-s -w -X main.Version=${VERSION}"
@@ -73,12 +78,19 @@ generate_windows_icon() {
 generate_windows_versioninfo() {
     # Remove any stale .syso from a previous run before regenerating
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+    rm -f "${DESKTOP_PKG}/resource_windows_amd64.syso"
 
     # Generate .ico first
     generate_windows_icon || return 1
 
     echo "  Generating Windows icon resource..."
-    (cd "${MAIN_PKG}" && rsrc -ico hfdesk.ico -o resource_windows_amd64.syso)
+    (cd "${SCRIPT_DIR}" && rsrc -ico "${MAIN_PKG}/hfdesk.ico" -o "${MAIN_PKG}/resource_windows_amd64.syso")
+
+    # The desktop host needs its own resource file: the linker picks up the
+    # .syso file of the package it builds, so the desktop host cannot borrow
+    # the resource of the console host.
+    echo "  Generating Windows icon resource of the desktop host..."
+    (cd "${SCRIPT_DIR}" && rsrc -ico "${MAIN_PKG}/hfdesk.ico" -o "${DESKTOP_PKG}/resource_windows_amd64.syso")
 
     return 0
 }
@@ -86,6 +98,7 @@ generate_windows_versioninfo() {
 # Cleanup Windows resource files
 cleanup_windows_versioninfo() {
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+    rm -f "${DESKTOP_PKG}/resource_windows_amd64.syso"
     rm -f "${MAIN_PKG}/hfdesk.ico"
 }
 
@@ -119,6 +132,39 @@ build() {
     echo "  -> ${output_path}"
 }
 
+# Build the desktop host of a target.
+#
+# The desktop host is the second Windows binary of HFDesk. It is built with
+# the GUI subsystem, so it never opens a console window: a desktop launch is
+# invisible without a tray icon. It carries the same version as the console
+# binary and its own icon resource.
+build_desktop() {
+    local os_arch=$1
+    local os=${os_arch%_*}
+    local arch=${os_arch#*_}
+
+    local output_name="hfdesk-desktop_${os}_${arch}_${VERSION}"
+    local ldflags="$LDFLAGS_NOSTRIP -H=windowsgui"
+
+    # Add .exe extension for Windows
+    if [ "$os" = "windows" ]; then
+        output_name="${output_name}.exe"
+    fi
+
+    local output_path="${OUTPUT_DIR}/${output_name}"
+
+    echo "Building the desktop host for ${os}/${arch}..."
+
+    # Build with CGO disabled for fully static binary
+    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+        -ldflags "$ldflags" \
+        -trimpath \
+        -o "$output_path" \
+        "$DESKTOP_PKG"
+
+    echo "  -> ${output_path}"
+}
+
 # Clean old builds (optional, uncomment if needed)
 # echo "Cleaning old builds..."
 # rm -f "${OUTPUT_DIR}"/hfdesk_*
@@ -139,10 +185,18 @@ else
     echo "  Install with: go install github.com/akavel/rsrc@latest"
     # Remove stale .syso so go build doesn't embed old resources
     rm -f "${MAIN_PKG}/resource_windows_amd64.syso"
+    rm -f "${DESKTOP_PKG}/resource_windows_amd64.syso"
 fi
 
 for target in "${TARGETS[@]}"; do
     build "$target"
+
+    # The desktop host exists for Windows only: it is a Windows program.
+    case "$target" in
+        windows_*)
+            build_desktop "$target"
+            ;;
+    esac
 done
 
 # Cleanup Windows version info files
@@ -168,5 +222,5 @@ echo "================================"
 echo ""
 echo "Build complete! Artifacts are in: ${OUTPUT_DIR}/"
 echo ""
-ls -lh "${OUTPUT_DIR}"/hfdesk_*_${VERSION}* 2>/dev/null || true
+ls -lh "${OUTPUT_DIR}"/hfdesk*_${VERSION}* 2>/dev/null || true
 

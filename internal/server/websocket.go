@@ -5,14 +5,19 @@ package server
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/gorilla/websocket"
 )
+
+// websocketLog is the logger of the WebSocket hub. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var websocketLog = logging.NewComponentLogger("websocket")
 
 // isAllowedWSOrigin decides whether a WebSocket upgrade request may proceed.
 // Browsers attach an Origin header to cross-site WebSocket handshakes but —
@@ -87,7 +92,7 @@ func (h *WSHub) Run() {
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
-			log.Printf("[WS] Client connected (%d total)", len(h.clients))
+			websocketLog.Info("client connected", "clients", len(h.clients))
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -96,7 +101,7 @@ func (h *WSHub) Run() {
 				close(client.send)
 			}
 			h.mu.Unlock()
-			log.Printf("[WS] Client disconnected (%d total)", len(h.clients))
+			websocketLog.Info("client disconnected", "clients", len(h.clients))
 
 		case message := <-h.broadcast:
 			h.mu.Lock()
@@ -123,14 +128,14 @@ func (h *WSHub) Broadcast(msgType string, data any) {
 
 	jsonData, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("[WS] Failed to marshal message: %v", err)
+		websocketLog.Info("failed to marshal message", "error", err)
 		return
 	}
 
 	select {
 	case h.broadcast <- jsonData:
 	default:
-		log.Printf("[WS] Broadcast channel full, dropping message")
+		websocketLog.Info("broadcast channel full, dropping message")
 	}
 }
 
@@ -160,7 +165,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WS] Upgrade failed: %v", err)
+		websocketLog.Info("upgrade failed", "error", err)
 		return
 	}
 
@@ -273,7 +278,7 @@ func (c *WSClient) readPump() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("[WS] Read error: %v", err)
+				websocketLog.Info("read error", "error", err)
 			}
 			break
 		}
