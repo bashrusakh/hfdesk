@@ -43,6 +43,15 @@ var (
 	// filters; path filters must use AppendFilterSubdir=false. Distinguishable
 	// via errors.Is.
 	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
+
+	// ErrBlobOwnershipUnknown is returned by CheckBlob when the ownership of
+	// an incomplete download cannot be determined: the OS-level ownership
+	// probe failed, or this platform cannot represent the lock. No live owner
+	// is proven in that case, so the caller must surface the failure instead
+	// of skipping the item - a skip would be reported as a successful
+	// download with the blob still missing. The incomplete payload is left
+	// untouched. Distinguishable via errors.Is.
+	ErrBlobOwnershipUnknown = errors.New("the owner of the incomplete download could not be determined")
 )
 
 // DownloadError wraps an error with file context.

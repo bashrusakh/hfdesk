@@ -10,6 +10,7 @@ package hfdownloader
 // exclusive lock is the only thing that should report busy.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,7 +103,12 @@ func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
 	}
 
 	status, _, err := repo.CheckBlob(sha)
-	if err != nil || status != BlobDownloading {
-		t.Fatalf("CheckBlob with ENOLCK probe = %v, %v; want downloading, not stale/free", status, err)
+	// The probe failed, so the ownership state is UNKNOWN. It must not be
+	// reported as "free"/stale (which would hand the file to a second
+	// writer) and it must not be reported as a proven live owner either
+	// (which would become a successful skip with the blob still missing).
+	// It is an observable error instead.
+	if !errors.Is(err, ErrBlobOwnershipUnknown) || status != BlobOwnershipUnknown {
+		t.Fatalf("CheckBlob with ENOLCK probe = %v, %v; want an unknown-ownership error, not stale/free", status, err)
 	}
 }

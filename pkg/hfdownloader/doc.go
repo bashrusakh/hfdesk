@@ -138,10 +138,13 @@ That pre-download decision is authoritative for an arbitrary destination. A
 staging claim treats an existing publish target as completion proof only when
 the target is content-addressed (blobs/<known-sha>); a legacy/output file or a
 tmp-<sha> staging name that the skip check declined is downloaded again and
-atomically renamed over the old bytes. Publish re-stats a content-addressed
-target under the ownership locks and never overwrites one that appeared while
-the transfer was in flight: it discards its own staging pair and reports the
-item as complete.
+atomically renamed over the old bytes. A content-addressed target is not
+overwritten by a writer of the same blob key: the publication places the
+payload with a no-replace primitive, so a blob another writer completed while
+the transfer was in flight stays untouched, and the loser discards its own
+staging pair and reports the item as complete. The strength of that guarantee
+depends on the filesystem, and the two tiers are described under "The
+publication primitive" below.
 
 Staging identity includes `plan.Commit`. If fetching repository info fails or
 returns an empty SHA, the planner uses the requested revision string as the
@@ -217,6 +220,71 @@ mutations fail before changing a claim or payload and preserve existing partial
 data; this runtime error does not declare permanent platform support policy.
 Age never authorizes transition recovery. An unfenced legacy record is
 protected unless its same-host owner is provably dead.
+
+One blob key owns one publication domain. Two routes write the same
+content-addressed blob key — the ranged route stages in `blobs/<sha>.incomplete`
+and publishes onto `blobs/<sha>`, the single-request route stages in
+`blobs/tmp-<sha>.part` and publishes through the cache store onto
+`blobs/<sha>` — so their ownership must be ONE domain, not one per staging
+path. The domain is an in-process slot keyed by the blob key plus the lifetime
+OS lock on the persistent sibling `blobs/tmp-<sha>.lock`, and a writer holds it
+for its whole operation on that key. One domain means the other route can
+neither adopt, migrate nor delete this route's LIVE partial — a live partial is
+therefore never mistaken for a pre-#140 leftover — and the "the blob does not
+exist yet" decision and the placement that follows it cannot be overtaken by
+the other route. Every writer of `blobs/<sha>` participates in that domain,
+including the exported `FinalizeBlob`, which publishes through the same
+no-replace primitive instead of renaming over the target. The domain's lock
+file is persistent, is never unlinked, and is excluded from cache statistics,
+listings, mirrors and cache deletion like every other `.lock` artifact.
+
+The publication primitive has two tiers, and they guarantee different things.
+
+The atomic no-replace tier is the normal one: the payload is placed with a
+hard link, which creates the final name and fails when the name already
+exists. The existence decision and the placement are then ONE filesystem
+operation, so a concurrent publisher cannot be overtaken between them, and an
+existing `blobs/<sha>` is never replaced — not by another writer of the same
+blob key, and not by a writer outside the blob key's domain either. The
+normal path stays rename-only in cost: a hard link is a directory operation,
+not a payload copy.
+
+The domain-exclusive tier is the fallback for a filesystem that cannot create
+hard links. The Go standard library exposes no atomic no-replace rename on any
+supported platform — `os.Rename` replaces an existing target on Unix and on
+Windows, and the `syscall` package exports neither
+`renameat2(RENAME_NOREPLACE)` nor `renamex_np(RENAME_EXCL)` — so there is no
+stronger primitive to fall back to. The placement is then a check-then-rename
+performed while the blob key's ownership domain is held exclusively, so no
+other participant of that domain can create the target between the check and
+the rename. The property that holds there is "an existing `blobs/<sha>` is
+never replaced by a domain participant", not "never replaced" unconditionally:
+the mirror writer and the selected-GGUF delete path are outside the domain, so
+they are not fenced by it. The placement refuses to run this tier without the
+ownership domain of the blob key it publishes, so the weaker guarantee is
+never reached by accident, and hard-link support is not a prerequisite for
+downloading.
+
+The cache status check reports three ownership outcomes and never guesses. A
+proven live owner (the ownership lock is held exclusively) is `BlobDownloading`
+and may be skipped. A provably dead owner is `BlobStale` and may be resumed. An
+unknown ownership state — the ownership probe failed, or the platform cannot
+represent the lock — is `BlobOwnershipUnknown` together with an error that
+wraps `ErrBlobOwnershipUnknown`. The caller surfaces that failure instead of
+skipping the item, because a skip would report a successful download with the
+blob still missing; the incomplete payload is preserved so a retry can resume
+it.
+
+The mirror writer copies destination blobs with a non-atomic truncate-and-write
+and a size-only check, so it can tear or overwrite a blob a downloader is
+publishing. The selected-GGUF delete path removes blob payloads of the
+selected entries, and it does that outside the blob key's ownership domain
+as well. Neither path takes the domain lock, so neither is fenced by the
+publication domain: they are the documented exception to "an existing
+`blobs/<sha>` is never replaced" (and, on a filesystem without hard links, to
+the domain-exclusive tier as well). Both are known limitations of those
+paths, not of the downloader: the downloader's publication invariant does not
+depend on their behavior.
 
 A claim record is always installed as a complete, valid document. The record
 is staged in a sibling temp file and then installed by one atomic operation: a

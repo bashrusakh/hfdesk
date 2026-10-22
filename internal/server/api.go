@@ -32,7 +32,8 @@ var Version = "dev"
 // the download staging family rather than to stored content:
 // blobs/<sha>.incomplete (payload), .incomplete.meta (resume record),
 // .incomplete.meta.tmp (atomic record temp) and the persistent
-// .incomplete.lock/.incomplete.meta.lock ownership files. Cache statistics,
+// .incomplete.lock/.incomplete.meta.lock ownership files, plus the blob key's
+// publication-domain lock (blobs/tmp-<sha>.lock). Cache statistics,
 // listings and mirrors must not count them as cached blobs.
 func isBlobStagingArtifactName(name string) bool {
 	return strings.HasSuffix(name, ".incomplete") ||

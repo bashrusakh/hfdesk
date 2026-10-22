@@ -186,6 +186,52 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
   authoritative pre-download skip decision and are redownloaded and atomically
   replaced when it declined them.
+- One blob key owns ONE publication domain, not one domain per staging path.
+  The ranged route (`blobs/<sha>.incomplete` -> `blobs/<sha>`) and the
+  single-request route (`blobs/tmp-<sha>.part` -> `blobs/tmp-<sha>` ->
+  `blobs/<sha>`) write the same key, so they must share one domain: an
+  in-process slot keyed by the blob key plus the lifetime OS lock on the
+  persistent sibling `blobs/tmp-<sha>.lock`, held for the whole operation on
+  that key. One domain means the other route can neither adopt, migrate nor
+  delete this route's LIVE partial (a live partial is never mistaken for a
+  pre-#140 leftover), and the "the blob does not exist yet" decision and the
+  placement that follows it cannot be overtaken. EVERY writer of `blobs/<sha>`
+  must take that domain and publish through the shared no-replace primitive —
+  including the exported `FinalizeBlob`, which must never rename over an
+  existing content-addressed blob. The domain lock file is
+  persistent, is never unlinked, and is excluded from cache statistics,
+  listings, mirrors and cache deletion like every other `.lock` artifact.
+- A content-addressed publication has TWO tiers, and they guarantee different
+  things. The tier is chosen by the FILESYSTEM, not by the operating system.
+  - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
+    payload with a hard link, which fails when the name exists, so the
+    existence decision and the placement are ONE filesystem operation. An
+    existing `blobs/<sha>` is then never replaced, proven or not, by another
+    writer of the same key or by a writer outside the domain. The normal path
+    stays rename-only in cost (a hard link is a directory operation, not a
+    payload copy).
+  - DOMAIN-EXCLUSIVE (a filesystem that cannot create hard links): the Go
+    standard library exposes NO atomic no-replace rename on any supported
+    platform — `os.Rename` replaces an existing target on Unix and on
+    Windows, and `syscall` exports neither `renameat2(RENAME_NOREPLACE)` nor
+    `renamex_np(RENAME_EXCL)` — so the placement is a check-then-rename
+    performed while the blob key's ownership domain is held exclusively. The
+    property that holds there is "an existing `blobs/<sha>` is never replaced
+    by a domain participant", NOT "never replaced" unconditionally: a writer
+    outside the domain (the mirror writer) is not fenced by it. The placement
+    must refuse to run this tier without the ownership domain of the blob key
+    it publishes, so the weaker guarantee is never reached by accident.
+  Hard-link support is not a prerequisite for downloading: the fallback tier
+  publishes normally, and the two tiers differ in strength, not in
+  availability.
+- The ownership check reports three outcomes and never guesses: a PROVEN live
+  owner (the lock is held exclusively) is `BlobDownloading` and may be skipped;
+  a PROVABLY dead owner is `BlobStale` and may be resumed; an UNKNOWN
+  ownership state (the probe failed, or the platform cannot represent the
+  lock) is `BlobOwnershipUnknown` plus an error wrapping
+  `ErrBlobOwnershipUnknown`, and the caller surfaces the failure. An unknown
+  state must never become a successful skip: the job would report completion
+  with the blob still missing. The incomplete payload is preserved.
 - Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
   (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
   before the claim transition and held through transfer, hashing and
@@ -227,6 +273,15 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   inode, and writing through it would empty the authoritative record before it
   was replaced.
 - Size checks are only a fallback for files without a trusted hash.
+- Known limitation (not a downloader invariant): the mirror writer copies
+  destination blobs with a non-atomic truncate-and-write and a size-only check,
+  so it can tear or overwrite a blob a downloader is publishing, and the
+  selected-GGUF delete path removes blob payloads outside the blob key's
+  ownership domain. Neither path takes the domain lock, so neither is fenced
+  by the publication domain: they are the documented exception to "an existing
+  `blobs/<sha>` is never replaced" (and, on a filesystem without hard links,
+  to the domain-exclusive tier as well). The downloader's publication
+  invariant must not depend on either path's behavior.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to
   be stale or incompatible.

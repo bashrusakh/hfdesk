@@ -439,7 +439,15 @@ LOOP:
 					if it.SHA256 != "" {
 						status, _, err := repoDir.CheckBlob(it.SHA256)
 						if err != nil {
-							return false, "", err
+							// The ownership of an existing incomplete
+							// download could not be determined (the
+							// OS-lock probe failed, or this platform
+							// cannot represent the lock). No live owner
+							// is proven, so this must NOT become a
+							// successful skip: the error travels the
+							// normal error channel and the incomplete
+							// payload is preserved.
+							return false, "", fmt.Errorf("check %s: %w", finalRel, err)
 						}
 						if status == BlobComplete {
 							// Blob exists, but ensure snapshot entries are in place
@@ -451,6 +459,7 @@ LOOP:
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
+							// A PROVEN live writer owns this blob key.
 							return true, "downloading by another process", nil
 						}
 					}
@@ -617,7 +626,45 @@ LOOP:
 					finalRel)})
 			}
 
-			var dlErr error
+			// The blob key's ownership domain. One domain per content-addressed
+			// key: the ranged route, the single-request route and the cache
+			// store all write the same blobs/<sha>, so they share ONE domain
+			// instead of one domain per staging path. The domain is held for
+			// the whole operation on that key, which keeps the other route
+			// from adopting, migrating or deleting this item's LIVE partial,
+			// and keeps the publication decision and the placement that
+			// follows it together.
+			var (
+				dlErr  error
+				domain *blobDomain
+			)
+			if useHFCache && it.SHA256 != "" {
+				dom, derr := blobDomainAcquire(fileCtx, repoDir.BlobPath(it.SHA256), dst)
+				switch {
+				case derr == nil:
+					domain = dom
+					defer domain.release()
+					// The ranged publication needs the domain of the blob key
+					// it publishes: the domain-exclusive placement tier
+					// (a filesystem without hard links) is only exclusive to
+					// the domain while it is held.
+					mpOpts.Domain = domain
+				case errors.Is(derr, errStagingOwnershipBusy):
+					// A PROVEN live writer owns this blob key: this item is
+					// not ours to write. It is finished as a skip, exactly
+					// like the pre-download skip check.
+					dlErr = errBlobIncompleteOwned
+				default:
+					// The lifetime ownership of this blob key is unavailable:
+					// the OS lock is unsupported, denied, or the filesystem
+					// failed. The operation fails HERE, before the transfer
+					// writes any payload. An operation that cannot own the
+					// blob key must not write bytes for it, and the partial
+					// data of an earlier run is preserved untouched.
+					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
+				}
+			}
+
 			directBlobPublished := blobDirect
 			if blobDirect && multipartRan {
 				mpOpts.DirectBlobPublished = &directBlobPublished
@@ -632,10 +679,12 @@ LOOP:
 			// bytes). HEAD-ETag-only verification with no known digest remains
 			// the documented post-publication exception.
 			var contentVerified bool
-			if multipartRan {
-				contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
-			} else {
-				contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			if dlErr == nil {
+				if multipartRan {
+					contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
+				} else {
+					contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				}
 			}
 			if blobDirect && multipartRan && !directBlobPublished {
 				// downloadMultipart delegated an unknown-size item to the
@@ -837,7 +886,10 @@ LOOP:
 				finalSHA256 = it.SHA256
 			case useHFCache:
 				sha := it.SHA256
-				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				// The store publishes into the blob key's ownership domain,
+				// which this item already holds: the existence decision and
+				// the placement that follows it are one serialized step.
+				result, err := repoDir.storeDownloadedFileInDomain(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView, domain)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):

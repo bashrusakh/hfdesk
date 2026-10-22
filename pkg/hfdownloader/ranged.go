@@ -294,6 +294,12 @@ type multipartOpts struct {
 	// back to the single-path temp destination instead; the caller must then
 	// pass that temp through the normal cache-store owner.
 	DirectBlobPublished *bool
+	// Domain is the ownership domain of the content-addressed blob key this
+	// item publishes to. The caller holds it for the whole operation on that
+	// key. The publication needs it for the domain-exclusive placement tier
+	// (a filesystem without hard links), where the existence check and the
+	// placement are only exclusive to the domain while it is held.
+	Domain *blobDomain
 }
 
 // stagingClaimState is what a successful claim produced.
@@ -1424,6 +1430,12 @@ type stagingDownload struct {
 	// the blob while this transfer was in flight.
 	contentAddressed bool
 
+	// domain is the ownership domain of the blob key pub belongs to. It is
+	// held for the whole download, so the publication's existence decision
+	// and the placement that follows it cannot be overtaken by another
+	// writer of the same key.
+	domain *blobDomain
+
 	// partCtx is the part-scoped cancellable context, stored so every
 	// post-claim phase (migration, transfer, hash, publish) can apply the same
 	// cancel-cleanup semantics.
@@ -1925,6 +1937,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		own:              state.own,
 		osExclusive:      state.osExclusive,
 		contentAddressed: opts.ContentAddressed,
+		domain:           opts.Domain,
 	}
 
 	// Part-scoped cancellable context: a permanent (fail-fast) error on any
@@ -2483,21 +2496,36 @@ func (d *stagingDownload) publish() error {
 	if err := d.ctx.Err(); err != nil {
 		return err
 	}
-	// A content-addressed target may have been completed by another writer
-	// while this download was in flight (single path, legacy tmp-<sha>+store,
-	// another staging family). Its existence proves completion; never rename
-	// over it. Discard this process's own staging pair and report completion so
-	// the caller treats the item as a skip and creates its own links.
 	if d.contentAddressed {
-		if _, err := os.Stat(d.pub); err == nil {
-			removeStagingArtifactsLocked(d.stg, d.meta)
-			return errBlobAlreadyComplete
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat publish target %s: %w", d.pub, err)
+		// The target is a content-addressed blob: its existence is completion
+		// proof and it is NEVER replaced. The placement is one no-replace
+		// step, so a concurrent publisher of the same blob key cannot be
+		// overtaken between the decision and the placement (a Stat-then-
+		// rename would let the other writer's rename replace this blob,
+		// leaving bytes that do not hash to the key they are stored under -
+		// corruption CheckBlob would then report as complete). On a
+		// filesystem with hard links the placement is atomic no-replace; on
+		// one without, it is exclusive to the blob key's ownership domain
+		// this download holds, so no domain participant can create the
+		// target in between.
+		if err := blobPublishPlace(d.stg, d.pub, d.domain); err != nil {
+			if errors.Is(err, errBlobTargetExists) {
+				// Another writer published this blob first. Its bytes are the
+				// completion proof; discard this process's staging pair and
+				// report the item as complete so the caller treats it as a
+				// skip and creates its own links.
+				removeStagingArtifactsLocked(d.stg, d.meta)
+				return errBlobAlreadyComplete
+			}
+			return fmt.Errorf("publish %s: %w", d.pub, err)
 		}
-	}
-	if err := os.Rename(d.stg, d.pub); err != nil {
-		return err
+	} else {
+		// An arbitrary destination is not completion proof: the caller's
+		// authoritative pre-download skip decision already declined it, so the
+		// new bytes overwrite stale/incomplete ones in one step.
+		if err := os.Rename(d.stg, d.pub); err != nil {
+			return err
+		}
 	}
 	// The payload is now authoritative. Removing the obsolete record under the
 	// same lock cannot race a successor: it would have had to observe this

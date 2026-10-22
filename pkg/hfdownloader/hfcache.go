@@ -347,6 +347,18 @@ const (
 
 	// BlobStale means an incomplete download exists but is stale (can be taken over).
 	BlobStale
+
+	// BlobOwnershipUnknown means the ownership of the incomplete download could
+	// not be determined: the OS-level ownership probe failed (or this platform
+	// cannot represent the lock), so neither "a live writer owns it" nor "its
+	// owner is gone" is proven.
+	//
+	// CheckBlob returns this status together with a non-nil error that wraps
+	// ErrBlobOwnershipUnknown. An unknown ownership state is an observable
+	// failure, never a successful skip: reporting it as "downloading by
+	// another process" would claim a live owner that was never proven, and the
+	// job would then report success with the blob still missing.
+	BlobOwnershipUnknown
 )
 
 // String returns a human-readable status.
@@ -360,6 +372,8 @@ func (s BlobStatus) String() string {
 		return "downloading"
 	case BlobStale:
 		return "stale"
+	case BlobOwnershipUnknown:
+		return "ownership-unknown"
 	default:
 		return "unknown"
 	}
@@ -367,6 +381,21 @@ func (s BlobStatus) String() string {
 
 // CheckBlob checks the status of a blob in the cache.
 // Returns the status and any existing incomplete metadata.
+//
+// The result distinguishes three ownership outcomes, and never guesses:
+//
+//   - a PROVEN live owner (the persistent <staging>.lock is held exclusively)
+//     is reported as BlobDownloading, so the caller may skip the item;
+//   - a PROVABLY dead owner (a free lock plus a lock-fenced record, or
+//     same-host process evidence that the recorded owner is gone) is reported
+//     as BlobStale, so the caller may resume it;
+//   - an UNKNOWN ownership state (the ownership probe failed, or this
+//     platform cannot represent the lock) is reported as
+//     BlobOwnershipUnknown together with an error that wraps
+//     ErrBlobOwnershipUnknown. The caller must surface that error instead of
+//     skipping the item: no live owner is proven, so a skip would be an
+//     unproven claim that turns into a successful download with the blob
+//     still missing.
 //
 // A held OS-level staging ownership lock (the persistent <staging>.lock) means
 // a live writer owns the staging file and is reported as BlobDownloading before
@@ -399,13 +428,24 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	// blocks, never creates the lock file, and releases immediately.
 	busy, probeErr := stagingOwnershipStatusProbe(incompletePath)
 	if probeErr == nil && busy {
+		// A PROVEN live writer owns this staging file.
 		return BlobDownloading, nil, nil
 	}
 	if probeErr != nil || !stagingOSLockAvailable {
-		// Probe failure cannot establish absence of an owner. Preserve the
-		// conservative status even when metadata is absent or unreadable.
+		// The ownership state is UNKNOWN: the probe failed, or this platform
+		// cannot represent the lifetime lock. Neither a live owner nor a dead
+		// owner is proven. The conservative reading ("somebody owns it") would
+		// be an unproven claim, and it becomes a successful skip with the blob
+		// still missing - the exact false completion this check must not
+		// report. Report an actionable error instead; the incomplete payload
+		// is left untouched so a retry can resume it.
 		meta, _ := r.readIncompleteMeta(metaPath)
-		return BlobDownloading, meta, nil
+		cause := probeErr
+		if cause == nil {
+			cause = errStagingOSLockUnsupported
+		}
+		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot determine the owner of the incomplete download %s: %w",
+			ErrBlobOwnershipUnknown, incompletePath, cause)
 	}
 
 	// Read metadata
@@ -476,13 +516,38 @@ func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 }
 
 // FinalizeBlob moves a completed .incomplete file to its final blob location.
+//
+// The publication participates in the blob key's ownership domain and runs
+// through the shared no-replace placement primitive, exactly like the ranged
+// publish and the cache store. An existing content-addressed blob is
+// therefore NEVER replaced: its bytes are the completion proof, the
+// .incomplete payload is left untouched for the caller to discard, and the
+// call reports the conflict instead of silently overwriting proven bytes.
 func (r *RepoDir) FinalizeBlob(sha256 string) error {
 	incompletePath := r.IncompletePath(sha256)
 	blobPath := r.BlobPath(sha256)
 
-	// Move incomplete to final location
-	if err := os.Rename(incompletePath, blobPath); err != nil {
-		return fmt.Errorf("rename incomplete to blob: %w", err)
+	// The blobs directory must exist before the domain's lock file can be
+	// created next to the destination.
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return fmt.Errorf("create blobs directory: %w", err)
+	}
+
+	// The publication runs inside the blob key's ownership domain, so it
+	// cannot race another writer of the same key.
+	dst, err := r.blobDomainDst(sha256)
+	if err != nil {
+		return fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, err)
+	}
+	domain, err := blobDomainAcquire(context.Background(), blobPath, dst)
+	if err != nil {
+		return fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, err)
+	}
+	defer domain.release()
+
+	// Move incomplete to final location without replacing an existing blob.
+	if err := blobPublishPlace(incompletePath, blobPath, domain); err != nil {
+		return fmt.Errorf("finalize blob %s: %w", sha256, err)
 	}
 
 	// Remove metadata file
@@ -807,6 +872,19 @@ func (r *RepoDir) StoreDownloadedFile(tempFile, relativePath, commit, sha256, fi
 // storeDownloadedFileCtx is the context-bounded implementation used by the
 // downloader; the existing public context-free API remains unchanged.
 func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool) (*StoreFileResult, error) {
+	return r.storeDownloadedFileInDomain(ctx, tempFile, relativePath, commit, sha256, filterSubdir, noFriendly, nil)
+}
+
+// storeDownloadedFileInDomain is storeDownloadedFileCtx with an explicit
+// ownership domain.
+//
+// The domain is the blob key's single ownership domain (see blob_domain.go).
+// The downloader already holds it for the whole operation on that key and
+// passes it in; a direct caller passes nil and the store takes the domain
+// itself. The publication therefore always happens inside the domain, so the
+// "the blob does not exist yet" decision and the placement that follows it
+// cannot be overtaken by another writer of the same key.
+func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool, domain *blobDomain) (*StoreFileResult, error) {
 	// Compute SHA256 if not provided
 	if sha256 == "" {
 		computed, err := computeSHA256Ctx(ctx, tempFile)
@@ -818,24 +896,61 @@ func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relative
 
 	blobPath := r.BlobPath(sha256)
 
-	// Check if blob already exists (deduplication)
-	if _, err := os.Stat(blobPath); err == nil {
-		// Blob exists, just remove temp file
-		os.Remove(tempFile)
-	} else {
-		// Move temp file to blob location
-		if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
-			return nil, fmt.Errorf("create blobs directory: %w", err)
+	// The blobs directory must exist before the domain's lock file can be
+	// created next to the destination.
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return nil, fmt.Errorf("create blobs directory: %w", err)
+	}
+
+	// The publication runs inside the blob key's ownership domain.
+	if domain == nil || !domain.holdsBlobKey(blobPath) {
+		dst, derr := r.blobDomainDst(sha256)
+		if derr != nil {
+			return nil, fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, derr)
 		}
-		if err := os.Rename(tempFile, blobPath); err != nil {
-			// Rename failed (cross-device?), try an atomic copy: stage in a
-			// sibling temp file, then atomically rename it into place. A cancelled or
-			// failed copy must never leave a partial file at the FINAL blob
-			// path (which CheckBlob would report complete, poisoning the cache).
-			if err := copyFileAtomicCtx(ctx, tempFile, blobPath); err != nil {
-				return nil, fmt.Errorf("move file to blob: %w", err)
-			}
+		d, derr := blobDomainAcquire(ctx, blobPath, dst)
+		if derr != nil {
+			return nil, fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, derr)
+		}
+		defer d.release()
+		domain = d
+	}
+
+	// Place the payload into the blob namespace. The placement never replaces
+	// an existing blob: a content-addressed blob that already exists is
+	// completion proof, so a concurrent publisher's bytes are not overwritten
+	// by ours (and ours are not published over theirs).
+	if err := blobPublishPlace(tempFile, blobPath, domain); err != nil {
+		switch {
+		case errors.Is(err, errBlobTargetExists):
+			// Another writer published this blob first. Its bytes are the
+			// completion proof; this payload is discarded.
 			os.Remove(tempFile)
+		case errors.Is(err, errBlobPublicationDomainRequired):
+			// The placement cannot prove that it will not replace an
+			// existing blob, and the copy fallback below is no stronger.
+			// The operation fails instead of guessing.
+			return nil, fmt.Errorf("move file to blob: %w", err)
+		default:
+			// The payload could not be placed by a link or a rename (a
+			// cross-device move, for example). Fall back to an atomic copy:
+			// stage in a sibling temp file, then atomically rename it into
+			// place. The copy is exclusive to the blob key's ownership
+			// domain this store holds, so no domain participant can create
+			// the target between the existence check and the copy. A
+			// cancelled or failed copy must never leave a partial file at
+			// the FINAL blob path (which CheckBlob would report complete,
+			// poisoning the cache).
+			if _, statErr := os.Stat(blobPath); statErr == nil {
+				// The blob appeared in the meantime: it is the completion
+				// proof, so this payload is discarded.
+				os.Remove(tempFile)
+			} else {
+				if cerr := copyFileAtomicCtx(ctx, tempFile, blobPath); cerr != nil {
+					return nil, fmt.Errorf("move file to blob: %w", cerr)
+				}
+				os.Remove(tempFile)
+			}
 		}
 	}
 
