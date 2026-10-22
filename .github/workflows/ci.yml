@@ -84,3 +84,35 @@ jobs:
 
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
+
+      - name: Test rebuild leases and native CLI coordination
+        run: go test ./pkg/hfdownloader -run '^Test('^Test(RebuildCoordinationLeaseProcessExitAndStableObject|RebuildCoordinationRefusesForeignCarrierRecord|RebuildCoordinationDoesNotAdoptUnownedDirectoryCandidate|RebuildCoordinationTreePreflightProtectsOwnedCoordinator|RebuildCoordinationPathIgnoresPerProcessCacheOverride|SameUIDDifferentEnvironmentChildSharesExclusiveRootLease|RebuildCoordinationConcurrentBootstrapAcrossProcesses|FirstBranchClaimWaitsForCrossProcessOrdinaryAdmission|SyncCleanKeepsStableRootLeaseObject|SyncCleanRefusesToRemoveOwnedCoordinationScope|SyncCleanLeavesProfileCoordinatorOutsideCacheScope|OrdinaryDownloadCannotReplaceOwnedCoordinationCarrier|OrdinaryHFWriterPreservesNestedCoordinationCarrier|OrdinaryLocalWriterUsesUnownedServiceOwnerSpelling|OrdinaryWriteWinsBeforeFirstBranchServiceClaim|FirstBranchServiceClaimWinsBeforeOrdinaryWriter|OrdinaryHFDownloadIgnoresUnownedRootServiceCandidateAndClaimRefuses|RebuildCoordinationLeavesLegacyRootSidecarUnclaimed|BranchVariantMutationGuardDistinguishesEntryFromReferent|BranchVariantPartialCleanupKeepsOwnershipAndCompletion|WindowsGoCLIRebuildWaitsForAppDownloadAcrossRootAlias|OrdinaryDownloadsIgnoreUnmarkedServiceCandidateRoot|CopiedLocalRootKeepsCompleteArtifactWithIncompleteSibling|UnverifiableServiceCandidateFailsClosedForIntersectingWrites)$')$' -count=1 -v
+
+      - name: Test rebuild probe and CLI entrypoint
+        run: go test ./cmd/hfdesk -count=1 -v
+
+      - name: Test server proof mutators
+        run: go test ./internal/server -run '^Test('^Test(CopiedLocalRootRebindSurvivesFailedSecondArtifact|SameUIDDifferentHomeCLIWaitsForOrdinaryAPIDownload|CopiedHFAndLocalRootsRetainBranchPresence|FailedTrustedSHAStableRetryRevokesOldPresenceProof|CacheDeleteRefusesNestedForeignBranchServiceBeforeAnyRemoval|CopiedLocalRootPresenceSurvivesIncompleteSiblingArtifact)$')$' -count=1 -v
+
+  go-macos:
+    name: Go checks (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Test rebuild leases, CLI coordination, and wrapper
+        run: go test ./pkg/hfdownloader -run '^Test(RebuildCoordinationLeaseProcessExitAndStableObject|RebuildCoordinationRefusesForeignCarrierRecord|RebuildCoordinationDoesNotAdoptUnownedDirectoryCandidate|RebuildCoordinationTreePreflightProtectsOwnedCoordinator|RebuildCoordinationPathIgnoresPerProcessCacheOverride|SameUIDDifferentEnvironmentChildSharesExclusiveRootLease|RebuildCoordinationConcurrentBootstrapAcrossProcesses|FirstBranchClaimWaitsForCrossProcessOrdinaryAdmission|SyncCleanKeepsStableRootLeaseObject|SyncCleanRefusesToRemoveOwnedCoordinationScope|SyncCleanLeavesProfileCoordinatorOutsideCacheScope|OrdinaryDownloadCannotReplaceOwnedCoordinationCarrier|OrdinaryHFWriterPreservesNestedCoordinationCarrier|OrdinaryLocalWriterUsesUnownedServiceOwnerSpelling|OrdinaryWriteWinsBeforeFirstBranchServiceClaim|FirstBranchServiceClaimWinsBeforeOrdinaryWriter|OrdinaryHFDownloadIgnoresUnownedRootServiceCandidateAndClaimRefuses|RebuildCoordinationLeavesLegacyRootSidecarUnclaimed|BranchVariantMutationGuardDistinguishesEntryFromReferent|BranchVariantPartialCleanupKeepsOwnershipAndCompletion|GoCLIRebuildWaitsForAppDownloadAcrossRootAlias|RebuildWrapperUsesGoWithoutPythonAndForwardsCleanVerbose|RebuildWrapperFailsClosedWithoutCompatibleBinary)$' -count=1 -v
+
+      - name: Test rebuild probe and CLI entrypoint
+        run: go test ./cmd/hfdesk -count=1 -v
+
+      - name: Test server proof mutators
+        run: go test ./internal/server -run '^Test(CopiedLocalRootRebindSurvivesFailedSecondArtifact|SameUIDDifferentHomeCLIWaitsForOrdinaryAPIDownload|CopiedHFAndLocalRootsRetainBranchPresence|FailedTrustedSHAStableRetryRevokesOldPresenceProof|CacheDeleteRefusesNestedForeignBranchServiceBeforeAnyRemoval)$' -count=1 -v

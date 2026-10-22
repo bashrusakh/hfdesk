@@ -135,6 +135,7 @@ is included when declared by the branch config or branch name.
       "category": "quantization",
       "filter_value": "",
       "revision": "SC_6.00bpw_H6_V6",
+      "branch_variant": true,
       "method": "exl3",
       "bits_per_weight": 6,
       "head_bits": 6,
@@ -144,7 +145,8 @@ is included when declared by the branch config or branch name.
   ],
   "recommended_download": {
     "repo": "owner/example-EXL3-model",
-    "revision": "4.00bpw"
+    "revision": "4.00bpw",
+    "branchVariant": true
   }
 }
 ```
@@ -152,9 +154,14 @@ is included when declared by the branch config or branch name.
 Branch selections use `revision` as the identity, not `files` or
 `filter_value`. Send the selected item's URL-encoded `revision` to
 `GET /api/analyze/{owner}/{repo}?revision=...` to analyze that branch, or send
-`{"repo":"owner/name","revision":"..."}` to `/api/download` to download
-the complete branch, including its model support/config/tokenizer files. The
-single recommended branch uses the same unfiltered request shape. Branch size
+`{"repo":"owner/name","revision":"...","branchVariant":true}` to
+`/api/download` to download the complete branch, including its model
+support/config/tokenizer files. Copy `selectable_items[].branch_variant` to the
+request's `branchVariant`; this explicit marker opts only analyzer-recognized
+EXL2/EXL3 branch choices into variant-isolated storage. A revision by itself
+does not opt in, so ordinary revision downloads keep their existing paths. The
+single recommended branch includes `branchVariant: true` in
+`recommended_download`. Branch size
 lookups are optional and bounded to 16 branches with at most three concurrent
 lookups; every listed branch remains selectable when a size lookup is skipped
 or fails, and the `size`/`size_human` fields are then omitted. These fields are
@@ -551,6 +558,12 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- `branchVariant` (optional boolean) is set only for an EXL branch choice
+  marked `branch_variant` by repository analysis. When true, `revision` is
+  required, `dataset` must be false, and filters, excludes, filter subdirectories,
+  and `localRepo` overrides are rejected because this request selects one
+  complete model branch. Ordinary revision requests without this marker keep
+  their existing storage paths.
 - A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
@@ -912,6 +925,60 @@ Cache entries may come from:
 - `filtered`
 - `unknown`
 
+The existing `GET /api/cache/{owner}/{repo}` response remains unchanged when no
+`branchVariant` selector is supplied. For exact EXL branch presence, use:
+
+```http
+GET /api/cache/{owner}/{repo}?type=model&branchVariant=true&revision=4.00bpw
+```
+
+The optional `routeKey` and `localDir` query fields use the same authoritative
+destination resolution as `POST /api/download` (explicit `localDir`, configured
+route, global `localDir`, then the selected HF cache). An explicitly requested
+route with no configured destination is rejected; status never searches other
+roots. The response is a `BranchVariantPresenceResponse`: `downloaded` and
+`downloadStatus` (`complete` or `unknown`) refer only to the requested revision
+at that exact destination. It includes `storageMode`, `destinationRoot`, the
+revision's `variantPath`, and, when present, the exact `artifactPath`, resolved
+`controlPath`, `commit`, and complete expected `files` set. `artifactPath` is
+the model-file root and `controlPath` is the separate app-owned completion
+namespace for the selected revision. Cache misses, mismatched revisions or
+locations, missing expected members, stale/unowned records, and legacy
+common-path files return `downloaded: false`; invalid selectors return `400`.
+
+EXL branch artifacts use an app-owned, commit-scoped tree inside the selected
+download root. Ordinary model-relative paths remain unchanged outside this
+service area:
+
+```text
+<destination>/.hfdesk-variant-store/
+  .hfdesk-owner.json
+  payloads/models/<owner>/<repo>/<branch-key>/<commit-key>/files/<repo files>
+  control/models/<owner>/<repo>/<branch-key>/<commit-key>/
+    .hfdesk-owner.json
+    hfd.yaml
+```
+
+`artifactPath` points to `files/`; `controlPath` points to the distinct
+app-owned completion namespace. Repo payload files named `manifest` or `hfd.yaml`
+remain ordinary model data and cannot replace the control record. Revision and
+commit components are portable, deterministic keys; separate ownership records
+bind the service tree and each artifact to the selected root and identity. HF
+cache blobs and snapshots remain under their existing Hub repo; the branch
+payload is separately materialized in the service tree. Ordinary downloads and
+restore operations that physically target an owned service tree fail before
+changing it, including through configured routes, explicit local roots, and
+filesystem aliases. A service directory that carries no application ownership
+record stays ordinary data: it never blocks unrelated ordinary work in its
+root, and an EXL claim at that exact root fails before changing it. A service
+directory whose ownership record cannot be established fails closed for writes
+that physically intersect it, and its data is neither adopted nor deleted. A
+matching path spelling outside an owned service tree is not globally reserved.
+Rebuild/Sync restore only owner-proven complete variants.
+Existing common-path files are not moved, deleted, or claimed as variant
+evidence; the existing explicit whole-repository delete removes only owned
+service entries for that repo and destination.
+
 `GET /api/cache` includes effective R as `cacheDir`, plus `effectiveHubDir` and
 `hubDirSource`. HF entries' `path` is under selected H, while `friendlyPath` is
 under associated R. A friendly manifest from a different Hub association does
@@ -920,11 +987,14 @@ Hub snapshot files without a friendly view; empty/partial-only Hub directories
 are not cached-content evidence. Independent local scan source priority remains
 unchanged.
 
-Rebuild and generated `R/rebuild.sh` use the same selected H/R association.
-Conventional R/hub scripts remain relocatable with their whole root; independent
-Hub scripts capture an absolute H, safely quoted, and regenerate when that
-association changes. They do not rediscover ambient ENV. Manifest `repo_path`
-is relative to R, or absolute when R/H are on different volumes.
+HTTP rebuild and `hfdesk --rebuild` call the same Go cache-sync owner with the
+selected H/R association. Generated `R/rebuild.sh` is an invocation-only
+wrapper and requires a compatible HFDesk binary (beside the script, on `PATH`,
+or named by `HFDESK_BIN`); it does not require Python. Conventional R/hub scripts
+remain relocatable with their whole root; independent-Hub scripts capture an
+absolute H, safely quoted, and regenerate when that association changes. They
+do not rediscover ambient ENV. Manifest `repo_path` is relative to R, or
+absolute when R/H are on different volumes.
 
 Delete removes only the selected repository under H and its friendly view under
 R, with separate confinement checks. Shared H deletion can affect other clients

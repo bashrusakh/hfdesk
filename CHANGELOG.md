@@ -5,12 +5,14 @@
 ### Added
 
 - Show EXL2/EXL3 bitrate variants stored on repository branches, including branch-specific method, BPW, head bits, optional size, and a balanced branch-revision download recommendation (#100).
+- Mark analyzer-recognized EXL branch choices explicitly in recommended/download requests, store each resolved branch commit in an app-owned payload tree with separate completion control, refuse ordinary writes that physically conflict with that tree, and expose additive variant-and-destination cache presence with durable ownership and complete-file evidence (#100).
 - Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
 - Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
 - Model Details now opens README, lineage, and related-download repository links in-place, with Back/Forward history across models, datasets, and revisions (#135).
 
 ### Changed
 
+- Use one Go cache-sync implementation for HTTP rebuild and `hfdesk --rebuild`; generated `rebuild.sh` is an invocation-only wrapper that requires a compatible HFDesk binary (`HFDESK_BIN` or the script directory/`PATH`) and no Python.
 - `hfdownloader.PlanRepo` and `hfdownloader.Download` now reject a path-shaped filter combined with `AppendFilterSubdir` (typed `ErrAppendFilterSubdirPathFilter`) before any network or plan work: only single-component group/token filters can name a destination subdirectory. Path filters remain valid with `AppendFilterSubdir` disabled.
 - README rendering and Hugging Face repository-link classification now have a single Go implementation: the bundled UI renders the server-sanitized `html` from `GET /api/readme` and no longer carries a client Markdown renderer or duplicate URL classifier (#135, #147).
 - Remote repository tree paths must now use their canonical spelling: a raw path whose `path.Clean` form differs (for example a `./` segment, duplicate slash, or trailing slash) fails planning with a non-canonical-path error instead of being normalized, so two spellings of one remote file cannot both be planned and race to write a single cache entry.
