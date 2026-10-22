@@ -1620,9 +1620,25 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
-	if _, qualified := r.URL.Query()["branchVariant"]; qualified {
-		s.handleBranchVariantPresence(w, r, repo)
-		return
+	// The qualified branch-variant query is selected by its selector value, not
+	// by the presence of the parameter. An absent selector and an explicit
+	// branchVariant=false both keep the documented legacy cache response; only
+	// branchVariant=true selects the qualified handler.
+	if selector, supplied := r.URL.Query()["branchVariant"]; supplied {
+		if len(selector) != 1 {
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant selector", "Expected exactly one branchVariant=true")
+			return
+		}
+		switch selector[0] {
+		case "true":
+			s.handleBranchVariantPresence(w, r, repo)
+			return
+		case "false":
+			// An explicit opt-out keeps the legacy response.
+		default:
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant selector", "Expected exactly one branchVariant=true")
+			return
+		}
 	}
 
 	repoTypeValue, suppliedType := r.URL.Query()["type"]
@@ -1850,6 +1866,10 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	opts := hfdownloader.SyncOptions{
 		Clean:   req.Clean,
 		Verbose: false,
+		// The rebuild waits for the same mutation leases an in-flight branch
+		// variant transfer holds. A disconnected client must not leave this
+		// handler blocked behind that transfer.
+		Context: r.Context(),
 	}
 
 	result, err := cache.Sync(opts)
@@ -2046,7 +2066,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer coordinationRelease()
-	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLease(cache.Root, true)
+	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(r.Context(), cache.Root, true)
 	if err != nil {
 		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant activity", err.Error())
 		return

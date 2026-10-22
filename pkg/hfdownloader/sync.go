@@ -21,6 +21,19 @@ type SyncOptions struct {
 	// OnProgress receives verbose rebuild progress from the shared Go owner.
 	// It is only called when Verbose is true.
 	OnProgress func(string)
+	// Context bounds the mutation leases this operation waits for. A caller
+	// that owns a request context passes it so a disconnected client does not
+	// leave the handler blocked behind a competing artifact mutation. A nil
+	// context means context.Background().
+	Context context.Context
+}
+
+// leaseContext returns the context that bounds this operation's lease waits.
+func (o SyncOptions) leaseContext() context.Context {
+	if o.Context == nil {
+		return context.Background()
+	}
+	return o.Context
 }
 
 // SyncResult contains statistics from a sync operation.
@@ -38,11 +51,12 @@ type SyncResult struct {
 // creates friendly-view entries pointing at snapshot files.
 func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	result := &SyncResult{}
+	leaseCtx := opts.leaseContext()
 	hubDir := c.HubDir()
 	if _, err := os.Stat(hubDir); errors.Is(err, os.ErrNotExist) {
 		return result, nil // Nothing to sync
 	}
-	coordinationRelease, err := acquireRebuildCoordinationLeases(context.Background(), []string{c.Root}, true, func() {
+	coordinationRelease, err := acquireRebuildCoordinationLeases(leaseCtx, []string{c.Root}, true, func() {
 		if opts.Verbose && opts.OnProgress != nil {
 			opts.OnProgress("Waiting for the HF cache mutation lease...")
 		}
@@ -62,7 +76,7 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	if opts.Clean {
 		// The cache root is the common admission scope for nested selected
 		// local roots; its exclusive lease fences the full recursive clean.
-		cleanRelease, err := AcquireBranchVariantDirectoryLease(c.Root, true)
+		cleanRelease, err := AcquireBranchVariantDirectoryLeaseContext(leaseCtx, c.Root, true)
 		if err != nil {
 			return nil, fmt.Errorf("lease recursive orphan cleanup: %w", err)
 		}
@@ -91,7 +105,7 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	} else if err := RebindBranchVariantServiceRootUnderLease(c.Root); err != nil {
 		return nil, fmt.Errorf("refresh copied branch variant owner before sync: %w", err)
 	}
-	rootRelease, err := AcquireBranchVariantDirectoryLease(c.Root, false)
+	rootRelease, err := AcquireBranchVariantDirectoryLeaseContext(leaseCtx, c.Root, false)
 	if err != nil {
 		return nil, fmt.Errorf("lease HF cache for sync: %w", err)
 	}
@@ -501,7 +515,7 @@ func (c *HFCache) syncBranchVariants(repoDir *RepoDir, opts SyncOptions) (create
 }
 
 func (c *HFCache) syncBranchVariantArtifact(repoDir *RepoDir, artifact *BranchVariantArtifact, opts SyncOptions) (created, updated int, errs []error) {
-	release, err := AcquireBranchVariantArtifactLease(artifact, true)
+	release, err := AcquireBranchVariantArtifactLeaseContext(opts.leaseContext(), artifact, true)
 	if err != nil {
 		return 0, 0, []error{fmt.Errorf("lease EXL branch artifact %s: %w", artifact.ControlRoot, err)}
 	}

@@ -142,7 +142,8 @@ func TestBranchVariantPresenceValidatesSelectorAndPreservesLegacyCacheResponse(t
 	for _, path := range []string{
 		"/api/cache/owner/model?branchVariant=true",
 		"/api/cache/owner/model?branchVariant=true&revision=main&revision=other",
-		"/api/cache/owner/model?branchVariant=false&revision=main",
+		"/api/cache/owner/model?branchVariant=maybe&revision=main",
+		"/api/cache/owner/model?branchVariant=true&branchVariant=true&revision=main",
 		"/api/cache/owner/model?type=dataset&branchVariant=true&revision=main",
 		"/api/cache/owner/model?branchVariant=true&revision=main&routeKey=unknown",
 		"/api/cache/owner/model?branchVariant=true&revision=main&routeKey=llm/safetensors",
@@ -158,6 +159,251 @@ func TestBranchVariantPresenceValidatesSelectorAndPreservesLegacyCacheResponse(t
 	}
 	if strings.Contains(w.Body.String(), "branchVariant") {
 		t.Fatalf("legacy cache response unexpectedly contains branch selector fields: %s", w.Body.String())
+	}
+	// An explicit opt-out is not a branch-variant selector, so it keeps the
+	// documented legacy response instead of failing the qualified handler.
+	optedOut := cacheRequest(t, s, http.MethodGet, "/api/cache/owner/model?branchVariant=false&revision=main", "")
+	if optedOut.Code != http.StatusNotFound {
+		t.Fatalf("legacy branchVariant=false cache lookup changed: status=%d body=%s", optedOut.Code, optedOut.Body.String())
+	}
+	if strings.Contains(optedOut.Body.String(), "branchVariant") {
+		t.Fatalf("legacy cache response unexpectedly contains branch selector fields: %s", optedOut.Body.String())
+	}
+}
+
+// TestBranchVariantPresenceAnswersDuringActiveTransfer covers the qualified
+// presence query while a variant transfer holds the artifact control
+// directory exclusively. The query must answer promptly and must report the
+// partially transferred artifact as not present. After the transfer completes,
+// the same query must report the artifact present.
+func TestBranchVariantPresenceAnswersDuringActiveTransfer(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	base := isolateCacheState(t)
+	body := []byte("controlled complete cache weights")
+	digest := sha256.Sum256(body)
+	hash := hex.EncodeToString(digest[:])
+
+	for _, mode := range []string{"hf-cache", "local"} {
+		t.Run(mode, func(t *testing.T) {
+			root := filepath.Join(base, mode+"-root")
+			transferStarted := make(chan struct{})
+			releaseTransfer := make(chan struct{})
+			var startOnce sync.Once
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseTransfer) }) }
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/revision/"):
+					_ = json.NewEncoder(w).Encode(map[string]string{"sha": "commit123"})
+				case strings.Contains(r.URL.Path, "/tree/"):
+					_ = json.NewEncoder(w).Encode([]map[string]any{{
+						"type": "file", "path": "weights.safetensors", "size": len(body),
+						"lfs": map[string]any{"oid": hash, "size": len(body)},
+					}})
+				case strings.Contains(r.URL.Path, "/resolve/"):
+					if r.Method != http.MethodHead {
+						// The transfer is now in flight and holds the artifact
+						// control lease for the whole transfer.
+						startOnce.Do(func() { close(transferStarted) })
+						<-releaseTransfer
+					}
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					if r.Method != http.MethodHead {
+						_, _ = w.Write(body)
+					}
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer hub.Close()
+			defer release()
+
+			settings := hfdownloader.Settings{Endpoint: hub.URL, Concurrency: 1, Verify: "sha256"}
+			if mode == "hf-cache" {
+				settings.CacheDir = root
+			} else {
+				settings.OutputDir = root
+			}
+			downloadDone := make(chan error, 1)
+			go func() {
+				downloadDone <- hfdownloader.Download(context.Background(), hfdownloader.Job{
+					Repo: "owner/model", Revision: "4.00bpw", BranchVariant: true,
+				}, settings, nil)
+			}()
+			select {
+			case <-transferStarted:
+			case err := <-downloadDone:
+				t.Fatalf("branch variant transfer ended before its payload request: %v", err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("branch variant transfer did not reach its payload request")
+			}
+
+			query := "revision=4.00bpw"
+			serverCacheRoot := root
+			if mode == "local" {
+				query += "&localDir=" + url.QueryEscape(root)
+				serverCacheRoot = filepath.Join(base, mode+"-cache")
+			}
+			s := newTestServerWithConfig(t, Config{CacheDir: serverCacheRoot, Endpoint: hub.URL})
+			mux := http.NewServeMux()
+			s.registerAPIRoutes(mux)
+			presenceDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				recorder := httptest.NewRecorder()
+				mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet,
+					"/api/cache/owner/model?type=model&branchVariant=true&"+query, nil))
+				presenceDone <- recorder
+			}()
+			var recorder *httptest.ResponseRecorder
+			select {
+			case recorder = <-presenceDone:
+			case <-time.After(20 * time.Second):
+				t.Fatal("qualified presence query did not answer while the branch variant transfer held the artifact control lease")
+			}
+			var during BranchVariantPresenceResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &during); err != nil {
+				t.Fatalf("decode presence response during transfer (%d): %s: %v", recorder.Code, recorder.Body.String(), err)
+			}
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("presence status during transfer=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if during.Downloaded || during.DownloadStatus == "complete" {
+				t.Fatalf("presence during an active transfer reported a complete artifact: %+v", during)
+			}
+
+			release()
+			select {
+			case err := <-downloadDone:
+				if err != nil {
+					t.Fatalf("branch variant transfer failed: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("branch variant transfer did not finish")
+			}
+			status, after := branchPresenceRequest(t, s, query)
+			if status != http.StatusOK || !after.Downloaded || after.DownloadStatus != "complete" || after.Commit != "commit123" {
+				t.Fatalf("presence after the transfer status=%d response=%+v", status, after)
+			}
+		})
+	}
+}
+
+// TestBranchVariantPresenceFindsCompleteSiblingBehindLockedControl covers a
+// revision whose control directory holds two complete commits. A sibling that
+// a competing writer holds exclusively must not starve the query: the
+// complete artifact behind it is still reported, the locked artifact is never
+// reported as present, and the query answers inside the overall budget.
+func TestBranchVariantPresenceFindsCompleteSiblingBehindLockedControl(t *testing.T) {
+	t.Setenv("HF_HUB_CACHE", "")
+	base := isolateCacheState(t)
+	revision := "4_25"
+	file := "weights.safetensors"
+	commits := []struct {
+		commit  string
+		content []byte
+	}{
+		{commit: "commit-first", content: []byte("AAAAAAAA")},
+		{commit: "commit-second", content: []byte("BBBBBBBB")},
+	}
+	// Each Hub resolves the same revision to its own commit, so one revision
+	// control directory ends up holding two complete commits.
+	newHub := func(commit string, content []byte) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			const apiPrefix = "/api/models/owner/model/"
+			switch {
+			case strings.HasPrefix(r.URL.Path, apiPrefix+"revision/"):
+				_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
+			case strings.HasPrefix(r.URL.Path, apiPrefix+"tree/"):
+				digest := sha256.Sum256(content)
+				_ = json.NewEncoder(w).Encode([]map[string]any{{
+					"type": "file", "path": file, "size": len(content),
+					"lfs": map[string]any{"oid": hex.EncodeToString(digest[:]), "size": len(content)},
+				}})
+			case strings.HasPrefix(r.URL.Path, "/owner/model/resolve/"),
+				strings.HasPrefix(r.URL.Path, apiPrefix+"resolve/"):
+				w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+				if r.Method != http.MethodHead {
+					_, _ = w.Write(content)
+				}
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+
+	for _, mode := range []string{"local", "hf-cache"} {
+		t.Run(mode, func(t *testing.T) {
+			root := filepath.Join(base, mode+"-root")
+			for _, candidate := range commits {
+				hub := newHub(candidate.commit, candidate.content)
+				settings := hfdownloader.Settings{Endpoint: hub.URL, Concurrency: 1, Verify: "sha256"}
+				if mode == "hf-cache" {
+					settings.CacheDir = root
+				} else {
+					settings.OutputDir = root
+				}
+				err := hfdownloader.Download(context.Background(), hfdownloader.Job{
+					Repo: "owner/model", Revision: revision, BranchVariant: true,
+				}, settings, nil)
+				hub.Close()
+				if err != nil {
+					t.Fatalf("download complete artifact %q: %v", candidate.commit, err)
+				}
+			}
+
+			// The commit whose control directory sorts first is the one a
+			// competing writer holds exclusively.
+			lockedCommit, completeCommit := commits[0].commit, commits[1].commit
+			if hfdownloader.BranchVariantCommitDirName(lockedCommit) > hfdownloader.BranchVariantCommitDirName(completeCommit) {
+				lockedCommit, completeCommit = completeCommit, lockedCommit
+			}
+			lockedControl, err := hfdownloader.BranchVariantMetadataPath(root, hfdownloader.RepoTypeModel, "owner/model", revision, lockedCommit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseLock, err := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(context.Background(), lockedControl, true)
+			if err != nil {
+				t.Fatalf("lock the sibling control directory: %v", err)
+			}
+			locked := true
+			defer func() {
+				if locked {
+					releaseLock()
+				}
+			}()
+
+			serverCacheRoot := root
+			query := "revision=" + revision
+			if mode == "local" {
+				query += "&localDir=" + url.QueryEscape(root)
+				serverCacheRoot = filepath.Join(base, mode+"-cache")
+			}
+			s := newTestServerWithConfig(t, Config{CacheDir: serverCacheRoot})
+			started := time.Now()
+			status, response := branchPresenceRequest(t, s, query)
+			elapsed := time.Since(started)
+			if status != http.StatusOK {
+				t.Fatalf("presence status=%d response=%+v", status, response)
+			}
+			if !response.Downloaded || response.DownloadStatus != "complete" {
+				t.Fatalf("a locked sibling hid the complete artifact: %+v", response)
+			}
+			if response.Commit != completeCommit {
+				t.Fatalf("presence reported commit %q; want the complete sibling %q", response.Commit, completeCommit)
+			}
+			if elapsed > 2*branchVariantPresenceLeaseBudget {
+				t.Fatalf("presence query took %s; it must answer within the overall budget", elapsed)
+			}
+
+			// Releasing the lock proves the skipped sibling was complete and
+			// was skipped only because its control record was being mutated.
+			releaseLock()
+			locked = false
+			status, released := branchPresenceRequest(t, s, query)
+			if status != http.StatusOK || !released.Downloaded || released.Commit != lockedCommit {
+				t.Fatalf("presence after releasing the lock status=%d response=%+v", status, released)
+			}
+		})
 	}
 }
 

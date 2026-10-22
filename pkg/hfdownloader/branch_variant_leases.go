@@ -32,16 +32,30 @@ type branchVariantDirectoryScope struct {
 // that directory. Parent directories are resolved before locking, so symlink
 // aliases share the same OS lock objects.
 func AcquireBranchVariantDirectoryLease(path string, exclusive bool) (func(), error) {
+	return AcquireBranchVariantDirectoryLeaseContext(context.Background(), path, exclusive)
+}
+
+// AcquireBranchVariantDirectoryLeaseContext is the cancellable form of
+// AcquireBranchVariantDirectoryLease. The context bounds the wait, so a
+// caller that competes with a long-running artifact mutation can give up
+// instead of staying blocked until that mutation finishes.
+func AcquireBranchVariantDirectoryLeaseContext(ctx context.Context, path string, exclusive bool) (func(), error) {
 	mode := branchVariantLeaseShared
 	if exclusive {
 		mode = branchVariantLeaseExclusive
 	}
-	return acquireBranchVariantDirectoryScopes(context.Background(), branchVariantDirectoryScope{path: path, mode: mode})
+	return acquireBranchVariantDirectoryScopes(ctx, branchVariantDirectoryScope{path: path, mode: mode})
 }
 
 // AcquireBranchVariantDirectoryLeases acquires a set of directory scopes in a
 // stable order. It is used for multi-root operations such as orphan cleanup.
 func AcquireBranchVariantDirectoryLeases(paths []string, exclusive bool) (func(), error) {
+	return AcquireBranchVariantDirectoryLeasesContext(context.Background(), paths, exclusive)
+}
+
+// AcquireBranchVariantDirectoryLeasesContext is the cancellable form of
+// AcquireBranchVariantDirectoryLeases.
+func AcquireBranchVariantDirectoryLeasesContext(ctx context.Context, paths []string, exclusive bool) (func(), error) {
 	mode := branchVariantLeaseShared
 	if exclusive {
 		mode = branchVariantLeaseExclusive
@@ -52,7 +66,7 @@ func AcquireBranchVariantDirectoryLeases(paths []string, exclusive bool) (func()
 			scopes = append(scopes, branchVariantDirectoryScope{path: path, mode: mode})
 		}
 	}
-	return acquireBranchVariantDirectoryScopes(context.Background(), scopes...)
+	return acquireBranchVariantDirectoryScopes(ctx, scopes...)
 }
 
 // AcquireBranchVariantArtifactLease fences one variant's control and payload
@@ -60,6 +74,12 @@ func AcquireBranchVariantDirectoryLeases(paths []string, exclusive bool) (func()
 // proceed concurrently. The service root is shared; the artifact control
 // directory is the exclusive/shared scope.
 func AcquireBranchVariantArtifactLease(artifact *BranchVariantArtifact, exclusive bool) (func(), error) {
+	return AcquireBranchVariantArtifactLeaseContext(context.Background(), artifact, exclusive)
+}
+
+// AcquireBranchVariantArtifactLeaseContext is the cancellable form of
+// AcquireBranchVariantArtifactLease.
+func AcquireBranchVariantArtifactLeaseContext(ctx context.Context, artifact *BranchVariantArtifact, exclusive bool) (func(), error) {
 	if artifact == nil {
 		return nil, fmt.Errorf("missing branch variant artifact")
 	}
@@ -67,13 +87,16 @@ func AcquireBranchVariantArtifactLease(artifact *BranchVariantArtifact, exclusiv
 	if exclusive {
 		mode = branchVariantLeaseExclusive
 	}
-	return acquireBranchVariantDirectoryScopes(context.Background(),
+	return acquireBranchVariantDirectoryScopes(ctx,
 		branchVariantDirectoryScope{path: artifact.ServiceRoot, mode: branchVariantLeaseShared},
 		branchVariantDirectoryScope{path: artifact.ControlRoot, mode: mode},
 	)
 }
 
-func acquireExactBranchVariantDirectoryLease(path string, mode branchVariantLeaseMode) (func(), error) {
+func acquireExactBranchVariantDirectoryLease(ctx context.Context, path string, mode branchVariantLeaseMode) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	physical, err := resolvedPathForCreate(path)
 	if err != nil {
 		return nil, err
@@ -85,7 +108,7 @@ func acquireExactBranchVariantDirectoryLease(path string, mode branchVariantLeas
 	if !info.IsDir() {
 		return nil, fmt.Errorf("lease target %q is not a directory", path)
 	}
-	return acquireBranchVariantOSDirectoryLock(context.Background(), physical, mode == branchVariantLeaseExclusive)
+	return acquireBranchVariantOSDirectoryLock(ctx, physical, mode == branchVariantLeaseExclusive)
 }
 
 // acquireBranchVariantCreationLease serializes a claim at its nearest existing

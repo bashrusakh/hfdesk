@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -13,9 +14,38 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// branchVariantPresenceLeaseBudget bounds how long the qualified presence
+// query waits for a competing artifact mutation. A variant transfer holds the
+// artifact control directory exclusively for the whole transfer, so an
+// unbounded wait would leave the query unanswered until the transfer ends.
+// The completion proof is revoked before any payload effect, so a control
+// lease that cannot be taken within this budget means "not present"; it never
+// means "present".
+const branchVariantPresenceLeaseBudget = 250 * time.Millisecond
+
+// branchVariantPresenceEntryBudget returns the lease budget for one control
+// entry of the presence query. The remaining query budget is divided across
+// the entries that are still unchecked, so one blocked entry can consume only
+// its own share and cannot starve the entries after it. The query as a whole
+// stays bounded by the same overall budget.
+func branchVariantPresenceEntryBudget(ctx context.Context, remainingEntries int) time.Duration {
+	if remainingEntries < 1 {
+		remainingEntries = 1
+	}
+	remaining := branchVariantPresenceLeaseBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+	}
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining / time.Duration(remainingEntries)
+}
 
 // BranchVariantPresenceResponse is returned only by the additive qualified
 // cache query. It identifies the selected branch, its resolved artifact root,
@@ -106,6 +136,11 @@ func (s *Server) handleBranchVariantPresence(w http.ResponseWriter, r *http.Requ
 		Repo: repo, Type: string(hfdownloader.RepoTypeModel), BranchVariant: true,
 		Revision: revision, DownloadStatus: "unknown", Files: []BranchVariantPresenceFile{},
 	}
+	// The presence read must answer while a variant transfer holds the
+	// artifact control lease, so every control-record lease it takes is
+	// bounded by one budget for the whole query.
+	presenceCtx, cancelPresence := context.WithTimeout(r.Context(), branchVariantPresenceLeaseBudget)
+	defer cancelPresence()
 	if effectiveLocalDir != "" {
 		root, err := filepath.Abs(effectiveLocalDir)
 		if err != nil {
@@ -126,7 +161,7 @@ func (s *Server) handleBranchVariantPresence(w http.ResponseWriter, r *http.Requ
 		response.DestinationRoot = root
 		response.VariantPath = variantBase
 		response.ControlPath = controlBase
-		manifest, artifactPath, controlPath, warning := findLocalBranchVariant(root, controlBase, repo, revision)
+		manifest, artifactPath, controlPath, warning := findLocalBranchVariant(presenceCtx, root, controlBase, repo, revision)
 		response.Warning = warning
 		if manifest != nil {
 			setBranchVariantPresence(&response, manifest, artifactPath, controlPath)
@@ -156,7 +191,7 @@ func (s *Server) handleBranchVariantPresence(w http.ResponseWriter, r *http.Requ
 	response.HubDir = cache.HubDir()
 	response.VariantPath = variantBase
 	response.ControlPath = metadataBase
-	manifest, artifactPath, controlPath, warning := findHFBranchVariant(cache, repoDir, metadataBase, revision)
+	manifest, artifactPath, controlPath, warning := findHFBranchVariant(presenceCtx, cache, repoDir, metadataBase, revision)
 	response.Warning = warning
 	if manifest != nil {
 		setBranchVariantPresence(&response, manifest, artifactPath, controlPath)
@@ -178,7 +213,7 @@ func setBranchVariantPresence(response *BranchVariantPresenceResponse, manifest 
 	sort.Slice(response.Files, func(i, j int) bool { return response.Files[i].Name < response.Files[j].Name })
 }
 
-func findLocalBranchVariant(destinationRoot, controlBase, repo, revision string) (*hfdownloader.DownloadManifest, string, string, string) {
+func findLocalBranchVariant(ctx context.Context, destinationRoot, controlBase, repo, revision string) (*hfdownloader.DownloadManifest, string, string, string) {
 	serviceRoot, err := hfdownloader.BranchVariantServiceRoot(destinationRoot)
 	if err != nil {
 		return nil, "", "", fmt.Sprintf("Could not resolve the selected local service tree: %v", err)
@@ -197,16 +232,28 @@ func findLocalBranchVariant(destinationRoot, controlBase, repo, revision string)
 	if err != nil {
 		return nil, "", "", fmt.Sprintf("Could not inspect the selected local destination: %v", err)
 	}
+	controlDirs := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		metadataDir := filepath.Join(controlBase, entry.Name())
-		lease, leaseErr := hfdownloader.AcquireBranchVariantDirectoryLease(metadataDir, false)
+		controlDirs = append(controlDirs, filepath.Join(controlBase, entry.Name()))
+	}
+	for index, metadataDir := range controlDirs {
+		// Every unchecked entry gets a bounded share of the remaining query
+		// budget, so a blocked entry cannot consume the whole budget and
+		// starve the entries after it.
+		entryCtx, cancelEntry := context.WithTimeout(ctx, branchVariantPresenceEntryBudget(ctx, len(controlDirs)-index))
+		lease, leaseErr := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(entryCtx, metadataDir, false)
+		cancelEntry()
 		if leaseErr != nil {
+			// The artifact is being mutated by a competing writer, or this
+			// entry's share of the bounded presence budget expired. An
+			// unproven artifact is not present, so skip it instead of
+			// blocking the query.
 			continue
 		}
-		manifest, readErr := readBranchVariantManifest(metadataDir, repo, revision, hfdownloader.RepoTypeModel, entry.Name())
+		manifest, readErr := readBranchVariantManifest(metadataDir, repo, revision, hfdownloader.RepoTypeModel, filepath.Base(metadataDir))
 		if readErr != nil {
 			lease()
 			continue
@@ -226,7 +273,7 @@ func findLocalBranchVariant(destinationRoot, controlBase, repo, revision string)
 	return nil, "", "", ""
 }
 
-func findHFBranchVariant(cache *hfdownloader.HFCache, repoDir *hfdownloader.RepoDir, metadataBase, revision string) (*hfdownloader.DownloadManifest, string, string, string) {
+func findHFBranchVariant(ctx context.Context, cache *hfdownloader.HFCache, repoDir *hfdownloader.RepoDir, metadataBase, revision string) (*hfdownloader.DownloadManifest, string, string, string) {
 	serviceRoot, err := hfdownloader.BranchVariantServiceRoot(cache.Root)
 	if os.IsNotExist(err) {
 		return nil, "", "", ""
@@ -252,16 +299,28 @@ func findHFBranchVariant(cache *hfdownloader.HFCache, repoDir *hfdownloader.Repo
 	if err != nil {
 		return nil, "", "", fmt.Sprintf("Could not inspect the selected HF cache destination: %v", err)
 	}
+	controlDirs := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		metadataDir := filepath.Join(metadataBase, entry.Name())
-		lease, leaseErr := hfdownloader.AcquireBranchVariantDirectoryLease(metadataDir, false)
+		controlDirs = append(controlDirs, filepath.Join(metadataBase, entry.Name()))
+	}
+	for index, metadataDir := range controlDirs {
+		// Every unchecked entry gets a bounded share of the remaining query
+		// budget, so a blocked entry cannot consume the whole budget and
+		// starve the entries after it.
+		entryCtx, cancelEntry := context.WithTimeout(ctx, branchVariantPresenceEntryBudget(ctx, len(controlDirs)-index))
+		lease, leaseErr := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(entryCtx, metadataDir, false)
+		cancelEntry()
 		if leaseErr != nil {
+			// The artifact is being mutated by a competing writer, or this
+			// entry's share of the bounded presence budget expired. An
+			// unproven artifact is not present, so skip it instead of
+			// blocking the query.
 			continue
 		}
-		manifest, readErr := readBranchVariantManifest(metadataDir, repoDir.RepoID(), revision, repoDir.Type(), entry.Name())
+		manifest, readErr := readBranchVariantManifest(metadataDir, repoDir.RepoID(), revision, repoDir.Type(), filepath.Base(metadataDir))
 		if readErr != nil || manifest == nil || !manifestBelongsToRepo(cache, repoDir, manifest) {
 			lease()
 			continue

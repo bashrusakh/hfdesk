@@ -8,6 +8,7 @@ package hfdownloader
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // The app and separate rebuild CLI coordinate process-visible effects through
@@ -25,7 +26,22 @@ type windowsBranchVariantPathLease struct {
 	users int
 }
 
+// acquireBranchVariantOSDirectoryLock takes the process-local directory lease.
+// The acquisition is cancellable: a bounded reader that competes with a
+// long-running writer must be able to give up instead of blocking until that
+// writer finishes.
+//
+// The lease provides mutual exclusion between an exclusive holder and shared
+// holders. It does not announce a pending writer, so a new shared lease can
+// still be granted while an exclusive waiter polls, and that waiter can be
+// delayed by later shared leases. The coordination model does not require
+// writer preference, so the retry loop polls the non-blocking TryLock/TryRLock
+// forms instead of a plain Lock/RLock call, which would wait for the lock
+// without observing the context.
 func acquireBranchVariantOSDirectoryLock(ctx context.Context, path string, exclusive bool) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -38,22 +54,43 @@ func acquireBranchVariantOSDirectoryLock(ctx context.Context, path string, exclu
 	}
 	lock.users++
 	windowsBranchVariantPathLeases.Unlock()
-	if exclusive {
-		lock.Lock()
-	} else {
-		lock.RLock()
-	}
-	return func() {
-		if exclusive {
-			lock.Unlock()
-		} else {
-			lock.RUnlock()
-		}
+
+	// drop releases the map reference held by this acquisition. It runs both
+	// after a successful lock and after a cancelled attempt, so a waiter that
+	// gives up never keeps a lease object alive.
+	drop := func() {
 		windowsBranchVariantPathLeases.Lock()
 		lock.users--
 		if lock.users == 0 && windowsBranchVariantPathLeases.locks[key] == lock {
 			delete(windowsBranchVariantPathLeases.locks, key)
 		}
 		windowsBranchVariantPathLeases.Unlock()
-	}, nil
+	}
+	release := func() {
+		if exclusive {
+			lock.Unlock()
+		} else {
+			lock.RUnlock()
+		}
+		drop()
+	}
+	for {
+		if exclusive {
+			if lock.TryLock() {
+				return release, nil
+			}
+		} else if lock.TryRLock() {
+			return release, nil
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			drop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

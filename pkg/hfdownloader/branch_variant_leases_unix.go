@@ -18,6 +18,12 @@ import (
 var branchVariantLeaseContentionHook func(string)
 
 func acquireBranchVariantOSDirectoryLock(ctx context.Context, path string, exclusive bool) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err

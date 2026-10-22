@@ -388,7 +388,7 @@ func claimBranchVariantArtifact(destinationRoot string, repoType RepoType, repoI
 	if err != nil {
 		return nil, nil, err
 	}
-	controlRelease, err := acquireExactBranchVariantDirectoryLease(artifact.ControlRoot, branchVariantLeaseExclusive)
+	controlRelease, err := acquireExactBranchVariantDirectoryLease(context.Background(), artifact.ControlRoot, branchVariantLeaseExclusive)
 	if err != nil {
 		rootRelease()
 		return nil, nil, err
@@ -858,22 +858,6 @@ func RejectBranchVariantServiceOverlap(destinationRoot string, targets ...string
 		}
 	}
 	return nil
-}
-
-// RemoveOwnedBranchVariantRepo removes only artifacts with matching app-owned
-// control records for this exact repository and selected destination.
-func RemoveOwnedBranchVariantRepo(destinationRoot string, repoType RepoType, repoID string) ([]string, error) {
-	coordinationRelease, err := acquireCompleteRebuildCoordinationLeases(context.Background(), []string{destinationRoot}, true, nil)
-	if err != nil {
-		return nil, fmt.Errorf("lease branch variant destination for deletion: %w", err)
-	}
-	defer coordinationRelease()
-	release, err := AcquireBranchVariantDirectoryLease(destinationRoot, true)
-	if err != nil {
-		return nil, fmt.Errorf("lease branch variant destination for deletion: %w", err)
-	}
-	defer release()
-	return RemoveOwnedBranchVariantRepoUnderLease(destinationRoot, repoType, repoID)
 }
 
 // RemoveOwnedBranchVariantRepoUnderLease removes exact-repository service

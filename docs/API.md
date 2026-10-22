@@ -1129,7 +1129,9 @@ Cache entries may come from:
 - `unknown`
 
 The existing `GET /api/cache/{owner}/{repo}` response remains unchanged when no
-`branchVariant` selector is supplied. For exact EXL branch presence, use:
+`branchVariant=true` selector is supplied. `branchVariant=false` is an
+explicit opt-out and keeps the same legacy response; any other selector value
+is invalid. For exact EXL branch presence, use:
 
 ```http
 GET /api/cache/{owner}/{repo}?type=model&branchVariant=true&revision=4.00bpw
@@ -1148,6 +1150,13 @@ the model-file root and `controlPath` is the separate app-owned completion
 namespace for the selected revision. Cache misses, mismatched revisions or
 locations, missing expected members, stale/unowned records, and legacy
 common-path files return `downloaded: false`; invalid selectors return `400`.
+
+The query answers while a variant transfer is still running. An artifact whose
+transfer holds the control lease is reported as `downloaded: false` with
+`downloadStatus: unknown` rather than blocking the request, because the
+completion proof is revoked before the first payload byte is written. The same
+query reports `downloaded: true` once the transfer has completed and published
+its completion proof.
 
 EXL branch artifacts use an app-owned, commit-scoped tree inside the selected
 download root. Ordinary model-relative paths remain unchanged outside this
