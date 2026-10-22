@@ -1950,16 +1950,16 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 	})
 }
 
-// TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance checks
-// that a directory inside the state directory of the instance is not checked
-// against the service account.
+// TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoot
+// checks that a directory inside the state directory of the instance that does
+// not exist yet is not checked against the service account.
 //
 // The installation creates the state directory of the instance and grants it
-// to the account, so a directory inside it belongs to the account: the check
-// of the named directories must not refuse it. A directory outside of the
-// state directory is still checked, because the installation never grants it
-// to the account.
-func TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance(t *testing.T) {
+// to the account, so the service creates the directory itself below the state
+// directory, as the account. The check of the named directories must not
+// refuse such a directory. A directory outside of the state directory is
+// still checked, because the installation never grants it to the account.
+func TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoot(t *testing.T) {
 	other := systemdSecondAccount(t)
 	root := systemdTraversableTempDir(t)
 
@@ -1976,11 +1976,15 @@ func TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance(t *testi
 	m := &systemdManager{scope: ScopeSystem}
 	opts := systemdTestOptions(t, ScopeSystem)
 	opts.Paths.StateDir = state
-	opts.CacheDir = filepath.Join(state, "cache")
+	// The named directories lie inside the state directory of the instance
+	// and do not exist yet: the service creates them below the state
+	// directory, and the account owns the state directory after the
+	// installation.
+	opts.CacheDir = filepath.Join(state, "models")
 	opts.HubDir = filepath.Join(opts.CacheDir, "hub")
-	// The local directory lies inside the state directory of the instance:
-	// the installation grants the state directory to the account, so the
-	// account can use the local directory as well.
+	// The local directory lies inside the state directory of the instance
+	// as well: the installation grants the state directory to the account,
+	// so the account can use the local directory as well.
 	opts.LocalDir = filepath.Join(state, "output")
 
 	if err := m.checkServiceAccountAccess(opts, other); err != nil {
@@ -1999,6 +2003,133 @@ func TestSystemdCheckServiceAccountAccessSkipsTheStateRootOfTheInstance(t *testi
 	opts.LocalDir = foreign
 	if err := m.checkServiceAccountAccess(opts, other); err == nil {
 		t.Error("checkServiceAccountAccess() = nil, want the refusal of a directory outside of the state directory of the instance")
+	}
+}
+
+// TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheStateRoot
+// checks that a named directory inside the state directory of the instance is
+// only exempt from the check while it does not exist yet.
+//
+// The installation grants the state directory to the account and creates
+// nothing below it: a directory that exists already inside the state
+// directory belongs to whoever owns it, and the account has to be able to
+// write there. The installation refuses such a directory when the account
+// cannot, so the failure happens at the installation and not at the first
+// write of the service.
+func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheStateRoot(t *testing.T) {
+	other := systemdSecondAccount(t)
+	root := systemdTraversableTempDir(t)
+
+	// The state directory of the instance. The installation grants it to
+	// the account, so the account passes through it: the mode leaves the
+	// traversal to every account.
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0o711); err != nil {
+		t.Fatalf("create the state directory: %v", err)
+	}
+	if err := os.Chmod(state, 0o711); err != nil {
+		t.Fatalf("open the state directory to the traversal: %v", err)
+	}
+
+	// A named directory inside the state directory that does not exist
+	// yet: the service creates it below the state directory, and the
+	// account owns the state directory after the installation.
+	missing := filepath.Join(state, "models")
+
+	// A named directory inside the state directory that exists and that
+	// the account cannot write into: it belongs to the user of the test
+	// and to nobody else.
+	closed := filepath.Join(state, "closed")
+	if err := os.Mkdir(closed, 0o700); err != nil {
+		t.Fatalf("create the closed directory: %v", err)
+	}
+	if err := os.Chmod(closed, 0o700); err != nil {
+		t.Fatalf("close the closed directory: %v", err)
+	}
+
+	// A named directory inside the state directory that exists and that
+	// the account can write into.
+	open := filepath.Join(state, "open")
+	if err := os.Mkdir(open, 0o777); err != nil {
+		t.Fatalf("create the open directory: %v", err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatalf("open the open directory: %v", err)
+	}
+
+	// A named directory outside of the state directory that does not
+	// exist yet: the account has to create it below the scratch
+	// directory, and it cannot write there.
+	outsideMissing := filepath.Join(root, "outside-missing")
+
+	// A directory outside of the state directory that the account of the
+	// check cannot write into.
+	foreign := filepath.Join(root, "foreign")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatalf("create the foreign directory: %v", err)
+	}
+	if err := os.Chmod(foreign, 0o700); err != nil {
+		t.Fatalf("close the foreign directory: %v", err)
+	}
+
+	// A link inside the state directory that points out of it, to a
+	// directory that exists.
+	outside := filepath.Join(state, "outside")
+	if err := os.Symlink(foreign, outside); err != nil {
+		t.Fatalf("create the link out of the state directory: %v", err)
+	}
+
+	// A link inside the state directory that points out of it, to a
+	// directory that does not exist yet.
+	outsideMissingLink := filepath.Join(state, "outside-missing")
+	if err := os.Symlink(outsideMissing, outsideMissingLink); err != nil {
+		t.Fatalf("create the link to the missing directory: %v", err)
+	}
+
+	m := &systemdManager{scope: ScopeSystem}
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.Paths.StateDir = state
+	opts.HubDir = ""
+	opts.LocalDir = ""
+
+	cases := []struct {
+		name    string
+		cache   string
+		wantErr bool
+	}{
+		{name: "a missing directory inside the state directory", cache: missing},
+		{name: "an existing directory inside the state directory that the account cannot write", cache: closed, wantErr: true},
+		{name: "an existing directory inside the state directory that the account can write", cache: open},
+		{name: "a missing directory outside of the state directory", cache: outsideMissing, wantErr: true},
+		{name: "a link inside the state directory that points to an existing directory out of it", cache: outside, wantErr: true},
+		{name: "a link inside the state directory that points to a missing directory out of it", cache: outsideMissingLink, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts.CacheDir = tc.cache
+			err := m.checkServiceAccountAccess(opts, other)
+			if !tc.wantErr {
+				if err != nil {
+					t.Errorf("checkServiceAccountAccess() = %v, want nil for the directory %q", err, tc.cache)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("checkServiceAccountAccess() = nil, want the refusal of the directory %q", tc.cache)
+			}
+			// The refusal names the directory, the account and the
+			// access that is missing.
+			message := err.Error()
+			for _, want := range []string{
+				"the service account " + strconv.Quote(other.Username),
+				strconv.Quote(tc.cache),
+				"cannot write",
+			} {
+				if !strings.Contains(message, want) {
+					t.Errorf("checkServiceAccountAccess() = %q, want a message that mentions %q", message, want)
+				}
+			}
+		})
 	}
 }
 
@@ -2027,9 +2158,9 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		t.Fatalf("open the state directory to the traversal: %v", err)
 	}
 
-	// A plain directory inside the state directory. The account of the
-	// check cannot write into it: the installation grants the state
-	// directory to the account, and not the tree below it.
+	// A plain directory inside the state directory. It exists already, so
+	// it belongs to whoever owns it: the account of the check cannot write
+	// into it, and the installation refuses it.
 	plain := filepath.Join(state, "models")
 	if err := os.Mkdir(plain, 0o700); err != nil {
 		t.Fatalf("create the plain directory: %v", err)
@@ -2087,7 +2218,7 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		cache   string
 		wantErr bool
 	}{
-		{name: "a plain directory inside the state directory", cache: plain},
+		{name: "a plain directory inside the state directory", cache: plain, wantErr: true},
 		{name: "a missing directory inside the state directory", cache: missing},
 		{name: "a link inside the state directory that points out of it", cache: outside, wantErr: true},
 		{name: "a link inside the state directory that points to a reachable place", cache: inside},
@@ -2123,7 +2254,8 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 	t.Run("the state directory is a link to another place", func(t *testing.T) {
 		// The state directory of the instance is a link: the installation
 		// grants the directory the link points at to the account, so a
-		// directory inside it is not checked against the account.
+		// directory inside it that does not exist yet is not checked
+		// against the account.
 		real := filepath.Join(root, "real-state")
 		if err := os.Mkdir(real, 0o700); err != nil {
 			t.Fatalf("create the real state directory: %v", err)
@@ -2144,16 +2276,28 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		}
 
 		opts.Paths.StateDir = link
-		opts.CacheDir = filepath.Join(link, "models")
+
+		// A directory that does not exist yet below the linked state
+		// directory: the service creates it, and the account owns the
+		// real state directory after the installation.
+		opts.CacheDir = filepath.Join(link, "output")
 		if err := m.checkServiceAccountAccess(opts, other); err != nil {
 			t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
 		}
 
 		// The same directory named by its real location is inside the
 		// state directory as well.
-		opts.CacheDir = models
+		opts.CacheDir = filepath.Join(real, "output")
 		if err := m.checkServiceAccountAccess(opts, other); err != nil {
 			t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
+		}
+
+		// The directory that exists already inside the linked state
+		// directory belongs to whoever owns it: the account cannot write
+		// into it, and the installation refuses it.
+		opts.CacheDir = models
+		if err := m.checkServiceAccountAccess(opts, other); err == nil {
+			t.Error("checkServiceAccountAccess() = nil, want the refusal of an existing directory inside the state directory of the instance")
 		}
 	})
 }

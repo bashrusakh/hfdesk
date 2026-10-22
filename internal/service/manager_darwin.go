@@ -957,10 +957,16 @@ func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *service
 // verifies that the account can write there and refuses the installation
 // with the commands that grant the access when it cannot.
 //
-// The exemption for a directory inside the state directory is decided on the
-// real location of the two paths: a link inside the state directory that
-// points out of it leaves the state directory, and the account has to reach
-// the target of the link on its own.
+// The exemption for a directory inside the state directory holds only while
+// the directory does not exist yet: the installation grants the state
+// directory to the account, and the service creates the directory itself
+// below it. A directory that exists already inside the state directory
+// belongs to whoever owns it, so it is checked like every other named
+// directory.
+//
+// The exemption is decided on the real location of the two paths: a link
+// inside the state directory that points out of it leaves the state
+// directory, and the account has to reach the target of the link on its own.
 //
 // The installation never changes the ownership or the permissions of such a
 // tree: a model or a cache tree belongs to whoever put it there.
@@ -987,10 +993,12 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 		if dir.path == "" {
 			continue
 		}
-		if pathInsideRealDir(opts.Paths.StateDir, dir.path) {
+		if pathMissingInsideRealDir(opts.Paths.StateDir, dir.path) {
 			// The default of the scope lives inside the state directory
 			// of the instance, and the state directory belongs to the
-			// account.
+			// account. The directory does not exist yet, so the service
+			// creates it below the state directory, and the account owns
+			// the state directory after the installation.
 			//
 			// The decision is made on the real location of the two
 			// paths: a link inside the state directory that points out

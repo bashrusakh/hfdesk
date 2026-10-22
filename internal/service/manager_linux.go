@@ -253,10 +253,16 @@ var errNotWritable = errors.New("the service account cannot write into the direc
 // lives inside its own state directory, which the installation owns.
 //
 // A directory inside the state directory of the instance is not checked
-// either: the installation creates the state directory and grants it to the
-// account, so the account can use the directory itself. The decision is made
-// on the real location of the two paths, so a link inside the state
-// directory that points out of it is checked like any other path.
+// either, as long as it does not exist yet: the installation creates the
+// state directory and grants it to the account, and the service creates the
+// directory itself below it. A directory that exists already inside the
+// state directory belongs to whoever owns it: the installation never walks
+// the tree of the state directory and never grants such a directory to the
+// account, so it is checked like every other named directory.
+//
+// The decision is made on the real location of the two paths, so a link
+// inside the state directory that points out of it is checked like any other
+// path.
 //
 // The ownership and the permissions of a named tree are never changed: the
 // installation refuses the installation and names the way to grant the
@@ -278,15 +284,19 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		if dir.path == "" || dir.path == dir.def {
 			continue
 		}
-		// A directory inside the state directory of the instance belongs
-		// to the account: the installation grants the state directory to
-		// the account, so the account can use the directory itself.
+		// A directory inside the state directory of the instance that
+		// does not exist yet belongs to the account: the installation
+		// grants the state directory to the account, and the service
+		// creates the directory itself below it.
+		//
+		// A directory that exists already belongs to whoever owns it, so
+		// it is checked against the account below.
 		//
 		// The decision is made on the real location of the two paths: a
 		// link inside the state directory that points out of it leaves
 		// the state directory, and the account has to reach the target of
 		// the link on its own.
-		if pathInsideRealDir(opts.Paths.StateDir, dir.path) {
+		if pathMissingInsideRealDir(opts.Paths.StateDir, dir.path) {
 			continue
 		}
 		if err := checkDirWritableByAccount(dir.path, account); err != nil {

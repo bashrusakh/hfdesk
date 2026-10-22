@@ -37,6 +37,13 @@ import (
 // and the resolved ancestors of it. A check that asked about the path as it
 // was written would accept a directory whose real location the account never
 // reaches.
+//
+// A directory the installation creates itself does not need the check: the
+// directory inside the state directory of the instance that does not exist
+// yet is one of them. The state directory belongs to the account of the
+// instance, and the service creates the directory below it. A directory that
+// exists already is a different case: it belongs to whoever owns it, so it
+// is checked against the account like every other named directory.
 
 // maxResolvedLinks is the number of symbolic links the resolution of a path
 // follows before it gives up.
@@ -304,8 +311,8 @@ func pathComponents(path string) []string {
 	return filtered
 }
 
-// pathInsideRealDir reports whether the real location of the path lies inside
-// the real location of the directory.
+// pathMissingInsideRealDir reports whether the real location of the path lies
+// inside the real location of the directory and the path does not exist yet.
 //
 // The kernel follows the symbolic links of a path before it uses it, so the
 // real location of a path is the one that decides whether the account can use
@@ -321,7 +328,13 @@ func pathComponents(path string) []string {
 // The answer is false when the location of a path cannot be resolved: an
 // unknown location is never a location inside the other path, so the caller
 // checks the path against the account in that case.
-func pathInsideRealDir(dir, path string) bool {
+//
+// The directory has to be missing as well. A directory that exists already
+// belongs to whoever owns it: the installation never walks the tree of the
+// state directory and never grants a directory of it to the account, so an
+// existing directory is checked against the account like every other named
+// directory.
+func pathMissingInsideRealDir(dir, path string) bool {
 	if dir == "" || path == "" {
 		return false
 	}
@@ -333,7 +346,15 @@ func pathInsideRealDir(dir, path string) bool {
 	if err != nil {
 		return false
 	}
-	return pathContains(realDir, realPath)
+	if !pathContains(realDir, realPath) {
+		return false
+	}
+	// The real location decides whether the directory is there: the
+	// kernel follows the symbolic links of a path before it uses it, so a
+	// path that points at a directory that is not there names a directory
+	// that does not exist yet.
+	_, err = os.Stat(realPath)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // pathContains reports whether the path lies inside the directory.
