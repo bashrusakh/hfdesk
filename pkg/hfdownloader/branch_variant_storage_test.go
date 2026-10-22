@@ -971,6 +971,177 @@ func TestConcurrentBranchVariantsMaterializeSharedTrustedBlobPerCommit(t *testin
 	}
 }
 
+// TestBranchVariantWaitsForAContendedSharedBlob pins the branch side of the
+// shared-blob boundary.
+//
+// A blob another transfer is writing is contended state. An ordinary
+// download reports it as skipped, but a branch variant must not claim the
+// other transfer's snapshot by skipping the file: it waits for that transfer,
+// reuses the shared blob without fetching it again, and then materializes its
+// own snapshot entry and its own variant payload.
+func TestBranchVariantWaitsForAContendedSharedBlob(t *testing.T) {
+	shared := []byte("shared-content-hash")
+	digest := sha256.Sum256(shared)
+	hash := hex.EncodeToString(digest[:])
+	files := map[string][]byte{
+		"a-config.json":  []byte(`{"model":"A"}`),
+		"b-weights.bin":  shared,
+		"z-support.json": []byte(`{"variant":"A"}`),
+	}
+	nodes := make([]hfNode, 0, len(files))
+	for _, name := range []string{"a-config.json", "b-weights.bin", "z-support.json"} {
+		body := files[name]
+		node := hfNode{Type: "file", Path: name, Size: int64(len(body))}
+		if name == "b-weights.bin" {
+			node.LFS = &hfLfsInfo{Oid: hash, Size: int64(len(body))}
+		}
+		nodes = append(nodes, node)
+	}
+
+	var requestsMu sync.Mutex
+	requests := map[string]int{}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/4.00bpw"):
+			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "commit-a"})
+			return
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_ = json.NewEncoder(w).Encode(nodes)
+			return
+		}
+		name := ""
+		for candidate := range files {
+			if strings.HasSuffix(r.URL.Path, "/"+candidate) {
+				name = candidate
+				break
+			}
+		}
+		if name == "" {
+			http.NotFound(w, r)
+			return
+		}
+		requestsMu.Lock()
+		requests[name]++
+		requestsMu.Unlock()
+		body := files[name]
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(body)
+		}
+	}))
+	defer hub.Close()
+
+	cacheRoot := t.TempDir()
+	cache := NewHFCache(cacheRoot, 0)
+	repo, err := cache.Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	// Another live transfer owns the blob: the incomplete file and its
+	// metadata name this process, so the blob reads as downloading.
+	if err := os.WriteFile(repo.IncompletePath(hash), shared[:4], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.WriteIncompleteMeta(hash, int64(len(shared))); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, err := repo.CheckBlob(hash); err != nil || status != BlobDownloading {
+		t.Fatalf("precondition CheckBlob=(%s,%v); want downloading", status, err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(context.Background(), Job{Repo: "owner/model", Revision: "4.00bpw", BranchVariant: true},
+			Settings{CacheDir: cacheRoot, Endpoint: hub.URL, Concurrency: 1, Verify: "sha256"}, nil)
+	}()
+
+	// The transfer claims the branch variant storage before it moves any
+	// file, so the service root is the signal that the transfer started.
+	serviceRoot, err := BranchVariantServiceRoot(cacheRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForPath(t, serviceRoot)
+	// The other transfer still owns the blob, so the branch variant waits
+	// for it instead of skipping the file and claiming the other snapshot.
+	select {
+	case err := <-done:
+		t.Fatalf("the branch variant finished while the other transfer still owned the blob: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	// The other transfer finishes and the shared blob becomes complete.
+	if err := os.WriteFile(repo.BlobPath(hash), shared, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CleanupIncomplete(hash); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the branch variant download failed: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the branch variant did not finish after the shared blob completed")
+	}
+
+	// The shared blob was reused, not fetched again.
+	requestsMu.Lock()
+	contended := requests["b-weights.bin"]
+	requestsMu.Unlock()
+	if contended != 0 {
+		t.Fatalf("the branch variant fetched the contended blob %d times; want 0", contended)
+	}
+	// The branch variant materialized its own snapshot entry ...
+	snapshot, err := repo.SnapshotPath("commit-a", "b-weights.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(snapshot); err != nil || string(got) != string(shared) {
+		t.Fatalf("the branch variant snapshot entry %s = %q, %v; want %q", snapshot, got, err, shared)
+	}
+	// ... and its own variant payload.
+	variantDir, err := repo.BranchVariantPath("4.00bpw", "commit-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range files {
+		payload := filepath.Join(variantDir, name)
+		if got, err := os.ReadFile(payload); err != nil || string(got) != string(want) {
+			t.Fatalf("the branch variant payload %s = %q, %v; want %q", payload, got, err, want)
+		}
+	}
+	manifestDir, err := repo.BranchVariantMetadataPath("4.00bpw", "commit-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := ReadManifest(filepath.Join(manifestDir, ManifestFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !manifest.BranchVariant || manifest.Commit != "commit-a" || manifest.TotalFiles != len(files) {
+		t.Fatalf("the branch variant manifest = %+v; want the complete variant proof", manifest)
+	}
+}
+
+// waitForPath waits until one path exists.
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the transfer did not create %q", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestCancelledBranchVariantRetryDoesNotTouchOtherVariant(t *testing.T) {
 	revisions := branchVariantTestRevisions()
 	blocked := make(chan struct{})

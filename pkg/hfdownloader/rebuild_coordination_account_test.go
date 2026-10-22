@@ -198,8 +198,8 @@ func TestCoordinationCarrierIsSharedBySameNumericAccountWithoutAccountRecord(t *
 		return carrier
 	}
 	first := resolve()
-	if !strings.HasPrefix(first, filepath.Join(home, ".cache")) {
-		t.Fatalf("carrier %q is not inside the account's own private area %q", first, filepath.Join(home, ".cache"))
+	if !strings.HasPrefix(first, home+string(filepath.Separator)) {
+		t.Fatalf("carrier %q is not inside the account's own private area %q", first, home)
 	}
 	second := resolve()
 	if first != second {

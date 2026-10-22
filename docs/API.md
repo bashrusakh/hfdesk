@@ -1218,7 +1218,9 @@ absolute when R/H are on different volumes.
 
 Delete removes only the selected repository under H and its friendly view under
 R, with separate confinement checks. Shared H deletion can affect other clients
-using that repository. Failure to remove the friendly view after Hub deletion
+using that repository. A delete that has to wait for the cache mutation lease
+ends that wait with `409` and `Cache is busy` instead of blocking for the whole
+duration of a running transfer. Failure to remove the friendly view after Hub deletion
 returns `success: false` with `errors`, rather than hiding partial failure.
 
 ## Mirror

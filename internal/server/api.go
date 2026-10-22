@@ -1842,6 +1842,36 @@ type RebuildResponse struct {
 // It is a variable so a focused test can shorten the wait.
 var cacheRebuildLeaseBudget = 5 * time.Second
 
+// cacheDeleteLeaseBudget bounds one lease wait of the cache deletion.
+//
+// The deletion waits for the same cache mutation leases an in-flight
+// download holds for its whole transfer, so an unbounded wait leaves the
+// delete request hanging until that transfer ends. The budget ends the wait
+// with the same clear conflict answer the rebuild gives; the ordinary delete,
+// where nothing else holds the lease, is unaffected.
+//
+// It is a variable so a focused test can shorten the wait.
+var cacheDeleteLeaseBudget = 5 * time.Second
+
+// cacheLeaseWaitContext bounds one cache lease wait with the server-side
+// budget. The budget applies to every wait separately, so a slow first wait
+// does not shorten the next one.
+func cacheLeaseWaitContext(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if budget <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, budget)
+}
+
+// cacheLeaseWaitExpired reports that a lease wait ended because its budget
+// or its request context ran out, not because the lease was refused.
+func cacheLeaseWaitExpired(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
@@ -2099,14 +2129,34 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
 		return
 	}
-	coordinationRelease, err := cache.AcquireRebuildCoordinationLeaseContext(r.Context(), true)
+	// The deletion waits for the same cache mutation leases an in-flight
+	// download holds for its whole transfer. A wait without a server-side
+	// budget stays blocked for the whole transfer, so every lease wait is
+	// bounded by the request context and by one server-side budget, and a
+	// contended lease ends the wait with the same clear conflict answer the
+	// cache rebuild gives.
+	coordinationWaitCtx, cancelCoordinationWait := cacheLeaseWaitContext(r.Context(), cacheDeleteLeaseBudget)
+	defer cancelCoordinationWait()
+	coordinationRelease, err := cache.AcquireRebuildCoordinationLeaseContext(coordinationWaitCtx, true)
 	if err != nil {
+		if cacheLeaseWaitExpired(err) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the deletion when it finishes")
+			return
+		}
 		writeError(w, http.StatusConflict, "Cache deletion conflicts with rebuild activity", err.Error())
 		return
 	}
 	defer coordinationRelease()
-	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(r.Context(), cache.Root, true)
+	mutationWaitCtx, cancelMutationWait := cacheLeaseWaitContext(r.Context(), cacheDeleteLeaseBudget)
+	defer cancelMutationWait()
+	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLeaseContext(mutationWaitCtx, cache.Root, true)
 	if err != nil {
+		if cacheLeaseWaitExpired(err) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the deletion when it finishes")
+			return
+		}
 		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant activity", err.Error())
 		return
 	}

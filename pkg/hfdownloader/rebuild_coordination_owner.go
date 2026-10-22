@@ -66,22 +66,34 @@ func privateCoordinationBaseDir() (string, error) {
 }
 
 // defaultCoordinationBaseDir derives a stable per-account storage root from
-// the OS account record/token, not HOME, XDG, or temporary-directory
-// environment variables. os.UserCacheDir and os.TempDir intentionally are not
-// used here because their documented platform behavior follows those per-
-// process environment overrides.
+// the OS account and the account's private base directory.
 //
-// The carrier is a private directory of the account itself: it is created by
-// that account with mode 0700 under the account's own cache area, it is not a
-// directory inside a model or cache tree of the application, and its name is
-// not a path an ordinary download can select.
+// The identity is the account's platform-native id, so the app and the CLI of
+// one account always resolve the same carrier and two accounts never share
+// one. The anchor is the account's private base directory: the account record
+// when the platform has one, and the environment home when it has none. A
+// numeric container identity has no account record, so the environment home
+// the container already sets is the anchor there. os.UserCacheDir and
+// os.TempDir are intentionally not used because their documented platform
+// behavior follows per-process environment overrides, which would let two
+// processes of one account resolve two different carriers.
 //
-// The account is resolved without a name-service lookup: a numeric container
-// identity has no account record, so the identity comes from the platform's
-// own numeric account and the private base directory from the environment the
-// container already sets. A failure to name the account is reported as
-// errCoordinationAccountUnavailable, which the caller turns into the loss of
-// the cross-process carrier instead of a failed operation.
+// The carrier is a direct child of that anchor, beside the account's own
+// cache area instead of inside it. It is created by the account with mode
+// 0700, so only that account reaches the lease objects, and its name is not
+// a path an ordinary download can select.
+//
+// The anchor is never tightened by the carrier: an existing anchor keeps its
+// own mode and its own owner, and a missing one is created with the ordinary
+// directory mode. A container gives every account the same home - the shared
+// data root - and a shared anchor that the first account tightened would lock
+// the other accounts out of their own cache. The carrier therefore adds
+// exactly one directory below the anchor and leaves every other directory of
+// the anchor alone.
+//
+// A failure to name the account is reported as errCoordinationAccountUnavailable,
+// which the caller turns into the loss of the cross-process carrier instead of
+// a failed operation.
 func defaultCoordinationBaseDir() (string, error) {
 	account, err := resolveCoordinationAccount()
 	if err != nil {
@@ -92,16 +104,26 @@ func defaultCoordinationBaseDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve current OS user profile path: %w", err)
 	}
-	var root string
-	switch runtime.GOOS {
-	case "darwin":
-		root = filepath.Join(profile, "Library", "Caches")
-	case "windows":
-		root = filepath.Join(profile, "AppData", "Local")
-	default:
-		root = filepath.Join(profile, ".cache")
+	return filepath.Join(profile, "hfdesk-coord-"+hex.EncodeToString(digest[:])), nil
+}
+
+// createPrivateCoordinationBase creates the carrier directory of one account.
+//
+// The carrier is created with mode 0700, so only that account reaches the
+// lease objects inside it. Its parent is the account's private base
+// directory, which the carrier never tightens: a missing parent is created
+// with the ordinary directory mode, and an existing parent keeps its own mode
+// and its own owner. That is what keeps a shared parent usable for the other
+// accounts of the same machine, which is the normal shape of the container
+// data root.
+func createPrivateCoordinationBase(base string) error {
+	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+		return fmt.Errorf("create per-user coordination parent: %w", err)
 	}
-	return filepath.Join(root, "hfdesk-coord-"+hex.EncodeToString(digest[:])), nil
+	if err := os.Mkdir(base, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create per-user coordination base: %w", err)
+	}
+	return nil
 }
 
 func privateCoordinationDirectoryPath() (string, error) {
@@ -113,9 +135,13 @@ func privateCoordinationDirectoryPath() (string, error) {
 }
 
 // ensurePrivateCoordinationDirectory bootstraps a per-OS-user coordinator
-// below the OS-reported profile's private cache area. The owner record is
-// published only after this process creates the directory; an existing
-// unmarked directory is never adopted as the lock namespace.
+// below the account's private base directory. The owner record is published
+// only after this process creates the directory; an existing unmarked
+// directory is never adopted as the lock namespace.
+//
+// The carrier adds one private directory below the account's base directory
+// and never tightens that base directory, so a shared base directory stays
+// usable for the other accounts of the same machine.
 //
 // A carrier that cannot be established at all - an unknown account, an
 // unusable base directory, or a path another account owns - is reported as
@@ -131,8 +157,8 @@ func ensurePrivateCoordinationDirectory(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", coordinationCarrierUnavailable(fmt.Errorf("resolve per-user coordination base: %w", err))
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return "", coordinationCarrierUnavailable(fmt.Errorf("create per-user coordination base: %w", err))
+	if err := createPrivateCoordinationBase(base); err != nil {
+		return "", coordinationCarrierUnavailable(err)
 	}
 	baseInfo, err := os.Lstat(base)
 	if err != nil {
