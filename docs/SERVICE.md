@@ -252,20 +252,29 @@ with bounded rotation:
 - `hfdesk.log` — the active log file
 - `hfdesk.log.1`, `hfdesk.log.2`, `hfdesk.log.3` — the rotated generations
 
-The active file is rotated before a write would exceed 2 MiB, and three
-rotated generations are kept, so the on-disk size of the log stays bounded.
-The instance creates its log directory and its log files owner-only (`0700` /
-`0600` on Unix) when they are missing. It never changes the mode of a
-directory or of a file that already exists: the log directory may be a
-directory that existed before the installation and that belongs to someone
-else, and the instance may only be able to write there. Tightening it needs
-an ownership the installation never checked, and it would keep the instance
-from starting at all.
+The instance uses the same logging pipeline as the interactive runs, so the
+records of the server land in the log file of the instance as well. The
+active file is rotated before a write would exceed 5 MiB, and three rotated
+generations are kept, so the on-disk size of the log stays bounded.
 
-The standard output and the standard error of the process also reach the
-supervisor: the systemd journal on Linux. On macOS the property list sets
-**no** `StandardOutPath` and **no** `StandardErrorPath`: launchd does not
-rotate the files it owns, so they would grow without bound. launchd
+The instance creates its log directory owner-only (`0700` on Unix) when it is
+missing, and the log file keeps the owner-only mode (`0600` on Unix) of the
+shared log file sink. It never changes the mode of a directory or of a file
+that already exists: the log directory may be a directory that existed
+before the installation and that belongs to someone else, and the instance
+may only be able to write there. Tightening it needs an ownership the
+installation never checked, and it would keep the instance from starting at
+all.
+
+A log file that cannot be written does not stop the instance: the instance
+falls back to the console sink alone, reports the failure on the standard
+error of the process and keeps serving. The failure of the log file never
+changes the exit code of the host.
+
+The records of the instance also reach the supervisor through the standard
+error of the process: the systemd journal on Linux. On macOS the property
+list sets **no** `StandardOutPath` and **no** `StandardErrorPath`: launchd
+does not rotate the files it owns, so they would grow without bound. launchd
 therefore discards them, and the bounded `hfdesk.log` inside the log
 directory of the instance is the real log sink on macOS.
 
