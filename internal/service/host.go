@@ -5,17 +5,21 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/bashrusakh/hfdesk/internal/logsink"
+	"github.com/bashrusakh/hfdesk/internal/app"
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
+
+// logFileName is the name of the log file of an instance inside its log
+// directory.
+const logFileName = "hfdesk.log"
 
 // RunOptions configures the headless service host.
 type RunOptions struct {
@@ -49,19 +53,27 @@ func Run(ctx context.Context, opts RunOptions) error {
 	// place.
 	runtimepaths.Install(opts.Paths)
 
-	// The process log goes to the supervisor (systemd journal, launchd log
-	// files) and into the bounded rotating log file of the instance. The
-	// two destinations are written independently: a Windows instance is
-	// started by the service control manager and has no valid standard
-	// output, and the log file of the instance still has to receive every
-	// line.
-	sink, err := logsink.Open(opts.Paths.LogDir)
+	// The shared logging pipeline is installed before the server starts:
+	// the server logs through it, so the pipeline is what puts the records
+	// of the server into the log file of the instance. The pipeline is
+	// closed when the host returns, so the records of the shutdown are
+	// written before the file sink goes away.
+	pipeline, err := installLogging(opts.Paths.LogDir)
 	if err != nil {
-		return fmt.Errorf("service: open log sink: %w", err)
+		return err
 	}
-	defer sink.Close()
-	restoreLogOutput := installLogOutput(sink, os.Stdout)
-	defer restoreLogOutput()
+	defer func() { _ = pipeline.Close() }()
+
+	// The failure of the persistent log is reported to the supervisor of the
+	// instance: the file sink can fail to rotate the log file, and a log
+	// file that stopped working is a problem the operator has to know
+	// about. The report happens on the standard error of the process, and
+	// it never changes the exit code of the host.
+	logFailure := app.NewLogFailureReporter(pipeline, func(text string) {
+		fmt.Fprintln(os.Stderr, text)
+	})
+	logFailure.Subscribe()
+	defer logFailure.Report()
 
 	// Resolve the bind address of the instance.
 	listen := opts.Listen
@@ -97,44 +109,65 @@ type destinations struct {
 	LocalDir string
 }
 
-// installLogOutput points the standard logger at the log file of the
-// instance and at the standard output of the process. It returns the
-// function that restores the previous output of the logger.
-func installLogOutput(file io.Writer, stdout io.Writer) func() {
-	previous := log.Writer()
-	log.SetOutput(logFanOut{file: file, stdout: stdout})
-	return func() { log.SetOutput(previous) }
+// installLogging installs the shared logging pipeline of a service instance.
+//
+// The console sink is on: the supervisor of the instance captures the
+// standard error of the process (the systemd journal, the launchd log), so
+// the records of the instance reach the supervisor. The file sink writes
+// into the log file of the instance, so the records of the server land in
+// the log file of the instance as well.
+//
+// The service mode has no log level option, so the pipeline keeps its
+// default level.
+//
+// A log file that cannot be written never stops the instance: the pipeline
+// falls back to the console sink alone and the failure is reported in a
+// readable form. The failure of the log file never changes the exit code of
+// the host.
+func installLogging(logDir string) (*logging.Pipeline, error) {
+	if logDir == "" {
+		return nil, errors.New("service: the log directory of the instance is required")
+	}
+	logPath := filepath.Join(logDir, logFileName)
+
+	// The log directory is created owner-only before the pipeline is
+	// installed: the shared file sink creates the directory of the log file
+	// with a wider mode, and the log directory of an instance holds the log
+	// of the instance. A directory that already exists keeps its mode, so
+	// the instance never widens the permissions of a directory it did not
+	// create.
+	if err := ensureDir(logDir, dirMode); err != nil {
+		return installConsoleLogging(
+			fmt.Errorf("service: create the log directory %q: %w", logDir, err), "")
+	}
+
+	pipeline, err := app.SetupLogging(app.LogOptions{
+		Console:  true,
+		FilePath: logPath,
+	})
+	if err != nil {
+		return installConsoleLogging(err, logPath)
+	}
+	return pipeline, nil
 }
 
-// logFanOut writes a log line to the log file of the instance and to the
-// standard output of the process.
+// installConsoleLogging installs a console-only pipeline and reports the
+// failure of the log file.
 //
-// The destinations are independent: the failure of one must never suppress
-// the other. A Windows instance is started by the service control manager
-// and has no valid standard output there, and the log file of the instance
-// still has to receive every line.
-//
-// The standard output is a secondary destination: its error is not the
-// error of the write. The log file of the instance is the log, and a
-// missing standard output is not a failure of it.
-type logFanOut struct {
-	// file is the log file of the instance. Its error is the error of
-	// the write.
-	file io.Writer
-	// stdout is the standard output of the process. It reaches the
-	// supervisor of the instance.
-	stdout io.Writer
-}
+// The failure of the log file is not the failure of the instance: the
+// instance keeps running, and the supervisor of the instance still receives
+// every record through the console sink.
+func installConsoleLogging(failure error, logPath string) (*logging.Pipeline, error) {
+	// The report goes to the standard error of the process, where the
+	// supervisor of the instance reads it. There is no pipeline yet, so the
+	// report cannot go through the console sink.
+	fmt.Fprintln(os.Stderr, app.LogFailureText(failure, logPath))
 
-// Write writes p to the log file of the instance and to the standard
-// output of the process.
-func (w logFanOut) Write(p []byte) (int, error) {
-	n, err := w.file.Write(p)
-	// The standard output is written on its own: its failure must not
-	// stop the log file from receiving the line, and it is not the
-	// failure of the write.
-	_, _ = w.stdout.Write(p)
-	return n, err
+	pipeline, err := app.SetupLogging(app.LogOptions{Console: true})
+	if err != nil {
+		return nil, err
+	}
+	return pipeline, nil
 }
 
 // buildConfig assembles the server configuration of a service instance.

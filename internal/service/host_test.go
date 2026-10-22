@@ -4,13 +4,10 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -21,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bashrusakh/hfdesk/internal/logsink"
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
@@ -57,6 +54,254 @@ func TestRunInstallsRuntimeModelAndStopsOnCancel(t *testing.T) {
 	if len(data) == 0 {
 		t.Errorf("%s is empty, want the process log", logFile)
 	}
+}
+
+// TestRunWritesTheRecordsOfTheServerIntoTheLogFileOfTheInstance checks the
+// property the service mode depends on: the records of the server reach the
+// log file of the instance.
+//
+// The server logs through the shared logging pipeline, so the instance has to
+// install that pipeline with a file sink that points at the log file of the
+// instance. A host that redirects the standard logger instead leaves the log
+// file of a running instance without the records of the server.
+//
+// The test is hermetic: the state directory and the log directory of the
+// instance are temporary directories, and the instance is a real one.
+func TestRunWritesTheRecordsOfTheServerIntoTheLogFileOfTheInstance(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	port := freePort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RunOptions{Paths: model, Listen: addr})
+	}()
+
+	// The instance has to answer before the log is read: the record of the
+	// server is written when it starts.
+	if _, err := waitForSettings(t, addr); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("the instance never answered: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	// The pipeline is closed when the host returns, so the log file of the
+	// instance is complete when the run is over.
+	logFile := filepath.Join(model.LogDir, "hfdesk.log")
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", logFile, err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("%s is empty, want the records of the server", logFile)
+	}
+	// The record is a record of the shared logging pipeline: the file sink
+	// of the pipeline writes the records as JSON lines, with the component
+	// that produced them.
+	if !strings.Contains(string(data), `"component":"server"`) {
+		t.Errorf("%s = %s, want the record of the server of the shared pipeline", logFile, data)
+	}
+	if !strings.Contains(string(data), `"message":"server starting"`) {
+		t.Errorf("%s = %s, want the record of the server of the shared pipeline", logFile, data)
+	}
+}
+
+// TestRunKeepsRunningWhenTheLogFileCannotBeWritten checks that a log file
+// that cannot be written never stops the instance.
+//
+// The failure of the log file is not the failure of the instance: the console
+// sink still reaches the supervisor of the instance, and the instance keeps
+// serving.
+func TestRunKeepsRunningWhenTheLogFileCannotBeWritten(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	// The log file cannot be created: a directory sits at its path.
+	if err := os.MkdirAll(filepath.Join(model.LogDir, "hfdesk.log"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	port := freePort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RunOptions{Paths: model, Listen: addr})
+	}()
+
+	if _, err := waitForSettings(t, addr); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("the instance never answered: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() = %v, want nil: the failure of the log file never stops the instance", err)
+	}
+}
+
+// TestRunKeepsWritingTheLogFileWhenTheStandardErrorFails checks the log of
+// a running instance against a broken standard error.
+//
+// The console sink of the shared pipeline writes to the standard error of the
+// process, and a Windows instance is started by the service control manager
+// that has no valid standard error there. The failure of the console sink
+// must never suppress the file sink: the log file of the instance still has
+// to receive every record.
+func TestRunKeepsWritingTheLogFileWhenTheStandardErrorFails(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	// The standard error of the process is broken: every write to it fails.
+	broken, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.Close(); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stderr
+	os.Stderr = broken
+	t.Cleanup(func() { os.Stderr = previous })
+
+	port := freePort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RunOptions{Paths: model, Listen: addr})
+	}()
+
+	if _, err := waitForSettings(t, addr); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("the instance never answered: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	logFile := filepath.Join(model.LogDir, "hfdesk.log")
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", logFile, err)
+	}
+	if !strings.Contains(string(data), `"message":"server starting"`) {
+		t.Errorf("%s = %s, want the record of the server: the console sink fails, the file sink still receives every record", logFile, data)
+	}
+
+	// The broken standard error really broke the console sink: without this
+	// the assertion above would prove nothing.
+	pipeline := logging.Default()
+	if pipeline == nil {
+		t.Fatal("the logging pipeline of the instance is not installed")
+	}
+	if pipeline.Err() == nil {
+		t.Error("the console sink did not fail: the broken standard error was not used")
+	}
+}
+
+// TestRunCreatesTheLogDirectoryOwnerOnly checks the permissions of the log
+// directory and of the log file of an instance.
+//
+// The log directory holds the log of the instance, so a directory that is
+// missing at the start of an instance must not be recreated world-readable.
+// A directory that already exists keeps its mode: it belongs to whoever
+// named it, and the instance may only be able to write there.
+func TestRunCreatesTheLogDirectoryOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mode bits are emulated and do not represent DACL permissions")
+	}
+
+	t.Run("the missing log directory is created owner-only", func(t *testing.T) {
+		root := t.TempDir()
+		model := runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var"),
+			LogDir:     filepath.Join(root, "var", "logs"),
+		}
+		t.Cleanup(runtimepaths.Reset)
+
+		if err := runService(t, RunOptions{Paths: model}); err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+
+		info, err := os.Stat(model.LogDir)
+		if err != nil {
+			t.Fatalf("stat %s: %v", model.LogDir, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("the mode of the log directory = %04o, want 0700", got)
+		}
+
+		// The log file keeps the mode the shared file sink gives it.
+		info, err = os.Stat(filepath.Join(model.LogDir, "hfdesk.log"))
+		if err != nil {
+			t.Fatalf("stat the log file: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Errorf("the mode of the log file = %04o, want 0600", got)
+		}
+	})
+
+	t.Run("an existing log directory keeps its mode", func(t *testing.T) {
+		root := t.TempDir()
+		model := runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var"),
+			LogDir:     filepath.Join(root, "var", "logs"),
+		}
+		t.Cleanup(runtimepaths.Reset)
+
+		// The log directory exists and belongs to somebody else: the
+		// instance writes there and leaves the mode alone.
+		if err := os.MkdirAll(model.LogDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(model.LogDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := runService(t, RunOptions{Paths: model}); err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+
+		info, err := os.Stat(model.LogDir)
+		if err != nil {
+			t.Fatalf("stat %s: %v", model.LogDir, err)
+		}
+		if got := info.Mode().Perm(); got != 0o755 {
+			t.Errorf("the mode of the log directory = %04o, want 0755: the instance never widens the permissions of a directory it did not create", got)
+		}
+	})
 }
 
 func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
@@ -980,112 +1225,4 @@ func stripComments(src string) string {
 		out.WriteString("\n")
 	}
 	return out.String()
-}
-
-// failingWriter is a writer that fails on every write.
-type failingWriter struct {
-	err error
-}
-
-// Write fails with the error of the writer.
-func (w failingWriter) Write(p []byte) (int, error) {
-	return 0, w.err
-}
-
-// TestLogFanOutWritesTheDestinationsIndependently checks that the two
-// destinations of the log of an instance are written independently.
-//
-// A Windows instance is started by the service control manager and has no
-// valid standard output there. The failure of one destination must never
-// suppress the other one: the log file of the instance still has to receive
-// every line.
-func TestLogFanOutWritesTheDestinationsIndependently(t *testing.T) {
-	t.Run("both destinations receive the line", func(t *testing.T) {
-		file := &bytes.Buffer{}
-		stdout := &bytes.Buffer{}
-
-		fanOut := logFanOut{file: file, stdout: stdout}
-		if _, err := fanOut.Write([]byte("a line\n")); err != nil {
-			t.Fatalf("write = %v, want nil", err)
-		}
-		if got := file.String(); got != "a line\n" {
-			t.Errorf("the log file = %q, want %q", got, "a line\n")
-		}
-		if got := stdout.String(); got != "a line\n" {
-			t.Errorf("the standard output = %q, want %q", got, "a line\n")
-		}
-	})
-
-	t.Run("the standard output fails", func(t *testing.T) {
-		file := &bytes.Buffer{}
-		stdout := failingWriter{err: errors.New("the service control manager has no standard output")}
-
-		fanOut := logFanOut{file: file, stdout: stdout}
-		if _, err := fanOut.Write([]byte("a line\n")); err != nil {
-			t.Fatalf("write = %v, want nil: the standard output is not the log", err)
-		}
-		if got := file.String(); got != "a line\n" {
-			t.Errorf("the log file = %q, want %q", got, "a line\n")
-		}
-	})
-
-	t.Run("the log file fails", func(t *testing.T) {
-		file := failingWriter{err: errors.New("the log file is gone")}
-		stdout := &bytes.Buffer{}
-
-		fanOut := logFanOut{file: file, stdout: stdout}
-		if _, err := fanOut.Write([]byte("a line\n")); err == nil {
-			t.Error("write = nil, want the error of the log file")
-		}
-		if got := stdout.String(); got != "a line\n" {
-			t.Errorf("the standard output = %q, want %q", got, "a line\n")
-		}
-	})
-}
-
-// TestInstallLogOutputKeepsTheLogFileWhenTheStandardOutputFails checks the
-// log of a running instance against a broken standard output.
-//
-// The instance writes its log to the log file of the instance and to the
-// standard output of the process. A Windows instance has no valid standard
-// output under the service control manager, and the log file of the
-// instance still has to receive every line.
-func TestInstallLogOutputKeepsTheLogFileWhenTheStandardOutputFails(t *testing.T) {
-	dir := t.TempDir()
-	sink, err := logsink.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sink.Close()
-
-	stdout := failingWriter{err: errors.New("the service control manager has no standard output")}
-	restore := installLogOutput(sink, stdout)
-	defer restore()
-
-	log.Print("a line of the instance")
-
-	data, err := os.ReadFile(sink.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "a line of the instance") {
-		t.Errorf("the log file of the instance = %q, want the line of the instance", data)
-	}
-}
-
-// TestInstallLogOutputKeepsTheStandardOutputWhenTheLogFileFails checks the
-// other direction: the supervisor of the instance still receives the log
-// when the log file of the instance cannot be written.
-func TestInstallLogOutputKeepsTheStandardOutputWhenTheLogFileFails(t *testing.T) {
-	stdout := &bytes.Buffer{}
-	file := failingWriter{err: errors.New("the log file is gone")}
-
-	restore := installLogOutput(file, stdout)
-	defer restore()
-
-	log.Print("a line of the instance")
-
-	if got := stdout.String(); !strings.Contains(got, "a line of the instance") {
-		t.Errorf("the standard output = %q, want the line of the instance", got)
-	}
 }
