@@ -254,7 +254,9 @@ var errNotWritable = errors.New("the service account cannot write into the direc
 //
 // A directory inside the state directory of the instance is not checked
 // either: the installation creates the state directory and grants it to the
-// account, so the account can use the directory itself.
+// account, so the account can use the directory itself. The decision is made
+// on the real location of the two paths, so a link inside the state
+// directory that points out of it is checked like any other path.
 //
 // The ownership and the permissions of a named tree are never changed: the
 // installation refuses the installation and names the way to grant the
@@ -279,7 +281,12 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		// A directory inside the state directory of the instance belongs
 		// to the account: the installation grants the state directory to
 		// the account, so the account can use the directory itself.
-		if pathInsideStateRoot(opts.Paths.StateDir, dir.path) {
+		//
+		// The decision is made on the real location of the two paths: a
+		// link inside the state directory that points out of it leaves
+		// the state directory, and the account has to reach the target of
+		// the link on its own.
+		if pathInsideRealDir(opts.Paths.StateDir, dir.path) {
 			continue
 		}
 		if err := checkDirWritableByAccount(dir.path, account); err != nil {
@@ -297,24 +304,6 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		}
 	}
 	return nil
-}
-
-// pathInsideStateRoot reports whether the path lies inside the state
-// directory of the instance.
-//
-// The state directory of the instance belongs to the service account: the
-// installation creates it and grants it to the account. A directory inside it
-// is therefore usable by the account, so the installation does not check it
-// against the account.
-//
-// The comparison is lexical: the paths are compared as they are written and
-// the symbolic links of the file system are not resolved, the same way the
-// guard of the home directory of the invoking user compares its paths.
-func pathInsideStateRoot(stateDir, path string) bool {
-	if stateDir == "" || path == "" {
-		return false
-	}
-	return hfdownloader.PathInside(stateDir, path)
 }
 
 // checkDirWritableByAccount reports whether the account can write into the

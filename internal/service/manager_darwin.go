@@ -957,6 +957,11 @@ func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *service
 // verifies that the account can write there and refuses the installation
 // with the commands that grant the access when it cannot.
 //
+// The exemption for a directory inside the state directory is decided on the
+// real location of the two paths: a link inside the state directory that
+// points out of it leaves the state directory, and the account has to reach
+// the target of the link on its own.
+//
 // The installation never changes the ownership or the permissions of such a
 // tree: a model or a cache tree belongs to whoever put it there.
 //
@@ -982,10 +987,15 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 		if dir.path == "" {
 			continue
 		}
-		if pathWithin(dir.path, opts.Paths.StateDir) {
+		if pathInsideRealDir(opts.Paths.StateDir, dir.path) {
 			// The default of the scope lives inside the state directory
 			// of the instance, and the state directory belongs to the
 			// account.
+			//
+			// The decision is made on the real location of the two
+			// paths: a link inside the state directory that points out
+			// of it leaves the state directory, and the account has to
+			// reach the target of the link on its own.
 			continue
 		}
 		ok, err := accountCanWrite(dir.path, account)

@@ -303,3 +303,51 @@ func pathComponents(path string) []string {
 	}
 	return filtered
 }
+
+// pathInsideRealDir reports whether the real location of the path lies inside
+// the real location of the directory.
+//
+// The kernel follows the symbolic links of a path before it uses it, so the
+// real location of a path is the one that decides whether the account can use
+// it. A link inside the directory that points out of it leaves the directory,
+// so a path that is written inside the directory can still live outside of
+// it.
+//
+// A path that does not exist yet is resolved through its nearest existing
+// ancestor: the parts that are missing keep the location they were written
+// with, so a directory that is going to be created is compared with the
+// directory that holds it.
+//
+// The answer is false when the location of a path cannot be resolved: an
+// unknown location is never a location inside the other path, so the caller
+// checks the path against the account in that case.
+func pathInsideRealDir(dir, path string) bool {
+	if dir == "" || path == "" {
+		return false
+	}
+	realDir, err := resolvePath(dir)
+	if err != nil {
+		return false
+	}
+	realPath, err := resolvePath(path)
+	if err != nil {
+		return false
+	}
+	return pathContains(realDir, realPath)
+}
+
+// pathContains reports whether the path lies inside the directory.
+//
+// The directory lies inside itself, so a path that names the directory is
+// contained by it. A sibling that shares the prefix of the directory
+// ("/stateful" against "/state") is not inside it.
+func pathContains(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
