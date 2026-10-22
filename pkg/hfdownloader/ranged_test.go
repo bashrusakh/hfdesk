@@ -1084,8 +1084,8 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	assertExactFile(t, staging, full[:1000])
 }
 
-// The claim take-over path: a record from a dead owner with a valid v2
-// layout is resumed, not discarded.
+// The claim take-over path: a record from a dead owner with a valid
+// versioned range layout is resumed, not discarded.
 func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8_000
@@ -1221,8 +1221,8 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 	const total = 8_000
 
 	// seedForeignOwned stages a payload preallocated to the full size
-	// with a valid committed prefix [0, committed) and a v2 record owned
-	// by the live foreign PID.
+	// with a valid committed prefix [0, committed) and a versioned record
+	// owned by the live foreign PID.
 	seedForeignOwned := func(t *testing.T, staging string, full []byte, committed int64) {
 		t.Helper()
 		if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, len(full)), 0o644); err != nil {

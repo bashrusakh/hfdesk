@@ -309,7 +309,7 @@ type stagingClaimState struct {
 	// ranges is the authoritative committed range layout resumed from the
 	// previous owner's record; nil for a fresh claim.
 	ranges []RangeProgress
-	// fresh reports that no v2 range state existed, so the staging payload
+	// fresh reports that no versioned range state existed, so the staging payload
 	// holds no validated bytes.
 	fresh bool
 	// legacyMigrated reports that the record's bytes originated in a pre-#140
@@ -353,7 +353,7 @@ type stagingClaimState struct {
 //     dead.
 //
 // A take-over preserves the record's committed ranges only when the record is
-// a fully normalized, identity-matching v2 record AND its staging payload
+// a fully normalized, identity-matching versioned record AND its staging payload
 // exists at the expected logical size. The evaluate/remove/create sequence
 // runs under both gates, so one claimant cannot displace another. contentAddressed
 // marks the publish target as a known blob digest, the only destination whose
@@ -504,7 +504,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		return nil, false, errBlobIncompleteOwned
 	}
 
-	// Dead, stale, or same-instance owner: take over. A fully validated v2
+	// Dead, stale, or same-instance owner: take over. A fully validated versioned
 	// record for this exact resolved object with a payload present at the
 	// expected logical size preserves its committed ranges (resume). Anything
 	// else is unvalidated data and is discarded per the downloader correctness
@@ -1091,9 +1091,10 @@ type multipartResumeState struct {
 	// legacy reports a valid pre-#140 .part-NN/.parts.json layout with at
 	// least one part contributing usable bytes.
 	legacy bool
-	// v2Staging is the staging payload path of a valid, identity-matching v2
-	// pair, or empty when no such pair exists.
-	v2Staging string
+	// versionedStaging is the staging payload path of a valid,
+	// identity-matching versioned staging pair, or empty when no such pair
+	// exists.
+	versionedStaging string
 }
 
 // hasUsableLegacyMultipartState reports whether dst has a valid pre-#140
@@ -1128,7 +1129,7 @@ func hasUsableLegacyMultipartState(dst string, size int64) bool {
 	return false
 }
 
-// hasResumableStagingState reports whether a v2 staging pair carries a valid,
+// hasResumableStagingState reports whether a versioned staging pair carries a valid,
 // identity-matching range layout and a payload at the expected logical size.
 // Ownership/liveness is deliberately not part of this check: the multipart
 // claim applies it and either resumes or backs off as owned. The detection only
@@ -1210,7 +1211,7 @@ func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int6
 // .part is stale/corrupt and is discarded rather than clamped to a prefix that
 // nobody can vouch for ("discard stale/mismatched part files rather than
 // guessing"). The prefix is tiled across the first ranges of the fresh worker
-// layout, so the caller can persist one normal v2 record and resume with any
+// layout, so the caller can persist one normal versioned record and resume with any
 // future concurrency.
 func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size int64, workers int) ([]RangeProgress, bool, error) {
 	partPath := dst + ".part"
@@ -2027,7 +2028,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// promptly instead of after the whole local copy.
 	legacyCleanup := false
 	if state.fresh {
-		// No valid v2 state: legacy .part-NN/.parts.json state or a single
+		// No valid versioned staging state: legacy .part-NN/.parts.json state or a single
 		// .part sequential prefix may hold validated bytes; migrate once.
 		ranges, migrated, merr := migrateLegacyMultipart(partCtx, dst, out, it.Size, cfg.Concurrency)
 		switch {

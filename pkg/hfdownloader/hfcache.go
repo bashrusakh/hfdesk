@@ -279,8 +279,9 @@ type IncompleteMeta struct {
 	// platform (or by an older version) carry false and keep the lease
 	// heuristic.
 	LockFenced bool `json:"lock_fenced,omitempty"`
-	// Version is 0 for legacy records (no range state) and 2 for ranged
-	// staging records written by the issue #140 downloader.
+	// Version is 0 for legacy records (no range state) and 3 for the ranged
+	// staging records written by this downloader. Version 2 is still accepted
+	// and migrated: its completed ranges are revalidated rather than trusted.
 	Version int `json:"version,omitempty"`
 	// Repo, Path and Commit identify the resolved remote object the staging
 	// file belongs to, so a reused destination or moved branch cannot

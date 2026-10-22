@@ -7,10 +7,11 @@ package hfdownloader
 //   - a fallback (LockFenced=false) record with a live foreign owner must not
 //     be displaced by a lock-capable process in claim or cleanup;
 //   - a lock-fenced record with a free lock remains take-over-able;
-//   - usable legacy/v2 multipart state keeps the multipart route when the item
-//     is ranged-capable even below the configured threshold;
+//   - usable legacy or versioned staging state keeps the multipart route when
+//     the item is ranged-capable even below the configured threshold;
 //   - without range support the single path warns, then removes the obsolete
-//     v2 pair only after the final file is durable and claim-checked;
+//     versioned staging pair only after the final file is durable and
+//     claim-checked;
 //   - an ignored-Range 200 restart clears the inherited-bytes proof flag.
 
 import (
@@ -273,7 +274,7 @@ func TestDownload_LowThresholdLegacyLayoutResumesMultipart(t *testing.T) {
 	}
 }
 
-func TestDownload_LowThresholdV2PairResumesMultipart(t *testing.T) {
+func TestDownload_LowThresholdVersionedPairResumesMultipart(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	sha := singleTestSHA(full)
@@ -320,7 +321,7 @@ func TestDownload_LowThresholdV2PairResumesMultipart(t *testing.T) {
 	}
 }
 
-func TestDownload_NoRangeSupportWarnsAndCleansV2ResumeState(t *testing.T) {
+func TestDownload_NoRangeSupportWarnsAndCleansVersionedResumeState(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	sha := singleTestSHA(full)
@@ -368,7 +369,7 @@ func TestDownload_NoRangeSupportWarnsAndCleansV2ResumeState(t *testing.T) {
 	}
 	for _, p := range []string{staging, metaPath} {
 		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("obsolete v2 resume artifact %s survived a successful download, stat err=%v", filepath.Base(p), serr)
+			t.Errorf("obsolete versioned resume artifact %s survived a successful download, stat err=%v", filepath.Base(p), serr)
 		}
 	}
 }

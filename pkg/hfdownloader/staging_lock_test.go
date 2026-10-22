@@ -281,9 +281,9 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	staging := dst + ".incomplete"
 	metaPath := staging + ".meta"
 
-	// Stale, fully resumable v2 record from a provably dead foreign owner. The
-	// payload bytes are garbage: every range is uncommitted, so the winner must
-	// fetch all of them.
+	// Stale, fully resumable versioned record from a provably dead foreign
+	// owner. The payload bytes are garbage: every range is uncommitted, so the
+	// winner must fetch all of them.
 	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, total), 0o644); err != nil {
 		t.Fatal(err)
 	}

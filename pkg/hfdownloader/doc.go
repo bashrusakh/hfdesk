@@ -125,11 +125,11 @@ Resume is always enabled. Multipart downloads write directly into one
 staging file (blobs/<sha>.incomplete in HF cache mode) and persist their
 committed byte ranges in versioned metadata next to it, so an interrupted
 transfer resumes from its durable high-water marks without re-downloading
-valid bytes — even when the connection count changes between runs. Skip
+valid bytes — even when the connection count changes between runs.
 Range-record version 3 marks ranges Done only after the response body reaches clean EOF;
 version-2 Done records reserve the final byte for revalidation because the
-older writer could infer completion from bytes written alone. Skip
-decisions are filesystem-based:
+older writer could infer completion from bytes written alone.
+Skip decisions are filesystem-based:
 
   - LFS files: Compared by SHA-256 hash (if available in metadata)
   - Non-LFS files: Compared by file size

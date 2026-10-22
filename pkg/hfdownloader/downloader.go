@@ -625,7 +625,7 @@ LOOP:
 			// identity. The requested branch name is not enough: a moved
 			// branch could otherwise resume old bytes in Verify=size mode.
 			mpOpts.Commit = plan.Commit
-			v2Staging := dst + ".incomplete"
+			versionedStaging := dst + ".incomplete"
 			if blobDirect {
 				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
 				mpOpts.Publish = repoDir.BlobPath(it.SHA256)
@@ -633,7 +633,7 @@ LOOP:
 				// arbitrary destination keeps the caller's pre-download skip
 				// decision authoritative.
 				mpOpts.ContentAddressed = true
-				v2Staging = mpOpts.Staging
+				versionedStaging = mpOpts.Staging
 			}
 			// Existing multipart resume state must not be ignored (and later
 			// deleted) just because the current threshold routes a small item to
@@ -643,23 +643,23 @@ LOOP:
 			resumeState := multipartResumeState{
 				legacy: hasUsableLegacyMultipartState(dst, it.Size),
 			}
-			if hasResumableStagingState(v2Staging, v2Staging+".meta", itForIO, job, plan.Commit) {
-				resumeState.v2Staging = v2Staging
+			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit) {
+				resumeState.versionedStaging = versionedStaging
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
-			if !multipartRan && it.AcceptRanges && (resumeState.legacy || resumeState.v2Staging != "") {
+			if !multipartRan && it.AcceptRanges && (resumeState.legacy || resumeState.versionedStaging != "") {
 				multipartRan = true
 			}
 			// A server/plan without range support cannot consume multipart
 			// state. Do not silently delete it: warn, download the full file
-			// through the single path, and remove the obsolete v2 pair only
-			// after the final state is durable (claim-checked). The legacy
+			// through the single path, and remove the obsolete versioned pair
+			// only after the final state is durable (claim-checked). The legacy
 			// family is removed by the single-path success cleanup.
-			obsoleteV2Staging := ""
-			if !it.AcceptRanges && resumeState.v2Staging != "" {
-				obsoleteV2Staging = resumeState.v2Staging
+			obsoleteVersionedStaging := ""
+			if !it.AcceptRanges && resumeState.versionedStaging != "" {
+				obsoleteVersionedStaging = resumeState.versionedStaging
 			}
-			if !it.AcceptRanges && (resumeState.legacy || resumeState.v2Staging != "") {
+			if !it.AcceptRanges && (resumeState.legacy || resumeState.versionedStaging != "") {
 				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf(
 					"resume state for %s cannot be used without HTTP range support; downloading the full file and attempting to discard the obsolete state after success",
 					finalRel)})
@@ -997,12 +997,12 @@ LOOP:
 			}
 
 			// The single path may have been chosen because the server/plan has
-			// no range support while usable v2 state existed. The final file is
-			// now durable (and, for cache mode, stored); remove the obsolete pair
-			// claim-checked so a live owner's state is never deleted and no stale
-			// pair survives a successful download.
-			if obsoleteV2Staging != "" {
-				removeStagingArtifactsIfUnclaimed(obsoleteV2Staging, obsoleteV2Staging+".meta")
+			// no range support while usable versioned staging state existed. The
+			// final file is now durable (and, for cache mode, stored); remove the
+			// obsolete pair claim-checked so a live owner's state is never deleted
+			// and no stale pair survives a successful download.
+			if obsoleteVersionedStaging != "" {
+				removeStagingArtifactsIfUnclaimed(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
 			}
 
 			// File is now at its final location; the partial (dst in HF

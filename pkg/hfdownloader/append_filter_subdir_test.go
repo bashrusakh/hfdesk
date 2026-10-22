@@ -71,7 +71,7 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 	}
 }
 
-func TestDownload_AppendFilterResumesV2AfterThresholdIncrease(t *testing.T) {
+func TestDownload_AppendFilterResumesVersionedStateAfterThresholdIncrease(t *testing.T) {
 	const size = 8192
 	const prefix = size / 2
 	full := rangedTestPayload(size)
