@@ -6,6 +6,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,12 @@ func saveSettingsConfig(cfg *ConfigFile, tokenWrite *string) error {
 func saveConfigFile(path string, cfg *ConfigFile) error {
 	if path == "" {
 		return nil
+	}
+	if err := hfdownloader.RejectOwnedBranchVariantEntryWrites(path); err != nil {
+		return fmt.Errorf("config path conflicts with app-owned storage: %w", err)
+	}
+	if err := hfdownloader.RejectOwnedBranchVariantContentWrites(path); err != nil {
+		return fmt.Errorf("config target conflicts with app-owned storage: %w", err)
 	}
 	if isRedactedToken(cfg.Token) {
 		return errors.New("cannot save a redacted token as a credential")

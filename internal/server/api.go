@@ -85,6 +85,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
+		return
+	}
 
 	// If dry-run, return the plan
 	if req.DryRun {
@@ -101,6 +105,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, errInvalidRouteKey) {
 			writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+			return
+		}
+		if errors.Is(err, errInvalidBranchVariant) {
+			writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
 			return
 		}
 		if errors.Is(err, errSelectionWriterBusy) {
@@ -145,7 +153,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
-
 	// Parse filters from repo:filter syntax
 	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
 		parts := strings.SplitN(req.Repo, ":", 2)
@@ -159,6 +166,10 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 			}
 		}
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branchVariant", "EXL branch variants require an explicit revision and an unfiltered model download to the analyzed repository")
+		return
+	}
 
 	revision := req.Revision
 	if revision == "" {
@@ -169,6 +180,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	dlJob := hfdownloader.Job{
 		Repo:               req.Repo,
 		Revision:           revision,
+		BranchVariant:      req.BranchVariant,
 		IsDataset:          req.Dataset,
 		Filters:            req.Filters,
 		Excludes:           req.Excludes,
@@ -949,6 +961,11 @@ type localCacheRoot struct {
 
 // skipsOwner applies the root's exclusion policy only to a top-level owner.
 func (root localCacheRoot) skipsOwner(owner string) bool {
+	if pathIdentityKey(owner) == pathIdentityKey(hfdownloader.BranchVariantServiceDirName) {
+		if owned, err := hfdownloader.BranchVariantServiceOwned(root.Path); err == nil && owned {
+			return true
+		}
+	}
 	if root.SkipSpecial {
 		switch strings.ToLower(owner) {
 		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
@@ -1147,6 +1164,15 @@ func walkLocalCacheRepo(dir string, excluded []string, walkFn filepath.WalkFunc)
 					}
 					return nil
 				}
+			}
+		}
+		if err == nil && info.IsDir() && pathIdentityKey(info.Name()) == pathIdentityKey(hfdownloader.BranchVariantServiceDirName) {
+			owned, ownerErr := hfdownloader.IsOwnedBranchVariantServicePath(path)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			if owned {
+				return filepath.SkipDir
 			}
 		}
 		return walkFn(path, info, err)
@@ -1594,6 +1620,10 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	if _, qualified := r.URL.Query()["branchVariant"]; qualified {
+		s.handleBranchVariantPresence(w, r, repo)
+		return
+	}
 
 	repoTypeValue, suppliedType := r.URL.Query()["type"]
 	repoType := hfdownloader.RepoTypeModel
@@ -1788,12 +1818,19 @@ type RebuildResponse struct {
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
-	release, ok := s.jobs.beginCacheMutation(
-		filepath.Join(cfg.cacheRoot(), "models"),
-		filepath.Join(cfg.cacheRoot(), "datasets"),
+	cacheRoot := cfg.cacheRoot()
+	serviceRoot, err := hfdownloader.BranchVariantServiceRoot(cacheRoot)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Cache destination cannot be resolved", err.Error())
+		return
+	}
+	release, ok := s.jobs.reserveSelectedHF(
+		filepath.Join(cacheRoot, "models"),
+		filepath.Join(cacheRoot, "datasets"),
+		serviceRoot,
 	)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "Cache is busy", "A download or cache mutation overlaps the friendly or EXL branch service tree")
 		return
 	}
 	defer release()
@@ -1902,6 +1939,16 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	hubPath := repoDir.Path()
 	friendlyPath := repoDir.FriendlyPath()
+	branchControlRepo, err := hfdownloader.BranchVariantControlRepoPath(cache.Root, repoType, repo)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant storage path", err.Error())
+		return
+	}
+	branchPayloadRepo, err := hfdownloader.BranchVariantPayloadRepoPath(cache.Root, repoType, repo)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant storage path", err.Error())
+		return
+	}
 
 	// Security Layer 5: Resolve absolute paths
 	absCacheDir, err := filepath.Abs(cacheDir)
@@ -1976,13 +2023,50 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// All security checks passed - proceed with deletion
-	release, ok := s.jobs.beginCacheMutation(absHubPath, friendlyPath)
+	// All security checks passed - reserve in-process jobs, then lease the
+	// complete physical cache root. Branch downloads hold shared destination
+	// ancestry; the generated rebuild script and recursive delete take the same
+	// root exclusively, so their ownership preflight cannot go stale.
+	release, ok := s.jobs.reserveSelectedHF(absHubPath, friendlyPath, branchControlRepo, branchPayloadRepo)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "HF cache is busy", "A download, selected-file mutation, or app-owned branch artifact operation overlaps this repository")
 		return
 	}
 	defer release()
+	if _, err := os.Lstat(absHubPath); errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
+		return
+	}
+	coordinationRelease, err := cache.AcquireRebuildCoordinationLeaseContext(r.Context(), true)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with rebuild activity", err.Error())
+		return
+	}
+	defer coordinationRelease()
+	mutationRelease, err := hfdownloader.AcquireBranchVariantDirectoryLease(cache.Root, true)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant activity", err.Error())
+		return
+	}
+	defer mutationRelease()
+	if _, err := os.Lstat(absHubPath); errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
+		return
+	}
+	if err := hfdownloader.RejectBranchVariantTreeEffects(absHubPath, friendlyPath); err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant storage", err.Error())
+		return
+	}
+	if err := hfdownloader.RebindBranchVariantServiceRootUnderLease(cache.Root); err != nil {
+		writeError(w, http.StatusConflict, "Cache deletion conflicts with branch variant ownership", err.Error())
+		return
+	}
 	if err := os.RemoveAll(absHubPath); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 		return
@@ -1996,6 +2080,14 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+	if _, err := hfdownloader.RemoveOwnedBranchVariantRepoUnderLease(cache.Root, repoType, repo); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": false,
+			"message": "Hub repository deleted; app-owned branch variant cleanup was partial",
+			"errors":  []string{err.Error()},
+		})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

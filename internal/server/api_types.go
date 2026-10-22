@@ -7,6 +7,7 @@ package server
 type DownloadRequest struct {
 	Repo               string   `json:"repo"`
 	Revision           string   `json:"revision,omitempty"`
+	BranchVariant      bool     `json:"branchVariant,omitempty"`
 	Dataset            bool     `json:"dataset,omitempty"`
 	Filters            []string `json:"filters,omitempty"`
 	Excludes           []string `json:"excludes,omitempty"`

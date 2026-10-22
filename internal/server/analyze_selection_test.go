@@ -213,7 +213,7 @@ func TestAnalyzeEXLBranchSelectionUsesBranchRevision(t *testing.T) {
 			case "main":
 				io.WriteString(w, `[{"type":"file","path":"README.md","size":1},{"type":"file","path":"config.json","size":10}]`)
 			case revision:
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model-6.safetensors","size":600},{"type":"file","path":"quantization_config.json","size":20}]`)
+				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model-6.safetensors","size":600},{"type":"file","path":"tokenizer.json","size":20}]`)
 			default:
 				t.Errorf("unexpected model tree revision %q", branch)
 				http.NotFound(w, r)
@@ -226,8 +226,8 @@ func TestAnalyzeEXLBranchSelectionUsesBranchRevision(t *testing.T) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/main/config.json"):
 				io.WriteString(w, `{"model_type":"llama"}`)
-			case strings.HasSuffix(r.URL.Path, "/"+revision+"/quantization_config.json"):
-				io.WriteString(w, `{"quant_method":"exl3","bits":4,"bits_per_weight":6,"head_bits":6}`)
+			case strings.HasSuffix(r.URL.Path, "/"+revision+"/config.json"):
+				io.WriteString(w, `{"model_type":"llama","architectures":["LlamaForCausalLM"],"quantization_config":{"quant_method":"exl3","bits":4,"bits_per_weight":6,"head_bits":6}}`)
 			default:
 				http.NotFound(w, r)
 			}
@@ -271,19 +271,33 @@ func TestAnalyzeEXLBranchSelectionUsesBranchRevision(t *testing.T) {
 
 	branchResponse := getAnalysis("?type=model&revision=" + revision)
 	var selected struct {
-		Branch string             `json:"branch"`
-		Files  []smartdl.FileInfo `json:"files"`
+		Branch    string                 `json:"branch"`
+		Type      smartdl.RepoType       `json:"type"`
+		Files     []smartdl.FileInfo     `json:"files"`
+		Quantized *smartdl.QuantizedInfo `json:"quantized"`
+		Metadata  map[string]interface{} `json:"metadata"`
 	}
 	if err := json.Unmarshal(branchResponse.Body.Bytes(), &selected); err != nil {
 		t.Fatalf("decode selected branch analysis: %v", err)
 	}
-	if selected.Branch != revision || len(selected.Files) != 3 {
-		t.Fatalf("selected branch response = branch %q files=%+v", selected.Branch, selected.Files)
+	if selected.Branch != revision || selected.Type != smartdl.TypeTransformers || len(selected.Files) != 3 {
+		t.Fatalf("selected branch response = branch %q type=%s files=%+v", selected.Branch, selected.Type, selected.Files)
 	}
 	for _, file := range selected.Files {
 		if file.Path == "README.md" {
 			t.Fatal("selected branch analysis returned main-only README")
 		}
+	}
+	if selected.Quantized == nil || selected.Quantized.Method != "exl3" || selected.Quantized.Bits != 0 || !selected.Quantized.MixedPrecision || selected.Quantized.BitsPerWeight != 6 || selected.Quantized.HeadBits != 6 {
+		t.Fatalf("selected branch API lost nested quantization projection: %+v", selected.Quantized)
+	}
+	outer, ok := selected.Metadata["config.json"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("selected branch API lost raw config.json: %+v", selected.Metadata)
+	}
+	nested, ok := outer["quantization_config"].(map[string]interface{})
+	if !ok || nested["bits"] != float64(4) || nested["head_bits"] != float64(6) {
+		t.Fatalf("selected branch API changed raw nested config: %+v", outer["quantization_config"])
 	}
 }
 
