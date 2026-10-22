@@ -114,7 +114,22 @@ func TestWindowsGoCLIRebuildWaitsForAppDownloadAcrossRootAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	commandDone := make(chan error, 1)
-	go func() { commandDone <- command.Wait() }()
+	var waitOnce sync.Once
+	var waitErr error
+	waitCommand := func() error {
+		waitOnce.Do(func() { waitErr = command.Wait() })
+		return waitErr
+	}
+	go func() { commandDone <- waitCommand() }()
+	// The CLI child must not outlive this workflow. On Windows an open handle
+	// keeps the coordination lease entry from being removed, so the child is
+	// stopped and reaped before the coordination cleanup runs.
+	defer func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		_ = waitCommand()
+	}()
 	waiting := make(chan struct{})
 	var waitingOnce sync.Once
 	var stderrMu sync.Mutex

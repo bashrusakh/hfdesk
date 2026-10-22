@@ -771,7 +771,13 @@ func (r *RepoDir) createBranchVariantEntryCtxLocked(ctx context.Context, artifac
 	if err != nil {
 		return fmt.Errorf("resolve branch variant snapshot path: %w", err)
 	}
-	target := friendlyLinkTarget(filepath.Dir(linkPath), snapshotPath)
+	// The payload entry is placed in the service tree, which is addressed in
+	// the destination root's canonical spelling. The snapshot entry it names
+	// must use that same spelling; a target computed across the two
+	// spellings leaves the destination root and re-enters it through the
+	// alias, so a copied root keeps a payload link that still points at the
+	// source root.
+	target := branchVariantPayloadLinkTarget(filepath.Dir(linkPath), snapshotPath)
 	correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target)
 	if cerr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

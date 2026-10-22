@@ -26,6 +26,12 @@ type testCoordinationLeaseFile struct {
 	wasNew  bool
 }
 
+// errTestCoordinationLeaseStillHeld reports that a tracked lease entry could
+// not be removed because another actor still holds the file open. The entry
+// is inert in that state: the holder's lease ends with it, so the workflow
+// leaves the entry in place instead of failing.
+var errTestCoordinationLeaseStillHeld = errors.New("coordination lease entry is still held open")
+
 // registerProfileCoordinationCleanup tracks only newly-created per-root lease
 // files for a workflow test's temporary roots. The app coordination directory
 // and its owner marker are never removed.
@@ -173,5 +179,14 @@ func removeUnusedTestCoordinationFile(entry testCoordinationLeaseFile, testRoot 
 	if !os.SameFile(opened, current) {
 		return fmt.Errorf("lease entry changed while exclusively locked")
 	}
-	return os.Remove(entry.path)
+	if err := removeTestCoordinationLeaseEntry(entry.path, file); err != nil {
+		if errors.Is(err, errTestCoordinationLeaseStillHeld) {
+			// Another actor still has the entry open. The entry is inert
+			// while that actor runs and the workflow owns it, so it is left
+			// in place instead of failing the test.
+			return nil
+		}
+		return err
+	}
+	return nil
 }

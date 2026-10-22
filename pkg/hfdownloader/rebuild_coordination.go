@@ -98,7 +98,10 @@ func acquirePhysicalRootLeases(ctx context.Context, roots []string, exclusive bo
 		}
 		info, err := os.Stat(physical)
 		if errors.Is(err, os.ErrNotExist) {
-			if err := os.MkdirAll(root, 0o755); err != nil {
+			// The physical spelling of the selected root is created instead of
+			// its original spelling: it names the same directory, and the
+			// resolver already proved which location that is.
+			if err := os.MkdirAll(physical, 0o755); err != nil {
 				return nil, fmt.Errorf("create rebuild coordination root %q: %w", root, err)
 			}
 			physical, err = resolvedPathForCreate(root)
@@ -245,7 +248,11 @@ func existingRebuildCoordinationRoots(roots []string) []string {
 		if root == "" {
 			continue
 		}
-		if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		abs, err := rootedPath(root)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		existing = append(existing, root)

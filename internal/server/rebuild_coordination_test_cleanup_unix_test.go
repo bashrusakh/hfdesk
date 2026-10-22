@@ -26,3 +26,11 @@ func tryLockServerCoordinationFile(file *os.File) (func(), bool, error) {
 		return nil, false, err
 	}
 }
+
+// removeServerCoordinationLeaseEntry removes one tracked lease entry.
+//
+// An open handle does not prevent unlinking on this platform, so the entry is
+// removed while the exclusive lease is still held.
+func removeServerCoordinationLeaseEntry(path string, held *os.File) error {
+	return os.Remove(path)
+}

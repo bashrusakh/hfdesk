@@ -444,7 +444,14 @@ func pathComponentsNoSymlinks(root, target string) bool {
 		if component == "" || component == "." || component == ".." {
 			return false
 		}
-		current = filepath.Join(current, component)
+		// The component is joined through the project's containment barrier,
+		// so the inspected spelling is proven to stay inside the root it was
+		// resolved against.
+		joined, err := hfdownloader.SafeJoin(current, component)
+		if err != nil {
+			return false
+		}
+		current = joined
 		info, err := os.Lstat(current)
 		if os.IsNotExist(err) {
 			return true

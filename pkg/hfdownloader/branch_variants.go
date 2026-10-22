@@ -98,12 +98,22 @@ type BranchVariantArtifact struct {
 // BranchVariantServiceRoot returns the physical service-root spelling below
 // the selected destination. Existing parent symlinks are resolved so route,
 // localDir, and configured-root aliases identify the same store.
+//
+// The service component is joined onto the resolved destination through
+// SafeJoin, so the service tree is proven to stay inside the selected root
+// and the resulting spelling carries no user-influenced component. The
+// resolution still runs on the selected destination itself, so the service
+// tree keeps exactly the physical location it had before.
 func BranchVariantServiceRoot(destinationRoot string) (string, error) {
 	root, err := resolvedPathForCreate(destinationRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve branch variant destination root: %w", err)
 	}
-	return filepath.Join(root, BranchVariantServiceDirName), nil
+	serviceRoot, err := SafeJoin(root, BranchVariantServiceDirName)
+	if err != nil {
+		return "", fmt.Errorf("resolve branch variant destination root: %w", err)
+	}
+	return serviceRoot, nil
 }
 
 // BranchVariantServiceOwned reports whether the selected root contains a
@@ -186,6 +196,30 @@ func IsOwnedBranchVariantServicePath(serviceRoot string) (bool, error) {
 		return false, err
 	}
 	return state == branchVariantServiceOwned, nil
+}
+
+// branchVariantPayloadLinkTarget computes the target of one app-owned branch
+// payload entry. The entry lives in the service tree, which is addressed in
+// the destination root's canonical (symlink-resolved) spelling, so the
+// snapshot entry it names is expressed in that same spelling. Both sides then
+// share one root identity: the relative target stays inside the destination
+// root, and a copied root keeps links that point at its own snapshot entries
+// instead of the source root they were created from.
+func branchVariantPayloadLinkTarget(linkDir, snapshotPath string) string {
+	return friendlyLinkTarget(linkDir, canonicalCacheEntryPath(snapshotPath))
+}
+
+// canonicalCacheEntryPath resolves the parent chain of a cache entry path and
+// keeps the entry itself lexical, so the result still names the cache entry
+// rather than the blob the entry resolves to. A parent that cannot be
+// resolved keeps the original spelling: the placement then still has a
+// concrete target, and the entry is repaired on the next attempt.
+func canonicalCacheEntryPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return path
+	}
+	return filepath.Join(resolved, filepath.Base(path))
 }
 
 // BranchVariantControlRepoPath returns one repository's control namespace in
@@ -509,7 +543,7 @@ func rejectOwnedBranchVariantEffects(followLeaf bool, targets ...string) error {
 		if target == "" {
 			continue
 		}
-		abs, err := filepath.Abs(filepath.Clean(target))
+		abs, err := rootedPath(target)
 		if err != nil {
 			return err
 		}
@@ -569,7 +603,14 @@ func RejectBranchVariantTreeEffects(targets ...string) error {
 		if err := rejectOwnedCoordinationTreeEffects(target); err != nil {
 			return err
 		}
-		info, err := os.Lstat(target)
+		// The recursive scope is inspected through its rooted spelling, so the
+		// walk below and every path it reports stay inside one absolute
+		// location.
+		scope, err := rootedPath(target)
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(scope)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -585,7 +626,7 @@ func RejectBranchVariantTreeEffects(targets ...string) error {
 		if err := RejectOwnedBranchVariantDirectoryWrites(target); err != nil {
 			return err
 		}
-		err = filepath.WalkDir(target, func(path string, entry os.DirEntry, walkErr error) error {
+		err = filepath.WalkDir(scope, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
@@ -637,7 +678,7 @@ func acquireOrdinaryMutationLease(entryPaths, contentPaths []string) (func(), er
 		if path == "" {
 			continue
 		}
-		abs, err := filepath.Abs(filepath.Clean(path))
+		abs, err := rootedPath(path)
 		if err != nil {
 			return nil, err
 		}
@@ -657,7 +698,7 @@ func acquireOrdinaryMutationLease(entryPaths, contentPaths []string) (func(), er
 		if path == "" {
 			continue
 		}
-		abs, err := filepath.Abs(filepath.Clean(path))
+		abs, err := rootedPath(path)
 		if err != nil {
 			return nil, err
 		}
@@ -736,7 +777,7 @@ func branchVariantWriteLockKeys(targets []string) ([]string, error) {
 		if target == "" {
 			continue
 		}
-		abs, err := filepath.Abs(filepath.Clean(target))
+		abs, err := rootedPath(target)
 		if err != nil {
 			return nil, err
 		}
@@ -797,7 +838,7 @@ func pathMayResolveIntoBranchVariantService(path string) bool {
 	if pathHasBranchVariantServiceComponent(path) {
 		return true
 	}
-	abs, err := filepath.Abs(filepath.Clean(path))
+	abs, err := rootedPath(path)
 	if err != nil {
 		return false
 	}
@@ -966,18 +1007,18 @@ func readBranchVariantArtifactAtControlAnyRevision(serviceRoot, storeID string, 
 }
 
 func ensureBranchVariantServiceRoot(destinationRoot string) (string, string, error) {
-	root, err := resolvedPathForCreate(destinationRoot)
+	// The service root is the proven, symlink-resolved spelling of the
+	// selected destination plus the service component. Its parent is the
+	// resolved destination root, so creating the destination root and the
+	// service tree keeps the same physical locations as before.
+	serviceRoot, err := BranchVariantServiceRoot(destinationRoot)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve branch variant destination: %w", err)
 	}
+	root := filepath.Dir(serviceRoot)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", "", fmt.Errorf("create branch variant destination: %w", err)
 	}
-	root, err = resolvedPathForCreate(root)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve created branch variant destination: %w", err)
-	}
-	serviceRoot := filepath.Join(root, BranchVariantServiceDirName)
 	info, err := os.Lstat(serviceRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.Mkdir(serviceRoot, 0o755); err != nil {
@@ -1059,7 +1100,13 @@ func readBranchVariantServiceRootAt(serviceRoot string) (string, string, bool, e
 // established. It is non-nil only for an unverifiable candidate; callers apply
 // their own policy to the resolved state.
 func resolveBranchVariantServiceOwnership(serviceRoot string) (branchVariantServiceState, *branchVariantStoreOwner, error) {
-	info, err := os.Lstat(serviceRoot)
+	// The candidate is inspected through its rooted spelling, so the
+	// ownership record below is read from one absolute location.
+	root, err := rootedPath(serviceRoot)
+	if err != nil {
+		return branchVariantServiceUnverifiable, nil, fmt.Errorf("inspect branch variant service path %q: %w", serviceRoot, err)
+	}
+	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return branchVariantServiceOrdinary, nil, nil
 	}
@@ -1071,7 +1118,7 @@ func resolveBranchVariantServiceOwnership(serviceRoot string) (branchVariantServ
 		// a service tree.
 		return branchVariantServiceOrdinary, nil, nil
 	}
-	owner, err := readBranchVariantStoreOwner(serviceRoot)
+	owner, err := readBranchVariantStoreOwner(root)
 	switch {
 	case err == nil:
 		return branchVariantServiceOwned, owner, nil
@@ -1230,7 +1277,11 @@ func writeExclusiveJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	abs, err := rootedPath(path)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
@@ -1245,22 +1296,26 @@ func writeExclusiveJSON(path string, value any) error {
 }
 
 func readRegularJSON(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
+	abs, err := rootedPath(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(abs)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("%w: ownership record %q is not a regular file", errInvalidBranchVariantOwnership, path)
 	}
-	return os.ReadFile(path)
+	return os.ReadFile(abs)
 }
 
 func makeOwnedDirectory(root, target string) error {
-	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	rootAbs, err := rootedPath(root)
 	if err != nil {
 		return err
 	}
-	targetAbs, err := filepath.Abs(filepath.Clean(target))
+	targetAbs, err := rootedPath(target)
 	if err != nil {
 		return err
 	}
@@ -1309,11 +1364,11 @@ func ensureDirectoryComponent(path string) error {
 }
 
 func ownedPathComponentsSafe(root, target string) bool {
-	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	rootAbs, err := rootedPath(root)
 	if err != nil {
 		return false
 	}
-	targetAbs, err := filepath.Abs(filepath.Clean(target))
+	targetAbs, err := rootedPath(target)
 	if err != nil {
 		return false
 	}
@@ -1348,7 +1403,9 @@ func resolvedPathForCreate(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("empty path")
 	}
-	absolute, err := filepath.Abs(filepath.Clean(path))
+	// The path is rooted before it is inspected, so the resolver never
+	// interprets a relative spelling against the process working directory.
+	absolute, err := rootedPath(path)
 	if err != nil {
 		return "", err
 	}

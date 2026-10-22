@@ -1977,8 +1977,6 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to resolve cache path", err.Error())
 		return
 	}
-	// Ensure cache dir ends with separator to prevent /cache/huggingface-evil matching /cache/huggingface
-	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
 	absHubDir, err := filepath.Abs(cache.HubDir())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to resolve Hub path", err.Error())
@@ -2038,7 +2036,15 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		// Keep the existing escape guard: a Hub/ancestor link must not
 		// redefine the trusted deletion root. Compare to selected H, not
 		// its parent and not a freshly trusted symlink target.
-		if !hfdownloader.PathInside(absHubDir, realHubPath) || realHubPath == absHubDir {
+		//
+		// The comparison uses one canonical spelling of H. A cache root
+		// that is reached through a linked ancestor (the usual macOS
+		// /var -> /private/var spelling) names the same physical Hub as
+		// its resolved form, and comparing the resolved repository path
+		// against the lexical spelling of H would report that ordinary
+		// cache content as an escape.
+		realHubDir := canonicalDirForComparison(absHubDir)
+		if !hfdownloader.PathInside(realHubDir, realHubPath) || realHubPath == realHubDir {
 			writeError(w, http.StatusBadRequest, "Invalid path", "Resolved path outside cache directory")
 			return
 		}
@@ -2095,7 +2101,7 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Delete the friendly view directory (symlinks) with same security checks
 	if friendlyPath != "" {
-		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep); err != nil {
+		if err := safeDeleteFriendlyPath(friendlyPath, absCacheDir); err != nil {
 			if !os.IsNotExist(err) {
 				writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Hub repository deleted; friendly view removal failed", "errors": []string{err.Error()}})
 				return
@@ -2140,14 +2146,25 @@ func isValidRepoComponent(s string) bool {
 }
 
 // safeDeleteFriendlyPath safely deletes the friendly view path with security checks.
-func safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep string) error {
+// The friendly path and the cache directory are compared in one spelling per
+// side: the requested path against the lexical cache directory, and a
+// resolved path against the canonical one. A cache root that is reached
+// through a linked ancestor is therefore not mistaken for an escape from its
+// own cache, while a friendly path that resolves outside the canonical cache
+// directory is still refused.
+func safeDeleteFriendlyPath(friendlyPath, absCacheDir string) error {
 	absFriendlyPath, err := filepath.Abs(friendlyPath)
 	if err != nil {
 		return err
 	}
+	separator := string(filepath.Separator)
+	// The cache dir ends with a separator so /cache/huggingface-evil does not
+	// match /cache/huggingface.
+	absCacheDirWithSep := absCacheDir + separator
+	canonicalCacheDirWithSep := canonicalDirForComparison(absCacheDir) + separator
 
 	// Check it's within cache
-	if !strings.HasPrefix(absFriendlyPath+string(filepath.Separator), absCacheDirWithSep) {
+	if !strings.HasPrefix(absFriendlyPath+separator, absCacheDirWithSep) {
 		return fmt.Errorf("friendly path outside cache")
 	}
 
@@ -2163,12 +2180,29 @@ func safeDeleteFriendlyPath(friendlyPath, absCacheDirWithSep string) error {
 	// Resolve symlinks and verify again
 	realPath, err := filepath.EvalSymlinks(absFriendlyPath)
 	if err == nil && realPath != absFriendlyPath {
-		if !strings.HasPrefix(realPath+string(filepath.Separator), absCacheDirWithSep) {
+		if !strings.HasPrefix(realPath+separator, canonicalCacheDirWithSep) {
 			return fmt.Errorf("resolved friendly path outside cache")
 		}
 	}
 
 	return os.RemoveAll(absFriendlyPath)
+}
+
+// canonicalDirForComparison resolves the parent chain of a directory and keeps
+// the directory itself lexical. A resolved path and the directory it is
+// compared against must use one canonical spelling, otherwise a cache root
+// that is reached through a linked ancestor (the usual macOS /var ->
+// /private/var spelling) looks like an escape from its own cache.
+//
+// Resolving only the parent chain keeps the link guard: a directory that is
+// itself a link keeps its own name, so a path that resolves through that link
+// is still outside the compared spelling.
+func canonicalDirForComparison(dir string) string {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
+	if err != nil {
+		return dir
+	}
+	return filepath.Join(parent, filepath.Base(dir))
 }
 
 // parseCommandFilters extracts filter information from a manifest command string.
