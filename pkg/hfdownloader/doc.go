@@ -243,6 +243,34 @@ no-replace primitive instead of renaming over the target. The domain's lock
 file is persistent, is never unlinked, and is excluded from cache statistics,
 listings, mirrors and cache deletion like every other `.lock` artifact.
 
+Every cache destination owns one ownership domain, not only the
+content-addressed ones. The domain is keyed on the DESTINATION, so a writer of
+a destination and the cleanup of that destination agree on one identity:
+destination `blobs/tmp-<name>` means domain key `blobs/<name>` and domain lock
+`blobs/tmp-<name>.lock`. For a content-addressed item the name is the SHA-256,
+so the domain is exactly the blob key's domain described above and the
+publication's `holdsBlobKey` check keeps working unchanged. An item without a
+known digest — the planner allows an empty SHA-256 — gets a path-derived
+destination (`blobs/tmp-<sanitized-relative-path>`), and a writer of that
+destination holds its domain too. That is what makes two writers of the same
+destination mutually exclusive, in this process and in another one, and what
+makes the cleanup of that destination's artifacts real: without it the cleanup
+derived a domain that no writer ever held, so a cancelled job could delete
+another live job's partial for the same path. A writer that finds the
+destination owned by a proven live owner waits for it (bounded,
+context-aware) and then obtains the file itself — a path-derived destination
+has no published content-addressed target to re-check, because its bytes are
+moved into a blob whose name is the digest computed at store time — and the
+store then reuses the already published blob instead of replacing it. A writer
+that cannot take its domain fails before it writes any payload, exactly like
+the content-addressed case.
+
+The legacy/output mode is deliberately outside this protocol: that namespace
+has no internal directory for a domain lock, and a stray `.lock` next to a
+user's model file is unacceptable. The legacy/output mode therefore keeps its
+historical shared-destination behavior, and two writers of the same legacy
+destination are not mutually excluded there.
+
 The domain is also what a second writer of the same key waits for. A writer
 that finds the key owned by a live owner waits for the owner (bounded,
 context-aware) and re-evaluates the key afterwards, instead of taking the key
@@ -288,11 +316,12 @@ blob still missing; the incomplete payload is preserved so a retry can resume
 it.
 
 The job contract follows from that: a job that reports success means the
-requested files are present. A file owned by another live writer is not
-present, so it is never a successful skip. When the blob key's ownership
-domain is held by a proven live owner — another process, or another writer of
-this process — the item WAITS for the domain (bounded and context-aware, never
-a takeover) and, once it holds the domain, RE-CHECKS the published
+requested files are present and reachable at their snapshot/friendly paths. A
+file owned by another live writer is not present, so it is never a successful
+skip. When the destination's ownership domain is held by a proven live owner —
+another process, or another writer of this process — the item WAITS for the
+domain (bounded and context-aware, never a takeover) and, once it holds the
+domain, RE-CHECKS the published
 content-addressed target. If the owner published the blob while the item
 waited, the item finishes as an ordinary "blob exists" skip with its own
 snapshot and friendly entries created and without another transfer; if the
@@ -300,11 +329,16 @@ owner released the domain without publishing, this writer downloads the file
 itself; and if the owner still holds the domain when the wait budget expires,
 the item fails with an actionable error ("blob <sha> is being downloaded by
 another process; try again later") and the job does not report success while
-that file is missing. The re-check trusts the EXISTENCE of the published
-content-addressed blob as completion proof, exactly like the pre-existing
-"blob exists" skip does, and does not re-verify its content: in `size` mode a
-torn blob written by a foreign writer is therefore accepted as complete — the
-same content-addressed assumption the pre-existing skip already makes. The wait
+that file is missing. A path-derived destination has no published
+content-addressed target to re-check, so the item that waited for its domain
+obtains the file itself: it re-downloads these small non-LFS files, and the
+store then reuses the already published blob. A successful skip that leaves
+the file missing is forbidden in every case. The re-check trusts the EXISTENCE
+of the published content-addressed blob as completion proof, exactly like the
+pre-existing "blob exists" skip does, and does not re-verify its content: in
+`size` mode a torn blob written by a foreign writer is therefore accepted as
+complete — the same content-addressed assumption the pre-existing skip already
+makes. The wait
 budget is a package-level knob derived from the existing ownership-lock
 convention — 60 times the 5s acquisition window, so the effective budget is 5
 minutes — not a user setting. The wait runs inside the item's goroutine, and
@@ -315,20 +349,37 @@ no progress events, so its byte counter does not move and the item simply
 stays in progress; when the budget expires the item fails with the actionable
 error above and the job does not report success.
 
-The cleanup of a blob key's artifacts participates in the same protocol. The
-`blobs/tmp-<sha>` staging name, its single-request `.part`, the legacy
-`.part-NN` parts and the blob-keyed staging pair are removed only while that
-key's ownership domain is held, so a cancelled job never deletes another live
-writer's partial — that writer would keep writing to an unlinked inode and its
-later publication would fail with ENOENT. A live owner of the key leaves those
+A cached file is reachable through its snapshot entry and its friendly entry;
+the payload in `blobs/` alone is not the requested path. The transfer path
+always treated a failed link creation as fatal for the item, and the two skip
+paths — the pre-download "blob exists" check and the post-domain "blob
+exists" skip — now agree with it: a link-creation failure fails the item with
+an actionable error ("the file is in the cache but its cache path is not
+reachable"), and the item reports no success. The end-of-job reconciliation
+that re-creates the links of skipped items reports its link failures as a job
+error instead of only a warning, so a job cannot finish successful with a
+missing path. The friendly entry is deliberately absent when
+`Settings.NoFriendlyView` is set, so that is not an error.
+
+The cleanup of a cache destination's artifacts participates in the same
+protocol. The `blobs/tmp-<name>` staging name, its single-request `.part`, the
+legacy `.part-NN` parts and the blob-keyed staging pair are removed only while
+that destination's ownership domain is held, so a cancelled job never deletes
+another live writer's partial — that writer would keep writing to an unlinked
+inode and its later publication would fail with ENOENT. The cleanup derives
+the same domain identity the writer holds, so the protection is real for a
+content-addressed and for a path-derived destination alike. A live owner of
+the destination leaves those
 artifacts alone, and the contention is reported. A job can still clean up its
 own artifacts: its writer releases the domain when it returns, and the
 downloader's own cancel cleanup removes its staging while it still holds the
-domain. The residual limitation is that the cleanup cannot tell "my own key"
-from "another live owner of the same key" beyond the domain itself, so a key
-another writer owns is left alone even when the cancelling job also had bytes
-for it. A legacy/output-mode destination is not blob-key-scoped and keeps its
-historical cleanup behavior.
+domain. The residual limitation is that the cleanup cannot tell "my own
+destination" from "another live owner of the same destination" beyond the
+domain itself, so a destination another writer owns is left alone even when
+the cancelling job also had bytes for it. A legacy/output-mode destination is
+not cache-scoped and keeps its historical cleanup behavior: that namespace has
+no internal directory for a domain lock, so two writers of the same legacy
+destination are not mutually excluded there.
 
 The mirror writer copies destination blobs with a non-atomic truncate-and-write
 and a size-only check, so it can tear or overwrite a blob a downloader is
@@ -434,6 +485,12 @@ Two levels of concurrency are configurable:
 
 Download returns the first error encountered. The context can be used for
 cancellation, and canceled downloads can be resumed on the next run.
+
+A cached file whose snapshot or friendly entry could not be created fails the
+affected item with `ErrCacheLinkUnreachable`: the payload may be in `blobs/`,
+but the requested path is not reachable through it, so the job does not
+report success. The friendly entry is deliberately absent when
+`Settings.NoFriendlyView` is set, so that is not an error.
 
 # Authentication
 

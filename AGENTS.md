@@ -207,9 +207,38 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   existing content-addressed blob. The domain lock file is
   persistent, is never unlinked, and is excluded from cache statistics,
   listings, mirrors and cache deletion like every other `.lock` artifact.
+- EVERY CACHE DESTINATION OWNS ONE OWNERSHIP DOMAIN, NOT ONLY THE
+  CONTENT-ADDRESSED ONES. The domain is keyed on the DESTINATION, and the
+  writer of a destination and the cleanup of that destination must agree on
+  ONE identity: destination `blobs/tmp-<name>` -> domain key `blobs/<name>`,
+  domain lock `blobs/tmp-<name>.lock`. For a content-addressed item the name
+  is the SHA-256, so the domain is exactly the blob key's domain described
+  above (key `blobs/<sha>`, lock `blobs/tmp-<sha>.lock`) and the publication's
+  `holdsBlobKey` check keeps working unchanged. An item WITHOUT a known digest
+  (the planner allows an empty SHA-256) gets a path-derived destination
+  (`blobs/tmp-<sanitized-relative-path>`), and a writer of that destination
+  MUST hold its domain too: otherwise two writers of the same destination are
+  not mutually excluded (in this process or in another one) and the cleanup's
+  protection is vacuous, because it derived the same key while NO writer ever
+  held it — so a cancelled job could delete another live job's `.part`/temp
+  for the same path. A writer that finds the destination owned by a PROVEN
+  live owner waits for it (bounded, context-aware, never a takeover) and then
+  obtains the file itself: a path-derived destination has no published
+  content-addressed target to re-check (its bytes are moved into a blob whose
+  name is the digest computed at store time, which the waiting writer cannot
+  know before it transfers the file), so the item re-downloads these small
+  non-LFS files and the store then reuses the already published blob instead
+  of replacing it. A writer of a cache destination that cannot take its
+  domain fails the item BEFORE it writes any payload, exactly like the
+  content-addressed case; the partial data of an earlier run is preserved.
+  The legacy/output mode is deliberately NOT covered: that namespace has no
+  internal directory for a domain lock, a stray `.lock` next to a user's model
+  file is unacceptable, so the legacy/output mode keeps its historical
+  (pre-existing) shared-destination behavior and is not mutually excluded.
 - JOB CONTRACT: "job completed successfully" MUST mean the requested files are
-  present. A file owned by another LIVE writer is NOT present, so it is NEVER
-  a successful skip. When the blob key's ownership domain is held by a proven
+  present AND reachable at their snapshot/friendly paths. A file owned by
+  another LIVE writer is NOT present, so it is NEVER a successful skip. When
+  the destination's ownership domain is held by a proven
   live owner (another process, or another writer of this process), the item
   WAITS for the domain — bounded, context-aware, never a takeover — and, once
   it holds the domain, RE-CHECKS the published content-addressed target:
@@ -228,6 +257,11 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   foreign writer is therefore accepted as complete — the same content-addressed
   assumption the pre-existing skip already makes. Do not claim content
   verification for the wait/re-check path.
+  A PATH-DERIVED destination (an item without a known digest) has no published
+  content-addressed target to re-check, so after it waited for the domain the
+  item OBTAINS the file itself — it re-downloads these small non-LFS files —
+  and the store then reuses the already published blob. A successful skip that
+  leaves the file missing is forbidden in every case.
   The wait budget is bounded and derived from the existing ownership-lock
   convention (the download budget is 60 times the 5s acquisition window, so
   the effective budget is 5 MINUTES); it is a package-level knob, not a user
@@ -243,21 +277,41 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   actionable error above and the job's status is failed, not completed. The
   existing "blob exists" skip (the file IS present) and the existing
   unknown-ownership error (`BlobOwnershipUnknown`) are unchanged.
+- A LINK-CREATION FAILURE FAILS THE ITEM, IN EVERY PATH. A cached file is
+  reachable through its snapshot entry (and its friendly entry); the payload in
+  `blobs/` alone is not the requested path. The transfer path already treated
+  a failed link creation as fatal for the item, so the two SKIP paths (the
+  pre-download "blob exists" skip and the post-domain "blob exists" skip) must
+  agree with it: a link-creation failure makes the item FAIL with an
+  actionable error ("the file is in the cache but its cache path is not
+  reachable"), and the item emits NO `file_done` success. The end-of-job
+  reconciliation that re-creates the links of skipped items surfaces its link
+  failures as a JOB error instead of only a warning, so a job cannot finish
+  "successful" with a missing path; its other duties are unchanged. The
+  friendly entry is deliberately ABSENT when `Settings.NoFriendlyView` is set,
+  so that is NOT an error.
 - CLEANUP PARTICIPATES IN THE SAME OWNERSHIP PROTOCOL. The artifacts of one
-  blob key — the `blobs/tmp-<sha>` staging name, its single-request `.part`,
-  the legacy `.part-NN` parts and the blob-keyed staging pair — are removed
-  only while that key's ownership domain is held. A cleanup without the domain
+  cache destination — the `blobs/tmp-<name>` staging name, its single-request
+  `.part`, the legacy `.part-NN` parts and the blob-keyed staging pair — are
+  removed only while that destination's ownership domain is held. The cleanup
+  derives the SAME domain identity the writer holds (destination
+  `blobs/tmp-<name>` -> key `blobs/<name>`, lock `blobs/tmp-<name>.lock`), so
+  the protection is real for a content-addressed AND for a path-derived
+  destination. A cleanup without the domain
   could delete another live writer's LIVE partial: that writer would keep
   writing to an unlinked inode and its later publication would fail with
-  ENOENT. When a live owner holds the key (in this process or in another one),
+  ENOENT. When a live owner holds the destination (in this process or in
+  another one),
   the artifacts are left alone and the contention is reported. A job CAN still
   clean up its OWN artifacts: its writer releases the domain when it returns,
   and the downloader's own cancel cleanup removes its staging while it still
   holds the domain. The residual limitation: the cleanup cannot distinguish
-  "my own key" from "another live owner of the same key" beyond the domain
-  itself, so a key that another writer owns is left alone (safe) even when the
-  cancelling job also had bytes for it. A legacy/output-mode destination is
-  not blob-key-scoped and keeps its historical cleanup behavior.
+  "my own destination" from "another live owner of the same destination" beyond
+  the domain itself, so a destination that another writer owns is left alone
+  (safe) even when the cancelling job also had bytes for it. A legacy/output-mode
+  destination is not cache-scoped and keeps its historical cleanup behavior:
+  that namespace has no internal directory for a domain lock, so two writers
+  of the same legacy destination are not mutually excluded there.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
   - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
@@ -353,7 +407,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 
 - `JobManager` owns live job state; callers should receive snapshots, not shared
   mutable pointers.
-- A job that reports success must mean the requested files are present. A file
+- A job that reports success must mean the requested files are present AND
+  reachable at their snapshot/friendly paths. A file
   owned by another live writer is not present: it is waited for (bounded) and
   re-checked, never reported as a completed skip. When the wait is exhausted
   the item fails with an actionable error, and the job's status is failed, not
@@ -365,6 +420,11 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   sees: the item stays in progress (no progress events are emitted while it
   waits, so its byte counter does not move), and when the budget expires the
   item fails with the actionable error and the job's status is failed.
+  A failed link creation (the snapshot or friendly entry of a cached file
+  could not be created) also fails the item, in the transfer path and in both
+  skip paths alike: the payload may be in `blobs/`, but the requested path is
+  not reachable, so the job must not report success. A job that ends with such
+  a failure is `failed`, not `completed`.
 - Do not hold the job manager lock while broadcasting to listeners or WebSocket
   clients.
 - Scheduler changes must preserve `max-active` semantics: queued jobs start in

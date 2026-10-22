@@ -475,11 +475,16 @@ LOOP:
 							return false, "", fmt.Errorf("check %s: %w", finalRel, err)
 						}
 						if status == BlobComplete {
-							// Blob exists, but ensure snapshot entries are in place
-							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil {
-								if !cfg.NoFriendlyView {
-									repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
-								}
+							// The blob exists, but the requested path must also
+							// be REACHABLE through its snapshot entry (and its
+							// friendly entry). A link-creation failure is an
+							// actionable error for this item, exactly like the
+							// same failure on the transfer path: the two paths
+							// must agree inside one contract, and a job that
+							// reports success means the requested files are
+							// present AND reachable.
+							if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
+								return false, "", err
 							}
 							return true, "blob exists", nil
 						}
@@ -665,61 +670,96 @@ LOOP:
 					finalRel)})
 			}
 
-			// The blob key's ownership domain. One domain per content-addressed
-			// key: the ranged route, the single-request route and the cache
-			// store all write the same blobs/<sha>, so they share ONE domain
-			// instead of one domain per staging path. The domain is held for
-			// the whole operation on that key, which keeps the other route
-			// from adopting, migrating or deleting this item's LIVE partial,
-			// and keeps the publication decision and the placement that
-			// follows it together.
+			// The DESTINATION's ownership domain.
 			//
-			// A PROVEN live owner of the key is WAITED FOR (bounded and
-			// context-aware), not skipped: the file is not present while the
-			// owner holds the key, so a skip would report a success the cache
-			// does not have. After the domain is acquired the published
-			// content-addressed target is re-checked, so a blob published
-			// while this writer waited is reused instead of transferred again.
+			// Every cache destination owns exactly ONE domain, and the domain
+			// is keyed on the DESTINATION, not on the blob key the item may
+			// end up in: a destination is blobs/tmp-<name>, its domain key is
+			// blobs/<name> and its domain lock is the persistent sibling
+			// blobs/tmp-<name>.lock. For a content-addressed item the name is
+			// the SHA-256, so the domain is EXACTLY the blob key's domain of
+			// today (key blobs/<sha>, lock blobs/tmp-<sha>.lock): the ranged
+			// route, the single-request route and the cache store still share
+			// one domain, and the publication's holdsBlobKey check keeps
+			// working unchanged.
+			//
+			// For a path-derived destination (an item without a known digest,
+			// which the planner allows) the same derivation gives the
+			// destination its own domain. Without it, two writers of that
+			// destination were not mutually excluded, and the CLEANUP's
+			// protection was vacuous: the cleanup derived the same key, but
+			// no writer ever held it, so a cancelled job could delete another
+			// live job's .part/temp for the same path.
+			//
+			// The domain is held for the whole operation on the destination:
+			// the partial namespace (so no other writer can adopt, migrate or
+			// delete this item's LIVE partial) and the publication (so the
+			// existence decision and the placement that follows it cannot be
+			// overtaken).
+			//
+			// A PROVEN live owner of the destination is WAITED FOR (bounded
+			// and context-aware), not skipped: the file is not present while
+			// the owner holds the destination, so a skip would report a
+			// success the cache does not have.
 			var (
 				dlErr  error
 				domain *blobDomain
 			)
-			if useHFCache && it.SHA256 != "" {
-				blobPath := repoDir.BlobPath(it.SHA256)
-				dom, derr := blobDomainAcquire(fileCtx, blobPath, dst)
-				switch {
-				case derr == nil:
-					domain = dom
-					defer domain.release()
-					// The ranged publication needs the domain of the blob key
-					// it publishes: the domain-exclusive placement tier
-					// (a filesystem without hard links) is only exclusive to
-					// the domain while it is held.
-					mpOpts.Domain = domain
-					// The blob may have been published while this writer
-					// waited for the domain - by the live owner it waited
-					// for, or by the other route of this process. An
-					// existing content-addressed blob is the completion
-					// proof, so it is reused: the item finishes as an
-					// ordinary skip and NO bytes are transferred.
-					if _, serr := os.Stat(blobPath); serr == nil {
-						dlErr = errBlobAlreadyComplete
+			if useHFCache {
+				key, keyed := cacheDstDomainKey(dst)
+				if !keyed {
+					// A cache destination always has a domain. A destination
+					// that cannot be mapped to one would run without the
+					// exclusion its cleanup relies on, so the item fails
+					// instead of writing unprotected bytes.
+					dlErr = fmt.Errorf("resolve the ownership domain of %s: the destination is not a cache staging name", finalRel)
+				} else {
+					dom, derr := blobDomainAcquire(fileCtx, key, dst)
+					switch {
+					case derr == nil:
+						domain = dom
+						defer domain.release()
+						if blobDirect {
+							// The ranged publication needs the domain of the blob key
+							// it publishes: the domain-exclusive placement tier
+							// (a filesystem without hard links) is only exclusive to
+							// the domain while it is held.
+							mpOpts.Domain = domain
+						}
+						// The published content-addressed target is the completion
+						// proof, so a blob published while this writer waited is
+						// reused instead of transferred again.
+						//
+						// A path-derived destination has no such proof: its
+						// completed bytes are moved into a content-addressed blob
+						// whose name is the digest computed at store time, which
+						// this writer cannot know before it transfers the file.
+						// The item therefore OBTAINS the file itself (these are
+						// small non-LFS files), and the store then reuses the
+						// already published blob instead of replacing it.
+						if it.SHA256 != "" {
+							blobPath := repoDir.BlobPath(it.SHA256)
+							if _, serr := os.Stat(blobPath); serr == nil {
+								dlErr = errBlobAlreadyComplete
+							}
+						}
+					case errors.Is(derr, errStagingOwnershipBusy):
+						// A PROVEN live writer still holds the destination's
+						// ownership domain after the bounded wait. The file is
+						// NOT present, so this is an actionable failure for this
+						// item - never a successful skip and never a silent
+						// success.
+						dlErr = blobLiveOwnerError(it.SHA256, finalRel)
+					default:
+						// The lifetime ownership of this destination is
+						// unavailable: the OS lock is unsupported, denied, or the
+						// filesystem failed. The operation fails HERE, before the
+						// transfer writes any payload. An operation that cannot
+						// own its destination must not write bytes for it, and
+						// the partial data of an earlier run is preserved
+						// untouched.
+						dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
 					}
-				case errors.Is(derr, errStagingOwnershipBusy):
-					// A PROVEN live writer still holds the blob key's
-					// ownership domain after the bounded wait. The file is
-					// NOT present, so this is an actionable failure for this
-					// item - never a successful skip and never a silent
-					// success.
-					dlErr = blobLiveOwnerError(it.SHA256, finalRel)
-				default:
-					// The lifetime ownership of this blob key is unavailable:
-					// the OS lock is unsupported, denied, or the filesystem
-					// failed. The operation fails HERE, before the transfer
-					// writes any payload. An operation that cannot own the
-					// blob key must not write bytes for it, and the partial
-					// data of an earlier run is preserved untouched.
-					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
 				}
 			}
 
@@ -756,16 +796,24 @@ LOOP:
 			// pre-download skip check does. The links for THIS item's path
 			// are created, so the requested file is present in the cache.
 			if errors.Is(dlErr, errBlobAlreadyComplete) {
-				recordSkippedBlobLink(it, finalRel, filterSubdir)
 				if useHFCache && it.SHA256 != "" {
-					// The blob is complete; make sure this file's
-					// snapshot and friendly entries exist for its own
-					// path (a cross-repo dedup winner may have created
-					// entries only for its path).
-					if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil && !cfg.NoFriendlyView {
-						repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
+					// The blob is complete; make sure this file's snapshot
+					// and friendly entries exist for its own path (a
+					// cross-repo dedup winner may have created entries only
+					// for its path). A link-creation failure is an actionable
+					// error for this item - the blob is present but the
+					// requested path is not reachable - and never a silent
+					// success.
+					if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
+						fatal := fmt.Errorf("download %s: %w", finalRel, err)
+						select {
+						case errCh <- fatal:
+						default:
+						}
+						return
 					}
 				}
+				recordSkippedBlobLink(it, finalRel, filterSubdir)
 				if cfg.OnPartialFile != nil {
 					cfg.OnPartialFile(dst, true)
 				}
@@ -1038,6 +1086,13 @@ LOOP:
 	// staging claim only becomes linkable after the winning writer publishes;
 	// create its own snapshot and friendly entries now so a shared blob does
 	// not leave later plan paths without cache entries.
+	//
+	// A link that cannot be created leaves the requested path unreachable, so
+	// the reconciliation reports it as a JOB ERROR instead of only a warning:
+	// a job must not finish "successful" with a missing path. The other duties
+	// of the reconciliation are unchanged: a link whose blob is not published
+	// yet is still skipped, and the remaining links are still reconciled.
+	var reconcileErr error
 	if useHFCache && repoDir != nil {
 		skippedLinksMu.Lock()
 		links := append([]skippedBlobLink(nil), skippedLinks...)
@@ -1047,16 +1102,11 @@ LOOP:
 			if cerr != nil || status != BlobComplete {
 				continue
 			}
-			if cerr := repoDir.createSnapshotSymlink(jobCtx, link.commit, link.relativePath, link.sha256); cerr != nil {
-				emit(ProgressEvent{Level: "warn", Event: "warning",
-					Message: fmt.Sprintf("create snapshot entry %s: %v", link.relativePath, cerr)})
-				continue
-			}
-			if !cfg.NoFriendlyView {
-				if ferr := repoDir.createFriendlySymlinkCtx(jobCtx, link.commit, link.relativePath, link.filterSubdir); ferr != nil {
-					emit(ProgressEvent{Level: "warn", Event: "warning",
-						Message: fmt.Sprintf("create friendly entry %s: %v", link.relativePath, ferr)})
+			if err := cacheEntryLinkCreate(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, cfg.NoFriendlyView); err != nil {
+				if reconcileErr == nil {
+					reconcileErr = err
 				}
+				continue
 			}
 		}
 	}
@@ -1086,6 +1136,13 @@ LOOP:
 	if drainedErr != nil {
 		emit(ProgressEvent{Level: "error", Event: "error", Message: drainedErr.Error()})
 		return drainedErr
+	}
+	// A link the end-of-job reconciliation could not create leaves the
+	// requested path unreachable, so the job fails instead of reporting
+	// success with a missing path.
+	if reconcileErr != nil {
+		emit(ProgressEvent{Level: "error", Event: "error", Message: reconcileErr.Error()})
+		return reconcileErr
 	}
 
 	if ctx.Err() != nil {
@@ -1208,22 +1265,33 @@ func cleanupLegacyPartials(dst string) {
 // downloader has renamed the completed bytes to tmp-<sha> but before
 // StoreDownloadedFile has moved them into the final blob.
 //
-// OWNERSHIP: in HF cache mode every artifact above belongs to ONE blob
-// key, and the key's ownership domain is what a writer of that key holds
-// while it works on it. The artifacts are therefore removed only while
-// that domain is held: a cleanup that removed them without the domain
-// could delete the LIVE partial of another writer (a cancelled job whose
-// key meanwhile became owned by another job), and that writer would keep
-// writing to an unlinked inode and fail its later publication with ENOENT.
-// When a live owner holds the key - in this process or in another one -
-// the artifacts are left alone and the contention is reported. The job
-// that owns the key can still clean up its own artifacts: its own writer
-// releases the domain when it returns, and the downloader's own cancel
-// cleanup removes its staging while it still holds the domain.
+// OWNERSHIP: in HF cache mode every artifact above belongs to ONE cache
+// destination, and the destination's ownership domain is what a writer of
+// that destination holds while it works on it. The artifacts are therefore
+// removed only while that domain is held: a cleanup that removed them
+// without the domain could delete the LIVE partial of another writer (a
+// cancelled job whose destination meanwhile became owned by another job),
+// and that writer would keep writing to an unlinked inode and fail its later
+// publication with ENOENT. When a live owner holds the destination - in this
+// process or in another one - the artifacts are left alone and the contention
+// is reported. The job that owns the destination can still clean up its own
+// artifacts: its own writer releases the domain when it returns, and the
+// downloader's own cancel cleanup removes its staging while it still holds
+// the domain.
 //
-// A legacy/output-mode destination is not blob-key-scoped: its .part
-// family belongs to the destination, not to a content-addressed key, and
-// keeps its historical cleanup behavior.
+// The domain identity is the SAME for the writer and for the cleanup: it is
+// derived from the destination (blobs/tmp-<name> -> domain key blobs/<name>,
+// lock file blobs/tmp-<name>.lock). For a content-addressed destination the
+// name is the SHA-256, so the domain is the blob key's domain; for a
+// path-derived destination (an item without a known digest) it is the
+// destination's own domain. The cleanup therefore protects a path-derived
+// destination exactly like a content-addressed one.
+//
+// A legacy/output-mode destination is not cache-scoped: it has no internal
+// directory for a domain lock (a stray ".lock" next to a user's model file
+// would be unacceptable), so it keeps its historical shared-destination
+// cleanup behavior. Two writers of the same legacy destination are not
+// mutually excluded there.
 //
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor
@@ -1240,19 +1308,22 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 			continue
 		}
 		if useHFCache {
-			// The blob-key namespace: the staging name, its single-request
+			// The destination namespace: the staging name, its single-request
 			// .part, the legacy .part-NN parts and the blob-keyed staging
-			// pair all belong to ONE blob key. They are removed only while
-			// that key's ownership domain is held.
-			if key, ok := blobKeyForCacheDst(dst); ok {
+			// pair all belong to ONE destination. They are removed only while
+			// that destination's ownership domain is held - the SAME domain
+			// its writer holds, whether the destination is content-addressed
+			// (the domain key is the blob key blobs/<sha>) or path-derived
+			// (the domain key is blobs/<name>).
+			if key, ok := cacheDstDomainKey(dst); ok {
 				domain, derr := blobDomainCleanupAcquire(context.Background(), key, dst)
 				if derr != nil {
-					// A live owner holds the key (in this process or in
-					// another one), or its ownership could not be
+					// A live owner holds the destination (in this process or
+					// in another one), or its ownership could not be
 					// established. The artifacts are left alone: not
 					// deleting is the safe choice, because the owner may
 					// be writing them right now.
-					downloadLog.Warn("skip cleanup of a blob key owned by another live writer",
+					downloadLog.Warn("skip cleanup of a destination owned by another live writer",
 						"path", dst, "error", derr)
 					continue
 				}
@@ -1272,34 +1343,6 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 		}
 	}
 	return nil
-}
-
-// blobKeyForCacheDst derives the blob key a cache-mode destination belongs
-// to, and reports whether the destination is blob-key-scoped at all.
-//
-// A cache-mode destination is the staging name the downloader allocates for
-// an item: blobs/tmp-<sha>. The blob key it belongs to is blobs/<sha>, and
-// that key's ownership domain lock is the persistent sibling
-// blobs/tmp-<sha>.lock - exactly the lock the item's writer holds. The
-// derivation therefore lets a cleanup take the SAME domain the writer holds.
-//
-// A destination outside a blobs directory, or one that is not a tmp-<name>
-// staging name, has no blob key: it is not blob-key-scoped and keeps its
-// historical cleanup behavior.
-func blobKeyForCacheDst(dst string) (string, bool) {
-	dir := filepath.Dir(dst)
-	if filepath.Base(dir) != "blobs" {
-		return "", false
-	}
-	name, found := strings.CutPrefix(filepath.Base(dst), "tmp-")
-	if !found || name == "" {
-		return "", false
-	}
-	key, err := SafeJoin(dir, name)
-	if err != nil {
-		return "", false
-	}
-	return key, true
 }
 
 // removeBlobStagingForTemp removes the blob-keyed staging artifacts the

@@ -53,6 +53,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -272,6 +273,46 @@ var blobDomainContentionHook func(key string)
 // with SafeJoin, exactly like the downloader's own destination.
 func (r *RepoDir) blobDomainDst(sha string) (string, error) {
 	return SafeJoin(r.BlobsDir(), "tmp-"+sha)
+}
+
+// cacheDstDomainKey derives the ownership-domain key of a cache destination.
+//
+// The domain is keyed on the DESTINATION, not on the blob key the item may
+// end up in:
+//
+//   - a cache destination is the staging name the downloader allocates for an
+//     item: blobs/tmp-<name>;
+//   - its domain key is blobs/<name>;
+//   - its domain lock is the persistent sibling blobs/tmp-<name>.lock.
+//
+// For a content-addressed item the name is the SHA-256, so the derivation
+// yields exactly the blob key's domain of today: key blobs/<sha>, lock
+// blobs/tmp-<sha>.lock. The publication's holdsBlobKey check therefore keeps
+// working unchanged, and the cleanup of a blob key's artifacts keeps taking
+// the same domain the writer holds.
+//
+// For a path-derived destination (an item without a known digest) the same
+// derivation gives the destination its own domain, so a writer of that
+// destination and the cleanup of that destination agree on ONE identity
+// instead of protecting a domain nobody holds.
+//
+// A destination outside a blobs directory, or one that is not a tmp-<name>
+// staging name, has no domain key: it is not a cache destination and keeps
+// its historical behavior.
+func cacheDstDomainKey(dst string) (string, bool) {
+	dir := filepath.Dir(dst)
+	if filepath.Base(dir) != "blobs" {
+		return "", false
+	}
+	name, found := strings.CutPrefix(filepath.Base(dst), "tmp-")
+	if !found || name == "" {
+		return "", false
+	}
+	key, err := SafeJoin(dir, name)
+	if err != nil {
+		return "", false
+	}
+	return key, true
 }
 
 // holdsBlobKey reports whether this holder owns the ownership domain of the
