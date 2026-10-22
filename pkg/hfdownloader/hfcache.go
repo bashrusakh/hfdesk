@@ -958,16 +958,16 @@ func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, rel
 		}
 	}
 
-	// Create snapshot entry
-	if err := r.createSnapshotSymlink(ctx, commit, relativePath, sha256); err != nil {
-		return nil, fmt.Errorf("create snapshot symlink: %w", err)
-	}
-
-	// Create friendly view entry (unless disabled)
-	if !noFriendly {
-		if err := r.createFriendlySymlinkCtx(ctx, commit, relativePath, filterSubdir); err != nil {
-			return nil, fmt.Errorf("create friendly symlink: %w", err)
-		}
+	// Create the snapshot entry and, unless the friendly view is disabled,
+	// the friendly entry. They are created through the SAME helper the skip
+	// paths use, so a link-creation failure carries the exported
+	// ErrCacheLinkUnreachable sentinel on every path that creates the cache
+	// entries: the payload may be in blobs/, but the requested path is not
+	// reachable through it, and the caller must not report the item as
+	// successful. The friendly entry stays deliberately absent when the
+	// friendly view is disabled, which is not an error.
+	if err := cacheEntryLinkCreate(ctx, r, commit, relativePath, filterSubdir, sha256, noFriendly); err != nil {
+		return nil, err
 	}
 
 	snapPath, err := r.SnapshotPath(commit, relativePath)

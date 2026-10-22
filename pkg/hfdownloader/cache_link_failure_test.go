@@ -356,6 +356,62 @@ func TestNegativeControlSwallowedLinkFailureReportsSuccess(t *testing.T) {
 	t.Logf("negative control reproduced the defect: the job reported success although the requested path is not reachable")
 }
 
+// TestTransferPathLinkFailureCarriesTheUnreachableSentinel covers the
+// transfer paths: a link-creation failure there must carry the SAME exported
+// ErrCacheLinkUnreachable sentinel as the skip paths, so the failure is
+// uniform on every path that creates the cache entries.
+//
+// The two transfer paths are covered:
+//   - the direct blob path (an LFS blob with a canonical SHA-256: the ranged
+//     route publishes blobs/<sha> and the downloader creates the entries);
+//   - the store path (a plain file: the downloader stores the payload through
+//     the cache store, which creates the entries).
+//
+// In both cases the payload IS in blobs/ while the requested path is not
+// reachable, so the item must fail instead of reporting a success.
+func TestTransferPathLinkFailureCarriesTheUnreachableSentinel(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
+
+	for _, tc := range []struct {
+		name string
+		lfs  bool
+	}{
+		{name: "direct blob path", lfs: true},
+		{name: "store path", lfs: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			repo := ownershipContractRepo(t, cacheDir)
+			// The snapshot entry of this commit cannot be created, so the
+			// transfer publishes the payload and then fails on the link.
+			breakSnapshotEntry(t, repo, "commit123")
+
+			srv, _ := recordingHub(t, full, "model.bin", tc.lfs)
+			cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
+			out := runOwnershipContractDownload(context.Background(), cfg)
+
+			if out.err == nil {
+				t.Fatalf("the job reported success although the requested path is not reachable (done=%v)", out.done)
+			}
+			if !errors.Is(out.err, ErrCacheLinkUnreachable) {
+				t.Errorf("Download error = %v, want the unreachable-cache-path error", out.err)
+			}
+			if !containsAll(out.err.Error(), "model.bin", "snapshot entry") {
+				t.Errorf("Download error = %v, want the item path and the failing entry in the message", out.err)
+			}
+			if len(out.done) != 0 {
+				t.Errorf("file_done events = %v, want none: the requested path is not reachable", out.done)
+			}
+			// The payload is in the cache; only the entry is missing.
+			if _, err := os.Stat(repo.BlobPath(sha)); err != nil {
+				t.Errorf("the published blob is missing: %v", err)
+			}
+		})
+	}
+}
+
 // containsAll reports whether s contains every one of the parts.
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {

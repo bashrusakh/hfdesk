@@ -231,10 +231,22 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   of replacing it. A writer of a cache destination that cannot take its
   domain fails the item BEFORE it writes any payload, exactly like the
   content-addressed case; the partial data of an earlier run is preserved.
-  The legacy/output mode is deliberately NOT covered: that namespace has no
-  internal directory for a domain lock, a stray `.lock` next to a user's model
-  file is unacceptable, so the legacy/output mode keeps its historical
-  (pre-existing) shared-destination behavior and is not mutually excluded.
+  The legacy/output (flat) mode has NO destination DOMAIN: that namespace has
+  no internal `blobs/`-style identity, so it has no destination-domain key and
+  no destination-domain lock file, and the wait/re-check protocol does not
+  apply there. It is NOT lock-free, though: the MULTIPART route stages at
+  `<destination>.incomplete` and takes the lifetime OS ownership lock on the
+  persistent sibling `<destination>.incomplete.lock` — a zero-byte artifact
+  next to the user's model file, never unlinked. A concurrent second writer of
+  the same flat destination on that route is therefore EXCLUDED: it fails its
+  item with the actionable live-owner error ("blob <sha> is being downloaded
+  by another process; try again later") instead of racing, which is safer than
+  the pre-#140 behavior, where two processes wrote the same `.part-NN` payload
+  files and could publish a silently corrupt model. The SINGLE-REQUEST route is
+  NOT excluded: it creates no lock artifact next to the destination (only
+  `<destination>.part`, removed on success) and takes no ownership lock, so two
+  writers of the same flat destination on that route still race over the same
+  `.part`.
 - JOB CONTRACT: "job completed successfully" MUST mean the requested files are
   present AND reachable at their snapshot/friendly paths. A file owned by
   another LIVE writer is NOT present, so it is NEVER a successful skip. When
@@ -284,7 +296,10 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   pre-download "blob exists" skip and the post-domain "blob exists" skip) must
   agree with it: a link-creation failure makes the item FAIL with an
   actionable error ("the file is in the cache but its cache path is not
-  reachable"), and the item emits NO `file_done` success. The end-of-job
+  reachable"), and the item emits NO `file_done` success. EVERY path that
+  creates the cache entries — both transfer paths and both skip paths —
+  returns the exported `ErrCacheLinkUnreachable` sentinel, so the failure is
+  uniform and detectable with `errors.Is`. The end-of-job
   reconciliation that re-creates the links of skipped items surfaces its link
   failures as a JOB error instead of only a warning, so a job cannot finish
   "successful" with a missing path; its other duties are unchanged. The
@@ -309,9 +324,13 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   "my own destination" from "another live owner of the same destination" beyond
   the domain itself, so a destination that another writer owns is left alone
   (safe) even when the cancelling job also had bytes for it. A legacy/output-mode
-  destination is not cache-scoped and keeps its historical cleanup behavior:
-  that namespace has no internal directory for a domain lock, so two writers
-  of the same legacy destination are not mutually excluded there.
+  destination is not cache-scoped, so its cleanup holds NO destination domain:
+  that namespace has no internal `blobs/`-style identity. Its cleanup is
+  claim-checked instead: the versioned staging pair (`<destination>.incomplete`
+  and its `.meta`) is removed only while no live claim remains, and the single
+  `.part`, the legacy `.part-NN` parts and `.parts.json` are removed as before.
+  The persistent `<destination>.incomplete.lock` of the multipart route is
+  never unlinked.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
   - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the

@@ -1009,21 +1009,21 @@ LOOP:
 				// The ranged downloader already renamed blobs/<sha>.incomplete
 				// onto blobs/<sha> (rename-only publish). Only the entries
 				// remain — metadata work, no payload copy.
-				if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err != nil {
+				//
+				// The entries are created through the SAME helper the skip
+				// paths use, so a link-creation failure carries the exported
+				// ErrCacheLinkUnreachable sentinel on every path that creates
+				// the cache entries, and the item fails the same way
+				// everywhere: the payload may be in blobs/, but the requested
+				// path is not reachable through it. The friendly entry stays
+				// deliberately absent when the friendly view is disabled,
+				// which is not an error.
+				if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
 					default:
 					}
 					return
-				}
-				if !cfg.NoFriendlyView {
-					if err := repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir); err != nil {
-						select {
-						case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
-						default:
-						}
-						return
-					}
 				}
 				finalSHA256 = it.SHA256
 			case useHFCache:
