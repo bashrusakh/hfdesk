@@ -1205,7 +1205,10 @@ are not cached-content evidence. Independent local scan source priority remains
 unchanged.
 
 HTTP rebuild and `hfdesk --rebuild` call the same Go cache-sync owner with the
-selected H/R association. Generated `R/rebuild.sh` is an invocation-only
+selected H/R association. A rebuild that has to wait for the cache mutation
+lease ends that wait with `409` and `Cache is busy` instead of blocking for the
+whole duration of a running transfer; the CLI rebuild ends the same wait when
+its session is interrupted. Generated `R/rebuild.sh` is an invocation-only
 wrapper and requires a compatible HFDesk binary (beside the script, on `PATH`,
 or named by `HFDESK_BIN`); it does not require Python. Conventional R/hub scripts
 remain relocatable with their whole root; independent-Hub scripts capture an

@@ -41,7 +41,9 @@ jobs:
 
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
-  # argument validation cannot regress silently.
+  # argument validation cannot regress silently. The smoke test also takes the
+  # per-account coordination carrier lease under a numeric UID that has no NSS
+  # entry, which is the configuration the official image runs in.
   docker:
     name: Docker entrypoint
     runs-on: ubuntu-latest

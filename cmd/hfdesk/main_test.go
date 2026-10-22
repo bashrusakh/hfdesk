@@ -10,11 +10,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimecoordination"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
@@ -291,5 +293,70 @@ func TestRebuildProbeAndCLIUseSharedGoSync(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(r, "hub")); !os.IsNotExist(err) {
 		t.Fatalf("CLI with exact H created an unintended R/hub: %v", err)
+	}
+}
+
+// TestRebuildCLIWaitEndsOnInterrupt proves that the rebuild command of the
+// CLI does not stay blocked behind a running transfer.
+//
+// The command waits for the cache mutation lease a transfer holds for its
+// whole duration. The wait observes the terminal session, so an interrupt
+// ends it with a reported failure instead of an endless wait.
+func TestRebuildCLIWaitEndsOnInterrupt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the interrupt of a console session is a Unix shape")
+	}
+	// Keep the default action of the interrupt disabled for the whole test,
+	// so the signal reaches the rebuild command instead of the test process.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+
+	r := filepath.Join(t.TempDir(), "R")
+	h := filepath.Join(t.TempDir(), "H")
+	if err := os.MkdirAll(h, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cache := hfdownloader.NewHFCacheResolved(r, h, 0)
+	release, err := cache.AcquireRebuildCoordinationLease(true)
+	if err != nil {
+		t.Fatalf("hold the cache mutation lease: %v", err)
+	}
+	defer release()
+
+	type outcome struct {
+		handled bool
+		code    int
+		stderr  string
+	}
+	results := make(chan outcome, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		handled, code := runRebuildCLI([]string{"--rebuild", "--cache-dir", r, "--hub-dir", h}, &stdout, &stderr)
+		results <- outcome{handled: handled, code: code, stderr: stderr.String()}
+	}()
+
+	// The command reaches its lease wait and blocks there.
+	time.Sleep(300 * time.Millisecond)
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("interrupt the rebuild command: %v", err)
+	}
+	select {
+	case got := <-results:
+		if !got.handled {
+			t.Fatal("the rebuild command was not handled")
+		}
+		if got.code == 0 {
+			t.Fatalf("the interrupted rebuild reported success: %s", got.stderr)
+		}
+		if !strings.Contains(got.stderr, "rebuild failed") {
+			t.Fatalf("the interrupted rebuild did not report the failure: %q", got.stderr)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the rebuild command stayed blocked behind the running transfer")
 	}
 }

@@ -77,10 +77,24 @@ exec "$HFDSK" "${args[@]}"
 // association. Default H is derived from the wrapper's current R so relocation
 // continues to work; a custom H is embedded as a shell-quoted exact path.
 func (c *HFCache) WriteRebuildScript() (string, error) {
+	return c.WriteRebuildScriptContext(context.Background())
+}
+
+// WriteRebuildScriptContext is the cancellable form of WriteRebuildScript.
+//
+// The context bounds the wait for the cache mutation lease. A running
+// download holds that lease for the whole transfer, so an unbounded wait
+// leaves the caller blocked for the duration of the transfer. A caller that
+// owns a request or session context passes it here and receives the context
+// error instead.
+func (c *HFCache) WriteRebuildScriptContext(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := RejectOwnedBranchVariantDirectoryWrites(c.Root); err != nil {
 		return "", err
 	}
-	coordinationRelease, err := acquireCompleteRebuildCoordinationLeases(context.Background(), []string{c.Root}, true, nil)
+	coordinationRelease, err := acquireCompleteRebuildCoordinationLeases(ctx, []string{c.Root}, true, nil)
 	if err != nil {
 		return "", fmt.Errorf("lease rebuild script destination: %w", err)
 	}

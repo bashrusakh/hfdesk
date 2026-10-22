@@ -1832,6 +1832,16 @@ type RebuildResponse struct {
 	Message         string   `json:"message,omitempty"`
 }
 
+// cacheRebuildLeaseBudget bounds one lease wait of the cache rebuild.
+//
+// A running download holds the cache mutation lease for the whole transfer,
+// so an unbounded wait leaves the rebuild request hanging until that transfer
+// ends. The budget ends the wait with a clear conflict error instead; the
+// ordinary rebuild, where nothing else holds the lease, is unaffected.
+//
+// It is a variable so a focused test can shorten the wait.
+var cacheRebuildLeaseBudget = 5 * time.Second
+
 // handleCacheRebuild regenerates the friendly view symlinks from the hub cache.
 func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
@@ -1859,7 +1869,20 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	_ = readJSON(r, &req) // Ignore errors, use defaults
 
 	cache := cfg.cache()
-	if _, err := cache.WriteRebuildScript(); err != nil {
+	// The rebuild waits for the same mutation leases an in-flight download
+	// holds for its whole transfer. A disconnected client must not leave this
+	// handler blocked behind that transfer, and a rebuild requested during a
+	// long transfer must fail with a clear error instead of hanging, so every
+	// lease wait is bounded by the request context and by one server-side
+	// budget.
+	rebuildCtx, cancelRebuild := context.WithTimeout(r.Context(), cacheRebuildLeaseBudget)
+	defer cancelRebuild()
+	if _, err := cache.WriteRebuildScriptContext(rebuildCtx); err != nil {
+		if rebuildCtx.Err() != nil {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the rebuild when it finishes")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to write rebuild script", err.Error())
 		return
 	}
@@ -1871,10 +1894,19 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 		// variant transfer holds. A disconnected client must not leave this
 		// handler blocked behind that transfer.
 		Context: r.Context(),
+		// Each lease wait of the rebuild is bounded on its own, so a running
+		// transfer ends the wait with an error instead of holding the
+		// request for its whole duration.
+		LeaseBudget: cacheRebuildLeaseBudget,
 	}
 
 	result, err := cache.Sync(opts)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			writeError(w, http.StatusConflict, "Cache is busy",
+				"A download or cache mutation holds the cache lease; retry the rebuild when it finishes")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Rebuild failed", err.Error())
 		return
 	}

@@ -739,18 +739,6 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 	return nil
 }
 
-// createBranchVariantEntryCtx materializes one Hub snapshot file in the
-// service-owned payload tree. It deliberately does not project branch files
-// into the ordinary models/ view.
-func (r *RepoDir) createBranchVariantEntryCtx(ctx context.Context, artifact *BranchVariantArtifact, relativePath string) error {
-	release, err := AcquireBranchVariantArtifactLease(artifact, true)
-	if err != nil {
-		return err
-	}
-	defer release()
-	return r.createBranchVariantEntryCtxLocked(ctx, artifact, relativePath)
-}
-
 // createBranchVariantEntryCtxLocked performs one branch payload projection
 // while the caller holds the artifact's exclusive mutation lease.
 func (r *RepoDir) createBranchVariantEntryCtxLocked(ctx context.Context, artifact *BranchVariantArtifact, relativePath string) error {

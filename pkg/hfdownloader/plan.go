@@ -188,14 +188,16 @@ func DestinationBase(root, folder string) (string, error) {
 // spelling that the filesystem operations in this package use.
 //
 // The selected destination, the configured cache root and every path derived
-// from them are user- or configuration-influenced. Rooting the spelling keeps
-// a relative path from being resolved against the process working directory,
-// which is not the location the caller selected, and the containment check
-// proves the spelling still names exactly one entry under the directory that
-// holds it. The strings.HasPrefix check is the primitive code scanning models
+// from them are user- or configuration-influenced. Rooting the spelling
+// resolves a relative path against the process working directory and removes
+// the "." and ".." segments, so the same selected path always names the same
+// entry. The strings.HasPrefix check is the primitive code scanning models
 // as a sanitizer guard, and it dominates the return below, so taint carried
 // in the selected path itself cannot flow out unnoticed -- the same property
-// SafeJoin and DestinationBase give for the paths they produce.
+// SafeJoin and DestinationBase give for the paths they produce. The check
+// compares the rooted spelling with its own parent directory, so it proves
+// that the spelling is a single entry under that parent; it does not prove
+// anything about the entries around it.
 func rootedPath(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("empty path")

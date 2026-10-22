@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,7 +30,22 @@ const (
 var (
 	errInvalidCoordinationOwnership = errors.New("invalid HFDesk coordination ownership")
 	errCoordinationOwnerPending     = errors.New("HFDesk coordination owner is not published yet")
+	// errCoordinationCarrierUnavailable marks the case where the per-account
+	// private carrier cannot be established: the account is unknown, the
+	// base directory cannot be created, or another account owns the path.
+	//
+	// The carrier is an advisory cross-process mechanism, so this condition
+	// never fails the operation that asked for a lease. The caller keeps the
+	// in-process half of the coordination and reports the loss of the
+	// cross-process half.
+	errCoordinationCarrierUnavailable = errors.New("HFDesk coordination carrier is unavailable")
 )
+
+// coordinationCarrierUnavailable marks err as the loss of the cross-process
+// carrier rather than a refusal to adopt a directory this account owns.
+func coordinationCarrierUnavailable(err error) error {
+	return fmt.Errorf("%w: %w", errCoordinationCarrierUnavailable, err)
+}
 
 type coordinationDirectoryOwner struct {
 	Version     int    `json:"version"`
@@ -56,20 +70,25 @@ func privateCoordinationBaseDir() (string, error) {
 // environment variables. os.UserCacheDir and os.TempDir intentionally are not
 // used here because their documented platform behavior follows those per-
 // process environment overrides.
+//
+// The carrier is a private directory of the account itself: it is created by
+// that account with mode 0700 under the account's own cache area, it is not a
+// directory inside a model or cache tree of the application, and its name is
+// not a path an ordinary download can select.
+//
+// The account is resolved without a name-service lookup: a numeric container
+// identity has no account record, so the identity comes from the platform's
+// own numeric account and the private base directory from the environment the
+// container already sets. A failure to name the account is reported as
+// errCoordinationAccountUnavailable, which the caller turns into the loss of
+// the cross-process carrier instead of a failed operation.
 func defaultCoordinationBaseDir() (string, error) {
-	current, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("resolve current OS user profile: %w", err)
-	}
-	if current.HomeDir == "" {
-		return "", fmt.Errorf("current OS user has no profile directory")
-	}
-	userID, err := coordinationOSUserID()
+	account, err := resolveCoordinationAccount()
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256([]byte(userID))
-	profile, err := filepath.Abs(filepath.Clean(current.HomeDir))
+	digest := sha256.Sum256([]byte(account.ID))
+	profile, err := filepath.Abs(filepath.Clean(account.Home))
 	if err != nil {
 		return "", fmt.Errorf("resolve current OS user profile path: %w", err)
 	}
@@ -97,41 +116,48 @@ func privateCoordinationDirectoryPath() (string, error) {
 // below the OS-reported profile's private cache area. The owner record is
 // published only after this process creates the directory; an existing
 // unmarked directory is never adopted as the lock namespace.
+//
+// A carrier that cannot be established at all - an unknown account, an
+// unusable base directory, or a path another account owns - is reported as
+// errCoordinationCarrierUnavailable: the lease keeps its in-process half and
+// the operation that asked for it continues. A directory this account owns
+// but cannot prove is its own coordinator stays a refusal, so foreign state
+// is never adopted.
 func ensurePrivateCoordinationDirectory(ctx context.Context) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	base, err := privateCoordinationBaseDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve per-user coordination base: %w", err)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("resolve per-user coordination base: %w", err))
 	}
 	if err := os.MkdirAll(base, 0o700); err != nil {
-		return "", fmt.Errorf("create per-user coordination base: %w", err)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("create per-user coordination base: %w", err))
 	}
 	baseInfo, err := os.Lstat(base)
 	if err != nil {
-		return "", fmt.Errorf("inspect per-user coordination base: %w", err)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("inspect per-user coordination base: %w", err))
 	}
 	if !baseInfo.IsDir() || baseInfo.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("refuse unsafe per-user coordination base %q", base)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("refuse unsafe per-user coordination base %q", base))
 	}
 	if err := validatePrivateCoordinationDirectory(base, baseInfo); err != nil {
-		return "", err
+		return "", coordinationCarrierUnavailable(err)
 	}
 	base, err = filepath.EvalSymlinks(base)
 	if err != nil {
-		return "", fmt.Errorf("resolve per-user coordination base: %w", err)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("resolve per-user coordination base: %w", err))
 	}
 	dir := filepath.Join(base, coordinationDirectoryName)
 	created := false
 	if err := os.Mkdir(dir, 0o700); err == nil {
 		created = true
 	} else if !errors.Is(err, os.ErrExist) {
-		return "", fmt.Errorf("create private coordination directory: %w", err)
+		return "", coordinationCarrierUnavailable(fmt.Errorf("create private coordination directory: %w", err))
 	}
 	if created {
 		if err := writeCoordinationDirectoryOwner(dir); err != nil {
-			return "", fmt.Errorf("establish private coordination ownership: %w", err)
+			return "", coordinationCarrierUnavailable(fmt.Errorf("establish private coordination ownership: %w", err))
 		}
 	}
 
@@ -142,18 +168,18 @@ func ensurePrivateCoordinationDirectory(ctx context.Context) (string, error) {
 		}
 		info, err := os.Lstat(dir)
 		if err != nil {
-			return "", fmt.Errorf("inspect private coordination directory: %w", err)
+			return "", coordinationCarrierUnavailable(fmt.Errorf("inspect private coordination directory: %w", err))
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("refuse unsafe private coordination directory %q", dir)
+			return "", coordinationCarrierUnavailable(fmt.Errorf("refuse unsafe private coordination directory %q", dir))
 		}
 		if err := validatePrivateCoordinationDirectory(dir, info); err != nil {
-			return "", err
+			return "", coordinationCarrierUnavailable(err)
 		}
 		if _, err := readCoordinationDirectoryOwner(dir); err == nil {
 			physical, err := filepath.EvalSymlinks(dir)
 			if err != nil {
-				return "", fmt.Errorf("resolve private coordination directory: %w", err)
+				return "", coordinationCarrierUnavailable(fmt.Errorf("resolve private coordination directory: %w", err))
 			}
 			return filepath.Clean(physical), nil
 		} else if !errors.Is(err, errCoordinationOwnerPending) {

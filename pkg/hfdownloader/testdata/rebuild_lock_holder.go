@@ -22,6 +22,10 @@ func main() {
 		holdPathLease(os.Args[2])
 		return
 	}
+	if len(os.Args) == 3 && os.Args[1] == "carrier-path" {
+		carrierPath(os.Args[2])
+		return
+	}
 	if len(os.Args) != 2 {
 		os.Exit(2)
 	}
@@ -54,6 +58,18 @@ func holdPathLease(root string) {
 		os.Exit(2)
 	}
 	fmt.Println("LEASE_RELEASED")
+}
+
+// carrierPath prints the coordination carrier this account resolves for one
+// root. It proves that two processes of the same account meet on one carrier
+// even when the account has no name-service record.
+func carrierPath(root string) {
+	path := hfdownloader.NewHFCache(root, 0).RebuildCoordinationPath()
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "could not resolve the coordination carrier")
+		os.Exit(1)
+	}
+	fmt.Println("CARRIER_PATH\t" + path)
 }
 
 func sharedLease(root string) {

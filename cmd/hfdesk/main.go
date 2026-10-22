@@ -190,7 +190,12 @@ func runRebuildCLI(args []string, stdout, stderr io.Writer) (bool, int) {
 			_, _ = fmt.Fprintln(stderr, message)
 		}
 	}
-	result, err := cache.Sync(hfdownloader.SyncOptions{Clean: clean, Verbose: verbose, OnProgress: progress})
+	// The rebuild waits for the cache mutation lease a running download holds
+	// for its whole transfer. The wait observes the terminal session, so an
+	// interrupt ends it instead of leaving the command blocked.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, err := cache.Sync(hfdownloader.SyncOptions{Clean: clean, Verbose: verbose, OnProgress: progress, Context: ctx})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rebuild failed: %v\n", err)
 		return true, 1

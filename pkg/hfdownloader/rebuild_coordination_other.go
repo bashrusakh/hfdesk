@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 )
 
 func coordinationOSUserID() (string, error) {
@@ -18,6 +19,19 @@ func coordinationOSUserID() (string, error) {
 		return "", err
 	}
 	return current.Uid, nil
+}
+
+// coordinationHomeDir returns the private base directory of the current
+// account. The account record is the primary source and the profile
+// environment is the fallback.
+func coordinationHomeDir() (string, error) {
+	if current, err := user.Current(); err == nil && current.HomeDir != "" {
+		return current.HomeDir, nil
+	}
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+		return home, nil
+	}
+	return "", fmt.Errorf("no account record and no absolute home directory in the environment")
 }
 
 func validatePrivateCoordinationDirectory(_ string, info os.FileInfo) error {

@@ -8,12 +8,34 @@ package hfdownloader
 import (
 	"fmt"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"syscall"
 )
 
 func coordinationOSUserID() (string, error) {
 	return strconv.Itoa(os.Getuid()), nil
+}
+
+// coordinationHomeDir returns the private base directory of the current
+// account.
+//
+// The account record is preferred, so the carrier does not follow a
+// per-process HOME override: the app and the CLI of one account then meet on
+// the same carrier even when they are started with different environments.
+//
+// A numeric container identity has no account record, so the environment the
+// container already sets is used instead. HOME is defined there, and
+// os.UserHomeDir reads it without any name-service lookup.
+func coordinationHomeDir() (string, error) {
+	if current, err := user.Current(); err == nil && current.HomeDir != "" {
+		return current.HomeDir, nil
+	}
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+		return home, nil
+	}
+	return "", fmt.Errorf("no account record and no absolute home directory in the environment")
 }
 
 func validatePrivateCoordinationDirectory(path string, info os.FileInfo) error {

@@ -12,12 +12,27 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 // rebuildCoordinationContentionHook is an unexported deterministic test seam;
 // production leaves it nil.
 var rebuildCoordinationContentionHook func(string, bool)
 var rebuildCoordinationAdmissionLeaseAcquiredHook func(string, bool)
+
+// coordinationCarrierWarningOnce reports the loss of the cross-process
+// carrier once per process: the condition is a property of the account and
+// its directories, so repeating it for every lease would only bury it.
+var coordinationCarrierWarningOnce sync.Once
+
+// reportCoordinationCarrierUnavailable states that the coordination lost its
+// cross-process half and keeps the in-process one.
+func reportCoordinationCarrierUnavailable(err error) {
+	coordinationCarrierWarningOnce.Do(func() {
+		downloadLog.Warn("HFDesk cross-process coordination carrier unavailable; coordinating in-process only",
+			"error", err)
+	})
+}
 
 // RebuildCoordinationPath returns the OS-private data-lease file for the
 // selected root's current filesystem object and canonical physical path.
@@ -84,7 +99,20 @@ func acquirePhysicalRootLeases(ctx context.Context, roots []string, exclusive bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	paths := make(map[string]string, len(roots))
+	// The per-account private carrier holds the cross-process half of every
+	// lease. When it cannot be established, the coordination keeps its
+	// in-process half only: the lease is advisory, so the operation that
+	// asked for it must not fail because the carrier is missing. A refusal
+	// to adopt a directory this account owns stays fatal, because that is
+	// the protection against foreign state.
+	carrierDir, carrierErr := ensurePrivateCoordinationDirectory(ctx)
+	if carrierErr != nil && !errors.Is(carrierErr, errCoordinationCarrierUnavailable) {
+		return nil, carrierErr
+	}
+	if carrierErr != nil {
+		reportCoordinationCarrierUnavailable(carrierErr)
+	}
+	paths := make(map[string]struct{}, len(roots))
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -120,11 +148,7 @@ func acquirePhysicalRootLeases(ctx context.Context, roots []string, exclusive bo
 		if err != nil {
 			return nil, fmt.Errorf("identify rebuild coordination root %q: %w", root, err)
 		}
-		lockPath, err := coordinationFilePathForIdentity(ctx, identity, admission)
-		if err != nil {
-			return nil, err
-		}
-		paths[identity] = lockPath
+		paths[identity] = struct{}{}
 	}
 	ordered := make([]string, 0, len(paths))
 	for key := range paths {
@@ -133,45 +157,65 @@ func acquirePhysicalRootLeases(ctx context.Context, roots []string, exclusive bo
 	sort.Strings(ordered)
 	var releases []func()
 	for _, key := range ordered {
-		lockPath := paths[key]
-		file, err := openRebuildCoordinationFile(ctx, lockPath, key, admission)
+		// The cross-process half comes first, so a contended carrier reports
+		// the contention on the carrier object itself.
+		var fileRelease func()
+		if carrierErr == nil {
+			lockPath := coordinationFilePathIn(carrierDir, key, admission)
+			file, err := openRebuildCoordinationFile(ctx, lockPath, key, admission)
+			if err != nil {
+				releaseAll(releases)
+				return nil, err
+			}
+			wait := func() {
+				if onWait != nil {
+					onWait()
+				}
+				if rebuildCoordinationContentionHook != nil {
+					rebuildCoordinationContentionHook(lockPath, exclusive)
+				}
+			}
+			release, err := acquireBranchVariantOSFileLock(ctx, file, exclusive, wait)
+			if err != nil {
+				_ = file.Close()
+				releaseAll(releases)
+				return nil, fmt.Errorf("acquire rebuild coordination lease %q: %w", lockPath, err)
+			}
+			current, verifyErr := os.Lstat(lockPath)
+			opened, statErr := file.Stat()
+			if verifyErr != nil || statErr != nil || !current.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, opened) {
+				release()
+				releaseAll(releases)
+				if verifyErr != nil {
+					return nil, fmt.Errorf("verify rebuild coordination object %q: %w", lockPath, verifyErr)
+				}
+				if statErr != nil {
+					return nil, fmt.Errorf("inspect rebuild coordination object %q: %w", lockPath, statErr)
+				}
+				return nil, fmt.Errorf("rebuild coordination object %q changed while acquiring its lease", lockPath)
+			}
+			if err := ctx.Err(); err != nil {
+				release()
+				releaseAll(releases)
+				return nil, err
+			}
+			fileRelease = release
+		}
+		// The in-process half is taken for every lease, so two operations of
+		// this process exclude each other whether or not the carrier is
+		// available.
+		localRelease, err := acquireProcessLocalCoordinationLease(ctx, processLocalCoordinationKey(key, admission), exclusive)
 		if err != nil {
+			if fileRelease != nil {
+				fileRelease()
+			}
 			releaseAll(releases)
 			return nil, err
 		}
-		wait := func() {
-			if onWait != nil {
-				onWait()
-			}
-			if rebuildCoordinationContentionHook != nil {
-				rebuildCoordinationContentionHook(lockPath, exclusive)
-			}
+		if fileRelease != nil {
+			releases = append(releases, fileRelease)
 		}
-		release, err := acquireBranchVariantOSFileLock(ctx, file, exclusive, wait)
-		if err != nil {
-			_ = file.Close()
-			releaseAll(releases)
-			return nil, fmt.Errorf("acquire rebuild coordination lease %q: %w", lockPath, err)
-		}
-		current, verifyErr := os.Lstat(lockPath)
-		opened, statErr := file.Stat()
-		if verifyErr != nil || statErr != nil || !current.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, opened) {
-			release()
-			releaseAll(releases)
-			if verifyErr != nil {
-				return nil, fmt.Errorf("verify rebuild coordination object %q: %w", lockPath, verifyErr)
-			}
-			if statErr != nil {
-				return nil, fmt.Errorf("inspect rebuild coordination object %q: %w", lockPath, statErr)
-			}
-			return nil, fmt.Errorf("rebuild coordination object %q changed while acquiring its lease", lockPath)
-		}
-		if err := ctx.Err(); err != nil {
-			release()
-			releaseAll(releases)
-			return nil, err
-		}
-		releases = append(releases, release)
+		releases = append(releases, localRelease)
 		if admission && rebuildCoordinationAdmissionLeaseAcquiredHook != nil {
 			rebuildCoordinationAdmissionLeaseAcquiredHook(key, exclusive)
 		}
@@ -228,12 +272,19 @@ func coordinationFilePathForIdentity(ctx context.Context, identity string, admis
 	if err != nil {
 		return "", err
 	}
+	return coordinationFilePathIn(dir, identity, admission), nil
+}
+
+// coordinationFilePathIn names the lease object of one identity inside an
+// established carrier. The object name is derived from the identity, so two
+// roots never share a lease and one root always finds the same object.
+func coordinationFilePathIn(dir, identity string, admission bool) string {
 	digest := sha256.Sum256([]byte(identity))
 	suffix := ".lock"
 	if admission {
 		suffix = ".admission.lock"
 	}
-	return filepath.Join(dir, hex.EncodeToString(digest[:])+suffix), nil
+	return filepath.Join(dir, hex.EncodeToString(digest[:])+suffix)
 }
 
 func releaseAll(releases []func()) {

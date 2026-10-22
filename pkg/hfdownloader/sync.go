@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // SyncOptions configures the sync operation.
@@ -26,6 +27,14 @@ type SyncOptions struct {
 	// leave the handler blocked behind a competing artifact mutation. A nil
 	// context means context.Background().
 	Context context.Context
+	// LeaseBudget bounds each individual lease wait of the operation. A
+	// running download holds the cache mutation lease for the whole transfer,
+	// so a caller that must answer while that transfer runs passes a budget:
+	// the wait then ends with a clear error instead of lasting for the whole
+	// transfer. The budget applies to every wait separately, so a long rebuild
+	// is not cut short by the time an earlier wait consumed. A zero budget
+	// leaves the waits bounded only by Context.
+	LeaseBudget time.Duration
 }
 
 // leaseContext returns the context that bounds this operation's lease waits.
@@ -34,6 +43,17 @@ func (o SyncOptions) leaseContext() context.Context {
 		return context.Background()
 	}
 	return o.Context
+}
+
+// leaseWaitContext bounds one lease wait with the operation's budget.
+func (o SyncOptions) leaseWaitContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if o.LeaseBudget <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, o.LeaseBudget)
 }
 
 // SyncResult contains statistics from a sync operation.
@@ -56,11 +76,13 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	if _, err := os.Stat(hubDir); errors.Is(err, os.ErrNotExist) {
 		return result, nil // Nothing to sync
 	}
-	coordinationRelease, err := acquireRebuildCoordinationLeases(leaseCtx, []string{c.Root}, true, func() {
+	waitCtx, cancelWait := opts.leaseWaitContext(leaseCtx)
+	coordinationRelease, err := acquireRebuildCoordinationLeases(waitCtx, []string{c.Root}, true, func() {
 		if opts.Verbose && opts.OnProgress != nil {
 			opts.OnProgress("Waiting for the HF cache mutation lease...")
 		}
 	})
+	cancelWait()
 	if err != nil {
 		return nil, fmt.Errorf("lease HF rebuild coordination for sync: %w", err)
 	}
@@ -76,7 +98,9 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	if opts.Clean {
 		// The cache root is the common admission scope for nested selected
 		// local roots; its exclusive lease fences the full recursive clean.
-		cleanRelease, err := AcquireBranchVariantDirectoryLeaseContext(leaseCtx, c.Root, true)
+		cleanWaitCtx, cancelCleanWait := opts.leaseWaitContext(leaseCtx)
+		cleanRelease, err := AcquireBranchVariantDirectoryLeaseContext(cleanWaitCtx, c.Root, true)
+		cancelCleanWait()
 		if err != nil {
 			return nil, fmt.Errorf("lease recursive orphan cleanup: %w", err)
 		}
@@ -105,7 +129,9 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	} else if err := RebindBranchVariantServiceRootUnderLease(c.Root); err != nil {
 		return nil, fmt.Errorf("refresh copied branch variant owner before sync: %w", err)
 	}
-	rootRelease, err := AcquireBranchVariantDirectoryLeaseContext(leaseCtx, c.Root, false)
+	rootWaitCtx, cancelRootWait := opts.leaseWaitContext(leaseCtx)
+	rootRelease, err := AcquireBranchVariantDirectoryLeaseContext(rootWaitCtx, c.Root, false)
+	cancelRootWait()
 	if err != nil {
 		return nil, fmt.Errorf("lease HF cache for sync: %w", err)
 	}

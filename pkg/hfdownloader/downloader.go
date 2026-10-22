@@ -739,6 +739,24 @@ LOOP:
 							return false, "", err
 						}
 						if status == BlobDownloading {
+							// A blob another transfer is writing is contended
+							// state, and the two jobs have different
+							// obligations towards it.
+							//
+							// A branch variant must not claim the other
+							// variant's snapshot by skipping the file: a
+							// shared blob is reused only after each variant
+							// has its own required snapshot entry, so the
+							// variant waits for the transfer and then
+							// materializes its own entry.
+							//
+							// An ordinary download keeps its previous
+							// behaviour: it reports the contended blob as
+							// skipped instead of blocking for the whole
+							// duration of the other transfer.
+							if !job.BranchVariant {
+								return true, "downloading by another process", nil
+							}
 							status, err = repoDir.WaitForBlob(fileCtx, it.SHA256)
 							if err != nil {
 								return false, "", err
