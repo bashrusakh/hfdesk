@@ -231,6 +231,9 @@ func (r *RepoDir) EnsureDirs() error {
 		r.RefsDir(),
 		r.SnapshotsDir(),
 	}
+	if err := rejectOwnedCoordinationMutationTargets(true, dirs...); err != nil {
+		return err
+	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("create directory %s: %w", dir, err)
@@ -320,6 +323,32 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	return BlobStale, meta, nil
 }
 
+// WaitForBlob returns once another downloader's incomplete blob is complete,
+// stale, or gone. A BlobDownloading observation is not proof that this job's
+// commit snapshot exists; callers must still place their own snapshot/view
+// entries after this wait. Context cancellation stops the wait promptly.
+func (r *RepoDir) WaitForBlob(ctx context.Context, sha256 string) (BlobStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, _, err := r.CheckBlob(sha256)
+		if err != nil {
+			return BlobMissing, err
+		}
+		if status != BlobDownloading {
+			return status, nil
+		}
+		select {
+		case <-ctx.Done():
+			return BlobDownloading, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // readIncompleteMeta reads the metadata file for an incomplete download.
 func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 	data, err := os.ReadFile(path)
@@ -335,6 +364,10 @@ func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 
 // WriteIncompleteMeta writes metadata for an incomplete download.
 func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
+	path := r.IncompleteMetaPath(sha256)
+	if err := rejectOwnedCoordinationMutationTargets(true, path); err != nil {
+		return err
+	}
 	meta := IncompleteMeta{
 		PID:       os.Getpid(),
 		StartedAt: time.Now().UTC(),
@@ -345,11 +378,14 @@ func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(r.IncompleteMetaPath(sha256), data, 0644)
+	return os.WriteFile(path, data, 0644)
 }
 
 // CleanupIncomplete removes the .incomplete and .incomplete.meta files.
 func (r *RepoDir) CleanupIncomplete(sha256 string) error {
+	if err := rejectOwnedCoordinationMutationTargets(false, r.IncompletePath(sha256), r.IncompleteMetaPath(sha256)); err != nil {
+		return err
+	}
 	var errs []error
 	if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)
@@ -367,6 +403,9 @@ func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 func (r *RepoDir) FinalizeBlob(sha256 string) error {
 	incompletePath := r.IncompletePath(sha256)
 	blobPath := r.BlobPath(sha256)
+	if err := rejectOwnedCoordinationMutationTargets(false, incompletePath, blobPath); err != nil {
+		return err
+	}
 
 	// Move incomplete to final location
 	if err := os.Rename(incompletePath, blobPath); err != nil {
@@ -402,6 +441,25 @@ func (r *RepoDir) FriendlyPath() string {
 	return filepath.Join(r.cache.ModelsDir(), r.owner, r.name)
 }
 
+// BranchVariantPath returns the selected revision/commit payload root in the
+// cache root's app-owned service tree. Ordinary model-relative paths remain in
+// the traditional models/ view.
+func (r *RepoDir) BranchVariantPath(revision, commit string) (string, error) {
+	return BranchVariantPath(r.cache.Root, r.repoType, r.RepoID(), revision, commit)
+}
+
+// BranchVariantMetadataRevisionPath returns the separate app-owned control
+// parent for one requested branch.
+func (r *RepoDir) BranchVariantMetadataRevisionPath(revision string) (string, error) {
+	return BranchVariantMetadataRevisionPath(r.cache.Root, r.repoType, r.RepoID(), revision)
+}
+
+// BranchVariantMetadataPath returns the durable control directory for one
+// requested revision and resolved commit.
+func (r *RepoDir) BranchVariantMetadataPath(revision, commit string) (string, error) {
+	return BranchVariantMetadataPath(r.cache.Root, r.repoType, r.RepoID(), revision, commit)
+}
+
 // RepoID returns the repository ID in owner/name format.
 func (r *RepoDir) RepoID() string {
 	return r.owner + "/" + r.name
@@ -431,6 +489,11 @@ func (r *RepoDir) WriteRef(ref, commit string) error {
 	if err != nil {
 		return err
 	}
+	release, err := acquireOrdinaryContentMutationLease(refPath)
+	if err != nil {
+		return fmt.Errorf("ref write conflicts with app-owned branch variant storage: %w", err)
+	}
+	defer release()
 	if err := os.MkdirAll(filepath.Dir(refPath), 0755); err != nil {
 		return fmt.Errorf("create refs directory: %w", err)
 	}
@@ -472,6 +535,9 @@ func (r *RepoDir) CreateSnapshot(commit string, files []SnapshotFile) error {
 	if err != nil {
 		return err
 	}
+	if err := rejectOwnedCoordinationMutationTargets(true, snapshotDir); err != nil {
+		return err
+	}
 
 	// Create snapshot directory
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
@@ -504,6 +570,11 @@ func (r *RepoDir) createSnapshotSymlink(ctx context.Context, commit, relativePat
 	if err != nil {
 		return fmt.Errorf("symlink path %q would escape snapshot directory: %w", relativePath, err)
 	}
+	release, err := acquireBranchVariantEntryMutationLease(linkPath)
+	if err != nil {
+		return fmt.Errorf("snapshot entry conflicts with app-owned branch variant storage: %w", err)
+	}
+	defer release()
 
 	// Create parent directories if needed (for nested paths like "subdir/file.txt")
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0755); err != nil {
@@ -613,6 +684,11 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 	if err != nil {
 		return fmt.Errorf("symlink path %q would escape friendly view base: %w", relativePath, err)
 	}
+	release, err := acquireBranchVariantEntryMutationLease(linkPath)
+	if err != nil {
+		return fmt.Errorf("friendly entry conflicts with app-owned branch variant storage: %w", err)
+	}
+	defer release()
 
 	// Create parent directories
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0755); err != nil {
@@ -663,6 +739,63 @@ func (r *RepoDir) createFriendlySymlinkCtx(ctx context.Context, commit, relative
 	return nil
 }
 
+// createBranchVariantEntryCtx materializes one Hub snapshot file in the
+// service-owned payload tree. It deliberately does not project branch files
+// into the ordinary models/ view.
+func (r *RepoDir) createBranchVariantEntryCtx(ctx context.Context, artifact *BranchVariantArtifact, relativePath string) error {
+	release, err := AcquireBranchVariantArtifactLease(artifact, true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return r.createBranchVariantEntryCtxLocked(ctx, artifact, relativePath)
+}
+
+// createBranchVariantEntryCtxLocked performs one branch payload projection
+// while the caller holds the artifact's exclusive mutation lease.
+func (r *RepoDir) createBranchVariantEntryCtxLocked(ctx context.Context, artifact *BranchVariantArtifact, relativePath string) error {
+	if artifact == nil || artifact.RepoType != r.repoType || !strings.EqualFold(artifact.Repo, r.RepoID()) {
+		return fmt.Errorf("branch variant payload owner does not match the selected repository")
+	}
+	if err := verifyBranchVariantArtifactOwner(artifact); err != nil {
+		return fmt.Errorf("verify branch variant payload ownership: %w", err)
+	}
+	linkPath, err := SafeJoin(artifact.PayloadRoot, relativePath)
+	if err != nil {
+		return fmt.Errorf("branch variant payload path %q is unsafe: %w", relativePath, err)
+	}
+	if err := makeOwnedDirectory(artifact.ServiceRoot, filepath.Dir(linkPath)); err != nil {
+		return fmt.Errorf("create branch variant payload parent: %w", err)
+	}
+	snapshotPath, err := r.SnapshotPath(artifact.Commit, relativePath)
+	if err != nil {
+		return fmt.Errorf("resolve branch variant snapshot path: %w", err)
+	}
+	target := friendlyLinkTarget(filepath.Dir(linkPath), snapshotPath)
+	correct, cerr := cacheEntryCorrect(ctx, linkPath, snapshotPath, target)
+	if cerr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	} else if correct {
+		return nil
+	}
+	if info, statErr := os.Lstat(linkPath); statErr == nil {
+		if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("refuse to replace non-file branch payload %q", linkPath)
+		}
+		if err := os.Remove(linkPath); err != nil {
+			return fmt.Errorf("remove old branch payload entry: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if _, err := r.placeCacheEntry(ctx, artifact.ServiceRoot, linkPath, snapshotPath, target); err != nil {
+		return fmt.Errorf("place branch variant payload entry: %w", err)
+	}
+	return nil
+}
+
 // friendlyLinkRoot is the placement root (and fallback-memo key) for friendly
 // view entries: the friendly tree root of this repo's kind, which sits on the
 // volume friendly entries are created on.
@@ -675,7 +808,11 @@ func (r *RepoDir) friendlyLinkRoot() string {
 
 // EnsureFriendlyDir creates the friendly view directory for this repo.
 func (r *RepoDir) EnsureFriendlyDir() error {
-	return os.MkdirAll(r.FriendlyPath(), 0755)
+	path := r.FriendlyPath()
+	if err := rejectOwnedCoordinationMutationTargets(true, path); err != nil {
+		return err
+	}
+	return os.MkdirAll(path, 0755)
 }
 
 // --- Download Workflow Helpers ---
@@ -719,6 +856,9 @@ func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relative
 	}
 
 	blobPath := r.BlobPath(sha256)
+	if err := rejectOwnedCoordinationMutationTargets(false, tempFile, blobPath); err != nil {
+		return nil, err
+	}
 
 	// Check if blob already exists (deduplication)
 	if _, err := os.Stat(blobPath); err == nil {
@@ -807,6 +947,9 @@ func copyFile(src, dst string) error {
 // This provides atomic visibility, not crash durability: it does not fsync the
 // staged file or containing directory.
 func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
+	if err := rejectOwnedCoordinationMutationTargets(false, dst); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err

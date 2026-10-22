@@ -41,6 +41,9 @@ func validate(job Job, cfg Settings) error {
 	if !IsValidModelName(job.Repo) {
 		return fmt.Errorf("invalid repo id %q (expected owner/name)", job.Repo)
 	}
+	if job.BranchVariant && (job.IsDataset || job.Revision == "" || len(job.Filters) != 0 || len(job.Excludes) != 0 || job.AppendFilterSubdir || job.LocalRepo != "") {
+		return errors.New("EXL branch variants require a model repo, an explicit revision, an unfiltered plan, and the repo's normal destination folder")
+	}
 	if job.AppendFilterSubdir {
 		if err := validateAppendFilterSubdirFilters(job.Filters); err != nil {
 			return err

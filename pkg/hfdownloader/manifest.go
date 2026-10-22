@@ -4,8 +4,10 @@
 package hfdownloader
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,11 +30,13 @@ type DownloadManifest struct {
 	Version string `yaml:"version" json:"version"` // Manifest format version
 
 	// Repository info
-	Type     string `yaml:"type" json:"type"`           // "model" or "dataset"
-	Repo     string `yaml:"repo" json:"repo"`           // "owner/name"
-	Branch   string `yaml:"branch" json:"branch"`       // Branch name (usually "main")
-	Commit   string `yaml:"commit" json:"commit"`       // Commit hash
-	RepoPath string `yaml:"repo_path" json:"repo_path"` // Relative to app root; absolute if Hub is on another volume.
+	Type           string `yaml:"type" json:"type"`     // "model" or "dataset"
+	Repo           string `yaml:"repo" json:"repo"`     // "owner/name"
+	Branch         string `yaml:"branch" json:"branch"` // Branch name (usually "main")
+	Commit         string `yaml:"commit" json:"commit"` // Commit hash
+	BranchVariant  bool   `yaml:"branch_variant,omitempty" json:"branchVariant,omitempty"`
+	CommitResolved bool   `yaml:"commit_resolved,omitempty" json:"commitResolved,omitempty"`
+	RepoPath       string `yaml:"repo_path" json:"repo_path"` // Relative to app root; absolute if Hub is on another volume.
 
 	// Timing
 	StartedAt   time.Time `yaml:"started_at" json:"started_at"`     // When download started
@@ -96,14 +100,15 @@ func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 	return &ManifestBuilder{
 		startTime: time.Now().UTC(),
 		manifest: &DownloadManifest{
-			Version:   "1.0",
-			Type:      repoType,
-			Repo:      job.Repo,
-			Branch:    branch,
-			RepoPath:  repoPath,
-			StartedAt: time.Now().UTC(),
-			Command:   command,
-			Files:     []ManifestFile{},
+			Version:       "1.0",
+			Type:          repoType,
+			Repo:          job.Repo,
+			Branch:        branch,
+			BranchVariant: job.BranchVariant,
+			RepoPath:      repoPath,
+			StartedAt:     time.Now().UTC(),
+			Command:       command,
+			Files:         []ManifestFile{},
 		},
 	}
 }
@@ -111,6 +116,12 @@ func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 // SetCommit sets the commit hash.
 func (b *ManifestBuilder) SetCommit(commit string) {
 	b.manifest.Commit = commit
+}
+
+// SetCommitResolved records whether Commit is the concrete SHA returned by the
+// Hub at the start of a branch-variant download rather than a revision fallback.
+func (b *ManifestBuilder) SetCommitResolved(resolved bool) {
+	b.manifest.CommitResolved = resolved
 }
 
 // AddFile adds a file to the manifest.
@@ -140,6 +151,11 @@ func (b *ManifestBuilder) Build() *DownloadManifest {
 // The staging file is not fsynced, so this does not provide crash durability.
 func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
+	release, err := acquireBranchVariantEntryMutationLease(manifestPath)
+	if err != nil {
+		return "", fmt.Errorf("manifest write conflicts with app-owned branch variant storage: %w", err)
+	}
+	defer release()
 
 	// Ensure directory exists
 	if err := os.MkdirAll(friendlyPath, 0o755); err != nil {
@@ -162,6 +178,28 @@ func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 		return "", fmt.Errorf("write manifest: %w", err)
 	}
 
+	return manifestPath, nil
+}
+
+// WriteBranchVariant writes the durable per-variant manifest as JSON. JSON is
+// also valid YAML, so the existing ReadManifest API remains compatible; the
+// standalone rebuild script can read the additive record with Python's
+// standard-library JSON parser without requiring PyYAML.
+func (m *DownloadManifest) WriteBranchVariant(dir string) (string, error) {
+	manifestPath := filepath.Join(dir, ManifestFilename)
+	if err := rejectOwnedCoordinationMutationTargets(false, manifestPath); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create branch variant manifest dir: %w", err)
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal branch variant manifest: %w", err)
+	}
+	if err := writeFileAtomic(manifestPath, data); err != nil {
+		return "", fmt.Errorf("write branch variant manifest: %w", err)
+	}
 	return manifestPath, nil
 }
 
@@ -197,6 +235,9 @@ func createManifestTemp(dir, pattern string) (*os.File, error) {
 // way os.WriteFile would. New-file permissions are filtered through the
 // process umask; a rewritten file keeps its existing mode.
 func writeFileAtomic(path string, data []byte) error {
+	if err := rejectOwnedCoordinationMutationTargets(false, path); err != nil {
+		return err
+	}
 	var mode os.FileMode
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 		mode = info.Mode().Perm()
@@ -233,6 +274,14 @@ func ReadManifest(path string) (*DownloadManifest, error) {
 	if err != nil {
 		return nil, err
 	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var manifest DownloadManifest
+		if err := json.Unmarshal(trimmed, &manifest); err != nil {
+			return nil, err
+		}
+		return &manifest, nil
+	}
 
 	var manifest DownloadManifest
 	if err := yaml.Unmarshal(data, &manifest); err != nil {
@@ -240,6 +289,38 @@ func ReadManifest(path string) (*DownloadManifest, error) {
 	}
 
 	return &manifest, nil
+}
+
+// IsCompleteBranchVariant validates the durable identity and expected file set
+// recorded for a finished EXL branch artifact. Callers still verify each file
+// in the requested physical destination before claiming presence.
+func (m *DownloadManifest) IsCompleteBranchVariant(repoID string, repoType RepoType, revision string) bool {
+	if m == nil || !m.BranchVariant || !m.CommitResolved || m.Commit == "" || m.Branch != revision ||
+		!strings.EqualFold(m.Repo, repoID) || m.Type != string(repoType) ||
+		m.CompletedAt.IsZero() || m.TotalFiles <= 0 || len(m.Files) != m.TotalFiles {
+		return false
+	}
+	seen := make(map[string]struct{}, len(m.Files))
+	var totalSize int64
+	for _, file := range m.Files {
+		name := filepath.ToSlash(file.Name)
+		if unsafeRepoPath(name) || name != file.Name || file.Size < 0 {
+			return false
+		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			return false
+		}
+		seen[key] = struct{}{}
+		if !strings.HasPrefix(file.Blob, "blobs/") || !canonicalSHA256(strings.TrimPrefix(file.Blob, "blobs/")) {
+			return false
+		}
+		if totalSize > int64(^uint64(0)>>1)-file.Size {
+			return false
+		}
+		totalSize += file.Size
+	}
+	return totalSize == m.TotalSize
 }
 
 // RecordDeletion tombstones name for the given snapshot versions so rebuild

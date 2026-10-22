@@ -204,8 +204,9 @@ type PlanItem struct {
 
 // Plan contains the list of files to download.
 type Plan struct {
-	Items  []PlanItem `json:"items"`
-	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	Items          []PlanItem `json:"items"`
+	Commit         string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	CommitResolved bool       `json:"commitResolved,omitempty"`
 }
 
 // PlanRepo builds the file list without downloading.
@@ -241,20 +242,34 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+	commitResolved := err == nil && repoInfo != nil && repoInfo.SHA != ""
 	if err != nil {
+		if job.BranchVariant {
+			return nil, fmt.Errorf("resolve EXL branch variant revision %q: %w", job.Revision, err)
+		}
 		// Fall back to revision name if API call fails (e.g., some mirrors)
 		repoInfo = &RepoInfo{SHA: job.Revision}
 	}
 	commitSHA := repoInfo.SHA
 	if commitSHA == "" {
+		if job.BranchVariant {
+			return nil, fmt.Errorf("resolve EXL branch variant revision %q: Hub response did not include a commit SHA", job.Revision)
+		}
 		commitSHA = job.Revision // fallback
+	}
+	treeJob := job
+	if job.BranchVariant {
+		// The branch is resolved once at download time. Read the complete tree
+		// and each file from that immutable commit so a moving ref cannot mix
+		// artifacts within one job. This does not pin during earlier analysis.
+		treeJob.Revision = commitSHA
 	}
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+	err = walkTree(ctx, httpc, token, cfg.Endpoint, treeJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -575,10 +590,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 		// Build URL and file size
 		var urlStr string
+		downloadJob := job
+		if job.BranchVariant {
+			downloadJob.Revision = commitSHA
+		}
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, job, rel)
+			urlStr = lfsURL(cfg.Endpoint, downloadJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, job, rel)
+			urlStr = rawURL(cfg.Endpoint, downloadJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64
@@ -659,7 +678,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA}, nil
+	return &Plan{Items: items, Commit: commitSHA, CommitResolved: commitResolved}, nil
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the

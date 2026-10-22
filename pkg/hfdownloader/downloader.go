@@ -5,6 +5,8 @@ package hfdownloader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -220,6 +222,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var branchArtifactRelease func()
+	defer func() {
+		if branchArtifactRelease != nil {
+			branchArtifactRelease()
+		}
+	}()
 	if err := validate(job, cfg); err != nil {
 		return err
 	}
@@ -250,8 +258,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// 1. --cache-dir is explicitly set, OR
 	// 2. --output is NOT set (default to HF cache)
 	useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
+	if job.BranchVariant && useHFCache && cfg.NoFriendlyView {
+		return errors.New("EXL branch variants require the HF friendly view")
+	}
 	var hfCache *HFCache
 	var repoDir *RepoDir
+	var branchArtifact *BranchVariantArtifact
 
 	if useHFCache {
 		var err error
@@ -274,8 +286,45 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if err != nil {
 			return fmt.Errorf("create repo dir: %w", err)
 		}
-		if err := repoDir.EnsureDirs(); err != nil {
-			return fmt.Errorf("ensure repo dirs: %w", err)
+		preflightErr := func() error {
+			if !job.BranchVariant {
+				preflightRoots := existingRebuildCoordinationRoots(cfg.RebuildCoordinationRoots)
+				preflightRoots = append(preflightRoots, hfCache.Root)
+				for _, root := range preflightRoots {
+					if err := RejectOwnedBranchVariantDirectoryWrites(root); err != nil {
+						return err
+					}
+				}
+				release, err := acquireRebuildCoordinationLeases(ctx, preflightRoots, false, nil)
+				if err != nil {
+					return fmt.Errorf("lease HF cache directory setup: %w", err)
+				}
+				defer release()
+			}
+			if job.BranchVariant {
+				if err := RejectOwnedBranchVariantDirectoryWrites(hfCache.Root, repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir()); err != nil {
+					return err
+				}
+				if err := RejectBranchVariantServiceOverlap(hfCache.Root, repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir()); err != nil {
+					return err
+				}
+			} else {
+				var locks branchVariantWriteLockSet
+				defer locks.Close()
+				if err := locks.Acquire(repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir()); err != nil {
+					return err
+				}
+				if err := RejectOwnedBranchVariantDirectoryWrites(repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir()); err != nil {
+					return err
+				}
+				if err := repoDir.EnsureDirs(); err != nil {
+					return fmt.Errorf("create HF cache directories: %w", err)
+				}
+			}
+			return nil
+		}()
+		if preflightErr != nil {
+			return preflightErr
 		}
 	} else {
 		// Legacy mode: use OutputDir
@@ -312,6 +361,54 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if err != nil {
 		return err
 	}
+	if job.BranchVariant && !plan.CommitResolved {
+		return fmt.Errorf("EXL branch variant revision %q has no resolved commit", job.Revision)
+	}
+	if cfg.BeforePlanWrite != nil {
+		completedPlan := *plan
+		completedPlan.Items = append([]PlanItem(nil), plan.Items...)
+		if err := cfg.BeforePlanWrite(completedPlan); err != nil {
+			return fmt.Errorf("plan write admission refused: %w", err)
+		}
+	}
+	// Keep app-owned filesystem checks/effects in the process-visible physical
+	// data lease shared with CLI Sync. A separate private admission lease fences
+	// ordinary writes against a first EXL service-root claim. Server-local jobs
+	// include their configured HF root as well as the selected local root; neither
+	// private lease occupies either cache's ordinary path namespace.
+	coordinationRoots := existingRebuildCoordinationRoots(cfg.RebuildCoordinationRoots)
+	if useHFCache {
+		coordinationRoots = append(coordinationRoots, hfCache.Root)
+	} else {
+		outputRoot := cfg.OutputDir
+		if outputRoot == "" {
+			outputRoot = "Storage"
+		}
+		coordinationRoots = append(coordinationRoots, outputRoot)
+	}
+	for _, root := range coordinationRoots {
+		if err := RejectOwnedBranchVariantDirectoryWrites(root); err != nil {
+			return err
+		}
+	}
+	coordinationRelease, err := acquireRebuildCoordinationLeases(ctx, coordinationRoots, false, nil)
+	if err != nil {
+		return fmt.Errorf("lease download destination coordination: %w", err)
+	}
+	defer func() {
+		if coordinationRelease != nil {
+			coordinationRelease()
+		}
+	}()
+	admissionRelease, err := acquireRebuildAdmissionLeases(ctx, coordinationRoots, false, nil)
+	if err != nil {
+		return fmt.Errorf("lease download destination admission: %w", err)
+	}
+	defer func() {
+		if admissionRelease != nil {
+			admissionRelease()
+		}
+	}()
 	if cfg.OnPlanComplete != nil {
 		completedPlan := *plan
 		completedPlan.Items = append([]PlanItem(nil), plan.Items...)
@@ -327,14 +424,183 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		emit(ProgressEvent{Event: "plan_item", Path: displayRel, Total: item.Size})
 	}
 
-	// Ensure destination root exists (only for legacy mode)
-	// HF cache mode already created directories via repoDir.EnsureDirs()
+	branchDestinationRoot := cfg.OutputDir
+	if useHFCache {
+		branchDestinationRoot = hfCache.Root
+	}
+	preflightBranchDestination := func() error {
+		if useHFCache {
+			if err := RejectOwnedBranchVariantDirectoryWrites(hfCache.Root, repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir()); err != nil {
+				return err
+			}
+			return RejectBranchVariantServiceOverlap(hfCache.Root, repoDir.Path(), repoDir.BlobsDir(), repoDir.RefsDir(), repoDir.SnapshotsDir())
+		}
+		return RejectOwnedBranchVariantDirectoryWrites(cfg.OutputDir)
+	}
+	preflightOrdinaryWrites := func() error {
+		ordinaryTargets, ordinaryContentTargets, ordinaryDirectoryTargets, targetErr := ordinaryDownloadWritePaths(job, cfg, plan, hfCache, repoDir, useHFCache)
+		if targetErr != nil {
+			return targetErr
+		}
+		if err := RejectOwnedBranchVariantEntryWrites(ordinaryTargets...); err != nil {
+			return err
+		}
+		if err := RejectOwnedBranchVariantDirectoryWrites(ordinaryDirectoryTargets...); err != nil {
+			return err
+		}
+		return RejectOwnedBranchVariantContentWrites(ordinaryContentTargets...)
+	}
+
+	if job.BranchVariant {
+		branchRepoType := RepoTypeModel
+		if job.IsDataset {
+			branchRepoType = RepoTypeDataset
+		}
+		prepareBranchArtifact := func() error {
+			if useHFCache {
+				branchArtifact, branchArtifactRelease, err = claimBranchVariantArtifactForDownload(hfCache.Root, branchRepoType, job.Repo, job.Revision, plan.Commit)
+			} else {
+				branchArtifact, branchArtifactRelease, err = claimBranchVariantArtifactForDownload(cfg.OutputDir, branchRepoType, job.Repo, job.Revision, plan.Commit)
+			}
+			if err != nil {
+				return fmt.Errorf("claim EXL branch variant storage: %w", err)
+			}
+			// A completion record authorizes the old payload only until this attempt
+			// begins. Revoke it while the artifact mutation lease (and root admission
+			// lease when this is a first claim) is held, before any payload effect.
+			if err := os.Remove(branchArtifact.ManifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("invalidate prior EXL branch completion proof: %w", err)
+			}
+			if useHFCache {
+				if err := repoDir.EnsureDirs(); err != nil {
+					return fmt.Errorf("create HF cache directories: %w", err)
+				}
+			}
+			return nil
+		}
+		if err := preflightBranchDestination(); err != nil {
+			return err
+		}
+
+		ownedService, ownershipErr := BranchVariantServiceOwned(branchDestinationRoot)
+		needsRebind := false
+		if ownershipErr == nil && ownedService {
+			needsRebind, ownershipErr = branchVariantServiceBindingNeedsRebind(branchDestinationRoot)
+		}
+		if ownershipErr == nil && ownedService && !needsRebind {
+			// Existing ownership does not need the exclusive admission lane. Keep
+			// independent branch claims and their payload transfers concurrent.
+			if err := prepareBranchArtifact(); err != nil {
+				return err
+			}
+		} else if ownershipErr == nil && ownedService && needsRebind {
+			// A complete copied store is validated above; refresh its physical
+			// binding under exclusive admission before an artifact can become
+			// partial. The shared data lease remains compatible with other readers.
+			admissionRelease()
+			admissionRelease = nil
+			exclusiveAdmissionRelease, err := acquireRebuildAdmissionLeases(ctx, coordinationRoots, true, nil)
+			if err != nil {
+				return fmt.Errorf("lease copied branch service rebind: %w", err)
+			}
+			prepareErr := func() error {
+				defer exclusiveAdmissionRelease()
+				stale, err := branchVariantServiceBindingNeedsRebind(branchDestinationRoot)
+				if err != nil {
+					return err
+				}
+				if stale {
+					if err := RebindBranchVariantServiceRootUnderLease(branchDestinationRoot); err != nil {
+						return err
+					}
+				}
+				return prepareBranchArtifact()
+			}()
+			if prepareErr != nil {
+				return prepareErr
+			}
+		} else {
+			// First claim and ordinary writes to this unowned candidate serialize
+			// on the private admission lease, separate from the shared data lease.
+			// If ordinary data wins, the claim refuses it; if this claim wins,
+			// ordinary writers observe the validated owner and refuse.
+			admissionRelease()
+			admissionRelease = nil
+			exclusiveAdmissionRelease, err := acquireRebuildAdmissionLeases(ctx, coordinationRoots, true, nil)
+			if err != nil {
+				return fmt.Errorf("lease EXL branch service claim: %w", err)
+			}
+			prepareErr := func() error {
+				defer exclusiveAdmissionRelease()
+				return prepareBranchArtifact()
+			}()
+			if prepareErr != nil {
+				return prepareErr
+			}
+		}
+		if admissionRelease != nil {
+			admissionRelease()
+			admissionRelease = nil
+		}
+	}
+
+	// Recheck concrete filesystem effects under the shared root lease. Branch
+	// service ownership was established under root admission above;
+	// ordinary plans are refused only when their actual target enters an owned
+	// service tree.
+	var localBase string
+	if job.BranchVariant {
+		if err := preflightBranchDestination(); err != nil {
+			return err
+		}
+	} else {
+		if err := preflightOrdinaryWrites(); err != nil {
+			return err
+		}
+		// Ordinary work never depends on claiming the service location. A
+		// candidate that carries no established ownership, or whose physical
+		// binding cannot be inspected, leaves unrelated ordinary downloads in
+		// this root usable; writes that physically intersect the candidate are
+		// refused by the ownership guard above.
+		needsRebind, bindingErr := branchVariantServiceBindingNeedsRebind(branchDestinationRoot)
+		if bindingErr != nil {
+			needsRebind = false
+		}
+		if needsRebind {
+			admissionRelease()
+			admissionRelease = nil
+			exclusiveAdmissionRelease, err := acquireRebuildAdmissionLeases(ctx, coordinationRoots, true, nil)
+			if err != nil {
+				return fmt.Errorf("lease copied branch service rebind: %w", err)
+			}
+			rebindErr := RebindBranchVariantServiceRootUnderLease(branchDestinationRoot)
+			exclusiveAdmissionRelease()
+			if rebindErr != nil {
+				return rebindErr
+			}
+			admissionRelease, err = acquireRebuildAdmissionLeases(ctx, coordinationRoots, false, nil)
+			if err != nil {
+				return fmt.Errorf("reacquire ordinary destination admission: %w", err)
+			}
+			if err := preflightOrdinaryWrites(); err != nil {
+				return err
+			}
+		}
+	}
 	if !useHFCache {
-		base, err := destinationBase(job, cfg)
+		localBase, err = destinationBase(job, cfg)
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if job.BranchVariant {
+			localBase = branchArtifact.PayloadRoot
+		}
+		if job.BranchVariant {
+			err = makeOwnedDirectory(branchArtifact.ServiceRoot, localBase)
+		} else {
+			err = os.MkdirAll(localBase, 0o755)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -383,16 +649,21 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Manifest is always written unless explicitly disabled with NoManifest
 	var manifestBuilder *ManifestBuilder
 	var manifestMu sync.Mutex
-	if useHFCache && !cfg.NoManifest {
+	if (useHFCache && !cfg.NoManifest) || job.BranchVariant {
 		manifestBuilder = NewManifestBuilder(job, cfg.Command)
 		manifestBuilder.SetCommit(plan.Commit)
+		manifestBuilder.SetCommitResolved(plan.CommitResolved)
 		// RepoPath describes the selected physical repository, relative to the
 		// friendly root when possible (absolute on different Windows volumes).
-		rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
-		if err != nil {
-			rel = repoDir.Path()
+		if useHFCache {
+			rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
+			if err != nil {
+				rel = repoDir.Path()
+			}
+			manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
+		} else {
+			manifestBuilder.manifest.RepoPath = ""
 		}
-		manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
 	}
 
 LOOP:
@@ -442,17 +713,28 @@ LOOP:
 						if err != nil {
 							return false, "", err
 						}
+						if status == BlobDownloading {
+							status, err = repoDir.WaitForBlob(fileCtx, it.SHA256)
+							if err != nil {
+								return false, "", err
+							}
+						}
 						if status == BlobComplete {
-							// Blob exists, but ensure snapshot entries are in place
-							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil {
-								if !cfg.NoFriendlyView {
-									repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
+							// Shared blob bytes do not imply this commit's snapshot/view
+							// entries exist. Materialize each before reporting a skip.
+							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err != nil {
+								return false, "", err
+							}
+							if job.BranchVariant {
+								if err := repoDir.createBranchVariantEntryCtxLocked(fileCtx, branchArtifact, it.RelativePath); err != nil {
+									return false, "", err
+								}
+							} else if !cfg.NoFriendlyView {
+								if err := repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir); err != nil {
+									return false, "", err
 								}
 							}
 							return true, "blob exists", nil
-						}
-						if status == BlobDownloading {
-							return true, "downloading by another process", nil
 						}
 					}
 					return false, "", nil
@@ -463,6 +745,13 @@ LOOP:
 				if it.SHA256 == "" {
 					// Fallback: sanitize path to avoid collisions
 					tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
+				}
+				if job.BranchVariant {
+					// A content hash is shared across commits, but a transfer's
+					// resumable bytes are not. Keep the partial stable for retries
+					// of this artifact while separating variants and same-hash paths.
+					key := sha256.Sum256([]byte(strings.Join([]string{hfCache.Root, job.Repo, job.Revision, plan.Commit, it.RelativePath}, "\x00")))
+					tmpName += "-" + hex.EncodeToString(key[:])
 				}
 				// Guard: SafeJoin so the remote-controlled temp name (SHA256
 				// or path-derived) cannot escape the blobs directory — the
@@ -482,19 +771,9 @@ LOOP:
 				dst = safeDst
 			} else {
 				// Legacy mode: flat directory structure
-				base, err := destinationBase(job, cfg)
-				if err != nil {
-					fatal := fmt.Errorf("path traversal: %w", err)
-					setFatalErr(fatal)
-					select {
-					case errCh <- fatal:
-					default:
-					}
-					return
-				}
 				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
 				// output directory via path traversal.
-				safeDst, err := SafeJoin(base, finalRel)
+				safeDst, err := SafeJoin(localBase, finalRel)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
 					setFatalErr(fatal)
@@ -506,11 +785,49 @@ LOOP:
 				}
 				dst = safeDst
 				skipCheck = func() (bool, string, error) {
+					if job.BranchVariant {
+						return shouldSkipBranchVariantLocalCtx(fileCtx, it, dst)
+					}
 					return shouldSkipLocalCtx(fileCtx, it, dst)
 				}
 			}
 
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			if !job.BranchVariant {
+				mutationRelease, leaseErr := acquireOrdinaryFileMutationLease(dst, dst+".part", dst+".part-00", dst+".parts.json")
+				if leaseErr != nil {
+					select {
+					case errCh <- leaseErr:
+					default:
+					}
+					return
+				}
+				defer mutationRelease()
+			}
+
+			if job.BranchVariant && !useHFCache {
+				if err := makeOwnedDirectory(branchArtifact.ServiceRoot, filepath.Dir(dst)); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				if info, err := os.Lstat(dst); err == nil && info.Mode()&os.ModeSymlink != 0 {
+					select {
+					case errCh <- fmt.Errorf("refuse symlinked EXL branch payload %q", dst):
+					default:
+					}
+					return
+				}
+			} else if !job.BranchVariant {
+				if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			} else if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 				select {
 				case errCh <- err:
 				default:
@@ -638,7 +955,7 @@ LOOP:
 			var finalSHA256 string
 			if useHFCache {
 				sha := it.SHA256
-				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView || job.BranchVariant)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -647,8 +964,27 @@ LOOP:
 					return
 				}
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
+				if job.BranchVariant {
+					if err := repoDir.createBranchVariantEntryCtxLocked(fileCtx, branchArtifact, it.RelativePath); err != nil {
+						select {
+						case errCh <- fmt.Errorf("materialize branch variant file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
 			} else {
 				finalSHA256 = it.SHA256
+				if job.BranchVariant && finalSHA256 == "" {
+					finalSHA256, err = computeSHA256Ctx(fileCtx, dst)
+					if err != nil {
+						select {
+						case errCh <- fmt.Errorf("hash branch variant file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
 			}
 
 			// File is now at its final location; the partial (dst in HF
@@ -732,16 +1068,31 @@ LOOP:
 
 	// Write/update the rebuild shell script if using HF cache (unless friendly view disabled)
 	if hfCache != nil && !cfg.NoFriendlyView {
-		if _, err := hfCache.WriteRebuildScript(); err != nil {
+		if _, err := hfCache.writeRebuildScriptUnderLease(); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write rebuild script: %v", err)})
 		}
 	}
 
 	// Write manifest file (hfd.yaml) if using HF cache (unless friendly view disabled)
-	if manifestBuilder != nil && repoDir != nil && !cfg.NoFriendlyView {
+	if manifestBuilder != nil && (useHFCache && !cfg.NoFriendlyView || job.BranchVariant) {
 		manifest := manifestBuilder.Build()
-		if _, err := manifest.Write(repoDir.FriendlyPath()); err != nil {
-			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", err)})
+		manifestDir := ""
+		if job.BranchVariant {
+			manifestDir = branchArtifact.ControlRoot
+		} else {
+			manifestDir = repoDir.FriendlyPath()
+		}
+		var writeErr error
+		if job.BranchVariant {
+			_, writeErr = manifest.WriteBranchVariant(manifestDir)
+		} else {
+			_, writeErr = manifest.Write(manifestDir)
+		}
+		if writeErr != nil {
+			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", writeErr)})
+			if job.BranchVariant {
+				return fmt.Errorf("write branch variant manifest: %w", writeErr)
+			}
 		}
 	}
 
@@ -750,6 +1101,108 @@ LOOP:
 		Message: fmt.Sprintf("download complete (downloaded %d, skipped %d)", downloadedCount, skippedCount),
 	})
 	return nil
+}
+
+// ordinaryDownloadWritePaths lists the filesystem targets that a completed
+// plan can write or use as staging. It is intentionally evaluated before any
+// destination directories are created so a service-tree conflict is a
+// no-effect refusal.
+func ordinaryDownloadWritePaths(job Job, cfg Settings, plan *Plan, cache *HFCache, repo *RepoDir, useHFCache bool) ([]string, []string, []string, error) {
+	if plan == nil {
+		return nil, nil, nil, fmt.Errorf("missing download plan")
+	}
+	var paths []string
+	var contentPaths []string
+	var directoryPaths []string
+	add := func(path string) {
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	addDirectory := func(path string) {
+		if path != "" {
+			directoryPaths = append(directoryPaths, path)
+		}
+	}
+	if !useHFCache {
+		base, err := destinationBase(job, cfg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		addDirectory(base)
+		for _, item := range plan.Items {
+			rel := item.RelativePath
+			if job.AppendFilterSubdir && item.DestinationSubdir != "" {
+				rel = filepath.Join(item.DestinationSubdir, rel)
+			}
+			dst, err := SafeJoin(base, rel)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("resolve ordinary download path %q: %w", rel, err)
+			}
+			add(dst)
+			add(dst + ".part")
+			add(dst + ".part-00")
+			add(dst + ".parts.json")
+			contentPaths = append(contentPaths, dst+".part", dst+".part-00", dst+".parts.json")
+		}
+		return paths, contentPaths, directoryPaths, nil
+	}
+	if cache == nil || repo == nil {
+		return nil, nil, nil, fmt.Errorf("missing HF cache destination")
+	}
+	addDirectory(cache.Root)
+	addDirectory(cache.HubDir())
+	addDirectory(repo.Path())
+	addDirectory(repo.BlobsDir())
+	addDirectory(repo.RefsDir())
+	addDirectory(repo.SnapshotsDir())
+	addDirectory(repo.FriendlyPath())
+	for _, item := range plan.Items {
+		tmpName := "tmp-" + item.SHA256
+		if item.SHA256 == "" {
+			tmpName = "tmp-" + strings.ReplaceAll(item.RelativePath, "/", "_")
+		}
+		tmp, err := SafeJoin(repo.BlobsDir(), tmpName)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("resolve ordinary cache staging path: %w", err)
+		}
+		add(tmp)
+		add(tmp + ".part")
+		add(tmp + ".part-00")
+		add(tmp + ".parts.json")
+		contentPaths = append(contentPaths, tmp+".part", tmp+".part-00", tmp+".parts.json")
+		snapshot, err := repo.SnapshotPath(plan.Commit, item.RelativePath)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("resolve ordinary snapshot path: %w", err)
+		}
+		add(snapshot)
+		if !cfg.NoFriendlyView {
+			friendlyBase := repo.FriendlyPath()
+			if job.AppendFilterSubdir && item.DestinationSubdir != "" {
+				friendlyBase, err = SafeJoin(friendlyBase, item.DestinationSubdir)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+			}
+			friendly, err := SafeJoin(friendlyBase, item.RelativePath)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("resolve ordinary friendly path: %w", err)
+			}
+			add(friendly)
+		}
+	}
+	refPath, err := repo.RefPath(job.Revision)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolve ordinary ref path: %w", err)
+	}
+	add(refPath)
+	if !cfg.NoManifest && !cfg.NoFriendlyView {
+		add(filepath.Join(repo.FriendlyPath(), ManifestFilename))
+	}
+	if !cfg.NoFriendlyView {
+		add(filepath.Join(cache.Root, "rebuild.sh"))
+	}
+	return paths, contentPaths, directoryPaths, nil
 }
 
 // cleanupPartialsOnCancel removes partial download artifacts (.part,
@@ -797,15 +1250,124 @@ func cleanupPartialsOnCancel(cfg Settings, dst string) {
 // All operations are best-effort: missing files are not an error, and
 // individual file removal failures are logged and skipped.
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
+	if len(dsts) == 0 {
+		return nil
+	}
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
+	coordinationRoots := existingRebuildCoordinationRoots(settings.RebuildCoordinationRoots)
+	if useHFCache {
+		cache, err := settings.BuildHFCache()
+		if err != nil {
+			return fmt.Errorf("resolve cleanup coordination root: %w", err)
+		}
+		coordinationRoots = append(existingRebuildCoordinationRoots([]string{cache.Root}), coordinationRoots...)
+	} else {
+		coordinationRoots = append(existingRebuildCoordinationRoots([]string{settings.OutputDir}), coordinationRoots...)
+	}
+	coordinationRelease, err := AcquireRebuildCoordinationLeases(coordinationRoots, false)
+	if err != nil {
+		return fmt.Errorf("lease partial cleanup coordination: %w", err)
+	}
+	defer coordinationRelease()
 	root := cleanupRoot(settings, useHFCache)
 	for _, dst := range dsts {
 		if !pathWithinRoot(root, dst) {
 			log.Printf("warning: skip cleanup for out-of-root partial dst %s", dst)
 			continue
 		}
+		release, leaseErr := acquireOrdinaryEntryMutationLease(dst)
+		if leaseErr != nil {
+			log.Printf("warning: skip cleanup for protected partial dst %s: %v", dst, leaseErr)
+			continue
+		}
 		if err := removePartialArtifacts(dst); err != nil {
 			log.Printf("warning: cleanup partials for %s: %v", dst, err)
+		}
+		if useHFCache {
+			removeHFCacheTemp(dst)
+		}
+		release()
+	}
+	return nil
+}
+
+// CleanupBranchVariantJobPartFiles removes only the partial paths recorded for
+// a cancelled/paused EXL job while holding shared destination ancestry. The
+// branch downloader has already revoked its old completion proof before any
+// payload write; this lease coordinates post-return cleanup with rebuild,
+// delete, and a later branch claim without serializing other variants.
+func CleanupBranchVariantJobPartFiles(settings Settings, dsts []string) error {
+	if len(dsts) == 0 {
+		return nil
+	}
+	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
+	leaseRoot := settings.OutputDir
+	if useHFCache {
+		cache, err := settings.BuildHFCache()
+		if err != nil {
+			return fmt.Errorf("resolve branch cleanup destination: %w", err)
+		}
+		leaseRoot = cache.Root
+	}
+	coordinationRoots := existingRebuildCoordinationRoots(settings.RebuildCoordinationRoots)
+	coordinationRoots = append(existingRebuildCoordinationRoots([]string{leaseRoot}), coordinationRoots...)
+	coordinationRelease, err := AcquireRebuildCoordinationLeases(coordinationRoots, false)
+	if err != nil {
+		return fmt.Errorf("lease branch partial cleanup coordination: %w", err)
+	}
+	defer func() {
+		if coordinationRelease != nil {
+			coordinationRelease()
+		}
+	}()
+	owned, ownerErr := BranchVariantServiceOwned(leaseRoot)
+	if ownerErr != nil || !owned {
+		if ownerErr == nil {
+			ownerErr = fmt.Errorf("branch service root is not owned")
+		}
+		return fmt.Errorf("refuse branch partial cleanup without a valid service owner: %w", ownerErr)
+	}
+	needsRebind, err := branchVariantServiceBindingNeedsRebind(leaseRoot)
+	if err != nil {
+		return fmt.Errorf("verify branch partial cleanup owner: %w", err)
+	}
+	if needsRebind {
+		coordinationRelease()
+		coordinationRelease = nil
+		coordinationRelease, err = AcquireRebuildCoordinationLeases(coordinationRoots, true)
+		if err != nil {
+			return fmt.Errorf("lease copied branch partial cleanup rebind: %w", err)
+		}
+		if err := RebindBranchVariantServiceRootUnderLease(leaseRoot); err != nil {
+			coordinationRelease()
+			coordinationRelease = nil
+			return err
+		}
+		coordinationRelease()
+		coordinationRelease = nil
+		coordinationRelease, err = AcquireRebuildCoordinationLeases(coordinationRoots, false)
+		if err != nil {
+			return fmt.Errorf("reacquire branch partial cleanup lease: %w", err)
+		}
+	}
+	release, err := AcquireBranchVariantDirectoryLease(leaseRoot, false)
+	if err != nil {
+		return fmt.Errorf("lease branch variant cleanup destination: %w", err)
+	}
+	defer release()
+
+	root := cleanupRoot(settings, useHFCache)
+	for _, dst := range dsts {
+		if !pathWithinRoot(root, dst) {
+			log.Printf("warning: skip cleanup for out-of-root branch partial dst %s", dst)
+			continue
+		}
+		if err := rejectOwnedCoordinationMutationTargets(false, dst, dst+".part", dst+".parts.json"); err != nil {
+			log.Printf("warning: skip cleanup for coordinator-owned partial dst %s: %v", dst, err)
+			continue
+		}
+		if err := removePartialArtifacts(dst); err != nil {
+			log.Printf("warning: cleanup branch partials for %s: %v", dst, err)
 		}
 		if useHFCache {
 			removeHFCacheTemp(dst)

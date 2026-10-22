@@ -113,3 +113,30 @@ func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, str
 
 	return false, "", nil
 }
+
+// shouldSkipBranchVariantLocalCtx reuses a local branch artifact only when the
+// plan supplies an expected SHA-256 and the file matches it. A size-only match
+// cannot establish the expected content identity for a branch manifest; when
+// the Hub has no trusted digest, re-fetch so the manifest hash comes from the
+// bytes downloaded for this resolved artifact rather than arbitrary local data.
+func shouldSkipBranchVariantLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		return false, "", nil
+	}
+	if it.Size > 0 && fi.Size() != it.Size {
+		return false, "", nil
+	}
+	if it.SHA256 == "" {
+		return false, "", nil
+	}
+	if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
+		return true, "sha256 match", nil
+	} else if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, "", ctxErr
+	}
+	return false, "", nil
+}
