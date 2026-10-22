@@ -685,7 +685,7 @@ func runtimeLogLevelName(level slog.Level) string {
 // reach the API, and the runtime data of a local host must not be readable
 // from there.
 //
-// Two independent rules are applied and both must pass:
+// Three independent rules are applied and all of them must pass:
 //
 //  1. The peer address must be a loopback address (127.0.0.0/8 or ::1). The
 //     peer is taken from r.RemoteAddr only. A forwarded header such as
@@ -697,6 +697,20 @@ func runtimeLogLevelName(level slog.Level) string {
 //     request really does come from a loopback peer, so the peer check
 //     alone does not stop it. A request without an Origin header comes from
 //     a native client and is allowed.
+//  3. The Host header must name the local machine: its host must be a
+//     loopback address (127.0.0.0/8 or ::1) or the name localhost. The port
+//     is irrelevant. A name of another site can be pointed at 127.0.0.1, and
+//     the request the browser then makes is same origin for the browser, so
+//     it carries no Origin header at all and the second rule cannot see it.
+//     The name the client asked for is what tells the two apart, so it has
+//     to be a name of the local machine. The match is exact: a name that
+//     only ends in "localhost" or that only starts with a loopback address
+//     is another site's name, not the local machine.
+//
+// The host of a request is r.Host, which the server fills from the Host
+// header of the request. The Runtime window is served from the loopback
+// address of the running server, so its own requests carry a loopback host
+// and keep working.
 //
 // A rejected request never reaches the handler, so no runtime or log data
 // is produced for it.
@@ -720,12 +734,15 @@ func isLocalRuntimeRequest(r *http.Request) bool {
 		return false
 	}
 	origin := r.Header.Get("Origin")
-	if origin == "" {
-		// A native client sends no Origin: there is no browser that
-		// could have been tricked into sending the request.
-		return true
+	if origin != "" && !isLoopbackHost(originHost(origin)) {
+		// A page of another site cannot read the runtime data.
+		return false
 	}
-	return isLoopbackHost(originHost(origin))
+	// The name the client asked for has to be a name of the local
+	// machine. A request without an Origin header is not necessarily a
+	// native client: a rebound name of another site produces exactly
+	// such a request, and it is the host that tells the two apart.
+	return isLoopbackHost(hostHeaderHost(r.Host))
 }
 
 // peerHost returns the host part of a peer address.
@@ -757,6 +774,53 @@ func originHost(origin string) string {
 	return parsed.Host
 }
 
+// hostHeaderHost returns the host part of a Host header.
+//
+// The port is dropped: the rule of the guard is about the name the client
+// asked for, not about the port it used, so any port is accepted.
+//
+// An IPv6 literal is written in brackets, with or without a port ("[::1]"
+// and "[::1]:8080"), and the brackets are removed. A value that carries no
+// host at all (an empty value, or a value that is only a port) and a value
+// that is not a host header at all yield an empty host, which is never
+// local.
+func hostHeaderHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") {
+		end := strings.Index(host, "]")
+		if end < 0 {
+			return ""
+		}
+		literal := host[1:end]
+		rest := host[end+1:]
+		if rest == "" {
+			return literal
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return ""
+		}
+		// The value behind the bracket has to be a port. SplitHostPort
+		// rejects a value that carries more than one colon, so a
+		// malformed value never reaches the loopback check.
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			return ""
+		}
+		return literal
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	// A value without a port is the host itself, but a value with more
+	// than one colon is not a host header.
+	if strings.Contains(host, ":") {
+		return ""
+	}
+	return host
+}
+
 // isLoopbackHost reports whether a host names the local machine.
 //
 // A loopback IP address (127.0.0.0/8 or ::1) and the name "localhost" are
@@ -771,4 +835,21 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return strings.EqualFold(host, "localhost")
+}
+
+// runtimeDiagnosticsPath is the path of the runtime surface: the status, the
+// log page, the log stream and the two actions of the Runtime window.
+const runtimeDiagnosticsPath = "/api/runtime"
+
+// isRuntimeDiagnosticsPath reports whether a path belongs to the runtime
+// surface.
+//
+// The path is either the path of the surface itself or a path below it, so
+// a path that only starts with the same characters ("/api/runtimefoo") is
+// not part of the surface.
+func isRuntimeDiagnosticsPath(path string) bool {
+	if path == runtimeDiagnosticsPath {
+		return true
+	}
+	return strings.HasPrefix(path, runtimeDiagnosticsPath+"/")
 }

@@ -154,6 +154,10 @@ file. The console host writes to the log file only when `--log-file` is
 given; the desktop host writes to its own log file by default and
 `--log-file` moves it somewhere else.
 
+The requests of the Runtime / Logs endpoints are written at `debug` level, so
+the polling of that window does not fill the log history the window shows.
+Every other request is written at `info` level as before.
+
 ## Configuration
 
 HFDesk reads `hfdesk.json`, `hfdesk.yaml`, or `hfdesk.yml` from the launch directory first, then from `~/.config`. Settings saved from the UI are written back to the launch directory.

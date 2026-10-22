@@ -57,14 +57,36 @@ func newRuntimeTestServer(pipeline *logging.Pipeline) *Server {
 	}
 }
 
+// runtimeLocalHost is the host of a request that names the local machine.
+//
+// The local-only guard requires it, so every request that the guard is
+// supposed to serve carries it.
+const runtimeLocalHost = "127.0.0.1:8080"
+
 // runtimeRequest builds a request for the runtime endpoints with an explicit
 // peer address.
 //
 // httptest.NewRequest uses 192.0.2.1:1234, the documentation address of
 // TEST-NET-1, as the peer, so every allowed case has to set its own.
+//
+// It also uses example.com as the host, which the local-only guard
+// rejects: the host of a request has to name the local machine, so every
+// request that the guard is supposed to serve sets a loopback host.
 func runtimeRequest(method, target, remoteAddr string) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
 	r.RemoteAddr = remoteAddr
+	r.Host = runtimeLocalHost
+	return r
+}
+
+// runtimeRequestWithHost builds a request for the runtime endpoints with an
+// explicit peer address and an explicit host.
+//
+// The host is set on the request itself, because that is where the server
+// reads the Host header from.
+func runtimeRequestWithHost(method, target, remoteAddr, host string) *http.Request {
+	r := runtimeRequest(method, target, remoteAddr)
+	r.Host = host
 	return r
 }
 
@@ -73,6 +95,22 @@ var runtimeLogPaths = []string{
 	"/api/runtime",
 	"/api/runtime/logs",
 	"/api/runtime/logs/stream",
+}
+
+// runtimeSurfaceRequests are the requests of the whole runtime surface: the
+// status, the log page, the log stream and the two actions of the window.
+//
+// The surface shares one guard, so every request of it is covered by the
+// same rules.
+var runtimeSurfaceRequests = []struct {
+	method string
+	path   string
+}{
+	{method: http.MethodGet, path: "/api/runtime"},
+	{method: http.MethodGet, path: "/api/runtime/logs"},
+	{method: http.MethodGet, path: "/api/runtime/logs/stream"},
+	{method: http.MethodPost, path: "/api/runtime/open-logs"},
+	{method: http.MethodPost, path: "/api/runtime/open-ui"},
 }
 
 // TestRuntimeEndpointsRejectNonLoopbackPeer proves that the runtime data of
@@ -204,6 +242,135 @@ func TestRuntimeOriginGuard(t *testing.T) {
 			handler.ServeHTTP(recorder, r)
 			if recorder.Code != c.want {
 				t.Fatalf("status = %d, want %d", recorder.Code, c.want)
+			}
+		})
+	}
+}
+
+// TestRuntimeEndpointsRejectNonLocalHost proves the third rule of the
+// local-only guard: the host of the request has to name the local machine.
+//
+// A name of another site can be pointed at 127.0.0.1, and the request the
+// browser then makes is same origin for the browser, so it carries no Origin
+// header at all. The peer of such a request is loopback and there is no
+// Origin, so only the host tells it apart from a native client.
+func TestRuntimeEndpointsRejectNonLocalHost(t *testing.T) {
+	pipeline, logger := newRuntimeTestPipeline(t, 16)
+	logger.Info("private record", "token", "value")
+	handler := newRuntimeTestServer(pipeline).handler()
+
+	// The openers are stubbed: a request that reaches a handler must
+	// never start a browser or a file manager.
+	browser := stubOpenBrowserURL(t, nil)
+	folder := stubOpenLogDirectory(t, nil)
+
+	cases := []struct {
+		name string
+		host string
+	}{
+		{name: "external hostname", host: "evil.example"},
+		{name: "external hostname with a port", host: "evil.example:8080"},
+		{name: "hostname that ends in localhost", host: "localhost.evil.example"},
+		{name: "hostname that starts with a loopback address", host: "127.0.0.1.evil.example"},
+		{name: "non-loopback address", host: "192.0.2.10"},
+		{name: "non-loopback address with a port", host: "192.0.2.10:8080"},
+		{name: "non-loopback IPv6 address", host: "[2001:db8::1]:8080"},
+		{name: "empty host", host: ""},
+		{name: "host that is only a port", host: ":8080"},
+		{name: "host with a trailing dot", host: "localhost."},
+		{name: "loopback address with a trailing dot", host: "127.0.0.1."},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, request := range runtimeSurfaceRequests {
+				// The context bounds the request: a log stream that is
+				// served holds the response open, and a test that
+				// hangs says less than a test that fails.
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder,
+					runtimeRequestWithHost(request.method, request.path, "127.0.0.1:5555", c.host).WithContext(ctx))
+				cancel()
+
+				if recorder.Code != http.StatusForbidden {
+					t.Errorf("%s %s: status = %d, want %d", request.method, request.path,
+						recorder.Code, http.StatusForbidden)
+				}
+				body := recorder.Body.String()
+				for _, secret := range []string{"private record", "logCursor", "\"version\"", "\"records\"", "\"url\""} {
+					if strings.Contains(body, secret) {
+						t.Errorf("%s %s: rejection body %q carries runtime data (%q)",
+							request.method, request.path, body, secret)
+					}
+				}
+			}
+		})
+	}
+
+	if len(browser.urls) != 0 {
+		t.Errorf("the rejected requests opened %v", browser.urls)
+	}
+	if len(folder.paths) != 0 {
+		t.Errorf("the rejected requests opened %v", folder.paths)
+	}
+}
+
+// TestRuntimeEndpointsAllowLocalHost proves that a request that names the
+// local machine is served, whatever the port it uses.
+func TestRuntimeEndpointsAllowLocalHost(t *testing.T) {
+	pipeline, _ := newRuntimeTestPipeline(t, 16)
+	handler := newRuntimeTestServer(pipeline).handler()
+
+	// The openers are stubbed: a served request must never start a
+	// browser or a file manager.
+	stubOpenBrowserURL(t, nil)
+	stubOpenLogDirectory(t, nil)
+
+	cases := []struct {
+		name string
+		host string
+	}{
+		{name: "localhost", host: "localhost"},
+		{name: "localhost with a port", host: "localhost:8080"},
+		{name: "loopback address", host: "127.0.0.1"},
+		{name: "loopback address with a port", host: "127.0.0.1:8080"},
+		{name: "another address of the loopback range", host: "127.0.0.2"},
+		{name: "another address of the loopback range with a port", host: "127.0.0.53:8080"},
+		{name: "IPv6 loopback", host: "[::1]"},
+		{name: "IPv6 loopback with a port", host: "[::1]:8080"},
+		{name: "non-standard port", host: "127.0.0.1:54321"},
+		{name: "non-standard port on localhost", host: "localhost:9999"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The log stream is not part of the cases: it holds the
+			// response open, and a served stream is proven by the
+			// other endpoints of the surface.
+			for _, path := range []string{"/api/runtime", "/api/runtime/logs"} {
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder,
+					runtimeRequestWithHost(http.MethodGet, path, "127.0.0.1:5555", c.host))
+
+				if recorder.Code != http.StatusOK {
+					t.Errorf("%s: status = %d, want %d (body %q)", path,
+						recorder.Code, http.StatusOK, recorder.Body.String())
+				}
+			}
+
+			// The two actions of the surface are served as well: the
+			// guard does not reject them. They answer with 404 here,
+			// because the test server has no log file and no bound
+			// address.
+			for _, path := range []string{"/api/runtime/open-logs", "/api/runtime/open-ui"} {
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder,
+					runtimeRequestWithHost(http.MethodPost, path, "127.0.0.1:5555", c.host))
+
+				if recorder.Code == http.StatusForbidden {
+					t.Errorf("%s: status = %d, want the request to be served", path, recorder.Code)
+				}
 			}
 		})
 	}

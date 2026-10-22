@@ -198,9 +198,15 @@ func TestRuntimeLogsCursorFollowsTheDeliveredRecords(t *testing.T) {
 func TestRuntimeLogsNeverSkipsARecordWhileTheServerEmits(t *testing.T) {
 	const (
 		emitted = 120
-		// idlePolls is the number of polls without a new record that
-		// end the test when the server stopped emitting.
-		idlePolls = 50
+		// idleWait is how long the client waits for a new record
+		// before it gives up when the server stopped emitting.
+		//
+		// The wait is a duration and not a number of polls: a record
+		// that is in flight leaves the ring empty, and how many
+		// polls a client fits into that window depends on how long a
+		// poll takes. A count of polls is not a measure of time, and a
+		// client that counts them gives up before the record lands.
+		idleWait = 50 * time.Millisecond
 	)
 
 	pipeline, err := logging.New(logging.Options{
@@ -228,7 +234,9 @@ func TestRuntimeLogsNeverSkipsARecordWhileTheServerEmits(t *testing.T) {
 	delivered := make(map[uint64]bool, emitted)
 	var violations []string
 	cursor := uint64(0)
-	idle := 0
+	// idleSince is the moment the client last saw a new record. The zero
+	// value means the client has not seen one yet.
+	var idleSince time.Time
 	deadline := time.Now().Add(30 * time.Second)
 
 poll:
@@ -243,9 +251,11 @@ poll:
 				violations = append(violations, fmt.Sprintf(
 					"an empty page changed the cursor from %d to %d", cursor, page.Cursor))
 			}
-			idle++
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
 		} else {
-			idle = 0
+			idleSince = time.Time{}
 			last := page.Records[len(page.Records)-1].Seq
 			if page.Cursor != last {
 				violations = append(violations, fmt.Sprintf(
@@ -266,7 +276,7 @@ poll:
 		// server stopped emitting and the client sees nothing new.
 		select {
 		case <-done:
-			if idle > idlePolls {
+			if !idleSince.IsZero() && time.Since(idleSince) > idleWait {
 				break poll
 			}
 		default:

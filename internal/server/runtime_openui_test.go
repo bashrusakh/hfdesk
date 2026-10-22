@@ -57,9 +57,13 @@ func newRuntimeUIServer(t *testing.T) *Server {
 
 // runtimeOpenUIRequest builds the request of the open-ui action with an
 // explicit peer address, an optional origin and an optional body.
+//
+// The host names the local machine, because the local-only guard rejects a
+// request that asks for another name.
 func runtimeOpenUIRequest(remoteAddr, origin, body string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/api/runtime/open-ui", strings.NewReader(body))
 	r.RemoteAddr = remoteAddr
+	r.Host = runtimeLocalHost
 	if origin != "" {
 		r.Header.Set("Origin", origin)
 	}

@@ -592,7 +592,17 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		// The path is logged without the query string: a query can carry a
 		// credential the caller put there.
-		serverLog.Info("request",
+		//
+		// The requests of the runtime surface are logged at debug level.
+		// The Runtime window polls the status every few seconds, and at
+		// info level the polling of the window that shows the log would
+		// fill the bounded history the window exists to show. A user who
+		// asks for debug level still sees them.
+		logRequest := serverLog.Info
+		if isRuntimeDiagnosticsPath(r.URL.Path) {
+			logRequest = serverLog.Debug
+		}
+		logRequest("request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"duration", time.Since(start).Round(time.Millisecond),

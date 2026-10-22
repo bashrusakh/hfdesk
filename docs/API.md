@@ -52,12 +52,42 @@ POST /api/runtime/open-ui
 
 These endpoints report the status and the log of the running server. They
 expose local process diagnostics, so they stay local: whatever address the
-server binds to, a request whose peer is not a loopback address (`127.0.0.0/8`
-or `::1`) is rejected with `403`, and so is a request that carries an
-`Origin` header of another site. A forwarded header such as
-`X-Forwarded-For` is ignored, and a request without an `Origin` header (a
-native client) is allowed. The Runtime window is served from the same
-loopback origin as the API, so it keeps working.
+server binds to, a request is rejected with `403` unless every one of the
+following rules holds.
+
+- The peer address is a loopback address (`127.0.0.0/8` or `::1`). The peer
+  is taken from the connection alone, so a forwarded header such as
+  `X-Forwarded-For` is ignored and cannot be used to fake a loopback peer.
+- The `Origin` header, when the request carries one, names the local
+  machine: a loopback address (`127.0.0.0/8` or `::1`) or the name
+  `localhost`. A request without an `Origin` header is not rejected by this
+  rule, because a native client sends none.
+- The `Host` header names the local machine: the host part of the header is
+  a loopback address (`127.0.0.0/8` or `::1`) or exactly `localhost`. The
+  port is irrelevant and may be any port. An IPv6 literal is written in
+  brackets, with or without a port (`[::1]` and `[::1]:8080`). The match is
+  exact, so `evil.example`, `localhost.evil.example` and
+  `127.0.0.1.evil.example` are rejected, and so is an empty or malformed
+  `Host` header.
+
+The third rule closes the DNS rebinding hole. A name of another site can be
+pointed at `127.0.0.1`, and the request the browser then makes is same
+origin for the browser, so it carries no `Origin` header at all: the peer is
+loopback and there is no origin to check. The name the client asked for is
+what tells such a request apart from a native client.
+
+The Runtime window is served from the loopback address of the running
+server, so its own requests carry a loopback `Host` and keep working. A
+server that is reached through another name of the local machine (a name
+that resolves to `127.0.0.1` without being `localhost`) does not serve the
+runtime endpoints: the name has to be a loopback address or `localhost`.
+
+The requests of these endpoints are written to the log at `debug` level, not
+at `info` level. The Runtime window polls the status every few seconds, and
+at `info` level that polling filled the bounded history the window exists to
+show. Every other request keeps the `info` level, including a request that
+answers with an error. A user who asks for `debug` level still sees the
+requests of the runtime endpoints.
 
 `GET /api/runtime` returns:
 

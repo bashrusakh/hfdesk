@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -359,6 +360,109 @@ func TestServerRequestLogUsesStructuredPipeline(t *testing.T) {
 	if standardLog.String() != "" {
 		t.Errorf("request log still wrote through the standard library logger: %q", standardLog.String())
 	}
+}
+
+// TestRuntimeRequestsAreNotLoggedAtInfoLevel proves that the requests of the
+// runtime surface do not fill the info level history that the Runtime window
+// shows.
+//
+// The window polls the status every few seconds, and every poll was written
+// into the same bounded ring as the records the window exists to show, so
+// the history was gone after half an hour. The requests of the surface are
+// logged at debug level instead.
+//
+// Every other request keeps its level, and a request that answers with an
+// error is still an info level record: the failure of an endpoint is
+// information the user needs.
+func TestRuntimeRequestsAreNotLoggedAtInfoLevel(t *testing.T) {
+	pipeline := installRequestLogPipeline(t, slog.LevelInfo)
+	s := &Server{jobs: newTestJobManager(t, Config{CacheDir: t.TempDir()}, nil)}
+	handler := s.handler()
+
+	// A request of the runtime surface.
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, runtimeRequest(http.MethodGet, "/api/runtime", "127.0.0.1:5555"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	// A request of another endpoint that answers with an error.
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/jobs/missing", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+
+	records, _ := pipeline.Records(0, logging.OldestFirst)
+	info := requestLogPaths(records, slog.LevelInfo)
+	for _, path := range info {
+		if isRuntimeDiagnosticsPath(path) {
+			t.Errorf("the request of the runtime surface (%q) is logged at info level", path)
+		}
+	}
+	if !slices.Contains(info, "/api/jobs/missing") {
+		t.Errorf("the info level records %v do not carry the failed request", info)
+	}
+}
+
+// TestRuntimeRequestsAreLoggedAtDebugLevel proves that the information about
+// the requests of the runtime surface is not dropped: a user who asks for
+// debug level still sees them.
+func TestRuntimeRequestsAreLoggedAtDebugLevel(t *testing.T) {
+	pipeline := installRequestLogPipeline(t, slog.LevelDebug)
+	s := &Server{jobs: newTestJobManager(t, Config{CacheDir: t.TempDir()}, nil)}
+	handler := s.handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, runtimeRequest(http.MethodGet, "/api/runtime", "127.0.0.1:5555"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	records, _ := pipeline.Records(0, logging.OldestFirst)
+	debug := requestLogPaths(records, slog.LevelDebug)
+	if !slices.Contains(debug, "/api/runtime") {
+		t.Errorf("the debug level records %v do not carry the request of the runtime surface", debug)
+	}
+	for _, path := range requestLogPaths(records, slog.LevelInfo) {
+		if isRuntimeDiagnosticsPath(path) {
+			t.Errorf("the request of the runtime surface (%q) is logged at info level", path)
+		}
+	}
+}
+
+// installRequestLogPipeline installs a logging pipeline as the process wide
+// default logger and returns it, so a test can read the records of the
+// request log with their level.
+//
+// The pipeline is installed process wide because that is how the application
+// installs it: the request log resolves the current default logger on every
+// call.
+func installRequestLogPipeline(t *testing.T, level slog.Level) *logging.Pipeline {
+	t.Helper()
+
+	pipeline, err := logging.New(logging.Options{Level: level, RingCapacity: 64})
+	if err != nil {
+		t.Fatalf("build logging pipeline: %v", err)
+	}
+	previous := slog.Default()
+	slog.SetDefault(pipeline.Logger())
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return pipeline
+}
+
+// requestLogPaths returns the paths of the request records that carry the
+// given level.
+func requestLogPaths(records []logging.Record, level slog.Level) []string {
+	var paths []string
+	for _, record := range records {
+		if record.Message != "request" || record.Level != level {
+			continue
+		}
+		path, _ := record.Attrs["path"].(string)
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 // TestProxyErrorReasonDropsCredentialBearingURL proves that a proxy

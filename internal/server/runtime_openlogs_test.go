@@ -56,9 +56,13 @@ func stubOpenLogDirectory(t *testing.T, err error) *openLogDirectoryStub {
 
 // runtimeOpenLogsRequest builds the request of the open-logs action with an
 // explicit peer address, an optional origin and an optional body.
+//
+// The host names the local machine, because the local-only guard rejects a
+// request that asks for another name.
 func runtimeOpenLogsRequest(remoteAddr, origin, body string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/api/runtime/open-logs", strings.NewReader(body))
 	r.RemoteAddr = remoteAddr
+	r.Host = runtimeLocalHost
 	if origin != "" {
 		r.Header.Set("Origin", origin)
 	}
