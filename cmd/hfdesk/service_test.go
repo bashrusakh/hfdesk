@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -15,20 +16,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
-
-// interactiveFlagPattern matches the registration of a flag of the
-// interactive command line, e.g. `flag.IntVar(&port, "port", 8080, ...)`.
-var interactiveFlagPattern = regexp.MustCompile(`flag\.\w+Var\(&\w+, "([^"]+)"`)
 
 // fakeManager is a service.Manager that answers with a fixed status.
 //
@@ -2008,20 +2005,82 @@ func TestRunPathRejectsAnUnknownFlag(t *testing.T) {
 	}
 }
 
+// TestInteractiveFlagsAreUnchanged proves that the service mode did not
+// change the interactive command line.
+//
+// The interactive host registers its flags through the shared application
+// layer, so the flag set of this test is built the way the interactive path
+// builds it: the names and the defaults are read from the registered flag
+// set and not from a source file. A source scan only proves where a
+// registration is written down, while the flag set proves what the command
+// line really offers.
 func TestInteractiveFlagsAreUnchanged(t *testing.T) {
-	source, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatalf("read main.go: %v", err)
-	}
+	var opts app.Options
+	fs := flag.NewFlagSet("hfdesk", flag.ContinueOnError)
+	app.RegisterFlags(fs, &opts)
 
-	registered := map[string]bool{}
-	for _, match := range interactiveFlagPattern.FindAllStringSubmatch(string(source), -1) {
-		registered[match[1]] = true
-	}
-
-	for _, name := range []string{"port", "cache-dir", "token", "local-dir", "stall-timeout", "open", "no-open"} {
-		if !registered[name] {
+	// The lookup reports a missing flag instead of dereferencing it, so a
+	// flag that is gone does not turn the defaults into a panic. A flag
+	// that is gone is reported once, not once per assertion about it.
+	reported := map[string]bool{}
+	lookup := func(name string) *flag.Flag {
+		f := fs.Lookup(name)
+		if f == nil && !reported[name] {
+			reported[name] = true
 			t.Errorf("the interactive command line does not register the %q flag any more", name)
+		}
+		return f
+	}
+
+	// The original flags of the interactive command line. Their names are
+	// the contract with the scripts that call the host.
+	for _, name := range []string{"port", "cache-dir", "token", "local-dir", "stall-timeout", "open", "no-open"} {
+		lookup(name)
+	}
+
+	// The defaults are the part of the contract that matters most: a host
+	// that is started without an argument has to behave exactly as it
+	// behaved before the service mode was added.
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse the interactive flags: %v", err)
+	}
+	if opts.Port != 8080 {
+		t.Errorf("the default port is %d, want 8080", opts.Port)
+	}
+	if !opts.OpenUI {
+		t.Error("the default of the \"open\" flag is false, want true")
+	}
+	if opts.NoOpen {
+		t.Error("the default of the \"no-open\" flag is true, want false")
+	}
+	for _, c := range []struct {
+		name  string
+		value string
+	}{
+		{"cache-dir", opts.CacheDir},
+		{"token", opts.Token},
+		{"local-dir", opts.LocalDir},
+		{"stall-timeout", opts.StallTimeout},
+	} {
+		if c.value != "" {
+			t.Errorf("the default of the %q flag is %q, want an empty value", c.name, c.value)
+		}
+	}
+
+	// The defaults of the registered flags themselves must be the very
+	// same values: the registration and the options are one contract.
+	if f := lookup("port"); f != nil && f.DefValue != "8080" {
+		t.Errorf("the registered default of the \"port\" flag is %q, want %q", f.DefValue, "8080")
+	}
+	if f := lookup("open"); f != nil && f.DefValue != "true" {
+		t.Errorf("the registered default of the \"open\" flag is %q, want %q", f.DefValue, "true")
+	}
+	if f := lookup("no-open"); f != nil && f.DefValue != "false" {
+		t.Errorf("the registered default of the \"no-open\" flag is %q, want %q", f.DefValue, "false")
+	}
+	for _, name := range []string{"cache-dir", "token", "local-dir", "stall-timeout"} {
+		if f := lookup(name); f != nil && f.DefValue != "" {
+			t.Errorf("the registered default of the %q flag is %q, want an empty value", name, f.DefValue)
 		}
 	}
 }
