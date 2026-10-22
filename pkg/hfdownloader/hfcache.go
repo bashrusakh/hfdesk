@@ -385,7 +385,10 @@ func (s BlobStatus) String() string {
 // The result distinguishes three ownership outcomes, and never guesses:
 //
 //   - a PROVEN live owner (the persistent <staging>.lock is held exclusively)
-//     is reported as BlobDownloading, so the caller may skip the item;
+//     is reported as BlobDownloading. The caller must NOT skip the item: the
+//     file is not present while that owner holds the key, so the caller waits
+//     for the blob key's ownership domain and re-checks the published
+//     content-addressed target afterwards;
 //   - a PROVABLY dead owner (a free lock plus a lock-fenced record, or
 //     same-host process evidence that the recorded owner is gone) is reported
 //     as BlobStale, so the caller may resume it;

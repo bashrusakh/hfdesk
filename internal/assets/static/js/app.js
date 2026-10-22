@@ -1525,9 +1525,10 @@ async function loadRepositoryDetails(entry) {
 
     // Reconcile live job state before the cache check. Job state contributes
     // running/queued for artifacts; cache presence (and a 404) is the final
-    // authority for artifact 'done' status. Job completion does not prove the
-    // artifact is cached: a file can be skipped while another process is still
-    // downloading it.
+    // authority for artifact 'done' status. A file owned by another live
+    // writer is never a successful skip: the item waits for the blob key's
+    // ownership domain and re-checks the published blob, so a completed job
+    // means the requested files are present.
     refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
     await syncLocalAnalysisStatus(data);
     if (requestId !== analyzeRequestId) return;
@@ -5389,8 +5390,9 @@ async function loadRepositoryDetails(entry) {
   function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
     // Reconcile per-quant status with the live job list. Active jobs set
     // running/queued; artifact completion is never inferred from job status,
-    // because a completed job can include a shard skipped as "downloading by
-    // another process". Cache synchronization is the authority for artifact
+    // because a shard owned by another live writer is never a successful skip
+    // (the item waits for the blob key's ownership domain and re-checks the
+    // published blob). Cache synchronization is the authority for artifact
     // 'done'. Stale running/queued entries (job gone, cancelled or failed) are
     // cleared so the Download button reappears. 'done' is kept.
     const map = getDlStatus(repo, isDataset);

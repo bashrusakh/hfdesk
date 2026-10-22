@@ -484,8 +484,17 @@ LOOP:
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
-							// A PROVEN live writer owns this blob key.
-							return true, "downloading by another process", nil
+							// A PROVEN live writer owns this blob key, so
+							// the file is NOT present. This must NOT
+							// become a successful skip: a job that
+							// reports success must mean the requested
+							// files are present. The item proceeds to the
+							// blob key's ownership domain, waits for the
+							// live owner (bounded) and re-checks the
+							// published blob afterwards, so a blob the
+							// owner publishes is reused instead of
+							// transferred a second time.
+							return false, "", nil
 						}
 					}
 					return false, "", nil
@@ -664,12 +673,20 @@ LOOP:
 			// from adopting, migrating or deleting this item's LIVE partial,
 			// and keeps the publication decision and the placement that
 			// follows it together.
+			//
+			// A PROVEN live owner of the key is WAITED FOR (bounded and
+			// context-aware), not skipped: the file is not present while the
+			// owner holds the key, so a skip would report a success the cache
+			// does not have. After the domain is acquired the published
+			// content-addressed target is re-checked, so a blob published
+			// while this writer waited is reused instead of transferred again.
 			var (
 				dlErr  error
 				domain *blobDomain
 			)
 			if useHFCache && it.SHA256 != "" {
-				dom, derr := blobDomainAcquire(fileCtx, repoDir.BlobPath(it.SHA256), dst)
+				blobPath := repoDir.BlobPath(it.SHA256)
+				dom, derr := blobDomainAcquire(fileCtx, blobPath, dst)
 				switch {
 				case derr == nil:
 					domain = dom
@@ -679,11 +696,22 @@ LOOP:
 					// (a filesystem without hard links) is only exclusive to
 					// the domain while it is held.
 					mpOpts.Domain = domain
+					// The blob may have been published while this writer
+					// waited for the domain - by the live owner it waited
+					// for, or by the other route of this process. An
+					// existing content-addressed blob is the completion
+					// proof, so it is reused: the item finishes as an
+					// ordinary skip and NO bytes are transferred.
+					if _, serr := os.Stat(blobPath); serr == nil {
+						dlErr = errBlobAlreadyComplete
+					}
 				case errors.Is(derr, errStagingOwnershipBusy):
-					// A PROVEN live writer owns this blob key: this item is
-					// not ours to write. It is finished as a skip, exactly
-					// like the pre-download skip check.
-					dlErr = errBlobIncompleteOwned
+					// A PROVEN live writer still holds the blob key's
+					// ownership domain after the bounded wait. The file is
+					// NOT present, so this is an actionable failure for this
+					// item - never a successful skip and never a silent
+					// success.
+					dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 				default:
 					// The lifetime ownership of this blob key is unavailable:
 					// the OS lock is unsupported, denied, or the filesystem
@@ -723,29 +751,26 @@ LOOP:
 				multipartRan = false
 			}
 
-			// A staging file owned by another live writer — or already
-			// published by one — is not a failure: finish this item as a
-			// skip, exactly like the pre-download skip check does.
-			if errors.Is(dlErr, errBlobIncompleteOwned) || errors.Is(dlErr, errBlobAlreadyComplete) {
+			// A published content-addressed blob is the completion proof:
+			// finish this item as an ordinary skip, exactly like the
+			// pre-download skip check does. The links for THIS item's path
+			// are created, so the requested file is present in the cache.
+			if errors.Is(dlErr, errBlobAlreadyComplete) {
 				recordSkippedBlobLink(it, finalRel, filterSubdir)
-				reason := "downloading by another process"
-				if errors.Is(dlErr, errBlobAlreadyComplete) {
-					reason = "blob exists"
-					if useHFCache && it.SHA256 != "" {
-						// The blob is complete; make sure this file's
-						// snapshot and friendly entries exist for its own
-						// path (a cross-repo dedup winner may have created
-						// entries only for its path).
-						if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil && !cfg.NoFriendlyView {
-							repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
-						}
+				if useHFCache && it.SHA256 != "" {
+					// The blob is complete; make sure this file's
+					// snapshot and friendly entries exist for its own
+					// path (a cross-repo dedup winner may have created
+					// entries only for its path).
+					if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil && !cfg.NoFriendlyView {
+						repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
 					}
 				}
 				if cfg.OnPartialFile != nil {
 					cfg.OnPartialFile(dst, true)
 				}
 				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
-					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
+					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (blob exists)"})
 					atomic.AddInt64(&skippedCount, 1)
 					if manifestBuilder != nil {
 						manifestMu.Lock()
@@ -754,6 +779,13 @@ LOOP:
 					}
 				}
 				return
+			}
+			// A live writer that still owns this item's staging is NOT a
+			// successful skip: the file is not present, so the item fails
+			// below with an actionable error instead of reporting a
+			// completion the cache does not have.
+			if errors.Is(dlErr, errBlobIncompleteOwned) {
+				dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 			}
 			if dlErr != nil {
 				fatal := fmt.Errorf("download %s: %w", finalRel, dlErr)
@@ -1176,6 +1208,23 @@ func cleanupLegacyPartials(dst string) {
 // downloader has renamed the completed bytes to tmp-<sha> but before
 // StoreDownloadedFile has moved them into the final blob.
 //
+// OWNERSHIP: in HF cache mode every artifact above belongs to ONE blob
+// key, and the key's ownership domain is what a writer of that key holds
+// while it works on it. The artifacts are therefore removed only while
+// that domain is held: a cleanup that removed them without the domain
+// could delete the LIVE partial of another writer (a cancelled job whose
+// key meanwhile became owned by another job), and that writer would keep
+// writing to an unlinked inode and fail its later publication with ENOENT.
+// When a live owner holds the key - in this process or in another one -
+// the artifacts are left alone and the contention is reported. The job
+// that owns the key can still clean up its own artifacts: its own writer
+// releases the domain when it returns, and the downloader's own cancel
+// cleanup removes its staging while it still holds the domain.
+//
+// A legacy/output-mode destination is not blob-key-scoped: its .part
+// family belongs to the destination, not to a content-addressed key, and
+// keeps its historical cleanup behavior.
+//
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor
 // OutputDir is set.
@@ -1190,6 +1239,30 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 			downloadLog.Warn("skip cleanup for out-of-root partial destination", "path", dst)
 			continue
 		}
+		if useHFCache {
+			// The blob-key namespace: the staging name, its single-request
+			// .part, the legacy .part-NN parts and the blob-keyed staging
+			// pair all belong to ONE blob key. They are removed only while
+			// that key's ownership domain is held.
+			if key, ok := blobKeyForCacheDst(dst); ok {
+				domain, derr := blobDomainCleanupAcquire(context.Background(), key, dst)
+				if derr != nil {
+					// A live owner holds the key (in this process or in
+					// another one), or its ownership could not be
+					// established. The artifacts are left alone: not
+					// deleting is the safe choice, because the owner may
+					// be writing them right now.
+					downloadLog.Warn("skip cleanup of a blob key owned by another live writer",
+						"path", dst, "error", derr)
+					continue
+				}
+				removePartialArtifacts(dst)
+				removeHFCacheTemp(dst)
+				removeBlobStagingForTemp(dst)
+				domain.release()
+				continue
+			}
+		}
 		if err := removePartialArtifacts(dst); err != nil {
 			downloadLog.Warn("cleanup partials failed", "path", dst, "error", err)
 		}
@@ -1199,6 +1272,34 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 		}
 	}
 	return nil
+}
+
+// blobKeyForCacheDst derives the blob key a cache-mode destination belongs
+// to, and reports whether the destination is blob-key-scoped at all.
+//
+// A cache-mode destination is the staging name the downloader allocates for
+// an item: blobs/tmp-<sha>. The blob key it belongs to is blobs/<sha>, and
+// that key's ownership domain lock is the persistent sibling
+// blobs/tmp-<sha>.lock - exactly the lock the item's writer holds. The
+// derivation therefore lets a cleanup take the SAME domain the writer holds.
+//
+// A destination outside a blobs directory, or one that is not a tmp-<name>
+// staging name, has no blob key: it is not blob-key-scoped and keeps its
+// historical cleanup behavior.
+func blobKeyForCacheDst(dst string) (string, bool) {
+	dir := filepath.Dir(dst)
+	if filepath.Base(dir) != "blobs" {
+		return "", false
+	}
+	name, found := strings.CutPrefix(filepath.Base(dst), "tmp-")
+	if !found || name == "" {
+		return "", false
+	}
+	key, err := SafeJoin(dir, name)
+	if err != nil {
+		return "", false
+	}
+	return key, true
 }
 
 // removeBlobStagingForTemp removes the blob-keyed staging artifacts the

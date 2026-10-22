@@ -201,6 +201,57 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   existing content-addressed blob. The domain lock file is
   persistent, is never unlinked, and is excluded from cache statistics,
   listings, mirrors and cache deletion like every other `.lock` artifact.
+- JOB CONTRACT: "job completed successfully" MUST mean the requested files are
+  present. A file owned by another LIVE writer is NOT present, so it is NEVER
+  a successful skip. When the blob key's ownership domain is held by a proven
+  live owner (another process, or another writer of this process), the item
+  WAITS for the domain — bounded, context-aware, never a takeover — and, once
+  it holds the domain, RE-CHECKS the published content-addressed target:
+  - the blob is present (the owner published it while the item waited): the
+    item completes as an ordinary skip ("blob exists"), with its own snapshot
+    and friendly entries created and NO additional network transfer;
+  - the owner released the domain without publishing: this writer downloads
+    the file itself and publishes it;
+  - the owner still holds the domain when the wait budget expires: the item
+    fails with an explicit, actionable error ("blob <sha> is being downloaded
+    by another process; try again later"), and the job does not report
+    success while that file is missing.
+  The re-check trusts the EXISTENCE of the published content-addressed blob as
+  completion proof, exactly like the pre-existing "blob exists" skip does, and
+  does not re-verify its content: in `size` mode a torn blob written by a
+  foreign writer is therefore accepted as complete — the same content-addressed
+  assumption the pre-existing skip already makes. Do not claim content
+  verification for the wait/re-check path.
+  The wait budget is bounded and derived from the existing ownership-lock
+  convention (the download budget is 60 times the 5s acquisition window, so
+  the effective budget is 5 MINUTES); it is a package-level knob, not a user
+  setting, and the in-process slot wait is bounded by the job's context only
+  (its holder is a goroutine of this process that finishes or is cancelled).
+  Cancellation stays prompt. COST: the wait happens INSIDE the item's
+  goroutine, and the item already holds its `MaxActiveDownloads` slot, so a
+  waiting item occupies a download slot for up to that budget — a job whose
+  item waits for a foreign owner can look stalled and holds a concurrency slot
+  it is not transferring with. What the operator sees: the item stays in
+  progress (no progress events are emitted while it waits, so its byte counter
+  does not move), and when the budget expires the item fails with the
+  actionable error above and the job's status is failed, not completed. The
+  existing "blob exists" skip (the file IS present) and the existing
+  unknown-ownership error (`BlobOwnershipUnknown`) are unchanged.
+- CLEANUP PARTICIPATES IN THE SAME OWNERSHIP PROTOCOL. The artifacts of one
+  blob key — the `blobs/tmp-<sha>` staging name, its single-request `.part`,
+  the legacy `.part-NN` parts and the blob-keyed staging pair — are removed
+  only while that key's ownership domain is held. A cleanup without the domain
+  could delete another live writer's LIVE partial: that writer would keep
+  writing to an unlinked inode and its later publication would fail with
+  ENOENT. When a live owner holds the key (in this process or in another one),
+  the artifacts are left alone and the contention is reported. A job CAN still
+  clean up its OWN artifacts: its writer releases the domain when it returns,
+  and the downloader's own cancel cleanup removes its staging while it still
+  holds the domain. The residual limitation: the cleanup cannot distinguish
+  "my own key" from "another live owner of the same key" beyond the domain
+  itself, so a key that another writer owns is left alone (safe) even when the
+  cancelling job also had bytes for it. A legacy/output-mode destination is
+  not blob-key-scoped and keeps its historical cleanup behavior.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
   - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
@@ -225,23 +276,27 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   publishes normally, and the two tiers differ in strength, not in
   availability.
 - The ownership check reports three outcomes and never guesses: a PROVEN live
-  owner (the lock is held exclusively) is `BlobDownloading` and may be skipped;
-  a PROVABLY dead owner is `BlobStale` and may be resumed; an UNKNOWN
-  ownership state (the probe failed, or the platform cannot represent the
-  lock) is `BlobOwnershipUnknown` plus an error wrapping
-  `ErrBlobOwnershipUnknown`, and the caller surfaces the failure. An unknown
-  state must never become a successful skip: the job would report completion
-  with the blob still missing. The incomplete payload is preserved.
+  owner (the lock is held exclusively) is `BlobDownloading` and the caller
+  MUST NOT skip the item — the file is not present while the owner holds it, so
+  the item waits for the blob key's ownership domain and re-checks the
+  published target (see the job contract above); a PROVABLY dead owner is
+  `BlobStale` and may be resumed; an UNKNOWN ownership state (the probe failed,
+  or the platform cannot represent the lock) is `BlobOwnershipUnknown` plus an
+  error wrapping `ErrBlobOwnershipUnknown`, and the caller surfaces the
+  failure. An unknown state must never become a successful skip: the job would
+  report completion with the blob still missing. The incomplete payload is
+  preserved.
 - Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
   (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
   before the claim transition and held through transfer, hashing and
-  publish/cleanup. A busy lock is a live owner (claim skips, cleanup skips,
-  `CheckBlob` reports downloading); a crashed process releases it at death, and
-  a suspended owner keeps it — there is deliberately no takeover while it is
-  alive. A free lock is authoritative only for a record written under it
-  (`LockFenced`). A fallback/legacy record is protected unless its same-host
-  owner is provably dead; age, ambiguous host/PID identity, or a free new lock
-  does not prove that an older writer cannot resume. If the lifetime lock cannot
+  publish/cleanup. A busy lock is a live owner (the claim reports it as owned
+  and the caller fails the item with the actionable live-owner error, the
+  cleanup skips, `CheckBlob` reports downloading); a crashed process releases
+  it at death, and a suspended owner keeps it — there is deliberately no
+  takeover while it is alive. A free lock is authoritative only for a record
+  written under it (`LockFenced`). A fallback/legacy record is protected unless
+  its same-host owner is provably dead; age, ambiguous host/PID identity, or a
+  free new lock does not prove that an older writer cannot resume. If the lifetime lock cannot
   be acquired (unsupported, denied, or filesystem error), fail the operation
   before mutating claims or payloads and preserve partials; this is an
   operation-time safety error, not a permanent platform-support policy. Keep
@@ -292,6 +347,18 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 
 - `JobManager` owns live job state; callers should receive snapshots, not shared
   mutable pointers.
+- A job that reports success must mean the requested files are present. A file
+  owned by another live writer is not present: it is waited for (bounded) and
+  re-checked, never reported as a completed skip. When the wait is exhausted
+  the item fails with an actionable error, and the job's status is failed, not
+  completed — see the downloader correctness rules for the ownership protocol.
+  The wait budget is 5 minutes, and the wait runs inside the item's goroutine,
+  which already holds one of the job's `MaxActiveDownloads` slots: a waiting
+  item therefore occupies a download slot for up to that budget, and a job
+  whose item waits for a foreign owner can look stalled. What the operator
+  sees: the item stays in progress (no progress events are emitted while it
+  waits, so its byte counter does not move), and when the budget expires the
+  item fails with the actionable error and the job's status is failed.
 - Do not hold the job manager lock while broadcasting to listeners or WebSocket
   clients.
 - Scheduler changes must preserve `max-active` semantics: queued jobs start in

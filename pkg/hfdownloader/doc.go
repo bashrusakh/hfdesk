@@ -168,7 +168,10 @@ Exactly one live writer may own a staging file. The exclusion fence is an
 OS-level exclusive lock on the persistent sibling file `<staging>.lock`,
 acquired before the claim transition and held for the whole ownership interval
 — claim read, create/resume, transfer, hashing, publish/cleanup. A busy lock
-means a live owner and a claimant skips the file. The lock is released by the
+means a live owner, and a claimant does NOT skip the file: the file is not
+present while the owner holds it, so the claimant waits for the blob key's
+ownership domain (bounded, context-aware, never a takeover) and re-checks the
+published content-addressed target afterwards. The lock is released by the
 kernel when the process exits, so a crashed owner is recoverable immediately; a
 suspended (but alive) process keeps ownership, and there is deliberately no
 take-over while it is alive — terminate it to recover. Unix uses
@@ -197,11 +200,13 @@ every peer: a concurrent claimant or status probe would then skip files that
 nobody is downloading. The observation therefore asks one question with one
 atomic, non-owning operation: is an exclusive holder present? A shared probe
 is granted unless an exclusive holder exists, so a refused shared probe proves
-a live writer (the claimant skips, exactly as before), and a granted shared
-probe proves no exclusive holder is present (the claimant retries its own
-acquisition within a bounded, cancellable window). A granted shared probe does
-not distinguish "a reader holds it" from "nobody holds it", and it does not
-need to: the real acquisition is the only operation that resolves that case.
+a live writer (the download path waits for the blob key's ownership domain and
+re-checks the published target, and the cleanup leaves the artifacts alone),
+and a granted shared probe proves no exclusive holder is present (the claimant
+retries its own acquisition within a bounded, cancellable window). A granted
+shared probe does not distinguish "a reader holds it" from "nobody holds it",
+and it does not need to: the real acquisition is the only operation that
+resolves that case.
 A contention that never resolves is reported as an actionable failure, never as
 a successful skip, because no live writer is proven to exist. A status probe in
 flight can therefore never turn a resumable download into a silently skipped
@@ -238,6 +243,12 @@ no-replace primitive instead of renaming over the target. The domain's lock
 file is persistent, is never unlinked, and is excluded from cache statistics,
 listings, mirrors and cache deletion like every other `.lock` artifact.
 
+The domain is also what a second writer of the same key waits for. A writer
+that finds the key owned by a live owner waits for the owner (bounded,
+context-aware) and re-evaluates the key afterwards, instead of taking the key
+over or skipping the item: the lock is never taken over, a suspended owner
+keeps it, and the wait ends in an actionable error rather than in a hang.
+
 The publication primitive has two tiers, and they guarantee different things.
 
 The atomic no-replace tier is the normal one: the payload is placed with a
@@ -266,14 +277,58 @@ never reached by accident, and hard-link support is not a prerequisite for
 downloading.
 
 The cache status check reports three ownership outcomes and never guesses. A
-proven live owner (the ownership lock is held exclusively) is `BlobDownloading`
-and may be skipped. A provably dead owner is `BlobStale` and may be resumed. An
+proven live owner (the ownership lock is held exclusively) is `BlobDownloading`;
+the caller must NOT skip that item, because the file is not present while the
+owner holds it. A provably dead owner is `BlobStale` and may be resumed. An
 unknown ownership state — the ownership probe failed, or the platform cannot
 represent the lock — is `BlobOwnershipUnknown` together with an error that
 wraps `ErrBlobOwnershipUnknown`. The caller surfaces that failure instead of
 skipping the item, because a skip would report a successful download with the
 blob still missing; the incomplete payload is preserved so a retry can resume
 it.
+
+The job contract follows from that: a job that reports success means the
+requested files are present. A file owned by another live writer is not
+present, so it is never a successful skip. When the blob key's ownership
+domain is held by a proven live owner — another process, or another writer of
+this process — the item WAITS for the domain (bounded and context-aware, never
+a takeover) and, once it holds the domain, RE-CHECKS the published
+content-addressed target. If the owner published the blob while the item
+waited, the item finishes as an ordinary "blob exists" skip with its own
+snapshot and friendly entries created and without another transfer; if the
+owner released the domain without publishing, this writer downloads the file
+itself; and if the owner still holds the domain when the wait budget expires,
+the item fails with an actionable error ("blob <sha> is being downloaded by
+another process; try again later") and the job does not report success while
+that file is missing. The re-check trusts the EXISTENCE of the published
+content-addressed blob as completion proof, exactly like the pre-existing
+"blob exists" skip does, and does not re-verify its content: in `size` mode a
+torn blob written by a foreign writer is therefore accepted as complete — the
+same content-addressed assumption the pre-existing skip already makes. The wait
+budget is a package-level knob derived from the existing ownership-lock
+convention — 60 times the 5s acquisition window, so the effective budget is 5
+minutes — not a user setting. The wait runs inside the item's goroutine, and
+the item already holds one of the job's `MaxActiveDownloads` slots, so a
+waiting item occupies a download slot for up to that budget and a job whose
+item waits for a foreign owner can look stalled. While the item waits it emits
+no progress events, so its byte counter does not move and the item simply
+stays in progress; when the budget expires the item fails with the actionable
+error above and the job does not report success.
+
+The cleanup of a blob key's artifacts participates in the same protocol. The
+`blobs/tmp-<sha>` staging name, its single-request `.part`, the legacy
+`.part-NN` parts and the blob-keyed staging pair are removed only while that
+key's ownership domain is held, so a cancelled job never deletes another live
+writer's partial — that writer would keep writing to an unlinked inode and its
+later publication would fail with ENOENT. A live owner of the key leaves those
+artifacts alone, and the contention is reported. A job can still clean up its
+own artifacts: its writer releases the domain when it returns, and the
+downloader's own cancel cleanup removes its staging while it still holds the
+domain. The residual limitation is that the cleanup cannot tell "my own key"
+from "another live owner of the same key" beyond the domain itself, so a key
+another writer owns is left alone even when the cancelling job also had bytes
+for it. A legacy/output-mode destination is not blob-key-scoped and keeps its
+historical cleanup behavior.
 
 The mirror writer copies destination blobs with a non-atomic truncate-and-write
 and a size-only check, so it can tear or overwrite a blob a downloader is

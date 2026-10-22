@@ -46,7 +46,9 @@ package hfdownloader
 //   - the shared probe is granted => no exclusive holder => not a live
 //     writer; the claimant retries its own acquisition (bounded);
 //   - the shared probe is refused  => an exclusive holder exists => a real
-//     live writer; the claimant skips the file;
+//     live writer; the download path waits for the blob key's ownership
+//     domain (bounded, context-aware, never a takeover) and re-checks the
+//     published target, and the cleanup leaves the artifacts alone;
 //   - the shared probe errors      => the state is unknown => the claimant
 //     fails closed with an actionable error.
 //
@@ -80,8 +82,11 @@ func stagingOwnershipLockPath(staging string) string { return staging + stagingL
 var (
 	// errStagingOwnershipBusy reports that another open handle (another
 	// process, or another open file description) holds the ownership lock
-	// EXCLUSIVELY: a live writer owns the staging file. Claimants translate
-	// it to errBlobIncompleteOwned; cleanup skips.
+	// EXCLUSIVELY: a live writer owns the staging file. The download path
+	// waits for that live owner and, when the bounded wait is exhausted,
+	// translates the contention into the actionable live-owner error (never
+	// a successful skip, never a takeover); the cleanup leaves the artifacts
+	// of a key owned by a live writer alone.
 	errStagingOwnershipBusy = errors.New("staging ownership lock is held by another live writer")
 
 	// errStagingOwnershipUncertain reports that the exclusive ownership lock
@@ -211,6 +216,17 @@ func observeStagingOSLockHolder(path string) (stagingLockHolderKind, error) {
 var stagingOwnershipContentionHook func(staging string)
 
 // acquireStagingOwnershipLockCtx takes the exclusive ownership lock for
+// staging with the default contention window.
+//
+// A PROVEN live owner is reported at once (errStagingOwnershipBusy): the
+// staging file belongs to that writer, and the caller must not take it over.
+// The blob key's ownership protocol needs a different shape - it WAITS for
+// the live owner - and uses acquireStagingOwnershipLockWaiting for that.
+func acquireStagingOwnershipLockCtx(ctx context.Context, staging string) (*stagingOwnershipLock, error) {
+	return acquireStagingOwnershipLockWithin(ctx, staging, stagingOwnershipAcquireWait)
+}
+
+// acquireStagingOwnershipLockWithin takes the exclusive ownership lock for
 // staging, waiting out transient contention within a bounded, context-aware
 // window.
 //
@@ -221,8 +237,8 @@ var stagingOwnershipContentionHook func(staging string)
 //
 //   - An EXCLUSIVE holder was observed: a real live writer owns the staging
 //     file. The claimant receives errStagingOwnershipBusy and the caller
-//     skips the file, exactly as before. A writer may be suspended, so its
-//     lock is never taken over.
+//     treats the file as owned by somebody else, exactly as before. A writer
+//     may be suspended, so its lock is never taken over.
 //   - NO exclusive holder was observed: the lock is held by a reader (a
 //     status probe) or by nobody. The claimant waits and retries its own
 //     acquisition, which is the only operation allowed to take the exclusive
@@ -234,15 +250,54 @@ var stagingOwnershipContentionHook func(staging string)
 //     is proven to exist.
 //
 // A cancellation ends the wait promptly with ctx.Err().
-func acquireStagingOwnershipLockCtx(ctx context.Context, staging string) (*stagingOwnershipLock, error) {
-	return acquireStagingOwnershipLockWithin(ctx, staging, stagingOwnershipAcquireWait)
-}
-
-// acquireStagingOwnershipLockWithin is acquireStagingOwnershipLockCtx with an
-// explicit contention window. Cleanup uses a shorter window because it is
+//
+// Cleanup uses a shorter window (see stagingLockCleanupWait) because it is
 // best-effort and must not delay an explicit cancel.
 func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait time.Duration) (*stagingOwnershipLock, error) {
+	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, false)
+}
+
+// acquireStagingOwnershipLockWaiting is acquireStagingOwnershipLockWithin for
+// a caller that must WAIT for a PROVEN live owner instead of backing off at
+// once.
+//
+// acquireStagingOwnershipLockWithin reports a proven live writer immediately
+// (errStagingOwnershipBusy), because a caller that merely wants to skip a
+// file must not block on it. The blob key's ownership protocol needs the
+// opposite: the file is NOT present while a live owner holds the key, so the
+// caller waits for that owner - bounded and context-aware - and re-evaluates
+// the key afterwards instead of reporting a success it cannot back.
+//
+// The lock is never taken over: a live owner keeps it for as long as its
+// process and open handle live, so the wait ends in an error, not in a
+// preemption.
+//
+// The outcomes are:
+//
+//   - the lock is acquired: the caller owns the key;
+//   - the budget expires while a PROVEN live owner still holds the lock:
+//     errStagingOwnershipBusy (the owner is still there);
+//   - the budget expires while the holder could not be classified:
+//     errStagingOwnershipUncertain (no live owner is proven, so the caller
+//     must fail closed rather than skip).
+func acquireStagingOwnershipLockWaiting(ctx context.Context, staging string, wait time.Duration) (*stagingOwnershipLock, error) {
+	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, true)
+}
+
+// acquireStagingOwnershipLockWithinMode is the shared acquisition loop.
+//
+// tolerateLiveOwner selects what a PROVEN exclusive holder means: with it
+// false (the skip-oriented acquisition) the holder is reported at once as
+// errStagingOwnershipBusy; with it true the holder is waited out until the
+// budget expires, which is what the blob key's ownership protocol needs (the
+// file is not present while the owner holds the key).
+func acquireStagingOwnershipLockWithinMode(ctx context.Context, staging string, wait time.Duration, tolerateLiveOwner bool) (*stagingOwnershipLock, error) {
 	deadline := time.Now().Add(wait)
+	// liveOwner records whether the last successful observation proved an
+	// exclusive holder. It decides the verdict when the budget expires: a
+	// proven live owner is reported as busy, an unclassifiable holder as
+	// uncertain.
+	liveOwner := false
 	for {
 		lock, err := stagingOwnershipAcquire(staging)
 		if err == nil {
@@ -264,16 +319,31 @@ func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait
 			// live writer, so the safe outcome is to keep waiting inside the
 			// window and report an uncertain failure if it never resolves.
 			log.Printf("warning: cannot observe the holder of the staging ownership lock %s: %v", staging, oerr)
+			liveOwner = false
 		case kind == stagingLockHolderExclusive:
 			// A proven live writer owns this staging file.
-			return nil, errStagingOwnershipBusy
+			liveOwner = true
+			if !tolerateLiveOwner {
+				return nil, errStagingOwnershipBusy
+			}
+			// The caller waits for the live owner: the file is not present
+			// while the owner holds it, so a skip would report a success
+			// the cache does not have. The wait is bounded by the budget.
 		default:
 			// No exclusive holder: a reader (status probe) or nobody. The
 			// real acquisition is the only thing that can resolve it, so
 			// wait and retry it.
+			liveOwner = false
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			if liveOwner {
+				// The budget closed while a PROVEN live owner still held the
+				// lock. The owner is not displaced; the contention is
+				// reported so the item can fail with an actionable error
+				// instead of a successful skip.
+				return nil, errStagingOwnershipBusy
+			}
 			// The window closed with the lock still held and no exclusive
 			// holder observed. The holder is a reader that never released,
 			// or the state stayed unknown: no live writer is proven, so the

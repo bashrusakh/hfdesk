@@ -137,8 +137,10 @@ var errNoLegacyState = errors.New("no valid legacy multipart state")
 var (
 	// errBlobIncompleteOwned reports that the staging file for this
 	// destination is currently owned by another live writer (another
-	// process, or a concurrently running download in this process). The
-	// caller must skip the file this run rather than touch the staging.
+	// process, or a concurrently running download in this process), or that
+	// a legacy record's owner cannot be proven dead. The file is NOT present
+	// in that state, so the caller must fail the item with an actionable
+	// error rather than touch the staging or report a successful skip.
 	errBlobIncompleteOwned = errors.New("incomplete download is owned by another live writer")
 
 	// errBlobAlreadyComplete reports that a content-addressed publish target
@@ -338,12 +340,12 @@ type stagingClaimState struct {
 //   - OS-level: the persistent <staging>.lock is taken exclusively and held
 //     for the whole ownership interval. The acquisition waits out transient
 //     contention (a read-only status probe shares the lock file briefly), so a
-//     probe in flight does not read as an owner. Only a PROVEN exclusive
-//     holder is a live owner (even one that stopped heartbeating while
-//     suspended), so the caller skips with errBlobIncompleteOwned. A crashed
-//     owner's lock is released by the kernel at death, so takeover is safe
-//     only after the old process is gone. If the platform/filesystem cannot
-//     supply the lock, the operation fails closed;
+//     probe in flight does not read as an owner. A PROVEN exclusive holder is
+//     a live owner (even one that stopped heartbeating while suspended), so
+//     the caller reports it as owned with errBlobIncompleteOwned and never
+//     takes it over. A crashed owner's lock is released by the kernel at
+//     death, so takeover is safe only after the old process is gone. If the
+//     platform/filesystem cannot supply the lock, the operation fails closed;
 //   - record transitions: the per-path in-process metadata gate serializes
 //     local read-modify-write operations. Current-version foreign processes
 //     cannot reach them without first acquiring the lifetime OS lock. A
@@ -403,8 +405,11 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		// transient contention: a read-only status probe touches the same
 		// lock file briefly, and on Unix a probe's shared lock makes this
 		// exclusive acquisition fail even though no writer exists. Only a
-		// PROVEN exclusive holder skips the file; an unresolvable contention
-		// is an actionable failure, never a successful skip.
+		// PROVEN exclusive holder is a live owner (even one that stopped
+		// heartbeating while suspended); it is never taken over, and the
+		// caller reports it as owned instead of displacing it. An
+		// unresolvable contention is an actionable failure, never a
+		// successful skip.
 		own, oerr := acquireStagingOwnershipLockCtx(ctx, staging)
 		osExclusive := oerr == nil
 		if oerr != nil {

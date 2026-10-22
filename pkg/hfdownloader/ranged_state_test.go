@@ -34,15 +34,16 @@ import (
 	"time"
 )
 
-// TestDownload_OwnedClaimCountsAsSkipped verifies that the live-owner skip
-// path (a staging file held by another writer, or an already-published blob
-// discovered after the pre-download check) participates in
-// skipOnce/skippedCount bookkeeping, so the final "skipped N" summary includes
-// it. The live owner is simulated by holding the OS ownership lock, which is
-// what a real writer holds for its whole interval; the pre-download lock probe
-// (or, when lifetime ownership is unavailable, the claim refusal) turns it into a skip rather
-// than a failure.
-func TestDownload_OwnedClaimCountsAsSkipped(t *testing.T) {
+// TestDownload_OwnedClaimIsNotCountedAsSkipped verifies that a live owner's
+// claim is NOT counted as a skip.
+//
+// The file is not present while another writer holds the item's staging, so
+// the item must fail with the actionable live-owner error instead of being
+// counted in the "skipped N" summary: a job that reports success must mean
+// the requested files are present. The live owner is simulated by holding the
+// OS ownership lock, which is what a real writer holds for its whole
+// interval.
+func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	tmpDir := t.TempDir()
 	const size = 64 * 1024
 	full := rangedTestPayload(size)
@@ -78,16 +79,26 @@ func TestDownload_OwnedClaimCountsAsSkipped(t *testing.T) {
 		StallTimeout:       "0",
 	}
 	var doneMessage string
+	var skips []string
 	err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
 		if ev.Event == "done" {
 			doneMessage = ev.Message
 		}
+		if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
+			skips = append(skips, ev.Message)
+		}
 	})
-	if err != nil {
-		t.Fatalf("Download: %v", err)
+	if err == nil {
+		t.Fatalf("Download reported success although a live writer owns the item (done=%q)", doneMessage)
 	}
-	if !strings.Contains(doneMessage, "skipped 1") {
-		t.Errorf("post-claim skip was not counted: done message = %q", doneMessage)
+	if !errors.Is(err, errBlobOwnedByLiveWriter) {
+		t.Errorf("Download error = %v, want the actionable live-owner error", err)
+	}
+	if len(skips) != 0 {
+		t.Errorf("the live-owned item was counted as a skip: %v", skips)
+	}
+	if strings.Contains(doneMessage, "skipped 1") {
+		t.Errorf("the live-owned item was counted in the summary: done message = %q", doneMessage)
 	}
 	if _, err := os.Stat(filepath.Join(blobsDir, sha)); err == nil {
 		t.Error("a live-owned staging file was published")

@@ -338,10 +338,14 @@ func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) 
 }
 
 // TestDownload_SharedBlobSkippedPathsGetLinks covers M4: two plan items with
-// the same SHA and different paths skip while a live owner holds the shared
-// staging. After that owner publishes, both paths still get their own snapshot
-// and friendly entries. A third, different-SHA item keeps Download alive until
-// the shared blob is published, so the post-wg.Wait reconcile can run.
+// the same SHA and different paths wait for the shared blob key's ownership
+// domain while a live owner holds it. After that owner publishes, both paths
+// still get their own snapshot and friendly entries. A third, different-SHA
+// item keeps Download alive until the shared blob is published.
+//
+// The wait is the job contract: the file is not present while the live owner
+// holds the key, so the items must not skip it as "done" - they wait, and the
+// published blob is then reused with their own links created.
 func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	const total = 64 * 1024
 	shared := rangedTestPayload(total)
@@ -401,8 +405,18 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		StallTimeout:       "0",
 	}
 
-	// A live owner (this test) holds the shared staging, so both same-SHA paths
-	// skip via BlobDownloading while the blob is still absent.
+	// A live owner (this test) holds the shared blob key's ownership domain
+	// and its staging, so both same-SHA paths WAIT for the domain while the
+	// blob is still absent.
+	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain, err := blobDomainAcquire(context.Background(), sharedBlob, mustDomainDst(t, repo, sharedSHA))
+	if err != nil {
+		t.Fatalf("pre-claim shared domain: %v", err)
+	}
+	defer domain.release()
 	state, err := claimStaging(context.Background(), sharedStaging, sharedBlob, sharedStaging+".meta",
 		PlanItem{RelativePath: "a/model.bin", Size: total, SHA256: sharedSHA},
 		Job{Repo: "owner/model"}, "commit123", cfg, true)
@@ -420,6 +434,18 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
+
+	// The in-process contention hook proves that the same-SHA paths really
+	// wait for the domain instead of proceeding.
+	waiting := make(chan struct{}, 4)
+	oldContention := blobDomainContentionHook
+	blobDomainContentionHook = func(string) {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+	defer func() { blobDomainContentionHook = oldContention }()
 
 	skipCh := make(chan struct{}, 4)
 	done := make(chan error, 1)
@@ -441,23 +467,36 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		state.release()
 		t.Fatal("the blocker transfer never started")
 	}
+	// Both same-SHA paths are waiting for the ownership domain.
 	for i := 0; i < 2; i++ {
 		select {
-		case <-skipCh:
-		case <-time.After(10 * time.Second):
+		case <-waiting:
+		case <-time.After(30 * time.Second):
 			releaseOnce.Do(func() { close(release) })
 			state.release()
-			t.Fatal("the same-SHA paths did not skip while the shared staging was owned")
+			t.Fatal("the same-SHA paths did not wait for the ownership domain")
 		}
 	}
 
-	// The live owner publishes the shared blob; only then is the blocker
-	// released so Download's post-wait reconcile sees BlobComplete.
-	state.release()
+	// The live owner publishes the shared blob and releases the domain; only
+	// then is the blocker released so Download can finish.
 	if err := os.WriteFile(sharedBlob, shared, 0o644); err != nil {
+		releaseOnce.Do(func() { close(release) })
+		state.release()
 		t.Fatal(err)
 	}
+	state.release()
+	domain.release()
 	releaseOnce.Do(func() { close(release) })
+
+	// The waiting items now find the published blob and finish as skips.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-skipCh:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the same-SHA paths did not skip after the owner published the blob")
+		}
+	}
 	if err := <-done; err != nil {
 		t.Fatalf("Download: %v", err)
 	}

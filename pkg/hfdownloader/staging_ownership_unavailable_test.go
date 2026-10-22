@@ -9,7 +9,10 @@ package hfdownloader
 // The ownership check has three possible outcomes and must never guess:
 //
 //   - a PROVEN live owner (the persistent <staging>.lock is held
-//     exclusively) -> BlobDownloading: the caller may skip the item;
+//     exclusively) -> BlobDownloading: the caller does NOT skip the item,
+//     because the file is not present while the owner holds it. The downloader
+//     waits for the blob key's ownership domain and re-checks the published
+//     target instead;
 //   - a PROVABLY dead owner -> BlobStale: the caller may resume the item;
 //   - an UNKNOWN ownership state (the OS-lock probe failed, or the platform
 //     cannot represent the lock) -> BlobOwnershipUnknown plus an error: the
@@ -282,10 +285,15 @@ func TestCheckBlobProvenOwnerAndStaleRemainDistinct(t *testing.T) {
 	}
 }
 
-// TestDownloadProvenOwnerSkipsWithoutError is the download-level half of the
-// same distinction: a PROVEN live owner still produces the ordinary
-// "downloading by another process" skip, which is not an error.
-func TestDownloadProvenOwnerSkipsWithoutError(t *testing.T) {
+// TestDownloadProvenOwnerIsNotASuccessfulSkip is the download-level half of
+// the same distinction: a PROVEN live owner is NOT a successful skip.
+//
+// The file is not present while the live owner holds the item's staging, so
+// the job must not report the item as done. The item waits for the blob key's
+// ownership domain and re-checks the published target; when the owner still
+// owns the item, the item fails with the actionable live-owner error instead
+// of a skip that would report a completion the cache does not have.
+func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
@@ -301,7 +309,8 @@ func TestDownloadProvenOwnerSkipsWithoutError(t *testing.T) {
 	if err := repo.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(repo.IncompletePath(sha), []byte("partial"), 0o644); err != nil {
+	partial := []byte("partial")
+	if err := os.WriteFile(repo.IncompletePath(sha), partial, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	meta := IncompleteMeta{
@@ -326,6 +335,8 @@ func TestDownloadProvenOwnerSkipsWithoutError(t *testing.T) {
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
 		case strings.HasSuffix(r.URL.Path, "/tree/main"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		default:
 			http.NotFound(w, r)
 		}
@@ -334,7 +345,9 @@ func TestDownloadProvenOwnerSkipsWithoutError(t *testing.T) {
 
 	cfg := Settings{
 		CacheDir: cacheDir, Endpoint: srv.URL, Concurrency: 1, MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", Verify: "size", Retries: 0, StallTimeout: "0",
+		// The multipart route is the one that claims the blob key's staging
+		// file, so the live owner's lock is the fence under test.
+		MultipartThreshold: "0", Verify: "size", Retries: 0, StallTimeout: "0",
 	}
 	var skips []string
 	dlErr := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ev ProgressEvent) {
@@ -342,10 +355,21 @@ func TestDownloadProvenOwnerSkipsWithoutError(t *testing.T) {
 			skips = append(skips, ev.Message)
 		}
 	})
-	if dlErr != nil {
-		t.Fatalf("Download with a proven live owner: %v", dlErr)
+	if dlErr == nil {
+		t.Fatalf("Download reported success although a live owner holds the item; skips=%v", skips)
 	}
-	if len(skips) != 1 || !strings.Contains(skips[0], "downloading by another process") {
-		t.Fatalf("skips = %v, want one 'downloading by another process' skip", skips)
+	if !errors.Is(dlErr, errBlobOwnedByLiveWriter) {
+		t.Errorf("Download error = %v, want the actionable live-owner error", dlErr)
+	}
+	if len(skips) != 0 {
+		t.Errorf("the job recorded a successful skip although the live owner holds the item: %v", skips)
+	}
+	// The file is not present and the owner's staging is untouched.
+	if _, serr := os.Stat(repo.BlobPath(sha)); !os.IsNotExist(serr) {
+		t.Errorf("a blob was published although the live owner holds the item, stat err=%v", serr)
+	}
+	got, rerr := os.ReadFile(repo.IncompletePath(sha))
+	if rerr != nil || !bytes.Equal(got, partial) {
+		t.Errorf("the live owner's staging changed: %q, %v", got, rerr)
 	}
 }
