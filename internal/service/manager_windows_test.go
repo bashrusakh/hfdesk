@@ -1135,12 +1135,11 @@ func TestSCMBrokenRegistration(t *testing.T) {
 // trustees appear as raw SIDs and not as aliases.
 //
 // The set of the trustees that cover the account is the documented
-// membership: the account itself, everybody and the authenticated users. It
-// is the set the check falls back to when the platform refuses every form of
-// the logon of the account, and the effective membership of the account is
-// checked by TestSDDLGrantsIdentityWithTheEffectiveGroups.
+// membership: the account itself, everybody and the authenticated users.
+// The membership of the account is checked by
+// TestSDDLGrantsIdentityWithTheMembershipOfTheAccount.
 func TestSDDLGrantsIdentity(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs(errors.New("the test checks the documented membership"))
+	identity := scmDocumentedIdentitySIDs()
 	cases := []struct {
 		name    string
 		sddl    string
@@ -1159,6 +1158,10 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 		{"an unrelated group", "D:P(A;;FA;;;S-1-5-32-544)", true},
 		{"a denied entry next to an allowed one", "D:P(D;;GA;;;S-1-5-19)(A;;FA;;;S-1-1-0)", true},
 		{"a denied entry for everybody", "D:P(D;;GA;;;S-1-1-0)(A;;FA;;;S-1-5-19)", true},
+		{"a denied entry that denies the write access", "D:P(D;;FW;;;S-1-5-19)(A;;FR;;;S-1-1-0)", true},
+		{"a denied entry that denies the read access", "D:P(D;;FR;;;S-1-5-19)(A;;FW;;;S-1-1-0)", true},
+		{"a denied entry that denies the change of the access control list", "D:P(D;;WD;;;S-1-5-19)(A;;FA;;;S-1-1-0)", false},
+		{"a denied entry that denies the change of the owner", "D:P(D;;WO;;;S-1-5-19)(A;;FA;;;S-1-1-0)", false},
 		{"read only rights", "D:P(A;;FR;;;S-1-5-19)", true},
 		{"write only rights", "D:P(A;;FW;;;S-1-5-19)", true},
 		{"the generic rights", "D:P(A;;0xC0000000;;;S-1-5-19)", false},
@@ -1178,18 +1181,62 @@ func TestSDDLGrantsIdentity(t *testing.T) {
 	}
 }
 
-// TestSDDLGrantsIdentityWithTheEffectiveGroups checks the access control
-// list of a path against the effective membership of the account the
-// instance runs as.
+// TestSDDLGrantsIdentityIgnoresADenialOfARightTheInstanceDoesNotNeed checks
+// that a denied entry refuses the path only when it denies a right the
+// instance needs.
 //
-// The membership comes from a token of the account when the platform grants
-// the logon, and from the membership the documentation of the platform grants
-// to the account when it refuses every form of the logon. A group the
-// account really carries covers it and a group it does not carry does not.
+// The instance reads the directory, it creates entries in it and it reads and
+// writes the files in it. The right to change the access control list of the
+// directory, the right to change its owner and the rights of the
+// configuration of the platform are none of them, so a denied entry that
+// carries one of them denies the instance nothing it needs.
+func TestSDDLGrantsIdentityIgnoresADenialOfARightTheInstanceDoesNotNeed(t *testing.T) {
+	identity := scmDocumentedIdentitySIDs()
+
+	// A denied entry that denies the change of the access control list of
+	// the directory: the directory is still usable by the instance.
+	if err := sddlGrantsIdentity("D:P(D;;WD;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil: a denial of the change of the access control list takes nothing the instance needs away", err)
+	}
+
+	// The same for the change of the owner of the directory.
+	if err := sddlGrantsIdentity("D:P(D;;WO;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil: a denial of the change of the owner takes nothing the instance needs away", err)
+	}
+
+	// A denial of the write access is a denial the instance needs: it has
+	// to create entries in the directory.
+	err := sddlGrantsIdentity("D:P(D;;FW;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied write access")
+	}
+	if !strings.Contains(err.Error(), "write access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
+	}
+
+	// A denial of the read access is a denial the instance needs: it has
+	// to read the directory and the files in it.
+	err = sddlGrantsIdentity("D:P(D;;FR;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied read access")
+	}
+	if !strings.Contains(err.Error(), "read access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
+	}
+}
+
+// TestSDDLGrantsIdentityWithTheMembershipOfTheAccount checks the access
+// control list of a path against the membership of the account the instance
+// runs as.
 //
-// The test never skips: both sources answer the question the test asks.
-func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
-	identity := scmTestIdentitySIDs(t)
+// The membership is the documented one: the account itself, everybody and
+// the authenticated users. A group the membership carries covers the account
+// and a group it does not carry does not.
+//
+// The test never skips: the membership of the account is the documented one
+// on every machine.
+func TestSDDLGrantsIdentityWithTheMembershipOfTheAccount(t *testing.T) {
+	identity := scmServiceIdentity()
 
 	// The membership the check is made against: it carries the account
 	// itself and everybody, and it never carries the interactive users,
@@ -1239,7 +1286,7 @@ func TestSDDLGrantsIdentityWithTheEffectiveGroups(t *testing.T) {
 // the account of the instance is an inherit only one is a directory the
 // instance can never use.
 func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs(errors.New("the test checks the documented membership"))
+	identity := scmDocumentedIdentitySIDs()
 
 	// The entry is about the children of the directory: it grants the
 	// account nothing on the directory itself.
@@ -1272,47 +1319,18 @@ func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
 	}
 }
 
-// TestSCMEffectiveIdentitySIDs checks the membership of the account the
+// TestSCMIdentitySIDsOfTheAccount checks the membership of the account the
 // instance runs as.
 //
-// The membership is the effective one when the platform grants the logon of
-// the account, and the membership the documentation of the platform grants to
-// the account when it refuses every form of the logon. Either way the
-// account itself is in it, everybody is in it, and the interactive users are
-// never in it, because the instance runs a service logon.
-func TestSCMEffectiveIdentitySIDs(t *testing.T) {
-	identity := scmTestIdentitySIDs(t)
-
-	if !identity.covers(scmServiceIdentitySID) {
-		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
-	}
-	if !identity.covers(scmEveryoneSID) {
-		t.Errorf("the membership %v does not carry everybody", identity.sids)
-	}
-	if identity.covers(scmInteractiveUsersSID) {
-		t.Errorf("the membership %v carries the interactive users, want a membership without them", identity.sids)
-	}
-}
-
-// TestSCMTokenIdentitySIDs checks the membership the implementation derives
-// out of a token of the account the instance runs as.
+// The membership is the documented one: the account itself is in it,
+// everybody is in it, and the interactive users are never in it, because the
+// instance runs a service logon.
 //
-// The test needs a token of the account: the platform has to grant the logon
-// of the account to the shell of the test. A platform that refuses every
-// form of the logon cannot answer the question, and the test skips then.
-//
-// The refusal of the platform is carried by the message of the skip: a
-// broken call of the logon is never mistaken for a platform that cannot
-// answer the question.
-func TestSCMTokenIdentitySIDs(t *testing.T) {
-	identity, err := scmReadServiceIdentitySIDs()
-	if err != nil {
-		t.Skipf("the platform refused the logon of the account %s: %v", scmServiceIdentityName, err)
-	}
+// The test never skips: the membership of the account is the documented one
+// on every machine.
+func TestSCMIdentitySIDsOfTheAccount(t *testing.T) {
+	identity := scmServiceIdentity()
 
-	if !identity.exact {
-		t.Error("the membership of the account is not the one of a token")
-	}
 	if !identity.covers(scmServiceIdentitySID) {
 		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
 	}
@@ -1327,12 +1345,11 @@ func TestSCMTokenIdentitySIDs(t *testing.T) {
 // TestSddlGrantsIdentityNamesTheDocumentedMembership checks that a check
 // that was made against the documented membership says so.
 //
-// The platform can refuse every form of the logon of the account. The check
-// then falls back to the membership the documentation of the platform grants
-// to the account, and the user has to know that the groups of the account
-// were not read from a token of it.
+// The membership of the account is the documented one and not the one of a
+// token of it, so the user has to know that the groups of the account were
+// not read from a token of the account.
 func TestSddlGrantsIdentityNamesTheDocumentedMembership(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs(errors.New("the logon of the account was refused"))
+	identity := scmDocumentedIdentitySIDs()
 
 	err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-32-544)", identity)
 	if err == nil {
@@ -1341,30 +1358,9 @@ func TestSddlGrantsIdentityNamesTheDocumentedMembership(t *testing.T) {
 	if !strings.Contains(err.Error(), "documentation of the platform") {
 		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the documented membership", err)
 	}
-	if !strings.Contains(err.Error(), "the logon of the account was refused") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the reason", err)
+	if !strings.Contains(err.Error(), "not against the groups of a token") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that says the check was not made against a token of the account", err)
 	}
-}
-
-// scmTestIdentitySIDs returns the membership of the account the instance
-// runs as, the way the implementation derives it.
-//
-// The membership comes from a token of the account when the platform grants
-// the logon, and from the membership the documentation of the platform grants
-// to the account when it refuses every form of the logon. The test never
-// skips: both sources answer the question the test asks.
-//
-// The token path itself is the subject of a test of its own: it skips when
-// the platform grants no token at all.
-func scmTestIdentitySIDs(t *testing.T) scmIdentitySIDs {
-	t.Helper()
-	identity, err := scmReadServiceIdentitySIDs()
-	if err == nil {
-		return identity
-	}
-	// The platform refused every form of the logon: the implementation
-	// falls back to the membership of the documentation of the platform.
-	return scmDocumentedIdentitySIDs(err)
 }
 
 // scmTestUncarriedSID returns a SID the account of the instance does not
@@ -1385,7 +1381,7 @@ func scmTestUncarriedSID(t *testing.T, identity scmIdentitySIDs) string {
 			return candidate
 		}
 	}
-	t.Skip("the account of the instance carries every candidate group")
+	t.Fatalf("the membership %v carries every candidate group", identity.sids)
 	return ""
 }
 
@@ -1483,6 +1479,105 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 				t.Errorf("the refused directory %q exists: %v", path, statErr)
 			}
 		})
+	}
+}
+
+// TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot checks that a
+// named directory that really lives inside the state root of the instance is
+// not checked against the account of the instance.
+//
+// The installation grants the state root to that account, and the instance
+// creates the cache tree it needs inside it. A directory of the state root
+// is therefore neither checked nor created.
+func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll() = %v, want nil", err)
+	}
+	// The state root belongs to the account of the instance.
+	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
+
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   stateDir,
+		LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+	}
+	opts.CacheDir = filepath.Join(stateDir, "cache")
+	opts.HubDir = filepath.Join(stateDir, "cache", "hub")
+	opts.LocalDir = ""
+
+	if err := preflightDataPaths(opts); err != nil {
+		t.Errorf("preflightDataPaths() = %v, want nil for a directory inside the state root", err)
+	}
+	// The directory was not created: the instance creates it when it runs.
+	if _, err := os.Stat(opts.CacheDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the cache directory %q exists (stat error: %v), want none: the instance creates it when it runs", opts.CacheDir, err)
+	}
+}
+
+// TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot checks that a
+// named directory that is reached through a link inside the state root is
+// checked like every other named directory.
+//
+// The exemption of the state root is decided on the real location of the two
+// paths: a link that leaves the state root points at a directory outside of
+// it, and the account of the instance has to be able to work with it. A
+// comparison of the paths as they were written would grant the exemption to
+// the link, and the installation would be accepted and fail later with an
+// access error.
+func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
+
+	// A directory outside of the state root that the account of the
+	// instance cannot use.
+	outside := filepath.Join(root, "models")
+	if err := os.Mkdir(outside, 0o750); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, outside, scmTestDenyInstanceIdentityDACL(t))
+
+	// A link inside the state root that points at it.
+	link := filepath.Join(stateDir, "cache")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("the platform does not allow a symbolic link here: %v", err)
+	}
+
+	// The link is not inside the state root: the directory it points at is
+	// somewhere else.
+	inside, err := scmPathInsideStateRoot(stateDir, link)
+	if err != nil {
+		t.Fatalf("scmPathInsideStateRoot() = %v, want nil", err)
+	}
+	if inside {
+		t.Errorf("scmPathInsideStateRoot(%q, %q) = true, want false: the link points outside of the state root", stateDir, link)
+	}
+
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   stateDir,
+		LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+	}
+	opts.CacheDir = link
+	opts.HubDir = ""
+	opts.LocalDir = ""
+
+	err = preflightDataPaths(opts)
+	if err == nil {
+		t.Fatalf("preflightDataPaths() = nil, want the refusal of a link that leaves the state root")
+	}
+	if !scmTestNamesPath(err.Error(), link) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the path", err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the account of the instance", err)
 	}
 }
 

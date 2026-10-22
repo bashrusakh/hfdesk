@@ -1068,22 +1068,24 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 // the instance needs, otherwise the instance fails later with an opaque
 // access error.
 //
-// The membership of the account is the effective one: it is read from a
-// token of the account itself. A static list of presumed groups cannot
-// answer the question, because the groups of an account are a property of
-// the machine and not of the code: the Interactive Users group (S-1-5-4) is
-// the group of an interactive logon, and the instance never runs an
+// The membership of the account is the one the documentation of the
+// platform grants to it, and it is the only source of it. The built-in
+// service accounts of the platform are local authenticated users, so the
+// token of a service logon of the account carries the account itself,
+// everybody and the authenticated users.
+//
+// The Interactive Users group (S-1-5-4) is deliberately not part of it: it
+// is the group of an interactive logon, and the instance never runs an
 // interactive logon. A descriptor that grants the access to the interactive
 // users only is a descriptor the instance can never use, and the
 // installation has to refuse it.
 //
-// A platform that refuses the logon of the account cannot answer the
-// question with a token. The membership of the documentation of the platform
-// is used then: the built-in service accounts are treated as local
-// authenticated users, so the token of such a logon carries the account
-// itself, everybody and the authenticated users. The fallback is never
-// silent: the log and the message of a refusal name it and name the refusal
-// of the platform.
+// The membership is never read from a token of the account: the local
+// security authority of a machine does not accept the logon of the account
+// on every machine, and a check of a path has to answer the same way on
+// every machine. The message of a refusal says that the check was made
+// against the documented membership and not against the groups of a token,
+// so the operator knows what the answer is based on.
 const (
 	// scmServiceIdentitySID is the SID of the account the instance runs
 	// as: LocalService (S-1-5-19).
@@ -1116,19 +1118,15 @@ const (
 // scmIdentitySIDs is the set of security identifiers that cover the account
 // the instance runs as.
 //
-// The set is the effective membership of the account: the account itself and
-// the groups of a token of the account. An access control list that grants
-// the access to one of them grants it to the account of the instance as
-// well.
+// The set is the documented membership of the account: the account itself,
+// everybody and the authenticated users. The Interactive Users group is
+// deliberately not part of it.
+//
+// An access control list that grants the access to one of them grants it to
+// the account of the instance as well.
 type scmIdentitySIDs struct {
 	// sids holds the SIDs of the set in their canonical form.
 	sids map[string]bool
-	// exact reports whether the set is the effective membership of the
-	// account, read from a token of the account itself.
-	exact bool
-	// reason names why the set is not the effective membership of the
-	// account. It is empty when the set is exact.
-	reason string
 }
 
 // covers reports whether a SID covers the account of the instance.
@@ -1140,296 +1138,69 @@ func (i scmIdentitySIDs) covers(sid string) bool {
 // against the documented membership of the account and not against the
 // groups of a token of it.
 //
-// The note is empty for an exact set: the caller has nothing to say about a
-// check that was made against the whole membership of the account.
-//
-// The note names the refusal of the platform: the user has to know that the
-// groups of the account were not read from a token of it.
+// The note is never empty: the membership of the account is the documented
+// one, so the user has to know that the groups of the account were not read
+// from a token of it.
 func (i scmIdentitySIDs) note() string {
-	if i.exact {
-		return ""
-	}
 	return fmt.Sprintf(
-		": the effective groups of the account %s are unknown, the platform refused the logon of the account (%s), so the check was made against the membership the documentation of the platform grants to the account: the account itself, everybody and the authenticated users",
-		scmServiceIdentityName, i.reason,
+		": the check was made against the membership the documentation of the platform grants to the account %s: the account itself, everybody and the authenticated users, and not against the groups of a token of the account",
+		scmServiceIdentityName,
 	)
 }
 
 // scmNormalizeSID returns the canonical form of a SID.
 //
-// The trustees of an access control entry and the SIDs of a token are both
-// written in the canonical form, but a descriptor that was written by hand
-// can carry another case and spaces around the SID.
+// The trustees of an access control entry and the SIDs of the membership of
+// the account are both written in the canonical form, but a descriptor that
+// was written by hand can carry another case and spaces around the SID.
 func scmNormalizeSID(sid string) string {
 	return strings.ToUpper(strings.TrimSpace(sid))
-}
-
-// scmLogonUserW logs an account on and returns the token of the logon.
-//
-// The procedure is not exported by the platform library of Go: it is called
-// through the dynamic library of the platform, the way the platform itself
-// calls it. No tool of the platform is called, and no shell is started.
-var scmLogonUserW = windows.NewLazySystemDLL("advapi32.dll").NewProc("LogonUserW")
-
-const (
-	// scmLogon32LogonService is the logon type of a service: the token
-	// of the logon carries the groups the account has when it runs as a
-	// service.
-	scmLogon32LogonService uintptr = 5
-
-	// scmLogon32ProviderDefault is the logon provider of the platform.
-	scmLogon32ProviderDefault uintptr = 0
-
-	// scmServiceIdentityUser is the user name of the account the instance
-	// runs as.
-	//
-	// The built-in service accounts are named without their domain: the
-	// platform reads the account from the local namespace of the
-	// machine.
-	scmServiceIdentityUser = "LocalService"
-
-	// scmServiceIdentityDomain is the domain of the built-in service
-	// accounts of the platform.
-	scmServiceIdentityDomain = "NT AUTHORITY"
-)
-
-// scmLogonForm is one documented form of the logon of the account the
-// instance runs as.
-//
-// The platform documents the built-in service accounts in more than one way,
-// and the local security authority of a machine does not accept every one of
-// them: a form that names a domain is looked up in that domain, so a machine
-// that has no domain of that name refuses the logon of an account of the
-// local namespace. Every documented form is therefore tried, and the first
-// one the platform accepts is used.
-type scmLogonForm struct {
-	// name names the form in a log message.
-	name string
-	// user is the user name of the logon.
-	user string
-	// domain is the domain of the logon. It is empty when the form
-	// carries no domain at all.
-	domain string
-}
-
-// scmLogonForms are the documented forms of the logon of the account the
-// instance runs as, in the order they are tried.
-//
-// Every form logs the account on without a password and with the logon type
-// of a service, so the token of the logon carries the groups the account
-// really has while it runs as the instance.
-//
-// The first form names the account by its own name and lets the platform look
-// it up in the local namespace. The second one is the form the documentation
-// of the platform shows for the built-in service accounts, with the domain of
-// the built-in accounts next to the name. The third one names the account
-// with its full name.
-var scmLogonForms = []scmLogonForm{
-	{name: `the user "LocalService" without a domain`, user: scmServiceIdentityUser},
-	{name: `the user "LocalService" and the domain "NT AUTHORITY"`, user: scmServiceIdentityUser, domain: scmServiceIdentityDomain},
-	{name: `the user "NT AUTHORITY\LocalService" without a domain`, user: scmServiceIdentityName},
-}
-
-// scmLogonServiceToken logs the account of the instance on as a service and
-// returns the token of the logon.
-//
-// The documented forms of the call are tried in the order of scmLogonForms
-// and the first one the platform accepts is used. The form that worked is
-// logged, so a machine that refuses every form of the logon is diagnosable.
-//
-// The password is a null pointer and not an empty string in every form: the
-// built-in service accounts have no password, and the platform refuses an
-// empty one.
-//
-// The caller needs the right to log on as a service, which the
-// administrators of the machine hold.
-//
-// The token is a real token and has to be closed.
-func scmLogonServiceToken() (windows.Token, error) {
-	var refusals []string
-	for _, form := range scmLogonForms {
-		token, err := scmLogonTokenWith(form)
-		if err == nil {
-			log.Printf("service: the account %s was logged on as a service with %s", scmServiceIdentityName, form.name)
-			return token, nil
-		}
-		refusals = append(refusals, fmt.Sprintf("%s: %v", form.name, err))
-	}
-	return 0, fmt.Errorf(
-		"the account %s cannot be logged on as a service: the platform refused every documented form of the logon: %s",
-		scmServiceIdentityName, strings.Join(refusals, "; "),
-	)
-}
-
-// scmLogonTokenWith logs the account of the instance on with one form of the
-// call and returns the token of the logon.
-//
-// The error the caller gets is the refusal of the platform itself, so the
-// reason of the refusal is never lost.
-func scmLogonTokenWith(form scmLogonForm) (windows.Token, error) {
-	username, err := windows.UTF16PtrFromString(form.user)
-	if err != nil {
-		return 0, fmt.Errorf("the name of the account cannot be read: %w", err)
-	}
-	// The domain of a form that carries none is a null pointer: the
-	// platform reads the account in the local namespace then.
-	var domain *uint16
-	if form.domain != "" {
-		domain, err = windows.UTF16PtrFromString(form.domain)
-		if err != nil {
-			return 0, fmt.Errorf("the domain of the account cannot be read: %w", err)
-		}
-	}
-	var handle windows.Handle
-	result, _, callErr := scmLogonUserW.Call(
-		uintptr(unsafe.Pointer(username)),
-		uintptr(unsafe.Pointer(domain)),
-		// The account has no password: the platform wants a null
-		// pointer and not an empty string.
-		0,
-		scmLogon32LogonService,
-		scmLogon32ProviderDefault,
-		uintptr(unsafe.Pointer(&handle)),
-	)
-	if result == 0 {
-		if callErr == nil || errors.Is(callErr, windows.ERROR_SUCCESS) {
-			// The platform refused the logon without an error code:
-			// the reason is unknown, and the message says so instead
-			// of naming an error that never happened.
-			return 0, errors.New("the platform refused the logon without an error code")
-		}
-		return 0, callErr
-	}
-	return windows.Token(handle), nil
-}
-
-// scmIdentitySIDsFromToken reads the effective membership of an account out
-// of the access token of the account.
-//
-// The set is the account of the token and the groups of the token: the
-// groups of a token carry the membership of the account, the nested members
-// included.
-//
-// The Interactive Users group is never part of the set: it is the group of
-// an interactive logon, and the account of the instance runs a service
-// logon.
-func scmIdentitySIDsFromToken(token windows.Token) (scmIdentitySIDs, error) {
-	user, err := token.GetTokenUser()
-	if err != nil {
-		return scmIdentitySIDs{}, fmt.Errorf("the account of the token cannot be read: %w", err)
-	}
-	if user.User.Sid == nil {
-		return scmIdentitySIDs{}, errors.New("the account of the token carries no SID")
-	}
-	groups, err := token.GetTokenGroups()
-	if err != nil {
-		return scmIdentitySIDs{}, fmt.Errorf("the groups of the token cannot be read: %w", err)
-	}
-	sids := make(map[string]bool, groups.GroupCount+1)
-	if sid := scmNormalizeSID(user.User.Sid.String()); sid != "" {
-		sids[sid] = true
-	}
-	for _, group := range groups.AllGroups() {
-		if group.Sid == nil {
-			continue
-		}
-		sid := scmNormalizeSID(group.Sid.String())
-		if sid == "" {
-			continue
-		}
-		sids[sid] = true
-	}
-	delete(sids, scmNormalizeSID(scmInteractiveUsersSID))
-	return scmIdentitySIDs{sids: sids, exact: true}, nil
-}
-
-// scmReadServiceIdentitySIDs reads the effective membership of the account
-// the instance runs as out of a token of the account.
-//
-// The account is logged on the way the service control manager logs it on,
-// as a service, so the token carries the groups the account really has
-// while it runs as the instance.
-//
-// A platform that refuses every form of the logon leaves the membership
-// unknown, and the caller falls back to the documented membership. The
-// refusal carries the error of the platform, so a broken call is never
-// mistaken for a platform that cannot answer the question.
-func scmReadServiceIdentitySIDs() (scmIdentitySIDs, error) {
-	token, err := scmLogonServiceToken()
-	if err != nil {
-		return scmIdentitySIDs{}, err
-	}
-	defer token.Close()
-
-	identity, err := scmIdentitySIDsFromToken(token)
-	if err != nil {
-		return scmIdentitySIDs{}, err
-	}
-	// A token that belongs to another account is not the token of the
-	// identity: the membership is unknown then.
-	if !identity.covers(scmServiceIdentitySID) {
-		return scmIdentitySIDs{}, fmt.Errorf("the token of the logon of %s does not belong to the account %s", scmServiceIdentityName, scmServiceIdentityName)
-	}
-	return identity, nil
 }
 
 // scmDocumentedIdentitySIDs returns the membership the documentation of the
 // platform grants to the account of the instance.
 //
-// The documentation of the platform treats LocalService and NetworkService as
-// local authenticated users: they belong to the same class as the
-// Authenticated Users group, and the default security descriptors of the
-// system grant that class its rights. The token of such a logon therefore
-// carries the account itself, everybody and the authenticated users.
+// The documentation of Microsoft treats the built-in service accounts as
+// local authenticated users: LocalService and NetworkService belong to the
+// same class as the Authenticated Users group, and the default security
+// descriptors of the system grant that class its rights. The token of such a
+// logon therefore carries the account itself, everybody and the authenticated
+// users.
 //
-// The Interactive Users group is never part of the set: it is the group of an
-// interactive logon, and the account of the instance runs a service logon.
+// The Interactive Users group is deliberately not part of the set: it is the
+// group of an interactive logon, and the account of the instance runs a
+// service logon.
 //
-// The set is used only when the platform refuses every form of the logon of
-// the account, and the fact is reported: the message of a refusal names it
-// and names the refusal of the platform, and the installation logs it.
-func scmDocumentedIdentitySIDs(reason error) scmIdentitySIDs {
+// The documentation the membership is taken from:
+//
+//   - "Well-known security identifiers in Windows" (Microsoft Learn):
+//     S-1-5-19 is LocalService, S-1-5-11 is Authenticated Users and
+//     S-1-5-4 is Interactive Users.
+//   - "Service Account Security and Access Rights" (Microsoft Learn):
+//     LocalService and NetworkService are members of the Authenticated
+//     Users group.
+//
+// The set is the only source of the membership: the local security authority
+// of a machine does not accept the logon of the account on every machine,
+// and a check of a path has to answer the same way on every machine. The
+// note of the set tells the operator that the check was made against the
+// documentation of the platform and not against the groups of a token of
+// the account.
+func scmDocumentedIdentitySIDs() scmIdentitySIDs {
 	return scmIdentitySIDs{
 		sids: map[string]bool{
 			scmNormalizeSID(scmServiceIdentitySID):    true,
 			scmNormalizeSID(scmEveryoneSID):           true,
 			scmNormalizeSID(scmAuthenticatedUsersSID): true,
 		},
-		exact:  false,
-		reason: reason.Error(),
 	}
 }
 
-// scmServiceIdentitySIDs returns the effective membership of the account the
-// instance runs as.
-//
-// The membership is the one of a token of the account: the account is logged
-// on as a service, and the groups of the token are the groups the account
-// really has while it runs as the instance.
-//
-// A platform that refuses every form of the logon leaves the membership
-// unknown, and the membership of the documentation of the platform is used
-// then. The refusal is reported, so the user knows that the check of a path
-// was made against the documented membership of the account and not against
-// the groups of a token.
-func scmServiceIdentitySIDs() scmIdentitySIDs {
-	identity, err := scmReadServiceIdentitySIDs()
-	if err != nil {
-		log.Printf(
-			"service: the platform refused the logon of the account %s (%v): the effective groups of the account are unknown, so the access of a path is checked against the membership the documentation of the platform grants to the account: the account itself, everybody and the authenticated users",
-			scmServiceIdentityName, err,
-		)
-		return scmDocumentedIdentitySIDs(err)
-	}
-	return identity
-}
-
-// scmServiceIdentity is the effective membership of the account the instance
-// runs as.
+// scmServiceIdentity is the membership of the account the instance runs as.
 //
 // The membership is read once per process: it is a property of the account
 // and not of the path that is checked.
-var scmServiceIdentity = sync.OnceValue(scmServiceIdentitySIDs)
+var scmServiceIdentity = sync.OnceValue(scmDocumentedIdentitySIDs)
 
 // preflightDataPaths checks the directories an installation reuses: the
 // cache root, the hub directory and the local output directory.
@@ -1438,10 +1209,16 @@ var scmServiceIdentity = sync.OnceValue(scmServiceIdentitySIDs)
 // and the cache of an interactive run of the user. Their access control
 // list is only read, never changed, and never changed recursively.
 //
-// A directory that lives inside the state directory of the instance belongs
-// to the instance: the state directory belongs to the account the instance
-// runs as, and the instance creates the cache tree it needs inside it. Such
-// a directory is neither checked nor created.
+// A directory that really lives inside the state directory of the instance
+// belongs to the instance: the state directory belongs to the account the
+// instance runs as, and the instance creates the cache tree it needs inside
+// it. Such a directory is neither checked nor created.
+//
+// The real location of the two paths decides that: the platform follows the
+// links of a path before it uses it, so a directory that is reached through
+// a link lives where its target lives and not where the link is. A link
+// that leaves the state directory is a directory outside of it, and it is
+// checked like every other named directory.
 //
 // A directory the user named is outside of the instance: it has to exist,
 // and the account of the instance has to be able to work with it. The
@@ -1459,7 +1236,16 @@ func preflightDataPaths(opts InstallOptions) error {
 		if dir.path == "" {
 			continue
 		}
-		if hfdownloader.PathInside(opts.Paths.StateDir, dir.path) {
+		inside, err := scmPathInsideStateRoot(opts.Paths.StateDir, dir.path)
+		if err != nil {
+			// The real location of the path cannot be read: the
+			// exemption is not granted, and the path is checked
+			// like every other named directory. The check below is
+			// the safe answer, and the reason is logged.
+			log.Printf("service: the real location of the %s %q cannot be read (%v): the path is checked like every other named directory", dir.name, dir.path, err)
+			inside = false
+		}
+		if inside {
 			// The default of the scope lives inside the state
 			// directory of the instance, and the state directory
 			// belongs to the account of the instance.
@@ -1470,6 +1256,86 @@ func preflightDataPaths(opts InstallOptions) error {
 		}
 	}
 	return nil
+}
+
+// scmPathInsideStateRoot reports whether a named directory really lives
+// inside the state root of the instance.
+//
+// The decision is made on the real location of the two paths: the platform
+// follows the links of a path before it uses it, so a directory that is
+// reached through a link lives where its target lives and not where the link
+// is.
+//
+// The decision asks nothing about the account of the instance: the exemption
+// is a fact about the two paths. A tree that does not exist yet is judged by
+// the place it will live in, and the account of the instance is never asked
+// about a tree that is not there.
+func scmPathInsideStateRoot(stateRoot, path string) (bool, error) {
+	if stateRoot == "" {
+		return false, nil
+	}
+	root, err := scmResolvePath(stateRoot)
+	if err != nil {
+		return false, err
+	}
+	target, err := scmResolvePath(path)
+	if err != nil {
+		return false, err
+	}
+	return hfdownloader.PathInside(root, target), nil
+}
+
+// scmResolvePath returns the real location of a path.
+//
+// The platform follows the symbolic links and the reparse points of a path
+// before it uses it, so the real location of a path is the one that decides
+// whether the account of the instance can work with it.
+//
+// The resolution follows the links of the path as far as the path exists:
+// the parts that are missing keep the location they were written with, so a
+// directory that is created later is judged by the place it will live in.
+func scmResolvePath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	// The path does not exist: the deepest ancestor of it that exists is
+	// resolved, and the parts that are missing are appended to it.
+	existing, missing, err := scmSplitExistingPath(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err = filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(append([]string{resolved}, missing...)...), nil
+}
+
+// scmSplitExistingPath splits a path into the deepest ancestor of it that
+// exists and the parts that are missing below it.
+//
+// The root of a volume is the end of the walk: a path below a volume that
+// does not exist cannot be resolved.
+func scmSplitExistingPath(path string) (string, []string, error) {
+	var missing []string
+	current := filepath.Clean(path)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			return current, missing, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", nil, err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", nil, fmt.Errorf("the path %q has no existing ancestor", path)
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
 }
 
 // preflightDataPath checks that the account of the instance can work with
@@ -1517,13 +1383,23 @@ func preflightDataPath(name, path string) error {
 //
 // The access control list is only read: the descriptor of the instance is
 // never applied to a path the installation reuses.
+//
+// The list that decides the access is the one of the real location of the
+// path: the platform follows the links of a path before it uses it, so a
+// directory that is reached through a link is used by the rights of its
+// target and not by the rights of the link itself. A path whose real
+// location cannot be read is judged by the path as it was written.
 func checkServiceAccess(label, path string) error {
+	resolved, err := scmResolvePath(path)
+	if err != nil {
+		resolved = path
+	}
 	// The owner and the group are read next to the access control list:
 	// the conversion of a descriptor into its SDDL form needs the whole
 	// descriptor, and reading them needs no right beyond the one the
 	// access control list needs.
 	sd, err := windows.GetNamedSecurityInfo(
-		path,
+		resolved,
 		windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
 	)
@@ -1548,14 +1424,16 @@ func checkServiceAccess(label, path string) error {
 // itself, it does not resolve the inheritance of a parent directory or the
 // privileges of a token.
 //
-// The trustees that cover the account are the ones of the effective
-// membership of the account, the one a token of the account carries. The
-// Interactive Users group is never one of them: the instance runs a service
-// logon and is never an interactive user, so a descriptor that grants the
-// access to the interactive users only is refused.
+// The trustees that cover the account are the ones of the documented
+// membership of the account. The Interactive Users group is never one of
+// them: the instance runs a service logon and is never an interactive user,
+// so a descriptor that grants the access to the interactive users only is
+// refused.
 //
-// A denied entry wins over an allowed one, so a directory that grants the
-// account the access and denies it as well is refused.
+// A denied entry wins over an allowed one, but only when it denies a right
+// the instance needs: a directory that denies the change of its access
+// control list, or the change of its owner, is a directory the instance can
+// still read and write, and it is not refused because of it.
 //
 // An inherit only entry applies to the children of the object and never to
 // the object itself: it grants the account nothing on the directory the
@@ -1577,11 +1455,18 @@ func sddlGrantsIdentity(sddl string, identity scmIdentitySIDs) error {
 		}
 		switch ace.kind {
 		case "D", "OD":
-			return fmt.Errorf("the access control list denies the account %s%s", scmServiceIdentityName, identity.note())
+			// The entry takes the access away only when it denies a
+			// right the instance needs.
+			denied := scmMaskRights(ace.rights) & scmNeededRights
+			if denied == 0 {
+				continue
+			}
+			return fmt.Errorf("the access control list denies the account %s the %s%s", scmServiceIdentityName, scmRightName(denied), identity.note())
 		case "A", "OA":
 			allowed = true
-			read = read || maskGrantsRead(ace.rights)
-			write = write || maskGrantsWrite(ace.rights)
+			rights := scmMaskRights(ace.rights)
+			read = read || rights&scmRightRead != 0
+			write = write || rights&scmRightWrite != 0
 		}
 	}
 	switch {
@@ -1660,28 +1545,69 @@ var sddlTrusteeAliases = map[string]string{
 	"LS": "S-1-5-19",     // LocalService
 }
 
-// maskGrantsRead reports whether an access mask grants the read access the
-// instance needs.
+// The rights the instance needs on a directory it works with.
+//
+// The instance reads the directory, it creates entries in it, and it reads
+// and writes the files in it: it needs the read access and the write access
+// of the directory and of its files.
+//
+// A right the instance does not need is not one of them. The right to
+// change the access control list of the directory, the right to change its
+// owner and the rights of the configuration of the platform are none of
+// them: a denied entry that carries one of them takes nothing the instance
+// needs away.
+const (
+	// scmRightRead is the right to read the directory and the files in
+	// it.
+	scmRightRead uint32 = 1 << iota
+	// scmRightWrite is the right to create entries in the directory and
+	// to write the files in it.
+	scmRightWrite
+)
+
+// scmNeededRights is the mask of the rights the instance needs.
+//
+// The mask is the intersection a denied entry is measured against: an entry
+// that denies one of these rights takes a right the instance needs away.
+const scmNeededRights = scmRightRead | scmRightWrite
+
+// scmMaskRights returns the rights of the check that an access mask
+// carries.
 //
 // The generic rights and the file specific rights are two different bit
-// sets: an entry that grants one of them grants the read access.
-func maskGrantsRead(mask uint32) bool {
-	if mask&windows.GENERIC_ALL != 0 || mask&windows.GENERIC_READ != 0 {
-		return true
+// sets: an entry that carries one of them carries the right it stands for.
+// The full control carries every right of the check.
+//
+// The mapping is the same for an allowed and for a denied entry: a right
+// that an entry does not carry is not a right it grants and not a right it
+// denies.
+func scmMaskRights(mask uint32) uint32 {
+	if mask&windows.GENERIC_ALL != 0 {
+		return scmRightRead | scmRightWrite
 	}
-	return mask&windows.FILE_GENERIC_READ == windows.FILE_GENERIC_READ
+	var rights uint32
+	if mask&windows.GENERIC_READ != 0 || mask&windows.FILE_GENERIC_READ == windows.FILE_GENERIC_READ {
+		rights |= scmRightRead
+	}
+	if mask&windows.GENERIC_WRITE != 0 || mask&windows.FILE_GENERIC_WRITE == windows.FILE_GENERIC_WRITE {
+		rights |= scmRightWrite
+	}
+	return rights
 }
 
-// maskGrantsWrite reports whether an access mask grants the write access
-// the instance needs.
+// scmRightName names the rights of the check a mask carries.
 //
-// The generic rights and the file specific rights are two different bit
-// sets: an entry that grants one of them grants the write access.
-func maskGrantsWrite(mask uint32) bool {
-	if mask&windows.GENERIC_ALL != 0 || mask&windows.GENERIC_WRITE != 0 {
-		return true
+// The name is the one the messages of the manager use: the read access and
+// the write access are the access the instance needs on a path.
+func scmRightName(rights uint32) string {
+	switch {
+	case rights&scmRightRead != 0 && rights&scmRightWrite != 0:
+		return "read and write access"
+	case rights&scmRightRead != 0:
+		return "read access"
+	default:
+		return "write access"
 	}
-	return mask&windows.FILE_GENERIC_WRITE == windows.FILE_GENERIC_WRITE
 }
 
 // parseSDDLAces returns the access control entries of an SDDL string.
