@@ -20,6 +20,14 @@ import (
 var Version = "dev"
 
 func main() {
+	// The service command family is a command of its own. It is dispatched
+	// before the interactive startup, so "hfdesk" without a "service" token
+	// keeps its exact behaviour: same flags, same defaults, same browser
+	// launch.
+	if isServiceCommand(os.Args[1:]) {
+		os.Exit(runServiceCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	if err := run(); err != nil {
 		os.Exit(1)
 	}
