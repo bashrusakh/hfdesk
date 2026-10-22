@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 )
 
 // jobsStateFile is the on-disk format for jobs_state.json.
@@ -47,7 +49,10 @@ func saveJobsStateLocked(path string, jobs []*Job) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// The state directory is created with the mode the server owns: an
+	// owner-only directory for a supervised instance, the historical mode
+	// for an interactive run.
+	if err := os.MkdirAll(filepath.Dir(path), serverDirMode()); err != nil {
 		return err
 	}
 	return replaceJobsStateFile(path, data, defaultStateFileOps{})
@@ -242,7 +247,10 @@ func AppendHistory(job *Job) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(AppConfigDir(), 0o755); err != nil {
+	// The state directory comes from the effective runtime path model, so a
+	// supervised instance writes its history into its own state root. The
+	// directory is created with the mode the server owns.
+	if err := os.MkdirAll(runtimepaths.StateDir(), serverDirMode()); err != nil {
 		return err
 	}
 	return os.WriteFile(HistoryPath(), data, 0o644)

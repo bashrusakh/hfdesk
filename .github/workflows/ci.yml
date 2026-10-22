@@ -32,6 +32,13 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # The service mode adds process-global mutable state (the installed
+      # runtime path model behind a lock, and the standard logger's output
+      # being redirected by the service host), so the race detector must run
+      # over the whole suite on the Linux runner.
+      - name: Test (race detector)
+        run: go test ./... -race
+
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
   # argument validation cannot regress silently.
@@ -85,6 +92,7 @@ jobs:
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
 
+
       # The Windows desktop host is a second binary of HFDesk. Its defining
       # property is the PE subsystem of the produced file: the console host
       # stays a console subsystem executable and the desktop host is a GUI
@@ -135,3 +143,62 @@ jobs:
       # skip themselves on a machine that cannot host them.
       - name: Test the desktop host lifecycle
         run: go test ./internal/desktop -count=1 -v
+
+      # The service tests skip cleanly when the runner is not elevated, so the
+      # SCM registration itself is only exercised where the runner allows it.
+      - name: Test service package
+        run: go test ./internal/service -v
+
+      # The command layer is platform independent, so it is exercised on
+      # Windows too: a check of the command line that only holds on Unix
+      # would otherwise stay unnoticed until a Windows installation.
+      - name: Test command layer
+        run: go test ./cmd/hfdesk -v
+
+  # The launchd manager and the property list rendering are darwin-only code,
+  # so they need a macOS runner. The run executes the plist validation
+  # (plutil -lint) and the launchctl integration cycle where the runner
+  # allows it.
+  #
+  # The repository has never run its full suite on macOS, so the job covers
+  # the darwin-only code only: the launchd manager, the property list
+  # rendering, the plutil validation and the launchctl lifecycle. Widening
+  # it to the full suite is a separate, deliberate step.
+  go-macos:
+    name: Go checks (macOS)
+    runs-on: macos-latest
+    # A macOS runner is slow and a stalled lifecycle test would occupy it
+    # until the default limit of the platform. The limit is comfortably
+    # above the duration of the job.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+
+      # The service package covers the launchd manager, the plutil -lint
+      # validation of the generated property list and the launchctl
+      # lifecycle where the runner allows it.
+      - name: Test service package
+        run: go test ./internal/service -v
+
+
+      # The command layer is platform independent, so it is exercised on
+      # macOS too: a check of the command line that only holds on another
+      # platform would otherwise stay unnoticed until a macOS installation.
+      - name: Test command layer
+        run: go test ./cmd/hfdesk -v
+

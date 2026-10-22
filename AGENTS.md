@@ -41,6 +41,8 @@ browser-only presentation belongs in `internal/assets/static`.
 | `internal/server/` | HTTP API, jobs, settings, cache browser, websocket state |
 | `internal/assets/` | embedded frontend assets |
 | `internal/assets/static/` | browser UI files |
+| `internal/service/` | service mode: scopes, lifecycle, and the systemd/launchd/SCM managers |
+| `internal/runtimepaths/` | runtime path model for the config file, state root and log dir |
 | `pkg/hfdownloader/` | Hugging Face scan/download/cache/mirror logic |
 | `pkg/smartdl/` | model analysis and selectable download helpers |
 | `docs/` | API docs and screenshots |
@@ -52,6 +54,7 @@ Read relevant Markdown before changing behavior:
 
 - General project behavior: `README.md`
 - API contracts: `docs/API.md`
+- Service mode reference: `docs/SERVICE.md`
 - Contribution and commit conventions: `CONTRIBUTING.md`
 - Release history and user-visible changes: `CHANGELOG.md`
 - Current project notes: `TODO.md`
@@ -83,10 +86,13 @@ change is documentation-only.
 ## Runtime entry points
 
 - Main process: `cmd/hfdesk/main.go`
+- Service command family: `cmd/hfdesk/service.go`
 - Server routes: `internal/server/server.go`, `internal/server/api.go`
 - Job manager: `internal/server/jobs.go`
 - WebSocket hub: `internal/server/websocket.go`
 - Config persistence: `internal/server/config.go`
+- Service layer: `internal/service/service.go`, `internal/service/manager_linux.go`, `internal/service/manager_darwin.go`
+- Runtime paths: `internal/runtimepaths/runtimepaths.go`
 - Frontend app: `internal/assets/static/js/app.js`
 - Frontend styles: `internal/assets/static/css/style.css`
 - Downloader: `pkg/hfdownloader/downloader.go`
@@ -404,6 +410,22 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   shell command string contract.
 - Exact matching and filter behavior must remain predictable for GGUF quants,
   sharded files, mmproj companions, safetensors, and datasets.
+
+## Service mode rules
+
+- The supervisor owns the lifecycle: HFDesk stays a foreground process, with
+  no self-daemonization, no PID file, no shell wrapper, and no startup
+  shortcut.
+- The service is headless: it never opens a browser and never shows a tray
+  icon.
+- Service mode binds loopback by default; a non-loopback address must be
+  requested explicitly, and `install` and `status` report it.
+- Credentials never enter a supervisor registration, a command line, or a unit
+  environment; they live in the service-owned config file.
+- `uninstall` removes the registration only and never deletes models, cache,
+  config, jobs/history, or logs.
+- Platform-specific supervisor code stays in `internal/service`; the shared
+  layer must not branch on the operating system.
 
 ## Testing expectations
 
