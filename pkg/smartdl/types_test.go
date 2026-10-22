@@ -134,6 +134,9 @@ func TestRepoInfo_PopulateDownloadSelection(t *testing.T) {
 		if info.RecommendedDownload == nil || info.RecommendedDownload.Revision != "4.00bpw" || len(info.RecommendedDownload.Filters) != 0 {
 			t.Fatalf("RecommendedDownload = %+v, want unfiltered branch request", info.RecommendedDownload)
 		}
+		if info.RecommendedDownload.BranchVariant {
+			t.Fatalf("ordinary revision-backed selection opted into EXL branch storage: %+v", info.RecommendedDownload)
+		}
 		if len(info.RecommendedFilters) != 0 {
 			t.Fatalf("RecommendedFilters = %v, want empty for revision selection", info.RecommendedFilters)
 		}

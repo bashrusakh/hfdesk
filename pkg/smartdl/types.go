@@ -630,6 +630,10 @@ type SelectableItem struct {
 	// set, selection is by revision rather than by Files or FilterValue; an
 	// unfiltered download includes the branch's model support files.
 	Revision string `json:"revision,omitempty"`
+	// BranchVariant marks an analyzer-recognized EXL2/EXL3 branch choice. It is
+	// separate from Revision so ordinary revision-backed downloads retain their
+	// existing storage behavior.
+	BranchVariant bool `json:"branch_variant,omitempty"`
 
 	// Method, BitsPerWeight, and HeadBits describe branch-backed EXL variants.
 	// BitsPerWeight is the bitrate named by the branch or declared in its
@@ -667,11 +671,12 @@ type RelatedDownload struct {
 
 // DownloadSelection is the web/API representation of a repo download choice.
 type DownloadSelection struct {
-	Repo       string   `json:"repo"`
-	Dataset    bool     `json:"dataset,omitempty"`
-	Revision   string   `json:"revision,omitempty"`
-	Filters    []string `json:"filters,omitempty"`
-	ExactMatch bool     `json:"exactMatch,omitempty"`
+	Repo          string   `json:"repo"`
+	Dataset       bool     `json:"dataset,omitempty"`
+	Revision      string   `json:"revision,omitempty"`
+	Filters       []string `json:"filters,omitempty"`
+	ExactMatch    bool     `json:"exactMatch,omitempty"`
+	BranchVariant bool     `json:"branchVariant,omitempty"`
 }
 
 // RecommendedFilterValues returns filters for recommended selectable items.
@@ -731,18 +736,21 @@ func exactArtifactFilter(repoPath string) string {
 func (r *RepoInfo) PopulateDownloadSelection() {
 	r.RecommendedFilters = r.RecommendedFilterValues()
 	var recommendedRevision string
+	var recommendedBranchVariant bool
 	for _, item := range r.SelectableItems {
 		if item.Recommended && item.UpstreamRepo == "" && item.Revision != "" {
 			recommendedRevision = item.Revision
+			recommendedBranchVariant = item.BranchVariant
 			break
 		}
 	}
 
 	r.RecommendedDownload = &DownloadSelection{
-		Repo:       r.Repo,
-		Dataset:    r.IsDataset,
-		Filters:    r.RecommendedFilters,
-		ExactMatch: r.IsDataset || r.Type == TypeGGUF,
+		Repo:          r.Repo,
+		Dataset:       r.IsDataset,
+		Filters:       r.RecommendedFilters,
+		ExactMatch:    r.IsDataset || r.Type == TypeGGUF,
+		BranchVariant: recommendedBranchVariant,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch

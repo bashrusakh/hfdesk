@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	maxEXLBranchSizeLookups = 16
-	exlBranchLookupWorkers  = 3
-	exlBranchLookupTimeout  = 15 * time.Second
+	maxEXLBranchSizeLookups      = 16
+	maxEXLSafeTensorHeaderProbes = 16
+	exlBranchLookupWorkers       = 3
+	exlBranchLookupTimeout       = 15 * time.Second
 )
 
 var (
@@ -46,7 +47,7 @@ type exlBranchResult struct {
 // names provide the complete option list; optional branch config/tree lookups
 // enrich method, precision, and size without making those lookups fatal.
 func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([]SelectableItem, error) {
-	if info == nil || info.IsDataset || hasModelWeightFiles(info.Files) {
+	if info == nil || info.IsDataset {
 		return nil, nil
 	}
 
@@ -70,6 +71,11 @@ func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([
 		}
 	}
 	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if hasWeights, err := a.hasModelWeightFiles(ctx, info.Repo, info.Files); err != nil {
+		return nil, err
+	} else if hasWeights {
 		return nil, nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
@@ -266,6 +272,7 @@ func newEXLBranchItem(candidate exlBranchCandidate, method string, bpw, headBits
 		Description:   exlBranchDescription(method, bpw, headBits),
 		Category:      "quantization",
 		Revision:      candidate.revision,
+		BranchVariant: true,
 		Method:        method,
 		BitsPerWeight: bpw,
 		HeadBits:      headBits,
@@ -354,19 +361,54 @@ func safeEXLRevision(revision string) bool {
 	return true
 }
 
-func hasModelWeightFiles(files []FileInfo) bool {
+// hasModelWeightFiles keeps the existing format checks, but does not equate a
+// safetensors extension alone with model weights. A positively identified
+// recognized calibration tensor family is calibration data; inconclusive
+// headers preserve the previous conservative behavior and count as weights.
+func (a *Analyzer) hasModelWeightFiles(ctx context.Context, repo string, files []FileInfo) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, exlBranchLookupTimeout)
+	defer cancel()
+	safetensorsProbes := 0
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		name := strings.ToLower(filepath.Base(file.Path))
 		switch filepath.Ext(name) {
-		case ".safetensors", ".gguf", ".gguf-split", ".onnx", ".pt", ".pth", ".ckpt", ".h5", ".pb":
-			return true
+		case ".safetensors":
+			if safetensorsProbes == maxEXLSafeTensorHeaderProbes || probeCtx.Err() != nil {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			safetensorsProbes++
+			header, err := a.fetchSafetensorsHeader(probeCtx, repo, "main", file)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return false, ctxErr
+				}
+				return true, nil
+			}
+			calibrationOnly, err := isCalibrationOnlySafetensorsHeader(header)
+			if err != nil || !calibrationOnly {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return false, ctxErr
+				}
+				return true, nil
+			}
+		case ".gguf", ".gguf-split", ".onnx", ".pt", ".pth", ".ckpt", ".h5", ".pb":
+			return true, nil
 		case ".bin":
 			if !strings.Contains(name, "tokenizer") {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func exlMethodFromRepo(repo string) string {
