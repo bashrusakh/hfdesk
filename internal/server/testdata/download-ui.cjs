@@ -8,6 +8,7 @@ const calls = [];
 const messages = [];
 let lowDestination = false;
 let sequence = 0;
+let diskPreviewGate = null;
 const window = {};
 const context = {
   window,
@@ -30,6 +31,12 @@ const context = {
     if (path === '/api/settings') {
       calls.push({ path, body: options?.body ? JSON.parse(options.body) : null });
       return { ok: true, json: async () => ({downloadRoutes: fixture.routes || {}}) };
+    }
+    if (path === '/api/diskfree' && options?.method === 'POST' && diskPreviewGate) {
+      const gate = diskPreviewGate;
+      diskPreviewGate = null;
+      gate.started();
+      await gate.release;
     }
     const response = await fetch(fixture.url + path, options);
     const data = await response.json();
@@ -143,6 +150,7 @@ async function runBranchVariant() {
     category: 'quantization',
     recommended: true,
     revision,
+    branch_variant: true,
     size: 12 * 1024 * 1024 * 1024,
     size_human: '12 GiB'
   };
@@ -154,7 +162,13 @@ async function runBranchVariant() {
     selectable_items: [item],
     recommended_download: { repo, revision, filters: [], exactMatch: false }
   };
-  ui.setAnalysis(analysis);
+  let routeKey = select('quantRouteSelect', analysis);
+  const preferredRoute = ui.getConfiguredRouteOptions().find(option => option.key === 'llm/safetensors')?.key;
+  if (preferredRoute) {
+    const selectNode = nodes.get('#quantRouteSelect');
+    selectNode.value = String(ui.getConfiguredRouteOptions().findIndex(option => option.key === preferredRoute));
+    routeKey = ui.routeSelectValue('quantRouteSelect');
+  }
   const html = ui.renderSelectableItems([item], 'selectableItems');
   assert(html.includes('>refs/bpw/4.0</span>'), 'branch label is rendered in the existing selectable row');
   assert(html.includes('EXL3 · 4 BPW · head 6 bits'), 'branch details use the existing row description');
@@ -167,7 +181,8 @@ async function runBranchVariant() {
   assert.equal(args.revision, revision, 'the row carries its own branch revision');
   assert.equal(args.filterValue, '', 'branch id is not reused as a file filter');
   assert.equal(args.files, null, 'whole-branch selection has no file list');
-  assert.equal(args.statusKey, `branch:${revision}`, 'branch row carries its revision-scoped status key');
+  assert.equal(args.statusKey, '', 'destination-qualified status identity is resolved from the current existing selector at click time');
+  assert.equal(args.branchVariant, true, 'branch action carries only the explicit analyzer branch marker');
 
   calls.length = 0;
   messages.length = 0;
@@ -178,12 +193,73 @@ async function runBranchVariant() {
   assert(preview, 'branch download includes the normal disk-space guard');
   assert(download, 'branch download reaches the real download handler');
   assert.deepEqual(download.body, preview.body, 'branch guard and creation use the identical request');
+  const selectedRoot = routeKey
+    ? (fixture.routes[routeKey] || (routeKey.startsWith('llm/') ? fixture.routes.llm : ''))
+    : '';
+  const appRoot = selectedRoot || fixture.local || fixture.cache;
+  assert.equal(preview.data.path, appRoot === fixture.cache ? fixture.cache + '/hub' : appRoot,
+    'branch disk guard resolves the selected destination provider');
+  assert.equal(download.data.outputDir, appRoot, 'branch job uses the same selected application destination');
   assert.equal(download.body.repo, repo);
   assert.equal(download.body.revision, revision, 'selected branch wins over currentAnalysis main');
+  assert.equal(download.body.branchVariant, true, 'analyzed EXL branch sends the explicit branchVariant flag');
+  assert.equal(download.body.routeKey || '', routeKey, 'branch request uses the selected existing destination provider');
   assert.deepEqual(download.body.filters, [], 'branch request includes all branch files');
   assert.equal(download.body.exactMatch, false, 'branch request does not use exact file matching');
   assert.equal(download.body.excludes, undefined, 'branch request keeps branch support files unfiltered');
   assert.equal(download.data.revision, revision, 'the created job retains the selected revision');
+  assert.equal(download.data.branchVariant, true, 'the created job retains the branch variant identity');
+  assert.equal(download.data.routeKey || '', routeKey, 'the created job retains the selected route identity');
+
+  const options = ui.getConfiguredRouteOptions();
+  const alternateRoute = options.find(option => option.key !== routeKey);
+  if (routeKey && alternateRoute) {
+    calls.length = 0;
+    messages.length = 0;
+    let markStarted;
+    let releasePreview;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const release = new Promise(resolve => { releasePreview = resolve; });
+    diskPreviewGate = { started: markStarted, release };
+    const rowControl = { outerHTML: '<button data-download="branch">↓</button>' };
+    const delayedRow = {
+      dataset: {},
+      querySelector(selector) { return selector === '.quant-dl-btn' ? rowControl : null; }
+    };
+    const delayed = window.downloadQuantFromButton({
+      dataset: { download: encoded },
+      closest: () => delayedRow
+    });
+    await started;
+    nodes.get('#quantRouteSelect').value = String(options.findIndex(option => option.key === alternateRoute.key));
+    assert.equal(ui.routeSelectValue('quantRouteSelect'), alternateRoute.key);
+    releasePreview();
+    await delayed;
+    const delayedDownload = calls.find(c => c.path === '/api/download');
+    assert.equal(delayedDownload.body.routeKey, routeKey, 'in-flight request keeps its captured destination selector');
+    assert.equal(delayedRow.dataset.dlStatus, undefined, 'late response does not mark the newly selected destination queued');
+    assert.equal(rowControl.outerHTML, '<button data-download="branch">↓</button>', 'late response does not replace the new destination row control');
+  }
+
+  // A revision by itself must remain an ordinary legacy request; only the
+  // explicit analyzer marker opts into branch-isolated storage.
+  const absentMarkerItem = { ...item };
+  delete absentMarkerItem.branch_variant;
+  for (const legacyItem of [{ ...item, branch_variant: false }, absentMarkerItem]) {
+    const legacyHtml = ui.renderSelectableItems([legacyItem], 'selectableItems');
+    const legacyEncoded = legacyHtml.match(/data-download="([^"]+)"/)?.[1];
+    const legacyArgs = JSON.parse(decodeURIComponent(legacyEncoded));
+    assert.equal(legacyArgs.revision, revision, 'revision-only row keeps its selected revision');
+    assert.equal(legacyArgs.branchVariant, undefined, 'false/absent analyzer marker does not opt into branch storage');
+    calls.length = 0;
+    await window.downloadQuantFromButton({ dataset: { download: legacyEncoded }, closest: () => sourceRow });
+    const legacyDownload = calls.find(c => c.path === '/api/download');
+    assert(legacyDownload, 'revision-only selectable row reaches the legacy download path');
+    assert.equal(legacyDownload.body.revision, revision);
+    assert.equal(legacyDownload.body.branchVariant, undefined);
+    assert.deepEqual(legacyDownload.body.filters, [legacyItem.id]);
+    assert.equal(legacyDownload.body.exactMatch, true);
+  }
 
   const noSizeItem = { ...item, id: 'exl-branch:refs/bpw/5.0', label: 'refs/bpw/5.0', revision: 'refs/bpw/5.0', recommended: false, size: undefined, size_human: undefined };
   const noSizeHtml = ui.renderSelectableItems([noSizeItem], 'selectableItems');
