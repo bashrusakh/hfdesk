@@ -1209,10 +1209,18 @@ var scmServiceIdentity = sync.OnceValue(scmDocumentedIdentitySIDs)
 // and the cache of an interactive run of the user. Their access control
 // list is only read, never changed, and never changed recursively.
 //
-// A directory that really lives inside the state directory of the instance
-// belongs to the instance: the state directory belongs to the account the
-// instance runs as, and the instance creates the cache tree it needs inside
-// it. Such a directory is neither checked nor created.
+// A directory that does not exist yet and that really lives inside the
+// state directory of the instance belongs to the instance: the state
+// directory belongs to the account the instance runs as, and the instance
+// creates the cache tree it needs inside it. Such a directory is neither
+// checked nor created.
+//
+// The exemption covers a directory that does not exist yet only. A directory
+// that exists already carries the access control list of whoever owns it,
+// and owning the state directory grants no right on a directory inside it:
+// a child of the state root that the account of the instance cannot write
+// in is a directory the instance cannot work with. Such a directory is
+// checked like every other named directory, wherever it lives.
 //
 // The real location of the two paths decides that: the platform follows the
 // links of a path before it uses it, so a directory that is reached through
@@ -1220,10 +1228,18 @@ var scmServiceIdentity = sync.OnceValue(scmDocumentedIdentitySIDs)
 // that leaves the state directory is a directory outside of it, and it is
 // checked like every other named directory.
 //
-// A directory the user named is outside of the instance: it has to exist,
-// and the account of the instance has to be able to work with it. The
-// installation never creates such a directory: it belongs to whoever named
-// it, and the installation only reads its access control list.
+// A directory the user named is outside of the instance: the account of the
+// instance has to be able to work with it. A directory that exists already is
+// checked against the account of the instance, wherever it lives.
+//
+// A directory that does not exist yet is checked through its nearest
+// existing ancestor: the account has to be able to create the directory
+// there, because the instance creates it when it runs, as the account the
+// instance runs as.
+//
+// The installation never creates a directory the user named: it belongs to
+// whoever named it, and the installation only reads the access control list
+// of the ancestor it judges.
 func preflightDataPaths(opts InstallOptions) error {
 	for _, dir := range []struct {
 		name string
@@ -1236,21 +1252,33 @@ func preflightDataPaths(opts InstallOptions) error {
 		if dir.path == "" {
 			continue
 		}
-		inside, err := scmPathInsideStateRoot(opts.Paths.StateDir, dir.path)
-		if err != nil {
-			// The real location of the path cannot be read: the
-			// exemption is not granted, and the path is checked
-			// like every other named directory. The check below is
-			// the safe answer, and the reason is logged.
-			log.Printf("service: the real location of the %s %q cannot be read (%v): the path is checked like every other named directory", dir.name, dir.path, err)
-			inside = false
+		if pathMissing(dir.path) {
+			// The directory does not exist yet. The instance creates
+			// the cache tree it needs inside the state directory it
+			// owns, so such a directory is neither checked nor
+			// created.
+			inside, err := scmPathInsideStateRoot(opts.Paths.StateDir, dir.path)
+			if err != nil {
+				// The real location of the path cannot be read: the
+				// exemption is not granted, and the path is checked
+				// like every other named directory. The check below is
+				// the safe answer, and the reason is logged.
+				log.Printf("service: the real location of the %s %q cannot be read (%v): the path is checked like every other named directory", dir.name, dir.path, err)
+				inside = false
+			}
+			if inside {
+				// The default of the scope lives inside the state
+				// directory of the instance, and the state directory
+				// belongs to the account of the instance.
+				continue
+			}
 		}
-		if inside {
-			// The default of the scope lives inside the state
-			// directory of the instance, and the state directory
-			// belongs to the account of the instance.
-			continue
-		}
+		// The directory is checked against the account of the instance,
+		// wherever it lives: a directory that exists already is checked
+		// against its own access control list, and a directory that does
+		// not exist yet is checked through its nearest existing ancestor.
+		// The check reads the access control list of the real location of
+		// the directory.
 		if err := preflightDataPath(dir.name, dir.path); err != nil {
 			return err
 		}
@@ -1341,13 +1369,18 @@ func scmSplitExistingPath(path string) (string, []string, error) {
 // preflightDataPath checks that the account of the instance can work with
 // the directory the installation reuses.
 //
-// The directory has to exist: the installation never creates a directory the
-// user named, because such a directory belongs to whoever named it. A
-// missing directory is refused with the guidance that tells the user what
-// to do.
+// A directory that exists already is checked against the account of the
+// instance: the access control list of the directory decides whether the
+// account can read it and write in it.
 //
-// The access control list of the directory is only read: the descriptor of
-// the instance is never applied to a path the installation reuses.
+// A directory that does not exist yet is checked through its nearest
+// existing ancestor: the instance creates the directory when it runs, as the
+// account the instance runs as, so the account has to be able to create the
+// directory there.
+//
+// The installation never creates a directory the user named: it belongs to
+// whoever named it, and the installation only reads the access control list
+// of the path it checks.
 func preflightDataPath(name, path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("service: %s %q must be an absolute path", name, path)
@@ -1364,18 +1397,94 @@ func preflightDataPath(name, path string) error {
 		return fmt.Errorf("service: %s %q is not usable: %w", name, path, err)
 	}
 
-	// The directory does not exist. The installation never creates a
-	// directory the user named: the directory and the access rights of
-	// it belong to whoever named it, and an installation that created
-	// one would take a tree of models over without being asked to.
+	// The directory does not exist yet. The instance creates it when it
+	// runs, as the account the instance runs as, so the installation
+	// judges it through its nearest existing ancestor: the account has to
+	// be able to create the directory there.
 	//
-	// The message names the account of the instance: the user has to
-	// grant the access to it, and the name of the account is what makes
-	// the guidance actionable.
-	return fmt.Errorf(
-		"service: the %s %q does not exist: the installation never creates a directory the user named: create it and grant the account read and write access to it, or install the instance without this path: the account %s has to be granted that access",
-		name, path, scmServiceIdentityName,
-	)
+	// The installation never creates the directory: the directory and the
+	// access rights of it belong to whoever named it, and an installation
+	// that created one would take a tree of models over without being
+	// asked to.
+	return checkServiceCreateAccess(name, path)
+}
+
+// checkServiceCreateAccess checks that the account of the instance can
+// create the directory the installation reuses.
+//
+// The directory does not exist yet: the instance creates it when it runs, as
+// the account the instance runs as. The check therefore judges the nearest
+// existing ancestor of the directory: the account has to be able to create
+// entries in it, which is the access the instance needs on every directory
+// it works with.
+//
+// The access control list of the ancestor is only read: the installation
+// never creates the directory the user named and never applies a descriptor
+// to a path it reuses.
+//
+// The directories above the ancestor are not judged: the account of the
+// instance traverses them with the privilege that lets a service account
+// bypass the traverse check, so a directory the account reaches is never
+// refused here for a traverse right it does not need. The check of the
+// manager is a preflight of the permissions of a path and not a simulation
+// of the access check of the operating system.
+func checkServiceCreateAccess(label, path string) error {
+	ancestor, err := scmNearestExistingDir(path)
+	if err != nil {
+		return fmt.Errorf("service: the %s %q does not exist and the nearest existing ancestor of it cannot be read: %w: the installation cannot tell whether the account %s can create the directory", label, path, err, scmServiceIdentityName)
+	}
+	sddl, err := scmReadServiceAccess(ancestor)
+	if err != nil {
+		return fmt.Errorf("service: the %s %q does not exist and the access rights of its nearest existing ancestor %q cannot be read: %w: the installation cannot tell whether the account %s can create the directory", label, path, ancestor, err, scmServiceIdentityName)
+	}
+	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
+		// The message names the directory, the account and the access
+		// that is missing: the user has to grant the access to the
+		// ancestor, and the name of the ancestor is what makes the
+		// guidance actionable.
+		return fmt.Errorf(
+			"service: the %s %q does not exist and the account %s cannot create it: %w: the nearest existing ancestor %q has to grant the account read and write access: the installation never creates a directory the user named, the instance creates it when it runs, as the account the instance runs as: grant the account read and write access to the ancestor directory, or install the instance without this path",
+			label, path, scmServiceIdentityName, err, ancestor,
+		)
+	}
+	return nil
+}
+
+// scmNearestExistingDir returns the nearest existing ancestor directory of
+// the path.
+//
+// The ancestor is the directory the instance creates the directory in: it is
+// the deepest directory that exists on the way to the path. A path below a
+// file has no such ancestor: a file can never hold a directory.
+//
+// The path is judged by its real location: the platform follows the links of
+// a path before it uses it, so a directory that is reached through a link is
+// created in the directory its target lives in.
+func scmNearestExistingDir(path string) (string, error) {
+	resolved, err := scmResolvePath(path)
+	if err != nil {
+		// The real location of the path cannot be read: the path as it
+		// was written is the one that is judged.
+		resolved = path
+	}
+	current := filepath.Clean(resolved)
+	for {
+		info, err := os.Stat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return "", fmt.Errorf("%q is not a directory", current)
+			}
+			return current, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing parent directory of %q was found", path)
+		}
+		current = parent
+	}
 }
 
 // checkServiceAccess reads the access control list of a path and checks
@@ -1383,13 +1492,26 @@ func preflightDataPath(name, path string) error {
 //
 // The access control list is only read: the descriptor of the instance is
 // never applied to a path the installation reuses.
+func checkServiceAccess(label, path string) error {
+	sddl, err := scmReadServiceAccess(path)
+	if err != nil {
+		return fmt.Errorf("service: the access rights of the %s %q cannot be read: %w: the installation cannot tell whether the account %s can use the path", label, path, err, scmServiceIdentityName)
+	}
+	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
+		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %w: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, err)
+	}
+	return nil
+}
+
+// scmReadServiceAccess reads the access control list of a path and returns
+// it in its SDDL form.
 //
 // The list that decides the access is the one of the real location of the
 // path: the platform follows the links of a path before it uses it, so a
 // directory that is reached through a link is used by the rights of its
 // target and not by the rights of the link itself. A path whose real
 // location cannot be read is judged by the path as it was written.
-func checkServiceAccess(label, path string) error {
+func scmReadServiceAccess(path string) (string, error) {
 	resolved, err := scmResolvePath(path)
 	if err != nil {
 		resolved = path
@@ -1404,16 +1526,13 @@ func checkServiceAccess(label, path string) error {
 		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
 	)
 	if err != nil {
-		return fmt.Errorf("service: the access rights of the %s %q cannot be read: %w: the installation cannot tell whether the account %s can use the path", label, path, err, scmServiceIdentityName)
+		return "", err
 	}
 	sddl := sd.String()
 	if sddl == "" {
-		return fmt.Errorf("service: the access rights of the %s %q cannot be read: the installation cannot tell whether the account %s can use the path", label, path, scmServiceIdentityName)
+		return "", errors.New("the access control list is empty")
 	}
-	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
-		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %w: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, err)
-	}
-	return nil
+	return sddl, nil
 }
 
 // sddlGrantsIdentity reports whether the access control list of an SDDL
@@ -1571,12 +1690,69 @@ const (
 // that denies one of these rights takes a right the instance needs away.
 const scmNeededRights = scmRightRead | scmRightWrite
 
+// The individual rights of a file and of a directory the instance needs.
+//
+// The instance reads a directory, it creates entries in it and it reads and
+// writes the files in it. The rights are the ones of a directory, and the
+// rights of a file carry the same values: the right to list the entries of
+// the directory is FILE_READ_DATA, the right to walk through it is
+// FILE_EXECUTE, the right to create a file in it is FILE_WRITE_DATA and the
+// right to create a directory in it is FILE_APPEND_DATA.
+//
+// The right to delete an entry of the directory is the one the platform does
+// not export, so it is written down here.
+const (
+	// scmFileDeleteChild is the right to delete an entry of a directory
+	// (FILE_DELETE_CHILD). The platform does not export the constant.
+	scmFileDeleteChild uint32 = 0x00000040
+
+	// scmFileReadRights is the mask of the individual rights the instance
+	// needs to read a directory and the files in it: the right to list
+	// the entries of the directory (FILE_LIST_DIRECTORY, the same value
+	// as FILE_READ_DATA), the right to read the extended attributes of
+	// the entries, the right to walk through the directory
+	// (FILE_TRAVERSE, the same value as FILE_EXECUTE) and the right to
+	// read their attributes.
+	scmFileReadRights uint32 = windows.FILE_READ_DATA |
+		windows.FILE_READ_EA |
+		windows.FILE_EXECUTE |
+		windows.FILE_READ_ATTRIBUTES
+
+	// scmFileWriteRights is the mask of the individual rights the
+	// instance needs to create entries in a directory and to write the
+	// files in it: the right to create a file in it (FILE_ADD_FILE, the
+	// same value as FILE_WRITE_DATA), the right to create a directory in
+	// it (FILE_ADD_SUBDIRECTORY, the same value as FILE_APPEND_DATA),
+	// the right to write the extended attributes of the entries, the
+	// right to delete an entry of it and the right to write their
+	// attributes.
+	scmFileWriteRights uint32 = windows.FILE_WRITE_DATA |
+		windows.FILE_APPEND_DATA |
+		windows.FILE_WRITE_EA |
+		scmFileDeleteChild |
+		windows.FILE_WRITE_ATTRIBUTES
+)
+
 // scmMaskRights returns the rights of the check that an access mask
 // carries.
 //
-// The generic rights and the file specific rights are two different bit
-// sets: an entry that carries one of them carries the right it stands for.
-// The full control carries every right of the check.
+// The mask is read by its individual bits: the rights of the check are the
+// rights of a directory and of a file, and an entry that carries one of
+// them carries the right it stands for. An entry that carries a single one
+// of them denies that one, so a denial of the right to create a file in a
+// directory is a denial of the write access the instance needs.
+//
+// The generic rights are the same rights in another form: the manager of the
+// platform expands them into the file rights of the object before it checks
+// the access, so they carry the rights they stand for. The full control
+// carries every right of the check. The right to execute an object is none
+// of the rights of the check.
+//
+// A right the instance does not need is not one of them: the right to delete
+// the object, the right to read its descriptor, the right to change its
+// access control list, the right to change its owner and the right to
+// synchronize with it are none of them, so an entry that carries one of them
+// takes nothing the instance needs away.
 //
 // The mapping is the same for an allowed and for a denied entry: a right
 // that an entry does not carry is not a right it grants and not a right it
@@ -1586,10 +1762,16 @@ func scmMaskRights(mask uint32) uint32 {
 		return scmRightRead | scmRightWrite
 	}
 	var rights uint32
-	if mask&windows.GENERIC_READ != 0 || mask&windows.FILE_GENERIC_READ == windows.FILE_GENERIC_READ {
+	if mask&windows.GENERIC_READ != 0 {
 		rights |= scmRightRead
 	}
-	if mask&windows.GENERIC_WRITE != 0 || mask&windows.FILE_GENERIC_WRITE == windows.FILE_GENERIC_WRITE {
+	if mask&windows.GENERIC_WRITE != 0 {
+		rights |= scmRightWrite
+	}
+	if mask&scmFileReadRights != 0 {
+		rights |= scmRightRead
+	}
+	if mask&scmFileWriteRights != 0 {
 		rights |= scmRightWrite
 	}
 	return rights

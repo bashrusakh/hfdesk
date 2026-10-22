@@ -1225,6 +1225,118 @@ func TestSDDLGrantsIdentityIgnoresADenialOfARightTheInstanceDoesNotNeed(t *testi
 	}
 }
 
+// TestSDDLGrantsIdentityRefusesADenialOfAnIndividualFileRight checks that a
+// denied entry that carries a single file right the instance needs is
+// refused.
+//
+// The instance creates the files of the cache in the directory it works
+// with, so the right to create a file in it (FILE_ADD_FILE) is a right the
+// instance needs. A descriptor that denies that right to the account of the
+// instance and grants the full control to everybody else denies the write
+// access the instance needs, and the installation has to refuse it.
+//
+// The denial is measured against the individual rights of the entry: the
+// aggregate masks alone carry nothing here, and the denial would be ignored.
+func TestSDDLGrantsIdentityRefusesADenialOfAnIndividualFileRight(t *testing.T) {
+	identity := scmDocumentedIdentitySIDs()
+
+	err := sddlGrantsIdentity("D:P(D;;0x00000002;;;LS)(A;;FA;;;WD)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied FILE_ADD_FILE")
+	}
+	if !strings.Contains(err.Error(), "write access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
+	}
+}
+
+// TestSDDLGrantsIdentityGrantsAnIndividualFileRight checks that an allowed
+// entry that carries a single file right grants that right and not the
+// other one.
+//
+// The right to create a file in a directory (FILE_ADD_FILE) is the write
+// access of the check, and it is not the read access: a directory that
+// grants it alone is a directory the account of the instance can write in
+// and cannot read.
+func TestSDDLGrantsIdentityGrantsAnIndividualFileRight(t *testing.T) {
+	identity := scmDocumentedIdentitySIDs()
+
+	// The mapping itself: the right to create a file is the write
+	// access and not the read access.
+	if got := scmMaskRights(windows.FILE_WRITE_DATA); got != scmRightWrite {
+		t.Errorf("scmMaskRights(FILE_ADD_FILE) = %#08x, want the write access and not the read access", got)
+	}
+
+	// The entry alone grants the write access and not the read access,
+	// so the directory is refused for the missing read access.
+	err := sddlGrantsIdentity("D:P(A;;0x00000002;;;LS)", identity)
+	if err == nil {
+		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a directory without the read access")
+	}
+	if !strings.Contains(err.Error(), "read access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the missing read access", err)
+	}
+	if strings.Contains(err.Error(), "write access") {
+		t.Errorf("sddlGrantsIdentity() = %v, want the write access to be granted", err)
+	}
+
+	// The same entry next to an entry that grants the read access: the
+	// directory is usable by the account of the instance.
+	if err := sddlGrantsIdentity("D:P(A;;0x00000002;;;LS)(A;;0x00000001;;;LS)", identity); err != nil {
+		t.Errorf("sddlGrantsIdentity() = %v, want nil for a directory the account of the instance can read and write", err)
+	}
+}
+
+// TestSCMMaskRightsMapsTheIndividualFileRights checks that the rights of an
+// access control entry are read by their individual bits.
+//
+// The instance needs the rights of a directory: it reads the entries of it
+// and the files in it, and it creates entries in it and writes the files in
+// it. An entry that carries a single one of them carries that right, so an
+// entry that denies a single one of them denies it.
+//
+// The rights the instance does not need are not rights of the check: the
+// right to delete the object, the right to read its descriptor, the right to
+// change its access control list, the right to change its owner, the right
+// to synchronize with it and the right to execute it are none of them.
+//
+// The generic rights and the aggregate masks carry the same rights as the
+// individual bits they stand for.
+func TestSCMMaskRightsMapsTheIndividualFileRights(t *testing.T) {
+	cases := []struct {
+		name string
+		mask uint32
+		want uint32
+	}{
+		{"the right to list the directory", windows.FILE_LIST_DIRECTORY, scmRightRead},
+		{"the right to read the extended attributes", windows.FILE_READ_EA, scmRightRead},
+		{"the right to walk through the directory", windows.FILE_TRAVERSE, scmRightRead},
+		{"the right to read the attributes", windows.FILE_READ_ATTRIBUTES, scmRightRead},
+		{"the right to create a file", windows.FILE_WRITE_DATA, scmRightWrite},
+		{"the right to create a directory", windows.FILE_APPEND_DATA, scmRightWrite},
+		{"the right to write the extended attributes", windows.FILE_WRITE_EA, scmRightWrite},
+		{"the right to delete a child", scmFileDeleteChild, scmRightWrite},
+		{"the right to write the attributes", windows.FILE_WRITE_ATTRIBUTES, scmRightWrite},
+		{"the right to delete the object", windows.DELETE, 0},
+		{"the right to read the descriptor", windows.READ_CONTROL, 0},
+		{"the right to change the access control list", windows.WRITE_DAC, 0},
+		{"the right to change the owner", windows.WRITE_OWNER, 0},
+		{"the right to synchronize", windows.SYNCHRONIZE, 0},
+		{"the right to execute", windows.GENERIC_EXECUTE, 0},
+		{"the generic read", windows.GENERIC_READ, scmRightRead},
+		{"the generic write", windows.GENERIC_WRITE, scmRightWrite},
+		{"the generic all", windows.GENERIC_ALL, scmRightRead | scmRightWrite},
+		{"the aggregate read", windows.FILE_GENERIC_READ, scmRightRead},
+		{"the aggregate write", windows.FILE_GENERIC_WRITE, scmRightWrite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmMaskRights(tc.mask); got != tc.want {
+				t.Errorf("scmMaskRights(%#08x) = %#08x, want %#08x", tc.mask, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSDDLGrantsIdentityWithTheMembershipOfTheAccount checks the access
 // control list of a path against the membership of the account the instance
 // runs as.
@@ -1416,21 +1528,18 @@ func TestPreflightDataPathRefusesAFile(t *testing.T) {
 	}
 }
 
-// TestPreflightDataPathsRefuseAMissingNamedDirectory checks that a
-// directory the user named and that does not exist is refused with the
-// guidance that tells the user what to do, and that the installation never
-// creates it.
-//
-// A named data directory belongs to whoever named it: the installation only
-// reads its access control list, and it never creates a directory the user
-// named. A directory that does not exist is a failed installation and not a
-// service that fails later with an opaque access error.
-func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
-	cases := []struct {
-		name string
-		// path returns the named directory of the installation.
-		path func(opts *InstallOptions, root string) string
-	}{
+// scmTestNamedDir is one directory an installation can name.
+type scmTestNamedDir struct {
+	// name names the directory in the name of the subtest.
+	name string
+	// path returns the named directory of the installation.
+	path func(opts *InstallOptions, root string) string
+}
+
+// scmTestNamedDirs returns the directories an installation can name: the
+// cache root, the hub directory and the local output directory.
+func scmTestNamedDirs() []scmTestNamedDir {
+	return []scmTestNamedDir{
 		{"the cache dir", func(opts *InstallOptions, root string) string {
 			opts.CacheDir = filepath.Join(root, "cache")
 			return opts.CacheDir
@@ -1444,33 +1553,100 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 			return opts.LocalDir
 		}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+}
+
+// scmTestOptionsWithNamedDir returns the options of an installation that
+// names one directory only, and the directory it names.
+//
+// The other directories are not part of the installation: the preflight
+// checks the named directories only.
+func scmTestOptionsWithNamedDir(root string, named scmTestNamedDir) (InstallOptions, string) {
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	opts.CacheDir = ""
+	opts.HubDir = ""
+	opts.LocalDir = ""
+	return opts, named.path(&opts, root)
+}
+
+// TestPreflightDataPathsAcceptAMissingNamedDirectory checks that a named
+// directory that does not exist yet is accepted when the account of the
+// instance can create it in its nearest existing ancestor.
+//
+// The instance creates the directory when it runs, as the account the
+// instance runs as, so the installation judges the directory through the
+// ancestor it would be created in: the account has to be able to create
+// entries there.
+//
+// The installation creates nothing: the directory belongs to whoever named
+// it, and the instance creates it when it runs.
+func TestPreflightDataPathsAcceptAMissingNamedDirectory(t *testing.T) {
+	for _, named := range scmTestNamedDirs() {
+		t.Run(named.name, func(t *testing.T) {
 			root := t.TempDir()
-			opts := scmTestOptions()
-			opts.Paths = runtimepaths.Paths{
-				ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
-				StateDir:   filepath.Join(root, "var"),
-				LogDir:     filepath.Join(root, "var", "logs"),
+			// The nearest existing ancestor of the directory grants the
+			// account of the instance the access it needs to create the
+			// directory there.
+			scmTestSetDACL(t, root, scmTestAllowInstanceIdentityDACL(t))
+
+			opts, path := scmTestOptionsWithNamedDir(root, named)
+
+			if err := preflightDataPaths(opts); err != nil {
+				t.Errorf("preflightDataPaths() = %v, want nil for a directory the account of the instance can create", err)
 			}
-			// Only the directory of the case is named: the other ones
-			// are not part of the installation.
-			opts.CacheDir = ""
-			opts.HubDir = ""
-			opts.LocalDir = ""
-			path := tc.path(&opts, root)
+			// The installation created nothing: the instance creates the
+			// directory when it runs.
+			if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("the directory %q exists (stat error: %v), want none: the instance creates it when it runs", path, err)
+			}
+		})
+	}
+}
+
+// TestPreflightDataPathsRefuseAMissingNamedDirectory checks that a named
+// directory that does not exist yet is refused when the account of the
+// instance cannot create it in its nearest existing ancestor.
+//
+// The instance creates the directory when it runs, as the account the
+// instance runs as, so the account has to be able to create entries in the
+// ancestor. A named data directory belongs to whoever named it: the
+// installation only reads the access control list of the ancestor and never
+// creates the directory.
+//
+// The refusal names the directory, the account and the access that is
+// missing, so the user knows what to grant.
+func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
+	for _, named := range scmTestNamedDirs() {
+		t.Run(named.name, func(t *testing.T) {
+			root := t.TempDir()
+			// The nearest existing ancestor of the directory does not
+			// grant the account of the instance the access it needs to
+			// create the directory there.
+			scmTestSetDACL(t, root, scmTestDenyInstanceIdentityDACL(t))
+
+			opts, path := scmTestOptionsWithNamedDir(root, named)
 
 			err := preflightDataPaths(opts)
 			if err == nil {
-				t.Fatalf("preflightDataPaths() = nil, want the refusal of %s", tc.name)
+				t.Fatalf("preflightDataPaths() = nil, want the refusal of %s", named.name)
 			}
 			if !scmTestNamesPath(err.Error(), path) {
 				t.Errorf("preflightDataPaths() = %v, want an error that names the path %q", err, path)
 			}
+			if !strings.Contains(err.Error(), scmServiceIdentityName) {
+				t.Errorf("preflightDataPaths() = %v, want an error that names the account of the instance", err)
+			}
+			if !strings.Contains(err.Error(), "read and write access") {
+				t.Errorf("preflightDataPaths() = %v, want an error that names the access that is missing", err)
+			}
 			if !strings.Contains(err.Error(), "never creates a directory the user named") {
 				t.Errorf("preflightDataPaths() = %v, want an error that tells the user that the installation creates no directory of its own", err)
 			}
-			if !strings.Contains(err.Error(), "create it and grant the account read and write access to it") {
+			if !strings.Contains(err.Error(), "grant the account read and write access to the ancestor directory") {
 				t.Errorf("preflightDataPaths() = %v, want an error that tells the user what to do", err)
 			}
 			// The refused directory was not created behind the back of
@@ -1482,13 +1658,49 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 	}
 }
 
+// TestPreflightDataPathJudgesTheNearestExistingAncestor checks that a named
+// directory that does not exist yet is judged through the nearest existing
+// ancestor of it and not through the directory above it.
+//
+// The instance creates the directory when it runs, as the account the
+// instance runs as: the account has to be able to create it in the
+// directory that holds it, and the directory that holds it is the nearest
+// existing ancestor.
+func TestPreflightDataPathJudgesTheNearestExistingAncestor(t *testing.T) {
+	root := t.TempDir()
+	// The directory that holds the named directory does not exist yet
+	// either: the nearest existing ancestor is the one below the root.
+	ancestor := filepath.Join(root, "a")
+	if err := os.Mkdir(ancestor, 0o750); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, ancestor, scmTestAllowInstanceIdentityDACL(t))
+	// The root of the test does not grant the account of the instance the
+	// access: the check has to judge the ancestor and not the root.
+	scmTestSetDACL(t, root, scmTestDenyInstanceIdentityDACL(t))
+
+	path := filepath.Join(ancestor, "b", "cache")
+	if err := preflightDataPath("cache dir", path); err != nil {
+		t.Errorf("preflightDataPath(%q) = %v, want nil for a directory the account of the instance can create in its nearest existing ancestor", path, err)
+	}
+	// The installation created nothing.
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the directory %q exists (stat error: %v), want none: the instance creates it when it runs", path, err)
+	}
+}
+
 // TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot checks that a
-// named directory that really lives inside the state root of the instance is
-// not checked against the account of the instance.
+// named directory that does not exist yet and that really lives inside the
+// state root of the instance is not checked against the account of the
+// instance.
 //
 // The installation grants the state root to that account, and the instance
 // creates the cache tree it needs inside it. A directory of the state root
-// is therefore neither checked nor created.
+// that does not exist yet is therefore neither checked nor created.
+//
+// A directory that exists already is checked, whatever it lives in: the
+// access control list of the child decides what the account of the instance
+// can do there, and owning the state root grants no right on it.
 func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
@@ -1514,6 +1726,113 @@ func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
 	// The directory was not created: the instance creates it when it runs.
 	if _, err := os.Stat(opts.CacheDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the cache directory %q exists (stat error: %v), want none: the instance creates it when it runs", opts.CacheDir, err)
+	}
+}
+
+// TestSCMPreflightDataPathsRefuseAnExistingDirectoryInsideTheStateRoot
+// checks that a named directory that exists inside the state root of the
+// instance is checked against the account of the instance.
+//
+// Owning a directory grants no right on a directory inside it: the access
+// control list of the child decides what the account of the instance can do
+// there. A cache that was moved by hand, a cache of an earlier installation
+// and a directory that was named with --cache-dir and exists already
+// therefore have to be checked, even when they live inside the state root
+// the installation owns.
+func TestSCMPreflightDataPathsRefuseAnExistingDirectoryInsideTheStateRoot(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll() = %v, want nil", err)
+	}
+	// The state root belongs to the account of the instance.
+	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
+
+	// The cache exists already and the account of the instance cannot
+	// work with it.
+	cacheDir := filepath.Join(stateDir, "cache")
+	if err := os.Mkdir(cacheDir, 0o750); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, cacheDir, scmTestDenyInstanceIdentityDACL(t))
+
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   stateDir,
+		LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+	}
+	opts.CacheDir = cacheDir
+	opts.HubDir = ""
+	opts.LocalDir = ""
+
+	err := preflightDataPaths(opts)
+	if err == nil {
+		t.Fatalf("preflightDataPaths() = nil, want the refusal of an existing directory inside the state root")
+	}
+	if !scmTestNamesPath(err.Error(), cacheDir) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the path", err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the account of the instance", err)
+	}
+}
+
+// TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot
+// checks that a named directory that exists outside the state root of the
+// instance is checked against the account of the instance, the way it has
+// always been.
+func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
+
+	// A directory outside of the state root the account of the instance
+	// can work with.
+	usable := filepath.Join(root, "models")
+	if err := os.Mkdir(usable, 0o750); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, usable, scmTestAllowInstanceIdentityDACL(t))
+
+	// A directory outside of the state root the account of the instance
+	// cannot work with.
+	unusable := filepath.Join(root, "other-models")
+	if err := os.Mkdir(unusable, 0o750); err != nil {
+		t.Fatalf("Mkdir() = %v, want nil", err)
+	}
+	scmTestSetDACL(t, unusable, scmTestDenyInstanceIdentityDACL(t))
+
+	opts := scmTestOptions()
+	opts.Paths = runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   stateDir,
+		LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+	}
+	opts.HubDir = ""
+	opts.LocalDir = ""
+
+	// The directory the account of the instance can work with is
+	// accepted.
+	opts.CacheDir = usable
+	if err := preflightDataPaths(opts); err != nil {
+		t.Errorf("preflightDataPaths() = %v, want nil for a directory the account of the instance can work with", err)
+	}
+
+	// The directory it cannot work with is refused.
+	opts.CacheDir = unusable
+	err := preflightDataPaths(opts)
+	if err == nil {
+		t.Fatalf("preflightDataPaths() = nil, want the refusal of a directory the account of the instance cannot work with")
+	}
+	if !scmTestNamesPath(err.Error(), unusable) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the path", err)
+	}
+	if !strings.Contains(err.Error(), scmServiceIdentityName) {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the account of the instance", err)
 	}
 }
 
@@ -1585,10 +1904,13 @@ func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
 // directory the account of the instance cannot reach is refused before the
 // registration is written.
 //
-// The directory does not exist: the installation never creates a directory the
-// user named, so the refusal names the missing directory and tells the user
-// what to do. The guidance names the account of the instance, because the
-// access rights of the directory have to be granted to that account.
+// The directory does not exist: the instance creates it when it runs, as the
+// account the instance runs as, so the refusal names the missing directory,
+// the nearest existing ancestor it would be created in and the access the
+// account is missing there.
+//
+// The guidance names the account of the instance, because the access rights
+// of the ancestor have to be granted to that account.
 func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
@@ -1597,7 +1919,7 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	}
 	// The directory grants the machine and its administrators the access,
 	// not the account the instance runs as: the account of the instance
-	// could not use the directory either, if it existed.
+	// could not create the directory there either.
 	scmTestSetDACL(t, parent, fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t)))
 
 	path := filepath.Join(parent, "cache")
@@ -1608,16 +1930,22 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	if !scmTestNamesPath(err.Error(), path) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
 	}
+	if !scmTestNamesPath(err.Error(), parent) {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the nearest existing ancestor %q", path, err, parent)
+	}
 	if !strings.Contains(err.Error(), scmServiceIdentityName) {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
 	}
 	if !strings.Contains(err.Error(), "does not exist") {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that names the missing directory", path, err)
 	}
+	if !strings.Contains(err.Error(), "read and write access") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the access that is missing", path, err)
+	}
 	if !strings.Contains(err.Error(), "never creates a directory the user named") {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user that the installation creates no directory of its own", path, err)
 	}
-	if !strings.Contains(err.Error(), "create it and grant the account read and write access to it") {
+	if !strings.Contains(err.Error(), "grant the account read and write access to the ancestor directory") {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
 	}
 	// The refused directory is not created behind the back of the user.
