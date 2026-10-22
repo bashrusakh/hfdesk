@@ -878,15 +878,6 @@ func metaFreshWithin(path string, d time.Duration) bool {
 	return time.Since(fi.ModTime()) < d
 }
 
-// parseStaleTimeoutSetting resolves the configured stale timeout with the
-// same defaults as Settings.BuildHFCache.
-func parseStaleTimeoutSetting(cfg Settings) (time.Duration, error) {
-	if cfg.StaleTimeout == "" {
-		return DefaultStaleTimeout, nil
-	}
-	return time.ParseDuration(cfg.StaleTimeout)
-}
-
 // removeStagingArtifactsLocked removes the staging meta record and then the
 // staging payload (best-effort; missing files are not an error). The caller
 // holds the staging metadata gate, so no concurrent transition can recreate
@@ -1885,6 +1876,11 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		remaining--
 		attempt++
 		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: apiErr.Error()})
+		downloadLog.Warn("download retry",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"error", apiErr,
+		)
 		if d := NextRetryWait(resp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
 			return false, ctx.Err()
 		}
@@ -2593,6 +2589,16 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 	// only when a write lands beyond it, so an overflowing attempt's accepted
 	// prefix is not counted a second time when the retry rewrites it.
 	countedUpTo := task.from
+	if commit0 > 0 {
+		// The bytes already on disk are reused: the request asks for the
+		// remaining suffix of this range only.
+		downloadLog.Info("resuming download",
+			"repo", d.job.Repo,
+			"path", d.it.RelativePath,
+			"part", task.idx,
+			"offset", task.from,
+		)
+	}
 
 	for {
 		select {
@@ -2789,6 +2795,13 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 		remaining--
 		attempt++
 		d.emit(ProgressEvent{Event: "retry", Path: d.it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+		downloadLog.Warn("download retry",
+			"repo", d.job.Repo,
+			"path", d.it.RelativePath,
+			"part", task.idx,
+			"attempt", attempt,
+			"error", lastErr,
+		)
 		wait := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now())
 		ok, werr := d.retryWaitSleep(partCtx, wait)
 		if werr != nil {

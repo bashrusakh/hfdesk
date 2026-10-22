@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -190,10 +189,25 @@ type skippedBlobLink struct {
 // Legacy mode (OutputDir set): Falls back to flat directory structure.
 //
 // Cancellation: all loops/sleeps/requests are tied to ctx for fast abort.
-func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
+func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// The outcome of the whole job is recorded exactly once, here: every
+	// return path of the function passes through this deferred record. A
+	// cancelled job is not a failure, so it is reported separately; the
+	// successful outcome is reported at the end of the function, where the
+	// file counters are final.
+	defer func() {
+		if err == nil {
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			downloadLog.Info("download cancelled", "repo", job.Repo, "error", err)
+			return
+		}
+		downloadLog.Error("download failed", "repo", job.Repo, "error", err)
+	}()
 	if err := validate(job, cfg); err != nil {
 		return err
 	}
@@ -281,10 +295,21 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 	emit(ProgressEvent{Event: "scan_start", Message: "scanning repo"})
 
+	downloadLog.Info("download started", "repo", job.Repo, "revision", job.Revision)
+
 	plan, err := scanRepo(ctx, httpc, cfg.Token, job, cfg)
 	if err != nil {
 		return err
 	}
+	var plannedBytes int64
+	for _, item := range plan.Items {
+		plannedBytes += item.Size
+	}
+	downloadLog.Info("download planned",
+		"repo", job.Repo,
+		"files", len(plan.Items),
+		"bytes", plannedBytes,
+	)
 	if cfg.OnPlanComplete != nil {
 		completedPlan := *plan
 		completedPlan.Items = append([]PlanItem(nil), plan.Items...)
@@ -568,6 +593,11 @@ LOOP:
 			}
 
 			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
+			downloadLog.Info("file download started",
+				"repo", job.Repo,
+				"path", finalRel,
+				"bytes", it.Size,
+			)
 
 			// Create a copy with updated RelativePath for progress display
 			itForIO := it
@@ -727,6 +757,15 @@ LOOP:
 			}
 			if dlErr != nil {
 				fatal := fmt.Errorf("download %s: %w", finalRel, dlErr)
+				if errors.Is(dlErr, context.Canceled) || errors.Is(dlErr, context.DeadlineExceeded) {
+					downloadLog.Info("file download cancelled", "repo", job.Repo, "path", finalRel)
+				} else {
+					downloadLog.Error("file download failed",
+						"repo", job.Repo,
+						"path", finalRel,
+						"error", dlErr,
+					)
+				}
 				if isFailFastError(dlErr) {
 					setFatalErr(fatal)
 				}
@@ -793,6 +832,12 @@ LOOP:
 					// published mismatch).
 					if !contentVerified {
 						if err := verifySHA256Ctx(fileCtx, verifyPath, it.SHA256); err != nil {
+							downloadLog.Warn("verification failed",
+								"repo", job.Repo,
+								"path", finalRel,
+								"method", "sha256",
+								"error", err,
+							)
 							select {
 							case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 							default:
@@ -820,6 +865,12 @@ LOOP:
 			} else if cfg.Verify == "size" && it.Size > 0 {
 				fi, err := os.Stat(verifyPath)
 				if err != nil || fi.Size() != it.Size {
+					downloadLog.Warn("verification failed",
+						"repo", job.Repo,
+						"path", finalRel,
+						"method", "size",
+						"expected_bytes", it.Size,
+					)
 					select {
 					case errCh <- fmt.Errorf("size mismatch for %s", finalRel):
 					default:
@@ -837,6 +888,11 @@ LOOP:
 					// this file promptly instead of pretending verification
 					// succeeded; a fail-fast status error, should one ever
 					// surface, is escalated job-fatal below.
+					downloadLog.Warn("verification probe failed",
+						"repo", job.Repo,
+						"path", finalRel,
+						"error", herr,
+					)
 					if isFailFastError(herr) {
 						setFatalErr(fmt.Errorf("verify head %s: %w", finalRel, herr))
 					}
@@ -848,6 +904,12 @@ LOOP:
 				}
 				if remoteSha != "" {
 					if err := verifySHA256Ctx(fileCtx, verifyPath, remoteSha); err != nil {
+						downloadLog.Warn("verification failed",
+							"repo", job.Repo,
+							"path", finalRel,
+							"method", "sha256",
+							"error", err,
+						)
 						select {
 						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
 						default:
@@ -928,6 +990,11 @@ LOOP:
 			}
 
 			emit(ProgressEvent{Event: "file_done", Path: finalRel})
+			downloadLog.Info("file download complete",
+				"repo", job.Repo,
+				"path", finalRel,
+				"bytes", it.Size,
+			)
 			atomic.AddInt64(&downloadedCount, 1)
 		}()
 	}
@@ -1038,6 +1105,11 @@ LOOP:
 		Event:   "done",
 		Message: fmt.Sprintf("download complete (downloaded %d, skipped %d)", downloadedCount, skippedCount),
 	})
+	downloadLog.Info("download complete",
+		"repo", job.Repo,
+		"downloaded", downloadedCount,
+		"skipped", skippedCount,
+	)
 	return nil
 }
 
@@ -1072,10 +1144,10 @@ func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 func cleanupLegacyPartials(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
+		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
 	}
 	if err := removeMultipartResumeFiles(dst); err != nil {
-		log.Printf("warning: cleanup multipart resume files for %s: %v", dst, err)
+		downloadLog.Warn("cleanup multipart resume files failed", "path", dst, "error", err)
 	}
 }
 
@@ -1113,21 +1185,17 @@ func cleanupLegacyPartials(dst string) {
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
 	root := cleanupRoot(settings, useHFCache)
-	staleTimeout := DefaultStaleTimeout
-	if d, err := parseStaleTimeoutSetting(settings); err == nil {
-		staleTimeout = d
-	}
 	for _, dst := range dsts {
 		if !pathWithinRoot(root, dst) {
-			log.Printf("warning: skip cleanup for out-of-root partial dst %s", dst)
+			downloadLog.Warn("skip cleanup for out-of-root partial destination", "path", dst)
 			continue
 		}
-		if err := removePartialArtifacts(dst, staleTimeout); err != nil {
-			log.Printf("warning: cleanup partials for %s: %v", dst, err)
+		if err := removePartialArtifacts(dst); err != nil {
+			downloadLog.Warn("cleanup partials failed", "path", dst, "error", err)
 		}
 		if useHFCache {
 			removeHFCacheTemp(dst)
-			removeBlobStagingForTemp(dst, staleTimeout)
+			removeBlobStagingForTemp(dst)
 		}
 	}
 	return nil
@@ -1144,9 +1212,9 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 // downloader's own naming scheme is ever touched.
 //
 // The pair is removed only when no live claim remains (in-process registry,
-// then record owner/freshness), so cancelling one job can never delete
-// another live job's staging file.
-func removeBlobStagingForTemp(dst string, staleTimeout time.Duration) {
+// then the lifetime OS lock and the record owner evidence), so cancelling
+// one job can never delete another live job's staging file.
+func removeBlobStagingForTemp(dst string) {
 	base := filepath.Base(dst)
 	sha, ok := strings.CutPrefix(base, "tmp-")
 	if !ok || sha == "" || !canonicalSHA256(sha) {
@@ -1204,7 +1272,7 @@ func pathWithinRoot(root, path string) bool {
 func removeHFCacheTemp(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst, err)
+		downloadLog.Warn("cleanup partial file failed", "path", dst, "error", err)
 	}
 }
 
@@ -1230,10 +1298,10 @@ func removeHFCacheTemp(dst string) {
 // recognized suffix family and a digit run, so a coincidentally
 // named "weights.part" or similar user file with a different base
 // (which would not appear in dsts) is not touched.
-func removePartialArtifacts(dst string, staleTimeout time.Duration) error {
+func removePartialArtifacts(dst string) error {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst+".part", err)
+		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
 	}
 	// Ranged staging file and resume metadata (issue #140). The pair is
 	// removed only when no live claim remains; the metadata goes first inside
@@ -1267,12 +1335,12 @@ func removePartialArtifacts(dst string, staleTimeout time.Duration) error {
 		}
 		full := filepath.Join(dir, name)
 		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-			log.Printf("warning: cleanup partial file %s: %v", full, err)
+			downloadLog.Warn("cleanup partial file failed", "path", full, "error", err)
 		}
 	}
 	// Legacy multipart layout metadata.
 	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup partial file %s: %v", dst+".parts.json", err)
+		downloadLog.Warn("cleanup partial file failed", "path", dst+".parts.json", "error", err)
 	}
 	return nil
 }
@@ -1428,6 +1496,14 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
+		// The bytes already on disk are reused: the next request asks for
+		// the remaining range only.
+		downloadLog.Info("resuming download",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"offset", pos,
+			"bytes", it.Size,
+		)
 	}
 
 	retry := newRetry(cfg)
@@ -1680,6 +1756,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		remaining--
 		attempt++
 		emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt, Message: lastErr.Error()})
+		downloadLog.Warn("download retry",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"attempt", attempt,
+			"error", lastErr,
+		)
 		if d := NextRetryWait(waitResp, retry.Next(), DefaultMaxRetryAfter, time.Now()); !sleepCtx(ctx, d) {
 			out.Close()
 			if !abortPartAttempt(ctx) {
@@ -1769,7 +1851,7 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	// survive a successful single-path finalization. Finalization already
 	// succeeded, so a cleanup failure is logged and does not unpublish the file.
 	if err := removeMultipartResumeFiles(dst); err != nil {
-		log.Printf("warning: cleanup legacy multipart artifacts for %s after single-path publish: %v", dst, err)
+		downloadLog.Warn("cleanup legacy multipart artifacts failed", "path", dst, "error", err)
 	}
 	return verified, nil
 }
@@ -1787,6 +1869,6 @@ func removeEmptyPartialFile(path string) {
 	}
 	// lgtm[go/path-injection]
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: cleanup empty partial file %s: %v", path, err)
+		downloadLog.Warn("cleanup empty partial file failed", "path", path, "error", err)
 	}
 }

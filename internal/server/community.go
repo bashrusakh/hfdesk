@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,8 +16,14 @@ import (
 
 	xhtml "golang.org/x/net/html"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
+
+// communityLog is the logger of the community proxy subsystem. It resolves
+// the current default logger on every call, so records reach whichever
+// pipeline the application installed.
+var communityLog = logging.NewComponentLogger("community")
 
 const (
 	communityDefaultEndpoint = "https://huggingface.co"
@@ -309,7 +314,7 @@ func communityThreadNum(upstreamNum, requested int) int {
 func (s *Server) fetchCommunityJSON(w http.ResponseWriter, r *http.Request, cfg Config, hfURL string, dst any) bool {
 	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
-		log.Printf("community: invalid proxy configuration")
+		communityLog.Info("invalid proxy configuration")
 		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", "")
 		return false
 	}
@@ -329,7 +334,7 @@ func (s *Server) fetchCommunityJSON(w http.ResponseWriter, r *http.Request, cfg 
 	if err != nil {
 		// The error can contain the request URL but never the Authorization
 		// header; keep the token out of both the log and the API response.
-		log.Printf("community: upstream request failed: %v", err)
+		communityLog.Info("upstream request failed", "error", err)
 		writeError(w, http.StatusBadGateway, "Community request failed", "")
 		return false
 	}
