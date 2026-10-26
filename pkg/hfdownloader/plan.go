@@ -206,6 +206,13 @@ type PlanItem struct {
 type Plan struct {
 	Items  []PlanItem `json:"items"`
 	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	// CommitPinned reports whether Commit is a RESOLVED, immutable commit
+	// identity. It is false when the planner could not resolve the requested
+	// revision and fell back to the revision string, which pins nothing: the
+	// branch may have moved, so the content behind that name is not fixed. A
+	// resume that inherits bytes from an earlier run requires a pinned
+	// identity on both sides.
+	CommitPinned bool `json:"commit_pinned,omitempty"`
 }
 
 // PlanRepo builds the file list without downloading.
@@ -243,9 +250,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
 	if err != nil {
 		// Fall back to revision name if API call fails (e.g., some mirrors)
-		repoInfo = &RepoInfo{SHA: job.Revision}
+		repoInfo = &RepoInfo{}
 	}
 	commitSHA := repoInfo.SHA
+	// A resolved commit SHA names an immutable revision; the requested
+	// revision string does not. The distinction decides whether a resume may
+	// inherit bytes staged by an earlier run, so it travels with the plan.
+	commitPinned := commitSHA != ""
 	if commitSHA == "" {
 		commitSHA = job.Revision // fallback
 	}
@@ -659,7 +670,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA}, nil
+	return &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned}, nil
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the

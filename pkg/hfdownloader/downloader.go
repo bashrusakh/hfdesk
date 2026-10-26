@@ -160,11 +160,14 @@ func removeMultipartResumeFiles(dst string) error {
 
 // removeLegacySinglePart removes the pre-#140 single-download prefix
 // (dst+".part") once it has either been migrated into the staging record or
-// become obsolete because a valid .part-NN layout won the migration.
+// become obsolete because a valid .part-NN layout won the migration. The
+// identity sidecar of that partial goes with it: no identity record may
+// outlive the partial it describes.
 func removeLegacySinglePart(dst string) error {
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	removeSinglePartIdentity(singlePartIdentityPath(dst))
 	return nil
 }
 
@@ -629,7 +632,11 @@ LOOP:
 			// The resolved plan commit is part of the staging record's resume
 			// identity. The requested branch name is not enough: a moved
 			// branch could otherwise resume old bytes in Verify=size mode.
+			// The pinned flag says whether that commit was actually resolved;
+			// an unresolved revision pins nothing, so no bytes may be
+			// inherited from it.
 			mpOpts.Commit = plan.Commit
+			mpOpts.CommitPinned = plan.CommitPinned
 			versionedStaging := dst + ".incomplete"
 			if blobDirect {
 				mpOpts.Staging = repoDir.IncompletePath(it.SHA256)
@@ -781,7 +788,8 @@ LOOP:
 				if multipartRan {
 					contentVerified, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, mpOpts, emit)
 				} else {
-					contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+					contentVerified, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst,
+						singleOpts{Commit: plan.Commit, CommitPinned: plan.CommitPinned}, emit)
 				}
 			}
 			if blobDirect && multipartRan && !directBlobPublished {
@@ -1229,12 +1237,14 @@ func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 }
 
 // cleanupLegacyPartials removes the pre-#140 multipart family and the single
-// dst+".part" prefix for dst. It never touches the ranged staging pair.
+// dst+".part" prefix for dst. It never touches the ranged staging pair. The
+// single-request identity sidecar goes with the partial it describes.
 func cleanupLegacyPartials(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
 	}
+	removeSinglePartIdentity(singlePartIdentityPath(dst))
 	if err := removeMultipartResumeFiles(dst); err != nil {
 		downloadLog.Warn("cleanup multipart resume files failed", "path", dst, "error", err)
 	}
@@ -1424,7 +1434,8 @@ func removeHFCacheTemp(dst string) {
 // with a single downloader dst, covering every artifact family the
 // downloader produces:
 //
-//   - the single-path partial (dst+".part");
+//   - the single-path partial (dst+".part") and its identity sidecar
+//     (dst+".part.meta");
 //   - legacy multipart parts (dst+".part-NN" for N any non-empty run of
 //     digits, matching the pre-#140 downloader's %02d/%d format) and the
 //     legacy layout metadata (dst+".parts.json");
@@ -1447,6 +1458,9 @@ func removePartialArtifacts(dst string) error {
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
 		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
 	}
+	// The identity sidecar describes the single-path partial; it must not
+	// outlive it.
+	removeSinglePartIdentity(singlePartIdentityPath(dst))
 	// Ranged staging file and resume metadata (issue #140). The pair is
 	// removed only when no live claim remains; the metadata goes first inside
 	// removeStagingArtifacts so a crash cannot leave a record claiming a
@@ -1573,16 +1587,22 @@ func absoluteAttemptCeiling(retries int) int {
 
 // downloadSingle downloads a file in a single request.
 //
-// Resume behavior: if a .part file already exists from a previous run, its
-// bytes are preserved and the HTTP request uses a Range header to fetch only
-// the remaining bytes. Every ranged (206) response is validated exactly like
-// the multipart worker path: the status must be 206, Content-Range must name
-// the requested [pos, size-1] start/end (and the expected total), Content-Length
-// must match the requested length, and a bounded writer refuses any byte
-// outside that range. A short body is rejected after the copy. If the server
-// ignores the Range header and responds with 200 (full body), the .part file is
-// truncated and the download restarts from zero. No resume is attempted when
-// the expected size is unknown (the range layout cannot be validated).
+// Resume behavior: the bytes already on disk in <dst>.part are inherited only
+// when the identity sidecar <dst>.part.meta proves they belong to THIS item:
+// the record must exist, be readable and well-formed, name the same
+// repository, resolved commit, item path and expected size, and be PINNED
+// (the commit was actually resolved). A partial without a usable record, or
+// one recorded for another object or another revision, is discarded: the
+// transfer restarts from zero. When the record matches, the HTTP request
+// uses a Range header to fetch only the remaining bytes. Every ranged (206)
+// response is validated exactly like the multipart worker path: the status
+// must be 206, Content-Range must name the requested [pos, size-1] start/end
+// (and the expected total), Content-Length must match the requested length,
+// and a bounded writer refuses any byte outside that range. A short body is
+// rejected after the copy. If the server ignores the Range header and
+// responds with 200 (full body), the .part file is truncated and the download
+// restarts from zero. No resume is attempted when the expected size is
+// unknown (the range layout cannot be validated).
 //
 // The path inherits the same trust model as the ranged path. Before the rename,
 // the file must have exactly the expected size, and a known digest is proven
@@ -1598,7 +1618,7 @@ func absoluteAttemptCeiling(retries int) int {
 // The returned bool reports whether this call already proved the payload
 // against it.SHA256 before the rename, so the caller does not repeat the
 // full-file pass.
-func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (bool, error) {
+func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts singleOpts, emit func(ProgressEvent)) (bool, error) {
 	const unboundedBody = int64(^uint64(0) >> 1)
 
 	tmp := dst + ".part"
@@ -1608,15 +1628,61 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 	defer out.Close()
 
+	// The identity of the object this transfer is about. The sidecar next to
+	// the partial records it, so the next run can tell whether the bytes on
+	// disk belong to this object or to another one that shares the staging
+	// name (an item without a known digest is staged under a name derived
+	// from its path, and two revisions share that name too).
+	identity := singleIdentityFor(job, it, opts)
+	sidecar := singlePartIdentityPath(dst)
+	recorded, rerr := readSinglePartIdentity(sidecar)
+	if rerr != nil {
+		// A record that cannot be read or understood authorizes nothing: the
+		// bytes on disk stay unproven and are discarded below.
+		downloadLog.Warn("single-part identity record is unusable",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"record", sidecar,
+			"error", rerr,
+		)
+		recorded = nil
+	}
+
 	fi, err := out.Stat()
 	if err != nil {
 		return false, err
 	}
 	pos := fi.Size()
 	// inherited marks bytes this run did not write. A .part is a sequential
-	// prefix with no resume record, so those bytes have no validated
-	// provenance and need the content proof below before publication.
+	// prefix, so those bytes need the content proof below before publication
+	// unless the identity record proves which object they belong to.
 	inherited := pos > 0
+
+	// Bytes are inherited only when the identity record proves they belong
+	// to this exact object. Otherwise they are discarded: a size match is
+	// not an identity, and publishing another object's bytes (or another
+	// revision's) would corrupt the cache silently.
+	if pos > 0 && !singlePartialInheritable(recorded, identity, pos) {
+		downloadLog.Info("discarding unproven single-path partial",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"bytes", pos,
+			"identity_recorded", recorded != nil,
+		)
+		if err := out.Truncate(0); err != nil {
+			return false, err
+		}
+		pos = 0
+		inherited = false
+	}
+
+	// The record is (re)written before any inherited byte is trusted, and
+	// after the unproven bytes are gone: it must describe exactly the partial
+	// that is on disk. A partial left by an interrupted run keeps this
+	// record, which is what makes the next run's decision possible.
+	if err := writeSinglePartIdentity(sidecar, identity); err != nil {
+		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
+	}
 
 	// An oversized partial is stale/corrupt. A partial with no known expected
 	// size cannot be range-validated at all, so it is discarded rather than
@@ -1728,6 +1794,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					attemptCancel()
 					out.Close()
 					removeEmptyPartialFile(tmp)
+					removeSinglePartIdentity(sidecar)
 					return false, lastErr
 				}
 				if !apiErr.IsRetryable() {
@@ -1991,6 +2058,10 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	if err := os.Rename(tmp, dst); err != nil {
 		return false, err
 	}
+	// The identity record described the partial that has just been published.
+	// It must not outlive its partial: the published file is the content now,
+	// and a stale record would describe bytes that no longer exist.
+	removeSinglePartIdentity(tmp + ".meta")
 	// Obsolete pre-#140 multipart artifacts for this destination must not
 	// survive a successful single-path finalization. Finalization already
 	// succeeded, so a cleanup failure is logged and does not unpublish the file.

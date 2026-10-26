@@ -150,6 +150,72 @@ Staging identity includes `plan.Commit`. If fetching repository info fails or
 returns an empty SHA, the planner uses the requested revision string as the
 fallback commit identity; that value is not necessarily an immutable commit.
 
+The single-request path has its own resume IDENTITY, because its staging name
+is not one. For an item without a known digest the staging name is derived
+from the item's path (`tmp-<sanitized path>`), so two different objects - or
+two revisions of one object - share one staging name, and the destination's
+ownership domain excludes concurrent writers without establishing WHICH object
+the staged bytes belong to. A size match is not an identity.
+
+The sidecar `<dst>.part.meta` records that identity next to the partial, in
+the same vocabulary the ranged record uses: repo, resolved commit, item
+relative path and expected size, plus whether the identity is PINNED - that
+is, whether the commit was actually resolved rather than the requested
+revision standing in for it. Bytes already on disk are inherited ONLY when
+the record exists, is readable and well-formed, matches the current item
+exactly (repo, commit, path, size) and is PINNED on both sides. Otherwise the
+inherited bytes are discarded (the partial is truncated) and the transfer
+starts from zero: unproven bytes are never published. An unpinned identity
+pins nothing - a moved branch may change the content under that name - so
+nothing is inherited from it.
+
+The record is written before any inherited byte is trusted, and after the
+unproven bytes are gone, so it always describes the partial that is on disk.
+It is removed together with the partial it describes (on publication and in
+the cancel-cleanup path), so no identity record outlives its partial, and it
+survives an interrupted run: that surviving record is exactly what makes the
+next run's decision possible. A legacy `.part` without a record is never
+inherited. The known-digest content proof is unchanged and still applies to
+the inherited bytes.
+
+# Cache Artifact Classification
+
+A cache's `blobs/` directory holds published content and the downloader's own
+staging artifacts. The two are distinguished by one exhaustive, name-based
+classification, and every consumer of a cache uses it: the mirror scan, copy
+and verification, the cache statistics, the cache listing, the cache
+selection and the cache deletion.
+
+The staging shapes are derived from the code that creates them:
+
+  - `tmp-<name>` - the single-request staging destination (a content digest, or
+    a path-derived name for an item without a known digest) and everything
+    derived from it: `tmp-<name>.part` (the single-request partial),
+    `tmp-<name>.part.meta` (its identity sidecar) and `tmp-<name>.lock` (the
+    destination domain's persistent lock)
+  - `<name>.incomplete` - the ranged staging payload
+  - `<name>.incomplete.meta` - its resume record
+  - `<name>.incomplete.meta.tmp` / `<name>.meta.tmp` - the atomic record temp
+  - `<name>.lock` - the persistent ownership lock beside a staging payload
+  - `<name>.part` - the single-request partial (the flat-mode destination's
+    partial)
+  - `<name>.part.meta` - the single-request identity sidecar
+  - `<name>.part-NN` - the legacy multipart family
+  - `<name>.parts.json` - the legacy layout metadata
+  - `<name>.tmp-<random>` - the cache store's atomic copy temp
+
+A published blob is named by its content: a canonical 64-hex SHA-256 digest.
+A file in `blobs/` that is neither a staging artifact nor a canonical digest
+is an UNUSUAL published name - the public storage API accepts such names, so
+it is content: it is copied, verified and counted, and it is never dropped,
+deleted or treated as a staging artifact.
+
+The staging exclusion applies ONLY inside `blobs/`, the namespace the
+downloader writes these artifacts into. A legitimate `*.meta` (or `*.part`,
+`*.lock`) file outside that namespace - a snapshot entry, for example - is
+content, and the mirror copies AND verifies it, so copy and verify always
+agree on the same set.
+
 Existing multipart resume state survives a threshold change. Before routing an
 item to the single-request path, the downloader detects a usable pre-#140
 `.part-NN`/`.parts.json` layout and a valid versioned

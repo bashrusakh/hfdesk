@@ -416,6 +416,49 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   `blobs/<sha>` is never replaced" (and, on a filesystem without hard links,
   to the domain-exclusive tier as well). The downloader's publication
   invariant must not depend on either path's behavior.
+- THE SINGLE-REQUEST PATH INHERITS BYTES ONLY UNDER A PROVEN IDENTITY. The
+  single-request path stages its bytes in `<dst>.part`; for an item without a
+  known digest the staging name is derived from the item's path
+  (`tmp-<sanitized path>`), so two different objects - or two revisions of one
+  object - share one staging name, and the destination domain excludes
+  concurrent writers without establishing WHICH object the staged bytes belong
+  to. A size match is not an identity. The sidecar `<dst>.part.meta` (JSON,
+  versioned) records the identity in the same vocabulary the ranged record
+  uses: repo, resolved commit, item relative path, expected size, and whether
+  the identity is PINNED (the commit was actually resolved). Bytes already on
+  disk are inherited ONLY when that record exists, is readable and well-formed,
+  matches the CURRENT item exactly (repo, commit, path, size) and is PINNED on
+  both sides. Otherwise the inherited bytes are discarded (the partial is
+  truncated) and the transfer starts from zero: unproven bytes are never
+  published. An UNPINNED identity (the planner fell back to the requested
+  revision because the endpoint did not resolve a commit) pins nothing - a
+  moved branch may change the content under that name - so nothing is
+  inherited from it. The record is written before any inherited byte is
+  trusted and after the unproven bytes are gone, is removed together with the
+  partial it describes (on publication and in the cancel-cleanup path), so no
+  identity record outlives its partial, and it survives an interrupted run:
+  that surviving record is what makes the next run's decision possible. A
+  legacy `.part` without a record is not inherited. The known-digest content
+  proof is unchanged and still applies to the inherited bytes.
+- STAGING ARTIFACTS AND PUBLISHED CONTENT ARE SEPARATED BY ONE EXHAUSTIVE
+  CLASSIFIER. The downloader creates: the single-request staging name
+  `tmp-<name>` with its `.part`, its `.part.meta` identity sidecar and its
+  `.lock` domain lock; the ranged staging pair `<name>.incomplete` +
+  `<name>.incomplete.meta` with its atomic record temp `<name>.meta.tmp`; the
+  persistent ownership lock `<name>.lock`; the legacy multipart family
+  `<name>.part-NN` and `<name>.parts.json`; the flat-mode partials
+  `<destination>.part` and `<destination>.incomplete`; and the cache store's
+  atomic copy temp `<name>.tmp-<random>`. A published blob is named by its
+  content: a canonical 64-hex SHA-256 digest. A file in `blobs/` that is
+  neither a staging artifact nor a canonical digest is an UNUSUAL published
+  name (the public storage API accepts it): it is content - it is copied,
+  verified and counted, and it is never dropped, deleted or treated as a
+  staging artifact. The staging exclusion applies ONLY inside `blobs/`: a
+  legitimate `*.meta` (or `*.part`, `*.lock`) file outside that namespace - a
+  snapshot entry, for example - is content, and the mirror copies AND verifies
+  it, so copy and verify always agree on the same set. Every consumer - the
+  mirror scan, copy and verification, the cache statistics, the cache listing,
+  the cache selection and the cache deletion - uses that one classification.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to
   be stale or incompatible.

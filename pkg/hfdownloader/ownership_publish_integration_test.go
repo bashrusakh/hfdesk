@@ -276,7 +276,7 @@ func TestDownloadSingle_FinalByteRequiresResponseFraming(t *testing.T) {
 	dst := filepath.Join(dir, "final-byte.bin")
 	it := PlanItem{RelativePath: "final-byte.bin", URL: srv.URL, Size: total}
 	cfg := Settings{Verify: "size", Retries: 1, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v (clean final-byte framing retry should recover)", err)
 	}
 	assertExactFile(t, dst, full)
@@ -300,9 +300,6 @@ func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) 
 	sha := singleTestSHA(full)
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "inherited.bin")
-	if err := os.WriteFile(dst+".part", full, 0o644); err != nil {
-		t.Fatal(err)
-	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no network request expected for a complete .part", http.StatusInternalServerError)
 	}))
@@ -310,8 +307,11 @@ func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) 
 
 	var events []ProgressEvent
 	it := PlanItem{RelativePath: "inherited.bin", URL: srv.URL, Size: total, LFS: true, SHA256: sha}
+	// The complete partial is published without a request only when its
+	// identity record proves the bytes belong to this item.
+	seedSinglePartial(t, dst, full, Job{Repo: "o/r"}, it, singleTestIdentity)
 	cfg := Settings{Verify: "size", Retries: 0, StallTimeout: "0"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ev ProgressEvent) {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ev ProgressEvent) {
 		events = append(events, ev)
 	}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
@@ -545,7 +545,7 @@ func TestDownloadSingle_UnknownSizeKnownDigestRequiresProof(t *testing.T) {
 			it := PlanItem{RelativePath: "unknown.bin", URL: srv.URL, Size: 0, LFS: true, SHA256: sha}
 			cfg := Settings{Verify: "size", Retries: 0, StallTimeout: "0"}
 			hashPassCount.Store(0)
-			verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
 			if got := hashPassCount.Load(); got != 1 {
 				t.Errorf("unknown-size known-digest transfer performed %d full-file passes; want exactly 1", got)
 			}
@@ -699,7 +699,7 @@ func TestDownloadSingle_RemovesLegacyMultipartArtifacts(t *testing.T) {
 	}))
 	defer srv.Close()
 	it := PlanItem{RelativePath: "single.bin", URL: srv.URL, Size: total}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	assertExactFile(t, dst, full)

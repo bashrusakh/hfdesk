@@ -30,17 +30,32 @@ import (
 var Version = "dev"
 
 // isBlobStagingArtifactName reports whether a blobs/ directory entry belongs to
-// the download staging family rather than to stored content:
-// blobs/<sha>.incomplete (payload), .incomplete.meta (resume record),
-// .incomplete.meta.tmp (atomic record temp) and the persistent
-// .incomplete.lock/.incomplete.meta.lock ownership files, plus the blob key's
-// publication-domain lock (blobs/tmp-<sha>.lock). Cache statistics,
-// listings and mirrors must not count them as cached blobs.
-func isBlobStagingArtifactName(name string) bool {
-	return strings.HasSuffix(name, ".incomplete") ||
-		strings.HasSuffix(name, ".meta") ||
-		strings.HasSuffix(name, ".meta.tmp") ||
-		strings.HasSuffix(name, ".lock")
+// the download staging family rather than to published content.
+//
+// The shapes are owned by the downloader (hfdownloader.IsStagingArtifactName),
+// which knows every producer it has: the single-request staging name with its
+// partial and identity sidecar, the ranged staging pair with its atomic record
+// temp, the persistent ownership locks, the legacy multipart family and the
+// atomic copy temp. Cache statistics, listings, selections, deletions and
+// mirrors must not count them as cached blobs.
+//
+// The exclusion applies INSIDE blobs/ only. A file outside that namespace - a
+// snapshot entry named "tokenizer.model.meta", for example - is content even
+// when its name has one of these shapes, so the mirror copies AND verifies it.
+//
+// It is a variable so the negative control can install the historical
+// suffix-only predicate and prove that the classification regressions are
+// discriminating.
+var isBlobStagingArtifactName = func(name string) bool {
+	return hfdownloader.IsStagingArtifactName(name)
+}
+
+// isPublishedBlobName reports whether a blobs/ entry is published content: a
+// canonical 64-hex digest, or an unusual published name the public storage API
+// accepts. Only a downloader staging artifact is not content, and an unusual
+// published name is never dropped, deleted or hidden.
+func isPublishedBlobName(name string) bool {
+	return hfdownloader.IsPublishedBlobName(name)
 }
 
 // effectiveEndpointURL returns the configured Hugging Face endpoint in the

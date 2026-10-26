@@ -99,9 +99,6 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 		t.Helper()
 		dir := t.TempDir()
 		dst := filepath.Join(dir, "complete.bin")
-		if err := os.WriteFile(dst+".part", part, 0o644); err != nil {
-			t.Fatal(err)
-		}
 		var requests atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests.Add(1)
@@ -109,6 +106,10 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 		it := PlanItem{RelativePath: "complete.bin", URL: srv.URL + "/complete.bin", Size: size, LFS: true, SHA256: sha}
+		// The staged bytes are inherited only when the identity record proves
+		// they belong to this item; the content proof then has to reject the
+		// corrupt ones.
+		seedSinglePartial(t, dst, part, Job{Repo: "o/r"}, it, singleTestIdentity)
 		return it, dst, srv, &requests
 	}
 
@@ -119,7 +120,9 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 
 		hashPassCount.Store(0)
 		verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
+			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+			func(ProgressEvent) {})
+
 		if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
 			t.Fatalf("corrupt complete .part error = %v, want a sha256 verification failure", err)
 		}
@@ -145,7 +148,9 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 
 		hashPassCount.Store(0)
 		verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
+			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+			func(ProgressEvent) {})
+
 		if err != nil {
 			t.Fatalf("downloadSingle: %v", err)
 		}
@@ -166,7 +171,9 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 
 		hashPassCount.Store(0)
 		verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-			Settings{Verify: "sha256", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
+			Settings{Verify: "sha256", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+			func(ProgressEvent) {})
+
 		if err != nil {
 			t.Fatalf("downloadSingle: %v", err)
 		}
@@ -186,7 +193,9 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 
 		hashPassCount.Store(0)
 		verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-			Settings{Verify: "none", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
+			Settings{Verify: "none", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+			func(ProgressEvent) {})
+
 		if err != nil {
 			t.Fatalf("Verify=none downloadSingle: %v", err)
 		}
@@ -204,56 +213,109 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 }
 
 // TestDownloadSingle_MovedCommitPartialIsContentProven covers the single-path
-// moved-commit case: a .part prefix from another revision (or any wrong bytes)
-// has the right length, so only the content proof can reject it.
+// moved-commit case from both sides of the identity rule.
+//
+// A .part staged by an EARLIER revision carries that revision's identity
+// record, so the current item must not inherit those bytes at all: the
+// staged prefix is discarded and the file is transferred again. The content
+// proof stays the last line of defense for the case the identity record
+// cannot rule out - a record that matches the current item while the staged
+// bytes are another revision's (or simply corrupt). There the bytes have the
+// right length, so only the content proof can reject them.
 func TestDownloadSingle_MovedCommitPartialIsContentProven(t *testing.T) {
 	const size = 4_096
 	const prefix = 2_048
 	full := rangedTestPayload(size)
 	sha := singleTestSHA(full)
 
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "moved.bin")
-	// Same length as the valid prefix, different revision's bytes.
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte{0x5A}, prefix), 0o644); err != nil {
-		t.Fatal(err)
+	serveRange := func(t *testing.T, requested *string) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*requested = r.Header.Get("Range")
+			if *requested == "" {
+				// A full request: the whole body, no range.
+				w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+				_, _ = w.Write(full)
+				return
+			}
+			var start, end int64
+			if _, err := fmt.Sscanf(*requested, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			content := full[start : end+1]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content)
+		}))
+		t.Cleanup(srv.Close)
+		return srv
 	}
 
-	var requested string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requested = r.Header.Get("Range")
-		var start, end int64
-		if _, err := fmt.Sscanf(requested, "bytes=%d-%d", &start, &end); err != nil {
-			http.Error(w, "bad range", http.StatusBadRequest)
-			return
+	t.Run("a record of another revision is not inherited", func(t *testing.T) {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "moved.bin")
+		job := Job{Repo: "o/r"}
+		it := PlanItem{RelativePath: "moved.bin", Size: size, LFS: true, SHA256: sha}
+		// The staged bytes and their record belong to the earlier revision.
+		earlier := singleOpts{Commit: "5555555555555555555555555555555555555555", CommitPinned: true}
+		seedSinglePartial(t, dst, bytes.Repeat([]byte{0x5A}, prefix), job, it, earlier)
+
+		var requested string
+		srv := serveRange(t, &requested)
+		it.URL = srv.URL + "/moved.bin"
+
+		current := singleOpts{Commit: "6666666666666666666666666666666666666666", CommitPinned: true}
+		hashPassCount.Store(0)
+		if _, err := downloadSingle(context.Background(), srv.Client(), "", job,
+			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, current,
+			func(ProgressEvent) {}); err != nil {
+			t.Fatalf("downloadSingle: %v", err)
 		}
-		content := full[start : end+1]
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
-		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(content)
-	}))
-	defer srv.Close()
+		if requested != "" {
+			t.Errorf("another revision's bytes were resumed: request %q, want a full request", requested)
+		}
+		if got := hashPassCount.Load(); got != 0 {
+			t.Errorf("inherited-bytes proof performed %d full-file passes; want 0 (nothing was inherited)", got)
+		}
+		assertExactFile(t, dst, full)
+	})
 
-	it := PlanItem{RelativePath: "moved.bin", URL: srv.URL + "/moved.bin", Size: size, LFS: true, SHA256: sha}
-	hashPassCount.Store(0)
-	verified, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-		Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
-	if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
-		t.Fatalf("moved-commit partial error = %v, want a sha256 verification failure (published=%v)", err, verified)
-	}
-	if want := fmt.Sprintf("bytes=%d-%d", prefix, size-1); requested != want {
-		t.Errorf("resume requested %q, want the exact missing suffix %q", requested, want)
-	}
-	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
-		t.Errorf("wrong-prefix bytes were published, stat err=%v", serr)
-	}
-	if _, serr := os.Stat(dst + ".part"); !os.IsNotExist(serr) {
-		t.Errorf("unproven partial was not discarded, stat err=%v", serr)
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("moved-commit proof performed %d full-file passes; want exactly 1", got)
-	}
+	t.Run("a matching record with foreign bytes is content proven", func(t *testing.T) {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "moved.bin")
+		job := Job{Repo: "o/r"}
+		it := PlanItem{RelativePath: "moved.bin", Size: size, LFS: true, SHA256: sha}
+		// Same length as the valid prefix, different revision's bytes, and a
+		// record that names THIS item.
+		seedSinglePartial(t, dst, bytes.Repeat([]byte{0x5A}, prefix), job, it, singleTestIdentity)
+
+		var requested string
+		srv := serveRange(t, &requested)
+		it.URL = srv.URL + "/moved.bin"
+
+		hashPassCount.Store(0)
+		verified, err := downloadSingle(context.Background(), srv.Client(), "", job,
+			Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+			func(ProgressEvent) {})
+
+		if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
+			t.Fatalf("moved-commit partial error = %v, want a sha256 verification failure (published=%v)", err, verified)
+		}
+		if want := fmt.Sprintf("bytes=%d-%d", prefix, size-1); requested != want {
+			t.Errorf("resume requested %q, want the exact missing suffix %q", requested, want)
+		}
+		if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+			t.Errorf("wrong-prefix bytes were published, stat err=%v", serr)
+		}
+		if _, serr := os.Stat(dst + ".part"); !os.IsNotExist(serr) {
+			t.Errorf("unproven partial was not discarded, stat err=%v", serr)
+		}
+		if got := hashPassCount.Load(); got != 1 {
+			t.Errorf("moved-commit proof performed %d full-file passes; want exactly 1", got)
+		}
+	})
 }
 
 // TestDownloadSingle_RejectsInvalidRangedResponses pins the strict 206
@@ -315,9 +377,8 @@ func TestDownloadSingle_RejectsInvalidRangedResponses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			dst := filepath.Join(dir, "ranged.bin")
-			if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-				t.Fatal(err)
-			}
+			it := PlanItem{RelativePath: "ranged.bin", Size: size}
+			seedSinglePartial(t, dst, full[:prefix], Job{Repo: "o/r"}, it, singleTestIdentity)
 			var requested atomic.Value
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requested.Store(r.Header.Get("Range"))
@@ -325,9 +386,11 @@ func TestDownloadSingle_RejectsInvalidRangedResponses(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			it := PlanItem{RelativePath: "ranged.bin", URL: srv.URL + "/ranged.bin", Size: size}
+			it.URL = srv.URL + "/ranged.bin"
 			_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-				Settings{Verify: "none", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {})
+				Settings{Verify: "none", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+				func(ProgressEvent) {})
+
 			if err == nil {
 				t.Fatal("invalid ranged response was accepted and published")
 			}
@@ -351,9 +414,8 @@ func TestDownloadSingle_OversizedSuffixIsNotTrustedOnRestart(t *testing.T) {
 	const size, prefix = 4096, 2048
 	full := rangedTestPayload(size)
 	dst := filepath.Join(t.TempDir(), "overflow-restart.bin")
-	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-		t.Fatal(err)
-	}
+	it := PlanItem{RelativePath: "overflow-restart.bin", Size: size}
+	seedSinglePartial(t, dst, full[:prefix], Job{Repo: "o/r"}, it, singleTestIdentity)
 	var requests atomic.Int32
 	var lastRange atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -372,16 +434,16 @@ func TestDownloadSingle_OversizedSuffixIsNotTrustedOnRestart(t *testing.T) {
 		_, _ = w.Write(full[prefix:])
 	}))
 	defer srv.Close()
-	it := PlanItem{RelativePath: "overflow-restart.bin", URL: srv.URL, Size: size}
+	it.URL = srv.URL
 	cfg := Settings{Verify: "size", Retries: 0, StallTimeout: "0"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err == nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err == nil {
 		t.Fatal("oversized response unexpectedly succeeded")
 	}
 	fi, err := os.Stat(dst + ".part")
 	if err != nil || fi.Size() != prefix {
 		t.Fatalf("invalid suffix was retained: stat err=%v, want committed prefix %d", err, prefix)
 	}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("valid restart failed: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -403,9 +465,8 @@ func TestDownloadSingle_FinalBytesRequireFramingEOF(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			dst := filepath.Join(t.TempDir(), "framing.bin")
-			if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-				t.Fatal(err)
-			}
+			it := PlanItem{RelativePath: "framing.bin", Size: size}
+			seedSinglePartial(t, dst, full[:prefix], Job{Repo: "o/r"}, it, singleTestIdentity)
 			var gets atomic.Int32
 			var secondRange atomic.Value
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -434,9 +495,9 @@ func TestDownloadSingle_FinalBytesRequireFramingEOF(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			it := PlanItem{RelativePath: "framing.bin", URL: srv.URL, Size: size}
+			it.URL = srv.URL
 			cfg := Settings{Verify: "none", Retries: 0, StallTimeout: "40ms"}
-			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err == nil {
+			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err == nil {
 				t.Fatal("unterminated/overflowing response published after writing all requested bytes")
 			}
 			if _, err := os.Stat(dst); !os.IsNotExist(err) {
@@ -446,7 +507,7 @@ func TestDownloadSingle_FinalBytesRequireFramingEOF(t *testing.T) {
 			if got, err := os.ReadFile(part); err != nil || !bytes.Equal(got, full[:size-1]) {
 				t.Fatalf("failed attempt must preserve the valid prefix and reserve the final byte: len=%d err=%v", len(got), err)
 			}
-			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+			if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
 				t.Fatalf("healthy final-byte restart: %v", err)
 			}
 			assertExactFile(t, dst, full)
@@ -484,11 +545,12 @@ func TestDownloadSingle_CancelAtFinalizeBeforeRename(t *testing.T) {
 			defer cancel()
 			cfg := Settings{Verify: "none", Retries: 0, StallTimeout: "0", CleanupPartialsOnCancel: func() bool { return cleanup }}
 			it := PlanItem{RelativePath: "cancel-finalize.bin", URL: srv.URL, Size: size}
-			_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ev ProgressEvent) {
+			_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ev ProgressEvent) {
 				if ev.Event == "file_finalizing" {
 					cancel()
 				}
 			})
+
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("download error=%v, want canceled", err)
 			}

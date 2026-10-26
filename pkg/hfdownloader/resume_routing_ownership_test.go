@@ -380,9 +380,10 @@ func TestDownloadSingle_IgnoredRangeRestartClearsInheritedProof(t *testing.T) {
 	sha := singleTestSHA(full)
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "restart.bin")
-	if err := os.WriteFile(dst+".part", full[:100], 0o644); err != nil {
-		t.Fatal(err)
-	}
+	it := PlanItem{RelativePath: "restart.bin", Size: total, LFS: true, SHA256: sha}
+	// The staged prefix is inheritable, so the ignored-Range restart is what
+	// discards it and clears the inherited-bytes proof.
+	seedSinglePartial(t, dst, full[:100], Job{Repo: "o/r"}, it, singleTestIdentity)
 	var (
 		mu     sync.Mutex
 		ranges []string
@@ -398,10 +399,11 @@ func TestDownloadSingle_IgnoredRangeRestartClearsInheritedProof(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{RelativePath: "restart.bin", URL: srv.URL, Size: total, LFS: true, SHA256: sha}
+	it.URL = srv.URL
 	hashPassCount.Store(0)
 	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-		Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, func(ProgressEvent) {}); err != nil {
+		Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleTestIdentity,
+		func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	assertExactFile(t, dst, full)

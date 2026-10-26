@@ -734,25 +734,34 @@ func copyFileForMirror(src, dst string) error {
 	return out.Close()
 }
 
+// mirrorVerifyCoversEntry reports whether the mirror verification covers the
+// repository-relative entry. The production path covers every entry the copy
+// produces, so copy and verify always agree on the same set. It is a variable
+// so the negative control can install the historical blobs/-only scope and
+// prove that the copy/verify agreement regression is discriminating.
+var mirrorVerifyCoversEntry = func(rel string) bool { return true }
+
 // verifyRepoCache verifies that a copied repo matches the source.
+//
+// It verifies exactly the set the copy produces: every file of the repository
+// except the downloader staging artifacts INSIDE blobs/. The exclusion is
+// scoped to that namespace, so copy and verify always agree on the same set
+// and a legitimate file outside it - a snapshot entry named
+// "tokenizer.model.meta", for example - is copied AND verified.
+//
+// A snapshot entry is a link, and the copy reproduces the link, so the link
+// target is what has to match; a regular file is compared by size.
 func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
 	}
 
-	blobsDir := filepath.Join(repoPath, "blobs")
-
-	return filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			return nil
-		}
-		// Staging artifacts are not copied content and have no destination to
-		// verify.
-		if isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
 
@@ -760,8 +769,41 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return err
 		}
+		// Staging artifacts are not copied content and have no destination to
+		// verify. The exclusion is scoped to blobs/, exactly like the copy's.
+		if filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
+		if !mirrorVerifyCoversEntry(rel) {
+			return nil
+		}
 
 		dstFile := filepath.Join(dstPath, rel)
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			// A snapshot entry is a link and the copy reproduces the link, so
+			// the link target is what has to match. Only the parent chain is
+			// confined: the leaf IS the link.
+			if err := mirrorNoSymlinkPath(srcCache, filepath.Dir(path)); err != nil {
+				return err
+			}
+			if err := mirrorNoSymlinkPath(dstCache, filepath.Dir(dstFile)); err != nil {
+				return err
+			}
+			want, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			got, err := os.Readlink(dstFile)
+			if err != nil {
+				return fmt.Errorf("missing link %s: %w", rel, err)
+			}
+			if got != want {
+				return fmt.Errorf("link mismatch for %s: src=%s dst=%s", rel, want, got)
+			}
+			return nil
+		}
+
 		if err := mirrorNoSymlinkPath(srcCache, path); err != nil {
 			return err
 		}
@@ -770,13 +812,11 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 		dstInfo, err := os.Stat(dstFile)
 		if err != nil {
-			return fmt.Errorf("missing blob %s: %w", rel, err)
+			return fmt.Errorf("missing file %s: %w", rel, err)
 		}
-
 		if dstInfo.Size() != info.Size() {
 			return fmt.Errorf("size mismatch for %s: src=%d dst=%d", rel, info.Size(), dstInfo.Size())
 		}
-
 		return nil
 	})
 }

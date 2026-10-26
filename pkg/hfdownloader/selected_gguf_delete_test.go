@@ -483,7 +483,18 @@ func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
 			t.Errorf("staging lock path %q was not classified", name)
 		}
 	}
-	for _, name := range []string{"model.part", "model.parts.json", "abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-", "abc.lock", "opaque-key.lock"} {
+	// The exhaustive producer-shape list also covers the shapes that are
+	// produced OUTSIDE the blobs/ namespace and therefore never occur there:
+	// the single-request partial of a flat-mode destination ("<name>.part"),
+	// the legacy layout metadata ("<name>.parts.json") and the persistent
+	// ownership lock ("<name>.lock"). A blob named after one of them is
+	// refused exactly like the other producer shapes.
+	for _, name := range []string{"model.part", "model.parts.json", "abc.lock", "opaque-key.lock"} {
+		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); !got {
+			t.Errorf("producer staging path %q was not classified", name)
+		}
+	}
+	for _, name := range []string{"abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-"} {
 		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); got {
 			t.Errorf("ordinary/non-producer blob path %q was classified", name)
 		}

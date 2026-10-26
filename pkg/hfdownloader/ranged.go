@@ -285,6 +285,11 @@ type multipartOpts struct {
 	// It is part of the resume identity; the requested branch name (Job.Revision)
 	// is not enough because the branch may move between runs.
 	Commit string
+	// CommitPinned reports whether Commit is an immutable, RESOLVED commit or
+	// the planner's fallback to the requested revision, which pins nothing.
+	// The single-request fallback of this path inherits the same rule: bytes
+	// are inherited only under a pinned identity.
+	CommitPinned bool
 	// ContentAddressed marks Publish as a content-addressed blob path whose
 	// existence alone proves the transfer complete (blobs/<known-sha>). When
 	// false (legacy/output dst, tmp-<sha> staging for an unknown digest), an
@@ -1895,7 +1900,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		if opts.DirectBlobPublished != nil {
 			*opts.DirectBlobPublished = false
 		}
-		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
+		// The size is unknown, so the single-request path is the only one
+		// that can transfer this item. It applies the same identity rule as
+		// every other single-request transfer: bytes are inherited only when
+		// the identity sidecar proves they belong to this exact object.
+		return downloadSingle(ctx, httpc, token, job, cfg, it, dst,
+			singleOpts{Commit: opts.Commit, CommitPinned: opts.CommitPinned}, emit)
 	}
 
 	stg := opts.Staging

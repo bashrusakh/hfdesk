@@ -19,8 +19,8 @@ import (
 
 // downloadSingleErr adapts downloadSingle's (contentVerified, error) result to
 // the error-only shape used by goroutine result channels.
-func downloadSingleErr(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
-	_, err := downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
+func downloadSingleErr(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts singleOpts, emit func(ProgressEvent)) error {
+	_, err := downloadSingle(ctx, httpc, token, job, cfg, it, dst, opts, emit)
 	return err
 }
 
@@ -38,9 +38,15 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst+".part", full[:partialN], 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: false,
 	}
+	// The staged bytes are inherited only when the identity record proves
+	// they belong to this item, so the fixture carries that record.
+	seedSinglePartial(t, dst, full[:partialN], job, it, singleTestIdentity)
 
 	var (
 		mu           sync.Mutex
@@ -67,15 +73,10 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-		AcceptRanges: false,
-	}
+	it.URL = srv.URL + "/test.bin"
 	cfg := Settings{Retries: 0}
 
-	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -115,9 +116,14 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst+".part", full, 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
 	}
+	// The complete partial is published without a request only when its
+	// identity record proves the bytes belong to this item.
+	seedSinglePartial(t, dst, full, job, it, singleTestIdentity)
 
 	var requestCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,12 +132,8 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-	}
-	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	it.URL = srv.URL + "/test.bin"
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -159,10 +161,14 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Pre-seed with garbage partial
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte("x"), partialN), 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
 	}
+	// Pre-seed with a garbage partial that the identity record ties to this
+	// item, so the ignored-Range restart is what discards it.
+	seedSinglePartial(t, dst, bytes.Repeat([]byte("x"), partialN), job, it, singleTestIdentity)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Intentionally ignore Range header and return 200 with full body.
@@ -172,12 +178,8 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-	}
-	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	it.URL = srv.URL + "/test.bin"
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
