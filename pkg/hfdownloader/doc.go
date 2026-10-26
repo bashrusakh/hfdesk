@@ -434,7 +434,15 @@ multipart route keeps relying on its claim. A concurrent second writer of the
 same flat destination is excluded: it fails its item with the actionable
 live-owner error instead of racing, which is safer than the pre-#140
 behavior, where two processes wrote the same `.part-NN` payload files and
-could publish a silently corrupt model.
+could publish a silently corrupt model. A flat destination whose ownership
+domain cannot be acquired (the OS lock is unsupported, denied, or the
+filesystem failed) fails the item before it writes any payload, exactly like
+cache mode: that is the fail-closed consequence of the flat route owning a
+domain. Because the single-request route takes that domain, every flat
+single-request download leaves the persistent zero-byte
+`<destination>.incomplete.lock` next to the file, even when no multipart
+transfer ran: the shared domain/staging lock is created by the domain
+acquisition, not by a multipart transfer.
 
 The domain is also what a second writer of the same key waits for. A writer
 that finds the key owned by a live owner waits for the owner (bounded,
@@ -533,14 +541,21 @@ makes. The wait
 budget is a package-level knob derived from the existing ownership-lock
 convention — 60 times the 5s acquisition window, so the effective budget is 5
 minutes — not a user setting. The wait runs inside the item's goroutine, but a
-waiting item does NOT hold one of the job's `MaxActiveDownloads` slots: the
-slot is a per-item lease that the ownership-domain acquisition returns for the
-duration of every wait (the in-process slot wait and the cross-process OS-lock
-wait alike) and takes back before it returns a domain the caller will transfer
-under. The slot therefore bounds concurrent TRANSFERS, not waiters, so the
-other files of the job proceed while one item waits, even with a low limit;
-waiting items do not consume transfer slots, while concurrent transfers still
-obey the configured limit. While the item waits it emits no progress events, so
+DESTINATION-DOMAIN waiter does NOT hold one of the job's `MaxActiveDownloads`
+slots: the slot is a per-item lease that the ownership-domain acquisition
+returns for the duration of every wait (the in-process slot wait and the
+cross-process OS-lock wait alike) and takes back before it returns a domain
+the caller will transfer under. The slot therefore bounds concurrent TRANSFERS,
+not destination-domain waiters, so the other files of the job proceed while
+one item waits, even with a low limit; destination-domain waiters do not
+consume transfer slots, while concurrent transfers still obey the configured
+limit. The MULTIPART staging CLAIM is a separate ownership wait and is the
+documented EXCEPTION to that rule: it still runs with the item's slot held. A
+cross-process claimant waits at most `stagingOwnershipAcquireWait` (5s) and
+then fails with the actionable ownership error; an in-process claimant waits
+for the current owner bounded by the item's context. That wait cannot
+deadlock — it gives up, or ends when the owner finishes — and it is not part
+of the domain lease. While the item waits it emits no progress events, so
 its byte counter does not move and the item simply stays in progress; when the
 budget expires the item fails with the actionable error above and the job does
 not report success.
@@ -686,8 +701,12 @@ Two levels of concurrency are configurable:
 
   - Concurrency: Number of parallel HTTP connections per file (for multipart downloads)
   - MaxActiveDownloads: Maximum number of files TRANSFERRING simultaneously
-    (a file waiting for another writer's ownership domain does not consume a
-    slot, so the limit bounds concurrent transfers, not waiters)
+    (the limit bounds concurrent transfers, not waiters: a file waiting for
+    another writer's destination ownership domain does not consume a slot. The
+    multipart staging claim is the separately documented exception - that
+    ownership wait still runs with the item's slot held, a cross-process
+    claimant waits at most `stagingOwnershipAcquireWait` (5s) and an in-process
+    claimant waits for the current owner bounded by the item's context)
 
 # Error Handling
 

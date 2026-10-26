@@ -185,9 +185,13 @@ type Settings struct {
 	Concurrency int
 
 	// MaxActiveDownloads limits how many files TRANSFER simultaneously.
-	// This controls overall parallelism across all files in a job. A file
-	// that waits for another writer's ownership domain does not consume a
-	// slot, so the limit bounds concurrent transfers, not waiters.
+	// This controls overall parallelism across all files in a job. The
+	// limit bounds concurrent transfers, not destination-domain waiters: a
+	// file that waits for another writer's destination ownership domain does
+	// not consume a slot. The multipart staging claim is the separately
+	// documented exception - that ownership wait still runs with the item's
+	// slot held (a cross-process claimant waits at most 5s, an in-process
+	// claimant waits for the current owner bounded by the item's context).
 	// If <= 0, defaults to GOMAXPROCS (number of CPU cores).
 	MaxActiveDownloads int
 

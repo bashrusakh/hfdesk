@@ -6,9 +6,10 @@ package hfdownloader
 // The per-item MaxActiveDownloads slot lease (issue #140 / PR #151).
 //
 // An item is not always transferring: when its destination is owned by a
-// PROVEN live writer it WAITS for that ownership domain (acquireBlobDomain,
-// through acquireBlobDomainWithin). A waiter consumes no bandwidth, so it must
-// not consume one of the job's MaxActiveDownloads slots: with a low limit a
+// PROVEN live writer it WAITS for that destination ownership domain
+// (acquireBlobDomain, through acquireBlobDomainWithin). A destination-domain
+// waiter consumes no bandwidth, so it must not consume one of the job's
+// MaxActiveDownloads slots: with a low limit a
 // single waiting item would otherwise keep every other file of the job from
 // starting, the job would look stalled, and a concurrency budget meant for
 // TRANSFERS would be spent on a wait.
@@ -41,9 +42,13 @@ package hfdownloader
 //     (that item waits for a DIFFERENT domain: a second contender for the same
 //     key is stopped at that key's in-process slot, so two contenders for one
 //     key cannot both hold it), or
-//   - the multipart route's staging claim, whose acquisition is bounded by
-//     stagingOwnershipAcquireWait (5s) and reports the contention instead of
-//     waiting forever (the separately documented, bounded exception).
+//   - the multipart route's staging claim, which is a SEPARATE ownership wait
+//     and still runs with the item's slot held - the documented exception to
+//     "a destination-domain waiter holds no slot": a cross-process claimant
+//     waits at most stagingOwnershipAcquireWait (5s) and then fails with the
+//     actionable ownership error, while an in-process claimant waits for the
+//     current owner bounded by the item's context. It cannot deadlock either:
+//     it gives up, or the owner finishes and releases.
 //
 // So the wait graph cannot contain a cycle. The OS ownership lock is still
 // taken exactly once: this mechanism only moves the job's semaphore token, and

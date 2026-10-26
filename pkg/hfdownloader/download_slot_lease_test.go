@@ -737,3 +737,39 @@ func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing
 		t.Errorf("endWait calls = %d, want 0: a failed acquisition has nothing to transfer and must not retake the slot", ends)
 	}
 }
+
+// TestDownloadSlotLeaseFreePathDoesNotReleaseOrRetake pins the free
+// (uncontended) path of the lease: when the destination's ownership domain is
+// available, the acquisition never signals a wait, so it must neither return
+// the item's slot nor take it back. The test holds no lock and no in-process
+// domain entry, so the acquisition can only run through the fast path.
+func TestDownloadSlotLeaseFreePathDoesNotReleaseOrRetake(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	dst := filepath.Join(t.TempDir(), "tmp-blob")
+	// The temp directory makes the destination, and therefore this key,
+	// unique to this test.
+	key := flatDomainKey(dst)
+	notice := &slotNoticeRecorder{}
+	ctx := withDownloadSlotWaitNotice(context.Background(), notice)
+
+	domain, err := acquireBlobDomainWithin(ctx, key, dst, 0, 100*time.Millisecond, true)
+	if err != nil {
+		t.Fatalf("uncontended domain acquisition: %v", err)
+	}
+	if domain == nil {
+		t.Fatal("uncontended domain acquisition returned no domain")
+	}
+	domain.release()
+
+	notice.mu.Lock()
+	begins, ends := notice.begins, notice.ends
+	notice.mu.Unlock()
+	if begins != 0 {
+		t.Errorf("beginWait calls = %d, want 0: the free path must not return the slot", begins)
+	}
+	if ends != 0 {
+		t.Errorf("endWait calls = %d, want 0: the free path must not retake the slot", ends)
+	}
+}
