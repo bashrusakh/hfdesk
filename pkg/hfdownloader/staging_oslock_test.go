@@ -114,13 +114,19 @@ func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 // under the transition lock while it holds the OS ownership lock, and refuses
 // a missing or foreign record with errStagingClaimLost instead of renaming
 // another writer's staging file.
+//
+// The record the owned case installs is a COMPLETE layout, because publish
+// also checks the publication invariant (every range Done, committed total
+// equal to the expected size) before it renames. The ownership semantics
+// under test are unchanged: an owned, complete record still publishes.
 func TestStagingPublishRefusesForeignClaim(t *testing.T) {
+	payload := []byte("someone else's payload")
 	makeDownload := func(t *testing.T) (*stagingDownload, string, string, *stagingOwnershipLock) {
 		t.Helper()
 		dir := t.TempDir()
 		staging := filepath.Join(dir, "x.incomplete")
 		pub := filepath.Join(dir, "x.bin")
-		if err := os.WriteFile(staging, []byte("someone else's payload"), 0o644); err != nil {
+		if err := os.WriteFile(staging, payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		own, oerr := acquireStagingOwnershipLock(staging)
@@ -133,7 +139,8 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 			stg:         staging,
 			pub:         pub,
 			meta:        staging + ".meta",
-			it:          PlanItem{RelativePath: "x.bin"},
+			it:          PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
+			ranges:      completeRangeLayout(int64(len(payload)), 1),
 			osExclusive: own != nil,
 			own:         own,
 		}
@@ -194,7 +201,7 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 			Version:   stagingMetaVersion,
 			Repo:      "o/r",
 			Path:      "x.bin",
-			Ranges:    buildRangeLayout(int64(len("someone else's payload")), 1),
+			Ranges:    completeRangeLayout(int64(len("someone else's payload")), 1),
 		}
 		if err := writeStagingMeta(d.meta, &ours); err != nil {
 			t.Fatal(err)

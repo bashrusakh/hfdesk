@@ -146,6 +146,18 @@ staging pair and reports the item as complete. The strength of that guarantee
 depends on the filesystem, and the two tiers are described under "The
 publication primitive" below.
 
+The ranged publication is gated on a COMPLETE range layout, and the gate is
+checked rather than implied. Before the rename, the live layout of the
+download and the persisted claim record must both cover the whole expected
+payload: every range `Done` (its bytes arrived under a response whose framing
+ended cleanly) and the committed total equal to the expected size. A layout
+that fails the check is refused with `errStagingLayoutIncomplete` and nothing
+is renamed, so the staged bytes stay on disk for a resume. The control flow
+that reaches the publication already implies completeness - every range
+worker's nil return is caught by the cancellation guard or by the error drain
+- but the invariant is asserted at the publication so that a later refactor
+cannot break it silently.
+
 Staging identity includes `plan.Commit`. If fetching repository info fails or
 returns an empty SHA, the planner uses the requested revision string as the
 fallback commit identity; that value is not necessarily an immutable commit.
@@ -390,6 +402,32 @@ wraps `ErrBlobOwnershipUnknown`. The caller surfaces that failure instead of
 skipping the item, because a skip would report a successful download with the
 blob still missing; the incomplete payload is preserved so a retry can resume
 it.
+
+The download path refuses a staging record whose owner can be proven NEITHER
+alive nor dead: a record written without the OS lock fence (`LockFenced` is
+false, which no released version ever wrote) or one that cannot be read or
+parsed at all. That refusal is deliberate and conservative — the record and
+its partial are preserved, and the record is never taken over, because no
+age-based takeover and no takeover without proof of same-host death is
+allowed. The two refusals of a staging record are told apart, because they
+need different operator actions:
+
+  - a PROVEN live owner keeps the transient message "blob <sha> is being
+    downloaded by another process; try again later" (the owner may publish the
+    file at any moment, so the operator simply retries);
+  - an UNPROVEN record reports that its staging state "cannot be proven to
+    belong to a live or dead owner (legacy or unreadable record)", that the
+    partial is preserved, and that removing the staging pair is the recovery.
+    It carries the exported sentinel `ErrStagingOwnershipUnproven`, which only
+    this case carries, so a caller can tell the two apart with `errors.Is`.
+
+The operator procedure for an unproven record is therefore manual and is
+deliberately not automated: remove the staging pair (`<staging>` and
+`<staging>.meta`, for example `blobs/<sha>.incomplete` and
+`blobs/<sha>.incomplete.meta`) and retry the download; the item then starts
+from zero. The persistent `<staging>.lock` is never removed, and a staging
+pair whose owner is a proven live owner is never removed either — that owner
+is still writing to it.
 
 The job contract follows from that: a job that reports success means the
 requested files are present and reachable at their snapshot/friendly paths. A

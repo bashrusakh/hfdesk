@@ -131,6 +131,14 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 
 - Never assemble multipart downloads after context cancellation or known part
   errors.
+- The publication is gated on a COMPLETE range layout, and the gate is
+  CHECKED rather than implied: before the rename, the live and the persisted
+  range layout must both cover the whole expected payload (every range `Done`,
+  committed total equal to the expected size). An incomplete layout is refused
+  with `errStagingLayoutIncomplete` and nothing is renamed, so the staged bytes
+  stay on disk for a resume. The control flow that reaches `publish()` already
+  implies completeness, but the invariant is asserted there so a later refactor
+  cannot break it silently.
 - Multipart part files are only reusable when their byte-range layout is known
   to match the current file size and connection count.
 - If legacy per-part resume metadata is invalid or mismatched, discard only the
@@ -365,6 +373,26 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   failure. An unknown state must never become a successful skip: the job would
   report completion with the blob still missing. The incomplete payload is
   preserved.
+- AN UNPROVEN STAGING RECORD IS NOT "ANOTHER LIVE WRITER". A staging record
+  that was written without the lock fence (`LockFenced == false`, which no
+  released version ever wrote) or that cannot be read/parsed is refused by the
+  claim, because its owner can be proven neither alive nor dead. The refusal
+  is the owner-decided rule and it does not change: the record and its partial
+  are PRESERVED and never taken over — no age-based takeover, no takeover
+  without proof of same-host death. What changes is the operator-visible
+  error: a PROVEN live owner keeps "blob <sha> is being downloaded by another
+  process; try again later" (transient — the owner may publish at any moment),
+  while the unproven record says that its state "cannot be proven to belong
+  to a live or dead owner (legacy or unreadable record)", that the partial is
+  preserved, and that removing the staging pair is the recovery. The two are
+  distinguishable by the exported sentinel `ErrStagingOwnershipUnproven`,
+  which only the unproven case carries. OPERATOR PROCEDURE: the automatic
+  recovery is deliberately absent, so the operator removes the staging pair
+  (`<staging>` and `<staging>.meta`, e.g. `blobs/<sha>.incomplete` and
+  `blobs/<sha>.incomplete.meta`) and retries; the download then starts from
+  zero. Never remove the persistent `<staging>.lock`, and never remove a
+  staging pair whose owner is a PROVEN live owner — that owner is still
+  writing to it.
 - Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
   (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
   before the claim transition and held through transfer, hashing and

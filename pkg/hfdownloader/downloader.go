@@ -840,7 +840,13 @@ LOOP:
 			// successful skip: the file is not present, so the item fails
 			// below with an actionable error instead of reporting a
 			// completion the cache does not have.
-			if errors.Is(dlErr, errBlobIncompleteOwned) {
+			//
+			// An UNPROVEN record (a legacy/unfenced one, or one that cannot
+			// be read) keeps its own actionable message: no live owner is
+			// proven for it, so it must not be reported as "being
+			// downloaded by another process", and its message names the
+			// staging pair the operator has to remove to retry.
+			if errors.Is(dlErr, errBlobIncompleteOwned) && !errors.Is(dlErr, ErrStagingOwnershipUnproven) {
 				dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 			}
 			if dlErr != nil {

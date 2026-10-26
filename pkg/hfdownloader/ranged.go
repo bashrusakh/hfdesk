@@ -141,6 +141,12 @@ var (
 	// a legacy record's owner cannot be proven dead. The file is NOT present
 	// in that state, so the caller must fail the item with an actionable
 	// error rather than touch the staging or report a successful skip.
+	//
+	// It classifies BOTH kinds of refusal - a PROVEN live owner and an
+	// UNPROVEN record - because in both cases the staging file is not
+	// available to this writer. The two are told apart by
+	// ErrStagingOwnershipUnproven, which only the unproven case carries, and
+	// by their operator-visible messages.
 	errBlobIncompleteOwned = errors.New("incomplete download is owned by another live writer")
 
 	// errBlobAlreadyComplete reports that a content-addressed publish target
@@ -149,6 +155,15 @@ var (
 	// pre-download skip check is authoritative and a declined file must be
 	// re-downloaded (a concurrent writer finishing is not a skip decision).
 	errBlobAlreadyComplete = errors.New("destination already complete")
+
+	// errStagingLayoutIncomplete reports that the range layout of a staging
+	// download does not cover the whole expected payload: not every range is
+	// Done, or the committed total is below the expected size. The
+	// publication refuses to rename such a payload onto the publish target -
+	// an incomplete payload published as the finished file is exactly the
+	// silent corruption this downloader must never produce. The staged bytes
+	// stay on disk for a resume. Distinguishable via errors.Is.
+	errStagingLayoutIncomplete = errors.New("staging range layout is incomplete")
 )
 
 // stagingOwners is the in-process exclusion registry keyed by staging file
@@ -500,13 +515,25 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		// current-version writer can be mid-claim: every current writer creates
 		// this record while holding the lifetime lock. An unreadable legacy
 		// record cannot establish that its owner is dead, regardless of age.
-		return nil, false, errBlobIncompleteOwned
+		//
+		// The refusal is reported as an UNPROVEN owner, not as a live one: no
+		// live writer is proven, so the operator must not be told that another
+		// process is downloading this file. The record and its payload are
+		// preserved (never taken over), and the message names the staging
+		// pair the operator has to remove to retry.
+		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
 	// A LockFenced record belongs to the current lifetime-lock protocol. A
 	// legacy/unfenced record is not proven dead by a free new lock.
+	//
+	// Such a record is UNPROVEN, not proven-live: the recorded identity is
+	// not a fence, so neither "a live writer owns it" nor "its owner is
+	// gone" can be established. The record is preserved and never taken
+	// over, and the operator-visible error says so and names the documented
+	// recovery instead of claiming another process is downloading the file.
 	if !meta.LockFenced && !stagingOwnerProvablyDead(&meta) && !stagingOwnerIsSelf(&meta) {
-		return nil, false, errBlobIncompleteOwned
+		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
 	// Dead, stale, or same-instance owner: take over. A fully validated versioned
@@ -848,6 +875,30 @@ func normalizedRangeLayout(ranges []RangeProgress, size int64) ([]RangeProgress,
 		return nil, false
 	}
 	return out, true
+}
+
+// stagingLayoutComplete reports whether a range layout covers the whole
+// expected payload: the layout tiles [0, size) exactly, every range is Done
+// (the range's bytes arrived under a response whose framing ended cleanly),
+// and the committed total equals size.
+//
+// The layout is validated with the package's OWN range validation
+// (normalizeRangesInPlace, through normalizedRangeLayout), never with a
+// re-implemented check, so the publication guard and the resume path can
+// never disagree about what a complete layout is. The copy
+// normalizedRangeLayout returns is used for the decision, so the caller's
+// layout is never mutated.
+func stagingLayoutComplete(ranges []RangeProgress, size int64) bool {
+	layout, ok := normalizedRangeLayout(ranges, size)
+	if !ok {
+		return false
+	}
+	for i := range layout {
+		if !layout[i].Done {
+			return false
+		}
+	}
+	return committedTotal(layout) == size
 }
 
 // normalizeRangesInPlace validates and normalizes ranges in place. Callers
@@ -2468,6 +2519,14 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 // owner; nothing is renamed. This closes the window where a writer whose claim
 // was taken over (or whose record was removed) could still publish a foreign
 // staging file.
+//
+// Publication is ALSO layout-checked, explicitly: before the rename the live
+// and the persisted range layout must both cover the whole expected payload
+// (every range Done, committed total equal to the expected size). An
+// incomplete layout returns errStagingLayoutIncomplete and nothing is
+// renamed, so the guarantee "an incomplete payload is never published" is a
+// checked invariant here and not only an implication of the control flow that
+// reached publish.
 func (d *stagingDownload) publish() error {
 	// A heartbeat failure while finalization is still active is fatal; never
 	// rename a payload whose claim record could no longer be kept fresh.
@@ -2490,6 +2549,16 @@ func (d *stagingDownload) publish() error {
 		return fmt.Errorf("close staging file %s before publish: %w", d.stg, err)
 	}
 
+	// Snapshot the live layout under the layout gate. The snapshot is taken
+	// BEFORE the metadata gate below is acquired, so the gate order stays
+	// metaMu -> metadata gate everywhere (the flush path takes them in that
+	// order) and no inversion is possible. The snapshot cannot be stale: the
+	// range workers have joined and the heartbeat is stopped, so nothing
+	// mutates the layout any more.
+	d.metaMu.Lock()
+	live := append([]RangeProgress(nil), d.ranges...)
+	d.metaMu.Unlock()
+
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(d.ctx, stagingLockWait); err != nil {
 		return err
@@ -2507,6 +2576,36 @@ func (d *stagingDownload) publish() error {
 	}
 	if err := d.ctx.Err(); err != nil {
 		return err
+	}
+	// The publication invariant is asserted HERE, explicitly, instead of
+	// being left to the control flow above: the range layout of this
+	// download must cover the whole expected payload before anything is
+	// renamed onto the publish target. Every range must be Done and the
+	// committed total must equal the expected size.
+	//
+	// Without this check the guarantee "an incomplete payload is never
+	// published" rested only on the fact that every runRange nil-return path
+	// is caught by the cancellation guard or by the errCh drain - correct, but
+	// implicit, and exactly the kind of invariant a later refactor can break
+	// silently. A layout that fails this check is never renamed: a partial
+	// payload published as the finished file is the silent corruption this
+	// downloader must never produce, and the staged bytes stay on disk for a
+	// resume.
+	//
+	// The live layout is the truth about the bytes this run wrote; the
+	// persisted record is the truth about the published payload's provenance.
+	// Both must describe the same complete layout.
+	if !stagingLayoutComplete(live, d.it.Size) {
+		return fmt.Errorf("refusing to publish %s: the staging range layout is incomplete (%d of %d bytes committed); the staged bytes are preserved for a resume: %w",
+			d.it.RelativePath, committedTotal(live), d.it.Size, errStagingLayoutIncomplete)
+	}
+	meta, merr := readStagingMeta(d.meta)
+	if merr != nil {
+		return fmt.Errorf("refusing to publish %s: the staging record cannot be read: %w", d.it.RelativePath, merr)
+	}
+	if meta.Size != d.it.Size || !stagingLayoutComplete(meta.Ranges, d.it.Size) {
+		return fmt.Errorf("refusing to publish %s: the persisted staging layout is incomplete (%d of %d bytes committed); the staged bytes are preserved for a resume: %w",
+			d.it.RelativePath, committedTotal(meta.Ranges), d.it.Size, errStagingLayoutIncomplete)
 	}
 	if d.contentAddressed {
 		// The target is a content-addressed blob: its existence is completion

@@ -98,6 +98,61 @@ func blobLiveOwnerError(sha, rel string) error {
 	return fmt.Errorf("blob %s is being downloaded by another process; try again later: %w", sha, errBlobOwnedByLiveWriter)
 }
 
+// stagingUnprovenOwnerError is the actionable error of an item whose staging
+// record cannot be proven to belong to a live owner or to a dead one.
+//
+// The condition is NOT "another process is downloading this": the record is
+// either a legacy/unfenced one (written without the lifetime ownership lock
+// fence) or one that cannot be read or parsed at all, so its owner can be
+// proven neither alive nor dead. The refusal is deliberate and conservative:
+// the record is preserved and never taken over, because no age-based takeover
+// and no takeover without proof of same-host death is allowed.
+//
+// The message therefore says what the state is AND what the operator can do:
+// the staging pair has to be removed by hand, because the automatic recovery
+// is deliberately absent. It names the blob key (or the item's path when the
+// item has no known digest) and the staging pair - and nothing else: no
+// credential, and no other absolute path.
+type stagingUnprovenOwnerError struct {
+	sha     string
+	rel     string
+	staging string
+	meta    string
+}
+
+// newStagingUnprovenOwnerError builds the operator-visible error of an
+// unproven staging record.
+func newStagingUnprovenOwnerError(it PlanItem, staging, metaPath string) error {
+	return &stagingUnprovenOwnerError{
+		sha:     it.SHA256,
+		rel:     it.RelativePath,
+		staging: staging,
+		meta:    metaPath,
+	}
+}
+
+func (e *stagingUnprovenOwnerError) Error() string {
+	what := e.rel
+	if e.sha != "" {
+		what = "blob " + e.sha
+	}
+	return fmt.Sprintf("the staging state for %s cannot be proven to belong to a live or dead owner (legacy or unreadable record); the partial is preserved - remove %s and %s to retry",
+		what, e.staging, e.meta)
+}
+
+// Unwrap exposes the exported sentinel, so a caller can tell an unproven
+// record apart from a proven live owner.
+func (e *stagingUnprovenOwnerError) Unwrap() error { return ErrStagingOwnershipUnproven }
+
+// Is keeps the "the staging file is not available to this writer"
+// classification of errBlobIncompleteOwned: in both the proven-live-owner and
+// the unproven case the staging file cannot be used by this writer. The two
+// are still told apart by ErrStagingOwnershipUnproven, which only the
+// unproven case carries.
+func (e *stagingUnprovenOwnerError) Is(target error) bool {
+	return target == errBlobIncompleteOwned
+}
+
 // blobDomainEntry is one in-process holder of a blob key's domain. Its done
 // channel is closed when the holder releases the domain.
 type blobDomainEntry struct {

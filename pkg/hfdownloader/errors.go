@@ -62,6 +62,23 @@ var (
 	// when Settings.NoFriendlyView is set, so that is not an error.
 	// Distinguishable via errors.Is.
 	ErrCacheLinkUnreachable = errors.New("the file is in the cache but its cache path is not reachable")
+
+	// ErrStagingOwnershipUnproven is returned when a staging record exists
+	// but its owner can be proven neither alive nor dead: the record was
+	// written without the lifetime OS ownership lock fence (a legacy/unfenced
+	// record), or it cannot be read or parsed at all.
+	//
+	// No live owner is proven, so this must NOT be reported as "being
+	// downloaded by another process": that message claims an owner that was
+	// never proven. No dead owner is proven either, so the record is NOT
+	// taken over - the conservative refusal is the owner-decided rule (no
+	// age-based takeover, no takeover without proof of same-host death). The
+	// incomplete payload is preserved, and the documented recovery is the
+	// operator's: remove the staging pair and retry.
+	//
+	// Distinguishable via errors.Is, so a caller can tell this apart from
+	// the proven-live-owner refusal.
+	ErrStagingOwnershipUnproven = errors.New("the staging state cannot be proven to belong to a live or dead owner")
 )
 
 // DownloadError wraps an error with file context.
