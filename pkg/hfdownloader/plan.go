@@ -206,6 +206,34 @@ type PlanItem struct {
 type Plan struct {
 	Items  []PlanItem `json:"items"`
 	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	// CommitResolved reports whether Commit came from a successful Hub
+	// revision response rather than the job's revision-name fallback. Branch
+	// variants require a resolved commit so their content-addressed blobs and
+	// per-commit snapshots cannot be confused with another revision.
+	CommitResolved bool `json:"commitResolved,omitempty"`
+}
+
+// safeCommitName reports whether commit is a single, non-escaping path
+// component. A real Hub commit is a hex SHA, but callers may also see fixture
+// or mirror values; accepting any plain name keeps ordinary behavior while
+// still rejecting separators, traversal segments, and control characters
+// before the value is used as snapshots/<commit> or a variant metadata
+// directory.
+func safeCommitName(commit string) bool {
+	if commit == "" || len(commit) > 128 || commit == "." || commit == ".." {
+		return false
+	}
+	for _, r := range commit {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // PlanRepo builds the file list without downloading.
@@ -241,20 +269,33 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 
 	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+	commitSHA := job.Revision
+	commitResolved := false
 	if err != nil {
 		// Fall back to revision name if API call fails (e.g., some mirrors)
 		repoInfo = &RepoInfo{SHA: job.Revision}
+	} else if repoInfo != nil {
+		if repoInfo.SHA != "" {
+			commitSHA = repoInfo.SHA
+		}
+		commitResolved = safeCommitName(repoInfo.SHA)
 	}
-	commitSHA := repoInfo.SHA
-	if commitSHA == "" {
-		commitSHA = job.Revision // fallback
+
+	// Once the Hub reports the commit, read the tree and file bytes at that
+	// exact commit. A branch name can move between the revision lookup and the
+	// later tree/file reads, which would otherwise combine one commit's planned
+	// file list with another commit's contents. Refs, destination naming,
+	// manifest Branch, and progress keep the caller's revision name below.
+	contentJob := job
+	if commitResolved {
+		contentJob.Revision = commitSHA
 	}
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+	err = walkTree(ctx, httpc, token, cfg.Endpoint, contentJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -573,12 +614,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size
+		// Build URL and file size. The URL is pinned to the resolved commit
+		// (contentJob), not the possibly-moved branch name.
 		var urlStr string
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, job, rel)
+			urlStr = lfsURL(cfg.Endpoint, contentJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, job, rel)
+			urlStr = rawURL(cfg.Endpoint, contentJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64
@@ -659,7 +701,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA}, nil
+	return &Plan{Items: items, Commit: commitSHA, CommitResolved: commitResolved}, nil
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the

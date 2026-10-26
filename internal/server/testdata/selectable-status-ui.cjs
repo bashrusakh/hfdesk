@@ -134,6 +134,7 @@ const hook = `
     refreshDlStatusFromJobs,
     syncLocalAnalysisStatus,
     renderSelectableItems,
+    renderAnalysisWarnings,
     updateSelectableRowStatuses,
     handleWSMessage,
     reconcileAnalysisAfterLoad,
@@ -749,6 +750,34 @@ scenario('untyped legacy storage is ignored for both namespaces', async () => {
   eq(result.map[ARTIFACT_KEY], 'done', 'dataset cache presence finalizes done');
   eq(ui.getDlStatus(REPO, false)[ARTIFACT_KEY], 'done', 'model artifact done remains isolated');
   eq(storage.get(LEGACY_STORAGE), legacyRaw, 'legacy key is untouched after cache presence');
+});
+
+scenario('analysis warning renders escaped message, causes, and retry', async () => {
+  eq(ui.renderAnalysisWarnings({}), '', 'no warnings renders nothing');
+  eq(ui.renderAnalysisWarnings({ analysis_warnings: [{ code: 'other', message: 'ignore' }] }), '', 'unrelated warning code is not rendered');
+  const html = ui.renderAnalysisWarnings({
+    analysis_warnings: [{
+      code: 'exl_branch_discovery_incomplete',
+      message: 'Branch discovery incomplete <retry>',
+      causes: ['header_unavailable', 'probe_timeout'],
+      retryable: true
+    }]
+  });
+  match(html, /Branch discovery incomplete &lt;retry&gt;/, 'warning message is escaped');
+  match(html, /Safetensors header unavailable/, 'header cause label is rendered');
+  match(html, /Header probe timed out/, 'probe cause label is rendered');
+  match(html, /data-analysis-warning-retry/, 'retryable warning offers a retry button');
+  doesNotMatch(html, /<retry>/, 'warning message is not injected as markup');
+
+  const pickerHtml = ui.renderAnalysisWarnings({
+    analysis_warnings: [{
+      code: 'exl_branch_discovery_incomplete',
+      message: 'Branch discovery incomplete',
+      causes: ['header_unavailable'],
+      retryable: true
+    }]
+  }, { showRetry: false });
+  doesNotMatch(pickerHtml, /data-analysis-warning-retry/, 'revision picker warning omits the retry button');
 });
 
 (async () => {

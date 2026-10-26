@@ -318,6 +318,78 @@ Important response fields:
 
 `recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
+### EXL2/EXL3 branch variants
+
+For a model repository whose main tree has no recognized model weights and whose
+refs contain EXL2/EXL3 bitrate branches (for example `4.00bpw`,
+`SC_6.00bpw_H6_V6`, `4_25`, or `exl/4_25`), `GET /api/analyze` exposes each
+branch as a selectable item:
+
+```json
+{
+  "id": "exl-branch:4.00bpw",
+  "label": "4.00bpw",
+  "category": "quantization",
+  "revision": "4.00bpw",
+  "branch_variant": true,
+  "method": "exl3",
+  "bits_per_weight": 4,
+  "head_bits": 5,
+  "recommended": true
+}
+```
+
+`revision` is the branch to download, `branch_variant` distinguishes it from an
+ordinary revision-backed selection, and `bits_per_weight`/`head_bits` describe
+the branch metadata when it is available. One branch is marked `recommended`.
+`recommended_download` then names that branch and asks for the whole branch
+without file filters:
+
+```json
+{
+  "repo": "owner/name",
+  "revision": "4.00bpw",
+  "dataset": false,
+  "filters": [],
+  "exactMatch": false,
+  "branchVariant": true
+}
+```
+
+GGUF, APEX, MTP, mmproj, and lineage behavior is unchanged.
+
+Isolation is a property of `branchVariant` downloads: they never write the
+shared friendly view, while their blobs and per-commit snapshots remain
+content/commit isolated. A generic revision download of the same branch (for
+example through the revision picker) remains an ordinary download and follows
+the existing revisionless friendly-view behavior. The existing rebuild fallback
+that mirrors an arbitrary snapshot when no main ref exists likewise may
+populate the friendly view. Neither path overwrites the stored blobs or another
+variant's per-commit snapshot.
+
+### Analysis warnings
+
+`analysis_warnings` is omitted when no warning applies. Otherwise it is an
+array of bounded, non-fatal diagnostics:
+
+```json
+{
+  "code": "exl_branch_discovery_incomplete",
+  "message": "EXL branch discovery could not be completed because one or more main file roles could not be safely established. Retry analysis to try again.",
+  "causes": ["header_unavailable", "header_uninterpretable"],
+  "retryable": true
+}
+```
+
+`code` identifies the warning. The only code currently emitted is
+`exl_branch_discovery_incomplete`. `causes` contains stable reason codes, not
+upstream response bodies or URLs: `header_unavailable`,
+`header_uninterpretable`, `probe_timeout`, `probe_limit`, and
+`weight_role_unrecognized`. `retryable` indicates that repeating the same
+analyze request may complete the optional discovery. A retry repeats the same
+repository, namespace, and revision request; it does not change the selection
+or start a download.
+
 ### Model/dataset selection
 
 If the repository exists as both a model and a dataset, auto-detection returns
@@ -659,7 +731,8 @@ Request:
   "dataset": false,
   "filters": ["q4_k_m"],
   "excludes": [],
-  "exactMatch": false
+  "exactMatch": false,
+  "branchVariant": false
 }
 ```
 
@@ -708,6 +781,35 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
+  `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
+  must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
+  rejected with `400`. The revision must have the analyzer's branch shape (a
+  `bpw` token or a bitrate-shaped `N_M` final component) and must also be a
+  valid completion-manifest path component sequence: slash-separated, with no
+  empty, `.`, or `..` component, no backslash or control characters, and no
+  component longer than 255 bytes. A branch download
+  stores the whole revision in an isolated location, so two variants with
+  identical file names cannot overwrite each other: HF cache mode uses the
+  per-commit `snapshots/<commit>/` tree and content-addressed blobs (with no
+  friendly-view entries), while local/flat mode writes under
+  `<root>/<repo>/<revision>/`. A completed variant manifest at
+  `hub/models--<owner>--<repo>/.hfdesk-variants/<revision>/<commit>/hfd.yaml`
+  (HF cache) or `<root>/<repo>/.hfdesk-variants/<revision>/<commit>/hfd.yaml`
+  (local) records the exact revision, commit, and files. The manifest is keyed
+  by revision and commit, so branches that share a commit keep separate
+  records, and its local location is outside the payload tree, so a
+  repository-owned `hfd.yaml` is never overwritten. `noManifest` only suppresses
+  the optional friendly-view manifest; a branch variant's completion manifest
+  is always written, because presence reads it. After a local branch-variant
+  plan succeeds and before any payload byte changes, the download invalidates
+  the revision's prior local completion records (only the app-owned
+  `.hfdesk-variants/<revision>` metadata; never the payload). If that
+  invalidation fails, the download fails without touching the payload. A failed
+  or cancelled local re-download therefore reports `missing` instead of complete.
+  A local re-download re-fetches hashless/non-LFS files instead of trusting size
+  equality, so a moved branch cannot retain same-size stale bytes; LFS files
+  continue to use their known SHA.
 - A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
@@ -1073,6 +1175,55 @@ Cache entries may come from:
 - `complete`
 - `filtered`
 - `unknown`
+
+### Branch-variant presence
+
+A qualified lookup reports whether one EXL branch revision is completely
+downloaded:
+
+```http
+GET /api/cache/{owner}/{repo}?branchVariant=true&revision=4.00bpw
+```
+
+Optional `routeKey` and `localDir` resolve the destination exactly like
+`POST /api/download`; either explicit selector checks only that destination.
+When both are omitted, the default destination is checked first and then every
+configured download route, returning the first complete variant. If none is
+complete, the default destination's `missing` response is returned. `type`,
+when present, must be `model`. The response is always `200` for a valid query,
+with `downloaded: false` when the variant is absent or incomplete:
+
+```json
+{
+  "repo": "owner/name",
+  "type": "model",
+  "branchVariant": true,
+  "revision": "4.00bpw",
+  "downloaded": true,
+  "downloadStatus": "complete",
+  "storageMode": "hf-cache",
+  "destinationRoot": "/cache/hub/models--owner--name",
+  "commit": "2222222222222222222222222222222222222222",
+  "artifactPath": "/cache/hub/models--owner--name/.hfdesk-variants/4.00bpw/2222.../hfd.yaml",
+  "expectedFiles": 3,
+  "files": [{"name": "config.json", "size": 123}]
+}
+```
+
+`downloadStatus` is `complete` or `missing` for this endpoint. HF cache mode
+reads `refs/<revision>` and requires the revision/commit manifest at
+`.hfdesk-variants/<revision>/<commit>/hfd.yaml` to match `branchVariant`, `repo`,
+`branch == revision`, `commit`, a non-zero completion time, `total_files > 0`,
+and `len(files) == total_files`; every snapshot entry must resolve to a regular
+file of the recorded size. Local mode reads the completion records under
+`<root>/<repo>/.hfdesk-variants/<revision>/<commit>/` and considers only the
+newest valid record for the revision (latest completion time, then
+lexicographic commit); it checks every file of that record against the revision
+payload directory `<root>/<repo>/<revision>/`. If the newest record's files are
+not all present at the recorded sizes, the revision reports `missing`; older
+records are not consulted, because local records carry no content hash and
+cannot prove that a replaced or mixed payload still matches them. An ordinary
+`GET /api/cache/{owner}/{repo}` without `branchVariant=true` is unchanged.
 
 `GET /api/cache` includes effective R as `cacheDir`, plus `effectiveHubDir` and
 `hubDirSource`. HF entries' `path` is under selected H, while `friendlyPath` is

@@ -47,10 +47,11 @@ type Job struct {
 	OutputDir          string            `json:"outputDir"`
 	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
 	DestinationWarning string            `json:"destinationWarning,omitempty"`
-	LocalDir           string            `json:"localDir,omitempty"`   // Effective local-dir for this job (per-request or server-global)
-	LocalRepo          string            `json:"localRepo,omitempty"`  // Override destination folder name (used for upstream mmproj)
-	Flat               bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
-	ExactMatch         bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
+	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
+	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
+	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
+	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
+	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
 	Status             JobStatus         `json:"status"`
 	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
 	Progress           JobProgress       `json:"progress"`
@@ -560,6 +561,7 @@ resolveRequest:
 			existing.Flat == flat &&
 			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
+			existing.BranchVariant == req.BranchVariant &&
 			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
@@ -571,22 +573,23 @@ resolveRequest:
 	}
 
 	job := &Job{
-		ID:         generateID(),
-		Repo:       req.Repo,
-		Revision:   revision,
-		IsDataset:  req.Dataset,
-		Filters:    req.Filters,
-		Excludes:   req.Excludes,
-		OutputDir:  outputDir,
-		HubDir:     hubDir,
-		LocalDir:   effectiveLocalDir,
-		LocalRepo:  req.LocalRepo,
-		Flat:       flat,
-		ExactMatch: req.ExactMatch,
-		RouteKey:   routeKey,
-		Status:     JobStatusQueued,
-		CreatedAt:  time.Now(),
-		Progress:   JobProgress{},
+		ID:            generateID(),
+		Repo:          req.Repo,
+		Revision:      revision,
+		IsDataset:     req.Dataset,
+		Filters:       req.Filters,
+		Excludes:      req.Excludes,
+		OutputDir:     outputDir,
+		HubDir:        hubDir,
+		LocalDir:      effectiveLocalDir,
+		LocalRepo:     req.LocalRepo,
+		BranchVariant: req.BranchVariant,
+		Flat:          flat,
+		ExactMatch:    req.ExactMatch,
+		RouteKey:      routeKey,
+		Status:        JobStatusQueued,
+		CreatedAt:     time.Now(),
+		Progress:      JobProgress{},
 		// partialFilesMu is allocated at job creation so cloneJobLocked
 		// can read it without a nil check; the tracker map is left
 		// nil until runJob wires it.
@@ -656,6 +659,7 @@ resolveRequest:
 			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
 				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
 				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
+				existing.BranchVariant == req.BranchVariant &&
 				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
 				a.Close()
@@ -1735,6 +1739,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		ExactMatch:         job.ExactMatch,
 		AppendFilterSubdir: false,
 		LocalRepo:          job.LocalRepo,
+		BranchVariant:      job.BranchVariant,
 	}
 
 	// Snapshot the manager config under the lock: a concurrent POST /api/settings

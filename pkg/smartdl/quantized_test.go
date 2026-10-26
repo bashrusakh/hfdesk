@@ -704,3 +704,31 @@ func TestAnalyzeQuantizedPrecisionEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestAnalyzeQuantizedNestedConfigPreservesPrecisionSemantics(t *testing.T) {
+	nested := map[string]interface{}{
+		"quant_method":    "exl2",
+		"bits":            float64(4.25),
+		"bits_per_weight": float64(4.5),
+		"head_bits":       float64(6),
+		"expert_bits":     nil,
+		partialHeadMarker: true,
+	}
+	outer := map[string]interface{}{
+		"architectures":       []interface{}{"Qwen2ForCausalLM"},
+		"model_type":          "qwen2",
+		"quantization_config": nested,
+	}
+	info := analyzeQuantized(map[string]interface{}{"config.json": outer})
+	if info == nil {
+		t.Fatal("nested EXL config was not analyzed")
+	}
+	if info.Method != "exl2" || info.Bits != 0 || !info.MixedPrecision || !info.ConfigPartial ||
+		info.BitsPerWeight != 4.5 || info.HeadBits != 6 || info.ExpertBitsMin != 0 || info.ModelArchitecture != "Qwen2ForCausalLM" {
+		t.Fatalf("nested projection = %+v; want method=exl2, fractional nominal bits unrounded, mixed/partial, bpw=4.5, head=6, and outer architecture", info)
+	}
+	retained, ok := outer["quantization_config"].(map[string]interface{})
+	if !ok || retained["quant_method"] != "exl2" || retained["bits"] != float64(4.25) || retained["head_bits"] != float64(6) {
+		t.Fatalf("nested raw metadata was changed: %+v", outer)
+	}
+}

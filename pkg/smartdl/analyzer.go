@@ -6,6 +6,7 @@ package smartdl
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,6 +181,20 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 
 	// Populate SelectableItems based on type
 	populateSelectableItems(info)
+
+	// Repositories that keep EXL2/EXL3 bitrate variants on branches may have
+	// no model weights on main. Keep ordinary main-branch analysis unchanged;
+	// the branch analyzer checks for missing weights independently of type.
+	if !isDataset && revision == "main" {
+		branchItems, warning, err := a.exlBranchVariantItems(ctx, info)
+		if err != nil {
+			return nil, err
+		}
+		if warning != nil {
+			info.AnalysisWarnings = append(info.AnalysisWarnings, *warning)
+		}
+		info.SelectableItems = append(info.SelectableItems, branchItems...)
+	}
 
 	// Populate web/API download defaults.
 	info.PopulateDownloadSelection()
@@ -830,6 +846,153 @@ func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]by
 	return content, nil
 }
 
+const maxSafeTensorHeaderSize = 1 << 20
+
+// fetchSafetensorsHeader reads only the safetensors prefix and JSON header. It
+// prefers exact byte ranges, but can read the same bounded prefix from a
+// complete 200 response when the server ignores Range.
+func (a *Analyzer) fetchSafetensorsHeader(ctx context.Context, repo, revision string, file FileInfo) ([]byte, error) {
+	reqURL := a.rawURL(repo, false, revision, file.Path)
+	if file.IsLFS {
+		reqURL = a.resolveURL(repo, false, revision, file.Path)
+	}
+	prefix, err := a.fetchSafetensorsRange(ctx, reqURL, file.Path, 0, 7, file.Size)
+	if err != nil {
+		return nil, err
+	}
+	if len(prefix) != 8 {
+		return nil, fmt.Errorf("read safetensors prefix %s: got %d bytes", file.Path, len(prefix))
+	}
+	headerSize := binary.LittleEndian.Uint64(prefix)
+	if headerSize == 0 || headerSize > maxSafeTensorHeaderSize {
+		return nil, fmt.Errorf("safetensors header %s exceeds the bounded header limit", file.Path)
+	}
+	headerEnd := int64(8 + headerSize - 1)
+	if file.Size > 0 && headerEnd >= file.Size {
+		return nil, fmt.Errorf("safetensors header %s exceeds the tree-reported file size", file.Path)
+	}
+	return a.fetchSafetensorsRange(ctx, reqURL, file.Path, 8, headerEnd, file.Size)
+}
+
+func (a *Analyzer) fetchSafetensorsRange(ctx context.Context, reqURL, path string, start, end, fileSize int64) ([]byte, error) {
+	if start < 0 || end < start || (fileSize > 0 && end >= fileSize) {
+		return nil, fmt.Errorf("invalid safetensors range for %s", path)
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("Accept-Encoding", "identity")
+	a.addAuth(req)
+
+	// Keep the default redirect policy used by fetchFile: /resolve may redirect
+	// cross-host, and Authorization must not be replayed to that host.
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		// Cancel first: a Range-ignoring 200 can still have a large unread body,
+		// and net/http may otherwise drain it while closing for connection reuse.
+		cancel()
+		_ = resp.Body.Close()
+	}()
+	expected := end - start + 1
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		rangeStart, rangeEnd, totalSize, ok := parseByteContentRange(resp.Header.Get("Content-Range"))
+		if !ok || rangeStart != start || rangeEnd != end || (fileSize > 0 && totalSize != fileSize) {
+			return nil, fmt.Errorf("invalid Content-Range for safetensors header %s", path)
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != expected {
+			return nil, fmt.Errorf("short safetensors range for %s: Content-Length %d, want %d", path, resp.ContentLength, expected)
+		}
+	case http.StatusOK:
+		// Some mirrors ignore Range. Only accept a declared complete file whose
+		// size matches the tree, then consume through the requested header slice
+		// and close the body without reading tensor data.
+		if fileSize <= 0 || resp.ContentLength != fileSize {
+			return nil, fmt.Errorf("unbounded full response for safetensors header %s", path)
+		}
+		if start > 0 {
+			if _, err := io.CopyN(io.Discard, resp.Body, start); err != nil {
+				return nil, &metadataReadError{err}
+			}
+		}
+	default:
+		return nil, fmt.Errorf("fetch safetensors range %s: %s", path, resp.Status)
+	}
+	content := make([]byte, expected)
+	if _, err := io.ReadFull(resp.Body, content); err != nil {
+		return nil, &metadataReadError{err}
+	}
+	return content, nil
+}
+
+func parseByteContentRange(value string) (start, end, total int64, ok bool) {
+	value, ok = strings.CutPrefix(value, "bytes ")
+	if !ok {
+		return 0, 0, 0, false
+	}
+	span, totalText, found := strings.Cut(value, "/")
+	if !found || totalText == "*" {
+		return 0, 0, 0, false
+	}
+	startText, endText, found := strings.Cut(span, "-")
+	if !found {
+		return 0, 0, 0, false
+	}
+	start, errStart := strconv.ParseInt(startText, 10, 64)
+	end, errEnd := strconv.ParseInt(endText, 10, 64)
+	total, errTotal := strconv.ParseInt(totalText, 10, 64)
+	return start, end, total, errStart == nil && errEnd == nil && errTotal == nil && start >= 0 && end >= start && total > end
+}
+
+// isCalibrationOnlySafetensorsHeader recognizes the pinned and current upstream
+// calibration tensor signatures from names, dtypes, and shapes, not filenames
+// or file size. Other valid headers are not assumed to be calibration data.
+func isCalibrationOnlySafetensorsHeader(header []byte) (bool, error) {
+	var tensors map[string]json.RawMessage
+	if err := json.Unmarshal(header, &tensors); err != nil {
+		return false, err
+	}
+	if len(tensors) == 0 {
+		return false, errors.New("empty safetensors header")
+	}
+	tensorsByName := make(map[string]struct {
+		DType string  `json:"dtype"`
+		Shape []int64 `json:"shape"`
+	}, 2)
+	for name, raw := range tensors {
+		if name == "__metadata__" {
+			continue
+		}
+		var tensor struct {
+			DType string  `json:"dtype"`
+			Shape []int64 `json:"shape"`
+		}
+		if err := json.Unmarshal(raw, &tensor); err != nil {
+			return false, err
+		}
+		tensorsByName[name] = tensor
+	}
+	inputIDs, ok := tensorsByName["input_ids"]
+	if !ok || inputIDs.DType != "I64" || len(inputIDs.Shape) != 2 || inputIDs.Shape[0] <= 0 || inputIDs.Shape[1] <= 0 {
+		return false, nil
+	}
+	if len(tensorsByName) == 1 {
+		return true, nil
+	}
+	lengths, ok := tensorsByName["lengths"]
+	if !ok || len(tensorsByName) != 2 || lengths.DType != "I64" || len(lengths.Shape) != 1 || lengths.Shape[0] != inputIDs.Shape[0] {
+		return false, nil
+	}
+	return true, nil
+}
+
 // isLFSPointer reports whether content is a structurally valid Git LFS pointer
 // stub (the pointer format of the Git LFS v1 spec) rather than actual file
 // content: the version header line plus an "oid sha256:<64 hex>" line and a
@@ -1028,7 +1191,7 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 	case TypeONNX:
 		info.ONNX = analyzeONNX(info.Files)
 	case TypeTransformers:
-		if _, ok := info.Metadata["quantization_config.json"]; ok {
+		if hasQuantizationConfig(info.Metadata) {
 			info.Quantized = analyzeQuantized(info.Metadata)
 		}
 		// For transformers, first try to detect specialized types from metadata
@@ -1050,7 +1213,7 @@ func (a *Analyzer) analyzeTypeSpecific(info *RepoInfo) {
 		// specialized refinement so the recursion below keeps it,
 		// symmetrically to TypeTransformers.
 		if hasRootWeights(info.Files) {
-			if _, ok := info.Metadata["quantization_config.json"]; ok {
+			if hasQuantizationConfig(info.Metadata) {
 				info.Quantized = analyzeQuantized(info.Metadata)
 			}
 		}

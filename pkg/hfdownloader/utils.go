@@ -41,6 +41,21 @@ func validate(job Job, cfg Settings) error {
 	if !IsValidModelName(job.Repo) {
 		return fmt.Errorf("invalid repo id %q (expected owner/name)", job.Repo)
 	}
+	if job.BranchVariant {
+		// A branch variant is one whole EXL2/EXL3 branch: the analyzer chose
+		// it by revision, not by file filters. Rejecting the incompatible
+		// selection fields here keeps direct library callers from producing a
+		// manifest that claims completeness for only a subset of the branch.
+		if job.IsDataset {
+			return errors.New("branch variant requires a model repository")
+		}
+		if job.Revision == "" {
+			return errors.New("branch variant requires a revision")
+		}
+		if len(job.Filters) != 0 || len(job.Excludes) != 0 || job.AppendFilterSubdir || job.LocalRepo != "" {
+			return errors.New("branch variant does not accept filters")
+		}
+	}
 	if job.AppendFilterSubdir {
 		if err := validateAppendFilterSubdirFilters(job.Filters); err != nil {
 			return err

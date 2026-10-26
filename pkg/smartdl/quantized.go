@@ -21,21 +21,33 @@ var quantMethodDescriptions = map[string]string{
 	"eetq":         "EETQ - Easy and Efficient Quantization",
 }
 
+// recognizedNonEXLMethod reports whether method is a quantization method this
+// analyzer recognizes and that is not EXL2/EXL3. quantMethodDescriptions is the
+// single source of truth for recognized methods; an unfamiliar string is
+// unknown evidence, not a known-negative.
+func recognizedNonEXLMethod(method string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(method))
+	if normalized == "" {
+		return false
+	}
+	if _, recognized := quantMethodDescriptions[normalized]; !recognized {
+		return false
+	}
+	switch normalized {
+	case "exl2", "exl3":
+		return false
+	default:
+		return true
+	}
+}
+
 // analyzeQuantized analyzes GPTQ/AWQ/EXL2 quantized models.
 func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	info := &QuantizedInfo{}
 
-	// Parse quantize_config.json
-	config, ok := metadata["quantize_config.json"].(map[string]interface{})
-	if !ok {
-		config, ok = metadata["quantization_config.json"].(map[string]interface{})
-	}
-	if !ok {
-		// Try config.json for some quantized models
-		config, ok = metadata["config.json"].(map[string]interface{})
-		if !ok {
-			return nil
-		}
+	config := quantizationConfig(metadata)
+	if config == nil {
+		return nil
 	}
 
 	// Detect quantization method
@@ -173,6 +185,39 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	}
 
 	return info
+}
+
+func quantizationConfig(metadata map[string]interface{}) map[string]interface{} {
+	for _, path := range []string{"quantize_config.json", "quantization_config.json"} {
+		if config, ok := metadata[path].(map[string]interface{}); ok {
+			return config
+		}
+	}
+	config, ok := metadata["config.json"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if nested, ok := config["quantization_config"].(map[string]interface{}); ok {
+		return nested
+	}
+	return config
+}
+
+// hasQuantizationConfig reports whether the metadata contains a dedicated
+// quantization file or a nested config.json quantization object. A legacy
+// top-level config.json map alone is not enough to opt into type projection.
+func hasQuantizationConfig(metadata map[string]interface{}) bool {
+	for _, path := range []string{"quantize_config.json", "quantization_config.json"} {
+		if _, ok := metadata[path].(map[string]interface{}); ok {
+			return true
+		}
+	}
+	config, ok := metadata["config.json"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, ok = config["quantization_config"].(map[string]interface{})
+	return ok
 }
 
 // declaredWidth reports whether a field exists and whether its value is a

@@ -1732,6 +1732,7 @@ async function loadRepositoryDetails(entry) {
     }
 
     showModal('Select Revision', `
+      ${renderAnalysisWarnings(data, { showRetry: false })}
       <p style="margin-bottom: 16px; color: var(--color-text-secondary);">
         This repository has multiple versions. Select which one to analyze:
       </p>
@@ -1873,57 +1874,90 @@ async function loadRepositoryDetails(entry) {
     const isDataset = !!data.is_dataset;
     try {
       const map = getDlStatus(data.repo, isDataset);
-      // /api/cache/<repo> without a type prefers the model namespace. A repo
-      // that exists as both model and dataset must be looked up in the
-      // namespace the open analysis actually represents.
-      const repoType = isDataset ? 'dataset' : 'model';
-      const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
       let changed = false;
 
-      if (resp.status === 404) {
-        data.selectable_items.forEach(item => {
-          const key = selectableStatusKey(item);
-          if (!key || map[key] !== 'done') return;
-          delete map[key];
-          changed = true;
-        });
-      } else {
-        if (!resp.ok) throw new Error(`cache lookup failed: ${resp.status}`);
+      // Branch-variant rows are whole-revision downloads. Their presence is a
+      // qualified lookup keyed by the revision, not the ordinary file list of
+      // the repository. The server searches the default destination and every
+      // configured route; the stored status is per revision.
+      const isBranchItem = item => item?.branch_variant === true && !!item?.revision;
+      const ordinaryItems = data.selectable_items.filter(item => !isBranchItem(item));
+      const branchItems = data.selectable_items.filter(isBranchItem);
 
-        const cached = await resp.json();
-        const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+      if (ordinaryItems.length) {
+        // /api/cache/<repo> without a type prefers the model namespace. A repo
+        // that exists as both model and dataset must be looked up in the
+        // namespace the open analysis actually represents.
+        const repoType = isDataset ? 'dataset' : 'model';
+        const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
 
-        data.selectable_items.forEach(item => {
-          const key = selectableStatusKey(item);
-          const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
-          if (!key || !files.length) return;
-
-          const isPresent = files.every(f => cachedFiles.has(f));
-          const isActive = map[key] === 'running' || map[key] === 'queued';
-          if (isPresent) {
-            if (map[key] !== 'done' && !isActive) {
-              map[key] = 'done';
-              changed = true;
-            }
-          } else if (map[key] === 'done') {
+        if (resp.status === 404) {
+          ordinaryItems.forEach(item => {
+            const key = selectableStatusKey(item);
+            if (!key || map[key] !== 'done') return;
             delete map[key];
             changed = true;
+          });
+        } else {
+          if (!resp.ok) throw new Error(`cache lookup failed: ${resp.status}`);
+
+          const cached = await resp.json();
+          const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+
+          ordinaryItems.forEach(item => {
+            const key = selectableStatusKey(item);
+            const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
+            if (!key || !files.length) return;
+
+            const isPresent = files.every(f => cachedFiles.has(f));
+            const isActive = map[key] === 'running' || map[key] === 'queued';
+            if (isPresent) {
+              if (map[key] !== 'done' && !isActive) {
+                map[key] = 'done';
+                changed = true;
+              }
+            } else if (map[key] === 'done') {
+              delete map[key];
+              changed = true;
+            }
+          });
+        }
+      }
+
+      for (const item of branchItems) {
+        const key = selectableStatusKey(item);
+        if (!key) continue;
+        const params = new URLSearchParams({ branchVariant: 'true', revision: item.revision });
+        const resp = await fetch(`/api/cache/${data.repo}?${params.toString()}`);
+        let downloaded = false;
+        if (resp.ok) {
+          const presence = await resp.json();
+          downloaded = presence?.downloaded === true;
+        }
+        const isActive = map[key] === 'running' || map[key] === 'queued';
+        if (downloaded) {
+          if (map[key] !== 'done' && !isActive) {
+            map[key] = 'done';
+            changed = true;
           }
-        });
+        } else if (map[key] === 'done') {
+          delete map[key];
+          changed = true;
+        }
       }
 
       if (changed) saveDlStatus(data.repo, isDataset, map);
     } catch {
       // Cache lookup is best-effort; remote analysis should still render. Cache
-      // presence is nevertheless the only authority for artifact 'done', so a
-      // transient lookup/parse failure must not leave a stale downloaded
-      // artifact hiding its Download button. Legacy non-artifact token statuses
-      // keep their last-known-good value.
+      // presence is nevertheless the only authority for artifact and branch
+      // 'done', so a transient lookup/parse failure must not leave a stale
+      // downloaded artifact hiding its Download button. Legacy non-artifact
+      // token statuses keep their last-known-good value.
       const map = getDlStatus(data.repo, isDataset);
       let changed = false;
       data.selectable_items.forEach(item => {
         const key = selectableStatusKey(item);
-        if (!String(key).startsWith('artifact:') || map[key] !== 'done') return;
+        if ((!String(key).startsWith('artifact:') && !String(key).startsWith('branchVariant:')) || map[key] !== 'done') return;
         delete map[key];
         changed = true;
       });
@@ -1935,7 +1969,60 @@ async function loadRepositoryDetails(entry) {
     return String(path || '').replace(/\\/g, '/').toLowerCase();
   }
 
+  const ANALYSIS_WARNING_CAUSE_LABELS = {
+    header_unavailable: 'Safetensors header unavailable',
+    header_uninterpretable: 'Safetensors header could not be interpreted',
+    probe_timeout: 'Header probe timed out',
+    probe_limit: 'Header probe limit reached',
+    weight_role_unrecognized: 'Unrecognized model-weight file role'
+  };
+
+  // Render only the bounded EXL branch-discovery warning. Messages and causes
+  // are server-owned, non-secret strings; escape both before injecting them.
+  function renderAnalysisWarnings(data, { showRetry = true } = {}) {
+    const warnings = (Array.isArray(data?.analysis_warnings) ? data.analysis_warnings : [])
+      .filter(w => w?.code === 'exl_branch_discovery_incomplete');
+    if (!warnings.length) return '';
+
+    const causes = [];
+    warnings.forEach(w => (Array.isArray(w.causes) ? w.causes : []).forEach(cause => {
+      if (cause && !causes.includes(cause)) causes.push(cause);
+    }));
+    const causeLabels = causes.map(cause => {
+      const label = ANALYSIS_WARNING_CAUSE_LABELS[cause] || cause;
+      return `<span class="analysis-warning-cause" data-cause="${escapeHtmlAttribute(cause)}" title="${escapeHtmlAttribute(cause)}">${escapeHtml(label)}</span>`;
+    }).join(' · ');
+    const retry = showRetry && warnings.some(w => w.retryable === true)
+      ? '<button type="button" class="btn btn-ghost analysis-warning-retry" data-analysis-warning-retry>Retry analysis</button>'
+      : '';
+
+    return `<div class="analysis-warning" role="status">
+      ${warnings.map(w => `<div class="analysis-warning-message">${escapeHtml(w.message || '')}</div>`).join('')}
+      ${causeLabels ? `<div class="analysis-warning-causes">${causeLabels}</div>` : ''}
+      ${retry}
+    </div>`;
+  }
+
+  // Bind after the rendered DOM exists. A retry re-runs only the analysis that
+  // is still current; no request identity or queued retry state is introduced.
+  function bindAnalysisWarningRetry(data) {
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    const button = resultDiv?.querySelector?.('[data-analysis-warning-retry]');
+    if (!button) return;
+    button.addEventListener('click', () => {
+      if (currentAnalysis !== data) return;
+      analyzeRepo(data.is_dataset ? 'dataset' : 'model', data.branch || null, data.repo);
+    });
+  }
+
   function selectableStatusKey(item) {
+    if (item?.branch_variant === true && item?.revision) {
+      // Branch status is per analyzed repository and revision. It deliberately
+      // does not depend on currentAnalysis or the route select: the load path
+      // reconciles status before currentAnalysis is assigned and before the
+      // route select is rendered.
+      return 'branchVariant:' + item.revision;
+    }
     const files = Array.isArray(item?.files) ? item.files : [];
     if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
       return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
@@ -2155,6 +2242,7 @@ async function loadRepositoryDetails(entry) {
     // Build unified selectable items section (works for all types)
     let selectableItemsHtml = '';
     const hasSelectableItems = data.selectable_items && data.selectable_items.length > 0;
+    const analysisWarningsHtml = renderAnalysisWarnings(data);
 
     if (hasSelectableItems) {
       selectableItemsHtml = `
@@ -2204,6 +2292,7 @@ async function loadRepositoryDetails(entry) {
           </div>
         </div>
         <div class="analysis-body">
+          ${analysisWarningsHtml}
           ${typeInfoHtml}
           ${selectableItemsHtml}
           ${relatedDownloadsHtml}
@@ -2230,6 +2319,7 @@ async function loadRepositoryDetails(entry) {
     renderDetailTabs(true);
     updateScrollArrows();
     loadReadmePreview(data);
+    bindAnalysisWarningRetry(data);
   }
 
   let _scrollArrowUp = null;
@@ -5386,18 +5476,47 @@ async function loadRepositoryDetails(entry) {
     return active;
   }
 
+  // A branch-variant job is a whole-revision, unfiltered download. Attribute
+  // running/queued to exactly the branch row with the same revision; a
+  // completed job is never evidence of presence.
+  function branchActiveKeys(items, jobs) {
+    const active = {};
+    (items || []).forEach(item => {
+      if (!(item?.branch_variant === true && item?.revision)) return;
+      const key = selectableStatusKey(item);
+      if (!key) return;
+      jobs.forEach(job => {
+        if (job.status !== 'running' && job.status !== 'queued') return;
+        if (job.branchVariant !== true) return;
+        if ((job.filters || []).length || (job.excludes || []).length) return;
+        if ((job.revision || 'main') !== item.revision) return;
+        const status = job.status === 'running' ? 'running' : 'queued';
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
   function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
     // Reconcile per-quant status with the live job list. Active jobs set
     // running/queued; artifact completion is never inferred from job status,
     // because a completed job can include a shard skipped as "downloading by
     // another process". Cache synchronization is the authority for artifact
-    // 'done'. Stale running/queued entries (job gone, cancelled or failed) are
-    // cleared so the Download button reappears. 'done' is kept.
+    // 'done'. The same rule applies to branch variants. Stale running/queued
+    // entries (job gone, cancelled or failed) are cleared so the Download
+    // button reappears. 'done' is kept.
     const map = getDlStatus(repo, isDataset);
     const jobs = Array.from(state.jobs.values())
       .filter(job => jobMatchesAnalysis(job, { repo, is_dataset: isDataset }));
     const active = artifactActiveKeys(items, jobs);
+    const branchActive = branchActiveKeys(items, jobs);
+    Object.entries(branchActive).forEach(([key, status]) => {
+      if (active[key] !== 'running') active[key] = status;
+    });
     jobs.forEach(j => {
+      // Branch jobs are not keyed by a filter set; their active rows were
+      // attributed above, and completion never implies their files exist.
+      if (j.branchVariant === true) return;
       const f = (j.filters || []).join(',') || '__all__';
       if (j.status === 'completed') active[f] = 'done';
       else if (j.status === 'running') active[f] = 'running';
@@ -5496,16 +5615,44 @@ async function loadRepositoryDetails(entry) {
     const repo = currentAnalysis?.repo || '';
     const fv = item.filter_value || item.id || '';
     const files = Array.isArray(item.files) ? item.files : [];
+    const isBranch = item?.branch_variant === true && !!item?.revision;
     const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
-    const statusKey = exactArtifact ? selectableStatusKey(item) : fv;
+    const statusKey = isBranch ? selectableStatusKey(item) : (exactArtifact ? selectableStatusKey(item) : fv);
     const dlRepo = item.upstream_repo || repo;
     const statusRepo = repo;
-    const chip = selectableStatusChip(status);
-    if (chip) return { statusKey, html: chip };
     const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                  <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
                </svg>`;
+    if (isBranch) {
+      // Only an active job replaces the action. A completed branch keeps a
+      // download control so the user can re-download it; the cache presence
+      // check remains the sole authority for the 'done' marker.
+      if (status === 'running' || status === 'queued') {
+        return { statusKey, html: selectableStatusChip(status) };
+      }
+      const payload = {
+        repo: dlRepo,
+        revision: item.revision,
+        statusKey,
+        isDataset: false,
+        label: item.label || '',
+        statusRepo,
+        branchVariant: true
+      };
+      const title = status === 'done'
+        ? 'Downloaded — click to download this variant again'
+        : 'Download this EXL variant';
+      const className = status === 'done' ? 'quant-dl-btn quant-dl-btn-done' : 'quant-dl-btn';
+      const style = status === 'done' ? ' style="cursor:pointer"' : '';
+      return {
+        statusKey,
+        html: `<button class="${className}"${style} title="${title}" onclick="downloadQuantFromButton(this)"
+                 data-download="${encodeURIComponent(JSON.stringify(payload))}">${dlIcon}</button>`
+      };
+    }
+    const chip = selectableStatusChip(status);
+    if (chip) return { statusKey, html: chip };
     return {
       statusKey,
       html: `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
@@ -5631,26 +5778,31 @@ async function loadRepositoryDetails(entry) {
   window.downloadQuantFromButton = function(button) {
     try {
       const args = JSON.parse(decodeURIComponent(button.dataset.download));
-      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey);
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey, args.revision, args.branchVariant === true);
     } catch (e) { console.error('Invalid selectable download data', e); }
   };
 
   // Download a single quantization from the quant list
-  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey) {
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey, branchRevision, branchVariant) {
     try {
       // When downloading from an upstream repo (e.g. mmproj from base model),
       // always use "main" — the current analysis revision applies only to
-      // the repo being analyzed, not to its ancestors.
-      const revision = (repo === currentAnalysis?.repo)
-        ? (currentAnalysis?.branch || 'main')
-        : 'main';
-      const body = {
-        repo,
-        revision,
-        dataset: isDataset,
-        filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
-        exactMatch: files ? true : !!filterValue
-      };
+      // the repo being analyzed, not to its ancestors. A branch variant names
+      // its own revision and selects that whole branch, never file filters.
+      const revision = branchVariant
+        ? branchRevision
+        : ((repo === currentAnalysis?.repo)
+          ? (currentAnalysis?.branch || 'main')
+          : 'main');
+      const body = branchVariant
+        ? { repo, revision, dataset: false, filters: [], exactMatch: false, branchVariant: true }
+        : {
+          repo,
+          revision,
+          dataset: isDataset,
+          filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
+          exactMatch: files ? true : !!filterValue
+        };
       // Send the labeled destination choice when type folders are configured.
       // For an upstream companion (mmproj) this still resolves to the analyzed
       // model's route, so companions land with the parent.
@@ -5658,7 +5810,7 @@ async function loadRepositoryDetails(entry) {
       if (routeKey) body.routeKey = routeKey;
       // When downloading from an upstream repo (e.g. mmproj from a base model),
       // tell the server to store the file under the current model's folder.
-      if (localRepo) body.localRepo = localRepo;
+      if (!branchVariant && localRepo) body.localRepo = localRepo;
       if (!await checkDownloadDiskSpace(body)) return;
       const data = await api('POST', '/download', body);
 

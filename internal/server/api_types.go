@@ -30,6 +30,10 @@ type DownloadRequest struct {
 	// When set, files fetched from Repo are stored as if they belong to LocalRepo.
 	// Used when downloading upstream mmproj files alongside the current model's quants.
 	LocalRepo string `json:"localRepo,omitempty"`
+	// BranchVariant selects a whole EXL2/EXL3 analysis branch named by Revision.
+	// It must be an unfiltered model download and is stored isolated from other
+	// variants of the same repository.
+	BranchVariant bool `json:"branchVariant,omitempty"`
 	// RouteKey selects a configured download route (a key from the closed,
 	// server-defined set, never a path). When set and configured, the resolved
 	// destination is used as the job's flat/local directory. An explicit

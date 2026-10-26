@@ -20,6 +20,117 @@ import (
 // ManifestFilename is the standard name for manifest files.
 const ManifestFilename = "hfd.yaml"
 
+// BranchVariantMetadataDir is the app-owned directory beside a repository's
+// payload where branch-variant completion manifests live. Each variant has its
+// own <revision>/<commit> subdirectory: two branches can point at the same
+// commit yet still need separate completion records, and a revision name may
+// itself contain slashes (for example "exl/4_25").
+const BranchVariantMetadataDir = ".hfdesk-variants"
+
+// BranchVariantManifestDir returns the directory that receives hfd.yaml for an
+// HF-cache branch variant revision at commit. The revision and commit are
+// validated so the result stays inside the repository's metadata directory.
+func BranchVariantManifestDir(repoDir *RepoDir, revision, commit string) (string, error) {
+	if repoDir == nil {
+		return "", errors.New("branch variant manifest requires a repository directory")
+	}
+	return branchVariantManifestDir(repoDir.Path(), revision, commit)
+}
+
+// BranchVariantLocalManifestDir returns the directory that receives hfd.yaml
+// for a local/flat branch variant revision at commit. It is a sibling of the
+// revision payload directory, never inside it, so a repository file named
+// hfd.yaml cannot collide with the completion record.
+func BranchVariantLocalManifestDir(repoBase, revision, commit string) (string, error) {
+	return branchVariantManifestDir(repoBase, revision, commit)
+}
+
+// branchVariantManifestDir is the single owner of the completion-manifest
+// layout: <base>/.hfdesk-variants/<revision>/<commit>.
+func branchVariantManifestDir(base, revision, commit string) (string, error) {
+	if !ValidBranchVariantRevision(revision) {
+		return "", fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	if !safeCommitName(commit) {
+		return "", fmt.Errorf("invalid branch variant commit %q", commit)
+	}
+	return SafeJoin(base, filepath.Join(BranchVariantMetadataDir, revision, commit))
+}
+
+// InvalidateBranchVariantLocalManifests removes the app-owned completion
+// records for revision under a local repository base. Only
+// <base>/.hfdesk-variants/<revision> is removed; the payload tree is never
+// touched. A local branch-variant download calls this after planning and
+// before any payload effect, so a failed or cancelled re-download cannot leave
+// an older record claiming a mixed or replaced payload is complete.
+func InvalidateBranchVariantLocalManifests(base, revision string) error {
+	if !ValidBranchVariantRevision(revision) {
+		return fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	revisionDir, err := SafeJoin(base, filepath.Join(BranchVariantMetadataDir, revision))
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(revisionDir); err != nil {
+		return fmt.Errorf("remove branch variant completion records: %w", err)
+	}
+	return nil
+}
+
+// BranchVariantManifestDirs lists the existing completion-manifest
+// directories for revision under base, in lexical commit order. Local/flat
+// mode has no ref file, so presence resolves the commit from the manifests
+// themselves.
+func BranchVariantManifestDirs(base, revision string) ([]string, error) {
+	if !ValidBranchVariantRevision(revision) {
+		return nil, fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	revisionDir, err := SafeJoin(base, filepath.Join(BranchVariantMetadataDir, revision))
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(revisionDir)
+	if err != nil {
+		// A missing, obstructed, or unreadable metadata store holds no
+		// completion record; presence reports the revision as not downloaded,
+		// matching the previous single-manifest lookup.
+		return nil, nil
+	}
+	dirs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && safeCommitName(entry.Name()) {
+			dirs = append(dirs, filepath.Join(revisionDir, entry.Name()))
+		}
+	}
+	return dirs, nil
+}
+
+// ValidBranchVariantRevision reports whether revision is a slash-separated
+// sequence of plain path components accepted by the branch-variant
+// completion-manifest layout. Revision names may contain "/" (a real branch
+// like "exl/4_25"), so each component is validated instead of rejecting the
+// separator outright: no empty, "." or ".." component, no backslash (a Windows
+// separator and never part of a Hub revision name), no control characters, and
+// no component longer than 255 bytes. The server's branch-variant admission
+// uses this validator so a revision that cannot become a manifest path never
+// reaches a download.
+func ValidBranchVariantRevision(revision string) bool {
+	if revision == "" {
+		return false
+	}
+	for _, part := range strings.Split(revision, "/") {
+		if part == "" || part == "." || part == ".." || len(part) > 255 {
+			return false
+		}
+		for _, r := range part {
+			if r == '\\' || r < 0x20 || r == 0x7f {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // DownloadManifest captures the complete record of a download job.
 // This file is written to the friendly view root (e.g., models/Owner/Repo/hfd.yaml)
 // and contains all information needed to understand and reproduce the download.
@@ -33,6 +144,10 @@ type DownloadManifest struct {
 	Branch   string `yaml:"branch" json:"branch"`       // Branch name (usually "main")
 	Commit   string `yaml:"commit" json:"commit"`       // Commit hash
 	RepoPath string `yaml:"repo_path" json:"repo_path"` // Relative to app root; absolute if Hub is on another volume.
+
+	// BranchVariant marks a manifest for an analyzer-recognized EXL2/EXL3
+	// branch stored in isolation. Ordinary repo manifests leave it false.
+	BranchVariant bool `yaml:"branch_variant,omitempty" json:"branch_variant,omitempty"`
 
 	// Timing
 	StartedAt   time.Time `yaml:"started_at" json:"started_at"`     // When download started
@@ -96,14 +211,15 @@ func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 	return &ManifestBuilder{
 		startTime: time.Now().UTC(),
 		manifest: &DownloadManifest{
-			Version:   "1.0",
-			Type:      repoType,
-			Repo:      job.Repo,
-			Branch:    branch,
-			RepoPath:  repoPath,
-			StartedAt: time.Now().UTC(),
-			Command:   command,
-			Files:     []ManifestFile{},
+			Version:       "1.0",
+			Type:          repoType,
+			Repo:          job.Repo,
+			Branch:        branch,
+			RepoPath:      repoPath,
+			BranchVariant: job.BranchVariant,
+			StartedAt:     time.Now().UTC(),
+			Command:       command,
+			Files:         []ManifestFile{},
 		},
 	}
 }
@@ -115,9 +231,16 @@ func (b *ManifestBuilder) SetCommit(commit string) {
 
 // AddFile adds a file to the manifest.
 func (b *ManifestBuilder) AddFile(name, blobHash string, size int64, isLFS bool) {
+	// An HF-cache entry points at its content-addressed blob. Local/flat mode
+	// has no blob, so leave the field empty instead of emitting a broken
+	// "blobs/" prefix.
+	blob := ""
+	if blobHash != "" {
+		blob = "blobs/" + blobHash
+	}
 	b.manifest.Files = append(b.manifest.Files, ManifestFile{
 		Name: name,
-		Blob: "blobs/" + blobHash,
+		Blob: blob,
 		Size: size,
 		LFS:  isLFS,
 	})

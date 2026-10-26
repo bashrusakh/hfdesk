@@ -44,6 +44,14 @@ type Job struct {
 	//   - "abc123" (commit SHA)
 	Revision string
 
+	// BranchVariant marks an analyzer-recognized EXL2/EXL3 quantization branch.
+	// The download covers the whole branch named by Revision (filters are not
+	// allowed) and is stored in an isolated location keyed by the resolved
+	// commit (HF cache) or by the revision (local/flat mode), so two variants
+	// with identical file names cannot overwrite each other. A completed
+	// variant manifest is written for presence checks.
+	BranchVariant bool
+
 	// Filters define case-insensitive direct selection matches against the full
 	// repository-relative path for any file type (not only LFS blobs). Recognized
 	// dataset group filters may also select files by dataset membership. If empty,
@@ -249,8 +257,9 @@ type Settings struct {
 	// Credits: Feature suggested by windtail (#38)
 	Endpoint string
 
-	// NoManifest disables writing the hfd.yaml manifest file after download.
-	// By default, a manifest is always written to the friendly view directory.
+	// NoManifest disables writing the optional friendly-view hfd.yaml manifest
+	// file after download. A branch variant's completion manifest is the
+	// downloaded-status record, so it is always written.
 	NoManifest bool
 
 	// NoFriendlyView disables creating the friendly view symlinks (models/, datasets/).

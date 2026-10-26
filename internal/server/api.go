@@ -86,6 +86,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
+		return
+	}
 
 	// If dry-run, return the plan
 	if req.DryRun {
@@ -165,6 +169,10 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	if revision == "" {
 		revision = "main"
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
+		return
+	}
 
 	// Create job for scanning
 	dlJob := hfdownloader.Job{
@@ -175,6 +183,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		Excludes:           req.Excludes,
 		ExactMatch:         req.ExactMatch,
 		AppendFilterSubdir: req.AppendFilterSubdir,
+		BranchVariant:      req.BranchVariant,
 	}
 
 	// Take a snapshot of the server config; every read below uses it
@@ -1586,6 +1595,10 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 
 // handleCacheInfo returns details about a specific cached repository.
 func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("branchVariant") == "true" {
+		s.handleBranchVariantPresence(w, r)
+		return
+	}
 	repo := r.PathValue("repo")
 	if repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/cache/owner/name")
