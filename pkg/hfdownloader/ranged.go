@@ -1240,13 +1240,22 @@ func buildRangeLayout(size int64, n int) []RangeProgress {
 // If a valid .part-NN layout exists, dst.part is obsolete and is removed with
 // the other legacy artifacts by the caller after the migrated state is
 // durable (only for the legacy shape: a sidecar-bearing .part that did not
-// match is preserved). A layout whose every part is missing, empty or
-// oversized contributes no bytes and is not usable: its family is discarded,
+// match is preserved by this decision - a later successful publish of the
+// destination treats it as obsolete and removes it). A layout whose every part
+// is missing, empty, oversized or reduced to nothing by the reserved final
+// byte contributes no bytes and is not usable: its family is discarded,
 // then dst.part is migrated if present. If no usable multipart state exists,
 // unvalidatable .part-NN files are discarded first (their byte-range contract
 // is unknown), then dst.part is migrated if present. No usable legacy state
 // returns errNoLegacyState. LegacyMigrated is reported only when actual legacy
 // bytes were copied.
+//
+// Every migrated byte range is a PREFIX: a `.part-NN` part contributes
+// committed-1 bytes and a fully-sized single `.part` is imported whole only
+// when a matching, pinned sidecar records clean framing (otherwise its final
+// byte is reserved). None of these bytes is ever treated as completion proof,
+// so a torn final byte is always re-requested with clean framing before the
+// migrated layout can publish.
 //
 // The copy is context-bounded (contextReader checks ctx before every chunk),
 // so an explicit cancel during a long migration stops promptly instead of
@@ -1322,12 +1331,15 @@ type multipartResumeState struct {
 }
 
 // hasUsableLegacyMultipartState reports whether dst has a valid pre-#140
-// .part-NN/.parts.json layout with at least one part that contributes usable
+// .part-NN/.parts.json layout with at least one part that can contribute usable
 // bytes. It is used before routing an item to the single-request path: routing
 // a ranged-capable item with valid legacy state to a full single GET would
 // ignore the partial and (after success) delete it, violating the upgrade
 // contract. A layout whose every part is missing/empty/oversized is not
-// "usable" and is left to the normal migration/discard path.
+// "usable" and is left to the normal migration/discard path. Detection is a
+// routing hint, not a migrated-bytes count: the migration reserves each
+// contributing part's final byte, so a part holding a single byte routes here
+// and then contributes nothing (the family is discarded by that same path).
 func hasUsableLegacyMultipartState(dst string, size int64) bool {
 	if size <= 0 {
 		return false
@@ -1375,11 +1387,21 @@ func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, co
 
 // migrateLegacyParts validates a .parts.json layout and copies each part's
 // valid prefix into the staging file. ok=false means the layout is absent,
-// unvalidatable, or contributes no bytes at all (every part missing, empty or
-// oversized); the caller then discards the part family and tries the
-// single-part path. A layout that contributes nothing must not be reported as
-// a usable migrated state, because the caller would delete a valid dst.part on
-// the strength of an empty migration.
+// unvalidatable, or contributes no bytes at all (every part missing, empty,
+// oversized, or contributing only its single reserved byte); the caller then
+// discards the part family and tries the single-part path. A layout that
+// contributes nothing must not be reported as a usable migrated state, because
+// the caller would delete a valid dst.part on the strength of an empty
+// migration.
+//
+// A part's byte count is never completion proof: the legacy layout records
+// ranges, not response framing, so every contributing part is imported as a
+// PREFIX with its final byte reserved and its range left not-Done. A worker
+// then re-requests that byte (and the rest of a short part's range) and the
+// range becomes Done only on clean framing. This is the same rule the
+// single-request path applies to an exactly-sized `.part`, and it is what
+// stops a torn last byte of a "complete" legacy part from being published with
+// zero GETs when the item has no known digest and Verify is "size".
 func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int64, data []byte) ([]RangeProgress, bool, error) {
 	parts, ok := validateLegacyPartsLayout(data, size)
 	if !ok {
@@ -1407,6 +1429,19 @@ func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int6
 			// valid.
 			continue
 		}
+		// A part's byte count is not completion proof either. The legacy
+		// `.parts.json` layout records byte ranges, never clean response
+		// framing, so a part that reaches its last byte may still hold a torn
+		// one (the response can end badly after the final WriteAt). Reserve
+		// that byte for EVERY contributing part: the range is imported as a
+		// prefix only, is never marked Done, and a worker re-requests the
+		// final byte (and, for a short part, the rest of the range). A part
+		// that contributes nothing after the reserve is skipped, exactly like
+		// an empty one.
+		committed--
+		if committed == 0 {
+			continue
+		}
 		in, err := os.Open(partPath)
 		if err != nil {
 			return nil, false, err
@@ -1420,7 +1455,8 @@ func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int6
 			return nil, false, cerr
 		}
 		ranges[i].Committed = committed
-		ranges[i].Done = committed == want
+		// Never Done: the reserved final byte has no clean-framing proof.
+		ranges[i].Done = false
 		copiedAny = true
 	}
 	if !copiedAny {
@@ -1449,7 +1485,10 @@ func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int6
 // sides. A mismatch (including an unpinned identity) or an unreadable sidecar
 // imports nothing and returns errNoLegacyState, leaving the .part and its
 // sidecar in place for the route that can use them. Only a .part WITHOUT a
-// sidecar keeps the historical pre-#140 prefix migration.
+// sidecar keeps the historical pre-#140 prefix migration - and even that is a
+// PREFIX, never completion proof: without a sidecar nothing records clean
+// response framing, so a fully-sized sidecarless .part has its final byte
+// reserved exactly like a sidecar that lacks the framing proof.
 func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size int64, workers int, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool, error) {
 	partPath := dst + ".part"
 	fi, err := os.Stat(partPath)
@@ -1506,14 +1545,19 @@ func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size
 		_ = removeLegacySinglePart(dst)
 		return nil, false, errNoLegacyState
 	}
-	if recorded != nil && !recorded.FramingComplete && committed == size {
-		// The sidecar proves these bytes belong to this object, but not that
-		// the response body ended cleanly at the final byte. A fully-sized
-		// prefix is therefore NOT a completed layout: reserve the final byte
-		// and let a ranged worker re-request [size-1, size) with clean framing
-		// - the same rule the single-request restart applies, and the same
-		// shape as v2 Done-range migration. Nothing else is imported as
-		// complete.
+	// Written byte count alone is NOT completion proof. A fully-sized `.part`
+	// is imported as a completed layout only when a matching, pinned sidecar
+	// records a cleanly framed body at the exact expected size; otherwise the
+	// final byte may be torn (a process can exit after the last WriteAt and
+	// before the response body ends), so it is reserved and a ranged worker
+	// re-requests [size-1, size) with clean framing. A SIDECARLESS pre-#140
+	// `.part` has no framing proof at all, so the reserve applies to it too:
+	// importing it whole would mark every range Done and publish a torn final
+	// byte with zero GETs, which nothing catches in Verify=size mode for an
+	// item without a known digest (LegacyMigrated needs no content proof
+	// there). A shorter prefix needs no reserve - every one of its bytes was
+	// written by a completed WriteAt - so it keeps its exact length.
+	if committed == size && !(recorded != nil && recorded.FramingComplete) {
 		committed--
 		if committed <= 0 {
 			// There is no usable prefix to import; keep the partial for the
@@ -2159,14 +2203,23 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 		// A permanent gated/private/missing response on HEAD fails the whole
 		// job immediately with the actionable message, before any part
-		// requests are issued. The zero-byte partial the attempt created goes
-		// with the identity sidecar that describes it, and only with it: a
-		// non-empty partial keeps its record, because that record is the only
-		// proof that the surviving bytes belong to this object.
+		// requests are issued.
+		//
+		// NOTHING IS REMOVED HERE. This route stages at <staging>.incomplete
+		// and creates no `.part` of its own, so a `<dst>.part` and its
+		// `.part.meta` sidecar next to this destination belong to the
+		// SINGLE-REQUEST route - possibly to a LIVE writer of it - or to an
+		// earlier run, and this route holds no ownership of the destination
+		// at this point: in flat/output mode the destination domain is taken
+		// at the Download level only for the route that does not take it
+		// internally, so a multipart item reaches this HEAD holding nothing.
+		// Unlinking those files would unlink another writer's open partial
+		// (its later publication would fail with ENOENT) and would let one
+		// route delete another route's resume state. The single-request HEAD
+		// failure keeps its own cleanup, because that route holds the
+		// destination domain and knows the partial is the one its attempt
+		// created.
 		if apiErr != nil && apiErr.IsFailFast() {
-			if removeEmptyPartialFile(dst + ".part") {
-				removeSinglePartIdentity(singlePartIdentityPath(dst))
-			}
 			return false, apiErr
 		}
 

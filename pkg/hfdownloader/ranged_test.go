@@ -147,6 +147,17 @@ func assertExactFile(t *testing.T, path string, want []byte) {
 	}
 }
 
+// containsRange reports whether want appears among the recorded Range request
+// headers.
+func containsRange(ranges []string, want string) bool {
+	for _, r := range ranges {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}
+
 // 1. Parallel ranges completing out of order must produce exact final
 // bytes, written directly into one staging file with no .part-NN payloads
 // and no assembly copy.

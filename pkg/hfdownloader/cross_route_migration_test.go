@@ -205,6 +205,71 @@ func TestCrossRouteMigrationOfUnframedCompletePartialRevalidatesFinalByte(t *tes
 	}
 }
 
+// TestCrossRouteMigrationReservesFinalByteOfSidecarlessFullPartial is the
+// torn-publish regression for the genuine pre-#140 shape: a `.part` WITHOUT an
+// identity sidecar that reaches the expected size has no framing proof at all,
+// so it must not be imported as a completed layout. The migration reserves the
+// final byte, a ranged worker re-requests it, and the published file is the
+// served content - not the torn seed. Without the reserve the layout is
+// all-Done and, for a digest-less item in Verify=size mode, nothing proves the
+// content: the torn file publishes with zero payload GETs.
+func TestCrossRouteMigrationReservesFinalByteOfSidecarlessFullPartial(t *testing.T) {
+	const size = 64
+	_, bPayload := crossRoutePayloads(size)
+	torn := append([]byte(nil), bPayload...)
+	torn[size-1] ^= 0xFF
+
+	out := t.TempDir()
+	dst := legacyOutputDst(t, out)
+	if err := os.WriteFile(dst+".part", torn, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(singlePartIdentityPath(dst)); !os.IsNotExist(err) {
+		t.Fatalf("fixture precondition: sidecar must be absent (stat err=%v)", err)
+	}
+
+	srv, ranges := crossRoutePlanHub(t, bPayload)
+	crossRouteRun(t, out, srv)
+
+	assertExactFile(t, dst, bPayload)
+	want := fmt.Sprintf("bytes=%d-%d", size-1, size-1)
+	if got := ranges(); len(got) != 1 || got[0] != want {
+		t.Errorf("payload GET ranges = %v, want exactly the revalidated final byte %q", got, want)
+	}
+}
+
+// TestDownloadMultipart_SidecarlessFullPartialReservesFinalByte is the direct
+// route-level control for the same rule: the multipart route imports a
+// sidecarless full `.part` as a PREFIX, so its byte count - even one that
+// matches the expected size exactly - never marks the layout complete.
+func TestDownloadMultipart_SidecarlessFullPartialReservesFinalByte(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	torn := append([]byte(nil), full...)
+	torn[total-1] ^= 0xFF
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "blobs", "tmp-path-model.bin")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".part", torn, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, gotRanges := rangedTestServer(t, full)
+	it := PlanItem{RelativePath: "model.bin", URL: srv.URL + "/model.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	assertExactFile(t, dst, full)
+	want := fmt.Sprintf("bytes=%d-%d", total-1, total-1)
+	if got := *gotRanges; len(got) != 1 || got[0] != want {
+		t.Errorf("payload GETs = %v, want exactly the revalidated final byte %q", got, want)
+	}
+}
+
 // migrationOpenStaging returns the freshly preallocated staging file the
 // multipart caller has open when it invokes the migration.
 func migrationOpenStaging(t *testing.T, dir string, size int64) (*os.File, string) {

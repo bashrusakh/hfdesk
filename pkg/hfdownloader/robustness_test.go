@@ -1522,8 +1522,9 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 
 	// T3: the pre-existing resumable bytes must not have been deleted: the
 	// migration moved the 500-byte legacy part into the staging file at its
-	// range offset, and the internal abort must preserve both the staging
-	// file and its committed-range metadata.
+	// range offset as a PREFIX (its final byte reserved, so 499 bytes are
+	// committed), and the internal abort must preserve both the staging file
+	// and its committed-range metadata.
 	staging := dst + ".incomplete"
 	if fi, err := os.Stat(staging); err != nil || fi.Size() != 100_000 {
 		t.Errorf("staging file was removed/modified by the internal abort (stat err=%v)", err)
@@ -1532,7 +1533,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	if merr != nil {
 		t.Fatalf("staging meta was removed by the internal abort: %v", merr)
 	}
-	if len(meta.Ranges) != 2 || meta.Ranges[1].Committed != 500 || meta.Ranges[1].Done {
+	if len(meta.Ranges) != 2 || meta.Ranges[1].Committed != 499 || meta.Ranges[1].Done {
 		t.Errorf("migrated resumable range state lost: %+v", meta.Ranges)
 	}
 	if meta.Ranges[0].Committed != 0 || meta.Ranges[0].Done {
@@ -2359,7 +2360,7 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 // cancelled-while-workers-running guard and immediately before the
 // finalization work starts — no timing/sleep dependence.
 func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
-	setup := func(t *testing.T) string {
+	setup := func(t *testing.T) (string, []byte) {
 		t.Helper()
 		tmpDir := t.TempDir()
 		dst := filepath.Join(tmpDir, "blobs", "tmp-finabort")
@@ -2367,8 +2368,9 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Seed a complete legacy part set plus layout: the one-time upgrade
-		// migration carries it into the staging file, so the range workers
-		// finish without any GET and the run reaches finalization.
+		// migration carries it into the staging file as prefixes, and only
+		// the reserved final byte of each part is re-requested, so the run
+		// reaches finalization without any full re-transfer.
 		full := bytes.Repeat([]byte("p"), 20_000)
 		if err := os.WriteFile(dst+".part-00", full[:10_000], 0o644); err != nil {
 			t.Fatal(err)
@@ -2379,12 +2381,12 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(20_000, 2, 10_000)); err != nil {
 			t.Fatal(err)
 		}
-		return dst
+		return dst, full
 	}
 
 	run := func(t *testing.T, cause func() error) string {
 		t.Helper()
-		dst := setup(t)
+		dst, full := setup(t)
 
 		ctx, cancel := context.WithCancelCause(context.Background())
 
@@ -2397,8 +2399,10 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
-			// Ranges are already complete on disk, so no GET should occur.
-			http.Error(w, "unexpected part request", http.StatusInternalServerError)
+			// The migrated parts are prefixes: only their reserved final
+			// bytes are re-requested, and serving them completes the layout
+			// without re-transferring a whole part.
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		}))
 		defer srv.Close()
 

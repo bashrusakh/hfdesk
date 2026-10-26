@@ -260,9 +260,18 @@ func TestDownload_LowThresholdLegacyLayoutResumesMultipart(t *testing.T) {
 		t.Fatalf("Download: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	want := fmt.Sprintf("bytes=%d-%d", total/2+total/4, total-1)
-	if got := getRanges(); len(got) != 1 || got[0] != want {
-		t.Errorf("ranged GETs = %v, want exactly the missing suffix %q", got, want)
+	// A legacy part is a PREFIX: the final byte of each contributing part is
+	// reserved for clean-framing revalidation, so the full part 0 re-requests
+	// only its last byte and the short part 1 resumes one byte before its
+	// durable offset.
+	part0LastByte := fmt.Sprintf("bytes=%d-%d", total/2-1, total/2-1)
+	want := fmt.Sprintf("bytes=%d-%d", total/2+total/4-1, total-1)
+	got := getRanges()
+	if len(got) != 2 || !containsRange(got, part0LastByte) || !containsRange(got, want) {
+		t.Errorf("ranged GETs = %v, want exactly the revalidated final bytes %q and %q", got, part0LastByte, want)
+	}
+	if containsRange(got, fmt.Sprintf("bytes=0-%d", total/2-1)) {
+		t.Errorf("the migrated layout re-downloaded a whole legacy part: %v", got)
 	}
 	if got := hashPassCount.Load(); got != 1 {
 		t.Errorf("legacy migration proof performed %d full-file passes; want exactly 1", got)

@@ -195,10 +195,11 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 
 // TestDownloadMultipart_ResumesPartialPart seeds a legacy pre-#140
 // .part-NN/.parts.json state and verifies the one-time upgrade migration:
-// fully-complete part 0 is never re-requested, the half-done part 1 resumes
-// from its exact durable offset, and the final bytes are exact — with no
-// new .part-NN payload files created and the legacy artifacts removed
-// after the successful finalization.
+// a full part is imported as a PREFIX (its final byte is reserved and
+// revalidated, never reused as completion proof), the half-done part 1
+// resumes from its exact durable offset minus that reserved byte, and the
+// final bytes are exact — with no new .part-NN payload files created and the
+// legacy artifacts removed after the successful finalization.
 func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Build a deterministic payload where each byte is its index mod 251.
@@ -263,17 +264,27 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	gotRanges := append([]string(nil), rangeHdrs...)
 	mu.Unlock()
 
-	// Part 0 should never have been requested (fully complete on disk).
-	part0Range := fmt.Sprintf("bytes=0-%d", partSize-1)
+	// Part 0 must never be re-downloaded as a whole: a full part is a prefix,
+	// not completion proof, so only its final byte is revalidated.
+	part0WholeRange := fmt.Sprintf("bytes=0-%d", partSize-1)
+	part0LastByte := fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1)
+	gotPart0LastByte := false
 	for _, rh := range gotRanges {
-		if rh == part0Range {
-			t.Errorf("part 0 was re-downloaded (range %q); ranges=%v", part0Range, gotRanges)
+		if rh == part0WholeRange {
+			t.Errorf("part 0 was re-downloaded whole (range %q); ranges=%v", part0WholeRange, gotRanges)
 			break
 		}
+		if rh == part0LastByte {
+			gotPart0LastByte = true
+		}
+	}
+	if !gotPart0LastByte {
+		t.Errorf("part 0's reserved final byte was not revalidated: wanted %q in ranges=%v", part0LastByte, gotRanges)
 	}
 
-	// Part 1 should have been resumed from part1Have bytes in, not from the part start.
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have, 2*partSize-1)
+	// Part 1 is a prefix too: its own last byte is reserved, so the worker
+	// resumes one byte before the durable offset and re-requests the suffix.
+	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have-1, 2*partSize-1)
 	found := false
 	for _, rh := range gotRanges {
 		if rh == wantPart1 {
@@ -300,6 +311,79 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 			t.Errorf("part file %s should be removed, stat err: %v", p, err)
 		}
 	}
+}
+
+// TestDownloadMultipart_FullLegacyPartReservesFinalByte is the .part-NN
+// counterpart of the single-`.part` rule: a full legacy part is a PREFIX, not
+// a completed range, because the pre-#140 layout records byte ranges and never
+// clean response framing. Its reserved final byte is re-requested, so a torn
+// last byte of a "complete" part can never be published, while the rest of the
+// part is reused instead of re-transferred.
+func TestDownloadMultipart_FullLegacyPartReservesFinalByte(t *testing.T) {
+	const total = 4_000
+	const nParts = 2
+	const partSize = total / nParts
+	full := rangedTestPayload(total)
+	torn := append([]byte(nil), full...)
+	torn[partSize-1] ^= 0xFF // the last byte of part 0
+
+	dst := filepath.Join(t.TempDir(), "blobs", "tmp-full-part")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".part-00", torn[:partSize], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".part-01", torn[partSize:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(total, nParts, partSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu        sync.Mutex
+		rangeHdrs []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		mu.Lock()
+		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
+		mu.Unlock()
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	it := PlanItem{RelativePath: "full-part.bin", URL: srv.URL + "/full-part.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: nParts, Retries: 0, StallTimeout: "0", Verify: "size"}
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), rangeHdrs...)
+	mu.Unlock()
+
+	// Only the reserved final byte of each full part is re-requested; a whole
+	// part is never downloaded again.
+	want := []string{
+		fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1),
+		fmt.Sprintf("bytes=%d-%d", total-1, total-1),
+	}
+	if len(got) != len(want) || !containsRange(got, want[0]) || !containsRange(got, want[1]) {
+		t.Errorf("payload GETs = %v, want exactly the reserved final bytes %v", got, want)
+	}
+	for _, rh := range got {
+		if rh == fmt.Sprintf("bytes=0-%d", partSize-1) {
+			t.Errorf("the full legacy part 0 was re-downloaded whole: %v", got)
+		}
+	}
+	// The torn last byte of part 0 must never reach the published file.
+	assertExactFile(t, dst, full)
 }
 
 // TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded verifies that
@@ -443,7 +527,9 @@ func TestDownloadMultipart_MigratesLegacySinglePart(t *testing.T) {
 
 // TestDownloadMultipart_LegacyPartsWinOverSinglePart verifies the priority
 // rule: a valid .part-NN/.parts.json migration wins over a leftover dst.part,
-// and the obsolete .part is removed with the other legacy artifacts.
+// and the obsolete .part is removed with the other legacy artifacts. A full
+// legacy part is still only a prefix: its final byte is revalidated, and the
+// short part 1 resumes one byte before its durable offset.
 func TestDownloadMultipart_LegacyPartsWinOverSinglePart(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalSize = 10000
@@ -500,11 +586,16 @@ func TestDownloadMultipart_LegacyPartsWinOverSinglePart(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), rangeHdrs...)
 	mu.Unlock()
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have, 2*partSize-1)
+	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have-1, 2*partSize-1)
+	part0LastByte := fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1)
 	found := false
+	foundPart0LastByte := false
 	for _, rh := range got {
 		if rh == fmt.Sprintf("bytes=0-%d", partSize-1) {
-			t.Errorf("complete legacy part 0 was re-downloaded: %v", got)
+			t.Errorf("legacy part 0 was re-downloaded whole: %v", got)
+		}
+		if rh == part0LastByte {
+			foundPart0LastByte = true
 		}
 		if rh == wantPart1 {
 			found = true
@@ -512,6 +603,9 @@ func TestDownloadMultipart_LegacyPartsWinOverSinglePart(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("valid .part-NN layout did not win: wanted %q in %v", wantPart1, got)
+	}
+	if !foundPart0LastByte {
+		t.Errorf("legacy part 0's reserved final byte was not revalidated: wanted %q in %v", part0LastByte, got)
 	}
 	assertExactFile(t, dst, full)
 	if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {

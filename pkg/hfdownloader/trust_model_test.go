@@ -240,8 +240,8 @@ func TestDownloadMultipart_LegacyPartsRequireContentProof(t *testing.T) {
 	if got := hashPassCount.Load(); got != 1 {
 		t.Errorf("legacy migration performed %d full-file hash passes; want exactly 1", got)
 	}
-	if len(*gotRanges) != 0 {
-		t.Errorf("the first run fetched %v; fully committed legacy ranges must be content-proven, not re-downloaded", *gotRanges)
+	if got := *gotRanges; len(got) != 2 || !containsRange(got, "bytes=3999-3999") || !containsRange(got, "bytes=7999-7999") {
+		t.Errorf("the first run fetched %v; only the reserved final byte of each migrated part may be revalidated before the content proof", got)
 	}
 	for _, p := range []string{dst, dst + ".incomplete", dst + ".incomplete.meta"} {
 		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
@@ -284,8 +284,8 @@ func TestDownloadMultipart_LegacySinglePartRequiresContentProof(t *testing.T) {
 	if got := hashPassCount.Load(); got != 1 {
 		t.Errorf("legacy single-.part migration performed %d hash passes; want exactly 1", got)
 	}
-	if len(*gotRanges) != 0 {
-		t.Errorf("fully committed single .part was re-downloaded before the content proof: %v", *gotRanges)
+	if got := *gotRanges; len(got) != 1 || got[0] != "bytes=7999-7999" {
+		t.Errorf("fully sized single .part fetched %v; want only its reserved final byte revalidated before the content proof", got)
 	}
 	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
 		t.Error("corrupt single-.part bytes were published")
@@ -411,8 +411,8 @@ func TestDownloadMultipart_LegacyMigrationSHA256ModeUsesOnePass(t *testing.T) {
 	if got := hashPassCount.Load(); got != 1 {
 		t.Errorf("sha256-mode legacy migration performed %d hash passes; want exactly 1", got)
 	}
-	if len(*gotRanges) != 0 {
-		t.Errorf("committed legacy ranges were re-downloaded in strict mode: %v", *gotRanges)
+	if got := *gotRanges; len(got) != 2 || !containsRange(got, "bytes=3999-3999") || !containsRange(got, "bytes=7999-7999") {
+		t.Errorf("strict mode fetched %v; want exactly the reserved final byte of each migrated part", got)
 	}
 	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
 		t.Error("corrupt legacy bytes were published in strict mode")

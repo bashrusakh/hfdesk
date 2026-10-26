@@ -254,7 +254,13 @@ that those bytes belong to this object; removing the record while the bytes
 stay would make the next run discard them, so a permanent (but eventually
 fixable) error would silently lose the progress. The sidecar therefore
 survives with a non-empty partial, and the next run with the same identity
-resumes from the stored offset.
+resumes from the stored offset. The MULTIPART route's permanent HEAD failure
+removes nothing: that route creates no `<dst>.part` at all, so a `.part`/sidecar
+next to the destination belongs to the single-request route (in flat/output mode
+possibly a live writer of it) or to an earlier run, and in flat/output mode the
+multipart route does not hold the destination's domain at that point either.
+Only the route that created a partial - and holds the destination domain while
+doing so - removes it.
 
 AN UNPINNED IDENTITY IS CONTENT-PROVED BEFORE PUBLICATION. An identity that
 names an unresolved revision is not bound to an immutable object: the bytes
@@ -683,7 +689,14 @@ partial from zero.
 Legacy migration: a valid pre-#140 `.part-NN`/`.parts.json` family, or a leftover
 single `.part` sequential prefix, is copied into the staging file once and the
 obsolete artifacts are removed only after the migrated range layout is durable.
-An oversized single `.part` is invalid and is discarded rather than clamped. A
+Migrated bytes are PREFIXES, never completion proof: the pre-#140 layout records
+byte ranges and not response framing, and a sidecarless `.part` records nothing
+at all, so every contributing legacy part is imported one byte short and never
+marked Done (a worker re-requests its last byte and, for a short part, the rest
+of its range), and a fully-sized single `.part` is imported whole only when a
+matching, pinned sidecar records the cleanly-framed completion - otherwise its
+final byte is reserved for a clean-framing re-request. An oversized single
+`.part` is invalid and is discarded rather than clamped. A
 layout whose every part is missing, empty or oversized contributes no usable
 bytes and is not a migrated state: the unusable family is discarded and a valid
 single `.part` is migrated instead. A single `.part` WITH an identity sidecar is
@@ -691,11 +704,11 @@ the current-version single-request staging name, not the pre-#140 shape: it is
 imported only when the recorded identity is inheritable by the current plan
 (repo, commit, path, size, PINNED on both sides); a mismatch (including
 unpinned) or an unreadable sidecar imports nothing and preserves the partial and
-its record. A `.part` WITHOUT a sidecar keeps the historical legacy prefix
-migration. When the matching sidecar does not record a cleanly-framed completion
-and the partial is already fully sized, its final byte is reserved and
-re-requested as `[size-1, size)` by a ranged worker instead of being imported as
-a completed layout. Migrated bytes are tagged LegacyMigrated:
+its record (a later successful publish of that destination removes the stale
+pair as obsolete). A `.part` WITHOUT a sidecar keeps the historical legacy prefix
+migration, including the reserved final byte: without a sidecar nothing records
+clean framing, so a fully-sized sidecarless `.part` is not a completed layout.
+Migrated bytes are tagged LegacyMigrated:
 they have layout/prefix structure but no validated provenance, so when the item
 carries a known SHA-256 and Verify is not "none" they receive one full-file
 SHA-256 proof before publication, even in "size" mode (the documented one-time

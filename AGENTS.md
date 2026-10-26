@@ -221,17 +221,33 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   them with one full-file SHA-256 pass before publication whenever a known
   digest exists and `Verify != "none"`. An oversized single `.part` is invalid:
   discard it, never clamp it. A multipart layout whose parts are all
-  missing/empty/oversized contributes no bytes and is not a migrated layout:
-  fall back to a valid single `.part`; set LegacyMigrated only when bytes were
-  actually copied. A single `.part` WITH a current-version identity sidecar is
+  missing/empty/oversized (or contribute nothing once their final byte is
+  reserved) contributes no bytes and is not a migrated layout: fall back to a
+  valid single `.part`; set LegacyMigrated only when bytes were actually
+  copied. A single `.part` WITH a current-version identity sidecar is
   not the pre-#140 shape: it is migrated only when the recorded identity is the
   current plan's (repo, commit, path, size, PINNED on both sides), and a
   mismatch (including unpinned) or an unreadable sidecar imports nothing and
-  preserves the partial and its record; a `.part` WITHOUT a sidecar keeps the
-  historical legacy prefix migration. If the matching sidecar does not record a
-  cleanly-framed completion and the partial is already fully sized, its final
-  byte is reserved and re-requested as `[size-1, size)` by a ranged worker
-  rather than imported as a completed layout.
+  preserves the partial and its record (a LATER successful publish of that
+  destination treats the stale pair as obsolete and removes it). A `.part`
+  WITHOUT a sidecar keeps the historical legacy prefix migration.
+  BYTES MIGRATED ARE PREFIXES, NEVER COMPLETION PROOF: the pre-#140
+  `.parts.json` layout records byte ranges and not response framing, and a
+  sidecarless `.part` records nothing at all. A fully-sized single `.part`
+  therefore has its final byte reserved and re-requested as `[size-1, size)`
+  unless a matching, pinned sidecar records the cleanly-framed completion, and
+  EVERY contributing legacy `.part-NN` part is imported one byte short and never
+  marked Done, so a worker re-requests its last byte (and the rest of a short
+  part's range). A torn final byte of a "complete" legacy partial is therefore
+  never published with zero GETs.
+- A ROUTE REMOVES ONLY THE ARTIFACTS IT CREATES. The multipart HEAD fail-fast
+  creates no `.part`: a `<dst>.part`/`.part.meta` next to the destination
+  belongs to the single-request route (in flat/output mode possibly to a LIVE
+  writer of it) or to an earlier run, and in flat/output mode the multipart
+  route reaches that HEAD holding no domain at all, so it leaves the pair
+  untouched. Only the single-request fail-fast removes its own zero-byte partial
+  (with its sidecar), because that route holds the destination domain and knows
+  the partial is the one its attempt created.
 - A publish target's existence proves completion only when it is
   content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
   authoritative pre-download skip decision and are redownloaded and atomically
@@ -308,9 +324,14 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   therefore keeps relying on its staging claim; the hand-off to the
   single-request path (the size stays unknown) takes the domain THERE,
   because that hand-off happens BEFORE the claim. A concurrent second writer
-  of the same flat destination is therefore EXCLUDED: it fails its item with
-  the actionable live-owner error ("blob <sha> is being downloaded by another
-  process; try again later") instead of racing, which is safer than the
+  of the same flat destination is therefore EXCLUDED, and how its exclusion
+  surfaces depends on the route it is on: a MULTIPART writer's staging claim
+  reports the contended lock at once with the actionable live-owner error
+  ("blob <sha> is being downloaded by another process; try again later"), while
+  a SINGLE-REQUEST writer WAITS for the domain (bounded, context-aware) and
+  only fails with that same actionable error when the wait is exhausted - if the
+  owner releases the domain it proceeds and downloads the file itself, instead
+  of racing, which is safer than the
   pre-#140 behavior, where two processes wrote the same `.part-NN` payload
   files and could publish a silently corrupt model. A flat destination whose
   ownership domain cannot be acquired (the OS lock is unsupported, denied, or
