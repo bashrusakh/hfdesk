@@ -133,7 +133,7 @@ func TestDownload_AppendFilterResumesVersionedStateAfterThresholdIncrease(t *tes
 	}
 	ioItem := item
 	ioItem.RelativePath = finalRel
-	meta := newClaimMeta(ioItem, job, plan.Commit)
+	meta := newClaimMeta(ioItem, job, plan.Commit, plan.CommitPinned)
 	meta.LockFenced = true
 	meta.Ranges = buildRangeLayout(size, 2)
 	meta.Ranges[0].Committed, meta.Ranges[0].Done = prefix, true

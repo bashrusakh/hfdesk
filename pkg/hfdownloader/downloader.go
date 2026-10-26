@@ -655,7 +655,7 @@ LOOP:
 			resumeState := multipartResumeState{
 				legacy: hasUsableLegacyMultipartState(dst, it.Size),
 			}
-			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit) {
+			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit, plan.CommitPinned) {
 				resumeState.versionedStaging = versionedStaging
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges

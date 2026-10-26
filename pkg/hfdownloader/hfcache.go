@@ -286,13 +286,26 @@ type IncompleteMeta struct {
 	// Repo, Path and Commit identify the resolved remote object the staging
 	// file belongs to, so a reused destination or moved branch cannot
 	// silently resume another revision's bytes. The commit is the resolved
-	// SHA from the plan, not the requested branch name.
+	// SHA from the plan, not the requested branch name. CommitPinned states
+	// whether that commit was actually resolved: an unpinned identity (the
+	// planner's fallback to the requested revision) pins nothing, so the
+	// record is inheritable only when the flag is set here AND on the
+	// current plan.
 	Repo string `json:"repo,omitempty"`
 	// Revision is a legacy advisory field written by earlier records. It is
 	// not part of the resume identity (the resolved Commit is).
 	Revision string `json:"revision,omitempty"`
 	Commit   string `json:"commit,omitempty"`
 	Path     string `json:"path,omitempty"`
+	// CommitPinned records whether Commit is a RESOLVED, immutable commit
+	// identity rather than the planner's fallback to the requested revision.
+	// An unpinned identity pins nothing: the branch may have moved, so the
+	// bytes staged under that name may not be inherited by a later run. The
+	// record is inheritable only when the flag is set on the record AND on
+	// the current plan. A record written without the flag is unpinned, and
+	// therefore not inheritable: the safe direction, and no released version
+	// ever wrote these records.
+	CommitPinned bool `json:"commit_pinned"`
 	// Ranges lists the persisted range layout and per-range committed
 	// progress; see RangeProgress. Empty for legacy records.
 	Ranges []RangeProgress `json:"ranges,omitempty"`

@@ -407,7 +407,7 @@ func TestClaimStaging_LiveOwnerIsStillRecognizedWithoutWaiting(t *testing.T) {
 	start := time.Now()
 	state, err := claimStaging(context.Background(), staging, pub, metaPath,
 		PlanItem{RelativePath: "owned.bin", Size: total, LFS: true, SHA256: sha},
-		Job{Repo: "o/r"}, "commit123", Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false)
+		Job{Repo: "o/r"}, "commit123", true, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false)
 	elapsed := time.Since(start)
 	if state != nil {
 		state.release()
@@ -502,7 +502,7 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	var falseSkips int
 	var uncertain int
 	for i := 0; i < 60; i++ {
-		state, err := claimStaging(context.Background(), staging, pub, metaPath, it, job, "commit123", cfg, false)
+		state, err := claimStaging(context.Background(), staging, pub, metaPath, it, job, "commit123", true, cfg, false)
 		if state != nil {
 			state.release()
 			continue

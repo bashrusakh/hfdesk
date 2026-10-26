@@ -52,8 +52,10 @@ var isBlobStagingArtifactName = func(name string) bool {
 
 // isPublishedBlobName reports whether a blobs/ entry is published content: a
 // canonical 64-hex digest, or an unusual published name the public storage API
-// accepts. Only a downloader staging artifact is not content, and an unusual
-// published name is never dropped, deleted or hidden.
+// accepts. Only a downloader staging artifact is not content. The
+// classification is by NAME SHAPE, so a name that carries a staging shape is
+// not content wherever it came from - the deletion path treats it as a
+// staging artifact and leaves it alone.
 func isPublishedBlobName(name string) bool {
 	return hfdownloader.IsPublishedBlobName(name)
 }

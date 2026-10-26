@@ -57,7 +57,8 @@ const (
 	BlobEntryCanonical
 	// BlobEntryUnusual is a published blob whose name is not the canonical
 	// digest form. The public storage API accepts such names, so they are
-	// content: they are copied, verified and counted, never dropped.
+	// content: the cache surfaces count them, the mirror copies and verifies
+	// them, and the deletion path may delete them.
 	BlobEntryUnusual
 )
 

@@ -450,10 +450,12 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   (`tmp-<sanitized path>`), so two different objects - or two revisions of one
   object - share one staging name, and the destination domain excludes
   concurrent writers without establishing WHICH object the staged bytes belong
-  to. A size match is not an identity. The sidecar `<dst>.part.meta` (JSON,
-  versioned) records the identity in the same vocabulary the ranged record
-  uses: repo, resolved commit, item relative path, expected size, and whether
-  the identity is PINNED (the commit was actually resolved). Bytes already on
+  to. A size match is not an identity. The `.part` is a sequential prefix with
+  NO RANGE-LAYOUT record: what identifies it is the identity sidecar
+  `<dst>.part.meta` (JSON, versioned), which records the identity in the same
+  vocabulary the ranged record uses: repo, resolved commit, item relative
+  path, expected size, and whether the
+  identity is PINNED (the commit was actually resolved). Bytes already on
   disk are inherited ONLY when that record exists, is readable and well-formed,
   matches the CURRENT item exactly (repo, commit, path, size) and is PINNED on
   both sides. Otherwise the inherited bytes are discarded (the partial is
@@ -468,6 +470,25 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   that surviving record is what makes the next run's decision possible. A
   legacy `.part` without a record is not inherited. The known-digest content
   proof is unchanged and still applies to the inherited bytes.
+- THE RANGED PATH INHERITS STAGED BYTES ONLY UNDER A PINNED IDENTITY - THE
+  SAME RULE AS THE SINGLE-REQUEST PATH. The ranged claim record carries the
+  repository, the resolved commit, the item's relative path, the expected size
+  and whether that commit was actually resolved (`commit_pinned`); the record
+  is resumable ONLY when the identity matches the current item exactly (repo,
+  commit, path, size), the identity is PINNED on both sides (the record's own
+  flag and the current plan's), the blob SHA is present on both sides or
+  neither, the range layout tiles the file with normalized completion, and the
+  payload exists at the expected logical size. Otherwise the record is
+  discarded and the payload is downloaded again. An UNPINNED identity (the
+  planner fell back to the requested revision because the endpoint did not
+  resolve a commit) pins nothing - a moved branch may change the content under
+  that name - so no staged bytes are inherited from it, and for an item
+  without a known digest there is no content proof that could catch the
+  mixture either. A record written WITHOUT the pinned flag is unpinned and
+  therefore not inheritable: the safe direction, and no released version ever
+  wrote these records. A pinned, matching record keeps its resume exactly as
+  before: only the missing bytes are re-fetched. The two routes consult ONE
+  shared rule, so they cannot drift apart.
 - STAGING ARTIFACTS AND PUBLISHED CONTENT ARE SEPARATED BY ONE EXHAUSTIVE
   CLASSIFIER. The downloader creates: the single-request staging name
   `tmp-<name>` with its `.part`, its `.part.meta` identity sidecar and its
@@ -479,9 +500,17 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   atomic copy temp `<name>.tmp-<random>`. A published blob is named by its
   content: a canonical 64-hex SHA-256 digest. A file in `blobs/` that is
   neither a staging artifact nor a canonical digest is an UNUSUAL published
-  name (the public storage API accepts it): it is content - it is copied,
-  verified and counted, and it is never dropped, deleted or treated as a
-  staging artifact. The staging exclusion applies ONLY inside `blobs/`: a
+  name (the public storage API accepts it): it is content - the cache
+  statistics count it, the listing shows it, the selection sees it, the mirror
+  copies and verifies it, and the deletion path may delete it. The
+  classification is by NAME SHAPE, so a `blobs/` name that CARRIES a staging
+  shape (`tmp-<name>`, `<name>.part`, `<name>.part.meta`, `<name>.lock`,
+  `<name>.incomplete`, `<name>.incomplete.meta`, `<name>.meta.tmp`,
+  `<name>.part-NN`, `<name>.parts.json` or `<name>.tmp-<random>`) is treated
+  as a staging artifact by EVERY surface, including the deletion path (the
+  conservative choice: a staging artifact is never deleted), even when such a
+  name was published content; a canonical 64-hex blob is unaffected. The
+  staging exclusion applies ONLY inside `blobs/`: a
   legitimate `*.meta` (or `*.part`, `*.lock`) file outside that namespace - a
   snapshot entry, for example - is content, and the mirror copies AND verifies
   it, so copy and verify always agree on the same set. Every consumer - the

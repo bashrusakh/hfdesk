@@ -27,7 +27,7 @@ func TestFreshClaimInstallIsAtomicAndRecoversStagedPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := claimStaging(context.Background(), staging, filepath.Join(dir, "fresh.bin"), metaPath,
-		item, job, "commit", Settings{Verify: "none"}, false)
+		item, job, "commit", true, Settings{Verify: "none"}, false)
 	if err == nil {
 		t.Fatal("claim unexpectedly succeeded with an unusable record temp")
 	}
@@ -53,7 +53,7 @@ func TestFreshClaimInstallIsAtomicAndRecoversStagedPartial(t *testing.T) {
 		return os.Link(src, dst)
 	}
 	_, err = claimStaging(context.Background(), staging, filepath.Join(dir, "fresh.bin"), metaPath,
-		item, job, "commit", Settings{Verify: "none"}, false)
+		item, job, "commit", true, Settings{Verify: "none"}, false)
 	linkStagingClaimRecord = oldLink
 	if !errors.Is(err, linkErr) || !stagedCompleteRecord {
 		t.Fatalf("failed atomic install error=%v, staged full record=%v", err, stagedCompleteRecord)
@@ -70,7 +70,7 @@ func TestFreshClaimInstallIsAtomicAndRecoversStagedPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, err := claimStaging(context.Background(), staging, filepath.Join(dir, "fresh.bin"), metaPath,
-		item, job, "commit", Settings{Verify: "none"}, false)
+		item, job, "commit", true, Settings{Verify: "none"}, false)
 	if err != nil {
 		t.Fatalf("claim after interrupted temp: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	if err := os.WriteFile(staging, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	old := newClaimMeta(item, job, "commit")
+	old := newClaimMeta(item, job, "commit", true)
 	old.Instance = "dead-predecessor"
 	old.PID = 99999999
 	old.Host = "some-other-host"
@@ -119,7 +119,7 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	if err := os.Mkdir(temp, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err = claimStaging(context.Background(), staging, dst, metaPath, item, job, "commit", Settings{Verify: "none"}, false)
+	_, err = claimStaging(context.Background(), staging, dst, metaPath, item, job, "commit", true, Settings{Verify: "none"}, false)
 	if err == nil {
 		t.Fatal("takeover unexpectedly succeeded when replacement temp creation failed")
 	}
@@ -145,7 +145,7 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	item.URL = srv.URL + "/takeover.bin"
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", job,
 		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "none"}, item, dst,
-		multipartOpts{Commit: "commit"}, func(ProgressEvent) {}); err != nil {
+		multipartOpts{Commit: "commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("resume after interrupted takeover replacement: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -176,7 +176,7 @@ func TestRangedDownloadSucceedsWithoutHardLinkSupport(t *testing.T) {
 
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", job,
 		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "none"}, item, dst,
-		multipartOpts{Commit: "commit"}, func(ProgressEvent) {}); err != nil {
+		multipartOpts{Commit: "commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("ranged download failed on a filesystem without hard-link support: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -205,7 +205,7 @@ func TestFreshClaimInstallSucceedsWithoutHardLinkSupport(t *testing.T) {
 	job := Job{Repo: "o/r"}
 
 	state, err := claimStaging(context.Background(), staging, filepath.Join(dir, "nolinks.bin"), metaPath,
-		item, job, "commit", Settings{Verify: "none"}, false)
+		item, job, "commit", true, Settings{Verify: "none"}, false)
 	if err != nil {
 		t.Fatalf("claim failed on a filesystem without hard-link support: %v", err)
 	}

@@ -267,16 +267,17 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 	job := Job{Repo: "o/r"}
 	it := PlanItem{RelativePath: "x.bin", Size: size, SHA256: shaA}
 	base := IncompleteMeta{
-		Version: stagingMetaVersion,
-		Size:    size,
-		Repo:    "o/r",
-		Path:    "x.bin",
-		Commit:  "commit-a",
-		SHA256:  shaA,
-		Ranges:  buildRangeLayout(size, 2),
+		Version:      stagingMetaVersion,
+		Size:         size,
+		Repo:         "o/r",
+		Path:         "x.bin",
+		Commit:       "commit-a",
+		CommitPinned: true,
+		SHA256:       shaA,
+		Ranges:       buildRangeLayout(size, 2),
 	}
 
-	if _, ok := stagingMetaResumable(base, it, job, "commit-a"); !ok {
+	if _, ok := stagingMetaResumable(base, it, job, "commit-a", true); !ok {
 		t.Error("matching identity was rejected; a valid record must resume")
 	}
 
@@ -285,24 +286,29 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 		mutate func(*IncompleteMeta)
 		item   PlanItem
 		commit string
+		pinned bool
 	}{
-		{"commit mismatch", func(m *IncompleteMeta) { m.Commit = "commit-b" }, it, "commit-a"},
-		{"repo mismatch", func(m *IncompleteMeta) { m.Repo = "o/other" }, it, "commit-a"},
-		{"path mismatch", func(m *IncompleteMeta) { m.Path = "y.bin" }, it, "commit-a"},
-		{"one-sided record SHA", func(m *IncompleteMeta) { m.SHA256 = "" }, it, "commit-a"},
-		{"one-sided item SHA", func(m *IncompleteMeta) {}, PlanItem{RelativePath: "x.bin", Size: size}, "commit-a"},
-		{"different SHA", func(m *IncompleteMeta) { m.SHA256 = shaB }, it, "commit-a"},
-		{"legacy revision does not substitute for commit", func(m *IncompleteMeta) {
+		{name: "commit mismatch", mutate: func(m *IncompleteMeta) { m.Commit = "commit-b" }, item: it, commit: "commit-a", pinned: true},
+		{name: "repo mismatch", mutate: func(m *IncompleteMeta) { m.Repo = "o/other" }, item: it, commit: "commit-a", pinned: true},
+		{name: "path mismatch", mutate: func(m *IncompleteMeta) { m.Path = "y.bin" }, item: it, commit: "commit-a", pinned: true},
+		{name: "one-sided record SHA", mutate: func(m *IncompleteMeta) { m.SHA256 = "" }, item: it, commit: "commit-a", pinned: true},
+		{name: "one-sided item SHA", mutate: func(m *IncompleteMeta) {}, item: PlanItem{RelativePath: "x.bin", Size: size}, commit: "commit-a", pinned: true},
+		{name: "different SHA", mutate: func(m *IncompleteMeta) { m.SHA256 = shaB }, item: it, commit: "commit-a", pinned: true},
+		{name: "legacy revision does not substitute for commit", mutate: func(m *IncompleteMeta) {
 			m.Commit = ""
 			m.Revision = "main"
-		}, it, "main"},
+		}, item: it, commit: "main", pinned: true},
+		// The pinned rule: an unpinned identity names a revision whose
+		// content may have moved, so it inherits nothing.
+		{name: "unpinned record", mutate: func(m *IncompleteMeta) { m.CommitPinned = false }, item: it, commit: "commit-a", pinned: true},
+		{name: "unpinned current plan", mutate: func(m *IncompleteMeta) {}, item: it, commit: "commit-a", pinned: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			meta := base
 			meta.Ranges = append([]RangeProgress(nil), base.Ranges...)
 			tc.mutate(&meta)
-			if _, ok := stagingMetaResumable(meta, tc.item, job, tc.commit); ok {
+			if _, ok := stagingMetaResumable(meta, tc.item, job, tc.commit, tc.pinned); ok {
 				t.Errorf("unprovable identity %q was accepted for resume", tc.name)
 			}
 		})
@@ -313,7 +319,7 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 	unnormalized := base
 	unnormalized.SHA256 = "" // item below has no SHA: both-or-neither
 	unnormalized.Ranges = []RangeProgress{{Start: 0, End: 499, Committed: 500}, {Start: 500, End: 999}}
-	ranges, ok := stagingMetaResumable(unnormalized, PlanItem{RelativePath: "x.bin", Size: size}, job, "commit-a")
+	ranges, ok := stagingMetaResumable(unnormalized, PlanItem{RelativePath: "x.bin", Size: size}, job, "commit-a", true)
 	if !ok {
 		t.Fatal("normalizable record was rejected")
 	}
@@ -324,7 +330,7 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 	overclaim := base
 	overclaim.SHA256 = ""
 	overclaim.Ranges = []RangeProgress{{Start: 0, End: 499, Committed: 501}, {Start: 500, End: 999}}
-	if _, ok := stagingMetaResumable(overclaim, PlanItem{RelativePath: "x.bin", Size: size}, job, "commit-a"); ok {
+	if _, ok := stagingMetaResumable(overclaim, PlanItem{RelativePath: "x.bin", Size: size}, job, "commit-a", true); ok {
 		t.Error("a record claiming bytes past its range end was accepted")
 	}
 }

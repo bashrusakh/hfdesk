@@ -83,9 +83,18 @@ func rangedTestServer(t *testing.T, full []byte) (*httptest.Server, *[]string) {
 	return srv, &gotRanges
 }
 
+// rangedSeedCommit is the RESOLVED commit the seeded staging records carry.
+// A staging record authorizes a resume only under a PINNED identity, so the
+// seeded state names a resolved commit and states that it is pinned.
+const rangedSeedCommit = "1111111111111111111111111111111111111111"
+
 // seedRangedState writes a current-version staging record plus a preallocated staging
 // file whose committed intervals hold the correct payload bytes (and
 // garbage everywhere else), simulating an interrupted previous run.
+//
+// The record carries the resolved, PINNED identity (rangedSeedCommit): a
+// record written under an unpinned identity never authorizes inheriting its
+// bytes, so a resume fixture must state a pinned one.
 func seedRangedState(t *testing.T, staging, repo, path string, size int64, ranges []RangeProgress, full []byte) {
 	t.Helper()
 	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, int(size)), 0o644); err != nil {
@@ -109,15 +118,17 @@ func seedRangedState(t *testing.T, staging, repo, path string, size int64, range
 	}
 	out.Close()
 	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken, // same process instance: earlier run, no live writer
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      size,
-		Version:   stagingMetaVersion,
-		Repo:      repo,
-		Path:      path,
-		Ranges:    ranges,
+		PID:          os.Getpid(),
+		Instance:     processInstanceToken, // same process instance: earlier run, no live writer
+		Host:         processHostname,
+		StartedAt:    time.Now().UTC(),
+		Size:         size,
+		Version:      stagingMetaVersion,
+		Repo:         repo,
+		Commit:       rangedSeedCommit,
+		CommitPinned: true,
+		Path:         path,
+		Ranges:       ranges,
 	}
 	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
 		t.Fatal(err)
@@ -558,7 +569,7 @@ func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
 	it := PlanItem{RelativePath: "resume-missing.bin", URL: srv.URL + "/resume-missing.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 3, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -619,7 +630,7 @@ func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 		it := PlanItem{RelativePath: "sparse.bin", URL: srv.URL + "/sparse.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 3, Retries: 0, StallTimeout: "0"}
 
-		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
 
@@ -692,7 +703,7 @@ func TestRangedMultipart_ConcurrencyChangePreservesCommitted(t *testing.T) {
 	it := PlanItem{RelativePath: "conc.bin", URL: srv.URL + "/conc.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -920,7 +931,7 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 		cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "sha256"}
 
 		hashPassCount.Store(0)
-		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
 		if err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
@@ -1110,7 +1121,7 @@ func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 	it := PlanItem{RelativePath: "dead.bin", URL: srv.URL + "/dead.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	assertExactFile(t, dst, full)

@@ -419,7 +419,7 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	defer domain.release()
 	state, err := claimStaging(context.Background(), sharedStaging, sharedBlob, sharedStaging+".meta",
 		PlanItem{RelativePath: "a/model.bin", Size: total, SHA256: sharedSHA},
-		Job{Repo: "owner/model"}, "commit123", cfg, true)
+		Job{Repo: "owner/model"}, "commit123", true, cfg, true)
 	if err != nil {
 		t.Fatalf("pre-claim shared staging: %v", err)
 	}

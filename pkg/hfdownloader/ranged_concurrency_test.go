@@ -221,7 +221,7 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 
 				done := make(chan error, 1)
 				go func() {
-					_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+					_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
 					done <- err
 				}()
 

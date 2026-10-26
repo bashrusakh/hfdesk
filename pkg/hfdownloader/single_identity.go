@@ -174,12 +174,13 @@ func singleIdentityFor(job Job, it PlanItem, opts singleOpts) singlePartIdentity
 // path and the same expected size - and when the identity is PINNED on both
 // sides. An unpinned identity names a revision whose content may have moved,
 // so nothing under that name may be inherited, no matter how well the names
-// match.
+// match. The pinned rule is the shared one (resumeIdentityPinned), so this
+// route and the ranged staging route cannot drift apart.
 func (id *singlePartIdentity) inheritableBy(current singlePartIdentity) bool {
 	if id == nil {
 		return false
 	}
-	if !id.Pinned || !current.Pinned {
+	if !resumeIdentityPinned(id.Pinned, current.Pinned) {
 		return false
 	}
 	if id.Repo != current.Repo || id.Commit != current.Commit || id.Path != current.Path {

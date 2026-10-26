@@ -273,7 +273,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), URL: "http://127.0.0.1:1/lock.bin", Size: cfg.Size, AcceptRanges: true}
 	job := Job{Repo: "o/r"}
 	metaPath := cfg.Staging + ".meta"
-	state, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, metaPath, it, job, cfg.Commit,
+	state, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, metaPath, it, job, cfg.Commit, true,
 		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false)
 	if err != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
@@ -470,7 +470,7 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	it := PlanItem{RelativePath: "lock.bin", URL: srv.URL + "/lock.bin", Size: total, AcceptRanges: true}
 	_, claimErr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
 		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, it, dst,
-		multipartOpts{Commit: commit}, func(ProgressEvent) {})
+		multipartOpts{Commit: commit, CommitPinned: true}, func(ProgressEvent) {})
 	if !errors.Is(claimErr, errBlobIncompleteOwned) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("second claimant error = %v, want errBlobIncompleteOwned while the OS lock is held", claimErr)
@@ -576,7 +576,7 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 	start := time.Now()
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
 		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, it, dst,
-		multipartOpts{Commit: commit}, func(ProgressEvent) {}); err != nil {
+		multipartOpts{Commit: commit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("takeover after the holder died: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

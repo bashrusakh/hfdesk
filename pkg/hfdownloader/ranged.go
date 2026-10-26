@@ -26,7 +26,10 @@ package hfdownloader
 // only the missing bytes.
 //
 // A record is trusted only when its repo/path/size/resolved-commit identity
-// matches, its blob SHA is present on both sides or neither, its ranges tile
+// matches, its identity is PINNED on both sides (the record's own flag and the
+// current plan's: an unpinned commit is the planner's fallback to the
+// requested revision, which pins nothing), its blob SHA is present on both
+// sides or neither, its ranges tile
 // [0,size) with normalized completion (Done means all bytes arrived under a
 // response whose framing ended cleanly), and the staging payload exists at the expected logical size
 // before any create/truncate. A record whose payload vanished is discarded and
@@ -377,8 +380,10 @@ type stagingClaimState struct {
 // exists at the expected logical size. The evaluate/remove/create sequence
 // runs under both gates, so one claimant cannot displace another. contentAddressed
 // marks the publish target as a known blob digest, the only destination whose
-// existence proves completion.
-func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, cfg Settings, contentAddressed bool) (*stagingClaimState, error) {
+// existence proves completion. commitPinned is the CURRENT plan's pinned
+// identity: the record's own flag must agree with it before any staged byte
+// may be inherited.
+func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool) (*stagingClaimState, error) {
 	// Durable proof gate: a fresh claim for a known-digest mode starts with
 	// ProofPending set, and a take-over preserves the record's flag (or adds it
 	// when the current mode/item still needs the proof). The claim write is
@@ -471,7 +476,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			}
 			return nil, lerr
 		}
-		state, retry, cerr := claimStagingLocked(staging, metaPath, it, job, commit, osExclusive, proofMode, proofForKnownDigest)
+		state, retry, cerr := claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode, proofForKnownDigest)
 		lock.release()
 		if cerr != nil {
 			release()
@@ -494,10 +499,10 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 // lock. retry=true asks the caller to re-evaluate after discarding unusable
 // state or after losing an exclusive create to an older writer that does not
 // participate in the lock.
-func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, osExclusive, proofMode, proofForKnownDigest bool) (*stagingClaimState, bool, error) {
+func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, osExclusive, proofMode, proofForKnownDigest bool) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
-		meta := newClaimMeta(it, job, commit)
+		meta := newClaimMeta(it, job, commit, commitPinned)
 		// A fresh known-digest mode claim persists the durable proof gate in
 		// its very first record write, before any transfer can start. The
 		// ownership mode is persisted too, so CheckBlob can use a free OS lock
@@ -543,7 +548,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// rules (never guess at unknown resume state). The metadata gate is
 	// held, so the record is still the one evaluated above: a racer cannot
 	// have replaced it, and removing it cannot displace a live claim.
-	ranges, resumable := stagingMetaResumable(meta, it, job, commit)
+	ranges, resumable := stagingMetaResumable(meta, it, job, commit, commitPinned)
 	if !resumable || !stagingPayloadSizeOK(staging, it.Size) {
 		removeStagingArtifactsLocked(staging, metaPath)
 		return nil, true, nil
@@ -551,7 +556,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// Atomically replace the validated predecessor. Until the rename installs
 	// the complete new record, the old resume authority remains intact; a crash
 	// during temp creation cannot leave a new empty/partial claim at metaPath.
-	take := newClaimMeta(it, job, commit)
+	take := newClaimMeta(it, job, commit, commitPinned)
 	take.StartedAt = meta.StartedAt
 	take.Ranges = ranges
 	take.LegacyMigrated = meta.LegacyMigrated
@@ -778,18 +783,24 @@ func claimRecordOurs(metaPath string) bool {
 // token, the expected logical size, and the resolved remote identity. Ranges
 // are filled in by the caller once determined (fresh layout or legacy
 // migration) and persisted with writeStagingMeta.
-func newClaimMeta(it PlanItem, job Job, commit string) IncompleteMeta {
+//
+// The identity records whether the commit was actually RESOLVED
+// (commitPinned): a record written under an unpinned identity names a
+// revision whose content may have moved, and such a record never authorizes
+// inheriting its bytes.
+func newClaimMeta(it PlanItem, job Job, commit string, commitPinned bool) IncompleteMeta {
 	return IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      it.Size,
-		SHA256:    it.SHA256,
-		Version:   stagingMetaVersion,
-		Repo:      job.Repo,
-		Commit:    commit,
-		Path:      it.RelativePath,
+		PID:          os.Getpid(),
+		Instance:     processInstanceToken,
+		Host:         processHostname,
+		StartedAt:    time.Now().UTC(),
+		Size:         it.Size,
+		SHA256:       it.SHA256,
+		Version:      stagingMetaVersion,
+		Repo:         job.Repo,
+		Commit:       commit,
+		CommitPinned: commitPinned,
+		Path:         it.RelativePath,
 	}
 }
 
@@ -823,15 +834,29 @@ func stagingPayloadSizeOK(staging string, size int64) bool {
 // stagingMetaResumable validates a staging record against the exact remote
 // object and returns its normalized range layout. It is resumable only when
 // version 2 or the current version, repo, path, size and resolved commit match,
-// the blob SHA is
+// the identity is PINNED on both sides (the record's own flag and the current
+// plan's), the blob SHA is
 // present on both sides or neither (and equal when present), and every range
 // carries a conservative completion marker. Version 2 completion is migrated
 // by reserving its final byte for clean-framing revalidation.
-func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string) ([]RangeProgress, bool) {
+//
+// The pinned rule is the SAME one the single-request path applies (see
+// resumeIdentityPinned): a record written under an unpinned identity names a
+// revision whose content may have moved, so its bytes are never inherited,
+// however well the repository, commit string, path and size match. A record
+// written without the pinned flag is unpinned and therefore not inheritable.
+func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool) {
 	if (meta.Version != stagingMetaVersion && meta.Version != priorStagingMetaVersion) || meta.Size != it.Size || meta.Size <= 0 {
 		return nil, false
 	}
 	if meta.Repo != job.Repo || meta.Path != it.RelativePath || meta.Commit != commit {
+		return nil, false
+	}
+	// The identity must be PINNED on both sides. An unpinned commit is the
+	// planner's fallback to the requested revision, so the content behind
+	// that name can differ between the run that staged the bytes and this
+	// one.
+	if !resumeIdentityPinned(meta.CommitPinned, commitPinned) {
 		return nil, false
 	}
 	// A blob SHA is an all-or-nothing identity claim. If either side has one,
@@ -1190,12 +1215,16 @@ func hasUsableLegacyMultipartState(dst string, size int64) bool {
 // Ownership/liveness is deliberately not part of this check: the multipart
 // claim applies it and either resumes or backs off as owned. The detection only
 // decides whether existing state should keep the multipart route.
-func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, commit string) bool {
+//
+// The identity check is the same one the claim applies, including the PINNED
+// rule: a record staged under an unpinned identity cannot be inherited, so it
+// does not keep the item on the multipart route either.
+func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool) bool {
 	meta, err := readStagingMeta(metaPath)
 	if err != nil || meta == nil {
 		return false
 	}
-	if _, ok := stagingMetaResumable(*meta, it, job, commit); !ok {
+	if _, ok := stagingMetaResumable(*meta, it, job, commit, commitPinned); !ok {
 		return false
 	}
 	return stagingPayloadSizeOK(staging, it.Size)
@@ -1466,6 +1495,13 @@ type stagingDownload struct {
 	// commit is the resolved plan commit forming part of the resume identity.
 	commit string
 
+	// commitPinned reports whether that commit is an immutable, RESOLVED
+	// commit. It is part of the resume identity: a record written under an
+	// unpinned identity (the planner's fallback to the requested revision)
+	// never authorizes inheriting its bytes, so the flag travels with the
+	// commit into every record this download writes.
+	commitPinned bool
+
 	// startedAt is this run's claim start (now). A resumed record's original
 	// StartedAt is diagnostic only; it is deliberately not inherited so the
 	// record always describes the current claim.
@@ -1571,7 +1607,7 @@ func (d *stagingDownload) flushMeta() error {
 // between claim creation and the initial migration/flush) writes an
 // ownership-only record that claims no bytes.
 func (d *stagingDownload) flushMetaLocked() error {
-	meta := newClaimMeta(d.it, d.job, d.commit)
+	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
 	meta.LegacyMigrated = d.legacyMigrated
 	meta.ProofPending = d.proofPending
@@ -1815,7 +1851,7 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	if err := os.Remove(d.meta); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	fresh := newClaimMeta(d.it, d.job, d.commit)
+	fresh := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	fresh.LockFenced = d.osExclusive
 	if _, retry, err := createStagingClaim(d.meta, fresh); err != nil {
 		return nil, err
@@ -1975,7 +2011,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// one that stopped heartbeating — short-circuits the file to a skip in the
 	// caller; only a content-addressed publish target is treated as already
 	// complete.
-	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, cfg, opts.ContentAddressed)
+	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed)
 	if err != nil {
 		return false, err
 	}
@@ -1994,6 +2030,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		meta:             metaPath,
 		emit:             emit,
 		commit:           opts.Commit,
+		commitPinned:     opts.CommitPinned,
 		startedAt:        time.Now().UTC(),
 		legacyMigrated:   state.legacyMigrated,
 		proofPending:     state.proofPending,

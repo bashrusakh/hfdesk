@@ -343,13 +343,15 @@ func TestDownloadMultipart_LegacyMigratedFlagSurvivesResume(t *testing.T) {
 	// The staged payload looks complete (all ranges Done) but is wrong; the
 	// legacy artifacts that produced it are already gone (the crash happened
 	// after the migrated layout became durable). Raw JSON keeps the fixture
-	// readable by the pre-correction code, which ignores the new field.
+	// readable by the pre-correction code, which ignores the new fields. The
+	// record names a RESOLVED, PINNED commit, so it is inheritable and the
+	// resume actually happens.
 	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xFF}, total), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	raw := fmt.Sprintf(
 		`{"pid":%d,"instance":%q,"host":%q,"started":"2025-01-01T00:00:00Z","size":%d,"sha256":%q,`+
-			`"version":%d,"repo":"o/r","path":"flag.bin","commit":"c1",`+
+			`"version":%d,"repo":"o/r","path":"flag.bin","commit":"c1","commit_pinned":true,`+
 			`"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}],"legacy_migrated":true}`,
 		os.Getpid(), processInstanceToken, processHostname, total, sha, stagingMetaVersion, total-1, total)
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
@@ -361,7 +363,7 @@ func TestDownloadMultipart_LegacyMigratedFlagSurvivesResume(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
 
 	hashPassCount.Store(0)
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1"}, func(ProgressEvent) {}); err == nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1", CommitPinned: true}, func(ProgressEvent) {}); err == nil {
 		t.Fatal("a resumed LegacyMigrated record skipped its content proof")
 	}
 	if got := hashPassCount.Load(); got != 1 {
@@ -458,16 +460,17 @@ func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 
 	mid := total / 2
 	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      total,
-		SHA256:    strings.Repeat("a", 64),
-		Version:   stagingMetaVersion,
-		Repo:      "o/r",
-		Path:      "hash-cancel.bin",
-		Commit:    "c1",
+		PID:          os.Getpid(),
+		Instance:     processInstanceToken,
+		Host:         processHostname,
+		StartedAt:    time.Now().UTC(),
+		Size:         total,
+		SHA256:       strings.Repeat("a", 64),
+		Version:      stagingMetaVersion,
+		Repo:         "o/r",
+		Path:         "hash-cancel.bin",
+		Commit:       "c1",
+		CommitPinned: true,
 		Ranges: []RangeProgress{
 			{Start: 0, End: mid - 1, Committed: mid, Done: true},
 			{Start: mid, End: total - 1, Committed: total - mid, Done: true},
@@ -494,7 +497,7 @@ func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 	done := make(chan error, 1)
 	hashPassCount.Store(0)
 	go func() {
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1"}, func(ev ProgressEvent) {
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1", CommitPinned: true}, func(ev ProgressEvent) {
 			if ev.Event == "file_finalizing" && once.CompareAndSwap(false, true) {
 				close(reached)
 			}

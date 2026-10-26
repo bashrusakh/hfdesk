@@ -63,7 +63,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 	}
 
 	_, err = claimStaging(t.Context(), staging, filepath.Join(dir, "published"), metaPath,
-		PlanItem{RelativePath: "payload", Size: int64(len(payload))}, Job{Repo: "o/r"}, "commit", Settings{}, false)
+		PlanItem{RelativePath: "payload", Size: int64(len(payload))}, Job{Repo: "o/r"}, "commit", true, Settings{}, false)
 	if !errors.Is(err, lockErr) || !strings.Contains(err.Error(), "ownership") {
 		t.Fatalf("claim error = %v, want actionable ownership failure", err)
 	}

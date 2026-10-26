@@ -209,7 +209,7 @@ func TestRangedMultipart_FinalChunkFailureRequiresFramingRevalidation(t *testing
 		}
 	}
 	go func() {
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, firstCfg, it, dst, multipartOpts{}, emit)
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, firstCfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, emit)
 		done <- err
 	}()
 	select {
@@ -248,7 +248,7 @@ func TestRangedMultipart_FinalChunkFailureRequiresFramingRevalidation(t *testing
 	}
 
 	recoveryCfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, recoveryCfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, recoveryCfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("recovery run failed after the normalized checkpoint: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -368,9 +368,12 @@ func TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte(t *testing.
 	if err := os.WriteFile(staging, full, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The record states a RESOLVED, PINNED commit, so the fixture exercises the
+	// version-2 LAYOUT migration (the final byte is revalidated) and not the
+	// pinned-identity gate.
 	raw := fmt.Sprintf(
-		`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"complete-prefix.bin","ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
-		host, total, total-1, total)
+		`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"complete-prefix.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
+		host, total, rangedSeedCommit, total-1, total)
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +386,7 @@ func TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte(t *testing.
 
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "complete-prefix.bin", URL: srv.URL + "/complete-prefix.bin", Size: total, AcceptRanges: true}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -426,10 +429,12 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 
 			// A valid-looking completed record from a provably dead foreign
 			// owner. Raw JSON keeps this fixture readable by the pre-fix code
-			// (which ignores instance/host) for falsification.
+			// (which ignores instance/host) for falsification. The record
+			// states a RESOLVED, PINNED commit, so the only reason it may be
+			// discarded is the payload check this test exercises.
 			raw := fmt.Sprintf(
-				`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"ghost.bin","ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
-				host, total, total-1, total)
+				`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"ghost.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
+				host, total, rangedSeedCommit, total-1, total)
 			if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -449,7 +454,7 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 			srv, gotRanges := rangedTestServer(t, full)
 			it := PlanItem{RelativePath: "ghost.bin", URL: srv.URL + "/ghost.bin", Size: total, AcceptRanges: true}
 			cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-			if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+			if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 				t.Fatalf("downloadMultipart: %v", err)
 			}
 			assertExactFile(t, dst, full)
@@ -522,10 +527,12 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 
 	// Stale heartbeat + provably dead same-host owner and no ownership lock:
 	// take-over resumes its validated prefix, while the version-2 completed
-	// range revalidates its final byte under the newer framing contract.
+	// range revalidates its final byte under the newer framing contract. The
+	// record states a RESOLVED, PINNED commit, so the fixture exercises the
+	// take-over and not the pinned-identity gate.
 	staleMeta := fmt.Sprintf(
-		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
-		host, total, total-1)
+		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
+		host, total, rangedSeedCommit, total-1)
 	if err := os.WriteFile(staging+".meta", []byte(staleMeta), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +555,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 
 	srv2, gotRanges := rangedTestServer(t, full)
 	it.URL = srv2.URL + "/pid-reuse.bin"
-	if _, err := downloadMultipart(context.Background(), srv2.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv2.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("take-over of a dead same-host owner failed: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -599,7 +606,7 @@ func TestRangedMultipart_ResolvedCommitMismatchDiscardsStaging(t *testing.T) {
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "commit.bin", URL: srv.URL + "/commit.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, multipartOpts{Commit: "new-commit"}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, multipartOpts{Commit: "new-commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -819,7 +826,7 @@ func TestStagingPublishAlreadyCanceledContextCannotPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	it := PlanItem{RelativePath: "already-canceled.bin", Size: 8}
-	meta := newClaimMeta(it, Job{Repo: "o/r"}, "commit")
+	meta := newClaimMeta(it, Job{Repo: "o/r"}, "commit", true)
 	meta.LockFenced = true
 	meta.Ranges = buildRangeLayout(8, 1)
 	meta.Ranges[0].Committed, meta.Ranges[0].Done = 8, true

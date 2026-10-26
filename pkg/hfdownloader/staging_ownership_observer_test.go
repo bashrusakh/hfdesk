@@ -559,7 +559,7 @@ func runContentionChild(t *testing.T) {
 
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), Size: int64(cfg.Size), LFS: true}
 	state, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, cfg.MetaPath, it,
-		Job{Repo: "o/r"}, "commit123", Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false)
+		Job{Repo: "o/r"}, "commit123", true, Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false)
 	if err != nil {
 		if errors.Is(err, errBlobIncompleteOwned) {
 			writeResult(contentionChildResult{Owned: true})

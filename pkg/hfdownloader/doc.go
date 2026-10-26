@@ -162,6 +162,23 @@ Staging identity includes `plan.Commit`. If fetching repository info fails or
 returns an empty SHA, the planner uses the requested revision string as the
 fallback commit identity; that value is not necessarily an immutable commit.
 
+The RANGED path inherits staged bytes under that identity only when it is
+PINNED on both sides. The claim record carries the resolved commit, the
+repository, the item's relative path and the expected size, and - like the
+single-request sidecar - whether that commit was actually resolved rather than
+the requested revision standing in for it. A record is resumable only when the
+identity matches the current item exactly (repo, commit, path, size), the
+identity is PINNED on both sides (the record's own flag and the current
+plan's), the blob SHA is present on both sides or neither, the range layout
+tiles the file with normalized completion, and the payload exists at the
+expected logical size. Otherwise the record is discarded and the payload is
+downloaded again: an unpinned identity pins nothing - a moved branch may
+change the content under that name - so no bytes are inherited from it, and
+with no known digest there is no content proof that could catch the mixture
+either. A record written without the pinned flag is unpinned, and therefore
+not resumable: the safe direction, and no released version ever wrote these
+records.
+
 The single-request path has its own resume IDENTITY, because its staging name
 is not one. For an item without a known digest the staging name is derived
 from the item's path (`tmp-<sanitized path>`), so two different objects - or
@@ -219,8 +236,18 @@ The staging shapes are derived from the code that creates them:
 A published blob is named by its content: a canonical 64-hex SHA-256 digest.
 A file in `blobs/` that is neither a staging artifact nor a canonical digest
 is an UNUSUAL published name - the public storage API accepts such names, so
-it is content: it is copied, verified and counted, and it is never dropped,
-deleted or treated as a staging artifact.
+it is content: the cache statistics count it, the listing shows it, the
+selection sees it, the mirror copies and verifies it, and the deletion path
+may delete it.
+
+The classification is by NAME SHAPE, so a `blobs/` name that CARRIES a
+staging shape - `tmp-<name>`, `<name>.part`, `<name>.part.meta`,
+`<name>.lock`, `<name>.incomplete`, `<name>.incomplete.meta`,
+`<name>.meta.tmp`, `<name>.part-NN`, `<name>.parts.json` or
+`<name>.tmp-<random>` - is treated as a staging artifact by EVERY surface,
+including the deletion path (the conservative choice: a staging artifact is
+never deleted), even when such a name was published content. A canonical
+64-hex blob is unaffected: it is content, and the deletion path may remove it.
 
 The staging exclusion applies ONLY inside `blobs/`, the namespace the
 downloader writes these artifacts into. A legitimate `*.meta` (or `*.part`,
@@ -521,7 +548,10 @@ may share the authoritative record's inode, is never written through and can
 never empty the authoritative record before it is replaced.
 
 The single-request path follows the same validation model. A resumed `.part` is
-a sequential prefix with no record, so it is never assumed complete: every
+a sequential prefix with no range-layout record - it is identified by the
+`<dst>.part.meta` sidecar (the repository, the resolved commit, the item's
+relative path, the expected size and whether that commit was pinned), not by
+a per-range layout - so it is never assumed complete: every
 ranged (206) response must match the exact requested Content-Range, expected
 total and body length, writes are bounded to the requested range, and the file
 must have exactly the expected size before the rename. A reader/copy error after
