@@ -661,7 +661,15 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			return err
 		}
 
-		dst := filepath.Join(dstPath, rel)
+		// Guard: SafeJoin so the walked repository-relative path cannot escape
+		// the destination repository. SafeJoin's filepath.IsLocal check also
+		// makes this barrier visible to CodeQL's go/path-injection analysis.
+		// The symlinked-parent check below still applies: SafeJoin is lexical
+		// and does not see symlinks.
+		dst, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
 		// Staging payloads, records, their atomic-write temp and ownership lock
 		// files are not stored content; mirrors copy only finished blobs.
 		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
@@ -697,6 +705,8 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
 			os.Remove(dst)
+			// The link target is contained: an absolute target is rejected and the resolved target must stay inside repoPath.
+			// lgtm[go/path-injection]
 			return os.Symlink(link, dst)
 		}
 
@@ -778,7 +788,13 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 			return nil
 		}
 
-		dstFile := filepath.Join(dstPath, rel)
+		// Guard: SafeJoin so the walked repository-relative path cannot escape
+		// the destination repository. SafeJoin's filepath.IsLocal check also
+		// makes this barrier visible to CodeQL's go/path-injection analysis.
+		dstFile, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
 
 		if info.Mode()&os.ModeSymlink != 0 {
 			// A snapshot entry is a link and the copy reproduces the link, so
