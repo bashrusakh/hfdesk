@@ -2264,9 +2264,20 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 func removeEmptyPartialFile(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
-		// The file is already gone: there is nothing left for a sidecar to
-		// describe.
-		return true
+		if os.IsNotExist(err) {
+			// The file is already gone: there is nothing left for a sidecar
+			// to describe.
+			return true
+		}
+		// The stat FAILED, so whether the partial still exists is UNKNOWN
+		// (a permission error, a symlink loop, an I/O error, ...). The caller
+		// uses this answer to decide whether the identity sidecar may be
+		// removed together with the partial. Removing a sidecar whose partial
+		// may still be on disk would make the next run unable to prove the
+		// identity of the surviving bytes and discard them, so the
+		// conservative answer is false: the sidecar survives.
+		downloadLog.Warn("cannot stat partial file; keeping its identity sidecar", "path", path, "error", err)
+		return false
 	}
 	if fi.Size() != 0 {
 		return false

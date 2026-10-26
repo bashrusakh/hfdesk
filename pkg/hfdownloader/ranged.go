@@ -415,13 +415,65 @@ type stagingClaimState struct {
 // existence proves completion. commitPinned is the CURRENT plan's pinned
 // identity: the record's own flag must agree with it before any staged byte
 // may be inherited.
-func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool) (*stagingClaimState, error) {
+//
+// A claim is a WAIT, not a transfer. When the item's context carries its
+// MaxActiveDownloads slot notice (see download_slot.go and the item goroutine
+// in downloader.go), the claim returns that slot for the duration of EVERY
+// wait it can perform - the in-process staging owner, the cross-process
+// lifetime OS lock and the local metadata gate - and takes it back before it
+// returns a claim the caller will transfer under. A failed claim keeps the
+// slot returned, exactly like a failed domain acquisition: no claim reaches
+// the caller, so the item reports the error instead of transferring.
+func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool) (state *stagingClaimState, err error) {
 	// Durable proof gate: a fresh claim for a known-digest mode starts with
 	// ProofPending set, and a take-over preserves the record's flag (or adds it
 	// when the current mode/item still needs the proof). The claim write is
 	// therefore durable before any transfer or proof starts.
 	proofMode := it.SHA256 != "" && (cfg.Verify == "sha256" || cfg.Verify == "etag")
 	proofForKnownDigest := it.SHA256 != "" && cfg.Verify != "none"
+
+	// One idempotent wait signal for the WHOLE claim: once the slot has been
+	// returned it stays returned across retry rounds, and the final success or
+	// error path below decides whether it is taken back. The deferred
+	// finalizer is the only place that reacquires it, so a claim can never
+	// reach the caller without the item's slot held.
+	notice := downloadSlotWaitNoticeFromContext(ctx)
+	waiting := false
+	beginWait := func() {
+		if notice == nil || waiting {
+			return
+		}
+		waiting = true
+		notice.beginWait()
+	}
+	defer func() {
+		if !waiting {
+			return
+		}
+		if state == nil || err != nil {
+			// The claim FAILED, so no claim reaches the caller and the item is
+			// about to report the error instead of transferring. The slot must
+			// stay returned: re-taking it here would make an actionable
+			// failure wait for an unrelated transfer. The lease's deferred
+			// release is a no-op while the slot is returned.
+			if state != nil {
+				state.release()
+				state = nil
+			}
+			return
+		}
+		if !notice.endWait() {
+			// The item's context ended while it waited, so the slot cannot be
+			// taken back. A claim handed out here would let the caller
+			// transfer without a slot: release it and report the
+			// cancellation.
+			state.release()
+			state = nil
+			if err == nil {
+				err = ctx.Err()
+			}
+		}
+	}()
 
 	for round := 0; round < 8; round++ {
 		// A content-addressed blob may have been published while we were
@@ -444,6 +496,9 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		}
 		stagingOwnersMu.Unlock()
 		if busy {
+			// The in-process owner is busy, so this claim is about to wait
+			// for it: return the item's download slot for the wait.
+			beginWait()
 			select {
 			case <-entry.done:
 				// Owner finished: re-evaluate (publish may now exist).
@@ -467,7 +522,11 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		// caller reports it as owned instead of displacing it. An
 		// unresolvable contention is an actionable failure, never a
 		// successful skip.
-		own, oerr := acquireStagingOwnershipLockCtx(ctx, staging)
+		//
+		// beginWait is passed as the acquisition's onWait: a contended
+		// attempt is about to wait, so the item returns its slot for it. The
+		// free fast path never calls it.
+		own, oerr := acquireStagingOwnershipLockCtx(ctx, staging, beginWait)
 		osExclusive := oerr == nil
 		if oerr != nil {
 			stagingOwnersMu.Lock()
@@ -496,7 +555,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 
 		// Local record-transition serialization; the lifetime OS lock already excludes other current-version processes.
 		lock := &stagingStateLock{path: stagingLockPath(metaPath)}
-		if lerr := lock.acquire(ctx, stagingLockWait); lerr != nil {
+		if lerr := lock.acquireWithWait(ctx, stagingLockWait, beginWait); lerr != nil {
 			release()
 			if cerr := ctx.Err(); cerr != nil {
 				return nil, cerr
@@ -508,7 +567,11 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 			}
 			return nil, lerr
 		}
-		state, retry, cerr := claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode, proofForKnownDigest)
+		// Assign to the NAMED return instead of shadowing it: the deferred
+		// finalizer needs the exact claim it must slot-gate or release.
+		var retry bool
+		var cerr error
+		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode, proofForKnownDigest)
 		lock.release()
 		if cerr != nil {
 			release()

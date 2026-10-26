@@ -7,57 +7,63 @@ package hfdownloader
 //
 // An item is not always transferring: when its destination is owned by a
 // PROVEN live writer it WAITS for that destination ownership domain
-// (acquireBlobDomain, through acquireBlobDomainWithin). A destination-domain
+// (acquireBlobDomain, through acquireBlobDomainWithin), and the multipart
+// route WAITS for its staging claim (claimStaging: the in-process staging
+// owner, the cross-process lifetime OS lock and the local metadata gate). A
 // waiter consumes no bandwidth, so it must not consume one of the job's
-// MaxActiveDownloads slots: with a low limit a
-// single waiting item would otherwise keep every other file of the job from
-// starting, the job would look stalled, and a concurrency budget meant for
-// TRANSFERS would be spent on a wait.
+// MaxActiveDownloads slots: with a low limit a single waiting item would
+// otherwise keep every other file of the job from starting, the job would look
+// stalled, and a concurrency budget meant for TRANSFERS would be spent on a
+// wait.
 //
 // The slot is therefore held through a small per-item LEASE:
 //
 //   - the item goroutine owns one slot from its start (the download loop
 //     acquired it before launching the goroutine);
-//   - when a domain acquisition is about to BLOCK, it signals the lease
-//     through the item's context (withDownloadSlotWaitNotice), the lease
-//     returns the slot, and the wait continues without it;
-//   - before the acquisition returns - a domain the caller will transfer
-//     under, or an error - the lease REACQUIRES the slot, bounded by the
-//     item's context. An item never continues to transfer without its slot.
+//   - when a domain acquisition or a staging claim is about to BLOCK, it
+//     signals the lease through the item's context
+//     (withDownloadSlotWaitNotice), the lease returns the slot, and the wait
+//     continues without it;
+//   - before the acquisition/claim returns - a domain/claim the caller will
+//     transfer under, or an error - the lease REACQUIRES the slot, bounded by
+//     the item's context. An item never continues to transfer without its
+//     slot. A FAILED acquisition/claim keeps the slot returned: nothing
+//     reaches the caller, so the item reports the error instead of
+//     transferring, and re-taking the slot would make the failure wait for an
+//     unrelated transfer.
 //
-// The signal is emitted by acquireBlobDomainWithin itself, because that is the
-// only place that knows BOTH waits: the in-process domain slot and the
-// cross-process lifetime OS lock. A caller guessing "this looks contended"
-// would miss the cross-process wait, and the fast path (the domain is free,
-// which is the normal case) never emits the signal, so it neither releases nor
-// reacquires the slot.
+// The signal is emitted by the acquisition/claim itself, because that is the
+// only place that knows about every wait: acquireBlobDomainWithin for the
+// in-process domain slot and the cross-process lifetime OS lock, claimStaging
+// for the in-process staging owner, the cross-process staging OS lock and the
+// local metadata gate. A caller guessing "this looks contended" would miss a
+// wait, and the fast path (the resource is free, which is the normal case)
+// never emits the signal, so it neither releases nor reacquires the slot.
 //
 // Deadlock freedom: the lease returns the slot BEFORE the item blocks on a
-// domain, so an item that waits for a domain never holds a slot while it
-// waits. The slot wait of a contended item happens only AFTER it owns its
-// domain, and the slot it waits for can only be held by
+// domain or a claim, so an item that waits never holds a slot while it waits.
+// The slot wait of a contended item happens only AFTER it owns its domain or
+// claim, and the slot it waits for can only be held by
 //
 //   - an item that is transferring (it finishes or is cancelled), or
-//   - an item that acquired a domain and is itself reacquiring its slot
+//   - an item that acquired a domain/claim and is itself reacquiring its slot
 //     (that item waits for a DIFFERENT domain: a second contender for the same
 //     key is stopped at that key's in-process slot, so two contenders for one
 //     key cannot both hold it), or
-//   - the multipart route's staging claim, which is a SEPARATE ownership wait
-//     and still runs with the item's slot held - the documented exception to
-//     "a destination-domain waiter holds no slot": a cross-process claimant
-//     waits at most stagingOwnershipAcquireWait (5s) and then fails with the
-//     actionable ownership error, while an in-process claimant waits for the
-//     current owner bounded by the item's context. It cannot deadlock either:
-//     it gives up, or the owner finishes and releases.
+//   - an item waiting on the multipart route's staging claim, which now
+//     returns its slot for that wait too (the in-process owner wait, the
+//     cross-process OS-lock window and the local metadata gate): waiting
+//     items hold no slot.
 //
-// So the wait graph cannot contain a cycle. The OS ownership lock is still
+// So the wait graph cannot contain a cycle. The OS ownership locks are still
 // taken exactly once: this mechanism only moves the job's semaphore token, and
 // no item takes the same lock twice.
 
 import "context"
 
 // downloadSlotWaitNotice is the item-side signal of an ownership-domain
-// acquisition that must WAIT for a PROVEN live owner.
+// acquisition or multipart staging claim that must WAIT for a PROVEN live
+// owner (or for a local writer/gate).
 //
 // beginWait is idempotent for one acquisition; endWait reports whether the
 // item's slot was taken back (false when the item's context ended first, in
@@ -68,16 +74,18 @@ type downloadSlotWaitNotice interface {
 }
 
 // downloadSlotWaitNoticeKey is the context key under which an item's slot
-// notice is carried to the ownership-domain acquisition.
+// notice is carried to the ownership-domain acquisition and the multipart
+// staging claim.
 type downloadSlotWaitNoticeKey struct{}
 
 // withDownloadSlotWaitNotice attaches an item's download-slot notice to its
 // context.
 //
-// The context is the item's own per-file context, so an acquisition made by
-// the item (the cache destination's domain, the flat destination's domain and
-// the flat-mode hand-off inside downloadMultipart) sees exactly this item's
-// lease. Acquisitions that are not item work (the cleanup, the cache store's
+// The context is the item's own per-file context, so a wait made by the item
+// (the cache destination's domain, the flat destination's domain, the
+// flat-mode hand-off inside downloadMultipart, and the multipart staging claim
+// that runs inside downloadMultipart) sees exactly this item's lease.
+// Acquisitions that are not item work (the cleanup, the cache store's
 // standalone path, exported FinalizeBlob) are not given this context and keep
 // their behavior unchanged.
 func withDownloadSlotWaitNotice(ctx context.Context, notice downloadSlotWaitNotice) context.Context {
@@ -97,9 +105,9 @@ func downloadSlotWaitNoticeFromContext(ctx context.Context) downloadSlotWaitNoti
 // downloadSlotLease is ONE item's lease on a MaxActiveDownloads slot.
 //
 // Only the item's own goroutine touches it: beginWait/endWait are called from
-// the domain acquisition that runs in that goroutine, and release is deferred
-// by the same goroutine. No mutex is needed, and no other goroutine may use the
-// lease.
+// the domain acquisition or the staging claim that runs in that goroutine, and
+// release is deferred by the same goroutine. No mutex is needed, and no other
+// goroutine may use the lease.
 type downloadSlotLease struct {
 	// lim is the job's MaxActiveDownloads semaphore.
 	lim chan struct{}
@@ -127,14 +135,15 @@ func (l *downloadSlotLease) release() {
 	<-l.lim
 }
 
-// beginWait returns the slot for the duration of an ownership-domain wait.
+// beginWait returns the slot for the duration of an ownership-domain wait or
+// a staging-claim wait.
 func (l *downloadSlotLease) beginWait() {
 	l.release()
 }
 
-// endWait takes the slot back before the acquisition returns, bounded by the
-// item's context. It reports false when the context ended first: the item is
-// cancelled, so it must not continue to transfer.
+// endWait takes the slot back before the acquisition/claim returns, bounded by
+// the item's context. It reports false when the context ended first: the item
+// is cancelled, so it must not continue to transfer.
 func (l *downloadSlotLease) endWait() bool {
 	if l == nil || l.held {
 		return true

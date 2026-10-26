@@ -222,8 +222,14 @@ var stagingOwnershipContentionHook func(staging string)
 // staging file belongs to that writer, and the caller must not take it over.
 // The blob key's ownership protocol needs a different shape - it WAITS for
 // the live owner - and uses acquireStagingOwnershipLockWaiting for that.
-func acquireStagingOwnershipLockCtx(ctx context.Context, staging string) (*stagingOwnershipLock, error) {
-	return acquireStagingOwnershipLockWithin(ctx, staging, stagingOwnershipAcquireWait)
+//
+// onWait is called when a contended attempt is about to block (never on the
+// free fast path). claimStaging uses it to return the item's
+// MaxActiveDownloads slot for the duration of the wait (see download_slot.go);
+// the lock is still acquired exactly as before, and a nil onWait is the
+// historical behavior.
+func acquireStagingOwnershipLockCtx(ctx context.Context, staging string, onWait func()) (*stagingOwnershipLock, error) {
+	return acquireStagingOwnershipLockWithinMode(ctx, staging, stagingOwnershipAcquireWait, false, onWait)
 }
 
 // acquireStagingOwnershipLockWithin takes the exclusive ownership lock for

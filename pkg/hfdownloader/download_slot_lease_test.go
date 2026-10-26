@@ -681,16 +681,24 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 	}
 }
 
-// slotNoticeRecorder records the lease signals of a domain acquisition.
+// slotNoticeRecorder records the lease signals of a domain acquisition or a
+// staging claim.
 type slotNoticeRecorder struct {
 	mu     sync.Mutex
 	begins int
 	ends   int
+	// began is closed on the FIRST beginWait when the test installed it. It is
+	// the deterministic "the acquisition/claim is now waiting" signal; tests
+	// that only count signals leave it nil.
+	began chan struct{}
 }
 
 func (r *slotNoticeRecorder) beginWait() {
 	r.mu.Lock()
 	r.begins++
+	if r.begins == 1 && r.began != nil {
+		close(r.began)
+	}
 	r.mu.Unlock()
 }
 
@@ -699,6 +707,13 @@ func (r *slotNoticeRecorder) endWait() bool {
 	r.ends++
 	r.mu.Unlock()
 	return true
+}
+
+// counts reports the recorded begin/end signal counts.
+func (r *slotNoticeRecorder) counts() (begins, ends int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.begins, r.ends
 }
 
 // TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot pins the

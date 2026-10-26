@@ -59,6 +59,16 @@ func stagingLockPath(metaPath string) string { return metaPath + stagingLockSuff
 
 // acquire waits at most wait for the local gate, while honoring cancellation.
 func (l *stagingStateLock) acquire(ctx context.Context, wait time.Duration) error {
+	return l.acquireWithWait(ctx, wait, nil)
+}
+
+// acquireWithWait is acquire with an onWait signal. It performs one
+// non-blocking attempt first, so the FREE fast path never signals anything,
+// and calls onWait only when the gate is actually held by another local writer
+// and this acquisition is about to block. The download path uses it to return
+// the item's MaxActiveDownloads slot for the duration of the wait (see
+// download_slot.go); a nil onWait is the historical behavior.
+func (l *stagingStateLock) acquireWithWait(ctx context.Context, wait time.Duration, onWait func()) error {
 	if wait <= 0 {
 		wait = stagingLockWait
 	}
@@ -70,6 +80,16 @@ func (l *stagingStateLock) acquire(ctx context.Context, wait time.Duration) erro
 	}
 	gate.refs++
 	stagingStateGates.Unlock()
+	// Free fast path: take the gate without ever announcing a wait.
+	select {
+	case gate.ch <- struct{}{}:
+		l.gate = gate
+		return nil
+	default:
+	}
+	if onWait != nil {
+		onWait()
+	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {

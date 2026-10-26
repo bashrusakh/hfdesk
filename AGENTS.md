@@ -329,32 +329,36 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the effective budget is 5 MINUTES); it is a package-level knob, not a user
   setting, and the in-process slot wait is bounded by the job's context only
   (its holder is a goroutine of this process that finishes or is cancelled).
-  Cancellation stays prompt. A DESTINATION-DOMAIN waiter does NOT hold an
-  `MaxActiveDownloads` slot: the slot is a per-item lease that the
-  ownership-domain acquisition returns for the duration of every wait (the
-  in-process slot wait and the cross-process OS-lock wait alike) and takes
-  back before it returns a domain the caller will transfer under. The slot
-  therefore bounds concurrent TRANSFERS, not destination-domain waiters, so
-  the other files of the job proceed while one item waits — a low limit no
-  longer keeps the transfer budget from starting the files that could
-  transfer. Destination-domain waiters do not consume transfer slots (any
-  number of items may wait) while the configured limit still bounds
-  concurrent transfers. A contended item that has acquired its domain may
-  wait to take its slot back, and that wait cannot deadlock: an item never
-  blocks on a domain while holding a slot, and two contenders for one key
-  cannot both hold its domain. The MULTIPART staging CLAIM is a separate
-  ownership wait and is the documented EXCEPTION to "waiters do not consume
-  transfer slots": it still runs with the item's slot held. A cross-process
-  claimant waits at most `stagingOwnershipAcquireWait` (5s) and then fails
-  with the actionable ownership error; an in-process claimant waits for the
-  current owner bounded by the item's context. That wait cannot deadlock
-  either — it gives up when its short budget expires, or ends when the owner
-  finishes — and it is not part of the domain lease. What the operator sees:
+  Cancellation stays prompt. Neither a DESTINATION-DOMAIN waiter nor a
+  MULTIPART STAGING CLAIM waiter holds a `MaxActiveDownloads` slot: the slot
+  is a per-item lease that the ownership-domain acquisition (the in-process
+  slot wait and the cross-process OS-lock wait alike) AND the multipart
+  staging claim (the in-process staging owner, the cross-process staging OS
+  lock and the local metadata gate) return for the duration of every wait and
+  take back before they return a domain/claim the caller will transfer under.
+  The slot therefore bounds concurrent TRANSFERS, not waiters, so the other
+  files of the job proceed while one item waits — a low limit no longer keeps
+  the transfer budget from starting the files that could transfer. Waiters do
+  not consume transfer slots (any number of items may wait) while the
+  configured limit still bounds concurrent transfers. A contended item that
+  has acquired its domain or claim may wait to take its slot back, and that
+  wait cannot deadlock: an item never blocks on a domain or claim while
+  holding a slot, and two contenders for one key cannot both hold its
+  domain/claim. A FAILED claim keeps the slot returned (no claim reaches the
+  caller, so the item reports the error instead of transferring), exactly
+  like a failed domain acquisition. Waiting items are still goroutines bounded
+  by the job's file set, and the slot is reacquired before the transfer. The
+  claim's waits and budgets are unchanged: an in-process claimant waits for
+  the current owner bounded by the item's context, a PROVEN live cross-process
+  owner is reported at once with the actionable ownership error, transient
+  cross-process contention is waited out within `stagingOwnershipAcquireWait`
+  (5s), and the local metadata gate is waited out within `stagingLockWait`.
+  What the operator sees:
   the item stays in progress (no progress events are emitted while it waits,
-  so its byte counter does not move), and when the budget expires the item
-  fails with the actionable error above and the job's status is failed, not
-  completed. The existing "blob exists" skip (the file IS
-  present) and the existing unknown-ownership error
+  so its byte counter does not move), and when a budget expires or a live
+  owner is reported the item fails with the actionable error above and the
+  job's status is failed, not completed. The existing "blob exists" skip (the
+  file IS present) and the existing unknown-ownership error
   (`BlobOwnershipUnknown`) are unchanged.
 - A LINK-CREATION FAILURE FAILS THE ITEM, IN EVERY PATH. A cached file is
   reachable through its snapshot entry (and its friendly entry); the payload in
@@ -617,23 +621,28 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the item fails with an actionable error, and the job's status is failed, not
   completed — see the downloader correctness rules for the ownership protocol.
   The wait budget is 5 minutes, and the wait runs inside the item's goroutine.
-  A DESTINATION-DOMAIN waiter does NOT hold one of the job's
-  `MaxActiveDownloads` slots: the slot is a per-item lease returned for the
-  duration of every ownership-domain wait (in-process and cross-process
-  alike) and taken back before the acquisition returns, so the slot bounds
-  concurrent TRANSFERS rather than destination-domain waiters. Other files of
-  the job therefore proceed while one item waits, even with a low limit;
-  destination-domain waiters do not consume transfer slots, while concurrent
-  transfers still obey the configured limit. The multipart staging CLAIM is
-  the separately documented EXCEPTION: that ownership wait still runs with
-  the item's slot held (a cross-process claimant waits at most
-  `stagingOwnershipAcquireWait`, 5s, before the actionable ownership error;
-  an in-process claimant waits for the current owner bounded by the item's
-  context), cannot deadlock, and is not part of the domain lease. What the
+  Neither a DESTINATION-DOMAIN waiter nor a MULTIPART STAGING CLAIM waiter
+  holds one of the job's `MaxActiveDownloads` slots: the slot is a per-item
+  lease returned for the duration of every ownership-domain wait (in-process
+  and cross-process alike) AND every multipart staging-claim wait (the
+  in-process staging owner, the cross-process staging OS lock and the local
+  metadata gate), and taken back before the acquisition/claim returns, so the
+  slot bounds concurrent TRANSFERS rather than waiters. Other files of the job
+  therefore proceed while one item waits, even with a low limit; waiters do
+  not consume transfer slots, while concurrent transfers still obey the
+  configured limit. A failed claim keeps the slot returned, exactly like a
+  failed domain acquisition. Waiting items are still goroutines bounded by the
+  job's file set, and the claim takes its slot back before the transfer; the
+  claim's own waits and budgets are unchanged (an in-process claimant waits
+  for the current owner bounded by the item's context; a PROVEN live
+  cross-process owner is reported at once with the actionable ownership
+  error; transient cross-process contention is waited out within
+  `stagingOwnershipAcquireWait`, 5s; the local metadata gate within
+  `stagingLockWait`). What the
   operator sees: the item stays in progress (no progress events are emitted
-  while it waits, so its byte counter does not move), and when the budget
-  expires the item fails with the actionable error and the job's status is
-  failed.
+  while it waits, so its byte counter does not move), and when a budget
+  expires or a live owner is reported the item fails with the actionable
+  error and the job's status is failed.
   A failed link creation (the snapshot or friendly entry of a cached file
   could not be created) also fails the item, in the transfer path and in both
   skip paths alike: the payload may be in `blobs/`, but the requested path is

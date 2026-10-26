@@ -540,25 +540,30 @@ complete — the same content-addressed assumption the pre-existing skip already
 makes. The wait
 budget is a package-level knob derived from the existing ownership-lock
 convention — 60 times the 5s acquisition window, so the effective budget is 5
-minutes — not a user setting. The wait runs inside the item's goroutine, but a
-DESTINATION-DOMAIN waiter does NOT hold one of the job's `MaxActiveDownloads`
-slots: the slot is a per-item lease that the ownership-domain acquisition
-returns for the duration of every wait (the in-process slot wait and the
-cross-process OS-lock wait alike) and takes back before it returns a domain
-the caller will transfer under. The slot therefore bounds concurrent TRANSFERS,
-not destination-domain waiters, so the other files of the job proceed while
-one item waits, even with a low limit; destination-domain waiters do not
-consume transfer slots, while concurrent transfers still obey the configured
-limit. The MULTIPART staging CLAIM is a separate ownership wait and is the
-documented EXCEPTION to that rule: it still runs with the item's slot held. A
-cross-process claimant waits at most `stagingOwnershipAcquireWait` (5s) and
-then fails with the actionable ownership error; an in-process claimant waits
-for the current owner bounded by the item's context. That wait cannot
-deadlock — it gives up, or ends when the owner finishes — and it is not part
-of the domain lease. While the item waits it emits no progress events, so
-its byte counter does not move and the item simply stays in progress; when the
-budget expires the item fails with the actionable error above and the job does
-not report success.
+minutes — not a user setting. The wait runs inside the item's goroutine, but
+neither a DESTINATION-DOMAIN waiter nor a MULTIPART STAGING CLAIM waiter holds
+one of the job's `MaxActiveDownloads` slots: the slot is a per-item lease that
+the ownership-domain acquisition AND the multipart staging claim return for the
+duration of every wait (the in-process domain slot, the cross-process domain
+lock, the in-process staging owner, the cross-process staging lock and the
+local metadata gate alike) and take back before they return a domain/claim the
+caller will transfer under. The slot therefore bounds concurrent TRANSFERS,
+not waiters, so the other files of the job proceed while one item waits, even
+with a low limit; waiters do not consume transfer slots, while concurrent
+transfers still obey the configured limit. A FAILED claim keeps the slot
+returned, exactly like a failed domain acquisition: no claim reaches the
+caller, so the item reports the error instead of transferring. Waiting items
+are still goroutines bounded by the job's file set, the claim takes its slot
+back before the transfer, and cancellation stays prompt. The claim's waits and
+budgets are unchanged: an
+in-process claimant waits for the current owner bounded by the item's context,
+a PROVEN live cross-process owner is reported at once with the actionable
+ownership error, transient cross-process contention is waited out within
+`stagingOwnershipAcquireWait` (5s), and the local metadata gate within
+`stagingLockWait`. While the item waits it emits no progress events, so
+its byte counter does not move and the item simply stays in progress; when a
+budget expires or a live owner is reported the item fails with the actionable
+error above and the job does not report success.
 
 A cached file is reachable through its snapshot entry and its friendly entry;
 the payload in `blobs/` alone is not the requested path. The transfer path
@@ -702,11 +707,12 @@ Two levels of concurrency are configurable:
   - Concurrency: Number of parallel HTTP connections per file (for multipart downloads)
   - MaxActiveDownloads: Maximum number of files TRANSFERRING simultaneously
     (the limit bounds concurrent transfers, not waiters: a file waiting for
-    another writer's destination ownership domain does not consume a slot. The
-    multipart staging claim is the separately documented exception - that
-    ownership wait still runs with the item's slot held, a cross-process
-    claimant waits at most `stagingOwnershipAcquireWait` (5s) and an in-process
-    claimant waits for the current owner bounded by the item's context)
+    another writer's destination ownership domain, or for a multipart staging
+    claim, does not consume a slot. Both the domain acquisition and the staging
+    claim - its in-process staging owner, its cross-process staging OS lock and
+    its local metadata gate - return the slot for a wait and take it back
+    before returning a domain/claim the caller will transfer under; a failed
+    claim keeps the slot returned)
 
 # Error Handling
 
