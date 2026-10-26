@@ -382,3 +382,83 @@ func TestDownloadSlotLeaseStagingClaimWait(t *testing.T) {
 		t.Errorf("a.bin payload requests = %d, want exactly 1", got)
 	}
 }
+
+// stagingClaimEndWaitFalseNotice simulates the one window the real lease
+// cannot be driven into deterministically: the claim itself SUCCEEDS, but the
+// item's context ends while the slot is being taken back. Production endWait
+// returns false only when the item context is done, which this fake reproduces
+// by cancelling that same context itself.
+type stagingClaimEndWaitFalseNotice struct {
+	once   sync.Once
+	began  chan struct{}
+	cancel context.CancelFunc
+}
+
+func (n *stagingClaimEndWaitFalseNotice) beginWait() {
+	n.once.Do(func() { close(n.began) })
+}
+
+func (n *stagingClaimEndWaitFalseNotice) endWait() bool {
+	n.cancel()
+	return false
+}
+
+// TestStagingClaimLeaseEndWaitFalseReleasesClaim pins the claim's last lease
+// branch: the claim succeeded internally, but the slot could not be taken back
+// because the item's context ended while endWait was waiting for it. A claim
+// handed to the caller in that state would let it transfer without a slot, so
+// the claim must release the ownership it just acquired and report the
+// cancellation instead.
+//
+// The release is proven by a FRESH claim on the SAME fixture: it can only
+// succeed if BOTH ownership layers of the discarded claim are really gone - the
+// cross-process OS lifetime lock and the in-process stagingOwners entry.
+// Otherwise it would see a live owner and fail (or time out).
+func TestStagingClaimLeaseEndWaitFalseReleasesClaim(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	f := newStagingClaimTestFixture(t)
+	releaseOwner := installStagingOwnerForTest(t, f.staging)
+	t.Cleanup(releaseOwner)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	notice := &stagingClaimEndWaitFalseNotice{began: make(chan struct{}), cancel: cancel}
+	result := f.claimAsync(withDownloadSlotWaitNotice(ctx, notice))
+
+	// The claim is waiting for the in-process owner: releasing the owner lets
+	// the claim itself SUCCEED, which is what makes the finalizer call endWait.
+	select {
+	case <-notice.began:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the staging claim never returned the item's transfer slot for its wait (no beginWait signal)")
+	}
+	releaseOwner()
+
+	var res stagingClaimResult
+	select {
+	case res = <-result:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the staging claim did not return after the in-process owner released")
+	}
+	if res.state != nil {
+		res.state.release()
+		t.Fatalf("a claim whose slot could not be taken back returned a claim state: %+v", res.state)
+	}
+	if !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("claim error = %v, want context.Canceled", res.err)
+	}
+
+	fresh, err := f.claim(context.Background())
+	if err != nil {
+		t.Fatalf("fresh claim after the discarded claim: %v (the discarded claim did not release its ownership)", err)
+	}
+	if fresh == nil {
+		t.Fatal("fresh claim after the discarded claim returned no state")
+	}
+	var freshOnce sync.Once
+	releaseFresh := func() { freshOnce.Do(fresh.release) }
+	t.Cleanup(releaseFresh)
+	releaseFresh()
+}

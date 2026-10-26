@@ -24,13 +24,13 @@ package hfdownloader
 //     signals the lease through the item's context
 //     (withDownloadSlotWaitNotice), the lease returns the slot, and the wait
 //     continues without it;
-//   - before the acquisition/claim returns - a domain/claim the caller will
-//     transfer under, or an error - the lease REACQUIRES the slot, bounded by
-//     the item's context. An item never continues to transfer without its
-//     slot. A FAILED acquisition/claim keeps the slot returned: nothing
-//     reaches the caller, so the item reports the error instead of
-//     transferring, and re-taking the slot would make the failure wait for an
-//     unrelated transfer.
+//   - before returning a domain/claim the caller will transfer under, the
+//     lease REACQUIRES the slot, bounded by the item's context. An item never
+//     continues to transfer without its slot. A FAILED acquisition/claim
+//     returns no domain/claim, keeps the slot returned, and the item reports
+//     the error instead of transferring: nothing reaches the caller, and
+//     re-taking the slot would make the failure wait for an unrelated
+//     transfer.
 //
 // The signal is emitted by the acquisition/claim itself, because that is the
 // only place that knows about every wait: acquireBlobDomainWithin for the
