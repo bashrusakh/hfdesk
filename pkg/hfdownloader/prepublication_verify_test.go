@@ -39,7 +39,7 @@ func prePublishHub(t *testing.T, declared, served []byte) *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte(fmt.Sprintf(
 				`[{"type":"file","path":"model.bin","size":%d,"lfs":{"oid":"%s","size":%d,"sha256":"%s"}}]`,
 				len(served), sha, len(served), sha)))

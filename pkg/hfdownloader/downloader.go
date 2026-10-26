@@ -1246,14 +1246,27 @@ func cleanupPartialsOnCancel(cfg Settings, dst, staging string) {
 // dst+".part" prefix for dst. It never touches the ranged staging pair. The
 // single-request identity sidecar goes with the partial it describes.
 func cleanupLegacyPartials(dst string) {
-	// lgtm[go/path-injection]
-	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
-	}
-	removeSinglePartIdentity(singlePartIdentityPath(dst))
+	removePartialWithIdentity(dst)
 	if err := removeMultipartResumeFiles(dst); err != nil {
 		downloadLog.Warn("cleanup multipart resume files failed", "path", dst, "error", err)
 	}
+}
+
+// removePartialWithIdentity removes the single-request partial of dst and the
+// identity sidecar that describes it.
+//
+// The sidecar goes only when the partial is actually GONE. An identity record
+// must not outlive the bytes it describes, and a partial that SURVIVES must
+// keep its record: without it the next run cannot prove which object the
+// bytes on disk belong to, so it discards them and the resumable progress is
+// lost even though the bytes are still there.
+func removePartialWithIdentity(dst string) {
+	// lgtm[go/path-injection]
+	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
+		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
+		return
+	}
+	removeSinglePartIdentity(singlePartIdentityPath(dst))
 }
 
 // CleanupJobPartFiles removes the partial download artifacts
@@ -1460,13 +1473,10 @@ func removeHFCacheTemp(dst string) {
 // named "weights.part" or similar user file with a different base
 // (which would not appear in dsts) is not touched.
 func removePartialArtifacts(dst string) error {
-	// lgtm[go/path-injection]
-	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-		downloadLog.Warn("cleanup partial file failed", "path", dst+".part", "error", err)
-	}
-	// The identity sidecar describes the single-path partial; it must not
-	// outlive it.
-	removeSinglePartIdentity(singlePartIdentityPath(dst))
+	// The single-path partial and the identity sidecar that describes it. The
+	// sidecar goes only when the partial is actually gone, so a partial that
+	// survives keeps the record that makes its bytes inheritable.
+	removePartialWithIdentity(dst)
 	// Ranged staging file and resume metadata (issue #140). The pair is
 	// removed only when no live claim remains; the metadata goes first inside
 	// removeStagingArtifacts so a crash cannot leave a record claiming a
@@ -1708,7 +1718,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// the proof/rename.
 	if it.Size > 0 && pos == it.Size {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
-		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
+		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
@@ -1797,10 +1807,19 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					// Permanent for the whole job: no retry, no request
 					// storm. Remove any empty partial this attempt created
 					// before returning the actionable error.
+					//
+					// The identity sidecar goes ONLY with the partial it
+					// describes. A NON-EMPTY partial holds resumable bytes
+					// that the next run may inherit, and that run can only
+					// prove they belong to this object while the sidecar
+					// survives. Removing the record while the bytes stay
+					// would silently discard the progress a permanent (but
+					// eventually fixable) error made.
 					attemptCancel()
 					out.Close()
-					removeEmptyPartialFile(tmp)
-					removeSinglePartIdentity(sidecar)
+					if removeEmptyPartialFile(tmp) {
+						removeSinglePartIdentity(sidecar)
+					}
 					return false, lastErr
 				}
 				if !apiErr.IsRetryable() {
@@ -1903,7 +1922,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						attemptCancel()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size})
-						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, emit)
+						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()
 					lastErr = classifyStall(ctx, body, cerr)
@@ -1995,13 +2014,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 // exact-size check runs first, then a known digest is proven with one
 // full-file SHA-256 pass before the rename whenever Verify is "sha256" or
 // "etag" (fresh or resumed), whenever the partial contains inherited bytes and
-// Verify is not "none" (the one-time migration exception for size mode), or
-// whenever the expected size is unknown but the item carries a known digest
-// (only the digest can prove an unconstrained stream). A mismatch removes the
-// partial and never renames it onto dst. The returned bool reports whether that
-// proof ran, so the caller does not repeat it. file_finalizing is emitted
-// before the slow proof so the UI sees the local-finalization window.
-func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool, emit func(ProgressEvent)) (bool, error) {
+// Verify is not "none" (the one-time migration exception for size mode),
+// whenever the identity is UNPINNED and Verify is not "none" (an unpinned
+// identity names a revision the endpoint did not resolve, so the bytes are not
+// bound to an immutable object and only the content proof can detect a moved
+// branch), or whenever the expected size is unknown but the item carries a
+// known digest (only the digest can prove an unconstrained stream). A mismatch
+// removes the partial and never renames it onto dst. The returned bool reports
+// whether that proof ran, so the caller does not repeat it. file_finalizing is
+// emitted before the slow proof so the UI sees the local-finalization window.
+func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool, opts singleOpts, emit func(ProgressEvent)) (bool, error) {
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "verifying"})
 	cancelBeforePublish := func() error {
 		if err := ctx.Err(); err != nil {
@@ -2028,10 +2050,14 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	verified := false
 	// Known-digest modes always prove before publication (fresh or resumed);
 	// size mode proves inherited bytes or an unknown-size stream, neither of
-	// which can be trusted from size alone. Verify="none" is the opt-out.
+	// which can be trusted from size alone. An UNPINNED identity proves in
+	// every non-"none" mode as well: it names a revision the endpoint did not
+	// resolve to a commit, so the transferred bytes are not bound to an
+	// immutable object and a moved branch can only be caught by the content
+	// proof. Verify="none" is the opt-out.
 	proveKnownDigest := it.SHA256 != "" &&
 		(cfg.Verify == "sha256" || cfg.Verify == "etag" ||
-			(cfg.Verify != "none" && (it.Size <= 0 || inherited)))
+			(cfg.Verify != "none" && (it.Size <= 0 || inherited || !opts.CommitPinned)))
 	if proveKnownDigest {
 		sum, err := computeSHA256Ctx(ctx, tmp)
 		if err != nil {
@@ -2050,7 +2076,11 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 			// Unproven bytes must never be published: the partial is removed so
 			// a retry starts from a clean prefix, and dst is left untouched.
 			_ = out.Close()
-			_ = os.Remove(tmp)
+			if rerr := os.Remove(tmp); rerr == nil || os.IsNotExist(rerr) {
+				// The identity record described the partial that is now gone:
+				// it must not outlive it.
+				removeSinglePartIdentity(tmp + ".meta")
+			}
 			return false, fmt.Errorf("sha256 verify failed: %s: expected %s got %s", it.RelativePath, it.SHA256, sum)
 		}
 		verified = true
@@ -2080,16 +2110,26 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 // removeEmptyPartialFile removes path when it exists and is empty. It is used
 // to clean up a zero-byte .part file that a fail-fast attempt created, without
 // touching a partial that predates the attempt and may hold resumable bytes.
-func removeEmptyPartialFile(path string) {
+//
+// It reports whether the file is GONE afterwards: the caller uses it to decide
+// whether the identity sidecar that describes the partial may be removed as
+// well. A sidecar must not outlive its partial, and a partial that SURVIVES
+// must keep its sidecar, or the next run cannot prove the identity of the
+// bytes on disk and discards them.
+func removeEmptyPartialFile(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
-		return
+		// The file is already gone: there is nothing left for a sidecar to
+		// describe.
+		return true
 	}
 	if fi.Size() != 0 {
-		return
+		return false
 	}
 	// lgtm[go/path-injection]
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		downloadLog.Warn("cleanup empty partial file failed", "path", path, "error", err)
+		return false
 	}
+	return true
 }

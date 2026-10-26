@@ -228,7 +228,7 @@ func TestDownloadUnresolvedCommitDoesNotInheritStagedBytes(t *testing.T) {
 			// The revision cannot be resolved: the plan falls back to the
 			// requested revision, which pins nothing.
 			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			// An LFS file WITHOUT a digest: the planner permits an empty
 			// SHA-256, and without one no content proof is possible.
 			_, _ = w.Write([]byte(fmt.Sprintf(

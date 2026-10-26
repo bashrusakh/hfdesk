@@ -290,6 +290,93 @@ func TestStagingArtifactsDoNotAffectTheDeletionPath(t *testing.T) {
 	}
 }
 
+// TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored pins the other side
+// of the store boundary (issue #140 follow-up).
+//
+// The public storage API refuses a blob key whose NAME belongs to the
+// downloader's staging namespace, because such a blob would be invisible to
+// every content surface. The refusal is narrow: an unusual but NON-reserved
+// name is still accepted, and the blob it produces is stored, visible to the
+// cache surfaces and mirrored.
+func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
+	isolateCacheState(t)
+	cacheRoot := t.TempDir()
+	hub := filepath.Join(cacheRoot, "hub")
+
+	cache := hfdownloader.NewHFCache(cacheRoot, 0)
+	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rd.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	const name = "unusual-published-name.bin"
+	if hfdownloader.IsStagingArtifactName(name) {
+		t.Fatalf("the fixture name %q is a staging artifact", name)
+	}
+	content := "unusual published content"
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := rd.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "commit123", name, "", false)
+	if err != nil {
+		t.Fatalf("the public storage API refused an unusual but non-reserved name: %v", err)
+	}
+	if stored.SHA256 != name {
+		t.Errorf("stored SHA256 = %q, want %q", stored.SHA256, name)
+	}
+	if data, err := os.ReadFile(stored.BlobPath); err != nil || string(data) != content {
+		t.Fatalf("published blob = %q (err=%v)", data, err)
+	}
+
+	repo := filepath.Join(hub, "models--owner--model")
+	// VISIBLE: the blob is counted as content, and the domain lock the store
+	// created next to it is not.
+	if got := countBlobs(repo); got != 1 {
+		t.Errorf("countBlobs = %d, want the unusual published blob", got)
+	}
+	s := newTestServerWithConfig(t, Config{CacheDir: cacheRoot})
+	w := cacheRequest(t, s, "GET", "/api/cache", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache stats: status %d body %s", w.Code, w.Body.String())
+	}
+	var listed struct {
+		Stats CacheStats `json:"stats"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Stats.TotalFiles != 1 {
+		t.Errorf("cache stats TotalFiles = %d, want 1 published file", listed.Stats.TotalFiles)
+	}
+	if listed.Stats.TotalSize != int64(len(content)) {
+		t.Errorf("cache stats TotalSize = %d, want %d", listed.Stats.TotalSize, len(content))
+	}
+
+	// MIRRORED: the mirror copies the unusual published name and verifies it.
+	entries, err := scanHubForMirror(hub)
+	if err != nil {
+		t.Fatalf("scanHubForMirror: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("scanHubForMirror returned %d repos, want 1", len(entries))
+	}
+	dstHub := filepath.Join(t.TempDir(), "hub")
+	if err := copyRepoCache(repo, hub, dstHub); err != nil {
+		t.Fatalf("copyRepoCache: %v", err)
+	}
+	dstBlob := filepath.Join(dstHub, "models--owner--model", "blobs", name)
+	if data, err := os.ReadFile(dstBlob); err != nil || string(data) != content {
+		t.Fatalf("the unusual published blob was not mirrored: %q %v", data, err)
+	}
+	if err := verifyRepoCache(repo, hub, dstHub); err != nil {
+		t.Errorf("verifyRepoCache: %v", err)
+	}
+}
+
 // TestMirrorCopyAndVerifyAgreeOnTheSameSet covers regressions (b), (c) and
 // (d): the copy and the verification must cover the same set - a published
 // blob, an unusual published name and a snapshot entry whose name has a

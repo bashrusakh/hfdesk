@@ -48,7 +48,7 @@ func recordingHub(t *testing.T, full []byte, rel string, lfs bool) (*httptest.Se
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
 			if r.Method == http.MethodGet {

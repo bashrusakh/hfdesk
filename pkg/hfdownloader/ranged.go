@@ -167,6 +167,13 @@ var (
 	// silent corruption this downloader must never produce. The staged bytes
 	// stay on disk for a resume. Distinguishable via errors.Is.
 	errStagingLayoutIncomplete = errors.New("staging range layout is incomplete")
+
+	// errStagingPayloadSize reports that the staging payload's physical
+	// logical size does not equal the expected size, even though the range
+	// layout claims a complete transfer. The publication refuses to rename
+	// such a payload: the record and the file behind it disagree, and the
+	// staged bytes stay on disk for a resume. Distinguishable via errors.Is.
+	errStagingPayloadSize = errors.New("staging payload size does not match the expected size")
 )
 
 // stagingOwners is the in-process exclusion registry keyed by staging file
@@ -829,6 +836,32 @@ func stagingArtifactsAbsent(staging, metaPath string) bool {
 func stagingPayloadSizeOK(staging string, size int64) bool {
 	fi, err := os.Stat(staging)
 	return err == nil && fi.Size() == size
+}
+
+// checkStagingPayloadSize verifies that the staging payload's physical
+// logical size equals the expected size and returns an actionable error when
+// it does not.
+//
+// The range layout is the completion contract for the BYTES; this check is the
+// completion contract for the PAYLOAD. A record can claim a complete layout
+// while the file behind it is short (a torn write, a truncated staging file
+// restored from a backup, a record that survived a payload that did not), and
+// publishing such a payload would put a file that does not match its own
+// metadata on the destination. The check therefore runs on the closed payload
+// handle, so every write has been flushed, and BEFORE the rename.
+//
+// The staged bytes are left on disk: a short payload is a state a later run
+// can re-transfer, so nothing is destroyed by the refusal.
+func checkStagingPayloadSize(staging string, size int64) error {
+	fi, err := os.Stat(staging)
+	if err != nil {
+		return fmt.Errorf("refusing to publish: the staging payload %s cannot be read: %w", staging, err)
+	}
+	if fi.Size() != size {
+		return fmt.Errorf("refusing to publish: the staging payload %s holds %d bytes, expected %d; the staged bytes are preserved for a resume: %w",
+			staging, fi.Size(), size, errStagingPayloadSize)
+	}
+	return nil
 }
 
 // stagingMetaResumable validates a staging record against the exact remote
@@ -1731,7 +1764,13 @@ func (d *stagingDownload) closeOut() error {
 //     which have no validated provenance (the migration exception);
 //   - any non-"none" mode whose record still carries ProofPending, so a crash
 //     mid-proof, a failed mismatch cleanup, or a later mode change cannot
-//     launder unproven all-Done ranges into a published blob.
+//     launder unproven all-Done ranges into a published blob;
+//   - any non-"none" mode with an UNPINNED identity and a known digest. An
+//     unpinned identity names a revision the endpoint did not resolve to a
+//     commit, so nothing in the transfer is bound to an immutable object: the
+//     bytes behind the name may have changed between the plan's tree walk and
+//     this transfer, and only the content proof can detect that. The size
+//     contract cannot.
 //
 // Verify="none" never requires it (the explicit no-hash opt-out). The
 // single-request path is not a staging record: its .part is only renamed after
@@ -1740,6 +1779,13 @@ func (d *stagingDownload) closeOut() error {
 func (d *stagingDownload) requiresPrePublicationProof() bool {
 	if d.it.SHA256 == "" || d.cfg.Verify == "none" {
 		return false
+	}
+	if !d.commitPinned {
+		// The identity is not pinned to an immutable commit, so the transfer
+		// is not bound to the object the plan described. One full-file
+		// content proof closes that hole; the normal size-mode "no reread"
+		// rule still applies to a PINNED identity.
+		return true
 	}
 	return d.cfg.Verify == "sha256" || d.cfg.Verify == "etag" || d.legacyMigrated || d.proofPending
 }
@@ -1942,9 +1988,14 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 		// A permanent gated/private/missing response on HEAD fails the whole
 		// job immediately with the actionable message, before any part
-		// requests are issued.
+		// requests are issued. The zero-byte partial the attempt created goes
+		// with the identity sidecar that describes it, and only with it: a
+		// non-empty partial keeps its record, because that record is the only
+		// proof that the surviving bytes belong to this object.
 		if apiErr != nil && apiErr.IsFailFast() {
-			removeEmptyPartialFile(dst + ".part")
+			if removeEmptyPartialFile(dst + ".part") {
+				removeSinglePartIdentity(singlePartIdentityPath(dst))
+			}
 			return false, apiErr
 		}
 
@@ -2584,6 +2635,17 @@ func (d *stagingDownload) publish() error {
 	d.stopHeartbeat()
 	if err := d.closeOut(); err != nil {
 		return fmt.Errorf("close staging file %s before publish: %w", d.stg, err)
+	}
+	// The PAYLOAD must physically hold the expected number of bytes before
+	// anything is renamed onto the publish target. The layout check below
+	// proves what the BYTES claim; this check proves the FILE behind them
+	// exists at the expected size. A record can describe a complete layout
+	// while the payload behind it is short, and publishing that payload would
+	// put a file that disagrees with its own metadata on the destination.
+	// The handle is closed, so every write has been flushed and the size is
+	// the payload's real logical size.
+	if err := checkStagingPayloadSize(d.stg, d.it.Size); err != nil {
+		return err
 	}
 
 	// Snapshot the live layout under the layout gate. The snapshot is taken

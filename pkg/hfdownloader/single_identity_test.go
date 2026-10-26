@@ -47,6 +47,12 @@ var singleTestIdentity = singleOpts{
 	CommitPinned: true,
 }
 
+// pinnedSingleIdentity returns the pinned resolved-commit identity the
+// single-path fixtures use.
+func pinnedSingleIdentity() singleOpts {
+	return singleTestIdentity
+}
+
 // seedSingleIdentity writes the identity sidecar that authorizes inheriting
 // the partial staged at dst.
 func seedSingleIdentity(t *testing.T, dst string, job Job, it PlanItem, opts singleOpts) {
@@ -416,14 +422,14 @@ func TestDownloadSinglePlanWithCollidingStagingNamesPublishesExactBytes(t *testi
 		switch {
 		case r.URL.Path == "/api/models/o/r/revision/main":
 			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: commit})
-		case r.URL.Path == "/api/models/o/r/tree/main":
+		case r.URL.Path == "/api/models/o/r/tree/"+commit:
 			nodes := make([]hfNode, 0, len(files))
 			for path, body := range files {
 				nodes = append(nodes, hfNode{Type: "file", Path: path, Size: int64(len(body))})
 			}
 			_ = json.NewEncoder(w).Encode(nodes)
 		default:
-			body, ok := files[strings.TrimPrefix(r.URL.Path, "/o/r/raw/main/")]
+			body, ok := files[strings.TrimPrefix(r.URL.Path, "/o/r/raw/"+commit+"/")]
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return

@@ -155,7 +155,7 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
@@ -333,7 +333,7 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))

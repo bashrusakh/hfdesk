@@ -432,7 +432,7 @@ func testDownloadSameProcessSiblingWriter(t *testing.T, threshold string) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			if r.Method == http.MethodGet {
@@ -832,7 +832,7 @@ func testNegativeControlHistoricalModelReTransfersTheFile(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			if r.Method == http.MethodGet {

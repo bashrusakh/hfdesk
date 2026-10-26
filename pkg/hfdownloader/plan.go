@@ -261,11 +261,33 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		commitSHA = job.Revision // fallback
 	}
 
+	// THE TRANSFER IS PINNED TO THE RESOLVED COMMIT.
+	//
+	// A resolved commit is an immutable identity, so the WHOLE transfer is
+	// built from it: the tree walk that discovers the files AND every
+	// per-file URL. Both halves must name the same identity. Walking the
+	// requested revision while fetching the commit (or the other way round)
+	// re-opens the hole the resolved commit closes: a branch that moves
+	// between the info call and the transfer would change the file set or the
+	// bytes behind the name the plan recorded, and the identity the staging
+	// record stores (the resolved commit) would then describe content that
+	// was never transferred.
+	//
+	// When the endpoint resolves NO commit (a custom or mirror endpoint that
+	// does not answer the revision API), nothing can be pinned: the requested
+	// revision is used exactly as before. The integrity hole that leaves
+	// open is closed by the downloader instead, which requires a content
+	// proof for an unpinned identity (see requiresPrePublicationProof).
+	transferJob := job
+	if commitPinned {
+		transferJob.Revision = commitSHA
+	}
+
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+	err = walkTree(ctx, httpc, token, cfg.Endpoint, transferJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -584,12 +606,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size
+		// Build URL and file size. The URL names the SAME identity the tree
+		// walk used: the resolved commit when the plan pinned one, the
+		// requested revision otherwise.
 		var urlStr string
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, job, rel)
+			urlStr = lfsURL(cfg.Endpoint, transferJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, job, rel)
+			urlStr = rawURL(cfg.Endpoint, transferJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64

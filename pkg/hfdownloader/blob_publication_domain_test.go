@@ -103,7 +103,7 @@ func newTwoWriterHub(t *testing.T, total int, sha string, streams publicationStr
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			hub.serveFile(w, r, total, streams)

@@ -139,6 +139,32 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   stay on disk for a resume. The control flow that reaches `publish()` already
   implies completeness, but the invariant is asserted there so a later refactor
   cannot break it silently.
+- THE PAYLOAD IS GATED SEPARATELY FROM THE LAYOUT. The layout is the
+  completion contract for the BYTES; the payload's own length is the completion
+  contract for the FILE. After the payload handle is closed - so every write is
+  flushed - the publication requires the staging file to hold exactly the
+  expected number of bytes. A record that describes a complete layout over a
+  physically short file is refused with `errStagingPayloadSize`, nothing is
+  renamed, and the staged bytes stay on disk for a resume.
+- THE TRANSFER IS PINNED TO THE RESOLVED COMMIT. When the planner resolves the
+  requested revision to a commit, the WHOLE transfer is built from that commit:
+  the tree walk that discovers the files AND every per-file URL (`lfsURL`,
+  `rawURL`). Pinning only one half re-opens the hole the resolved commit
+  closes: a branch that moves between the info call and the transfer would
+  change the file set or the bytes behind the name the plan recorded, and the
+  identity the staging record stores would then describe content that was
+  never transferred. When the endpoint resolves NO commit, nothing can be
+  pinned and the requested revision is used exactly as before; the integrity
+  hole that leaves open is closed by the content proof below.
+- AN UNPINNED IDENTITY IS CONTENT-PROVED BEFORE PUBLICATION. An identity that
+  names an unresolved revision is not bound to an immutable object, so the
+  bytes behind the name may differ from the digest the plan recorded. When the
+  identity is UNPINNED, the item carries a known digest and `Verify != "none"`,
+  exactly ONE full-file content proof runs before the publication, on both
+  routes, and a mismatch publishes nothing with the actionable error of the
+  existing pre-publication proof path. The normal size-mode "no reread" rule
+  is unchanged for a PINNED identity: there the transfer is bound to an
+  immutable commit, so the size contract is enough.
 - Multipart part files are only reusable when their byte-range layout is known
   to match the current file size and connection count.
 - If legacy per-part resume metadata is invalid or mismatched, discard only the
@@ -151,7 +177,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   validated transfer coverage on both the ranged and single-request paths and
   performs no full-file SHA-256 pass on the normal path (the pre-download skip
   check, the one-time legacy-migration content proof, the inherited
-  single-path `.part` proof, and a single-request known digest with no known
+  single-path `.part` proof, the unpinned-identity content proof, and a
+  single-request known digest with no known
   expected size may still hash); `sha256` performs at most one
   full-file pass, always before the rename/publication when a known digest
   exists, and never publishes a mismatch; `etag` proves a known digest with
@@ -465,11 +492,23 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   moved branch may change the content under that name - so nothing is
   inherited from it. The record is written before any inherited byte is
   trusted and after the unproven bytes are gone, is removed together with the
-  partial it describes (on publication and in the cancel-cleanup path), so no
-  identity record outlives its partial, and it survives an interrupted run:
+  partial it describes (on publication, in the cancel-cleanup path and after a
+  failed content proof), so no identity record outlives its partial, and it
+  survives an interrupted run:
   that surviving record is what makes the next run's decision possible. A
   legacy `.part` without a record is not inherited. The known-digest content
   proof is unchanged and still applies to the inherited bytes.
+- A PERMANENT ERROR MUST NOT DESTROY THE RESUME IDENTITY. The single-request
+  path's fail-fast branch (a permanent 401/403/404) removes the zero-byte
+  partial the attempt created, and the identity sidecar goes with it - but ONLY
+  with it. A NON-EMPTY partial holds resumable bytes, and the sidecar is the
+  only proof that those bytes belong to this object; removing the record while
+  the bytes stay would make the next run discard them, so a permanent (but
+  eventually fixable) error would silently lose the progress. The sidecar
+  therefore SURVIVES with a non-empty partial, and the next run with the same
+  identity resumes from the stored offset. The same rule applies to every other
+  branch that removes the sidecar: it may only go when the partial it
+  describes is actually gone.
 - THE RANGED PATH INHERITS STAGED BYTES ONLY UNDER A PINNED IDENTITY - THE
   SAME RULE AS THE SINGLE-REQUEST PATH. The ranged claim record carries the
   repository, the resolved commit, the item's relative path, the expected size
@@ -516,6 +555,17 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   it, so copy and verify always agree on the same set. Every consumer - the
   mirror scan, copy and verification, the cache statistics, the cache listing,
   the cache selection and the cache deletion - uses that one classification.
+- A BLOB KEY WHOSE NAME IS A STAGING SHAPE IS REFUSED AT THE BOUNDARY. Because
+  the classification is by name shape, a blob published under a staging-shaped
+  name would be INVISIBLE: the statistics, the listing, the selection, the
+  mirror and the deletion path would all exclude it, so a successful store
+  would have no reachable result. Every public path that chooses a blob name
+  from a caller-provided key therefore refuses such a name BEFORE anything is
+  placed: `StoreDownloadedFile` (and its context-bounded implementation) and
+  `FinalizeBlob` reject it with an actionable error that names the staging
+  namespace. The refusal is narrow - only the NAME SHAPE is refused - so a
+  non-canonical but NON-reserved name (an unusual published name) stays
+  accepted, stored, visible and mirrored.
 - Keep retry resume offsets based on bytes actually written to disk.
 - Do not delete partial data on transient network failure unless it is known to
   be stale or incompatible.

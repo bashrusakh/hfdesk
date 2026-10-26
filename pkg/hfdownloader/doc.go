@@ -158,9 +158,29 @@ worker's nil return is caught by the cancellation guard or by the error drain
 - but the invariant is asserted at the publication so that a later refactor
 cannot break it silently.
 
+The PAYLOAD is gated separately. The layout is the completion contract for the
+bytes; the payload's own length is the completion contract for the file. After
+the payload handle is closed - so every write is flushed - the publication
+requires the staging file to hold exactly the expected number of bytes. A
+record that describes a complete layout over a physically short file is
+refused with `errStagingPayloadSize`, nothing is renamed, and the staged
+bytes stay on disk for a resume.
+
 Staging identity includes `plan.Commit`. If fetching repository info fails or
 returns an empty SHA, the planner uses the requested revision string as the
 fallback commit identity; that value is not necessarily an immutable commit.
+
+THE TRANSFER IS PINNED TO THE RESOLVED COMMIT. When the planner resolves the
+requested revision to a commit, the WHOLE transfer is built from that commit:
+the tree walk that discovers the files AND every per-file URL (`lfsURL`,
+`rawURL`). Both halves must name the same identity - walking the requested
+revision while fetching the commit (or the other way round) would let a branch
+that moves between the info call and the transfer change the file set or the
+bytes behind the name the plan recorded, and the identity the staging record
+stores would then describe content that was never transferred. When the
+endpoint resolves no commit, nothing can be pinned and the requested revision
+is used exactly as before; the integrity hole that leaves open is closed by
+the content proof described below.
 
 The RANGED path inherits staged bytes under that identity only when it is
 PINNED on both sides. The claim record carries the resolved commit, the
@@ -200,12 +220,31 @@ nothing is inherited from it.
 
 The record is written before any inherited byte is trusted, and after the
 unproven bytes are gone, so it always describes the partial that is on disk.
-It is removed together with the partial it describes (on publication and in
-the cancel-cleanup path), so no identity record outlives its partial, and it
-survives an interrupted run: that surviving record is exactly what makes the
-next run's decision possible. A legacy `.part` without a record is never
-inherited. The known-digest content proof is unchanged and still applies to
-the inherited bytes.
+It is removed together with the partial it describes (on publication, in the
+cancel-cleanup path and after a failed content proof), so no identity record
+outlives its partial, and it survives an interrupted run: that surviving
+record is exactly what makes the next run's decision possible. A legacy
+`.part` without a record is never inherited. The known-digest content proof
+is unchanged and still applies to the inherited bytes.
+
+A PERMANENT error does not destroy that record. The single-request path's
+fail-fast branch (401/403/404) removes the zero-byte partial the attempt
+created, and the identity sidecar goes with it - but only with it. A
+non-empty partial holds resumable bytes, and the sidecar is the only proof
+that those bytes belong to this object; removing the record while the bytes
+stay would make the next run discard them, so a permanent (but eventually
+fixable) error would silently lose the progress. The sidecar therefore
+survives with a non-empty partial, and the next run with the same identity
+resumes from the stored offset.
+
+AN UNPINNED IDENTITY IS CONTENT-PROVED BEFORE PUBLICATION. An identity that
+names an unresolved revision is not bound to an immutable object: the bytes
+behind the name may differ from the digest the plan recorded. When the
+identity is unpinned, the item carries a known digest and `Verify` is not
+`"none"`, exactly ONE full-file content proof runs before the publication,
+on both routes, and a mismatch publishes nothing. The normal size-mode "no
+reread" rule is unchanged for a PINNED identity: there the transfer is bound
+to an immutable commit, so the size contract is enough.
 
 # Cache Artifact Classification
 
@@ -254,6 +293,16 @@ downloader writes these artifacts into. A legitimate `*.meta` (or `*.part`,
 `*.lock`) file outside that namespace - a snapshot entry, for example - is
 content, and the mirror copies AND verifies it, so copy and verify always
 agree on the same set.
+
+Because the classification is by NAME SHAPE, a blob published under a
+staging-shaped name would be invisible: the statistics, the listing, the
+selection, the mirror and the deletion path would all exclude it. The
+boundary that accepts a caller-provided blob key therefore refuses such a
+name, before anything is placed: `StoreDownloadedFile` and `FinalizeBlob`
+reject it with an actionable error. The refusal is narrow - it is the NAME
+SHAPE that is refused, so a non-canonical but non-reserved name (an unusual
+published name) is still accepted, stored, visible and mirrored, exactly as
+before.
 
 Existing multipart resume state survives a threshold change. Before routing an
 item to the single-request path, the downloader detects a usable pre-#140

@@ -23,7 +23,7 @@ func TestDownload_NonLFSModelFilterDoesNotChangeDestination(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 4}})
-		case r.URL.Path == "/owner/model/raw/main/config.json":
+		case r.URL.Path == "/owner/model/raw/deadbeef/config.json":
 			_, _ = w.Write([]byte("data"))
 		default:
 			http.NotFound(w, r)
@@ -260,9 +260,9 @@ func TestDownload_RetainedModelVocabKeepsRepoRelativeDestination(t *testing.T) {
 				{Type: "file", Path: "weights/model.safetensors", LFS: &hfLfsInfo{Size: 6}},
 				{Type: "file", Path: "arbitrary/assets/vocab.txt", Size: 5},
 			})
-		case r.URL.Path == "/owner/model/resolve/main/weights/model.safetensors":
+		case r.URL.Path == "/owner/model/resolve/deadbeef/weights/model.safetensors":
 			_, _ = w.Write([]byte("weight"))
-		case r.URL.Path == "/owner/model/raw/main/arbitrary/assets/vocab.txt":
+		case r.URL.Path == "/owner/model/raw/deadbeef/arbitrary/assets/vocab.txt":
 			_, _ = w.Write([]byte("vocab"))
 		default:
 			http.NotFound(w, r)
@@ -302,9 +302,9 @@ func TestDownload_DatasetOrdinaryNonLFSFilterPreservesRootDestinations(t *testin
 				{Type: "file", Path: "train.csv", Size: 4},
 				{Type: "file", Path: "config.json", Size: 4},
 			})
-		case r.URL.Path == "/datasets/owner/data/raw/main/train.csv":
+		case r.URL.Path == "/datasets/owner/data/raw/deadbeef/train.csv":
 			_, _ = w.Write([]byte("data"))
-		case r.URL.Path == "/datasets/owner/data/raw/main/config.json":
+		case r.URL.Path == "/datasets/owner/data/raw/deadbeef/config.json":
 			_, _ = w.Write([]byte("meta"))
 		default:
 			http.NotFound(w, r)
@@ -393,9 +393,9 @@ func TestDownload_DatasetGGUFNonLFSFilterKeepsAppendedDestination(t *testing.T) 
 				{Type: "file", Path: "README-Q4_K_M.md", Size: 4},
 				{Type: "file", Path: "train.csv", Size: 4},
 			})
-		case r.URL.Path == "/datasets/owner/data/raw/main/Q4_K_M/model-Q4_K_M.gguf":
+		case r.URL.Path == "/datasets/owner/data/raw/deadbeef/Q4_K_M/model-Q4_K_M.gguf":
 			_, _ = w.Write([]byte("gguf"))
-		case r.URL.Path == "/datasets/owner/data/raw/main/README-Q4_K_M.md":
+		case r.URL.Path == "/datasets/owner/data/raw/deadbeef/README-Q4_K_M.md":
 			_, _ = w.Write([]byte("read"))
 		default:
 			http.NotFound(w, r)
@@ -571,9 +571,9 @@ func TestDownload_MixedFormatKeepsPerFileGGUFDestination(t *testing.T) {
 				{Type: "file", Path: "model-Q4_K_M.gguf", Size: 4},
 				{Type: "file", Path: "other.safetensors", Size: 4, LFS: &hfLfsInfo{Size: 4}},
 			})
-		case r.URL.Path == "/owner/model/raw/main/model-Q4_K_M.gguf":
+		case r.URL.Path == "/owner/model/raw/deadbeef/model-Q4_K_M.gguf":
 			_, _ = w.Write([]byte("gguf"))
-		case r.URL.Path == "/owner/model/resolve/main/other.safetensors":
+		case r.URL.Path == "/owner/model/resolve/deadbeef/other.safetensors":
 			_, _ = w.Write([]byte("safe"))
 		default:
 			http.NotFound(w, r)

@@ -185,6 +185,38 @@ func (r *RepoDir) SnapshotsDir() string {
 // real blob names, which are hex digests.
 const invalidBlobName = "invalid-blob-name"
 
+// errReservedBlobName reports a blob key whose NAME belongs to the
+// downloader's staging namespace.
+//
+// The blobs/ directory holds two kinds of entries: published content and the
+// downloader's own staging artifacts. The shared classifier (see
+// ClassifyBlobEntryName) excludes a staging-shaped name from EVERY content
+// surface - the cache statistics, the listing, the selection, the mirror and
+// the deletion path - so a blob published under such a name is invisible:
+// stored, counted as nothing, never mirrored, never selected. That is a
+// successful store with no reachable result, so the boundary that chooses the
+// blob name refuses the name instead.
+//
+// The refusal is deliberately narrow: it applies to the NAME SHAPE only. A
+// non-canonical but non-reserved name (an unusual published name) stays
+// accepted, because the public storage API's tolerance for unusual names is
+// unchanged.
+var errReservedBlobName = errors.New("blob name belongs to the downloader's staging namespace")
+
+// checkPublishableBlobName refuses a blob key whose name classifies as a
+// downloader staging artifact.
+//
+// It is called by every public path that chooses a blob name from a
+// caller-provided key, so the invariant holds at the boundary where the name
+// enters the cache: a staging-shaped name is never published, and therefore
+// never becomes an invisible blob.
+func checkPublishableBlobName(name string) error {
+	if IsStagingArtifactName(name) {
+		return fmt.Errorf("refuse blob name %q: %w; a published blob may not use one of the downloader's staging artifact names", name, errReservedBlobName)
+	}
+	return nil
+}
+
 // BlobPath returns the path where a blob with the given SHA256 should be stored.
 // The name is confined to the blobs directory the same way RefPath and
 // SnapshotDir confine theirs: SafeJoin rejects values that are not local
@@ -541,6 +573,14 @@ func (r *RepoDir) CleanupIncomplete(sha256 string) error {
 // .incomplete payload is left untouched for the caller to discard, and the
 // call reports the conflict instead of silently overwriting proven bytes.
 func (r *RepoDir) FinalizeBlob(sha256 string) error {
+	// The blob key is chosen from a caller-provided value, so the boundary
+	// that accepts it refuses a name that belongs to the downloader's staging
+	// namespace: such a blob would be invisible to every content surface.
+	// The refusal happens BEFORE anything is created or moved.
+	if err := checkPublishableBlobName(sha256); err != nil {
+		return err
+	}
+
 	incompletePath := r.IncompletePath(sha256)
 	blobPath := r.BlobPath(sha256)
 
@@ -909,6 +949,16 @@ func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, rel
 			return nil, fmt.Errorf("compute sha256: %w", err)
 		}
 		sha256 = computed
+	}
+
+	// The blob key is chosen from a caller-provided value, so the boundary
+	// that accepts it refuses a name that belongs to the downloader's staging
+	// namespace: such a blob would be invisible to every content surface (the
+	// statistics, the listing, the selection, the mirror and the deletion
+	// path all exclude staging-shaped names). The store fails BEFORE it
+	// places anything, so no payload is moved and no entry is created.
+	if err := checkPublishableBlobName(sha256); err != nil {
+		return nil, err
 	}
 
 	blobPath := r.BlobPath(sha256)

@@ -608,7 +608,7 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 		Context:  context.Background(),
 		boundary: closedFileBoundary(out),
 	}
-	verified, err := finalizeSinglePartial(calibration, out, tmp, dst, it, configure, false, emit)
+	verified, err := finalizeSinglePartial(calibration, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
 	if err != nil || !verified {
 		t.Fatalf("calibration finalization = (%v,%v)", verified, err)
 	}
@@ -644,7 +644,7 @@ func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
 		armed:    true,
 	}
 	hashPassCount.Store(0)
-	verified, err = finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, emit)
+	verified, err = finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
 	if !errors.Is(err, context.Canceled) || verified {
 		t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
 	}
@@ -704,7 +704,7 @@ func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) 
 				armed:    true,
 			}
 			hashPassCount.Store(0)
-			verified, err := finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, emit)
+			verified, err := finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
 			if !errors.Is(err, context.Canceled) || verified {
 				t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
 			}

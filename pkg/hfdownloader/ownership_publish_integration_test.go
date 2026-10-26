@@ -66,7 +66,7 @@ func TestPublishKeepsMidFlightContentAddressedBlob(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			// Seed the good blob on the first ranged GET, i.e. after the claim
@@ -366,7 +366,7 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
-		case strings.HasSuffix(r.URL.Path, "/tree/main"):
+		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" +
 				lfsTreeNode("a/model.bin", total, sharedSHA) + "," +
 				lfsTreeNode("b/model.bin", total, sharedSHA) + "," +
@@ -596,7 +596,7 @@ func TestDownloadUnknownSizeLFSStoresSinglePathFallbackCorrectly(t *testing.T) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/revision/main"):
 					_, _ = w.Write([]byte(`{"sha":"commit-unknown-size"}`))
-				case strings.HasSuffix(r.URL.Path, "/tree/main"):
+				case strings.Contains(r.URL.Path, "/tree/"):
 					// Both tree Size and LFS.Size are intentionally omitted.
 					node := fmt.Sprintf(`{"type":"file","path":"unknown.bin","lfs":{"oid":%q,"sha256":%q}}`, sha, sha)
 					_, _ = w.Write([]byte("[" + node + "]"))

@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -409,7 +410,15 @@ func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
 	}
 }
 
-func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing.T) {
+// TestStoreDownloadedFileRefusesReservedCollisionName pins the store
+// boundary: a blob key whose NAME belongs to the downloader's staging
+// namespace is refused.
+//
+// The shared classifier excludes a staging-shaped name from EVERY content
+// surface - the cache statistics, the listing, the selection, the mirror and
+// the deletion path - so a blob published under such a name would be stored
+// and invisible. The boundary that accepts the name therefore refuses it.
+func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
 	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -423,17 +432,132 @@ func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing
 		t.Fatal(err)
 	}
 	stored, err := repo.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", key, "", false)
+	if err == nil {
+		t.Fatalf("the store accepted a staging-shaped blob name: %+v", stored)
+	}
+	if !errors.Is(err, errReservedBlobName) {
+		t.Fatalf("store error = %v, want the reserved-name refusal", err)
+	}
+	if !strings.Contains(err.Error(), "staging") {
+		t.Errorf("store error %q does not explain that the name belongs to the staging namespace", err)
+	}
+	// Nothing was published: the refusal happens before the payload is placed.
+	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
+		t.Errorf("the refused store published the blob, stat err=%v", serr)
+	}
+	if _, serr := os.Stat(filepath.Join(repo.SnapshotsDir(), "version-a", "model-Q4_K_M.gguf")); !os.IsNotExist(serr) {
+		t.Errorf("the refused store created the snapshot entry, stat err=%v", serr)
+	}
+	// The payload is untouched: the caller still owns it.
+	if _, serr := os.Stat(temp); serr != nil {
+		t.Errorf("the refused store consumed the payload: %v", serr)
+	}
+}
+
+// TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget keeps the deletion
+// path's coverage of the reserved namespace: a snapshot entry that links to a
+// staging-shaped blob is refused before anything is unlinked.
+//
+// The state is built directly on disk because the public store no longer
+// creates it (see TestStoreDownloadedFileRefusesReservedCollisionName); the
+// deletion path must still refuse such a target if it finds one.
+func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
 	if err != nil {
-		t.Fatalf("reserved collision must remain creatable through the public storage API: %v", err)
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "tmp-" + strings.Repeat("f", 64)
+	blob := repo.BlobPath(key)
+	if err := os.WriteFile(blob, []byte("published collision"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := filepath.Join(repo.SnapshotsDir(), "version-a")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(snapshotDir, "model-Q4_K_M.gguf")
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", key), snapshot); err != nil {
+		t.Fatal(err)
 	}
 	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
 	if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
 		t.Fatalf("reserved collision was not refused at preflight: %+v", result)
 	}
-	for _, name := range []string{stored.SnapshotPath, stored.FriendlyPath, stored.BlobPath} {
+	for _, name := range []string{snapshot, blob} {
 		if _, err := os.Lstat(name); err != nil {
 			t.Fatalf("collision refusal changed %s: %v", name, err)
 		}
+	}
+}
+
+// TestFinalizeBlobRefusesReservedCollisionName pins the same boundary on the
+// exported writer of blobs/<key>: a staging-shaped blob key is refused before
+// anything is created or moved.
+func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "tmp-" + strings.Repeat("f", 64)
+	// The payload the caller would have published.
+	if err := os.WriteFile(repo.IncompletePath(key), []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.FinalizeBlob(key)
+	if err == nil {
+		t.Fatal("FinalizeBlob accepted a staging-shaped blob name")
+	}
+	if !errors.Is(err, errReservedBlobName) {
+		t.Fatalf("FinalizeBlob error = %v, want the reserved-name refusal", err)
+	}
+	// Nothing was published.
+	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
+		t.Errorf("the refused finalize published the blob, stat err=%v", serr)
+	}
+}
+
+// TestStoreDownloadedFileAcceptsUnusualNonReservedName pins the other side
+// of the boundary: a non-canonical but NON-reserved name is still accepted.
+// The public storage API's tolerance for unusual published names is
+// unchanged; only the downloader's own staging namespace is refused.
+func TestStoreDownloadedFileAcceptsUnusualNonReservedName(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "unusual-published-name.bin"
+	if IsStagingArtifactName(key) {
+		t.Fatalf("the fixture name %q is a staging artifact", key)
+	}
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte("unusual content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", key, "", false)
+	if err != nil {
+		t.Fatalf("an unusual but non-reserved blob name was refused: %v", err)
+	}
+	if stored.SHA256 != key {
+		t.Errorf("stored SHA256 = %q, want %q", stored.SHA256, key)
+	}
+	got, err := os.ReadFile(stored.BlobPath)
+	if err != nil || string(got) != "unusual content" {
+		t.Fatalf("published blob = %q (err=%v)", got, err)
+	}
+	if _, err := os.Lstat(stored.SnapshotPath); err != nil {
+		t.Errorf("the snapshot entry was not created: %v", err)
+	}
+	if _, err := os.Lstat(stored.FriendlyPath); err != nil {
+		t.Errorf("the friendly entry was not created: %v", err)
 	}
 }
 
