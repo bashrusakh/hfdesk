@@ -607,7 +607,15 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		return createStagingClaim(metaPath, meta)
 	}
 	if rerr != nil {
-		return nil, false, rerr
+		// The record exists but cannot be read. That is an UNPROVEN owner for
+		// exactly the same reason a malformed record is: the read failure
+		// establishes neither a live writer nor a dead one, so the record and
+		// its payload are preserved and never taken over. Preserve the cause
+		// as well as the classification: the operator-visible message names
+		// the staging pair, while errors.Is still finds both the unproven
+		// sentinel and the underlying filesystem error.
+		return nil, false, fmt.Errorf("%w: read staging record %s: %w",
+			newStagingUnprovenOwnerError(it, staging, metaPath), metaPath, rerr)
 	}
 	var meta IncompleteMeta
 	if json.Unmarshal(raw, &meta) != nil {
@@ -1216,11 +1224,25 @@ func buildRangeLayout(size int64, n int) []RangeProgress {
 //     an interrupted old assembly), copied as a committed prefix and tiled
 //     across the first ranges at the configured worker count.
 //
+// The single dst.part shape has TWO owners. A `.part` WITHOUT a sidecar is the
+// historical pre-#140 shape: the old downloader wrote no identity record, so
+// its bytes are a genuine legacy prefix. A `.part` WITH a sidecar is the
+// CURRENT-VERSION single-request staging name, and its bytes belong to the
+// object recorded in the sidecar - which is not necessarily the current item,
+// because the staging name is reused across revisions and (for a digest-less
+// item) across different paths. Such a prefix is imported only when the
+// recorded identity is inheritable by the current plan (repo, commit, path,
+// size and PINNED on both sides); otherwise nothing is imported, the `.part`
+// and its sidecar are preserved, and the caller starts fresh. Without that
+// check, a migrated old prefix plus the new object's suffix is a silent
+// content mixture that a digest-less item cannot content-prove.
+//
 // If a valid .part-NN layout exists, dst.part is obsolete and is removed with
 // the other legacy artifacts by the caller after the migrated state is
-// durable. A layout whose every part is missing, empty or oversized
-// contributes no bytes and is not usable: its family is discarded, then
-// dst.part is migrated if present. If no usable multipart state exists,
+// durable (only for the legacy shape: a sidecar-bearing .part that did not
+// match is preserved). A layout whose every part is missing, empty or
+// oversized contributes no bytes and is not usable: its family is discarded,
+// then dst.part is migrated if present. If no usable multipart state exists,
 // unvalidatable .part-NN files are discarded first (their byte-range contract
 // is unknown), then dst.part is migrated if present. No usable legacy state
 // returns errNoLegacyState. LegacyMigrated is reported only when actual legacy
@@ -1240,7 +1262,7 @@ func buildRangeLayout(size int64, n int) []RangeProgress {
 // survive the upgrade until its replacement is durable). The caller also
 // records LegacyMigrated so the imported bytes are content-proven before
 // publication when the item has a known SHA-256.
-func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size int64, workers int) ([]RangeProgress, bool, error) {
+func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size int64, workers int, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool, error) {
 	data, err := os.ReadFile(multipartLayoutMetaPath(dst))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		// A real I/O failure must not silently discard legacy data.
@@ -1259,7 +1281,7 @@ func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size 
 	// unknown byte-range contract and must not be reused; dst.part is a
 	// sequential prefix and remains migratable below.
 	_ = removeMultipartResumeFiles(dst)
-	return migrateLegacySinglePart(ctx, dst, out, size, workers)
+	return migrateLegacySinglePart(ctx, dst, out, size, workers, it, job, commit, commitPinned)
 }
 
 // validateLegacyPartsLayout parses a legacy .parts.json record and checks that
@@ -1419,7 +1441,16 @@ func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int6
 // guessing"). The prefix is tiled across the first ranges of the fresh worker
 // layout, so the caller can persist one normal versioned record and resume with any
 // future concurrency.
-func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size int64, workers int) ([]RangeProgress, bool, error) {
+//
+// A sidecar-bearing .part is not legacy state: it is the current-version
+// single-request staging name and its sidecar names the object the bytes
+// belong to. The prefix is imported ONLY when that identity is inheritable by
+// the current plan - same repo, resolved commit, path and size, PINNED on both
+// sides. A mismatch (including an unpinned identity) or an unreadable sidecar
+// imports nothing and returns errNoLegacyState, leaving the .part and its
+// sidecar in place for the route that can use them. Only a .part WITHOUT a
+// sidecar keeps the historical pre-#140 prefix migration.
+func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size int64, workers int, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool, error) {
 	partPath := dst + ".part"
 	fi, err := os.Stat(partPath)
 	if err != nil {
@@ -1428,16 +1459,68 @@ func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size
 		}
 		return nil, false, err
 	}
+	recorded, ierr := readSinglePartIdentity(singlePartIdentityPath(dst))
+	if ierr != nil {
+		// The record exists but cannot be read or understood: whether these
+		// bytes belong to the current object can be proven neither way, so
+		// they are not imported. The record and the partial are preserved:
+		// discarding them is the single-request route's decision, made only
+		// when it can establish that the bytes are unusable.
+		downloadLog.Warn("refusing to migrate single-path partial with an unreadable identity record",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"partial", partPath,
+			"error", ierr,
+		)
+		return nil, false, errNoLegacyState
+	}
+	if recorded != nil {
+		current := singleIdentityFor(job, it, singleOpts{Commit: commit, CommitPinned: commitPinned})
+		if !recorded.inheritableBy(current) {
+			// The .part is the current-version single-request staging name of
+			// another object or another revision. Importing its prefix and
+			// fetching the current object's suffix would publish a mixture,
+			// which a digest-less item cannot content-prove. Start fresh and
+			// keep the partial (and its record) for its own route.
+			downloadLog.Warn("refusing to migrate single-path partial staged for another identity",
+				"repo", job.Repo,
+				"path", it.RelativePath,
+				"partial", partPath,
+				"recorded_commit", recorded.Commit,
+				"current_commit", current.Commit,
+				"recorded_pinned", recorded.Pinned,
+				"current_pinned", current.Pinned,
+			)
+			return nil, false, errNoLegacyState
+		}
+	}
 	committed := fi.Size()
 	if committed <= 0 {
-		// An empty partial has no bytes worth preserving.
-		_ = os.Remove(partPath)
+		// An empty partial has no bytes worth preserving. Its identity record,
+		// if any, must not outlive it.
+		_ = removeLegacySinglePart(dst)
 		return nil, false, errNoLegacyState
 	}
 	if committed > size {
 		// Oversized: not a prefix this destination can ever finish.
-		_ = os.Remove(partPath)
+		_ = removeLegacySinglePart(dst)
 		return nil, false, errNoLegacyState
+	}
+	if recorded != nil && !recorded.FramingComplete && committed == size {
+		// The sidecar proves these bytes belong to this object, but not that
+		// the response body ended cleanly at the final byte. A fully-sized
+		// prefix is therefore NOT a completed layout: reserve the final byte
+		// and let a ranged worker re-request [size-1, size) with clean framing
+		// - the same rule the single-request restart applies, and the same
+		// shape as v2 Done-range migration. Nothing else is imported as
+		// complete.
+		committed--
+		if committed <= 0 {
+			// There is no usable prefix to import; keep the partial for the
+			// single-request route instead of reporting a zero-byte
+			// migration.
+			return nil, false, errNoLegacyState
+		}
 	}
 	ranges := buildRangeLayout(size, workers)
 	if len(ranges) == 0 {
@@ -2285,7 +2368,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	if state.fresh {
 		// No valid versioned staging state: legacy .part-NN/.parts.json state or a single
 		// .part sequential prefix may hold validated bytes; migrate once.
-		ranges, migrated, merr := migrateLegacyMultipart(partCtx, dst, out, it.Size, cfg.Concurrency)
+		ranges, migrated, merr := migrateLegacyMultipart(partCtx, dst, out, it.Size, cfg.Concurrency,
+			it, job, opts.Commit, opts.CommitPinned)
 		switch {
 		case merr == nil:
 			d.metaMu.Lock()

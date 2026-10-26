@@ -17,15 +17,21 @@ package hfdownloader
 //     another live job's .part/temp for the same path.
 //
 // A writer of a cache destination now ALWAYS holds that destination's
-// ownership domain, and the cleanup uses the SAME domain identity, so writer
-// and cleanup agree for every cache destination:
+// ownership domain, and the cleanup uses the SAME name-based identity, so
+// writer and cleanup agree for every cache destination:
 //
-//	destination      domain key        domain lock
-//	blobs/tmp-<sha>  blobs/<sha>       blobs/tmp-<sha>.lock
-//	blobs/tmp-<name> blobs/<name>      blobs/tmp-<name>.lock
+//	destination            domain key         domain lock
+//	blobs/tmp-<sha>        blobs/<sha>        blobs/tmp-<sha>.lock
+//	blobs/tmp-path-<name>  blobs/path-<name>  blobs/tmp-path-<name>.lock
 //
 // The content-addressed row is unchanged, so the publication's holdsBlobKey
-// check keeps working exactly as before.
+// check keeps working exactly as before. The path-derived row is structurally
+// non-canonical: "path-" is not a hex digest, so its key and lock can never be
+// a canonical blob key/lock, and its staging name can never equal a
+// content-addressed tmp-<sha> staging name. That is what prevents two
+// digest-less items whose paths are each other's content digests from holding
+// the blob domains each other's store needs, and it removes the staging-name
+// collision by construction.
 //
 // The cases below are driven through the real Download and cleanup paths, and
 // the synchronization is deterministic: a writer proves that it waits through
@@ -48,9 +54,9 @@ import (
 )
 
 // pathDerivedDst is the cache destination the downloader allocates for an
-// item without a known digest: blobs/tmp-<sanitized relative path>.
+// item without a known digest: blobs/tmp-path-<sanitized relative path>.
 func pathDerivedDst(blobsDir, rel string) string {
-	return filepath.Join(blobsDir, "tmp-"+strings.ReplaceAll(rel, "/", "_"))
+	return filepath.Join(blobsDir, "tmp-path-"+strings.ReplaceAll(rel, "/", "_"))
 }
 
 // pathDerivedPayload builds an ASCII payload of the requested size.
@@ -258,7 +264,7 @@ func TestPathDerivedDestinationDomainExcludesASecondWriter(t *testing.T) {
 
 // TestPathDerivedDestinationDomainExcludesAnotherProcess is the cross-process
 // variant: a REAL child process holds the destination's domain lock
-// (blobs/tmp-<name>.lock), and the writer must wait for it.
+// (blobs/tmp-path-<name>.lock), and the writer must wait for it.
 //
 // The child's live partial is a valid PREFIX of the payload, so the writer
 // resumes from it and the published file is byte-exact.
@@ -496,6 +502,9 @@ func TestContentAddressedDestinationDomainIsUnchanged(t *testing.T) {
 	if want := repo.BlobPath(sha); key != want {
 		t.Errorf("the domain key = %q, want the blob key %q", key, want)
 	}
+	if got, want := stagingOwnershipLockPath(dst), dst+".lock"; got != want {
+		t.Errorf("the domain lock = %q, want %q", got, want)
+	}
 
 	// The writer's domain, observed through the production seam.
 	type acquisition struct {
@@ -608,4 +617,314 @@ func TestNegativeControlNoDomainForPathDerivedDestination(t *testing.T) {
 		t.Fatalf("the negative control did not reproduce the defect: the live partial survived (stat err=%v)", err)
 	}
 	t.Logf("negative control reproduced the defect: the cleanup deleted the live partial of a path-derived destination")
+}
+
+// TestCacheDstDomainKeyUsesNameBasedIdentityForBothClasses pins the single
+// name-based domain rule:
+//
+//   - a content-addressed destination blobs/tmp-<sha> keeps the blob key's
+//     domain (key blobs/<sha>, lock blobs/tmp-<sha>.lock), unchanged;
+//   - a path-derived destination blobs/tmp-path-<name> derives key
+//     blobs/path-<name> and lock blobs/tmp-path-<name>.lock. The "path-"
+//     prefix is not a hex digest, so even when <name> is a canonical SHA the
+//     key/lock cannot equal a blob key/lock and the staging name cannot equal
+//     a content-addressed tmp-<sha> name.
+func TestCacheDstDomainKeyUsesNameBasedIdentityForBothClasses(t *testing.T) {
+	blobsDir := filepath.Join(t.TempDir(), "blobs")
+	sha := strings.Repeat("ab", 32)
+
+	contentDst := filepath.Join(blobsDir, "tmp-"+sha)
+	blobKey, ok := cacheDstDomainKey(contentDst)
+	if !ok {
+		t.Fatalf("the content-addressed destination %s has no domain key", contentDst)
+	}
+	if want := filepath.Join(blobsDir, sha); blobKey != want {
+		t.Errorf("content-addressed domain key = %q, want the blob key %q", blobKey, want)
+	}
+	if got, want := stagingOwnershipLockPath(contentDst), contentDst+".lock"; got != want {
+		t.Errorf("content-addressed domain lock = %q, want %q", got, want)
+	}
+
+	// A path-derived destination uses the structurally non-canonical
+	// tmp-path- shape even when its sanitized relative path is a digest.
+	pathDst := filepath.Join(blobsDir, "tmp-path-"+sha)
+	pathKey, ok := cacheDstDomainKey(pathDst)
+	if !ok {
+		t.Fatalf("the path-derived destination %s has no domain key", pathDst)
+	}
+	if want := filepath.Join(blobsDir, "path-"+sha); pathKey != want {
+		t.Errorf("path-derived domain key = %q, want %q", pathKey, want)
+	}
+	if got, want := stagingOwnershipLockPath(pathDst), pathDst+".lock"; got != want {
+		t.Errorf("path-derived domain lock = %q, want %q", got, want)
+	}
+	if pathDst == contentDst {
+		t.Errorf("the path-derived and content-addressed destinations share the staging name %q", pathDst)
+	}
+	if pathKey == blobKey {
+		t.Errorf("path-derived domain key %q equals the blob key", pathKey)
+	}
+	if got := stagingOwnershipLockPath(pathDst); got == stagingOwnershipLockPath(contentDst) {
+		t.Errorf("the path-derived lock file %q equals the blob domain lock", got)
+	}
+
+	// Only a blobs/tmp-<name> staging name is a cache destination.
+	if _, ok := cacheDstDomainKey(filepath.Join(blobsDir, "model.bin")); ok {
+		t.Error("a non-staging blobs entry was accepted as a cache destination")
+	}
+	if _, ok := cacheDstDomainKey(filepath.Join(blobsDir, "tmp-")); ok {
+		t.Error("an empty tmp- name was accepted as a cache destination")
+	}
+}
+
+// TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity pins the cleanup
+// half of the single name-based identity.
+//
+// The path-derived destination uses blobs/tmp-path-<sanitized path> even when
+// that path is a canonical digest string, so the cleanup derives
+// key blobs/path-<name> and lock blobs/tmp-path-<name>.lock from the SAME
+// destination name the writer holds. While the writer holds that domain the
+// live partial must survive; after release the cleanup removes it. The staging
+// name can never equal a content-addressed tmp-<sha> destination.
+func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	restoreWait := stagingLockCleanupWait
+	stagingLockCleanupWait = 50 * time.Millisecond
+	defer func() { stagingLockCleanupWait = restoreWait }()
+
+	rel := strings.Repeat("cd", 32)
+	cacheDir := t.TempDir()
+	repo := ownershipContractRepo(t, cacheDir)
+	dst := pathDerivedDst(repo.BlobsDir(), rel)
+	partial := dst + ".part"
+	live := []byte("the live partial of the path-derived writer")
+	if err := os.WriteFile(partial, live, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	key, ok := cacheDstDomainKey(dst)
+	if !ok {
+		t.Fatalf("the path-derived destination %s has no domain key", dst)
+	}
+	if want := filepath.Join(repo.BlobsDir(), "path-"+rel); key != want {
+		t.Errorf("path-derived domain key = %q, want %q", key, want)
+	}
+	if got, want := stagingOwnershipLockPath(dst), dst+".lock"; got != want {
+		t.Fatalf("path-derived domain lock = %q, want %q", got, want)
+	}
+	contentDst := filepath.Join(repo.BlobsDir(), "tmp-"+rel)
+	if dst == contentDst {
+		t.Fatalf("the path-derived and content-addressed destinations share the staging name %q", dst)
+	}
+	domain, err := blobDomainAcquire(context.Background(), key, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			domain.release()
+		}
+	}()
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	got, err := os.ReadFile(partial)
+	if err != nil {
+		t.Fatalf("the cleanup removed the live partial of the path-derived writer: %v", err)
+	}
+	if !bytes.Equal(got, live) {
+		t.Errorf("the live partial changed across the cleanup: got %q, want %q", got, live)
+	}
+
+	// Once the writer releases its domain, the cleanup removes the artifacts.
+	domain.release()
+	released = true
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("the released destination's own partial survived cleanup, stat err=%v", err)
+	}
+}
+
+// twoPathDerivedFile is one file of the deadlock hub below.
+type twoPathDerivedFile struct {
+	rel  string
+	body []byte
+}
+
+// newTwoPathDerivedHub serves two plain (non-LFS) files WITHOUT a supplied
+// digest and holds BOTH payload responses until both GETs have arrived.
+//
+// The gate makes the ownership cycle deterministic: both items own their own
+// destination domain before either can finish its transfer and enter the
+// store, which is the state in which the old identity could deadlock.
+func newTwoPathDerivedHub(t *testing.T, files []twoPathDerivedFile) (*httptest.Server, <-chan struct{}, func()) {
+	t.Helper()
+	var nodes []string
+	byPath := map[string][]byte{}
+	for _, f := range files {
+		// No sha256 and no lfs block: the planner accepts an empty digest and
+		// the item is a plain, non-ranged file.
+		nodes = append(nodes, fmt.Sprintf(`{"type":"file","path":%q,"size":%d}`, f.rel, len(f.body)))
+		byPath[f.rel] = f.body
+	}
+	tree := "[" + strings.Join(nodes, ",") + "]"
+
+	var (
+		mu      sync.Mutex
+		entered int
+	)
+	bothEntered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(tree))
+		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
+			rel := filepath.Base(r.URL.Path)
+			body, ok := byPath[rel]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method == http.MethodHead {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			mu.Lock()
+			entered++
+			if entered == len(files) {
+				close(bothEntered)
+			}
+			mu.Unlock()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(func() {
+		unblock()
+		srv.Close()
+	})
+	return srv, bothEntered, unblock
+}
+
+// TestPathDerivedDigestNamedFilesDoNotDeadlockWithComputedBlobDomains is the
+// regression for the path-derived destination-domain deadlock.
+//
+// File A's path is SHA256(Y) and its content is X; file B's path is SHA256(X)
+// and its content is Y. Neither item has a supplied digest, so both are
+// path-derived and stage under blobs/tmp-path-SHA256(Y) and
+// blobs/tmp-path-SHA256(X). The "path-" prefix makes those names structurally
+// non-canonical, so their name-based domains are blobs/path-SHA256(Y) and
+// blobs/path-SHA256(X): neither can equal a blob key or lock.
+//
+// Before the prefix, the destinations were blobs/tmp-SHA256(Y) and
+// blobs/tmp-SHA256(X), so A's destination held domain key blobs/SHA256(Y) and
+// B's held blobs/SHA256(X); A's store then needed blobs/SHA256(X) and B's
+// store needed blobs/SHA256(Y) - each waited forever for the domain the other
+// held, and the in-process wait is unbounded. The items must instead transfer,
+// store and publish both blobs under the digests computed from their content.
+//
+// The two payload responses are gated until both transfers have started, so
+// the cycle is reached deterministically and the bounded context is the only
+// timing element.
+func TestPathDerivedDigestNamedFilesDoNotDeadlockWithComputedBlobDomains(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	x := []byte(strings.Repeat("x", 1_024))
+	y := []byte(strings.Repeat("y", 1_024))
+	shaX := singleTestSHA(x)
+	shaY := singleTestSHA(y)
+	if shaX == shaY {
+		t.Fatal("the two test payloads share a digest")
+	}
+
+	cacheDir := t.TempDir()
+	repo := ownershipContractRepo(t, cacheDir)
+
+	srv, bothEntered, release := newTwoPathDerivedHub(t, []twoPathDerivedFile{
+		{rel: shaY, body: x},
+		{rel: shaX, body: y},
+	})
+
+	cfg := ownershipContractSettings(cacheDir, srv.URL, "1MB")
+	cfg.MaxActiveDownloads = 2
+	cfg.Concurrency = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result := make(chan ownershipContractOutcome, 1)
+	go func() { result <- runOwnershipContractDownload(ctx, cfg) }()
+
+	// Both items must be inside their transfer before the gate opens: that is
+	// the state in which each still holds its own destination domain when the
+	// other enters the store.
+	select {
+	case <-bothEntered:
+	case <-time.After(60 * time.Second):
+		release()
+		t.Fatal("the two items did not both start their transfers")
+	}
+	release()
+
+	var out ownershipContractOutcome
+	select {
+	case out = <-result:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Download did not finish: the two path-derived destinations deadlocked on their computed blob domains")
+	}
+	if out.err != nil {
+		t.Fatalf("Download: %v (both path-derived items must complete, not deadlock on each other's computed blob domains)", out.err)
+	}
+
+	// Both computed content digests are published with the exact bytes, and
+	// both requested paths are reachable.
+	assertExactFile(t, repo.BlobPath(shaX), x)
+	assertExactFile(t, repo.BlobPath(shaY), y)
+	assertOwnershipContractLinks(t, cacheDir, shaX)
+	assertOwnershipContractLinks(t, cacheDir, shaY)
+
+	// The writers used the structurally non-canonical tmp-path- staging names
+	// and the single name-based domain: each destination owns the persistent
+	// tmp-path-<name>.lock sibling, its key is blobs/path-<name>, and it can
+	// never share the staging name of a content-addressed tmp-<sha> item.
+	for _, rel := range []string{shaX, shaY} {
+		dst := filepath.Join(repo.BlobsDir(), "tmp-path-"+rel)
+		key, ok := cacheDstDomainKey(dst)
+		if !ok {
+			t.Errorf("the path-derived destination %s has no domain key", dst)
+			continue
+		}
+		if want := filepath.Join(repo.BlobsDir(), "path-"+rel); key != want {
+			t.Errorf("path-derived domain key = %q, want %q", key, want)
+		}
+		if _, err := os.Stat(dst + ".lock"); err != nil {
+			t.Errorf("the path-derived destination domain lock %s is missing: %v", dst+".lock", err)
+		}
+		contentDst := filepath.Join(repo.BlobsDir(), "tmp-"+rel)
+		if dst == contentDst {
+			t.Errorf("the path-derived and content-addressed destinations share the staging name %q", dst)
+		}
+	}
 }

@@ -28,7 +28,9 @@ package hfdownloader
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -222,5 +224,51 @@ func TestUnprovenAndLiveOwnerErrorsDiffer(t *testing.T) {
 	// working; only the unproven case carries the new sentinel.
 	if !errors.Is(unproven, errBlobIncompleteOwned) {
 		t.Errorf("the unproven error lost the shared staging-unavailable classification: %v", unproven)
+	}
+}
+
+// TestUnprovenStagingReadErrorKeepsSentinelAndCause covers a record that
+// EXISTS but cannot be read for a reason other than not-exist, such as the
+// record path being a directory.
+//
+// The state is unproven for the same reason a malformed record is: the read
+// failure proves neither a live owner nor a dead one, so the partial is
+// preserved, the operator-visible message names the staging pair, and the
+// caller can still distinguish the state with ErrStagingOwnershipUnproven.
+// The underlying filesystem error stays inspectable as well.
+func TestUnprovenStagingReadErrorKeepsSentinelAndCause(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "blob.incomplete")
+	metaPath := staging + ".meta"
+	// A directory at the record path makes os.ReadFile fail with a non-
+	// not-exist error on every supported platform.
+	if err := os.Mkdir(metaPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	it := PlanItem{RelativePath: "model.bin", SHA256: strings.Repeat("a", 64)}
+
+	_, _, err := claimStagingLocked(staging, metaPath, it, Job{Repo: "owner/model"},
+		"commit123", true, true, false, false)
+	if err == nil {
+		t.Fatal("an unreadable staging record was accepted")
+	}
+	if !errors.Is(err, ErrStagingOwnershipUnproven) {
+		t.Errorf("error = %v, want the ErrStagingOwnershipUnproven sentinel", err)
+	}
+	if !errors.Is(err, errBlobIncompleteOwned) {
+		t.Errorf("error = %v, want the shared staging-unavailable classification", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "cannot be proven to belong to a live or dead owner") {
+		t.Errorf("error = %q, want the unproven-ownership wording", msg)
+	}
+	if !strings.Contains(msg, staging) || !strings.Contains(msg, metaPath) {
+		t.Errorf("error = %q, want the staging pair %s / %s named", msg, staging, metaPath)
+	}
+	// The read failure is preserved, not replaced by the classification.
+	var pathErr *fs.PathError
+	if !errors.As(err, &pathErr) {
+		t.Errorf("error = %v, want the underlying filesystem error to stay inspectable", err)
+	} else if pathErr.Path != metaPath {
+		t.Errorf("underlying error path = %q, want %q", pathErr.Path, metaPath)
 	}
 }

@@ -308,8 +308,9 @@ func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) 
 	var events []ProgressEvent
 	it := PlanItem{RelativePath: "inherited.bin", URL: srv.URL, Size: total, LFS: true, SHA256: sha}
 	// The complete partial is published without a request only when its
-	// identity record proves the bytes belong to this item.
-	seedSinglePartial(t, dst, full, Job{Repo: "o/r"}, it, singleTestIdentity)
+	// identity record proves the bytes belong to this item and records a
+	// cleanly-framed body.
+	seedSinglePartial(t, dst, full, Job{Repo: "o/r"}, it, completeSingleIdentity())
 	cfg := Settings{Verify: "size", Retries: 0, StallTimeout: "0"}
 	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ev ProgressEvent) {
 		events = append(events, ev)

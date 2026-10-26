@@ -7,7 +7,7 @@ package hfdownloader
 //
 // The single-request path stages its bytes in <dst>.part. For an item without
 // a known digest the destination name is derived from the item's path
-// (tmp-<sanitized path>), so two different objects - and two revisions of one
+// (tmp-path-<sanitized path>), so two different objects - and two revisions of one
 // object - share one staging name. The bytes already on disk are inherited
 // only when the identity sidecar <dst>.part.meta proves they belong to this
 // exact object: same repository, same RESOLVED commit, same item path, same
@@ -53,8 +53,20 @@ func pinnedSingleIdentity() singleOpts {
 	return singleTestIdentity
 }
 
+// completeSingleIdentity returns the pinned identity of a partial whose
+// producing run also recorded a cleanly-framed response body. Fixtures that
+// seed an exactly-sized partial and expect it to be published without a
+// request MUST use this: an exact size alone is not framing proof.
+func completeSingleIdentity() singleOpts {
+	opts := singleTestIdentity
+	opts.FramingComplete = true
+	return opts
+}
+
 // seedSingleIdentity writes the identity sidecar that authorizes inheriting
-// the partial staged at dst.
+// the partial staged at dst. opts also carries the clean-framing completion
+// proof: callers seeding an exactly-sized partial that must finalize without
+// a request pass completeSingleIdentity().
 func seedSingleIdentity(t *testing.T, dst string, job Job, it PlanItem, opts singleOpts) {
 	t.Helper()
 	if err := writeSinglePartIdentity(singlePartIdentityPath(dst), singleIdentityFor(job, it, opts)); err != nil {

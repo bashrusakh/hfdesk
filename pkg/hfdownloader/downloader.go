@@ -528,8 +528,13 @@ LOOP:
 				// target for the single-request path and non-LFS files.
 				tmpName := "tmp-" + it.SHA256
 				if it.SHA256 == "" {
-					// Fallback: sanitize path to avoid collisions
-					tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
+					// Path-derived names are STRUCTURALLY NON-CANONICAL: the
+					// "path-" prefix can never be a 64-hex digest, so this
+					// staging name can never look like a content-addressed
+					// tmp-<sha> name and its name-based destination domain
+					// (blobs/path-<sanitized>) can never reach a blob key or
+					// lock. Sanitize path separators to avoid collisions.
+					tmpName = "tmp-path-" + strings.ReplaceAll(it.RelativePath, "/", "_")
 				}
 				// Guard: SafeJoin so the remote-controlled temp name (SHA256
 				// or path-derived) cannot escape the blobs directory — the
@@ -688,24 +693,32 @@ LOOP:
 
 			// The DESTINATION's ownership domain.
 			//
-			// Every cache destination owns exactly ONE domain, and the domain
-			// is keyed on the DESTINATION, not on the blob key the item may
-			// end up in: a destination is blobs/tmp-<name>, its domain key is
+			// Every cache destination owns exactly ONE name-based domain:
+			// a destination is blobs/tmp-<name>, its domain key is
 			// blobs/<name> and its domain lock is the persistent sibling
-			// blobs/tmp-<name>.lock. For a content-addressed item the name is
-			// the SHA-256, so the domain is EXACTLY the blob key's domain of
-			// today (key blobs/<sha>, lock blobs/tmp-<sha>.lock): the ranged
-			// route, the single-request route and the cache store still share
-			// one domain, and the publication's holdsBlobKey check keeps
-			// working unchanged.
+			// blobs/tmp-<name>.lock. The writer and the cleanup of that
+			// destination derive the same identity.
 			//
-			// For a path-derived destination (an item without a known digest,
-			// which the planner allows) the same derivation gives the
-			// destination its own domain. Without it, two writers of that
-			// destination were not mutually excluded, and the CLEANUP's
-			// protection was vacuous: the cleanup derived the same key, but
-			// no writer ever held it, so a cancelled job could delete another
-			// live job's .part/temp for the same path.
+			// The two item classes are kept in separate staging SHAPES, so
+			// the name-based derivation cannot collide with a blob key:
+			//
+			//   - a content-addressed item stages at blobs/tmp-<sha>; its
+			//     name is the canonical SHA-256, so the domain is EXACTLY the
+			//     blob key's domain (key blobs/<sha>, lock
+			//     blobs/tmp-<sha>.lock) and the publication's holdsBlobKey
+			//     check keeps working unchanged.
+			//
+			//   - a path-derived item (no supplied digest, which the planner
+			//     allows) stages at blobs/tmp-path-<sanitized path>. "path-"
+			//     is not a hex digest, so its domain key is
+			//     blobs/path-<sanitized path> and its lock is
+			//     blobs/tmp-path-<sanitized path>.lock. Neither identity can
+			//     be reached by a canonical blob key/lock, and the staging
+			//     name can never equal a content-addressed tmp-<sha> name.
+			//     That is what prevents two digest-less items whose paths are
+			//     each other's content digests from holding the blob domains
+			//     each other's store needs, and it removes the staging-name
+			//     collision by construction.
 			//
 			// The domain is held for the whole operation on the destination:
 			// the partial namespace (so no other writer can adopt, migrate or
@@ -1392,12 +1405,16 @@ func removePartialWithIdentity(dst string) {
 // the domain.
 //
 // The domain identity is the SAME for the writer and for the cleanup: it is
-// derived from the destination (blobs/tmp-<name> -> domain key blobs/<name>,
-// lock file blobs/tmp-<name>.lock). For a content-addressed destination the
-// name is the SHA-256, so the domain is the blob key's domain; for a
-// path-derived destination (an item without a known digest) it is the
-// destination's own domain. The cleanup therefore protects a path-derived
-// destination exactly like a content-addressed one.
+// derived from the destination name (blobs/tmp-<name> -> domain key
+// blobs/<name>, lock file blobs/tmp-<name>.lock). For a content-addressed
+// destination the name is the SHA-256, so the domain is the blob key's domain.
+// For a path-derived destination the downloader allocates the structurally
+// non-canonical staging name blobs/tmp-path-<sanitized path>, so the key is
+// blobs/path-<sanitized path>: "path-" cannot be a canonical digest, so this
+// domain can never equal a blob key or lock, and the staging name can never
+// equal a content-addressed tmp-<sha> name. The cleanup therefore protects a
+// path-derived destination exactly like a content-addressed one while keeping
+// ONE name-based identity per destination.
 //
 // A legacy/output-mode destination is not cache-scoped: it has no blobs/
 // style internal identity of its own. It nevertheless owns ONE domain, and
@@ -1428,10 +1445,13 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 			// The destination namespace: the staging name, its single-request
 			// .part, the legacy .part-NN parts and the blob-keyed staging
 			// pair all belong to ONE destination. They are removed only while
-			// that destination's ownership domain is held - the SAME domain
-			// its writer holds, whether the destination is content-addressed
-			// (the domain key is the blob key blobs/<sha>) or path-derived
-			// (the domain key is blobs/<name>).
+			// that destination's ownership domain is held - the SAME
+			// name-based domain its writer holds: destination
+			// blobs/tmp-<name> means key blobs/<name> and lock
+			// blobs/tmp-<name>.lock. A path-derived destination is staged at
+			// blobs/tmp-path-<sanitized path>, so its key is
+			// blobs/path-<sanitized path>; "path-" cannot be a canonical
+			// digest, so the writer and this cleanup never derive a blob key.
 			if key, ok := cacheDstDomainKey(dst); ok {
 				domain, derr := blobDomainCleanupAcquire(context.Background(), key, dst)
 				if derr != nil {
@@ -1609,8 +1629,9 @@ func removePartialArtifacts(dst string) error {
 //
 // It is the flat/output-mode counterpart of removePartialArtifacts. In HF
 // cache mode the domain's lifetime lock and the staging pair's lock are
-// DIFFERENT files (blobs/tmp-<name>.lock vs blobs/tmp-<name>.incomplete.lock),
-// so the staging pair can be removed through the unclaimed-claim path. In
+// DIFFERENT files (blobs/tmp-<name>.lock vs
+// blobs/tmp-<name>.incomplete.lock), so the staging pair can be removed
+// through the unclaimed-claim path. In
 // flat mode they are the SAME file (<destination>.incomplete.lock), so the
 // pair must be removed through the body that does NOT take the lock again: a
 // second exclusive open of the same lock file conflicts even inside one
@@ -1755,7 +1776,12 @@ func absoluteAttemptCeiling(retries int) int {
 // (the commit was actually resolved). A partial without a usable record, or
 // one recorded for another object or another revision, is discarded: the
 // transfer restarts from zero. When the record matches, the HTTP request
-// uses a Range header to fetch only the remaining bytes. Every ranged (206)
+// uses a Range header to fetch only the remaining bytes. An exactly-sized
+// partial is published without a request only when the matching sidecar also
+// records a cleanly-framed completion (io.Copy saw EOF at the exact expected
+// byte count); otherwise the final byte is reserved and re-requested as the
+// non-empty range [size-1, size), because written bytes alone do not prove
+// that the response body ended cleanly. Every ranged (206)
 // response is validated exactly like the multipart worker path: the status
 // must be 206, Content-Range must name the requested [pos, size-1] start/end
 // (and the expected total), Content-Length must match the requested length,
@@ -1841,6 +1867,18 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// after the unproven bytes are gone: it must describe exactly the partial
 	// that is on disk. A partial left by an interrupted run keeps this
 	// record, which is what makes the next run's decision possible.
+	//
+	// The clean-framing completion proof travels with the bytes it describes
+	// and only with them: it is carried over only for an exactly-sized partial
+	// that the recorded identity authorizes, and it is dropped for a fresh
+	// transfer, for an incomplete restart (the proof described a full body)
+	// and for a partial that is about to be discarded. It is not part of the
+	// identity comparison - a matching record still resumes the prefix - but
+	// an exactly-sized partial without it is not published without a request
+	// (see the exact-size branch below).
+	sizeValid := !((it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0))
+	identity.FramingComplete = it.Size > 0 && pos == it.Size && recorded != nil &&
+		recorded.FramingComplete && recorded.inheritableBy(identity)
 	if err := writeSinglePartIdentity(sidecar, identity); err != nil {
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
@@ -1848,7 +1886,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// An oversized partial is stale/corrupt. A partial with no known expected
 	// size cannot be range-validated at all, so it is discarded rather than
 	// guessed at (downloader correctness rule: never resume unknown layout).
-	if (it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0) {
+	if !sizeValid {
 		if err := out.Truncate(0); err != nil {
 			return false, err
 		}
@@ -1856,14 +1894,41 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		inherited = false
 	}
 
+	// forceLastByteRange makes the clean-framing revalidation an explicit
+	// ranged request even when the reserved final byte starts at offset zero
+	// (a one-byte file), where the ordinary resume rule would send a full GET.
+	forceLastByteRange := false
+
 	// If the partial already holds exactly the expected number of bytes, its
 	// bytes are still unproven: publish only after the exact-size check and,
 	// for inherited bytes, the content proof. Emit the full-progress reading
 	// before the finalization event so the UI does not sit below 100% through
 	// the proof/rename.
 	if it.Size > 0 && pos == it.Size {
-		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
-		return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
+		if identity.FramingComplete {
+			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
+			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
+		}
+		// The file is exactly full, but no run recorded that the response
+		// body ended cleanly at that byte count. Written bytes alone are not
+		// proof of clean framing: a process can exit after the last WriteAt
+		// and before io.Copy observes EOF, leaving a torn final byte. Reserve
+		// that byte so the normal transfer path re-requests the non-empty
+		// range [size-1, size) and only a clean response commits it.
+		downloadLog.Info("revalidating unframed single-path final byte",
+			"repo", job.Repo,
+			"path", it.RelativePath,
+			"bytes", it.Size,
+		)
+		if err := out.Truncate(it.Size - 1); err != nil {
+			return false, err
+		}
+		pos = it.Size - 1
+		// For a one-byte file the reserved range starts at zero, where the
+		// normal resume rule would send a full GET. Force the explicit
+		// non-empty [0, 1) range so the revalidation is always one cleanly
+		// framed ranged response, exactly like every other size.
+		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
@@ -1922,7 +1987,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 
 		req, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
 		addAuth(req, token)
-		if pos > 0 && it.Size > 0 {
+		if it.Size > 0 && (pos > 0 || forceLastByteRange) {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, it.Size-1))
 		}
 
@@ -2060,6 +2125,23 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						}
 					}
 					if cerr == nil {
+						// io.Copy observed a clean end of the body AND every
+						// exact length check passed, so this run holds the
+						// clean-framing proof the partial lacked. Persist it
+						// before publication: a later restart that lands on an
+						// exactly-sized partial may then finalize without a
+						// request. A persistence failure only loses that
+						// restart optimization - this run's bytes are framed
+						// now - so it is a warning, not a publication error.
+						identity.FramingComplete = true
+						if werr := writeSinglePartIdentity(sidecar, identity); werr != nil {
+							downloadLog.Warn("cannot persist single-part clean-framing completion",
+								"repo", job.Repo,
+								"path", it.RelativePath,
+								"record", sidecar,
+								"error", werr,
+							)
+						}
 						// The file now has exactly the expected bytes (a ranged
 						// body covers [pos, size) and a full body covers
 						// [0, size)); finalizeSinglePartial re-checks the size
@@ -2154,8 +2236,20 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	return false, lastErr
 }
 
+// singleProofStartHook is a test seam invoked at the very start of the
+// single-path known-digest content proof, immediately before
+// computeSHA256Ctx. It is nil in production. A regression test installs it to
+// cancel the context while the partial's writable handle is still open, so it
+// can prove that the explicit-cancel cleanup closes that handle before it
+// removes anything (Windows cannot unlink an open file).
+var singleProofStartHook func(out *os.File)
+
 // finalizeSinglePartial publishes a .part that already holds exactly the
-// expected number of bytes. It is the single path's publication gate: the
+// expected number of bytes. It is called only when this run observed a clean
+// end of the response body at that byte count, or when a matching sidecar
+// already recorded that clean-framing completion for the exact-sized partial;
+// written bytes alone never reach this gate. It is the single path's
+// publication gate: the
 // exact-size check runs first, then a known digest is proven with one
 // full-file SHA-256 pass before the rename whenever Verify is "sha256" or
 // "etag" (fresh or resumed), whenever the partial contains inherited bytes and
@@ -2204,9 +2298,22 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 		(cfg.Verify == "sha256" || cfg.Verify == "etag" ||
 			(cfg.Verify != "none" && (it.Size <= 0 || inherited || !opts.CommitPinned)))
 	if proveKnownDigest {
+		if singleProofStartHook != nil {
+			singleProofStartHook(out)
+		}
 		sum, err := computeSHA256Ctx(ctx, tmp)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
+				// The content proof is the only pre-publication cancellation
+				// branch that reached the cleanup with the partial's writable
+				// handle still open. Close it before the explicit-cancel
+				// cleanup: Windows cannot unlink a file while this handle
+				// (opened without FILE_SHARE_DELETE) is open, so a cancelled
+				// proof would otherwise retain the whole .part and its identity
+				// sidecar. A double Close from the deferred close is harmless.
+				// Pause/internal aborts keep their bytes exactly as before; they
+				// only skip the cleanup below.
+				_ = out.Close()
 				if !abortPartAttempt(ctx) {
 					cleanupPartialsOnCancel(cfg, dst, "")
 				}

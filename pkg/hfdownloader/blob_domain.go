@@ -33,6 +33,17 @@ package hfdownloader
 // unlinked, and excluded from cache statistics, listings, mirrors and cache
 // deletion.
 //
+// A PATH-DERIVED cache destination (an item without a supplied digest, whose
+// staging name is derived from its relative path) is staged under a
+// STRUCTURALLY NON-CANONICAL name: blobs/tmp-path-<sanitized path>. The
+// "path-" name can never be a canonical 64-hex digest, so the name-based
+// domain derivation below yields blobs/path-<sanitized path> and
+// blobs/tmp-path-<sanitized path>.lock, which no blob key or lock can reach.
+// The staging name can also never equal a content-addressed item's
+// blobs/tmp-<sha> name. That is what prevents two digest-less items whose
+// paths are each other's content digests from holding the blob domains each
+// other's store needs, and it keeps ONE destination domain per staging name.
+//
 // A writer holds the domain for its whole operation on the key: the partial
 // namespace (so no other route can adopt, migrate or delete a live partial of
 // the same key) and the publication (so the existence decision and the
@@ -405,10 +416,17 @@ func (r *RepoDir) blobDomainDst(sha string) (string, error) {
 // working unchanged, and the cleanup of a blob key's artifacts keeps taking
 // the same domain the writer holds.
 //
-// For a path-derived destination (an item without a known digest) the same
-// derivation gives the destination its own domain, so a writer of that
-// destination and the cleanup of that destination agree on ONE identity
-// instead of protecting a domain nobody holds.
+// For a path-derived destination (an item without a known digest) the
+// downloader allocates a STRUCTURALLY NON-CANONICAL staging name,
+// blobs/tmp-path-<sanitized path>. The "path-" prefix can never be a canonical
+// 64-hex digest, so the same derivation gives key blobs/path-<sanitized path>
+// and lock blobs/tmp-path-<sanitized path>.lock: a domain no blob key or lock
+// can reach, even when the sanitized relative path is itself a digest string.
+// The staging name also can never equal a content-addressed tmp-<sha> name.
+// That is what prevents two digest-less items whose paths are each other's
+// content digests from holding the blob domains each other's store needs,
+// while the writer and the cleanup of one destination still agree on ONE
+// identity.
 //
 // A destination outside a blobs directory, or one that is not a tmp-<name>
 // staging name, has no domain key: it is not a cache destination and keeps

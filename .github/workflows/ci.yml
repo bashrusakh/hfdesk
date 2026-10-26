@@ -123,9 +123,14 @@ jobs:
       #     inherited only under the matching identity;
       #   - the flat/output-mode destination domain: both routes and the
       #     cleanup resolve ONE ownership identity for a flat destination,
-      #     and the hand-off to the single-request path holds it too.
+      #     and the hand-off to the single-request path holds it too;
+      #   - explicit-cancel cleanup while the single-path content proof is
+      #     running: the proof can reach the cleanup with the partial's
+      #     writable handle still open, so the cleanup must close that handle
+      #     before removing the cancelled `.part` and its `.part.meta`
+      #     sidecar (Windows cannot unlink an open file).
       - name: Test downloader ownership, resume and publication
-        run: go test ./pkg/hfdownloader -count=1 -run '^(TestStagingOSLockHeldByLiveProcessBlocksTakeover|TestStagingOSLockReleasedByCrashedProcess|TestStagingOwnershipHolderObservation|TestStagingOwnership_CrossProcessClaimantsDoNotSeeEachOtherAsOwners|TestRangedMultipart_OutOfOrderRangesProduceExactBytes|TestRangedResumeKeepsAPinnedMatchingIdentity|TestPublishBlobNoReplaceRefusesToOverwrite|TestFinalizeBlobNeverReplacesAnExistingBlob|TestSinglePathIdentityKeepsResumeForTheSameRevision|TestDownloadFlatModeRoutesExcludeEachOther|TestDownloadFlatModeSingleRouteWritersAreExcluded|TestDownloadFlatModeSingleRouteTakesTheDestinationDomain|TestDownloadFlatModeUnknownSizeHandoffTakesTheDestinationDomain|TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain)$' -v
+        run: go test ./pkg/hfdownloader -count=1 -run '^(TestStagingOSLockHeldByLiveProcessBlocksTakeover|TestStagingOSLockReleasedByCrashedProcess|TestStagingOwnershipHolderObservation|TestStagingOwnership_CrossProcessClaimantsDoNotSeeEachOtherAsOwners|TestRangedMultipart_OutOfOrderRangesProduceExactBytes|TestRangedResumeKeepsAPinnedMatchingIdentity|TestPublishBlobNoReplaceRefusesToOverwrite|TestFinalizeBlobNeverReplacesAnExistingBlob|TestSinglePathIdentityKeepsResumeForTheSameRevision|TestDownloadFlatModeRoutesExcludeEachOther|TestDownloadFlatModeSingleRouteWritersAreExcluded|TestDownloadFlatModeSingleRouteTakesTheDestinationDomain|TestDownloadFlatModeUnknownSizeHandoffTakesTheDestinationDomain|TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain|TestDownloadSingle_CancelDuringProofRemovesPartial)$' -v
 
 
       # The Windows desktop host is a second binary of HFDesk. Its defining

@@ -201,8 +201,8 @@ records.
 
 The single-request path has its own resume IDENTITY, because its staging name
 is not one. For an item without a known digest the staging name is derived
-from the item's path (`tmp-<sanitized path>`), so two different objects - or
-two revisions of one object - share one staging name, and the destination's
+from the item's path (`tmp-path-<sanitized path>`), so two different objects -
+or two revisions of one object - share one staging name, and the destination's
 ownership domain excludes concurrent writers without establishing WHICH object
 the staged bytes belong to. A size match is not an identity.
 
@@ -218,14 +218,33 @@ starts from zero: unproven bytes are never published. An unpinned identity
 pins nothing - a moved branch may change the content under that name - so
 nothing is inherited from it.
 
+Object identity is not clean response framing. A process can exit after the
+last WriteAt but before io.Copy observes EOF, so an exactly-sized partial can
+still hold a torn final byte. The sidecar separately records whether the run
+that produced the partial saw the body end cleanly at the exact expected byte
+count (`framing_complete`). An exactly-sized partial is published without a
+request only when the identity matches AND that proof is present. Otherwise
+the final byte is reserved and re-requested as the non-empty range
+`[size-1, size)`; only a cleanly-framed response commits it, and a body error
+during that revalidation leaves the final byte uncommitted for a later
+retry/restart. A fresh transfer records the flag false before any byte is
+trusted and sets it only after io.Copy returns nil and every exact body-length
+check passes. When the expected size is unknown the exact-size shortcut does
+not apply.
+
 The record is written before any inherited byte is trusted, and after the
 unproven bytes are gone, so it always describes the partial that is on disk.
 It is removed together with the partial it describes (on publication, in the
 cancel-cleanup path and after a failed content proof), so no identity record
 outlives its partial, and it survives an interrupted run: that surviving
-record is exactly what makes the next run's decision possible. A legacy
-`.part` without a record is never inherited. The known-digest content proof
-is unchanged and still applies to the inherited bytes.
+record is exactly what makes the next run's decision possible. The
+cancel-cleanup path closes the single-path partial's writable handle before it
+removes anything: the content proof could previously reach that cleanup while
+the handle was still open, and Windows cannot unlink an open file, so an
+explicit cancel during the proof does not retain the whole `.part` and its
+sidecar. Pause/internal aborts still preserve both. A legacy `.part` without a
+record is never inherited. The known-digest content proof is unchanged and
+still applies to the inherited bytes.
 
 A PERMANENT error does not destroy that record. The single-request path's
 fail-fast branch (401/403/404) removes the zero-byte partial the attempt
@@ -257,10 +276,10 @@ selection and the cache deletion.
 The staging shapes are derived from the code that creates them:
 
   - `tmp-<name>` - the single-request staging destination (a content digest, or
-    a path-derived name for an item without a known digest) and everything
-    derived from it: `tmp-<name>.part` (the single-request partial),
-    `tmp-<name>.part.meta` (its identity sidecar) and `tmp-<name>.lock` (the
-    destination domain's persistent lock)
+    the structurally non-canonical `tmp-path-<name>` form for an item without a
+    known digest) and everything derived from it: `tmp-<name>.part` (the
+    single-request partial), `tmp-<name>.part.meta` (its identity sidecar) and
+    `tmp-<name>.lock` (the destination domain's persistent lock)
   - `<name>.incomplete` - the ranged staging payload
   - `<name>.incomplete.meta` - its resume record
   - `<name>.incomplete.meta.tmp` / `<name>.meta.tmp` - the atomic record temp
@@ -398,26 +417,32 @@ file is persistent, is never unlinked, and is excluded from cache statistics,
 listings, mirrors and cache deletion like every other `.lock` artifact.
 
 Every cache destination owns one ownership domain, not only the
-content-addressed ones. The domain is keyed on the DESTINATION, so a writer of
-a destination and the cleanup of that destination agree on one identity:
-destination `blobs/tmp-<name>` means domain key `blobs/<name>` and domain lock
-`blobs/tmp-<name>.lock`. For a content-addressed item the name is the SHA-256,
-so the domain is exactly the blob key's domain described above and the
-publication's `holdsBlobKey` check keeps working unchanged. An item without a
-known digest — the planner allows an empty SHA-256 — gets a path-derived
-destination (`blobs/tmp-<sanitized-relative-path>`), and a writer of that
-destination holds its domain too. That is what makes two writers of the same
-destination mutually exclusive, in this process and in another one, and what
-makes the cleanup of that destination's artifacts real: without it the cleanup
-derived a domain that no writer ever held, so a cancelled job could delete
-another live job's partial for the same path. A writer that finds the
-destination owned by a proven live owner waits for it (bounded,
-context-aware) and then obtains the file itself — a path-derived destination
-has no published content-addressed target to re-check, because its bytes are
-moved into a blob whose name is the digest computed at store time — and the
-store then reuses the already published blob instead of replacing it. A writer
-that cannot take its domain fails before it writes any payload, exactly like
-the content-addressed case.
+content-addressed ones. The domain is keyed on the destination name and is the
+same identity for the writer and the cleanup. A content-addressed item (a
+supplied canonical SHA-256) stages at `blobs/tmp-<sha>`; its name is the
+digest, so its domain is exactly the blob key's domain: key `blobs/<sha>`,
+lock `blobs/tmp-<sha>.lock`; the `holdsBlobKey` check is unchanged. An item
+without a known digest — the planner allows an empty SHA-256 — stages at the
+STRUCTURALLY NON-CANONICAL `blobs/tmp-path-<sanitized-relative-path>`. Its
+domain key is `blobs/path-<sanitized-relative-path>` and its lock is
+`blobs/tmp-path-<sanitized-relative-path>.lock`. "path-" is not a 64-hex
+digest, so neither identity can be reached by a blob key or lock, and the
+staging name can never equal a content-addressed `tmp-<sha>` name. The prefix
+is required: before it a digest-less item's destination name was
+`blobs/tmp-<sanitized path>`, so item A at path `SHA256(Y)` (content X) and
+item B at path `SHA256(X)` (content Y) held the blob domains each other's
+store needed, and the unbounded in-process wait deadlocked the job. It also
+removes the staging-name collision between a digest-less path that is a digest
+string and a content-addressed item with that digest. With the unambiguous
+name the domain stays name-based, one destination has one identity, and
+neither defect can be constructed. The user-visible final/snapshot paths do not
+change. A writer that finds the destination owned by
+a proven live owner waits for it (bounded, context-aware) and then obtains the
+file itself — a path-derived destination has no published content-addressed
+target to re-check, because its bytes are moved into a blob whose name is the
+digest computed at store time — and the store then reuses the already
+published blob instead of replacing it. A writer that cannot take its domain
+fails before it writes any payload, exactly like the content-addressed case.
 
 The legacy/output (flat) mode has no `blobs/`-style internal identity, so it
 borrows the multipart staging name for the destination's one domain: the
@@ -582,9 +607,14 @@ protocol. The `blobs/tmp-<name>` staging name, its single-request `.part`, the
 legacy `.part-NN` parts and the blob-keyed staging pair are removed only while
 that destination's ownership domain is held, so a cancelled job never deletes
 another live writer's partial — that writer would keep writing to an unlinked
-inode and its later publication would fail with ENOENT. The cleanup derives
-the same domain identity the writer holds, so the protection is real for a
-content-addressed and for a path-derived destination alike. A live owner of
+inode and its later publication would fail with ENOENT. The cleanup uses the
+same name-based identity the writer holds: destination `blobs/tmp-<name>`
+means key `blobs/<name>` and lock `blobs/tmp-<name>.lock`. For a
+content-addressed `tmp-<sha>` that is the blob key's domain; for a path-derived
+`tmp-path-<sanitized path>` it is `blobs/path-<sanitized path>` with lock
+`blobs/tmp-path-<sanitized path>.lock`, which no blob key or lock can reach.
+The staging name is unambiguous, so there is one name-based identity per
+destination. A live owner of
 the destination leaves those
 artifacts alone, and the contention is reported. A job can still clean up its
 own artifacts: its writer releases the domain when it returns, and the
@@ -628,11 +658,16 @@ never empty the authoritative record before it is replaced.
 The single-request path follows the same validation model. A resumed `.part` is
 a sequential prefix with no range-layout record - it is identified by the
 `<dst>.part.meta` sidecar (the repository, the resolved commit, the item's
-relative path, the expected size and whether that commit was pinned), not by
+relative path, the expected size, whether that commit was pinned, and whether
+the producing run observed a cleanly-framed body), not by
 a per-range layout - so it is never assumed complete: every
 ranged (206) response must match the exact requested Content-Range, expected
 total and body length, writes are bounded to the requested range, and the file
-must have exactly the expected size before the rename. A reader/copy error after
+must have exactly the expected size before the rename. An exactly-sized
+partial is published without a request only when the matching sidecar also
+records the clean-framing completion; without that proof the final byte is
+reserved and re-requested as `[size-1, size)`, and only a clean response
+commits it. A reader/copy error after
 the final requested byte was written is not successful framing: publication is
 refused, and the last byte is left uncommitted for a nonempty retry/restart
 range. When the expected size is unknown, the partial is discarded rather than
@@ -651,7 +686,16 @@ obsolete artifacts are removed only after the migrated range layout is durable.
 An oversized single `.part` is invalid and is discarded rather than clamped. A
 layout whose every part is missing, empty or oversized contributes no usable
 bytes and is not a migrated state: the unusable family is discarded and a valid
-single `.part` is migrated instead. Migrated bytes are tagged LegacyMigrated:
+single `.part` is migrated instead. A single `.part` WITH an identity sidecar is
+the current-version single-request staging name, not the pre-#140 shape: it is
+imported only when the recorded identity is inheritable by the current plan
+(repo, commit, path, size, PINNED on both sides); a mismatch (including
+unpinned) or an unreadable sidecar imports nothing and preserves the partial and
+its record. A `.part` WITHOUT a sidecar keeps the historical legacy prefix
+migration. When the matching sidecar does not record a cleanly-framed completion
+and the partial is already fully sized, its final byte is reserved and
+re-requested as `[size-1, size)` by a ranged worker instead of being imported as
+a completed layout. Migrated bytes are tagged LegacyMigrated:
 they have layout/prefix structure but no validated provenance, so when the item
 carries a known SHA-256 and Verify is not "none" they receive one full-file
 SHA-256 proof before publication, even in "size" mode (the documented one-time
@@ -672,10 +716,12 @@ the owned discard is attempted; if ownership cannot be verified the poison is
 skipped and the durable flag remains the guard, so the next run re-proves or
 discards. Publication itself is refused while a known digest's proof is still
 pending. Verify "none" is the explicit no-hash opt-out. The single-request
-`.part` has no separate flag: when a proof is required (sha256/etag, inherited
-bytes, or a known digest with unknown size) it is renamed only after that proof,
-so every restart re-proves it; a fresh size transfer with a known size follows
-the size contract and may rename without a hash.
+`.part` has no separate proof-pending flag (its `framing_complete` field
+records response framing, not a content proof): when a proof is required
+(sha256/etag, inherited bytes, or a known digest with unknown size) it is
+renamed only after that proof, so every restart re-proves it; a fresh size
+transfer with a known size follows the size contract and may rename without a
+hash.
 
 # Verification Options
 

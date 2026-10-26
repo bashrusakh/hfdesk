@@ -7,11 +7,11 @@ package hfdownloader
 //
 // The single-request path stages its bytes in <dst>.part. For an item without
 // a known digest the destination name is derived from the item's path
-// (tmp-<sanitized path>), so two different objects - or two revisions of one
-// object - can share one staging name, and the destination's ownership domain
-// excludes concurrent writers without establishing WHICH object the staged
-// bytes belong to. A size match is not an identity: a partial left by an
-// earlier run of a different file or a different revision could otherwise be
+// (tmp-path-<sanitized path>), so two different objects - or two revisions of
+// one object - can share one staging name, and the destination's ownership
+// domain excludes concurrent writers without establishing WHICH object the
+// staged bytes belong to. A size match is not an identity: a partial left by
+// an earlier run of a different file or a different revision could otherwise be
 // published as this item's content.
 //
 // The sidecar <dst>.part.meta carries that identity next to the partial: the
@@ -23,6 +23,14 @@ package hfdownloader
 // zero. The sidecar is written before any inherited byte is trusted, is
 // removed with the partial it describes, and survives an interrupted run -
 // which is exactly what makes the next run's decision possible.
+//
+// The same sidecar records a second, independent fact: whether the run that
+// produced the partial saw the response body end cleanly at the exact expected
+// byte count (FramingComplete). Object identity does not prove clean framing:
+// a process can exit after the last WriteAt but before io.Copy observes EOF.
+// An exactly-sized partial is therefore published without a request only when
+// the identity matches AND that completion proof is present; otherwise the
+// final byte is reserved and revalidated with a non-empty range request.
 
 import (
 	"encoding/json"
@@ -49,6 +57,11 @@ type singleOpts struct {
 	// identity pins nothing: the branch may have moved, so no bytes may be
 	// inherited from it.
 	CommitPinned bool
+	// FramingComplete is the persisted clean-framing completion proof of the
+	// sidecar: it is set only after a response body ended cleanly at the
+	// exact expected byte count, and it is NOT part of the object identity
+	// (inheritableBy ignores it). A fresh identity carries it false.
+	FramingComplete bool
 }
 
 // singlePartIdentity is the recorded identity of a single-request partial.
@@ -71,6 +84,15 @@ type singlePartIdentity struct {
 	// commit. An unpinned identity pins nothing, so a partial carrying it is
 	// never inherited.
 	Pinned bool `json:"pinned"`
+	// FramingComplete records that the run which produced this partial
+	// observed a clean end of the response body at the exact expected byte
+	// count. It is not part of the object identity (inheritableBy ignores
+	// it): a matching, pinned record may resume the staged prefix without it,
+	// but an exactly-sized partial is not published without a request until
+	// this proof exists. A fresh transfer records false before any byte is
+	// trusted and sets it only after io.Copy returns nil and every exact body
+	// length check has passed.
+	FramingComplete bool `json:"framing_complete,omitempty"`
 }
 
 // singlePartIdentityPath returns the identity sidecar path of the
@@ -154,11 +176,12 @@ func removeSinglePartIdentity(path string) {
 // uses.
 func singleIdentityFor(job Job, it PlanItem, opts singleOpts) singlePartIdentity {
 	id := singlePartIdentity{
-		Version: singleIdentityVersion,
-		Repo:    job.Repo,
-		Path:    it.RelativePath,
-		Size:    it.Size,
-		Pinned:  opts.CommitPinned,
+		Version:         singleIdentityVersion,
+		Repo:            job.Repo,
+		Path:            it.RelativePath,
+		Size:            it.Size,
+		Pinned:          opts.CommitPinned,
+		FramingComplete: opts.FramingComplete,
 	}
 	if opts.CommitPinned {
 		id.Commit = opts.Commit
@@ -176,6 +199,11 @@ func singleIdentityFor(job Job, it PlanItem, opts singleOpts) singlePartIdentity
 // so nothing under that name may be inherited, no matter how well the names
 // match. The pinned rule is the shared one (resumeIdentityPinned), so this
 // route and the ranged staging route cannot drift apart.
+//
+// FramingComplete is deliberately NOT compared here: it is completion proof
+// for the response body, not part of the object identity. A matching record
+// without it still authorizes resuming the staged prefix; it only forbids
+// publishing an exactly-sized partial without revalidating the final byte.
 func (id *singlePartIdentity) inheritableBy(current singlePartIdentity) bool {
 	if id == nil {
 		return false

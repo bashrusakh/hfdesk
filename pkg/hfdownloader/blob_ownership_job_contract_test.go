@@ -66,14 +66,21 @@ type ownershipContractOutcome struct {
 }
 
 // runOwnershipContractDownload runs one Download and collects its outcome.
+// The progress callback is invoked from the per-file goroutines, which a
+// multi-file case runs concurrently, so the collections are guarded.
 func runOwnershipContractDownload(ctx context.Context, cfg Settings) ownershipContractOutcome {
 	out := ownershipContractOutcome{}
+	var mu sync.Mutex
 	out.err = Download(ctx, Job{Repo: "owner/model", Revision: "main"}, cfg, func(ev ProgressEvent) {
 		switch {
 		case ev.Event == "file_done" && strings.Contains(ev.Message, "skip"):
+			mu.Lock()
 			out.skips = append(out.skips, ev.Message)
+			mu.Unlock()
 		case ev.Event == "file_done":
+			mu.Lock()
 			out.done = append(out.done, ev.Path)
+			mu.Unlock()
 		}
 	})
 	return out

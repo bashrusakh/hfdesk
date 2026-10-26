@@ -213,7 +213,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   is pending; `none` is the explicit opt-out. The single-path `.part` is its own
   marker when a proof is required (sha256/etag, inherited bytes, or a known
   digest with unknown size): it is renamed only after proof, so every restart
-  re-proves it. A fresh size transfer with a known size follows the size
+  re-proves it. (The sidecar's `framing_complete` is response-framing evidence,
+  not a content proof.) A fresh size transfer with a known size follows the size
   contract and may rename without a hash.
 - Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
   them LegacyMigrated, keep the marker durable across resume, and content-prove
@@ -222,7 +223,15 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   discard it, never clamp it. A multipart layout whose parts are all
   missing/empty/oversized contributes no bytes and is not a migrated layout:
   fall back to a valid single `.part`; set LegacyMigrated only when bytes were
-  actually copied.
+  actually copied. A single `.part` WITH a current-version identity sidecar is
+  not the pre-#140 shape: it is migrated only when the recorded identity is the
+  current plan's (repo, commit, path, size, PINNED on both sides), and a
+  mismatch (including unpinned) or an unreadable sidecar imports nothing and
+  preserves the partial and its record; a `.part` WITHOUT a sidecar keeps the
+  historical legacy prefix migration. If the matching sidecar does not record a
+  cleanly-framed completion and the partial is already fully sized, its final
+  byte is reserved and re-requested as `[size-1, size)` by a ranged worker
+  rather than imported as a completed layout.
 - A publish target's existence proves completion only when it is
   content-addressed (`blobs/<known-sha>`). Arbitrary destinations follow the
   authoritative pre-download skip decision and are redownloaded and atomically
@@ -243,20 +252,35 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   persistent, is never unlinked, and is excluded from cache statistics,
   listings, mirrors and cache deletion like every other `.lock` artifact.
 - EVERY CACHE DESTINATION OWNS ONE OWNERSHIP DOMAIN, NOT ONLY THE
-  CONTENT-ADDRESSED ONES. The domain is keyed on the DESTINATION, and the
-  writer of a destination and the cleanup of that destination must agree on
-  ONE identity: destination `blobs/tmp-<name>` -> domain key `blobs/<name>`,
-  domain lock `blobs/tmp-<name>.lock`. For a content-addressed item the name
-  is the SHA-256, so the domain is exactly the blob key's domain described
-  above (key `blobs/<sha>`, lock `blobs/tmp-<sha>.lock`) and the publication's
-  `holdsBlobKey` check keeps working unchanged. An item WITHOUT a known digest
-  (the planner allows an empty SHA-256) gets a path-derived destination
-  (`blobs/tmp-<sanitized-relative-path>`), and a writer of that destination
-  MUST hold its domain too: otherwise two writers of the same destination are
-  not mutually excluded (in this process or in another one) and the cleanup's
-  protection is vacuous, because it derived the same key while NO writer ever
-  held it — so a cancelled job could delete another live job's `.part`/temp
-  for the same path. A writer that finds the destination owned by a PROVEN
+  CONTENT-ADDRESSED ONES. The domain is keyed on the DESTINATION name and is
+  the SAME identity for the writer and the cleanup:
+  - a content-addressed item (a supplied canonical SHA-256) stages at
+    `blobs/tmp-<sha>`; its name is the digest, so its domain is exactly the
+    blob key's domain: key `blobs/<sha>`, lock `blobs/tmp-<sha>.lock`.
+    `holdsBlobKey`, the publication domain, `FinalizeBlob` and the existing
+    cache cleanup are unchanged for it.
+  - an item WITHOUT a known digest (the planner allows an empty SHA-256) stages
+    at the STRUCTURALLY NON-CANONICAL
+    `blobs/tmp-path-<sanitized relative path>`. Its domain key is
+    `blobs/path-<sanitized relative path>` and its lock is
+    `blobs/tmp-path-<sanitized relative path>.lock`. "path-" is not a 64-hex
+    digest, so neither identity can be reached by a blob key or lock, and the
+    staging name can never equal a content-addressed `tmp-<sha>` name.
+  The `path-` prefix is REQUIRED, not cosmetic. Without it a digest-less
+  item's destination name was `blobs/tmp-<sanitized path>`, so file A at path
+  `SHA256(Y)` (content X) held the domain `blobs/SHA256(Y)` while file B at
+  path `SHA256(X)` (content Y) held `blobs/SHA256(X)`; A's store then needed
+  the blob domain of its computed digest `SHA256(X)` and B's store needed
+  `SHA256(Y)`, and each waited for the domain the other held. The in-process
+  wait is unbounded (bounded only by the job's context), so the job hung until
+  cancelled; returning transfer slots does not break an ownership cycle. The
+  same prefix also prevents a digest-less item from sharing a content-
+  addressed `tmp-<sha>` staging file. Because the staging name is now
+  unambiguous, the domain stays name-based, the writer and the cleanup agree
+  on ONE identity, and the two-item deadlock and the staging-name collision
+  cannot be constructed. The user-visible final/snapshot paths do not change;
+  only the internal staging name does.
+  A writer that finds the destination owned by a PROVEN
   live owner waits for it (bounded, context-aware, never a takeover) and then
   obtains the file itself: a path-derived destination has no published
   content-addressed target to re-check (its bytes are moved into a blob whose
@@ -380,10 +404,14 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   cache destination — the `blobs/tmp-<name>` staging name, its single-request
   `.part`, the legacy `.part-NN` parts and the blob-keyed staging pair — are
   removed only while that destination's ownership domain is held. The cleanup
-  derives the SAME domain identity the writer holds (destination
-  `blobs/tmp-<name>` -> key `blobs/<name>`, lock `blobs/tmp-<name>.lock`), so
-  the protection is real for a content-addressed AND for a path-derived
-  destination. A cleanup without the domain
+  uses the SAME name-based identity the writer holds: destination
+  `blobs/tmp-<name>` -> key `blobs/<name>`, lock `blobs/tmp-<name>.lock`. For a
+  content-addressed `tmp-<sha>` that is the blob key's domain; for a
+  path-derived `tmp-path-<sanitized path>` it is `blobs/path-<sanitized path>`
+  with lock `blobs/tmp-path-<sanitized path>.lock`, which no blob key or lock
+  can reach. The staging name is unambiguous, so there is ONE name-based
+  identity per destination. A cleanup without
+  the domain
   could delete another live writer's LIVE partial: that writer would keep
   writing to an unlinked inode and its later publication would fail with
   ENOENT. When a live owner holds the destination (in this process or in
@@ -512,15 +540,27 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 - THE SINGLE-REQUEST PATH INHERITS BYTES ONLY UNDER A PROVEN IDENTITY. The
   single-request path stages its bytes in `<dst>.part`; for an item without a
   known digest the staging name is derived from the item's path
-  (`tmp-<sanitized path>`), so two different objects - or two revisions of one
-  object - share one staging name, and the destination domain excludes
+  (`tmp-path-<sanitized path>`), so two different objects - or two revisions
+  of one object - share one staging name, and the destination domain excludes
   concurrent writers without establishing WHICH object the staged bytes belong
-  to. A size match is not an identity. The `.part` is a sequential prefix with
+  to. A size match is not an identity. Object identity is not clean response
+  framing either: a process can exit after the final WriteAt and before
+  io.Copy observes EOF, so an exactly-sized partial can still hold a torn
+  final byte. The sidecar therefore also records, independently of the
+  identity, whether the producing run observed a cleanly-framed body at the
+  exact expected byte count (`framing_complete`). An exactly-sized partial is
+  published without a request only when the identity matches AND that proof is
+  present; otherwise the final byte is reserved and re-requested as the
+  non-empty range `[size-1, size)`, and only a cleanly-framed response commits
+  it. A body error during that revalidation leaves the final byte uncommitted
+  for a later retry/restart, exactly like the original transfer. The `.part` is
+  a sequential prefix with
   NO RANGE-LAYOUT record: what identifies it is the identity sidecar
   `<dst>.part.meta` (JSON, versioned), which records the identity in the same
   vocabulary the ranged record uses: repo, resolved commit, item relative
-  path, expected size, and whether the
-  identity is PINNED (the commit was actually resolved). Bytes already on
+  path, expected size, whether the
+  identity is PINNED (the commit was actually resolved), and the separate
+  `framing_complete` completion proof. Bytes already on
   disk are inherited ONLY when that record exists, is readable and well-formed,
   matches the CURRENT item exactly (repo, commit, path, size) and is PINNED on
   both sides. Otherwise the inherited bytes are discarded (the partial is
@@ -533,8 +573,13 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   partial it describes (on publication, in the cancel-cleanup path and after a
   failed content proof), so no identity record outlives its partial, and it
   survives an interrupted run:
-  that surviving record is what makes the next run's decision possible. A
-  legacy `.part` without a record is not inherited. The known-digest content
+  that surviving record is what makes the next run's decision possible. The
+  cancel-cleanup path closes the single-path partial's writable handle BEFORE
+  it removes anything: the content proof could previously reach that cleanup
+  while the handle was still open, and Windows cannot unlink an open file, so
+  an explicit cancel during the proof must not retain the whole `.part` and
+  its sidecar. Pause/internal aborts still preserve both.
+  A legacy `.part` without a record is not inherited. The known-digest content
   proof is unchanged and still applies to the inherited bytes.
 - A PERMANENT ERROR MUST NOT DESTROY THE RESUME IDENTITY. The single-request
   path's fail-fast branch (a permanent 401/403/404) removes the zero-byte
@@ -568,8 +613,9 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   shared rule, so they cannot drift apart.
 - STAGING ARTIFACTS AND PUBLISHED CONTENT ARE SEPARATED BY ONE EXHAUSTIVE
   CLASSIFIER. The downloader creates: the single-request staging name
-  `tmp-<name>` with its `.part`, its `.part.meta` identity sidecar and its
-  `.lock` domain lock; the ranged staging pair `<name>.incomplete` +
+  `tmp-<name>` (including the path-derived `tmp-path-<sanitized path>` form)
+  with its `.part`, its `.part.meta` identity sidecar and its `.lock` domain
+  lock; the ranged staging pair `<name>.incomplete` +
   `<name>.incomplete.meta` with its atomic record temp `<name>.meta.tmp`; the
   persistent ownership lock `<name>.lock`; the legacy multipart family
   `<name>.part-NN` and `<name>.parts.json`; the flat-mode partials

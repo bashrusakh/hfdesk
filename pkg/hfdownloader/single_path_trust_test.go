@@ -107,9 +107,10 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 		t.Cleanup(srv.Close)
 		it := PlanItem{RelativePath: "complete.bin", URL: srv.URL + "/complete.bin", Size: size, LFS: true, SHA256: sha}
 		// The staged bytes are inherited only when the identity record proves
-		// they belong to this item; the content proof then has to reject the
-		// corrupt ones.
-		seedSinglePartial(t, dst, part, Job{Repo: "o/r"}, it, singleTestIdentity)
+		// they belong to this item, and an exact size is published without a
+		// request only with the clean-framing completion proof; the content
+		// proof then has to reject the corrupt ones.
+		seedSinglePartial(t, dst, part, Job{Repo: "o/r"}, it, completeSingleIdentity())
 		return it, dst, srv, &requests
 	}
 
@@ -726,5 +727,86 @@ func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) 
 				t.Errorf("pause failed to preserve the proven partial: len=%d err=%v", len(got), partErr)
 			}
 		})
+	}
+}
+
+// TestDownloadSingle_CancelDuringProofRemovesPartial pins the explicit-cancel
+// cleanup at the single-path content proof, the only pre-publication
+// cancellation branch that reached the cleanup while the partial's writable
+// handle was still open.
+//
+// On Windows os.Remove cannot unlink an open file: downloadSingle opens the
+// partial without FILE_SHARE_DELETE. The proof-cancel branch used to call the
+// cleanup with that handle still open, so an explicit cancel during
+// verification retained the whole `.part` AND its `.part.meta` sidecar; the
+// deferred close happened after the only cleanup attempt. The seam cancels at
+// the exact start of the proof, and the cleanup callback records whether the
+// payload handle was already closed, so the close-before-cleanup order is
+// checked on every platform. The artifact assertions then fail on Windows if
+// the pre-fix order ever returns; on Unix removal succeeds regardless, but the
+// ordering assertion still discriminates.
+func TestDownloadSingle_CancelDuringProofRemovesPartial(t *testing.T) {
+	const size = 64 * 1024
+	full := rangedTestPayload(size)
+	sha := singleTestSHA(full)
+	dst := filepath.Join(t.TempDir(), "cancel-proof.bin")
+	job := Job{Repo: "o/r"}
+	it := PlanItem{RelativePath: "cancel-proof.bin", Size: size, LFS: true, SHA256: sha}
+	// An exactly-sized partial with a matching pinned record that also proves
+	// clean framing reaches the content proof without any HTTP request.
+	seedSinglePartial(t, dst, full, job, it, completeSingleIdentity())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var payload *os.File
+	var proofStarted, payloadClosedAtCleanup bool
+	cleanupCalls := 0
+	cfg := Settings{
+		Verify:       "sha256",
+		Retries:      0,
+		StallTimeout: "0",
+		CleanupPartialsOnCancel: func() bool {
+			cleanupCalls++
+			if payload != nil {
+				_, serr := payload.Stat()
+				payloadClosedAtCleanup = serr != nil
+			}
+			return true
+		},
+	}
+	singleProofStartHook = func(out *os.File) {
+		payload = out
+		proofStarted = true
+		cancel()
+	}
+	defer func() { singleProofStartHook = nil }()
+
+	verified, err := downloadSingle(ctx, http.DefaultClient, "", job, cfg, it, dst, singleTestIdentity,
+		func(ProgressEvent) {})
+
+	if !proofStarted {
+		t.Fatal("the content proof never started; the fixture did not reach proveKnownDigest")
+	}
+	if !errors.Is(err, context.Canceled) || verified {
+		t.Fatalf("cancel during the content proof = (%v,%v), want canceled without publication", verified, err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("explicit-cancel cleanup ran %d times, want exactly the proof-cancel branch's one", cleanupCalls)
+	}
+	if payload == nil {
+		t.Fatal("the proof seam did not receive the partial's payload handle")
+	}
+	if !payloadClosedAtCleanup {
+		t.Error("the payload handle was still open when the cancel cleanup ran; " +
+			"Windows cannot unlink the .part there, so the cancelled payload and its sidecar would survive")
+	}
+	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+		t.Errorf("destination exists after a cancelled proof, stat err=%v", serr)
+	}
+	for _, path := range []string{dst + ".part", dst + ".part.meta"} {
+		if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+			t.Errorf("explicit cancel during the content proof left %s behind (stat err=%v)", filepath.Base(path), serr)
+		}
 	}
 }

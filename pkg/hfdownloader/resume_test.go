@@ -122,8 +122,9 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 		Size:         int64(len(full)),
 	}
 	// The complete partial is published without a request only when its
-	// identity record proves the bytes belong to this item.
-	seedSinglePartial(t, dst, full, job, it, singleTestIdentity)
+	// identity record proves the bytes belong to this item AND records that
+	// the producing run saw the response body end cleanly at the exact size.
+	seedSinglePartial(t, dst, full, job, it, completeSingleIdentity())
 
 	var requestCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

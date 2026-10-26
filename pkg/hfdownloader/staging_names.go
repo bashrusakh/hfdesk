@@ -18,7 +18,9 @@ package hfdownloader
 //     digest, or a path-derived name for an item without a known digest) and
 //     everything derived from it: tmp-<name>.part (the single-request
 //     partial), tmp-<name>.part.meta (its identity sidecar) and
-//     tmp-<name>.lock (the destination domain's persistent lock);
+//     tmp-<name>.lock (the destination domain's persistent lock). A
+//     path-derived name is structurally non-canonical (tmp-path-<name>), so
+//     it can never equal a content-addressed tmp-<sha> name;
 //   - <name>.incomplete      the ranged staging payload;
 //   - <name>.incomplete.meta its resume record;
 //   - <name>.incomplete.meta.tmp / <name>.meta.tmp
