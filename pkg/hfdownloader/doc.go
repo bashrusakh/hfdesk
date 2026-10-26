@@ -419,21 +419,22 @@ store then reuses the already published blob instead of replacing it. A writer
 that cannot take its domain fails before it writes any payload, exactly like
 the content-addressed case.
 
-The legacy/output (flat) mode has no destination domain: that namespace has no
-internal `blobs/`-style identity, so it has no destination-domain key and no
-destination-domain lock file, and the wait-and-re-check protocol does not
-apply there. It is not lock-free, though. The multipart route stages at
-`<destination>.incomplete` and takes the lifetime OS ownership lock on the
-persistent sibling `<destination>.incomplete.lock` — a zero-byte artifact next
-to the user's model file, never unlinked. A concurrent second writer of the
-same flat destination on that route is excluded: it fails its item with the
-actionable live-owner error instead of racing, which is safer than the
-pre-#140 behavior, where two processes wrote the same `.part-NN` payload files
-and could publish a silently corrupt model. The single-request route is not
-excluded: it creates no lock artifact next to the destination (only
-`<destination>.part`, removed on success) and takes no ownership lock, so two
-writers of the same flat destination on that route still race over the same
-`.part`.
+The legacy/output (flat) mode has no `blobs/`-style internal identity, so it
+borrows the multipart staging name for the destination's one domain: the
+domain's lifetime lock is the persistent sibling
+`<destination>.incomplete.lock` — the very lock the multipart route's staging
+claim already takes — and no new artifact name appears next to the user's
+model file. The single-request route holds that same domain while it
+transfers, so one lock file excludes every pair of writers of the same flat
+destination: single-vs-single, single-vs-multipart and multipart-vs-multipart.
+The domain is taken at the download level only for the route that does not
+take it internally: the multipart route's claim holds that lock inside the
+transfer, and an exclusive lock conflicts even within one process, so the
+multipart route keeps relying on its claim. A concurrent second writer of the
+same flat destination is excluded: it fails its item with the actionable
+live-owner error instead of racing, which is safer than the pre-#140
+behavior, where two processes wrote the same `.part-NN` payload files and
+could publish a silently corrupt model.
 
 The domain is also what a second writer of the same key waits for. A writer
 that finds the key owned by a live owner waits for the owner (bounded,
@@ -566,14 +567,17 @@ downloader's own cancel cleanup removes its staging while it still holds the
 domain. The residual limitation is that the cleanup cannot tell "my own
 destination" from "another live owner of the same destination" beyond the
 domain itself, so a destination another writer owns is left alone even when
-the cancelling job also had bytes for it. A legacy/output-mode destination is
-not cache-scoped, so its cleanup holds no destination domain: that namespace
-has no internal `blobs/`-style identity. Its cleanup is claim-checked
-instead: the versioned staging pair (`<destination>.incomplete` and its
-`.meta`) is removed only while no live claim remains, and the single `.part`,
-the legacy `.part-NN` parts and `.parts.json` are removed as before. The
-persistent `<destination>.incomplete.lock` of the multipart route is never
-unlinked.
+the cancelling job also had bytes for it. A legacy/output-mode destination has
+no `blobs/`-style internal identity, so its cleanup derives the same domain
+identity the writer holds: the destination's domain lock is the persistent
+sibling `<destination>.incomplete.lock`, the very lock the multipart route's
+staging claim takes. Its artifacts are removed only while that domain is
+held, so a cancelled job cannot delete another live job's `.part`,
+`.incomplete` or `.meta` for the same path. The versioned staging pair
+(`<destination>.incomplete` and its `.meta`) is still claim-checked, and the
+single `.part`, the legacy `.part-NN` parts and `.parts.json` are removed as
+before. The persistent `<destination>.incomplete.lock` of the multipart route
+is never unlinked.
 
 The mirror writer copies destination blobs with a non-atomic truncate-and-write
 and a size-only check, so it can tear or overwrite a blob a downloader is

@@ -370,6 +370,60 @@ func cacheDstDomainKey(dst string) (string, bool) {
 	return key, true
 }
 
+// flatDomainKeyPrefix namespaces the flat/output-mode domain keys in the
+// shared in-process registry, so a flat destination can never collide with a
+// cache-mode blob-key domain (the two namespaces are disjoint by construction,
+// and the prefix makes that explicit rather than incidental).
+const flatDomainKeyPrefix = "flat:"
+
+// flatDomainKey derives the ownership-domain key of a flat/output-mode
+// destination.
+//
+// The flat namespace has no blobs/-style internal identity, so the key is the
+// destination path itself. The LIFETIME LOCK of that domain is not derived
+// from the key but from the destination's MULTIPART staging name (see
+// flatDomainLockSrc): both routes and the cleanup must resolve the SAME lock
+// file, and that file is the one the multipart route's staging claim already
+// takes.
+func flatDomainKey(dst string) string {
+	return flatDomainKeyPrefix + filepath.Clean(dst)
+}
+
+// flatDomainLockSrc is the staging name whose persistent ".lock" sibling is
+// the lifetime OS ownership lock of a flat destination's domain.
+//
+// It is the MULTIPART staging name (<destination>.incomplete), because the
+// multipart route's staging claim already takes exactly that lock. Reusing it
+// is what excludes the single-request route from the multipart route - and
+// the cleanup from both - without a second artifact next to the user's model
+// file: the lock file is <destination>.incomplete.lock, the zero-byte
+// artifact the multipart route already leaves there and never unlinks.
+func flatDomainLockSrc(dst string) string {
+	return dst + ".incomplete"
+}
+
+// flatDestinationDomain names the ownership domain of one flat/output-mode
+// destination.
+//
+// It is the identity the single-request route holds while it transfers, the
+// identity the cleanup holds while it removes the destination's artifacts,
+// and the identity the multipart route hands to the single-request path when
+// it falls back to it (the fall-back happens BEFORE the multipart route
+// claims the staging, so the domain is still free there).
+type flatDestinationDomain struct {
+	// key is the domain identity: the in-process registry key.
+	key string
+	// lockSrc is the staging name whose persistent ".lock" sibling is the
+	// domain's lifetime OS ownership lock.
+	lockSrc string
+}
+
+// newFlatDestinationDomain derives the ownership domain of one flat/output
+// mode destination.
+func newFlatDestinationDomain(dst string) *flatDestinationDomain {
+	return &flatDestinationDomain{key: flatDomainKey(dst), lockSrc: flatDomainLockSrc(dst)}
+}
+
 // holdsBlobKey reports whether this holder owns the ownership domain of the
 // given content-addressed blob path.
 //
@@ -383,6 +437,24 @@ func (d *blobDomain) holdsBlobKey(key string) bool {
 		return false
 	}
 	return filepath.Clean(d.key) == filepath.Clean(key)
+}
+
+// holdsStagingLock reports whether this holder owns the lifetime ownership
+// lock of the staging pair named by staging.
+//
+// It is the check the flat/output-mode paths need: there the destination's
+// domain lock and the staging pair's lock are the SAME file
+// (<destination>.incomplete.lock), so a removal that took that lock again
+// would report the caller's OWN hold as a live owner and skip the removal.
+//
+// In HF cache mode the two are different files (blobs/tmp-<name>.lock vs
+// blobs/tmp-<name>.incomplete.lock), so the answer is false there and the
+// ordinary claim-checked removal applies.
+func (d *blobDomain) holdsStagingLock(staging string) bool {
+	if d == nil || d.released || d.lock == nil || staging == "" {
+		return false
+	}
+	return d.lock.path == stagingOwnershipLockPath(staging)
 }
 
 // release drops the domain: the OS lock is closed and the in-process slot is

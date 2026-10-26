@@ -708,6 +708,15 @@ LOOP:
 			// and context-aware), not skipped: the file is not present while
 			// the owner holds the destination, so a skip would report a
 			// success the cache does not have.
+			//
+			// A FLAT/output-mode destination owns a domain as well. That
+			// namespace has no blobs/-style identity of its own, so the
+			// domain borrows the MULTIPART staging name: the destination's
+			// domain lock is the persistent sibling of
+			// <destination>.incomplete, which is the very lock the multipart
+			// route's staging claim already takes. Both routes and the
+			// cleanup therefore resolve ONE lock file, and no new artifact
+			// name appears next to the user's model file.
 			var (
 				dlErr  error
 				domain *blobDomain
@@ -765,6 +774,60 @@ LOOP:
 						// own its destination must not write bytes for it, and
 						// the partial data of an earlier run is preserved
 						// untouched.
+						dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
+					}
+				}
+			} else {
+				// Flat/output mode: the destination owns ONE domain too, and
+				// both routes and the cleanup resolve that ONE identity.
+				//
+				// The domain's lifetime lock is the persistent sibling of the
+				// MULTIPART staging name: <destination>.incomplete.lock - the
+				// very lock the multipart route's staging claim already takes.
+				// Reusing it is what excludes the two routes from each other
+				// (and the cleanup from both) without a SECOND artifact next
+				// to the user's model file: the lock file is the one the
+				// multipart route already leaves there.
+				flatDom := newFlatDestinationDomain(dst)
+				// The multipart route needs the domain only for the hand-off
+				// to the single-request path, which happens before it claims
+				// the staging.
+				mpOpts.FlatDomain = flatDom
+				//
+				// DEADLOCK RULE: the domain is taken HERE only for the route
+				// that does NOT take it internally. The multipart route's
+				// claim takes <destination>.incomplete.lock from inside
+				// downloadMultipart, and an exclusive lock conflicts even
+				// within one process when a second descriptor is used, so
+				// taking the same lock here would make the writer contend
+				// with ITSELF. The multipart route therefore keeps relying on
+				// its staging claim - which is the same lock file - and
+				// single-vs-multipart and multipart-vs-multipart are excluded
+				// by that one file.
+				//
+				// A PROVEN live owner of the destination is WAITED FOR
+				// (bounded and context-aware), never skipped: the file is not
+				// present while the owner holds the destination, so a skip
+				// would report a success the output directory does not have.
+				if !multipartRan {
+					dom, derr := blobDomainAcquire(fileCtx, flatDom.key, flatDom.lockSrc)
+					switch {
+					case derr == nil:
+						domain = dom
+						defer domain.release()
+					case errors.Is(derr, errStagingOwnershipBusy):
+						// A PROVEN live writer still holds the destination's
+						// ownership domain after the bounded wait. The file
+						// is NOT present, so this is an actionable failure for
+						// this item - never a successful skip and never a
+						// silent success.
+						dlErr = blobLiveOwnerError(it.SHA256, finalRel)
+					default:
+						// The lifetime ownership of this destination is
+						// unavailable: the OS lock is unsupported, denied, or
+						// the filesystem failed. The operation fails HERE,
+						// before the transfer writes any payload, and the
+						// partial data of an earlier run is preserved.
 						dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
 					}
 				}
@@ -1064,7 +1127,18 @@ LOOP:
 			// obsolete pair claim-checked so a live owner's state is never deleted
 			// and no stale pair survives a successful download.
 			if obsoleteVersionedStaging != "" {
-				removeStagingArtifactsIfUnclaimed(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
+				if domain.holdsStagingLock(obsoleteVersionedStaging) {
+					// The caller already holds this staging pair's lifetime
+					// lock - in flat/output mode the destination's domain
+					// lock IS that lock - so it must not be taken again: a
+					// second exclusive open of the same lock file conflicts
+					// even inside one process, and the acquisition would
+					// report the caller's OWN hold as a live owner and skip
+					// the removal.
+					removeStagingArtifactsIfUnclaimedLocked(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
+				} else {
+					removeStagingArtifactsIfUnclaimed(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
+				}
 			}
 
 			// File is now at its final location; the partial (dst in HF
@@ -1316,11 +1390,16 @@ func removePartialWithIdentity(dst string) {
 // destination's own domain. The cleanup therefore protects a path-derived
 // destination exactly like a content-addressed one.
 //
-// A legacy/output-mode destination is not cache-scoped: it has no internal
-// directory for a domain lock (a stray ".lock" next to a user's model file
-// would be unacceptable), so it keeps its historical shared-destination
-// cleanup behavior. Two writers of the same legacy destination are not
-// mutually excluded there.
+// A legacy/output-mode destination is not cache-scoped: it has no blobs/
+// style internal identity of its own. It nevertheless owns ONE domain, and
+// that domain borrows the MULTIPART staging name: the destination's domain
+// lock is the persistent sibling of <destination>.incomplete, which is the
+// very lock the multipart route's staging claim already takes. Both routes
+// and the cleanup therefore resolve the SAME lock file, so no new artifact
+// name appears next to the user's model file, and the cleanup protects a
+// flat destination exactly like a cache one: a live owner of the destination
+// keeps its .part/.incomplete/.meta artifacts, and the job that owns the
+// destination can still clean up its own.
 //
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor
@@ -1362,6 +1441,37 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 				domain.release()
 				continue
 			}
+		} else {
+			// Flat/output mode: the destination's artifacts are removed only
+			// while THAT destination's ownership domain is held - the same
+			// domain its writer holds, and the same lock file
+			// (<destination>.incomplete.lock) that excludes the single-request
+			// route from the multipart route.
+			//
+			// Without the domain, a cleanup could delete the LIVE partial of
+			// another writer (a cancelled job whose destination meanwhile
+			// became owned by another job), and that writer would keep writing
+			// to an unlinked inode and fail its later publication with ENOENT.
+			// When a live owner holds the destination - in this process or in
+			// another one - the artifacts are left alone and the contention is
+			// reported.
+			//
+			// The job that owns the destination can still clean up its own
+			// artifacts: its own writer releases the domain when it returns,
+			// and the downloader's own cancel cleanup removes its staging
+			// while it still holds the domain.
+			flatDom := newFlatDestinationDomain(dst)
+			domain, derr := blobDomainCleanupAcquire(context.Background(), flatDom.key, flatDom.lockSrc)
+			if derr != nil {
+				downloadLog.Warn("skip cleanup of a destination owned by another live writer",
+					"path", dst, "error", derr)
+				continue
+			}
+			if err := removePartialArtifactsOwned(dst); err != nil {
+				downloadLog.Warn("cleanup partials failed", "path", dst, "error", err)
+			}
+			domain.release()
+			continue
 		}
 		if err := removePartialArtifacts(dst); err != nil {
 			downloadLog.Warn("cleanup partials failed", "path", dst, "error", err)
@@ -1482,6 +1592,32 @@ func removePartialArtifacts(dst string) error {
 	// removeStagingArtifacts so a crash cannot leave a record claiming a
 	// deleted payload.
 	removeStagingArtifactsIfUnclaimed(dst+".incomplete", dst+".incomplete.meta")
+	return removeLegacyMultipartParts(dst)
+}
+
+// removePartialArtifactsOwned removes the partial artifacts of dst while the
+// caller HOLDS the destination's ownership domain.
+//
+// It is the flat/output-mode counterpart of removePartialArtifacts. In HF
+// cache mode the domain's lifetime lock and the staging pair's lock are
+// DIFFERENT files (blobs/tmp-<name>.lock vs blobs/tmp-<name>.incomplete.lock),
+// so the staging pair can be removed through the unclaimed-claim path. In
+// flat mode they are the SAME file (<destination>.incomplete.lock), so the
+// pair must be removed through the body that does NOT take the lock again: a
+// second exclusive open of the same lock file conflicts even inside one
+// process, so re-acquiring it would report the caller's OWN hold as a live
+// owner and skip the removal.
+func removePartialArtifactsOwned(dst string) error {
+	removePartialWithIdentity(dst)
+	removeStagingArtifactsIfUnclaimedLocked(dst+".incomplete", dst+".incomplete.meta")
+	return removeLegacyMultipartParts(dst)
+}
+
+// removeLegacyMultipartParts removes the legacy multipart artifact family of
+// one downloader dst: the pre-#140 parts (dst+".part-NN" for N any non-empty
+// run of digits, matching the pre-#140 downloader's %02d/%d format) and the
+// legacy layout metadata (dst+".parts.json").
+func removeLegacyMultipartParts(dst string) error {
 	// Multipart parts: glob the dst's directory for files matching
 	// dst+".part-NNN" pattern. This matches what the legacy downloader
 	// produced (the parts have indices 0..n-1).

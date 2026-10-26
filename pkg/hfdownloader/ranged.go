@@ -236,6 +236,22 @@ func removeStagingArtifactsIfUnclaimed(staging, metaPath string) {
 	}
 	defer own.release()
 
+	removeStagingArtifactsIfUnclaimedLocked(staging, metaPath)
+}
+
+// removeStagingArtifactsIfUnclaimedLocked is the body of
+// removeStagingArtifactsIfUnclaimed for a caller that ALREADY holds the
+// staging pair's lifetime ownership lock.
+//
+// The caller must NOT take that lock again: an exclusive lock belongs to the
+// open file description, so a second exclusive open of the same lock file
+// conflicts even inside one process. The acquisition would therefore report
+// the caller's OWN hold as a live owner and skip the removal.
+//
+// The flat/output-mode cleanup needs exactly this: there the destination's
+// ownership domain lock and the staging pair's lock are the SAME file
+// (<destination>.incomplete.lock).
+func removeStagingArtifactsIfUnclaimedLocked(staging, metaPath string) {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
 		log.Printf("warning: skip cleanup of staging file %s: local metadata gate unavailable: %v", staging, err)
@@ -332,6 +348,15 @@ type multipartOpts struct {
 	// (a filesystem without hard links), where the existence check and the
 	// placement are only exclusive to the domain while it is held.
 	Domain *blobDomain
+	// FlatDomain names the ownership domain of a flat/output-mode
+	// destination. The MULTIPART route takes that domain's lifetime lock
+	// through its staging claim, so the caller must NOT take it a second
+	// time for the same item. The one hand-off that needs it is the fall-back
+	// to the single-request path when the size stays unknown: that hand-off
+	// happens BEFORE the claim, so the domain is still free there and the
+	// receiving route must take it - without it the transfer would run with
+	// no ownership lock at all.
+	FlatDomain *flatDestinationDomain
 }
 
 // stagingClaimState is what a successful claim produced.
@@ -2037,6 +2062,24 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	if it.Size == 0 {
 		if opts.DirectBlobPublished != nil {
 			*opts.DirectBlobPublished = false
+		}
+		// The hand-off to the single-request path happens BEFORE this route
+		// claims the staging, so a flat destination's ownership domain is
+		// still free here. The receiving route must take it: without it the
+		// transfer would run with no ownership lock at all, and two writers
+		// of the same flat destination would race over the same payload.
+		if opts.FlatDomain != nil {
+			dom, derr := blobDomainAcquire(ctx, opts.FlatDomain.key, opts.FlatDomain.lockSrc)
+			if derr != nil {
+				if errors.Is(derr, errStagingOwnershipBusy) {
+					// A PROVEN live owner holds the destination: the file is
+					// NOT present, so the item fails with the actionable
+					// live-owner error instead of racing that owner.
+					return false, errBlobIncompleteOwned
+				}
+				return false, fmt.Errorf("acquire the ownership domain of %s: %w", dst, derr)
+			}
+			defer dom.release()
 		}
 		// The size is unknown, so the single-request path is the only one
 		// that can transfer this item. It applies the same identity rule as

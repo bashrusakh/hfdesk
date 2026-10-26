@@ -5,20 +5,20 @@ package hfdownloader
 
 // Regression coverage for the flat/output-mode exclusion contract.
 //
-// The legacy/output (flat) mode has NO destination ownership domain: that
-// namespace has no blobs/-style internal identity, so there is no
-// destination-domain key and no destination-domain lock file. The MULTIPART
-// route is nevertheless excluded from concurrent writers: it stages at
-// <destination>.incomplete and takes the lifetime OS ownership lock on the
-// persistent sibling <destination>.incomplete.lock - a zero-byte artifact next
-// to the user's model file that is never unlinked. A concurrent second writer
-// of the same flat destination on that route is EXCLUDED: it fails its item
-// with the actionable live-owner error instead of racing over the same
-// payload.
+// A flat/output (legacy) destination owns ONE ownership domain, and both
+// routes and the cleanup resolve that ONE identity. The domain's lifetime
+// lock is the persistent sibling of the MULTIPART staging name:
+// <destination>.incomplete.lock - the zero-byte artifact the multipart route
+// already leaves next to the user's model file and never unlinks. The
+// MULTIPART route takes that lock through its staging claim; the
+// SINGLE-REQUEST route holds the same domain while it transfers. One lock
+// file therefore excludes every pair of writers of the same flat
+// destination: single-vs-single, single-vs-multipart and
+// multipart-vs-multipart.
 //
-// The SINGLE-REQUEST route is NOT excluded: it creates no lock artifact next
-// to the destination and takes no ownership lock, so two writers of the same
-// flat destination on that route still race over the same .part.
+// Before the flat destination owned a domain, the single-request route took
+// no lock at all, so two writers of the same flat destination interleaved
+// over the same payload and could publish corrupt bytes.
 //
 // The cases below drive the real Download path, so they exercise the product
 // routing and not just the raw lock primitive. The synchronization is
@@ -273,14 +273,21 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 	assertExactFile(t, dst, preexisting)
 }
 
-// TestDownloadFlatModeSingleRouteTakesNoOwnershipLock pins the other half of
-// the contract: the single-request route takes NO ownership lock and leaves no
-// lock artifact next to the destination, so two writers of the same flat
-// destination on that route are not excluded by a lock.
+// TestDownloadFlatModeSingleRouteTakesTheDestinationDomain pins the identity
+// the single-request route uses in flat/output mode.
 //
-// The acquisition is observed through the production seam, so the assertion
-// covers the mechanism and not only the artifacts it happens to leave behind.
-func TestDownloadFlatModeSingleRouteTakesNoOwnershipLock(t *testing.T) {
+// A flat destination owns ONE domain, and the domain's lifetime lock is the
+// persistent sibling of the MULTIPART staging name:
+// <destination>.incomplete.lock - the very lock the multipart route's staging
+// claim already takes. The single-request route holds that same domain while
+// it transfers, so the two routes are mutually excluded, and the cleanup
+// resolves the same lock.
+//
+// The artifact shape is pinned too: the route leaves the destination and the
+// zero-byte <destination>.incomplete.lock next to it. That lock file is NOT a
+// new artifact name - the multipart route already leaves exactly that file -
+// so the flat namespace gains no second file next to the user's model file.
+func TestDownloadFlatModeSingleRouteTakesTheDestinationDomain(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
@@ -315,13 +322,26 @@ func TestDownloadFlatModeSingleRouteTakesNoOwnershipLock(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), acquired...)
 	mu.Unlock()
-	if len(got) != 0 {
-		t.Errorf("the single-request route took %d ownership locks (%v), want none: it creates no lock artifact next to the destination",
-			len(got), got)
+	// The route holds the destination's domain, whose lock source is the
+	// MULTIPART staging name - the same lock the multipart claim takes.
+	want := []string{dst + ".incomplete"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ownership-lock acquisitions = %v, want exactly %v: the single-request route must hold the destination's domain", got, want)
 	}
-	for _, name := range dirEntryNames(t, filepath.Dir(dst)) {
-		if strings.HasSuffix(name, stagingLockSuffix) {
-			t.Errorf("the single-request route left the lock artifact %s next to the destination", name)
-		}
+
+	// The persistent lock file is the one the multipart route already leaves:
+	// no NEW artifact name appears next to the user's model file.
+	lockPath := dst + ".incomplete.lock"
+	fi, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("the persistent ownership lock %s is missing: %v", filepath.Base(lockPath), err)
+	}
+	if fi.Size() != 0 {
+		t.Errorf("the ownership lock %s is %d bytes, want a zero-byte artifact", filepath.Base(lockPath), fi.Size())
+	}
+	names := dirEntryNames(t, filepath.Dir(dst))
+	wantNames := []string{filepath.Base(dst), filepath.Base(lockPath)}
+	if !reflect.DeepEqual(names, wantNames) {
+		t.Errorf("the destination directory holds %v, want exactly %v", names, wantNames)
 	}
 }

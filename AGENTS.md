@@ -266,22 +266,29 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   of replacing it. A writer of a cache destination that cannot take its
   domain fails the item BEFORE it writes any payload, exactly like the
   content-addressed case; the partial data of an earlier run is preserved.
-  The legacy/output (flat) mode has NO destination DOMAIN: that namespace has
-  no internal `blobs/`-style identity, so it has no destination-domain key and
-  no destination-domain lock file, and the wait/re-check protocol does not
-  apply there. It is NOT lock-free, though: the MULTIPART route stages at
-  `<destination>.incomplete` and takes the lifetime OS ownership lock on the
-  persistent sibling `<destination>.incomplete.lock` — a zero-byte artifact
-  next to the user's model file, never unlinked. A concurrent second writer of
-  the same flat destination on that route is therefore EXCLUDED: it fails its
-  item with the actionable live-owner error ("blob <sha> is being downloaded
-  by another process; try again later") instead of racing, which is safer than
-  the pre-#140 behavior, where two processes wrote the same `.part-NN` payload
-  files and could publish a silently corrupt model. The SINGLE-REQUEST route is
-  NOT excluded: it creates no lock artifact next to the destination (only
-  `<destination>.part`, removed on success) and takes no ownership lock, so two
-  writers of the same flat destination on that route still race over the same
-  `.part`.
+  The legacy/output (flat) mode has no `blobs/`-style internal identity, so it
+  borrows the MULTIPART staging name for the destination's ONE domain: the
+  domain key is the destination path, and the domain's lifetime lock is the
+  persistent sibling `<destination>.incomplete.lock` — the very lock the
+  MULTIPART route's staging claim already takes. That lock file is a zero-byte
+  artifact next to the user's model file and is never unlinked, and NO new
+  artifact name appears next to the user's model file. The SINGLE-REQUEST
+  route holds that same domain while it transfers, so ONE lock file excludes
+  every pair of writers of the same flat destination: single-vs-single,
+  single-vs-multipart and multipart-vs-multipart. THE DEADLOCK RULE: the
+  domain is taken at the download level ONLY for the route that does not take
+  it internally — the MULTIPART route's claim takes
+  `<destination>.incomplete.lock` from inside the multipart transfer, and an
+  exclusive lock conflicts even within one process, so taking it a second
+  time would make the writer contend with ITSELF. The MULTIPART route
+  therefore keeps relying on its staging claim; the hand-off to the
+  single-request path (the size stays unknown) takes the domain THERE,
+  because that hand-off happens BEFORE the claim. A concurrent second writer
+  of the same flat destination is therefore EXCLUDED: it fails its item with
+  the actionable live-owner error ("blob <sha> is being downloaded by another
+  process; try again later") instead of racing, which is safer than the
+  pre-#140 behavior, where two processes wrote the same `.part-NN` payload
+  files and could publish a silently corrupt model.
 - JOB CONTRACT: "job completed successfully" MUST mean the requested files are
   present AND reachable at their snapshot/friendly paths. A file owned by
   another LIVE writer is NOT present, so it is NEVER a successful skip. When
@@ -359,13 +366,15 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   "my own destination" from "another live owner of the same destination" beyond
   the domain itself, so a destination that another writer owns is left alone
   (safe) even when the cancelling job also had bytes for it. A legacy/output-mode
-  destination is not cache-scoped, so its cleanup holds NO destination domain:
-  that namespace has no internal `blobs/`-style identity. Its cleanup is
-  claim-checked instead: the versioned staging pair (`<destination>.incomplete`
-  and its `.meta`) is removed only while no live claim remains, and the single
-  `.part`, the legacy `.part-NN` parts and `.parts.json` are removed as before.
-  The persistent `<destination>.incomplete.lock` of the multipart route is
-  never unlinked.
+  destination has no `blobs/`-style internal identity, so its cleanup derives
+  the SAME domain identity the writer holds: the destination's domain lock is
+  the persistent sibling `<destination>.incomplete.lock`, the very lock the
+  MULTIPART route's staging claim takes. Its artifacts are removed only while
+  that domain is held, so a cancelled job cannot delete another live job's
+  `.part`/`.incomplete`/`.meta` for the same path. The versioned staging pair
+  is still claim-checked, and the single `.part`, the legacy `.part-NN` parts
+  and `.parts.json` are removed as before. The persistent
+  `<destination>.incomplete.lock` of the multipart route is never unlinked.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
   - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
