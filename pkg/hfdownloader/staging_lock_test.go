@@ -309,9 +309,11 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	}
 
 	var (
-		mu     sync.Mutex
-		ranges []string
+		mu        sync.Mutex
+		ranges    []string
+		firstOnce sync.Once
 	)
+	firstRange := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +330,13 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		mu.Lock()
 		ranges = append(ranges, r.Header.Get("Range"))
 		mu.Unlock()
+		// The winner issues its first range only AFTER downloadMultipart has
+		// opened and preallocated the staging payload, so this is the product
+		// signal that the payload exists. The claim record alone is written
+		// BEFORE that open, so reading the new record instance does not prove
+		// the payload is present: a takeover legitimately removes the
+		// unusable predecessor and recreates the payload afterwards.
+		firstOnce.Do(func() { close(firstRange) })
 		// Hold every body until the losers have finished their claim attempts,
 		// so the race is decided by ownership, not by how fast a body arrives.
 		<-release
@@ -440,8 +449,26 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+
+	// The replacement record is installed BEFORE downloadMultipart opens and
+	// preallocates the payload, so a stat right after the record read can land
+	// in the takeover's legitimate remove/recreate window (the unusable
+	// predecessor is removed, the fresh claim record is written, and the
+	// payload is only recreated when the winner opens it). Synchronize on the
+	// winner's FIRST RANGE REQUEST instead: it is sent only after the payload
+	// has been opened and preallocated, and every range body is parked until
+	// this test releases the server.
+	select {
+	case <-firstRange:
+	case <-time.After(10 * time.Second):
+		// Release the parked handlers before failing, so the test's
+		// httptest.Server.Close does not wait for them and the failure is
+		// reported instead of hanging until the test timeout.
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("winner never issued a range request after replacing the claim record (instance %q): the staging payload was never opened", claimMeta.Instance)
+	}
 	if _, serr := os.Stat(staging); serr != nil {
-		t.Fatalf("winner's staging payload is missing while it is still downloading: %v", serr)
+		t.Fatalf("winner's staging payload is missing after its first range request: %v", serr)
 	}
 	releaseOnce.Do(func() { close(release) })
 

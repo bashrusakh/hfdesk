@@ -321,16 +321,25 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the effective budget is 5 MINUTES); it is a package-level knob, not a user
   setting, and the in-process slot wait is bounded by the job's context only
   (its holder is a goroutine of this process that finishes or is cancelled).
-  Cancellation stays prompt. COST: the wait happens INSIDE the item's
-  goroutine, and the item already holds its `MaxActiveDownloads` slot, so a
-  waiting item occupies a download slot for up to that budget — a job whose
-  item waits for a foreign owner can look stalled and holds a concurrency slot
-  it is not transferring with. What the operator sees: the item stays in
-  progress (no progress events are emitted while it waits, so its byte counter
-  does not move), and when the budget expires the item fails with the
-  actionable error above and the job's status is failed, not completed. The
-  existing "blob exists" skip (the file IS present) and the existing
-  unknown-ownership error (`BlobOwnershipUnknown`) are unchanged.
+  Cancellation stays prompt. A waiting item does NOT hold an
+  `MaxActiveDownloads` slot: the slot is a per-item lease that the
+  ownership-domain acquisition returns for the duration of every wait (the
+  in-process slot wait and the cross-process OS-lock wait alike) and takes
+  back before it returns a domain the caller will transfer under. The slot
+  therefore bounds concurrent TRANSFERS, not waiters, so the other files of
+  the job proceed while one item waits — a low limit no longer keeps the
+  transfer budget from starting the files that could transfer. Waiting items
+  do not consume transfer slots (any number of items may wait) while the
+  configured limit still bounds concurrent transfers. A contended item that
+  has acquired its domain may wait to take its slot back, and that wait
+  cannot deadlock: an item never blocks on a domain while holding a slot, and
+  two contenders for one key cannot both hold its domain. What the
+  operator sees: the item stays in progress (no progress events are emitted
+  while it waits, so its byte counter does not move), and when the budget
+  expires the item fails with the actionable error above and the job's status
+  is failed, not completed. The existing "blob exists" skip (the file IS
+  present) and the existing unknown-ownership error
+  (`BlobOwnershipUnknown`) are unchanged.
 - A LINK-CREATION FAILURE FAILS THE ITEM, IN EVERY PATH. A cached file is
   reachable through its snapshot entry (and its friendly entry); the payload in
   `blobs/` alone is not the requested path. The transfer path already treated
@@ -591,10 +600,14 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   re-checked, never reported as a completed skip. When the wait is exhausted
   the item fails with an actionable error, and the job's status is failed, not
   completed — see the downloader correctness rules for the ownership protocol.
-  The wait budget is 5 minutes, and the wait runs inside the item's goroutine,
-  which already holds one of the job's `MaxActiveDownloads` slots: a waiting
-  item therefore occupies a download slot for up to that budget, and a job
-  whose item waits for a foreign owner can look stalled. What the operator
+  The wait budget is 5 minutes, and the wait runs inside the item's goroutine.
+  A waiting item does NOT hold one of the job's `MaxActiveDownloads` slots:
+  the slot is a per-item lease returned for the duration of every ownership-
+  domain wait (in-process and cross-process alike) and taken back before the
+  acquisition returns, so the slot bounds concurrent TRANSFERS rather than
+  waiters. Other files of the job therefore proceed while one item waits, even
+  with a low limit; waiting items do not consume transfer slots, while
+  concurrent transfers still obey the configured limit. What the operator
   sees: the item stays in progress (no progress events are emitted while it
   waits, so its byte counter does not move), and when the budget expires the
   item fails with the actionable error and the job's status is failed.

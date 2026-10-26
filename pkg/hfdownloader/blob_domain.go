@@ -243,7 +243,64 @@ var blobDomainCleanupAcquire = acquireBlobDomainForCleanup
 // with it true the owner is waited out (the download path: the file is not
 // present while it holds the key), with it false the contention is reported
 // at once (the cleanup path: the artifacts belong to the live owner).
-func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, lockWait time.Duration, tolerateLiveOwner bool) (*blobDomain, error) {
+//
+// When the context carries an item's download-slot notice (see
+// download_slot.go), the acquisition returns that item's MaxActiveDownloads
+// slot for the DURATION of every wait. It takes the slot back before it
+// returns a domain the caller will transfer under. A FAILED acquisition keeps
+// the slot returned: no domain reaches the caller, so the item reports the
+// error instead of transferring, and re-taking the slot there would make the
+// failure wait for an unrelated transfer. A waiter is not transferring, so it
+// must not hold a transfer slot; a returned domain still reaches the caller
+// only with a slot held.
+func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, lockWait time.Duration, tolerateLiveOwner bool) (domain *blobDomain, err error) {
+	// The wait is signalled by THIS function, not guessed by the caller: it is
+	// the only place that knows both waits (the in-process domain slot and the
+	// cross-process lifetime lock). The notice releases the slot once, before
+	// the first blocking wait. The deferred endWait takes it back only when a
+	// domain is returned for transfer; a failed acquisition returns no domain,
+	// and the lease's deferred release is a no-op while the slot is still
+	// returned, so the lease stays balanced on both paths.
+	notice := downloadSlotWaitNoticeFromContext(ctx)
+	waiting := false
+	beginWait := func() {
+		if notice == nil || waiting {
+			return
+		}
+		waiting = true
+		notice.beginWait()
+	}
+	defer func() {
+		if !waiting {
+			return
+		}
+		if domain == nil || err != nil {
+			// The acquisition FAILED, so no domain reaches the caller and the
+			// item is about to report the error. There is nothing to transfer,
+			// so the slot must NOT be taken back here: a wait-budget expiry
+			// would otherwise block until some other (possibly long) transfer
+			// released a slot, delaying the actionable failure the caller is
+			// about to report. The lease's deferred release is a no-op while
+			// the slot is still returned.
+			if domain != nil {
+				domain.release()
+				domain = nil
+			}
+			return
+		}
+		if !notice.endWait() {
+			// The item's context ended while it waited, so the slot cannot be
+			// taken back. A domain acquired in that instant must not reach the
+			// caller: the item would transfer without a slot. Release it and
+			// report the cancellation instead.
+			domain.release()
+			domain = nil
+			if err == nil {
+				err = ctx.Err()
+			}
+		}
+	}()
+
 	var entry *blobDomainEntry
 	for {
 		blobDomainOwners.Lock()
@@ -260,6 +317,9 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 		if blobDomainContentionHook != nil {
 			blobDomainContentionHook(key)
 		}
+		// The in-process slot is busy, so this acquisition is about to wait
+		// for its holder: return the item's download slot for the wait.
+		beginWait()
 		// A nil timeout channel blocks forever, which is the unbounded
 		// (context-only) wait of the download path.
 		var timeout <-chan time.Time
@@ -290,9 +350,8 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 	}
 
 	var lock *stagingOwnershipLock
-	var err error
 	if tolerateLiveOwner {
-		lock, err = acquireStagingOwnershipLockWaiting(ctx, dst, lockWait)
+		lock, err = acquireStagingOwnershipLockWaiting(ctx, dst, lockWait, beginWait)
 	} else {
 		lock, err = acquireStagingOwnershipLockWithin(ctx, dst, lockWait)
 	}

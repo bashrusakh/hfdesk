@@ -184,8 +184,10 @@ type Settings struct {
 	// If <= 0, defaults to 8.
 	Concurrency int
 
-	// MaxActiveDownloads limits how many files download simultaneously.
-	// This controls overall parallelism across all files in a job.
+	// MaxActiveDownloads limits how many files TRANSFER simultaneously.
+	// This controls overall parallelism across all files in a job. A file
+	// that waits for another writer's ownership domain does not consume a
+	// slot, so the limit bounds concurrent transfers, not waiters.
 	// If <= 0, defaults to GOMAXPROCS (number of CPU cores).
 	MaxActiveDownloads int
 

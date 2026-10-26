@@ -254,7 +254,7 @@ func acquireStagingOwnershipLockCtx(ctx context.Context, staging string) (*stagi
 // Cleanup uses a shorter window (see stagingLockCleanupWait) because it is
 // best-effort and must not delay an explicit cancel.
 func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait time.Duration) (*stagingOwnershipLock, error) {
-	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, false)
+	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, false, nil)
 }
 
 // acquireStagingOwnershipLockWaiting is acquireStagingOwnershipLockWithin for
@@ -272,6 +272,12 @@ func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait
 // process and open handle live, so the wait ends in an error, not in a
 // preemption.
 //
+// onWait is called when the acquisition is about to block on the contended
+// lock. The download path uses it to return the item's MaxActiveDownloads slot
+// for the duration of the wait (see download_slot.go); it is called only on a
+// contended attempt, so the free fast path never releases anything. A nil
+// onWait is the historical behavior.
+//
 // The outcomes are:
 //
 //   - the lock is acquired: the caller owns the key;
@@ -280,8 +286,8 @@ func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait
 //   - the budget expires while the holder could not be classified:
 //     errStagingOwnershipUncertain (no live owner is proven, so the caller
 //     must fail closed rather than skip).
-func acquireStagingOwnershipLockWaiting(ctx context.Context, staging string, wait time.Duration) (*stagingOwnershipLock, error) {
-	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, true)
+func acquireStagingOwnershipLockWaiting(ctx context.Context, staging string, wait time.Duration, onWait func()) (*stagingOwnershipLock, error) {
+	return acquireStagingOwnershipLockWithinMode(ctx, staging, wait, true, onWait)
 }
 
 // acquireStagingOwnershipLockWithinMode is the shared acquisition loop.
@@ -291,7 +297,12 @@ func acquireStagingOwnershipLockWaiting(ctx context.Context, staging string, wai
 // errStagingOwnershipBusy; with it true the holder is waited out until the
 // budget expires, which is what the blob key's ownership protocol needs (the
 // file is not present while the owner holds the key).
-func acquireStagingOwnershipLockWithinMode(ctx context.Context, staging string, wait time.Duration, tolerateLiveOwner bool) (*stagingOwnershipLock, error) {
+//
+// onWait is called on every contended attempt, before the acquisition blocks,
+// so the download path can return the item's MaxActiveDownloads slot for the
+// wait. It is never called on the free fast path. A nil onWait is the
+// historical behavior.
+func acquireStagingOwnershipLockWithinMode(ctx context.Context, staging string, wait time.Duration, tolerateLiveOwner bool, onWait func()) (*stagingOwnershipLock, error) {
 	deadline := time.Now().Add(wait)
 	// liveOwner records whether the last successful observation proved an
 	// exclusive holder. It decides the verdict when the budget expires: a
@@ -306,9 +317,14 @@ func acquireStagingOwnershipLockWithinMode(ctx context.Context, staging string, 
 		if !errors.Is(err, errStagingOwnershipBusy) {
 			return nil, err
 		}
-		// The lock is busy. Observe it WITHOUT taking the exclusive lock: an
-		// exclusive observer would itself look like a live writer to every
-		// peer and would make them skip files nobody is downloading.
+		// The lock is busy, so this acquisition is about to wait: let the
+		// caller return its download slot - never on the free fast path.
+		if onWait != nil {
+			onWait()
+		}
+		// Observe the holder WITHOUT taking the exclusive lock: an exclusive
+		// observer would itself look like a live writer to every peer and
+		// would make them skip files nobody is downloading.
 		if stagingOwnershipContentionHook != nil {
 			stagingOwnershipContentionHook(staging)
 		}

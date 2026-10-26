@@ -532,13 +532,18 @@ complete — the same content-addressed assumption the pre-existing skip already
 makes. The wait
 budget is a package-level knob derived from the existing ownership-lock
 convention — 60 times the 5s acquisition window, so the effective budget is 5
-minutes — not a user setting. The wait runs inside the item's goroutine, and
-the item already holds one of the job's `MaxActiveDownloads` slots, so a
-waiting item occupies a download slot for up to that budget and a job whose
-item waits for a foreign owner can look stalled. While the item waits it emits
-no progress events, so its byte counter does not move and the item simply
-stays in progress; when the budget expires the item fails with the actionable
-error above and the job does not report success.
+minutes — not a user setting. The wait runs inside the item's goroutine, but a
+waiting item does NOT hold one of the job's `MaxActiveDownloads` slots: the
+slot is a per-item lease that the ownership-domain acquisition returns for the
+duration of every wait (the in-process slot wait and the cross-process OS-lock
+wait alike) and takes back before it returns a domain the caller will transfer
+under. The slot therefore bounds concurrent TRANSFERS, not waiters, so the
+other files of the job proceed while one item waits, even with a low limit;
+waiting items do not consume transfer slots, while concurrent transfers still
+obey the configured limit. While the item waits it emits no progress events, so
+its byte counter does not move and the item simply stays in progress; when the
+budget expires the item fails with the actionable error above and the job does
+not report success.
 
 A cached file is reachable through its snapshot entry and its friendly entry;
 the payload in `blobs/` alone is not the requested path. The transfer path
@@ -680,7 +685,9 @@ files included:
 Two levels of concurrency are configurable:
 
   - Concurrency: Number of parallel HTTP connections per file (for multipart downloads)
-  - MaxActiveDownloads: Maximum number of files downloading simultaneously
+  - MaxActiveDownloads: Maximum number of files TRANSFERRING simultaneously
+    (a file waiting for another writer's ownership domain does not consume a
+    slot, so the limit bounds concurrent transfers, not waiters)
 
 # Error Handling
 

@@ -340,9 +340,11 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		}
 	}
 
-	// Overall concurrency limiter (ctx-aware acquisition)
-	type token struct{}
-	lim := make(chan token, cfg.MaxActiveDownloads)
+	// Overall concurrency limiter (ctx-aware acquisition). One token is one
+	// TRANSFER slot (see download_slot.go): an item that waits for another
+	// writer's ownership domain returns its token while it waits and takes it
+	// back before it transfers.
+	lim := make(chan struct{}, cfg.MaxActiveDownloads)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(plan.Items))
@@ -435,7 +437,7 @@ LOOP:
 
 		// Acquire a slot or abort if canceled
 		select {
-		case lim <- token{}:
+		case lim <- struct{}{}:
 		case <-jobCtx.Done():
 			break LOOP
 		}
@@ -443,13 +445,20 @@ LOOP:
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-lim }()
 
 			// Per-file context; ensures all inner loops stop on cancellation.
 			// It derives from jobCtx so a fatal error in a sibling file also
 			// stops this one promptly.
 			fileCtx, fileCancel := context.WithCancel(jobCtx)
+			// The item owns the slot acquired above through a LEASE, so it can
+			// return the slot while it WAITS for another writer's ownership
+			// domain and take it back before it transfers. The wait is
+			// signalled by the domain acquisition through this context (see
+			// download_slot.go and acquireBlobDomainWithin).
+			lease := newDownloadSlotLease(fileCtx, lim)
 			defer fileCancel()
+			defer lease.release()
+			fileCtx = withDownloadSlotWaitNotice(fileCtx, lease)
 
 			finalRel := it.RelativePath
 			filterSubdir := ""
