@@ -7,6 +7,7 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,9 +23,29 @@ import (
 //
 // The lookup is a local read of the service control manager, so the budget
 // only covers a machine that is busy or a service control manager that does
-// not answer. The launch waits for it before it decides whether it starts a
-// server, so the wait has to be bounded.
-const serviceStatusTimeout = 10 * time.Second
+// not answer. A service that is starting or stopping is read again within the
+// same budget until it settled. The launch waits for it before it decides
+// whether it starts a server, so the wait has to be bounded.
+//
+// It is a variable so the tests can shorten the wait: a service whose state
+// never settles has to end the launch, and a test must not wait for the whole
+// budget to prove that.
+var serviceStatusTimeout = 10 * time.Second
+
+// serviceGatePollInterval is the pause between two reads of the service state
+// while the service is starting or stopping.
+//
+// The state is read again shortly, so a launch that found the service in the
+// middle of a transition decides on the state it reached and not on the
+// transition.
+const serviceGatePollInterval = 200 * time.Millisecond
+
+// errServiceGatePending reports a service that is still starting or stopping
+// when the budget of the service gate ends.
+//
+// A pending state is not a state to decide on: it is neither a running nor a
+// stopped service, so the gate offers no action for it.
+var errServiceGatePending = errors.New("the service is still starting or stopping")
 
 // serviceStatus reads the registration of the Windows service.
 //
@@ -61,12 +82,25 @@ func lookupServiceStatus(ctx context.Context) (service.Status, error) {
 // without one: a service control manager that does not answer has no running
 // instance to compete with, and the desktop host must not refuse to start
 // because it could not look.
+//
+// A service that is starting or stopping is not a state to decide on: it is
+// neither a running nor a stopped service, so the gate waits for it to settle
+// before it asks the user. A service that did not settle within the budget is
+// reported with a notice and ends the launch as well: no answer of the dialog
+// could be right for a service in the middle of a transition.
 func serviceGate() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
 	defer cancel()
 
-	status, err := serviceStatus(ctx)
+	status, err := serviceGateStatus(ctx)
 	if err != nil {
+		if errors.Is(err, errServiceGatePending) {
+			desktopLog.Info("the Windows service is still starting or stopping: this launch changes nothing",
+				"state", string(status.State))
+			showMessage(serviceGatePendingCaption,
+				serviceGatePendingText(status.State), windows.MB_ICONINFORMATION)
+			return false
+		}
 		desktopLog.Warn("could not read the Windows service registration", "error", err)
 		return true
 	}
@@ -115,6 +149,36 @@ func serviceGate() bool {
 		desktopLog.Info("the service gate changed nothing")
 	}
 	return false
+}
+
+// serviceGateStatus reads the registration of the service and waits for a
+// pending state to settle.
+//
+// The service control manager reports a started or a stopped instance as
+// pending first, so the first read of a launch can observe a transition that is
+// over a moment later. A stopping instance is read as "not running" by the
+// decision of the gate, and deciding on it would offer the start of a service
+// that is still on its way down. The state is therefore read again until it
+// settled, and a state that did not settle within the budget is returned with
+// errServiceGatePending so the caller reports it instead of deciding on it.
+//
+// A registration that cannot be read is returned as it is: a service control
+// manager that does not answer has no state to wait for.
+func serviceGateStatus(ctx context.Context) (service.Status, error) {
+	for {
+		status, err := serviceStatus(ctx)
+		if err != nil {
+			return status, err
+		}
+		if serviceStateSettled(status.State) {
+			return status, nil
+		}
+		select {
+		case <-ctx.Done():
+			return status, errServiceGatePending
+		case <-time.After(serviceGatePollInterval):
+		}
+	}
 }
 
 // serviceInstallRunning is the guard of the tray installation action.

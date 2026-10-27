@@ -88,7 +88,7 @@ func RunServiceAction(o ServiceActionOptions) error {
 
 	if o.WaitPID > 0 {
 		if err := waitForProcess(o.WaitPID, serviceWaitBudget); err != nil {
-			reportServiceFailure(action, err)
+			reportServiceFailure(action, err, "")
 			return err
 		}
 	}
@@ -123,22 +123,22 @@ func installWindowsService(action serviceAction, version string) error {
 
 	opts, manager, err := serviceInstallation()
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, "")
 		return err
 	}
 
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, opts.Executable)
 		return err
 	}
 	if err := manager.Start(ctx); err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, serviceProgram(installed, opts))
 		return err
 	}
 	status, err := waitForServiceState(ctx, manager, true)
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, serviceProgram(installed, opts))
 		return err
 	}
 
@@ -172,13 +172,13 @@ func updateWindowsService(action serviceAction, version string) error {
 
 	opts, manager, err := serviceInstallation()
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, "")
 		return err
 	}
 
 	before, err := manager.Status(ctx)
 	if err != nil {
-		reportServiceFailure(action, fmt.Errorf("the state of the service before the update cannot be read: %w", err))
+		reportServiceFailure(action, fmt.Errorf("the state of the service before the update cannot be read: %w", err), "")
 		return err
 	}
 	if before.State == service.StateNotInstalled {
@@ -188,7 +188,7 @@ func updateWindowsService(action serviceAction, version string) error {
 
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, opts.Executable)
 		return err
 	}
 	status, err := waitForServiceState(ctx, manager, wasRunning)
@@ -199,7 +199,7 @@ func updateWindowsService(action serviceAction, version string) error {
 		}
 		reportServiceFailure(action, fmt.Errorf(
 			"the update must leave the service %s, because it was %q before the update: %w",
-			expected, before.State, err))
+			expected, before.State, err), serviceProgram(installed, opts))
 		return err
 	}
 
@@ -226,24 +226,24 @@ func startWindowsService(action serviceAction) error {
 
 	manager, err := newServiceManager(service.ScopeSystem)
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, "")
 		return err
 	}
 	before, err := manager.Status(ctx)
 	if err != nil {
-		reportServiceFailure(action, fmt.Errorf("the state of the service cannot be read: %w", err))
+		reportServiceFailure(action, fmt.Errorf("the state of the service cannot be read: %w", err), "")
 		return err
 	}
 	if before.State == service.StateNotInstalled {
 		return reportServiceNotInstalled(action)
 	}
 	if err := manager.Start(ctx); err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, before.Executable)
 		return err
 	}
 	status, err := waitForServiceState(ctx, manager, true)
 	if err != nil {
-		reportServiceFailure(action, err)
+		reportServiceFailure(action, err, before.Executable)
 		return err
 	}
 
@@ -372,13 +372,14 @@ func serviceWebAddress(status service.Status) string {
 //
 // The helper is a GUI process: a failure that is only recorded leaves the user
 // with a helper that vanished. The box carries the underlying error, so the user
-// can see what the service control manager refused.
-func reportServiceFailure(action serviceAction, err error) {
+// can see what the service control manager refused, and the program of the
+// action, so a failure of the service account names what it could not use.
+func reportServiceFailure(action serviceAction, err error, program string) {
 	if err == nil {
 		return
 	}
-	desktopLog.Error("the service action failed", "action", string(action), "error", err)
-	showMessage(serviceFailureCaption(action), serviceActionFailureText(action, err), windows.MB_ICONERROR)
+	desktopLog.Error("the service action failed", "action", string(action), "error", err, "program", program)
+	showMessage(serviceFailureCaption(action), serviceActionFailureText(action, err, program), windows.MB_ICONERROR)
 }
 
 // reportServiceLaunchFailure records the failure of a launch of the elevated

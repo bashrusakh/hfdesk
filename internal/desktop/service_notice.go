@@ -6,6 +6,8 @@ package desktop
 import (
 	"fmt"
 	"strings"
+
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // The captions of the message boxes of the service actions.
@@ -21,6 +23,10 @@ const (
 	// serviceGateCaption is the caption of the choice dialog of a launch
 	// that found an installed service.
 	serviceGateCaption = "HFDesk is installed as a Windows service"
+
+	// serviceGatePendingCaption is the caption of the notice of a launch
+	// that found the service in the middle of a transition.
+	serviceGatePendingCaption = "HFDesk - the service is starting or stopping"
 
 	// serviceSiblingMissingCaption is the caption of the notice that the
 	// console program of the service is missing.
@@ -127,6 +133,23 @@ func serviceGateContent(prompt serviceChoicePrompt) string {
 // gate.
 func serviceGateText(prompt serviceChoicePrompt) string {
 	return serviceGateInstruction(prompt) + "\n\n" + serviceGateContent(prompt)
+}
+
+// serviceGatePendingText returns the text of the notice of a launch that found
+// the service while it was starting or stopping.
+//
+// The notice is not the choice dialog: a pending state is not a state to decide
+// on, so the launch offers neither Open nor Start for it. It names the
+// transition it observed and that the launch changed nothing, so the user knows
+// that the state of the service is not the result of this launch.
+func serviceGatePendingText(state service.State) string {
+	transition := "starting"
+	if state == service.StateStopping {
+		transition = "stopping"
+	}
+	return "The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
+		"This launch changes nothing: it starts no server of its own, so two instances never compete for the same address.\n\n" +
+		"Start the desktop app again when the service has settled, or read its state with \"hfdesk service status\"."
 }
 
 // serviceGateOpenLabel returns the label of the first button of the choice
@@ -272,26 +295,54 @@ func serviceNotInstalledText(action serviceAction) string {
 // the state afterwards. It never claims that a registration was restored: a
 // failure can happen after the registration was written, and the state of the
 // service has to be read before it is described.
-func serviceActionFailureText(action serviceAction, err error) string {
+//
+// The report also names what to check when the service account cannot use the
+// program: the helper installs no logging pipeline, so the failure report is
+// the only surface this reason has. program is the program of the action, empty
+// when the caller does not know it.
+func serviceActionFailureText(action serviceAction, err error, program string) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
+	access := serviceAccountAccessText(program)
 
 	switch action {
 	case serviceActionInstall:
 		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 			"This attempt did not confirm the service as running. The settings, jobs and models of the desktop app were not touched. " +
+			access + "\n\n" +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	case serviceActionUpdate:
 		return "HFDesk could not update the Windows service.\n\n" + detail + "\n\n" +
 			"The desktop app and the service keep separate data: the settings, jobs and models of the desktop app were not touched. " +
+			access + "\n\n" +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	default:
 		return "HFDesk could not start the Windows service.\n\n" + detail + "\n\n" +
 			"The start attempt was not confirmed. " +
+			access + "\n\n" +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	}
+}
+
+// serviceAccountAccessText returns the sentence that names what to check when
+// the service account cannot use the program of the registration.
+//
+// The machine-wide service runs as NT AUTHORITY\LocalService, so a program in a
+// folder of the user who installed it is not reachable for the instance: the
+// account has to be able to read the program and to traverse its folder. The
+// sentence is guidance and not a check of its own: the action reports the
+// failure it got and names the reason the user can repair.
+func serviceAccountAccessText(program string) string {
+	text := `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to read`
+	if program != "" {
+		text += " " + program
+	} else {
+		text += " the program"
+	}
+	return text + " and to traverse its folder. If the program sits in a folder only you can read, " +
+		"move it to a folder the service can read, for example under %ProgramFiles%, and install again."
 }
 
 // serviceLaunchFailedText returns the report of a failed launch of the elevated

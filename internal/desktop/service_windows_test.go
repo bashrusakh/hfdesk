@@ -307,6 +307,136 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	}
 }
 
+// TestServiceGateOpensAStartingServiceAfterItSettled proves that a launch that
+// finds the service starting waits for it to settle and offers the running
+// service instead of starting it a second time.
+func TestServiceGateOpensAStartingServiceAfterItSettled(t *testing.T) {
+	reads := 0
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		reads++
+		if reads == 1 {
+			return runningServiceStatus(service.StateStarting, "127.0.0.1:18080"), nil
+		}
+		return runningServiceStatus(service.StateRunning, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(prompt serviceChoicePrompt) serviceChoice {
+		if prompt.State != service.StateRunning {
+			t.Errorf("the dialog asked about the state %q, want the settled running service", prompt.State)
+		}
+		if got, want := serviceGateOpenLabel(prompt), "Open HFDesk"; got != want {
+			t.Errorf("the first button is %q, want %q", got, want)
+		}
+		return serviceChoiceOpen
+	})
+	var opened []string
+	replaceSeam(t, &openBrowser, func(url string) error {
+		opened = append(opened, url)
+		return nil
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the gate started a service that was already starting")
+		return 0, nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate() {
+		t.Fatal("the service gate let a launch with an installed service start its own server")
+	}
+	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
+		t.Errorf("the gate opened %v, want the web UI of the running service", opened)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the gate showed %v, want no notice", *messages)
+	}
+}
+
+// TestServiceGateStartsAStoppingServiceAfterItSettled proves that a launch that
+// finds the service stopping waits for it to settle and only then offers the
+// start of the stopped service.
+//
+// A stopping service is not a running one, so a decision taken while it is still
+// on its way down would offer "Start service" for a registration the service
+// control manager is still stopping.
+func TestServiceGateStartsAStoppingServiceAfterItSettled(t *testing.T) {
+	reads := 0
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		reads++
+		if reads == 1 {
+			return runningServiceStatus(service.StateStopping, "127.0.0.1:18080"), nil
+		}
+		return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(prompt serviceChoicePrompt) serviceChoice {
+		if prompt.State != service.StateStopped {
+			t.Errorf("the dialog asked about the state %q, want the settled stopped service", prompt.State)
+		}
+		if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
+			t.Errorf("the first button is %q, want %q", got, want)
+		}
+		return serviceChoiceStart
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the gate opened a browser for a stopped service")
+		return nil
+	})
+	var launches []elevatedLaunch
+	replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+		launches = append(launches, l)
+		return 4242, nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate() {
+		t.Fatal("the service gate let a launch with an installed service start its own server")
+	}
+	if len(launches) != 1 || launches[0].Action != serviceActionStart {
+		t.Fatalf("the gate launched %v, want the start of the settled service", launches)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the gate showed %v, want the helper to report the outcome", *messages)
+	}
+}
+
+// TestServiceGateEndsAPendingLaunchWithoutAChoice proves that a service that did
+// not settle within the budget ends the launch with a notice: no answer of the
+// dialog is right for a service in the middle of a transition, so the gate asks
+// no question and starts no server.
+func TestServiceGateEndsAPendingLaunchWithoutAChoice(t *testing.T) {
+	replaceSeam(t, &serviceStatusTimeout, 50*time.Millisecond)
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return runningServiceStatus(service.StateStopping, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+		t.Fatal("the service gate asked the user about a service that is still stopping")
+		return serviceChoiceCancel
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the gate launched a helper for a service that is still stopping")
+		return 0, nil
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the gate opened a browser for a service that is still stopping")
+		return nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate() {
+		t.Fatal("the service gate let a launch with an installed service start its own server")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the gate showed %v, want the notice of the pending service", *messages)
+	}
+	if caption := serviceGatePendingCaption; (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	if !strings.Contains((*messages)[0].text, "still stopping") {
+		t.Errorf("the notice %q does not name the transition", (*messages)[0].text)
+	}
+	if !strings.Contains((*messages)[0].text, "changes nothing") {
+		t.Errorf("the notice %q does not say that the launch changed nothing", (*messages)[0].text)
+	}
+}
+
 // TestServiceGateUpdatesTheServiceWithTheElevatedHelper proves that the update
 // of an installed service is handed to the elevated helper.
 func TestServiceGateUpdatesTheServiceWithTheElevatedHelper(t *testing.T) {
@@ -908,6 +1038,68 @@ func TestServiceHelperStartReportsAMissingRegistration(t *testing.T) {
 	}
 	if !strings.Contains((*messages)[0].text, "not installed as a Windows service") {
 		t.Errorf("the report %q does not say that the service is not installed", (*messages)[0].text)
+	}
+}
+
+// TestServiceHelperStartNamesTheProgramTheServiceCouldNotRun proves that a start
+// the service control manager refused names the registered program and the
+// account of the service.
+//
+// The helper installs no logging pipeline, so the message box is the only
+// surface the reason has: a program in a folder the service account cannot read
+// otherwise leaves the user with the state message of the supervisor alone.
+func TestServiceHelperStartNamesTheProgramTheServiceCouldNotRun(t *testing.T) {
+	status := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	status.Executable = `C:\Users\ada\HFDesk\hfdesk.exe`
+	manager := &fakeServiceManager{
+		statuses: []service.Status{status},
+		startErr: errors.New("the service control manager refused the start"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "start"}); err == nil {
+		t.Fatal("the start succeeded although the service control manager refused it")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the start", len(*messages))
+	}
+	for _, want := range []string{status.Executable, `NT AUTHORITY\LocalService`, `%ProgramFiles%`} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallNamesTheEffectiveProgram proves that a failed
+// installation names the program the registration was asked to run, so the user
+// can check the folder of that program against the account of the service.
+func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
+	const console = `C:\portable\hfdesk.exe`
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return console, nil
+	})
+	manager := &fakeServiceManager{
+		statuses:   []service.Status{runningServiceStatus(service.StateStopped, "127.0.0.1:18080")},
+		installErr: errors.New("the service control manager refused the registration"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service control manager refused it")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{console, `NT AUTHORITY\LocalService`} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
 	}
 }
 

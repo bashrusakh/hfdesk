@@ -554,8 +554,15 @@ replaces the other.
 
   | Registered state | Buttons |
   |---|---|
-  | running, or starting | **Open HFDesk** / **Update service** / **Cancel** |
+  | running | **Open HFDesk** / **Update service** / **Cancel** |
   | stopped, failed or broken | **Start service** / **Update service** / **Cancel** |
+
+  A service that reports `starting` or `stopping` is not asked about: the
+  launch waits for the state to settle and then asks about the state it
+  reached — a service that came up offers **Open HFDesk**, a service that
+  stopped offers **Start service**. A service that is still starting or
+  stopping when the wait ends is reported with a short notice that the launch
+  changes nothing, and the launch starts no server of its own.
 
   **Open HFDesk** opens the registered address, **Start service** starts the
   registered service, and **Cancel** changes nothing. **Update service**

@@ -138,6 +138,36 @@ func TestServiceGateFallbackChoicesMapTheAnswers(t *testing.T) {
 	}
 }
 
+// TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch proves that
+// a launch that found the service in the middle of a transition reports the
+// transition it observed and that the launch itself changed nothing.
+//
+// The notice is not the choice dialog: a service that is starting or stopping
+// has no state a button could act on, so the text carries no button and no
+// action of its own.
+func TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch(t *testing.T) {
+	for _, tc := range []struct {
+		state service.State
+		want  string
+	}{
+		{state: service.StateStarting, want: "still starting"},
+		{state: service.StateStopping, want: "still stopping"},
+	} {
+		text := serviceGatePendingText(tc.state)
+		for _, want := range []string{tc.want, "changes nothing", "starts no server"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the notice of %q is %q, want it to mention %q", tc.state, text, want)
+			}
+		}
+		if strings.Contains(text, "Open HFDesk") || strings.Contains(text, "Start service") {
+			t.Errorf("the notice of %q is %q, want it to offer no action", tc.state, text)
+		}
+	}
+	if serviceGatePendingCaption == "" {
+		t.Error("the notice of a pending service has no caption")
+	}
+}
+
 // TestServiceUpdatedTextKeepsAStoppedServiceStopped proves that the report of an
 // update of a stopped service says that nothing serves HFDesk afterwards.
 //
@@ -234,28 +264,62 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 // touches the settings, jobs and models of the desktop app. The report says so,
 // and it never claims that a registration was restored: a failure can happen
 // after it was written.
+//
+// The report also names the account the service runs as and the program the
+// action could not put into service: the helper installs no logging pipeline,
+// so this box is the only surface the reason has.
 func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
+	const program = `C:\portable\hfdesk.exe`
 
-	install := serviceActionFailureText(serviceActionInstall, reason)
+	install := serviceActionFailureText(serviceActionInstall, reason, program)
 	for _, want := range []string{reason.Error(), "did not confirm the service as running", "were not touched", "hfdesk service status"} {
 		if !strings.Contains(install, want) {
 			t.Errorf("the report %q does not mention %q", install, want)
 		}
 	}
 
-	update := serviceActionFailureText(serviceActionUpdate, reason)
+	update := serviceActionFailureText(serviceActionUpdate, reason, program)
 	for _, want := range []string{reason.Error(), "were not touched", "hfdesk service status"} {
 		if !strings.Contains(update, want) {
 			t.Errorf("the report %q does not mention %q", update, want)
 		}
 	}
 
-	start := serviceActionFailureText(serviceActionStart, reason)
+	start := serviceActionFailureText(serviceActionStart, reason, program)
 	for _, want := range []string{reason.Error(), "start attempt was not confirmed", "hfdesk service status"} {
 		if !strings.Contains(start, want) {
 			t.Errorf("the report %q does not mention %q", start, want)
 		}
+	}
+}
+
+// TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount proves that
+// the report of a failed installation, update and start names the account of the
+// service, the program of the action and what the user can do when the account
+// cannot use the folder of the program.
+func TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount(t *testing.T) {
+	reason := errors.New("the service control manager refused the registration")
+	const program = `C:\portable\hfdesk.exe`
+
+	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
+		text := serviceActionFailureText(action, reason, program)
+		for _, want := range []string{`NT AUTHORITY\LocalService`, program, `%ProgramFiles%`, "and install again"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the report of %q is %q, want it to mention %q", action, text, want)
+			}
+		}
+	}
+
+	// A caller that does not know the program still names the account: the
+	// guidance is not withheld because one path of the action has no
+	// program yet.
+	unknown := serviceActionFailureText(serviceActionStart, reason, "")
+	if !strings.Contains(unknown, `NT AUTHORITY\LocalService`) {
+		t.Errorf("the report without a program is %q, want it to name the service account", unknown)
+	}
+	if !strings.Contains(unknown, "must be able to read the program and to traverse its folder") {
+		t.Errorf("the report without a program is %q, want the general form of the guidance", unknown)
 	}
 }
 
