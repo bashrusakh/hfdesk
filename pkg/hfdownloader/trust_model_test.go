@@ -4,10 +4,9 @@
 package hfdownloader
 
 // Trust-model regressions for the issue #140 ranged downloader: staging reuse
-// (T1, already covered by ranged_state_test.go), legacy-migration content proof
-// (T2), content-addressed completion (T3), serialized ownership (T4, see
-// staging_lock_test.go), cancel/phase semantics (T5) and mode compatibility
-// (T6). The fixtures use only the pre-correction public/package API so the same
+// (T1, already covered by ranged_state_test.go), content-addressed completion
+// (T3), serialized ownership (T4, see staging_lock_test.go), cancel/phase
+// semantics (T5) and mode compatibility (T6). The fixtures use only the pre-correction public/package API so the same
 // tests can be run against an overlay of the previous HEAD to show the failure
 // they pin.
 
@@ -197,109 +196,10 @@ func TestDownloadMultipart_TempDestinationIsNotCompletion(t *testing.T) {
 	assertExactFile(t, dst, full)
 }
 
-// T2: valid-looking legacy .part-NN bytes for a *moved* commit (the resume
-// identity is the current resolved commit; only the digest can prove content)
-// must not be published in size mode. The forced one-time migration hash
-// detects the mismatch, discards the staging data, and a retry re-downloads.
-func TestDownloadMultipart_LegacyPartsRequireContentProof(t *testing.T) {
-	const total = 8000
-	full := rangedTestPayload(total)
-	sum := sha256.Sum256(full)
-	sha := hex.EncodeToString(sum[:])
-
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "moved-commit.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Structurally valid legacy layout, wrong content (a previous commit's
-	// bytes that happen to have the same geometry).
-	for i := 0; i < 2; i++ {
-		if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, i), bytes.Repeat([]byte{0xFF}, total/2), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(total, 2, total/2)); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "moved-commit.bin", URL: srv.URL + "/moved-commit.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-	opts := multipartOpts{Commit: "resolved-new-commit"}
-
-	hashPassCount.Store(0)
-	hashPassBytes.Store(0)
-	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
-	if err == nil {
-		t.Fatalf("wrong-content legacy bytes were published in size mode (verified=%v)", verified)
-	}
-	if verified {
-		t.Error("a failed content proof reported the payload as verified")
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("legacy migration performed %d full-file hash passes; want exactly 1", got)
-	}
-	if got := *gotRanges; len(got) != 2 || !containsRange(got, "bytes=3999-3999") || !containsRange(got, "bytes=7999-7999") {
-		t.Errorf("the first run fetched %v; only the reserved final byte of each migrated part may be revalidated before the content proof", got)
-	}
-	for _, p := range []string{dst, dst + ".incomplete", dst + ".incomplete.meta"} {
-		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("corrupt migrated state survived the content-proof failure: %s (stat err=%v)", filepath.Base(p), serr)
-		}
-	}
-
-	// Retry policy: the discard leaves no poison, so a fresh transfer publishes
-	// the exact bytes.
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("retry after the content-proof failure: %v", err)
-	}
-	assertExactFile(t, dst, full)
-}
-
-// T2: the single .part prefix variant of the same rule.
-func TestDownloadMultipart_LegacySinglePartRequiresContentProof(t *testing.T) {
-	const total = 8000
-	full := rangedTestPayload(total)
-	sum := sha256.Sum256(full)
-	sha := hex.EncodeToString(sum[:])
-
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "single-wrong.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte{0xFF}, total), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "single-wrong.bin", URL: srv.URL + "/single-wrong.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-
-	hashPassCount.Store(0)
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err == nil {
-		t.Fatal("wrong-content single .part bytes were published in size mode")
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("legacy single-.part migration performed %d hash passes; want exactly 1", got)
-	}
-	if got := *gotRanges; len(got) != 1 || got[0] != "bytes=7999-7999" {
-		t.Errorf("fully sized single .part fetched %v; want only its reserved final byte revalidated before the content proof", got)
-	}
-	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
-		t.Error("corrupt single-.part bytes were published")
-	}
-
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("retry after the content-proof failure: %v", err)
-	}
-	assertExactFile(t, dst, full)
-}
-
-// T2: an oversized single .part is not a prefix anyone can vouch for. It must
-// be discarded (never clamped) and the file downloaded from offset 0.
-func TestDownloadMultipart_OversizedSinglePartIsDiscarded(t *testing.T) {
+// T2: an oversized single .part is not a prefix anyone can vouch for. The
+// single-request path must discard it (never clamp it) and download the file
+// from offset 0; the multipart route neither reads nor removes it.
+func TestDownloadSingle_OversizedPartialIsDiscarded(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
 	tmpDir := t.TempDir()
@@ -314,108 +214,15 @@ func TestDownloadMultipart_OversizedSinglePartIsDiscarded(t *testing.T) {
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "oversized.bin", URL: srv.URL + "/oversized.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadSingle: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	if len(*gotRanges) == 0 {
-		t.Fatal("the oversized .part was clamped instead of discarded; nothing was fetched")
+	if got := *gotRanges; len(got) != 1 || got[0] != "" {
+		t.Errorf("payload GETs = %v, want one whole-file request (the oversized partial must be discarded)", got)
 	}
 	if _, serr := os.Stat(dst + ".part"); !os.IsNotExist(serr) {
 		t.Errorf("the invalid oversized .part survived, stat err=%v", serr)
-	}
-}
-
-// T2: the LegacyMigrated marker is persisted in the record, so a crash after
-// the migration flush still forces the content proof on resume.
-func TestDownloadMultipart_LegacyMigratedFlagSurvivesResume(t *testing.T) {
-	const total = 8000
-	full := rangedTestPayload(total)
-	sum := sha256.Sum256(full)
-	sha := hex.EncodeToString(sum[:])
-
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "flag.bin")
-	staging := dst + ".incomplete"
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The staged payload looks complete (all ranges Done) but is wrong; the
-	// legacy artifacts that produced it are already gone (the crash happened
-	// after the migrated layout became durable). Raw JSON keeps the fixture
-	// readable by the pre-correction code, which ignores the new fields. The
-	// record names a RESOLVED, PINNED commit, so it is inheritable and the
-	// resume actually happens.
-	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xFF}, total), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	raw := fmt.Sprintf(
-		`{"pid":%d,"instance":%q,"host":%q,"started":"2025-01-01T00:00:00Z","size":%d,"sha256":%q,`+
-			`"version":%d,"repo":"o/r","path":"flag.bin","commit":"c1","commit_pinned":true,`+
-			`"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}],"legacy_migrated":true}`,
-		os.Getpid(), processInstanceToken, processHostname, total, sha, stagingMetaVersion, total-1, total)
-	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "flag.bin", URL: srv.URL + "/flag.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-
-	hashPassCount.Store(0)
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1", CommitPinned: true}, func(ProgressEvent) {}); err == nil {
-		t.Fatal("a resumed LegacyMigrated record skipped its content proof")
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("resumed legacy record performed %d hash passes; want 1", got)
-	}
-	if len(*gotRanges) != 0 {
-		t.Errorf("a fully committed record was re-downloaded before the proof: %v", *gotRanges)
-	}
-	for _, p := range []string{dst, staging, staging + ".meta"} {
-		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("%s survived the failed content proof, stat err=%v", filepath.Base(p), serr)
-		}
-	}
-}
-
-// T2: in strict sha256 mode the migration proof and the normal strict pass are
-// the same single pass (never two), and a mismatch still never publishes.
-func TestDownloadMultipart_LegacyMigrationSHA256ModeUsesOnePass(t *testing.T) {
-	const total = 8000
-	full := rangedTestPayload(total)
-	sum := sha256.Sum256(full)
-	sha := hex.EncodeToString(sum[:])
-
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "strict-migrate.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 2; i++ {
-		if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, i), bytes.Repeat([]byte{0xFF}, total/2), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(total, 2, total/2)); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "strict-migrate.bin", URL: srv.URL + "/strict-migrate.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "sha256"}
-	hashPassCount.Store(0)
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err == nil {
-		t.Fatal("wrong-content legacy bytes were published in sha256 mode")
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("sha256-mode legacy migration performed %d hash passes; want exactly 1", got)
-	}
-	if got := *gotRanges; len(got) != 2 || !containsRange(got, "bytes=3999-3999") || !containsRange(got, "bytes=7999-7999") {
-		t.Errorf("strict mode fetched %v; want exactly the reserved final byte of each migrated part", got)
-	}
-	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
-		t.Error("corrupt legacy bytes were published in strict mode")
 	}
 }
 
@@ -533,101 +340,6 @@ func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 			t.Errorf("explicit cancel during the strict hash left %s behind (stat err=%v)", filepath.Base(p), serr)
 		}
 	}
-}
-
-// T5: the legacy migration copy is context-aware. The deterministic signal is
-// the staging payload's first byte: cancel as soon as the copy has started, then
-// assert the final source byte was never reached (an unbounded copy would have
-// written the whole source).
-func TestDownloadMultipart_CancelDuringLegacyMigrationIsPrompt(t *testing.T) {
-	const partSize = 64 << 20
-	runCase := func(t *testing.T, cleanup bool) {
-		tmpDir := t.TempDir()
-		dst := filepath.Join(tmpDir, "migrate-cancel.bin")
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst+".part", bytes.Repeat([]byte{0xFF}, partSize), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		staging := dst + ".incomplete"
-
-		srv := headOnlyServer(t, partSize+1)
-		it := PlanItem{RelativePath: "migrate-cancel.bin", URL: srv.URL + "/migrate-cancel.bin", Size: partSize + 1, AcceptRanges: true}
-		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-		if cleanup {
-			cfg.CleanupPartialsOnCancel = func() bool { return true }
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		done := make(chan error, 1)
-		go func() {
-			_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
-			done <- err
-		}()
-
-		// Wait until the migration copy has written its first byte.
-		deadline := time.Now().Add(10 * time.Second)
-		buf := make([]byte, 1)
-		for {
-			if f, err := os.Open(staging); err == nil {
-				_, rerr := f.ReadAt(buf, 0)
-				f.Close()
-				if rerr == nil && buf[0] == 0xFF {
-					break
-				}
-			}
-			select {
-			case err := <-done:
-				t.Fatalf("download finished before the migration copy started: %v", err)
-			case <-time.After(200 * time.Microsecond):
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("legacy migration copy never started")
-			}
-		}
-
-		cancelAt := time.Now()
-		cancel()
-		select {
-		case err := <-done:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("error = %v, want context.Canceled", err)
-			}
-			if elapsed := time.Since(cancelAt); elapsed > 2*time.Second {
-				t.Errorf("cancel mid-migration took %v", elapsed)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("download did not return after cancel mid-migration")
-		}
-
-		if cleanup {
-			for _, p := range []string{staging, staging + ".meta", dst + ".part"} {
-				if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-					t.Errorf("explicit cancel mid-migration left %s behind (stat err=%v)", filepath.Base(p), serr)
-				}
-			}
-			return
-		}
-
-		// The unbounded copy would have written every source byte. Only a
-		// context-aware copy can leave the tail unwritten.
-		f, err := os.Open(staging)
-		if err != nil {
-			t.Fatalf("staging payload missing after the aborted migration: %v", err)
-		}
-		defer f.Close()
-		if _, err := f.ReadAt(buf, partSize-1); err != nil {
-			t.Fatalf("read staging tail: %v", err)
-		}
-		if buf[0] != 0 {
-			t.Fatal("the legacy migration copy ran to completion after cancel; the copy is not context-aware")
-		}
-	}
-
-	t.Run("aborts the copy", func(t *testing.T) { runCase(t, false) })
-	t.Run("runs cancel cleanup", func(t *testing.T) { runCase(t, true) })
 }
 
 // T6: etag preserves the historical LFS behavior — a known-SHA LFS file was

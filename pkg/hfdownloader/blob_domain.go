@@ -45,7 +45,7 @@ package hfdownloader
 // other's store needs, and it keeps ONE destination domain per staging name.
 //
 // A writer holds the domain for its whole operation on the key: the partial
-// namespace (so no other route can adopt, migrate or delete a live partial of
+// namespace (so no other route can adopt or delete a live partial of
 // the same key) and the publication (so the existence decision and the
 // placement that follows it cannot be overtaken).
 //
@@ -113,7 +113,7 @@ func blobLiveOwnerError(sha, rel string) error {
 // record cannot be proven to belong to a live owner or to a dead one.
 //
 // The condition is NOT "another process is downloading this": the record is
-// either a legacy/unfenced one (written without the lifetime ownership lock
+// either an unfenced one (written without the lifetime ownership lock
 // fence) or one that cannot be read or parsed at all, so its owner can be
 // proven neither alive nor dead. The refusal is deliberate and conservative:
 // the record is preserved and never taken over, because no age-based takeover

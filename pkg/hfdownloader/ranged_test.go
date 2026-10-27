@@ -24,10 +24,9 @@ package hfdownloader
 //     parallel transfer and never publishes corrupt bytes;
 //  10. a fresh Concurrency==1 strict transfer hashes on write (no second
 //     pass); a resumed sequential transfer falls back to one final pass;
-//  11. legacy .part-NN/.parts.json upgrade path
-//     (TestDownloadMultipart_ResumesPartialPart and
-//     TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded in
-//     resume_test.go), plus single .part prefix migration;
+//  11. old/unsupported partials are discarded, never migrated or resumed
+//     (TestDownloadMultipart_OldMultipartArtifactsAreNotResumed in
+//     resume_test.go);
 //  12. two concurrent claims for the same staging file → only one writer;
 //  13. stall/retry/cancel/fail-fast behavior (robustness_test.go suite).
 

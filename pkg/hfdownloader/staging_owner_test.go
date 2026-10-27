@@ -73,8 +73,8 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 		raw := fmt.Sprintf(
-			`{"pid":%d,"instance":"foreign-live-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"x.bin","ranges":[{"start":0,"end":%d,"committed":0,"done":false}]}`,
-			os.Getppid(), host, total, total-1)
+			`{"pid":%d,"instance":"foreign-live-instance","host":%q,"size":%d,"version":%d,"repo":"o/r","path":"x.bin","ranges":[{"start":0,"end":%d,"committed":0,"done":false}]}`,
+			os.Getppid(), host, total, stagingMetaVersion, total-1)
 		writeRawStagingMeta(t, metaPath, raw)
 		// A live owner holds the OS-level ownership lock for its whole
 		// interval; cleanup must treat that (not a heartbeat heuristic) as the

@@ -15,7 +15,7 @@ package hfdownloader
 //
 // The token is the record's identity, not the exclusion fence. The lifetime OS
 // lock excludes current-version writers; a free lock is sufficient only for a
-// LockFenced record. A legacy/unfenced record is protected unless same-host
+// LockFenced record. An unfenced record is protected unless same-host
 // process evidence proves its owner dead. Publish also verifies the token under
 // the local metadata gate as a claim check.
 //

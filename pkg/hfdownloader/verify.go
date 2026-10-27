@@ -42,10 +42,11 @@ func computeSHA256(path string) (string, error) {
 // hashPassCount/hashPassBytes observability counters. Scoped to the NORMAL
 // transfer/finalization path, the issue #140 verification contract allows at
 // most ONE such pass per downloaded file in strict Verify=sha256 mode, and none
-// in Verify=size mode. Two deliberate exceptions exist: the pre-download skip
-// check may hash an already-present destination, and the one-time
-// legacy-migration content proof runs a pass even in size mode when the item
-// carries a known digest (Verify != "none").
+// in Verify=size mode. Deliberate exceptions exist: the pre-download skip check
+// may hash an already-present destination, and inherited single-path .part
+// bytes (or a durable ProofPending / unpinned-identity gate) are proven before
+// publication even in size mode when the item carries a known digest
+// (Verify != "none").
 func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

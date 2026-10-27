@@ -126,9 +126,11 @@ staging file (blobs/<sha>.incomplete in HF cache mode) and persist their
 committed byte ranges in versioned metadata next to it, so an interrupted
 transfer resumes from its durable high-water marks without re-downloading
 valid bytes — even when the connection count changes between runs.
-Range-record version 3 marks ranges Done only after the response body reaches clean EOF;
-version-2 Done records reserve the final byte for revalidation because the
-older writer could infer completion from bytes written alone.
+Range-record version 4 marks ranges Done only after the response body reaches
+clean EOF. It is the ONLY resumable version: a record of any other version is
+an old or unsupported format, so it is discarded under the claim's ownership
+and the file is re-downloaded from zero. Partial downloads from old formats are
+never migrated.
 Skip decisions are filesystem-based:
 
   - LFS files: Compared by SHA-256 hash (if available in metadata)
@@ -242,8 +244,8 @@ cancel-cleanup path closes the single-path partial's writable handle before it
 removes anything: the content proof could previously reach that cleanup while
 the handle was still open, and Windows cannot unlink an open file, so an
 explicit cancel during the proof does not retain the whole `.part` and its
-sidecar. Pause/internal aborts still preserve both. A legacy `.part` without a
-record is never inherited. The known-digest content proof is unchanged and
+sidecar. Pause/internal aborts still preserve both. A `.part` without a
+matching identity record is never inherited. The known-digest content proof is unchanged and
 still applies to the inherited bytes.
 
 A PERMANENT error does not destroy that record. The single-request path's
@@ -293,8 +295,8 @@ The staging shapes are derived from the code that creates them:
   - `<name>.part` - the single-request partial (the flat-mode destination's
     partial)
   - `<name>.part.meta` - the single-request identity sidecar
-  - `<name>.part-NN` - the legacy multipart family
-  - `<name>.parts.json` - the legacy layout metadata
+  - `<name>.part-NN` - the obsolete pre-#140 multipart family
+  - `<name>.parts.json` - the obsolete pre-#140 layout metadata
   - `<name>.tmp-<random>` - the cache store's atomic copy temp
 
 A published blob is named by its content: a canonical 64-hex SHA-256 digest.
@@ -330,18 +332,18 @@ published name) is still accepted, stored, visible and mirrored, exactly as
 before.
 
 Existing multipart resume state survives a threshold change. Before routing an
-item to the single-request path, the downloader detects a usable pre-#140
-`.part-NN`/`.parts.json` layout and a valid versioned
-`<staging>.incomplete`/`.meta` pair (including the blob-keyed staging pair for
-LFS cache items). Version-2 records are migrated conservatively by re-fetching
-the final byte of completed ranges to validate response framing. A ranged-
-capable item keeps the multipart route regardless of `MultipartThreshold`, so
-the state is consumed through the existing migration/resume and content-proof
-rules; a fresh item with no state keeps the configured routing. If the server or
-plan does not support ranges, the downloader emits an explicit warning,
-downloads the full file through the single path, and removes the obsolete
-pair only after the final file is durable (claim-checked); the legacy family is
-removed by the single-path success cleanup.
+item to the single-request path, the downloader detects a valid current-format
+(version 4) `<staging>.incomplete`/`.meta` pair, including the blob-keyed
+staging pair for LFS cache items. A ranged-capable item keeps the multipart
+route regardless of `MultipartThreshold`, so the state is resumed. A partial
+download from an old or unsupported format is NOT resume state: a pre-#140
+`.part-NN`/`.parts.json` family is ignored, discarded under the claim when the
+multipart route owns the staging (or left for the existing success/cleanup
+path), and the file is re-downloaded from zero. If the server or plan does not
+support ranges, the downloader emits an explicit warning, downloads the full
+file through the single path, and removes the obsolete versioned pair only
+after the final file is durable (claim-checked); the pre-#140 family is removed
+by the single-path success cleanup.
 
 Exactly one live writer may own a staging file. The exclusion fence is an
 OS-level exclusive lock on the persistent sibling file `<staging>.lock`,
@@ -360,7 +362,7 @@ was OS-lock fenced (`LockFenced`); on a supported platform a free lock is then
 authoritative for CheckBlob and reports the record stale even when its stored
 PID is still live, so a reused PID cannot hide a resumable crash state. The same
 distinction applies to claims and cleanup: a free lock is authoritative only
-for a LockFenced record. A legacy/unfenced record belongs to a writer that did
+for a LockFenced record. An unfenced record belongs to a writer that did
 not hold the OS lock, so a new process preserves it unless same-host process
 evidence proves the owner dead; age or ambiguous identity is not sufficient.
 The ownership probe itself is non-owning (a shared lock on Unix, a
@@ -402,7 +404,7 @@ lock before rename; a missing or foreign record is refused with
 `errStagingClaimLost`. If the OS lock is unsupported or cannot be acquired,
 mutations fail before changing a claim or payload and preserve existing partial
 data; this runtime error does not declare permanent platform support policy.
-Age never authorizes transition recovery. An unfenced legacy record is
+Age never authorizes transition recovery. An unfenced record is
 protected unless its same-host owner is provably dead.
 
 One blob key owns one publication domain. Two routes write the same
@@ -413,7 +415,7 @@ and publishes onto `blobs/<sha>`, the single-request route stages in
 path. The domain is an in-process slot keyed by the blob key plus the lifetime
 OS lock on the persistent sibling `blobs/tmp-<sha>.lock`, and a writer holds it
 for its whole operation on that key. One domain means the other route can
-neither adopt, migrate nor delete this route's LIVE partial — a live partial is
+neither adopt nor delete this route's LIVE partial — a live partial is
 therefore never mistaken for a pre-#140 leftover — and the "the blob does not
 exist yet" decision and the placement that follows it cannot be overtaken by
 the other route. Every writer of `blobs/<sha>` participates in that domain,
@@ -610,7 +612,7 @@ missing path. The friendly entry is deliberately absent when
 
 The cleanup of a cache destination's artifacts participates in the same
 protocol. The `blobs/tmp-<name>` staging name, its single-request `.part`, the
-legacy `.part-NN` parts and the blob-keyed staging pair are removed only while
+obsolete pre-#140 `.part-NN` parts and the blob-keyed staging pair are removed only while
 that destination's ownership domain is held, so a cancelled job never deletes
 another live writer's partial — that writer would keep writing to an unlinked
 inode and its later publication would fail with ENOENT. The cleanup uses the
@@ -636,7 +638,7 @@ staging claim takes. Its artifacts are removed only while that domain is
 held, so a cancelled job cannot delete another live job's `.part`,
 `.incomplete` or `.meta` for the same path. The versioned staging pair
 (`<destination>.incomplete` and its `.meta`) is still claim-checked, and the
-single `.part`, the legacy `.part-NN` parts and `.parts.json` are removed as
+single `.part`, the obsolete pre-#140 `.part-NN` parts and `.parts.json` are removed as
 before. The persistent `<destination>.incomplete.lock` of the multipart route
 is never unlinked.
 
@@ -681,43 +683,27 @@ guessed at. Known-digest
 verification happens before publication on this path too: in Verify "sha256"
 and "etag" modes a fresh or resumed transfer is proven with one full-file
 SHA-256 pass before the rename, and in "size" mode inherited `.part` bytes are
-proven once (the one-time migration exception). A mismatch leaves the
+proven once (the inherited-bytes exception). A mismatch leaves the
 destination untouched and removes the partial. Verify "none" inherits that
 mode's no-hash semantics. An ignored-Range 200 response still restarts the
 partial from zero.
 
-Legacy migration: a valid pre-#140 `.part-NN`/`.parts.json` family, or a leftover
-single `.part` sequential prefix, is copied into the staging file once and the
-obsolete artifacts are removed only after the migrated range layout is durable.
-Migrated bytes are PREFIXES, never completion proof: the pre-#140 layout records
-byte ranges and not response framing, and a sidecarless `.part` records nothing
-at all, so every contributing legacy part is imported one byte short and never
-marked Done (a worker re-requests its last byte and, for a short part, the rest
-of its range), and a fully-sized single `.part` is imported whole only when a
-matching, pinned sidecar records the cleanly-framed completion - otherwise its
-final byte is reserved for a clean-framing re-request. An oversized single
-`.part` is invalid and is discarded rather than clamped. A
-layout whose every part is missing, empty or oversized contributes no usable
-bytes and is not a migrated state: the unusable family is discarded and a valid
-single `.part` is migrated instead. A single `.part` WITH an identity sidecar is
-the current-version single-request staging name, not the pre-#140 shape: it is
-imported only when the recorded identity is inheritable by the current plan
-(repo, commit, path, size, PINNED on both sides); a mismatch (including
-unpinned) or an unreadable sidecar imports nothing and preserves the partial and
-its record (a later successful publish of that destination removes the stale
-pair as obsolete). A `.part` WITHOUT a sidecar keeps the historical legacy prefix
-migration, including the reserved final byte: without a sidecar nothing records
-clean framing, so a fully-sized sidecarless `.part` is not a completed layout.
-Migrated bytes are tagged LegacyMigrated:
-they have layout/prefix structure but no validated provenance, so when the item
-carries a known SHA-256 and Verify is not "none" they receive one full-file
-SHA-256 proof before publication, even in "size" mode (the documented one-time
-migration exception). A mismatch discards the staging data and never publishes.
-With Verify "none" they inherit that mode's no-hash semantics.
+Old or unsupported partial downloads are DISCARDED, never migrated. Only a
+version-4 staging record is resumable; a record of any other version - and a
+pre-#140 `.part-NN`/`.parts.json` family - is obsolete state that the claim
+discards under its lifetime ownership and local metadata serialization, and the
+file is re-downloaded from zero. A sidecarless single-route `.part` is never
+inherited by the multipart route (that route creates no `.part`); the
+single-request path discards a `.part` without a matching, pinned identity
+record itself. Already-published blobs, completed files and the snapshot and
+friendly entries are untouched, and a warning is logged when old artifacts are
+discarded. An unreadable or unproven CURRENT-format record is not discarded
+automatically: it is refused with `ErrStagingOwnershipUnproven` and its record
+and payload are preserved for the operator.
 
 Durable proof gate: a multipart staging record persists a `ProofPending` flag.
 It is set and flushed before any known-digest proof starts (fresh sha256/etag,
-migrated bytes) and cleared and flushed only after the proof succeeds,
+an unpinned identity) and cleared and flushed only after the proof succeeds,
 immediately before publication. On resume the flag forces the proof in every
 mode except "none" — including "size" — whenever the item carries a known
 digest, so a crash mid-proof, a mismatch whose cleanup fails, or a later
@@ -746,8 +732,8 @@ files included:
   - "size": Verify expected size and complete validated transfer coverage on
     both transfer paths (default); no full-file SHA-256 reread on the normal
     transfer path. The pre-download skip check over an existing file, the
-    one-time legacy migration proof, the inherited single-path `.part` proof,
-    and a known digest with no known expected size may still hash. A resumed
+    inherited single-path `.part` proof, and a known digest with no known
+    expected size may still hash. A resumed
     ProofPending record forces the known-digest proof even in size mode after a
     crash, a failed mismatch cleanup, or a mode change
   - "etag": Historical compatibility: a known SHA-256 digest is proven before

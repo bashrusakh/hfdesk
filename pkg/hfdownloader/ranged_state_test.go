@@ -351,50 +351,6 @@ func TestRangedMultipart_FinalChunkFailureRetriesLastByteUntilFramed(t *testing.
 	}
 }
 
-// TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte seeds the
-// version-2 Done state produced when all bytes were written but response
-// framing failed. Migration keeps the prefix and re-fetches the final byte
-// before publication.
-func TestRangedMultipart_V2UnframedCompletePrefixRevalidatesLastByte(t *testing.T) {
-	const total = 8000
-	full := rangedTestPayload(total)
-	host, _ := os.Hostname()
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "complete-prefix.bin")
-	staging := dst + ".incomplete"
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(staging, full, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// The record states a RESOLVED, PINNED commit, so the fixture exercises the
-	// version-2 LAYOUT migration (the final byte is revalidated) and not the
-	// pinned-identity gate.
-	raw := fmt.Sprintf(
-		`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"complete-prefix.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
-		host, total, rangedSeedCommit, total-1, total)
-	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	past := time.Now().Add(-2 * claimGracePeriod)
-	for _, p := range []string{staging, staging + ".meta"} {
-		if err := os.Chtimes(p, past, past); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "complete-prefix.bin", URL: srv.URL + "/complete-prefix.bin", Size: total, AcceptRanges: true}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-	assertExactFile(t, dst, full)
-	if len(*gotRanges) != 1 || (*gotRanges)[0] != fmt.Sprintf("bytes=%d-%d", total-1, total-1) {
-		t.Errorf("unframed complete-prefix record did not revalidate exactly its final byte; requests=%v", *gotRanges)
-	}
-}
-
 // TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord reproduces
 // blocker 2: a record can claim every range Done while its payload was deleted
 // or replaced. The record must be discarded and the bytes re-fetched; a
@@ -433,7 +389,7 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 			// states a RESOLVED, PINNED commit, so the only reason it may be
 			// discarded is the payload check this test exercises.
 			raw := fmt.Sprintf(
-				`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":2,"repo":"o/r","path":"ghost.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
+				`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":4,"repo":"o/r","path":"ghost.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
 				host, total, rangedSeedCommit, total-1, total)
 			if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 				t.Fatal(err)
@@ -495,7 +451,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := fmt.Sprintf(
-		`{"pid":%d,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","ranges":[{"start":0,"end":%d,"committed":0,"done":false}]}`,
+		`{"pid":%d,"instance":"different-process-instance","host":%q,"size":%d,"version":4,"repo":"o/r","path":"pid-reuse.bin","ranges":[{"start":0,"end":%d,"committed":0,"done":false}]}`,
 		os.Getpid(), host, total, total-1)
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
@@ -526,12 +482,11 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	}
 
 	// Stale heartbeat + provably dead same-host owner and no ownership lock:
-	// take-over resumes its validated prefix, while the version-2 completed
-	// range revalidates its final byte under the newer framing contract. The
-	// record states a RESOLVED, PINNED commit, so the fixture exercises the
-	// take-over and not the pinned-identity gate.
+	// take-over resumes its validated prefix. The record states a RESOLVED,
+	// PINNED identity in the CURRENT format, so the fixture exercises the
+	// take-over and not the pinned-identity or version gate.
 	staleMeta := fmt.Sprintf(
-		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":2,"repo":"o/r","path":"pid-reuse.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
+		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":4,"repo":"o/r","path":"pid-reuse.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
 		host, total, rangedSeedCommit, total-1)
 	if err := os.WriteFile(staging+".meta", []byte(staleMeta), 0o644); err != nil {
 		t.Fatal(err)
@@ -559,7 +514,10 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatalf("take-over of a dead same-host owner failed: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	wantRanges := map[string]bool{"bytes=799-799": false, "bytes=800-7999": false}
+	// The CURRENT format treats a Done range as clean-framed completion, so
+	// the 800 committed bytes are reused and only the missing suffix is
+	// fetched. The take-over itself is what this test pins.
+	wantRanges := map[string]bool{"bytes=800-7999": false}
 	for _, rh := range *gotRanges {
 		if _, ok := wantRanges[rh]; !ok {
 			t.Errorf("unexpected take-over range %q (all ranges=%v)", rh, *gotRanges)
@@ -568,7 +526,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		wantRanges[rh] = true
 	}
 	if len(*gotRanges) != len(wantRanges) {
-		t.Errorf("take-over ranges=%v, want prefix revalidation plus missing suffix", *gotRanges)
+		t.Errorf("take-over ranges=%v, want only the missing suffix", *gotRanges)
 	}
 	for rh, seen := range wantRanges {
 		if !seen {
@@ -849,5 +807,103 @@ func TestStagingPublishAlreadyCanceledContextCannotPublish(t *testing.T) {
 	}
 	if _, err := os.Stat(staging); err != nil {
 		t.Fatalf("staging was not preserved: %v", err)
+	}
+}
+
+// TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4 pins the S0
+// format break: a version-3 record carrying legacy_migrated:true is not resume
+// state. Its record and payload are discarded under the claim, the file is
+// downloaded from zero (one whole-file request), no legacy content proof runs,
+// and the published content is exact.
+func TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4(t *testing.T) {
+	const total = 8000
+	full := rangedTestPayload(total)
+	dst := filepath.Join(t.TempDir(), "v3-old.bin")
+	staging := dst + ".incomplete"
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A complete-looking version-3 layout over the WRONG bytes, with the
+	// branch-only legacy_migrated marker set.
+	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xFF}, total), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(
+		`{"pid":%d,"instance":%q,"host":%q,"size":%d,"version":3,"repo":"o/r","path":"v3-old.bin","commit":%q,"commit_pinned":true,"lock_fenced":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}],"legacy_migrated":true}`,
+		os.Getpid(), processInstanceToken, processHostname, total, rangedSeedCommit, total-1, total)
+	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, gotRanges := rangedTestServer(t, full)
+	it := PlanItem{RelativePath: "v3-old.bin", URL: srv.URL + "/v3-old.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "size"}
+	hashPassCount.Store(0)
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+		multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	assertExactFile(t, dst, full)
+	if got := *gotRanges; len(got) != 1 || got[0] != fmt.Sprintf("bytes=0-%d", total-1) {
+		t.Errorf("payload GETs = %v, want one whole-file request (the v3 record must be discarded)", got)
+	}
+	if got := hashPassCount.Load(); got != 0 {
+		t.Errorf("the discarded v3 record triggered %d content proofs; want 0", got)
+	}
+}
+
+// TestStagingMetaResumableAcceptsOnlyTheCurrentVersion pins the version gate
+// directly: every other record version is refused, including version 3 (the
+// branch format that could carry legacy_migrated) and a future version.
+func TestStagingMetaResumableAcceptsOnlyTheCurrentVersion(t *testing.T) {
+	const size = 100
+	it := PlanItem{RelativePath: "x.bin", Size: size}
+	job := Job{Repo: "o/r"}
+	complete := []RangeProgress{{Start: 0, End: size - 1, Committed: size, Done: true}}
+	for _, version := range []int{0, 2, 3, 5, 99} {
+		meta := IncompleteMeta{
+			Version: version, Repo: "o/r", Path: "x.bin", Size: size,
+			Commit: "c1", CommitPinned: true, Ranges: complete,
+		}
+		if _, ok := stagingMetaResumable(meta, it, job, "c1", true); ok {
+			t.Errorf("version %d record was accepted as resume state", version)
+		}
+	}
+	meta := IncompleteMeta{
+		Version: stagingMetaVersion, Repo: "o/r", Path: "x.bin", Size: size,
+		Commit: "c1", CommitPinned: true, Ranges: complete,
+	}
+	ranges, ok := stagingMetaResumable(meta, it, job, "c1", true)
+	if !ok || len(ranges) != 1 || !ranges[0].Done {
+		t.Fatalf("current-version record = (%+v, %v), want a resumable complete range", ranges, ok)
+	}
+}
+
+// TestRangedMultipart_CurrentFormatV4RecordResumesCommittedPrefix is the
+// positive control for the version gate: the current format still resumes, so
+// the discard rule cannot degrade into re-downloading every file.
+func TestRangedMultipart_CurrentFormatV4RecordResumesCommittedPrefix(t *testing.T) {
+	const total = 8000
+	full := rangedTestPayload(total)
+	dst := filepath.Join(t.TempDir(), "v4.bin")
+	staging := dst + ".incomplete"
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedRangedState(t, staging, "o/r", "v4.bin", total, []RangeProgress{
+		{Start: 0, End: 3999, Committed: 4000, Done: true},
+		{Start: 4000, End: 7999},
+	}, full)
+
+	srv, gotRanges := rangedTestServer(t, full)
+	it := PlanItem{RelativePath: "v4.bin", URL: srv.URL + "/v4.bin", Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "size"}
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+		multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	assertExactFile(t, dst, full)
+	if got := *gotRanges; len(got) != 1 || got[0] != "bytes=4000-7999" {
+		t.Errorf("payload GETs = %v, want only the missing suffix bytes=4000-7999", got)
 	}
 }

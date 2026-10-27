@@ -5,7 +5,6 @@ package hfdownloader
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,58 +58,11 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-type multipartResumeLayout struct {
-	Size        int64                `json:"size"`
-	Concurrency int                  `json:"concurrency"`
-	Parts       []multipartPartRange `json:"parts"`
-}
-
-type multipartPartRange struct {
-	Index int   `json:"index"`
-	Start int64 `json:"start"`
-	End   int64 `json:"end"`
-}
-
+// multipartLayoutMetaPath returns the path of the pre-#140 multipart layout
+// record. The downloader no longer writes or reads it: only the cleanup and
+// the classification surfaces still know the name.
 func multipartLayoutMetaPath(dst string) string {
 	return dst + ".parts.json"
-}
-
-// buildMultipartResumeLayout is the legacy .parts.json layout builder. The
-// ranged downloader no longer writes it, but the one-time upgrade migration
-// (migrateLegacyMultipart) reads layouts in exactly this shape, and the
-// legacy cleanup family still enumerates its artifacts.
-func buildMultipartResumeLayout(size int64, n int, chunk int64) multipartResumeLayout {
-	layout := multipartResumeLayout{
-		Size:        size,
-		Concurrency: n,
-		Parts:       make([]multipartPartRange, n),
-	}
-	for i := 0; i < n; i++ {
-		start := int64(i) * chunk
-		end := start + chunk - 1
-		if i == n-1 {
-			end = size - 1
-		}
-		layout.Parts[i] = multipartPartRange{Index: i, Start: start, End: end}
-	}
-	return layout
-}
-
-// writeMultipartResumeLayout persists a legacy .parts.json layout. The
-// ranged downloader no longer writes these records; this helper remains so
-// the one-time upgrade migration and the legacy-state tests share the exact
-// on-disk shape a pre-#140 version produced.
-func writeMultipartResumeLayout(dst string, layout multipartResumeLayout) error {
-	data, err := json.Marshal(layout)
-	if err != nil {
-		return err
-	}
-	metaPath := multipartLayoutMetaPath(dst)
-	tmpPath := metaPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, metaPath)
 }
 
 // multipartPartFiles lists the legacy per-connection payload files for dst:
@@ -155,19 +107,6 @@ func removeMultipartResumeFiles(dst string) error {
 	if err := os.Remove(multipartLayoutMetaPath(dst)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return nil
-}
-
-// removeLegacySinglePart removes the pre-#140 single-download prefix
-// (dst+".part") once it has either been migrated into the staging record or
-// become obsolete because a valid .part-NN layout won the migration. The
-// identity sidecar of that partial goes with it: no identity record may
-// outlive the partial it describes.
-func removeLegacySinglePart(dst string) error {
-	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	removeSinglePartIdentity(singlePartIdentityPath(dst))
 	return nil
 }
 
@@ -661,31 +600,31 @@ LOOP:
 				mpOpts.ContentAddressed = true
 				versionedStaging = mpOpts.Staging
 			}
-			// Existing multipart resume state must not be ignored (and later
-			// deleted) just because the current threshold routes a small item to
-			// the single-request path. Detect it before choosing the route; a
-			// ranged-capable item keeps the multipart route so migration/resume
-			// consumes it. A fresh download with no state is unchanged.
-			resumeState := multipartResumeState{
-				legacy: hasUsableLegacyMultipartState(dst, it.Size),
-			}
+			// A CURRENT-FORMAT multipart resume pair must not be ignored (and
+			// later deleted) just because the current threshold routes a small
+			// item to the single-request path. Detect it before choosing the
+			// route; a ranged-capable item keeps the multipart route so the
+			// version-4 state is resumed. A partial download from an old or
+			// unsupported format is never resume state: it is discarded and the
+			// file is re-downloaded from zero.
+			resumeStaging := ""
 			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit, plan.CommitPinned) {
-				resumeState.versionedStaging = versionedStaging
+				resumeStaging = versionedStaging
 			}
 			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
-			if !multipartRan && it.AcceptRanges && (resumeState.legacy || resumeState.versionedStaging != "") {
+			if !multipartRan && it.AcceptRanges && resumeStaging != "" {
 				multipartRan = true
 			}
 			// A server/plan without range support cannot consume multipart
 			// state. Do not silently delete it: warn, download the full file
 			// through the single path, and remove the obsolete versioned pair
-			// only after the final state is durable (claim-checked). The legacy
-			// family is removed by the single-path success cleanup.
+			// only after the final state is durable (claim-checked). The
+			// pre-#140 family is removed by the single-path success cleanup.
 			obsoleteVersionedStaging := ""
-			if !it.AcceptRanges && resumeState.versionedStaging != "" {
-				obsoleteVersionedStaging = resumeState.versionedStaging
+			if !it.AcceptRanges && resumeStaging != "" {
+				obsoleteVersionedStaging = resumeStaging
 			}
-			if !it.AcceptRanges && (resumeState.legacy || resumeState.versionedStaging != "") {
+			if !it.AcceptRanges && resumeStaging != "" {
 				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf(
 					"resume state for %s cannot be used without HTTP range support; downloading the full file and attempting to discard the obsolete state after success",
 					finalRel)})
@@ -721,7 +660,7 @@ LOOP:
 			//     collision by construction.
 			//
 			// The domain is held for the whole operation on the destination:
-			// the partial namespace (so no other writer can adopt, migrate or
+			// the partial namespace (so no other writer can adopt or
 			// delete this item's LIVE partial) and the publication (so the
 			// existence decision and the placement that follows it cannot be
 			// overtaken).
@@ -862,7 +801,7 @@ LOOP:
 			// contentVerified reports that the downloader already proved the
 			// payload against it.SHA256 inside this call, before the publish
 			// rename (one pass at most): the ranged path's hash-on-write/final/
-			// legacy proof, or the single path's pre-publication proof. For a
+			// pass, or the single path's pre-publication proof. For a
 			// known digest this is always true on success in Verify=sha256 and
 			// Verify=etag modes, so the caller must not repeat the hash (a
 			// post-publication hash could only observe corrupt published
@@ -972,10 +911,9 @@ LOOP:
 			//   size   — (default) the exact expected-size invariant, plus
 			//            the complete validated transfer coverage both paths
 			//            already enforced; NO full-file SHA reread on the
-			//            normal path. Three pre-existing, documented
+			//            normal path. Two pre-existing, documented
 			//            exceptions may still hash: the pre-download skip
-			//            check of an already-present file, the one-time
-			//            legacy-migration content proof, and the proof of
+			//            check of an already-present file and the proof of
 			//            inherited single-path .part bytes — all before
 			//            publication.
 			//   sha256 — strict full-file SHA-256 against the known digest,
@@ -1795,8 +1733,8 @@ func absoluteAttemptCeiling(retries int) int {
 // the file must have exactly the expected size, and a known digest is proven
 // before publication: in Verify=sha256 and Verify=etag modes every single-path
 // transfer (fresh or resumed) gets one full-file SHA-256 pass, and in Verify=size
-// mode inherited .part bytes are proven once (the same one-time migration
-// exception the legacy import gets). A mismatch removes the partial and never
+// mode inherited .part bytes are proven once (the inherited-bytes exception).
+// A mismatch removes the partial and never
 // renames it onto the destination. Verify="none" inherits that mode's no-hash
 // semantics, and bytes written entirely by this run in Verify="size" mode need
 // no reread. Verification with no known digest, where the caller falls back to a
@@ -1850,12 +1788,25 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// not an identity, and publishing another object's bytes (or another
 	// revision's) would corrupt the cache silently.
 	if pos > 0 && !singlePartialInheritable(recorded, identity, pos) {
-		downloadLog.Info("discarding unproven single-path partial",
-			"repo", job.Repo,
-			"path", it.RelativePath,
-			"bytes", pos,
-			"identity_recorded", recorded != nil,
-		)
+		if recorded == nil {
+			// No usable identity record (a sidecarless pre-#140 partial, an
+			// unreadable record, or an unsupported sidecar version): this is
+			// old or unproven state, so say so at warning level before
+			// starting from zero.
+			downloadLog.Warn("discarding old or unproven single-path partial; re-downloading from zero",
+				"repo", job.Repo,
+				"path", it.RelativePath,
+				"bytes", pos,
+				"record", sidecar,
+			)
+		} else {
+			downloadLog.Info("discarding unproven single-path partial",
+				"repo", job.Repo,
+				"path", it.RelativePath,
+				"bytes", pos,
+				"identity_recorded", recorded != nil,
+			)
+		}
 		if err := out.Truncate(0); err != nil {
 			return false, err
 		}
@@ -2253,7 +2204,7 @@ var singleProofStartHook func(out *os.File)
 // exact-size check runs first, then a known digest is proven with one
 // full-file SHA-256 pass before the rename whenever Verify is "sha256" or
 // "etag" (fresh or resumed), whenever the partial contains inherited bytes and
-// Verify is not "none" (the one-time migration exception for size mode),
+// Verify is not "none" (the inherited-bytes exception for size mode),
 // whenever the identity is UNPINNED and Verify is not "none" (an unpinned
 // identity names a revision the endpoint did not resolve, so the bytes are not
 // bound to an immutable object and only the content proof can detect a moved
@@ -2354,7 +2305,7 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	// survive a successful single-path finalization. Finalization already
 	// succeeded, so a cleanup failure is logged and does not unpublish the file.
 	if err := removeMultipartResumeFiles(dst); err != nil {
-		downloadLog.Warn("cleanup legacy multipart artifacts failed", "path", dst, "error", err)
+		downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", dst, "error", err)
 	}
 	return verified, nil
 }

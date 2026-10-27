@@ -214,13 +214,13 @@ type Settings struct {
 	//     validated and written, and the single path requires an exact 206
 	//     Content-Range/body-length match and checks the on-disk size before
 	//     the rename. On the normal transfer path no full-file SHA-256 reread
-	//     is performed for LFS files. Four deliberate exceptions may still
-	//     hash: the pre-download skip check over an already-present
-	//     destination, the one-time legacy-migration content proof, the
-	//     content proof of inherited single-path .part bytes, and a
-	//     single-request transfer with a known digest but no known expected
-	//     size (see below). A resumed ProofPending record can also force the
-	//     proof after a crash or mode change (see the durable proof gate below).
+	//     is performed for LFS files. Deliberate exceptions may still hash:
+	//     the pre-download skip check over an already-present destination,
+	//     the content proof of inherited single-path .part bytes, an
+	//     unpinned-identity proof, and a single-request transfer with a known
+	//     digest but no known expected size (see below). A resumed
+	//     ProofPending record can also force the proof after a crash or mode
+	//     change (see the durable proof gate below).
 	//   - "sha256": Full SHA-256 hash verification (most secure, slower).
 	//     At most one full-file read is performed per file, always before
 	//     publication when the item carries a known digest: only an eligible
@@ -237,20 +237,19 @@ type Settings struct {
 	//     (The HEAD-ETag fallback exists only in "sha256" mode; with no known
 	//     digest it remains a post-publication check.)
 	//
-	// Bytes migrated from a pre-#140 .part-NN/.parts.json partial or a single
-	// .part have layout/prefix structure but no validated provenance. When the
-	// item carries a known SHA-256 and Verify is not "none", they receive one
-	// full-file SHA-256 pass before publication even in "size" mode — the
-	// explicit one-time migration exception. The same rule applies to bytes a
-	// resumed single-request .part contributed before this run: a moved commit
-	// or a corrupt file can produce a size-correct prefix, so inherited .part
-	// bytes are content-proven once before the rename. A fresh single-request
-	// transfer in "sha256"/"etag" mode is likewise proven before the rename,
-	// and a known digest with no known expected size is proven too (only the
-	// digest can validate an unconstrained stream). A mismatch discards the
-	// partial/staging data and never publishes. With Verify "none" both inherit
-	// the mode's no-hash semantics; without a known digest only size and
-	// complete transfer coverage can be checked.
+	// Partial downloads from old or unsupported formats are discarded, not
+	// migrated: their bytes are never read into staging and the file is
+	// re-downloaded from zero (already-published blobs, completed files and
+	// snapshot/friendly entries are untouched). A resumed single-request
+	// .part contributed bytes before this run, and since a moved commit or a
+	// corrupt file can produce a size-correct prefix, inherited .part bytes are
+	// content-proven once before the rename. A fresh single-request transfer in
+	// "sha256"/"etag" mode is likewise proven before the rename, and a known
+	// digest with no known expected size is proven too (only the digest can
+	// validate an unconstrained stream). A mismatch discards the
+	// partial/staging data and never publishes. With Verify "none" these
+	// inherit the mode's no-hash semantics; without a known digest only size
+	// and complete transfer coverage can be checked.
 	//
 	// Durable proof gate: a staging (multipart) record carries a persisted
 	// ProofPending flag that is set and flushed before any known-digest proof
@@ -261,7 +260,7 @@ type Settings struct {
 	// or a later Verify-mode change cannot publish unproven all-Done ranges. On
 	// a mismatch the flag stays set, poison is attempted only while the claim is
 	// still owned under lifetime exclusion and metadata serialization (an
-	// unfenced legacy writer must not truncate another owner's payload), and the owned discard
+	// unfenced writer must not truncate another owner's payload), and the owned discard
 	// is attempted; if either cannot verify ownership, the durable flag remains
 	// the guard and the next run re-proves or discards. Publish refuses while the
 	// flag is still set for a known digest. Verify "none" is the explicit

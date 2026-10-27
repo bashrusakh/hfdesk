@@ -165,21 +165,20 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   existing pre-publication proof path. The normal size-mode "no reread" rule
   is unchanged for a PINNED identity: there the transfer is bound to an
   immutable commit, so the size contract is enough.
-- Multipart part files are only reusable when their byte-range layout is known
-  to match the current file size and connection count.
-- If legacy per-part resume metadata is invalid or mismatched, discard only the
-  incompatible part files and restart rather than guessing. For a current
-  `.incomplete.meta` claim, discard identity-mismatched data only while holding
-  lifetime ownership; preserve unreadable or ambiguous legacy claims unless
-  same-host owner death is proven.
+- Only a CURRENT-format (version 4) staging record is resumable. A record of
+  any other version, and every pre-#140 `.part-NN`/`.parts.json` family, is an
+  old or unsupported format: discard it under lifetime ownership and restart
+  the file from zero rather than guessing. For a current `.incomplete.meta`
+  claim, discard identity-mismatched data only while holding lifetime
+  ownership; preserve unreadable or unproven current claims (refuse them with
+  `ErrStagingOwnershipUnproven`) unless same-host owner death is proven.
 - `Settings.Verify` governs LFS verification too: `none` performs no
   post-download content hash; `size` (default) checks exact size plus complete
   validated transfer coverage on both the ranged and single-request paths and
   performs no full-file SHA-256 pass on the normal path (the pre-download skip
-  check, the one-time legacy-migration content proof, the inherited
-  single-path `.part` proof, the unpinned-identity content proof, and a
-  single-request known digest with no known
-  expected size may still hash); `sha256` performs at most one
+  check, the inherited single-path `.part` proof, the unpinned-identity content
+  proof, and a single-request known digest with no known expected size may
+  still hash); `sha256` performs at most one
   full-file pass, always before the rename/publication when a known digest
   exists, and never publishes a mismatch; `etag` proves a known digest with
   that same single pre-publication pass and keeps the historical non-LFS ETag
@@ -216,30 +215,22 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   re-proves it. (The sidecar's `framing_complete` is response-framing evidence,
   not a content proof.) A fresh size transfer with a known size follows the size
   contract and may rename without a hash.
-- Bytes migrated from a pre-#140 partial are not trusted on layout alone: mark
-  them LegacyMigrated, keep the marker durable across resume, and content-prove
-  them with one full-file SHA-256 pass before publication whenever a known
-  digest exists and `Verify != "none"`. An oversized single `.part` is invalid:
-  discard it, never clamp it. A multipart layout whose parts are all
-  missing/empty/oversized (or contribute nothing once their final byte is
-  reserved) contributes no bytes and is not a migrated layout: fall back to a
-  valid single `.part`; set LegacyMigrated only when bytes were actually
-  copied. A single `.part` WITH a current-version identity sidecar is
-  not the pre-#140 shape: it is migrated only when the recorded identity is the
-  current plan's (repo, commit, path, size, PINNED on both sides), and a
-  mismatch (including unpinned) or an unreadable sidecar imports nothing and
-  preserves the partial and its record (a LATER successful publish of that
-  destination treats the stale pair as obsolete and removes it). A `.part`
-  WITHOUT a sidecar keeps the historical legacy prefix migration.
-  BYTES MIGRATED ARE PREFIXES, NEVER COMPLETION PROOF: the pre-#140
-  `.parts.json` layout records byte ranges and not response framing, and a
-  sidecarless `.part` records nothing at all. A fully-sized single `.part`
-  therefore has its final byte reserved and re-requested as `[size-1, size)`
-  unless a matching, pinned sidecar records the cleanly-framed completion, and
-  EVERY contributing legacy `.part-NN` part is imported one byte short and never
-  marked Done, so a worker re-requests its last byte (and the rest of a short
-  part's range). A torn final byte of a "complete" legacy partial is therefore
-  never published with zero GETs.
+- OLD OR UNSUPPORTED PARTIALS ARE DISCARDED, NEVER MIGRATED. Only a version-4
+  `.incomplete`/`.meta` record is resume state. A record of any other version
+  (including a branch-only version-3 record whose `legacy_migrated` flag
+  described imported bytes) and every pre-#140 `.part-NN`/`.parts.json` family
+  is discarded under the claim/domain and the file is re-downloaded from zero;
+  a warning is logged. The multipart route never imports a single-route
+  `<dst>.part`: a sidecar-bearing `.part` is resumed only by the single-request
+  route under its own identity rule, and a sidecarless `.part` is discarded by
+  that route and never inherited. Old artifacts may be removed by the
+  multipart route only under its claim/domain, or left for the existing
+  success/cleanup path; a live single-route `.part`/sidecar is never removed by
+  the multipart route. Already-published blobs, completed files, and the
+  snapshot/friendly entries are untouched. An oversized single `.part` is
+  invalid: discard it, never clamp it. An unreadable or unproven current-format
+  record is refused with `ErrStagingOwnershipUnproven` and preserved, never
+  auto-deleted.
 - A ROUTE REMOVES ONLY THE ARTIFACTS IT CREATES. The multipart HEAD fail-fast
   creates no `.part`: a `<dst>.part`/`.part.meta` next to the destination
   belongs to the single-request route (in flat/output mode possibly to a LIVE
@@ -258,8 +249,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   `blobs/<sha>`) write the same key, so they must share one domain: an
   in-process slot keyed by the blob key plus the lifetime OS lock on the
   persistent sibling `blobs/tmp-<sha>.lock`, held for the whole operation on
-  that key. One domain means the other route can neither adopt, migrate nor
-  delete this route's LIVE partial (a live partial is never mistaken for a
+  that key. One domain means the other route can neither adopt nor delete this
+  route's LIVE partial (a live partial is never mistaken for a
   pre-#140 leftover), and the "the blob does not exist yet" decision and the
   placement that follows it cannot be overtaken. EVERY writer of `blobs/<sha>`
   must take that domain and publish through the shared no-replace primitive —
@@ -423,9 +414,9 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   so that is NOT an error.
 - CLEANUP PARTICIPATES IN THE SAME OWNERSHIP PROTOCOL. The artifacts of one
   cache destination — the `blobs/tmp-<name>` staging name, its single-request
-  `.part`, the legacy `.part-NN` parts and the blob-keyed staging pair — are
-  removed only while that destination's ownership domain is held. The cleanup
-  uses the SAME name-based identity the writer holds: destination
+  `.part`, the obsolete pre-#140 `.part-NN` parts and the blob-keyed staging
+  pair — are removed only while that destination's ownership domain is held.
+  The cleanup uses the SAME name-based identity the writer holds: destination
   `blobs/tmp-<name>` -> key `blobs/<name>`, lock `blobs/tmp-<name>.lock`. For a
   content-addressed `tmp-<sha>` that is the blob key's domain; for a
   path-derived `tmp-path-<sanitized path>` it is `blobs/path-<sanitized path>`
@@ -450,8 +441,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   MULTIPART route's staging claim takes. Its artifacts are removed only while
   that domain is held, so a cancelled job cannot delete another live job's
   `.part`/`.incomplete`/`.meta` for the same path. The versioned staging pair
-  is still claim-checked, and the single `.part`, the legacy `.part-NN` parts
-  and `.parts.json` are removed as before. The persistent
+  is still claim-checked, and the single `.part`, the obsolete pre-#140
+  `.part-NN` parts and `.parts.json` are removed as before. The persistent
   `<destination>.incomplete.lock` of the multipart route is never unlinked.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
@@ -515,7 +506,7 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   cleanup skips, `CheckBlob` reports downloading); a crashed process releases
   it at death, and a suspended owner keeps it — there is deliberately no
   takeover while it is alive. A free lock is authoritative only for a record
-  written under it (`LockFenced`). A fallback/legacy record is protected unless
+  written under it (`LockFenced`). An unfenced record is protected unless
   its same-host owner is provably dead; age, ambiguous host/PID identity, or a
   free new lock does not prove that an older writer cannot resume. If the lifetime lock cannot
   be acquired (unsupported, denied, or filesystem error), fail the operation
@@ -523,16 +514,18 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   operation-time safety error, not a permanent platform-support policy. Keep
   the ownership lock file: never unlink it (that would let two processes own
   different inodes).
-- Before routing an item to the single-request path, detect usable multipart
-  resume state: a valid versioned `<staging>.incomplete`/`.meta` pair
-  (including the blob-keyed LFS pair; v2 completed ranges revalidate the final
-  byte) or a usable pre-#140 `.part-NN`/`.parts.json` layout. A
-  ranged-capable item keeps the multipart route even below the configured
-  threshold so migration/resume consumes the state; a fresh item with no state
-  keeps the configured routing. Without range support, warn, download the full
-  file through the single path, and remove the obsolete versioned pair only after the
-  final file is durable and claim-checked; the legacy family is removed by the
-  single-path success cleanup.
+- Before routing an item to the single-request path, detect usable CURRENT
+  multipart resume state: a valid version-4 `<staging>.incomplete`/`.meta`
+  pair (including the blob-keyed LFS pair). A ranged-capable item keeps the
+  multipart route even below the configured threshold so the state is resumed;
+  a fresh item with no state keeps the configured routing. A pre-#140
+  `.part-NN`/`.parts.json` family is NOT resume state and does not force the
+  multipart route; it is discarded when the multipart route owns the staging,
+  or by the existing success/cleanup path, and the file is re-downloaded.
+  Without range support, warn, download the full file through the single path,
+  and remove the obsolete versioned pair only after the final file is durable
+  and claim-checked; the pre-#140 family is removed by the single-path success
+  cleanup.
 - Serialize current-process record transitions with the per-staging metadata
   mutex while the lifetime OS lock excludes foreign current-version mutators.
   Never recover a transition by age or unlink a lock that a suspended holder may
@@ -600,8 +593,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   while the handle was still open, and Windows cannot unlink an open file, so
   an explicit cancel during the proof must not retain the whole `.part` and
   its sidecar. Pause/internal aborts still preserve both.
-  A legacy `.part` without a record is not inherited. The known-digest content
-  proof is unchanged and still applies to the inherited bytes.
+  A `.part` without a matching identity record is not inherited. The
+  known-digest content proof is unchanged and still applies to the inherited bytes.
 - A PERMANENT ERROR MUST NOT DESTROY THE RESUME IDENTITY. The single-request
   path's fail-fast branch (a permanent 401/403/404) removes the zero-byte
   partial the attempt created, and the identity sidecar goes with it - but ONLY
@@ -638,8 +631,8 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   with its `.part`, its `.part.meta` identity sidecar and its `.lock` domain
   lock; the ranged staging pair `<name>.incomplete` +
   `<name>.incomplete.meta` with its atomic record temp `<name>.meta.tmp`; the
-  persistent ownership lock `<name>.lock`; the legacy multipart family
-  `<name>.part-NN` and `<name>.parts.json`; the flat-mode partials
+  persistent ownership lock `<name>.lock`; the obsolete pre-#140 multipart
+  family `<name>.part-NN` and `<name>.parts.json`; the flat-mode partials
   `<destination>.part` and `<destination>.incomplete`; and the cache store's
   atomic copy temp `<name>.tmp-<random>`. A published blob is named by its
   content: a canonical 64-hex SHA-256 digest. A file in `blobs/` that is

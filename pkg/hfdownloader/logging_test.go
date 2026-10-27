@@ -123,9 +123,9 @@ func newTestHub(t *testing.T, content []byte) (*httptest.Server, func() []string
 }
 
 // TestCleanupWarningReachesPipelineWithDownloadComponent proves that a
-// migrated cleanup warning reaches the application pipeline with the
-// download component and at warning level, and that the downloader no longer
-// writes that message through the standard library logger.
+// cleanup warning reaches the application pipeline with the download
+// component and at warning level, and that the downloader no longer writes
+// that message through the standard library logger.
 //
 // A .part path that is a non-empty directory cannot be removed, so the
 // cleanup reaches the branch that reports a failure it cannot act on.

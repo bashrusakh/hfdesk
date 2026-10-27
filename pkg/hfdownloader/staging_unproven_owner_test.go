@@ -247,7 +247,7 @@ func TestUnprovenStagingReadErrorKeepsSentinelAndCause(t *testing.T) {
 	it := PlanItem{RelativePath: "model.bin", SHA256: strings.Repeat("a", 64)}
 
 	_, _, err := claimStagingLocked(staging, metaPath, it, Job{Repo: "owner/model"},
-		"commit123", true, true, false, false)
+		"commit123", true, true, false)
 	if err == nil {
 		t.Fatal("an unreadable staging record was accepted")
 	}

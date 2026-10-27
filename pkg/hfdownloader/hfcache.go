@@ -283,11 +283,12 @@ func (r *RepoDir) EnsureDirs() error {
 // incomplete download, deliberately decoupled from worker count so changed
 // Settings.Concurrency re-fetches only missing bytes. Crash-safety contract:
 // payload data is written before Committed is advanced, and Committed must not
-// claim bytes that were not written. Version 3 Done additionally requires clean
-// response framing; a version-2 Done range is migrated with its final byte
-// reserved for revalidation. The staging file is preallocated, so its length
-// is never evidence of completion — only Ranges is, after payload existence and
-// logical size have been checked.
+// claim bytes that were not written. The current version is 4; Done requires
+// clean response framing. A record of any other version is not understood: it
+// is discarded under the claim's ownership and the file is re-downloaded from
+// zero (old/unsupported partials are never migrated). The staging file is
+// preallocated, so its length is never evidence of completion — only Ranges is,
+// after payload existence and logical size have been checked.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
@@ -311,9 +312,13 @@ type IncompleteMeta struct {
 	// platform (or by an older version) carry false and keep the lease
 	// heuristic.
 	LockFenced bool `json:"lock_fenced,omitempty"`
-	// Version is 0 for legacy records (no range state) and 3 for the ranged
-	// staging records written by this downloader. Version 2 is still accepted
-	// and migrated: its completed ranges are revalidated rather than trusted.
+	// Version is 0 for pre-range records and 4 for the ranged staging records
+	// written by this downloader. Only version 4 is resumable: every other
+	// version is an old or unsupported format, so its record and partial are
+	// discarded under the claim's ownership and the file is re-downloaded from
+	// zero. A version-3 record written by an earlier branch (whose
+	// legacy_migrated flag described migrated bytes) is therefore never
+	// trusted as ordinary resume state.
 	Version int `json:"version,omitempty"`
 	// Repo, Path and Commit identify the resolved remote object the staging
 	// file belongs to, so a reused destination or moved branch cannot
@@ -339,21 +344,13 @@ type IncompleteMeta struct {
 	// ever wrote these records.
 	CommitPinned bool `json:"commit_pinned"`
 	// Ranges lists the persisted range layout and per-range committed
-	// progress; see RangeProgress. Empty for legacy records.
+	// progress; see RangeProgress. Empty only for the brief ownership-only
+	// window before the fresh layout is flushed.
 	Ranges []RangeProgress `json:"ranges,omitempty"`
-	// LegacyMigrated marks bytes imported from a pre-#140 partial
-	// (.part-NN/.parts.json family or a single .part). Such bytes have
-	// layout/prefix structure but no validated provenance, so the downloader
-	// performs one full-file SHA-256 content proof before publication whenever
-	// the item carries a known digest and Verify is not "none" — the explicit
-	// one-time migration exception to the size-mode "no reread" rule. The flag
-	// is persisted so a crash and resume repeat the proof instead of publishing
-	// unproven bytes.
-	LegacyMigrated bool `json:"legacy_migrated,omitempty"`
 	// ProofPending is the durable publication gate for known-digest
 	// verification. It is set (and flushed) before any pre-publication
-	// SHA-256 proof starts — a fresh sha256/etag multipart transfer or bytes
-	// migrated from a pre-#140 partial — and cleared (and flushed) only after
+	// SHA-256 proof starts — a fresh sha256/etag multipart transfer or an
+	// unpinned-identity proof — and cleared (and flushed) only after
 	// that proof succeeds, immediately before the publish rename. A record that
 	// still carries the flag forces the proof on the next claim regardless of
 	// the current Verify mode (including "size") whenever the item has a known
@@ -505,7 +502,7 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	}
 
 	// A current-version record plus a free lifetime lock proves the owner is
-	// gone. A legacy/unfenced record is resumable only when same-host process
+	// gone. An unfenced record is resumable only when same-host process
 	// evidence proves owner death; age or remote/ambiguous identity is not proof.
 	if meta.LockFenced {
 		return BlobStale, meta, nil
@@ -527,23 +524,6 @@ func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 		return nil, err
 	}
 	return &meta, nil
-}
-
-// WriteIncompleteMeta writes metadata for an incomplete download.
-func (r *RepoDir) WriteIncompleteMeta(sha256 string, size int64) error {
-	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      size,
-		SHA256:    sha256,
-	}
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(r.IncompleteMetaPath(sha256), data, 0644)
 }
 
 // CleanupIncomplete removes the .incomplete.meta and .incomplete files. The

@@ -1026,3 +1026,60 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestCleanupLeavesOldMultipartFamilyUnderLiveDomain pins the cleanup half of
+// the S0 discard rule: the pre-#140 .part-NN/.parts.json family is removed by
+// CleanupJobPartFiles only while the cache destination's ownership domain is
+// held. When another live writer owns the destination, the family is left
+// alone; once the domain is free, a later cleanup removes it.
+func TestCleanupLeavesOldMultipartFamilyUnderLiveDomain(t *testing.T) {
+	if !stagingOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	restoreWait := stagingLockCleanupWait
+	stagingLockCleanupWait = 50 * time.Millisecond
+	defer func() { stagingLockCleanupWait = restoreWait }()
+
+	const sha = "6666666666666666666666666666666666666666666666666666666666666666"
+	cacheDir := t.TempDir()
+	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--model", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(blobsDir, "tmp-"+sha)
+	oldPart := dst + ".part-00"
+	oldLayout := dst + ".parts.json"
+	if err := os.WriteFile(oldPart, []byte("obsolete part bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldLayout, []byte(`{"size":19}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	key, ok := cacheDstDomainKey(dst)
+	if !ok {
+		t.Fatalf("cache destination %s has no domain key", dst)
+	}
+	live, err := blobDomainAcquire(context.Background(), key, dst)
+	if err != nil {
+		t.Fatalf("acquire live domain: %v", err)
+	}
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	for _, p := range []string{oldPart, oldLayout} {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Errorf("cleanup removed a live owner's old-format artifact %s: %v", filepath.Base(p), serr)
+		}
+	}
+	live.release()
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
+		t.Fatalf("CleanupJobPartFiles after release: %v", err)
+	}
+	for _, p := range []string{oldPart, oldLayout} {
+		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
+			t.Errorf("old-format artifact %s survived a free-domain cleanup, stat err=%v", filepath.Base(p), serr)
+		}
+	}
+}

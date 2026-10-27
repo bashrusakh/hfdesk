@@ -228,20 +228,26 @@ func TestCleanupJobPartFiles_FallbackLiveOwnerSurvives(t *testing.T) {
 	}
 }
 
-func TestDownload_LowThresholdLegacyLayoutResumesMultipart(t *testing.T) {
+// TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded pins the S0
+// routing rule: a pre-#140 .part-NN/.parts.json family is not resume state, so
+// it does not force the multipart route. With a threshold above the item size
+// the item takes the single-request path, downloads the whole file from zero,
+// publishes exact content, and the obsolete family is cleaned up.
+func TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
-	layout := buildMultipartResumeLayout(total, 2, total/2)
-	if err := writeMultipartResumeLayout(dst, layout); err != nil {
+	// A valid-looking pre-#140 layout plus two parts; both are ignored.
+	if err := os.WriteFile(multipartLayoutMetaPath(dst),
+		[]byte(fmt.Sprintf(`{"size":%d,"concurrency":2,"parts":[]}`, total)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 0), full[:total/2], 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 1), full[total/2:total/2+total/4], 0o644); err != nil {
+	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 1), full[total/2:], 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -250,7 +256,7 @@ func TestDownload_LowThresholdLegacyLayoutResumesMultipart(t *testing.T) {
 		Endpoint:           srv.URL,
 		Concurrency:        2,
 		MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", // would route the 4 KiB item to the single path
+		MultipartThreshold: "1MB", // routes the 4 KiB item to the single path
 		Verify:             "size",
 		Retries:            0,
 		StallTimeout:       "0",
@@ -260,25 +266,16 @@ func TestDownload_LowThresholdLegacyLayoutResumesMultipart(t *testing.T) {
 		t.Fatalf("Download: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	// A legacy part is a PREFIX: the final byte of each contributing part is
-	// reserved for clean-framing revalidation, so the full part 0 re-requests
-	// only its last byte and the short part 1 resumes one byte before its
-	// durable offset.
-	part0LastByte := fmt.Sprintf("bytes=%d-%d", total/2-1, total/2-1)
-	want := fmt.Sprintf("bytes=%d-%d", total/2+total/4-1, total-1)
-	got := getRanges()
-	if len(got) != 2 || !containsRange(got, part0LastByte) || !containsRange(got, want) {
-		t.Errorf("ranged GETs = %v, want exactly the revalidated final bytes %q and %q", got, part0LastByte, want)
+	// The single-request path re-downloads from zero: one full GET, no range.
+	if got := getRanges(); len(got) != 1 || got[0] != "" {
+		t.Errorf("payload GETs = %v, want exactly one full-body request (no old-format resume)", got)
 	}
-	if containsRange(got, fmt.Sprintf("bytes=0-%d", total/2-1)) {
-		t.Errorf("the migrated layout re-downloaded a whole legacy part: %v", got)
+	if got := hashPassCount.Load(); got != 0 {
+		t.Errorf("old-format artifacts triggered %d content proofs; want 0", got)
 	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("legacy migration proof performed %d full-file passes; want exactly 1", got)
-	}
-	for _, p := range []string{dst + ".parts.json", fmt.Sprintf("%s.part-%02d", dst, 0), fmt.Sprintf("%s.part-%02d", dst, 1)} {
+	for _, p := range []string{multipartLayoutMetaPath(dst), fmt.Sprintf("%s.part-%02d", dst, 0), fmt.Sprintf("%s.part-%02d", dst, 1)} {
 		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("legacy artifact %s survived finalization, stat err=%v", filepath.Base(p), serr)
+			t.Errorf("obsolete pre-#140 artifact %s survived finalization, stat err=%v", filepath.Base(p), serr)
 		}
 	}
 }

@@ -235,7 +235,7 @@ func TestFreshClaimInstallSucceedsWithoutHardLinkSupport(t *testing.T) {
 func TestStagedRecordResidueCannotEmptyPredecessor(t *testing.T) {
 	dir := t.TempDir()
 	metaPath := filepath.Join(dir, "alias.incomplete.meta")
-	predecessor := []byte(`{"instance":"predecessor","version":3}`)
+	predecessor := []byte(`{"instance":"predecessor","version":4}`)
 	if err := os.WriteFile(metaPath, predecessor, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestStagedRecordResidueCannotEmptyPredecessor(t *testing.T) {
 func TestInterruptedInstallResidueDoesNotReplacePredecessor(t *testing.T) {
 	dir := t.TempDir()
 	metaPath := filepath.Join(dir, "install.incomplete.meta")
-	predecessor := []byte(`{"instance":"predecessor","version":3}`)
+	predecessor := []byte(`{"instance":"predecessor","version":4}`)
 	if err := os.WriteFile(metaPath, predecessor, 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -193,206 +193,14 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_ResumesPartialPart seeds a legacy pre-#140
-// .part-NN/.parts.json state and verifies the one-time upgrade migration:
-// a full part is imported as a PREFIX (its final byte is reserved and
-// revalidated, never reused as completion proof), the half-done part 1
-// resumes from its exact durable offset minus that reserved byte, and the
-// final bytes are exact — with no new .part-NN payload files created and the
-// legacy artifacts removed after the successful finalization.
-func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Build a deterministic payload where each byte is its index mod 251.
-	const totalSize = 10000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-	const nParts = 4
-	const partSize = totalSize / nParts // 2500
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-multi")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Part 0: fully complete
-	if err := os.WriteFile(dst+".part-00", full[0:partSize], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Part 1: half done (correct prefix)
-	const part1Have = partSize / 2
-	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
-		t.Fatal(err)
-	}
-	// Parts 2, 3: missing
-
-	var (
-		mu        sync.Mutex
-		rangeHdrs []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		mu.Lock()
-		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
-		mu.Unlock()
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-		AcceptRanges: true,
-	}
-	cfg := Settings{Concurrency: nParts, Retries: 0}
-
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
-	if err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	mu.Lock()
-	gotRanges := append([]string(nil), rangeHdrs...)
-	mu.Unlock()
-
-	// Part 0 must never be re-downloaded as a whole: a full part is a prefix,
-	// not completion proof, so only its final byte is revalidated.
-	part0WholeRange := fmt.Sprintf("bytes=0-%d", partSize-1)
-	part0LastByte := fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1)
-	gotPart0LastByte := false
-	for _, rh := range gotRanges {
-		if rh == part0WholeRange {
-			t.Errorf("part 0 was re-downloaded whole (range %q); ranges=%v", part0WholeRange, gotRanges)
-			break
-		}
-		if rh == part0LastByte {
-			gotPart0LastByte = true
-		}
-	}
-	if !gotPart0LastByte {
-		t.Errorf("part 0's reserved final byte was not revalidated: wanted %q in ranges=%v", part0LastByte, gotRanges)
-	}
-
-	// Part 1 is a prefix too: its own last byte is reserved, so the worker
-	// resumes one byte before the durable offset and re-requests the suffix.
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have-1, 2*partSize-1)
-	found := false
-	for _, rh := range gotRanges {
-		if rh == wantPart1 {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("part 1 not resumed from offset: wanted %q in ranges=%v", wantPart1, gotRanges)
-	}
-
-	// Final file should match.
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
-	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch: len got=%d want=%d", len(got), len(full))
-	}
-	// Part files should have been cleaned up after assembly.
-	for i := 0; i < nParts; i++ {
-		p := fmt.Sprintf("%s.part-%02d", dst, i)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("part file %s should be removed, stat err: %v", p, err)
-		}
-	}
-}
-
-// TestDownloadMultipart_FullLegacyPartReservesFinalByte is the .part-NN
-// counterpart of the single-`.part` rule: a full legacy part is a PREFIX, not
-// a completed range, because the pre-#140 layout records byte ranges and never
-// clean response framing. Its reserved final byte is re-requested, so a torn
-// last byte of a "complete" part can never be published, while the rest of the
-// part is reused instead of re-transferred.
-func TestDownloadMultipart_FullLegacyPartReservesFinalByte(t *testing.T) {
-	const total = 4_000
-	const nParts = 2
-	const partSize = total / nParts
-	full := rangedTestPayload(total)
-	torn := append([]byte(nil), full...)
-	torn[partSize-1] ^= 0xFF // the last byte of part 0
-
-	dst := filepath.Join(t.TempDir(), "blobs", "tmp-full-part")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part-00", torn[:partSize], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part-01", torn[partSize:], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(total, nParts, partSize)); err != nil {
-		t.Fatal(err)
-	}
-
-	var (
-		mu        sync.Mutex
-		rangeHdrs []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		mu.Lock()
-		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
-		mu.Unlock()
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{RelativePath: "full-part.bin", URL: srv.URL + "/full-part.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: nParts, Retries: 0, StallTimeout: "0", Verify: "size"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	mu.Lock()
-	got := append([]string(nil), rangeHdrs...)
-	mu.Unlock()
-
-	// Only the reserved final byte of each full part is re-requested; a whole
-	// part is never downloaded again.
-	want := []string{
-		fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1),
-		fmt.Sprintf("bytes=%d-%d", total-1, total-1),
-	}
-	if len(got) != len(want) || !containsRange(got, want[0]) || !containsRange(got, want[1]) {
-		t.Errorf("payload GETs = %v, want exactly the reserved final bytes %v", got, want)
-	}
-	for _, rh := range got {
-		if rh == fmt.Sprintf("bytes=0-%d", partSize-1) {
-			t.Errorf("the full legacy part 0 was re-downloaded whole: %v", got)
-		}
-	}
-	// The torn last byte of part 0 must never reach the published file.
-	assertExactFile(t, dst, full)
-}
-
-// TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded verifies that
-// pre-#140 part files with no .parts.json layout have an unknown byte-range
-// contract and are not reused: the next run re-downloads from scratch and
-// removes the stale parts. A valid layout, by contrast, maps 1:1 and preserves
-// committed bytes across a concurrency change; see
-// TestRangedMultipart_ConcurrencyChangePreservesCommitted.
-func TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded(t *testing.T) {
+// TestDownloadMultipart_OldMultipartArtifactsAreNotResumed pins the S0
+// behavior: a pre-#140 .part-NN/.parts.json family and a sidecarless
+// single-route .part are old/unsupported formats, so they are neither resumed
+// nor migrated. The file is downloaded from zero (one fresh range layout), the
+// obsolete multipart family is discarded under the claim, the single-route
+// .part is left byte-identically untouched, and the published content is
+// exactly the served payload.
+func TestDownloadMultipart_OldMultipartArtifactsAreNotResumed(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalSize = 16000
 	full := make([]byte, totalSize)
@@ -400,15 +208,14 @@ func TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded(t *testing.T) {
 		full[i] = byte(i % 251)
 	}
 
-	dst := filepath.Join(tmpDir, "blobs", "tmp-change-concurrency")
+	dst := filepath.Join(tmpDir, "blobs", "tmp-old-family")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate an interrupted previous run with 8 connections but no
-	// layout record: the parts cannot be mapped to byte ranges, so they must
-	// be discarded rather than reused by index under a different worker count.
-	const oldParts = 8
+	// A structurally valid pre-#140 layout with two fully-sized parts. The
+	// layout is irrelevant now: nothing parses it.
+	const oldParts = 2
 	oldChunk := totalSize / oldParts
 	for i := 0; i < oldParts; i++ {
 		start := i * oldChunk
@@ -420,372 +227,80 @@ func TestDownloadMultipart_LegacyPartsWithoutLayoutAreDiscarded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(multipartLayoutMetaPath(dst), []byte(`{"size":16000,"concurrency":2,"parts":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The single-request route's own staging file: a sidecarless prefix of
+	// DIFFERENT bytes. The multipart route must neither import it nor remove
+	// it (B1: a route removes only the artifacts it creates).
+	stalePrefix := bytes.Repeat([]byte("x"), 4_000)
+	if err := os.WriteFile(dst+".part", stalePrefix, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
+	var (
+		mu        sync.Mutex
+		rangeHdrs []string
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 			w.Header().Set("Accept-Ranges", "bytes")
 			return
 		}
+		mu.Lock()
+		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
+		mu.Unlock()
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 	}))
 	defer srv.Close()
 
 	it := PlanItem{
-		RelativePath: "change.bin",
-		URL:          srv.URL + "/change.bin",
+		RelativePath: "old.bin",
+		URL:          srv.URL + "/old.bin",
 		Size:         int64(len(full)),
 		AcceptRanges: true,
 	}
-	cfg := Settings{Concurrency: 4, Retries: 0}
+	cfg := Settings{Concurrency: 4, Retries: 0, StallTimeout: "0"}
 
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
+	mu.Lock()
+	gotRanges := append([]string(nil), rangeHdrs...)
+	mu.Unlock()
+	// The fresh claim re-downloads the whole file with the configured worker
+	// count; no old-format prefix may contribute a committed byte.
+	wantLayout := buildRangeLayout(int64(len(full)), cfg.Concurrency)
+	if len(gotRanges) != len(wantLayout) {
+		t.Fatalf("payload GET ranges = %v, want one request per fresh range (%d)", gotRanges, len(wantLayout))
 	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch after concurrency change")
+	for _, r := range wantLayout {
+		want := fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
+		if !containsRange(gotRanges, want) {
+			t.Errorf("payload GET ranges = %v, missing fresh range %q", gotRanges, want)
+		}
 	}
+
+	assertExactFile(t, dst, full)
+
 	parts, err := multipartPartFiles(dst)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(parts) != 0 {
-		t.Errorf("stale part files were not cleaned up: %v", parts)
+		t.Errorf("obsolete pre-#140 part files were not discarded: %v", parts)
 	}
 	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
-		t.Errorf("multipart layout metadata should be removed after success, stat err: %v", err)
-	}
-}
-
-// TestDownloadMultipart_MigratesLegacySinglePart verifies that a leftover
-// dst.part is a valid sequential prefix when no .part-NN/layout state exists:
-// the first range(s) are committed up to min(part length, size), the rest are
-// tiled at the configured worker count, and the obsolete .part file is removed
-// only after the migrated layout is durable.
-func TestDownloadMultipart_MigratesLegacySinglePart(t *testing.T) {
-	tmpDir := t.TempDir()
-	const totalSize = 12000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-	const prefix = 3000
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-single-prefix")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	var (
-		mu        sync.Mutex
-		rangeHdrs []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		mu.Lock()
-		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
-		mu.Unlock()
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{RelativePath: "single-prefix.bin", URL: srv.URL + "/single-prefix.bin", Size: totalSize, AcceptRanges: true}
-	cfg := Settings{Concurrency: 3, Retries: 0, StallTimeout: "0"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	mu.Lock()
-	got := append([]string(nil), rangeHdrs...)
-	mu.Unlock()
-	migratedPrefix := false
-	for _, rh := range got {
-		if rh == "bytes=3000-3999" {
-			migratedPrefix = true
-		}
-	}
-	if !migratedPrefix {
-		t.Errorf("single .part prefix was not migrated into the first range: requests=%v", got)
-	}
-	assertExactFile(t, dst, full)
-	if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
-		t.Errorf("legacy .part must be removed after the migrated state is durable, stat err=%v", err)
-	}
-}
-
-// TestDownloadMultipart_LegacyPartsWinOverSinglePart verifies the priority
-// rule: a valid .part-NN/.parts.json migration wins over a leftover dst.part,
-// and the obsolete .part is removed with the other legacy artifacts. A full
-// legacy part is still only a prefix: its final byte is revalidated, and the
-// short part 1 resumes one byte before its durable offset.
-func TestDownloadMultipart_LegacyPartsWinOverSinglePart(t *testing.T) {
-	tmpDir := t.TempDir()
-	const totalSize = 10000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-	const nParts = 4
-	const partSize = totalSize / nParts
-	const part1Have = partSize / 2
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-parts-win")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Valid multipart family: part 0 complete, part 1 half done.
-	if err := os.WriteFile(dst+".part-00", full[:partSize], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
-		t.Fatal(err)
-	}
-	// A stale single prefix also exists; it loses to the valid layout.
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte("x"), totalSize/2), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	var (
-		mu        sync.Mutex
-		rangeHdrs []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		mu.Lock()
-		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
-		mu.Unlock()
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{RelativePath: "parts-win.bin", URL: srv.URL + "/parts-win.bin", Size: totalSize, AcceptRanges: true}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	mu.Lock()
-	got := append([]string(nil), rangeHdrs...)
-	mu.Unlock()
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have-1, 2*partSize-1)
-	part0LastByte := fmt.Sprintf("bytes=%d-%d", partSize-1, partSize-1)
-	found := false
-	foundPart0LastByte := false
-	for _, rh := range got {
-		if rh == fmt.Sprintf("bytes=0-%d", partSize-1) {
-			t.Errorf("legacy part 0 was re-downloaded whole: %v", got)
-		}
-		if rh == part0LastByte {
-			foundPart0LastByte = true
-		}
-		if rh == wantPart1 {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("valid .part-NN layout did not win: wanted %q in %v", wantPart1, got)
-	}
-	if !foundPart0LastByte {
-		t.Errorf("legacy part 0's reserved final byte was not revalidated: wanted %q in %v", part0LastByte, got)
-	}
-	assertExactFile(t, dst, full)
-	if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
-		t.Errorf("obsolete .part must be removed when the .part-NN migration wins, stat err=%v", err)
-	}
-}
-
-// TestDownloadMultipart_SinglePartMigrationSurvivesFlushFailure pins the
-// durability order for the single .part migration: the prefix must survive a
-// failed first metadata flush and be migratable again on recovery.
-func TestDownloadMultipart_SinglePartMigrationSurvivesFlushFailure(t *testing.T) {
-	tmpDir := t.TempDir()
-	const totalSize = 8000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-	const prefix = 2500
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-single-survive")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{RelativePath: "single-survive.bin", URL: srv.URL + "/single-survive.bin", Size: totalSize, AcceptRanges: true}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-	if err := os.Mkdir(dst+".incomplete.meta.tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err == nil {
-		t.Fatal("download succeeded despite the forced metadata flush failure")
+		t.Errorf("obsolete pre-#140 layout should be discarded after success, stat err: %v", err)
 	}
 	gotPart, err := os.ReadFile(dst + ".part")
 	if err != nil {
-		t.Fatalf("single .part was removed before the migrated state was durable: %v", err)
+		t.Fatalf("the multipart route removed the single-route .part: %v", err)
 	}
-	if !bytes.Equal(gotPart, full[:prefix]) {
-		t.Errorf("single .part changed during the failed migration")
-	}
-
-	if err := os.Remove(dst + ".incomplete.meta.tmp"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("recovery downloadMultipart: %v", err)
-	}
-	assertExactFile(t, dst, full)
-	if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
-		t.Errorf("single .part survived successful recovery, stat err=%v", err)
-	}
-}
-
-// TestDownloadMultipart_LegacyMigrationSurvivesFlushFailure pins the
-// failure window of the one-time legacy upgrade migration (issue #140,
-// criterion 11): the legacy .part-NN/.parts.json artifacts are the only
-// finishable copy of a valid partial until the migrated range layout is
-// durably persisted in the staging record, so they must survive a
-// staging-metadata flush failure. The first flushMeta is forced to fail
-// deterministically by pre-creating its atomic-write staging path
-// (staging+".meta.tmp") as a directory, which makes the write inside
-// writeStagingMeta fail; the legacy bytes must still be on disk so a
-// later run can migrate again, and that recovery run must finish the
-// download and then remove the obsolete artifacts.
-func TestDownloadMultipart_LegacyMigrationSurvivesFlushFailure(t *testing.T) {
-	tmpDir := t.TempDir()
-	const totalSize = 10000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-	const nParts = 4
-	const partSize = totalSize / nParts
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-migrate")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Legacy pre-#140 state: part 0 fully complete, part 1 half done.
-	part0 := full[0:partSize]
-	const part1Have = partSize / 2
-	if err := os.WriteFile(dst+".part-00", part0, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
-		t.Fatal(err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-		AcceptRanges: true,
-	}
-	cfg := Settings{Concurrency: nParts, Retries: 0}
-
-	// Force the first staging-metadata flush to fail: writeStagingMeta
-	// stages through staging+".meta.tmp", and a directory at that path
-	// cannot be opened for writing.
-	if err := os.Mkdir(dst+".incomplete.meta.tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Run 1: the migration copies the part bytes into the staging file,
-	// then the first flush of the migrated layout fails.
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
-	if err == nil {
-		t.Fatal("download succeeded despite the forced metadata flush failure")
-	}
-
-	// The legacy artifacts — and their bytes — must survive the failure
-	// so a later run can still finish the partial (criterion 11: never
-	// silently discard a valid partial after upgrade).
-	assertPartBytes := func(path string, want []byte) {
-		t.Helper()
-		got, rerr := os.ReadFile(path)
-		if rerr != nil {
-			t.Errorf("legacy artifact %s was discarded before the migrated state was durable: %v", filepath.Base(path), rerr)
-			return
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("legacy artifact %s changed: got %d bytes, want %d", filepath.Base(path), len(got), len(want))
-		}
-	}
-	assertPartBytes(dst+".part-00", part0)
-	assertPartBytes(dst+".part-01", full[partSize:partSize+part1Have])
-	if _, lerr := os.Stat(multipartLayoutMetaPath(dst)); lerr != nil {
-		t.Errorf("legacy layout metadata must survive the flush failure: %v", lerr)
-	}
-
-	// Recovery: with the flush failure cleared, the next run re-migrates
-	// the legacy partial, finishes it, and removes the obsolete artifacts
-	// once the migrated layout is durable.
-	if err := os.Remove(dst + ".incomplete.meta.tmp"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("recovery downloadMultipart: %v", err)
-	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch: got len=%d want len=%d", len(got), len(full))
-	}
-	parts, err := multipartPartFiles(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(parts) != 0 {
-		t.Errorf("legacy part files must be removed after the migrated state is durable: %v", parts)
-	}
-	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
-		t.Errorf("legacy layout metadata must be removed after successful migration, stat err: %v", err)
+	if !bytes.Equal(gotPart, stalePrefix) {
+		t.Errorf("the multipart route rewrote the single-route .part: got %d bytes, want %d", len(gotPart), len(stalePrefix))
 	}
 }
 
@@ -851,73 +366,5 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 	}
 	if finalizingAt < fullProgressAt {
 		t.Errorf("file_finalizing (index %d) emitted before the 100%% progress reading (index %d)", finalizingAt, fullProgressAt)
-	}
-}
-
-// TestDownloadMultipart_UnusablePartLayoutFallsBackToSinglePart covers M1: a
-// pre-#140 .parts.json layout whose every part is missing/empty/oversized
-// contributes no bytes and is not a usable migrated state. The layout family
-// must be discarded and a valid dst.part prefix migrated instead — with
-// LegacyMigrated set only because bytes were actually copied.
-func TestDownloadMultipart_UnusablePartLayoutFallsBackToSinglePart(t *testing.T) {
-	const total = 8_000
-	const prefix = 3_000
-	full := rangedTestPayload(total)
-	sha := singleTestSHA(full)
-
-	tmpDir := t.TempDir()
-	dst := filepath.Join(tmpDir, "unusable-layout.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A syntactically valid two-part layout that tiles [0,total)...
-	layout := buildMultipartResumeLayout(total, 2, total/2)
-	if err := writeMultipartResumeLayout(dst, layout); err != nil {
-		t.Fatal(err)
-	}
-	// ...whose parts are useless: part 0 is oversized, part 1 is empty.
-	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 0), make([]byte, total/2+64), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, 1), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// The valid sequential prefix that must survive the upgrade.
-	if err := os.WriteFile(dst+".part", full[:prefix], 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "unusable-layout.bin", URL: srv.URL + "/unusable-layout.bin", Size: total, AcceptRanges: true, LFS: true, SHA256: sha}
-	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "size"}
-
-	hashPassCount.Store(0)
-	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
-	if err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-	// The migrated prefix was content-proven (one pass) and reported as
-	// already verified.
-	if !verified {
-		t.Error("migrated .part bytes were not content-proven")
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("migration proof performed %d full-file passes; want exactly 1", got)
-	}
-	// The valid .part prefix was resumed instead of being deleted and
-	// re-downloaded from zero.
-	if len(*gotRanges) != 1 || (*gotRanges)[0] != fmt.Sprintf("bytes=%d-%d", prefix, total-1) {
-		t.Errorf("fetched %v, want exactly the suffix bytes=%d-%d (the layout had no usable bytes)", *gotRanges, prefix, total-1)
-	}
-	assertExactFile(t, dst, full)
-	for _, p := range []string{
-		multipartLayoutMetaPath(dst),
-		fmt.Sprintf("%s.part-%02d", dst, 0),
-		fmt.Sprintf("%s.part-%02d", dst, 1),
-		dst + ".part",
-	} {
-		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("legacy artifact %s survived finalization, stat err=%v", filepath.Base(p), serr)
-		}
 	}
 }

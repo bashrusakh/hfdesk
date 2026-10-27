@@ -68,12 +68,12 @@ package hfdownloader
 // evidence of completion — a sparse/preallocated file reports its final
 // size from the first truncate, so only the committed ranges count.
 //
-// Legacy bytes imported from a pre-#140 .part-NN/.parts.json family or a
-// single .part have layout/prefix structure but no validated provenance.
-// They are tagged LegacyMigrated and content-proven with one full-file SHA-256
-// pass before publication whenever the item carries a digest and Verify is not
-// "none" (the explicit one-time migration exception to the size/sha256
-// contract). A mismatch discards the staging data and never publishes.
+// Partial downloads from old or unsupported formats are DISCARDED, never
+// migrated: only a version-4 record is resumable, and a pre-#140
+// .part-NN/.parts.json family is obsolete residue. The affected file is
+// re-downloaded from zero; already-published content is untouched. The
+// single-request path likewise never migrates a leftover .part into ranged
+// staging: a sidecarless or unsupported .part is discarded by that route.
 
 import (
 	"context"
@@ -95,12 +95,11 @@ import (
 )
 
 // stagingMetaVersion is the IncompleteMeta.Version value written by this
-// downloader. Version 3 marks range completion only after clean response
-// framing; version 2 checkpoints are migrated with their last byte reserved
-// for revalidation.
-const stagingMetaVersion = 3
-
-const priorStagingMetaVersion = 2
+// downloader. Version 4 is the only resumable version: a record of any other
+// version is discarded under the claim/domain and the transfer starts from
+// zero (old branch records, including a version-3 record whose
+// legacy_migrated flag described migrated bytes, are never trusted).
+const stagingMetaVersion = 4
 
 // linkStagingClaimRecord atomically publishes a complete fresh record without
 // replacing an existing path. Tests replace it to exercise the crash/error
@@ -131,11 +130,6 @@ const claimHeartbeatEvery = claimGracePeriod / 2
 // tests can shorten the finalization-length pause they simulate; production
 // keeps the derived constant.
 var stagingHeartbeatEvery = claimHeartbeatEvery
-
-// errNoLegacyState reports that no usable legacy .part-NN/.parts.json state
-// exists for a destination (missing layout, or a layout that does not tile
-// the file, in which case the unvalidatable artifacts were discarded).
-var errNoLegacyState = errors.New("no valid legacy multipart state")
 
 var (
 	// errBlobIncompleteOwned reports that the staging file for this
@@ -289,15 +283,15 @@ func removeStagingArtifactsIfUnclaimedLocked(staging, metaPath string) {
 // maxAttemptsPerRetry; package tests run sequentially and reset them.
 var (
 	// stagingWriteBytes counts all payload bytes written into staging files
-	// by the ranged downloader: the network transfer landing on disk plus any
-	// one-time legacy migration copy. It is not "extra" local I/O; compare it
-	// with the file size to derive the transfer factor.
+	// by the ranged downloader: the network transfer landing on disk. It is
+	// not "extra" local I/O; compare it with the file size to derive the
+	// transfer factor.
 	stagingWriteBytes atomic.Int64
 	// hashPassCount counts full-file SHA-256 passes over downloaded
 	// payloads and hashPassBytes the bytes they read. Strict Verify=sha256
 	// must perform at most one such pass per file on the normal path;
-	// Verify=size performs none there (the one-time legacy migration content
-	// proof is the documented exception).
+	// Verify=size performs none there (the unpinned-identity and durable
+	// ProofPending gates are the documented exceptions).
 	hashPassCount atomic.Int64
 	hashPassBytes atomic.Int64
 	// finalizationNanos is the wall time of the most recent successful
@@ -367,9 +361,6 @@ type stagingClaimState struct {
 	// fresh reports that no versioned range state existed, so the staging payload
 	// holds no validated bytes.
 	fresh bool
-	// legacyMigrated reports that the record's bytes originated in a pre-#140
-	// partial and therefore still need the one-time content proof (T2).
-	legacyMigrated bool
 	// proofPending reports that the record still carries the durable
 	// known-digest proof gate; the run must prove before publication regardless
 	// of the current mode (except Verify="none").
@@ -430,7 +421,6 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 	// when the current mode/item still needs the proof). The claim write is
 	// therefore durable before any transfer or proof starts.
 	proofMode := it.SHA256 != "" && (cfg.Verify == "sha256" || cfg.Verify == "etag")
-	proofForKnownDigest := it.SHA256 != "" && cfg.Verify != "none"
 
 	// One idempotent wait signal for the WHOLE claim: once the slot has been
 	// returned it stays returned across retry rounds, and the final success or
@@ -571,7 +561,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		// finalizer needs the exact claim it must slot-gate or release.
 		var retry bool
 		var cerr error
-		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode, proofForKnownDigest)
+		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode)
 		lock.release()
 		if cerr != nil {
 			release()
@@ -594,7 +584,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 // lock. retry=true asks the caller to re-evaluate after discarding unusable
 // state or after losing an exclusive create to an older writer that does not
 // participate in the lock.
-func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, osExclusive, proofMode, proofForKnownDigest bool) (*stagingClaimState, bool, error) {
+func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, osExclusive, proofMode bool) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit, commitPinned)
@@ -632,8 +622,8 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
-	// A LockFenced record belongs to the current lifetime-lock protocol. A
-	// legacy/unfenced record is not proven dead by a free new lock.
+	// A LockFenced record belongs to the current lifetime-lock protocol. An
+	// unfenced record is not proven dead by a free new lock.
 	//
 	// Such a record is UNPROVEN, not proven-live: the recorded identity is
 	// not a fence, so neither "a live writer owns it" nor "its owner is
@@ -651,6 +641,20 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// rules (never guess at unknown resume state). The metadata gate is
 	// held, so the record is still the one evaluated above: a racer cannot
 	// have replaced it, and removing it cannot displace a live claim.
+	//
+	// Only the CURRENT record version is resumable. A record from any other
+	// format - including a branch-only version-3 record whose legacy_migrated
+	// flag described bytes imported from a pre-#140 partial - is obsolete
+	// state: it is discarded here, under the lifetime ownership lock and the
+	// metadata gate, and the transfer starts from zero. The version is never
+	// silently ignored.
+	if meta.Version != stagingMetaVersion {
+		downloadLog.Warn("discarding a staging record from an unsupported format; re-downloading from zero",
+			"staging", staging,
+			"record_version", meta.Version,
+			"current_version", stagingMetaVersion,
+		)
+	}
 	ranges, resumable := stagingMetaResumable(meta, it, job, commit, commitPinned)
 	if !resumable || !stagingPayloadSizeOK(staging, it.Size) {
 		removeStagingArtifactsLocked(staging, metaPath)
@@ -662,10 +666,8 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	take := newClaimMeta(it, job, commit, commitPinned)
 	take.StartedAt = meta.StartedAt
 	take.Ranges = ranges
-	take.LegacyMigrated = meta.LegacyMigrated
-	// Preserve the durable gate, add it for the current known-digest mode or
-	// for an older record whose legacy-migrated bytes still need the proof.
-	take.ProofPending = meta.ProofPending || proofMode || (meta.LegacyMigrated && proofForKnownDigest)
+	// Preserve the durable gate or add it for the current known-digest mode.
+	take.ProofPending = meta.ProofPending || proofMode
 	// Record the ownership mode of THIS claim, not the predecessor's: the
 	// current process holds the required OS lifetime lock.
 	take.LockFenced = osExclusive
@@ -860,10 +862,9 @@ func stagingHardLinkUnsupported(err error) bool {
 
 func stagingClaimStateFromMeta(meta IncompleteMeta) *stagingClaimState {
 	return &stagingClaimState{
-		ranges:         meta.Ranges,
-		fresh:          meta.Ranges == nil,
-		legacyMigrated: meta.LegacyMigrated,
-		proofPending:   meta.ProofPending,
+		ranges:       meta.Ranges,
+		fresh:        meta.Ranges == nil,
+		proofPending: meta.ProofPending,
 	}
 }
 
@@ -884,8 +885,8 @@ func claimRecordOurs(metaPath string) bool {
 
 // newClaimMeta builds the claim record for it/job: our PID and instance
 // token, the expected logical size, and the resolved remote identity. Ranges
-// are filled in by the caller once determined (fresh layout or legacy
-// migration) and persisted with writeStagingMeta.
+// are filled in by the caller once determined (fresh layout) and persisted
+// with writeStagingMeta.
 //
 // The identity records whether the commit was actually RESOLVED
 // (commitPinned): a record written under an unpinned identity names a
@@ -962,20 +963,22 @@ func checkStagingPayloadSize(staging string, size int64) error {
 
 // stagingMetaResumable validates a staging record against the exact remote
 // object and returns its normalized range layout. It is resumable only when
-// version 2 or the current version, repo, path, size and resolved commit match,
-// the identity is PINNED on both sides (the record's own flag and the current
-// plan's), the blob SHA is
+// its version is the current one (stagingMetaVersion), repo, path, size and
+// resolved commit match, the identity is PINNED on both sides (the record's own
+// flag and the current plan's), the blob SHA is
 // present on both sides or neither (and equal when present), and every range
-// carries a conservative completion marker. Version 2 completion is migrated
-// by reserving its final byte for clean-framing revalidation.
+// carries a conservative completion marker.
 //
 // The pinned rule is the SAME one the single-request path applies (see
 // resumeIdentityPinned): a record written under an unpinned identity names a
 // revision whose content may have moved, so its bytes are never inherited,
 // however well the repository, commit string, path and size match. A record
 // written without the pinned flag is unpinned and therefore not inheritable.
+//
+// A record from any other version is not understood and is never resumed: old
+// or unsupported formats are discarded and the file is re-downloaded.
 func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool) {
-	if (meta.Version != stagingMetaVersion && meta.Version != priorStagingMetaVersion) || meta.Size != it.Size || meta.Size <= 0 {
+	if meta.Version != stagingMetaVersion || meta.Size != it.Size || meta.Size <= 0 {
 		return nil, false
 	}
 	if meta.Repo != job.Repo || meta.Path != it.RelativePath || meta.Commit != commit {
@@ -1000,18 +1003,6 @@ func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit stri
 	ranges, ok := normalizedRangeLayout(meta.Ranges, meta.Size)
 	if !ok {
 		return nil, false
-	}
-	if meta.Version == priorStagingMetaVersion {
-		// Version 2 could mark a range Done after every requested byte was
-		// written even when response framing/EOF failed. Preserve its validated
-		// prefix, but re-fetch each range's final byte before trusting completion.
-		for i := range ranges {
-			if ranges[i].Done {
-				length := ranges[i].End - ranges[i].Start + 1
-				ranges[i].Committed = length - 1
-				ranges[i].Done = false
-			}
-		}
 	}
 	return ranges, true
 }
@@ -1191,8 +1182,9 @@ func writeStagingMetaFile(metaPath string, meta *IncompleteMeta) error {
 	return nil
 }
 
-// buildRangeLayout partitions [0, size) into n contiguous ranges, matching
-// the layout the legacy .parts.json resume used so a migration maps 1:1.
+// buildRangeLayout partitions [0, size) into n contiguous ranges. The layout
+// is persisted as the authoritative work contract, so a later run with a
+// different worker count re-fetches only the missing bytes.
 func buildRangeLayout(size int64, n int) []RangeProgress {
 	if size <= 0 {
 		return nil
@@ -1213,158 +1205,6 @@ func buildRangeLayout(size int64, n int) []RangeProgress {
 	return ranges
 }
 
-// migrateLegacyMultipart converts usable pre-#140 legacy state for dst into
-// range progress over the already-open (and freshly truncated) staging file.
-//
-// Two legacy shapes are recognized, in priority order:
-//
-//  1. a valid .part-NN + .parts.json layout (the pre-#140 multipart state),
-//     copied range-by-range; this wins whenever the family/layout exists;
-//  2. a single dst.part sequential prefix (an interrupted single download or
-//     an interrupted old assembly), copied as a committed prefix and tiled
-//     across the first ranges at the configured worker count.
-//
-// The single dst.part shape has TWO owners. A `.part` WITHOUT a sidecar is the
-// historical pre-#140 shape: the old downloader wrote no identity record, so
-// its bytes are a genuine legacy prefix. A `.part` WITH a sidecar is the
-// CURRENT-VERSION single-request staging name, and its bytes belong to the
-// object recorded in the sidecar - which is not necessarily the current item,
-// because the staging name is reused across revisions and (for a digest-less
-// item) across different paths. Such a prefix is imported only when the
-// recorded identity is inheritable by the current plan (repo, commit, path,
-// size and PINNED on both sides); otherwise nothing is imported, the `.part`
-// and its sidecar are preserved, and the caller starts fresh. Without that
-// check, a migrated old prefix plus the new object's suffix is a silent
-// content mixture that a digest-less item cannot content-prove.
-//
-// If a valid .part-NN layout exists, dst.part is obsolete and is removed with
-// the other legacy artifacts by the caller after the migrated state is
-// durable (only for the legacy shape: a sidecar-bearing .part that did not
-// match is preserved by this decision - a later successful publish of the
-// destination treats it as obsolete and removes it). A layout whose every part
-// is missing, empty, oversized or reduced to nothing by the reserved final
-// byte contributes no bytes and is not usable: its family is discarded,
-// then dst.part is migrated if present. If no usable multipart state exists,
-// unvalidatable .part-NN files are discarded first (their byte-range contract
-// is unknown), then dst.part is migrated if present. No usable legacy state
-// returns errNoLegacyState. LegacyMigrated is reported only when actual legacy
-// bytes were copied.
-//
-// Every migrated byte range is a PREFIX: a `.part-NN` part contributes
-// committed-1 bytes and a fully-sized single `.part` is imported whole only
-// when a matching, pinned sidecar records clean framing (otherwise its final
-// byte is reserved). None of these bytes is ever treated as completion proof,
-// so a torn final byte is always re-requested with clean framing before the
-// migrated layout can publish.
-//
-// The copy is context-bounded (contextReader checks ctx before every chunk),
-// so an explicit cancel during a long migration stops promptly instead of
-// waiting for a multi-gigabyte local copy.
-//
-// On success the legacy artifacts are deliberately NOT removed yet: the
-// staging record does not describe the migrated bytes until the caller
-// persists the returned layout, and removing the parts before that flush
-// would leave the staging payload as the only copy of a valid partial under a
-// record with no range layout — unvalidatable state the next run must discard.
-// The caller removes the obsolete artifacts only after the migrated layout is
-// durably persisted (issue #140, criterion 11: a valid legacy partial must
-// survive the upgrade until its replacement is durable). The caller also
-// records LegacyMigrated so the imported bytes are content-proven before
-// publication when the item has a known SHA-256.
-func migrateLegacyMultipart(ctx context.Context, dst string, out *os.File, size int64, workers int, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool, error) {
-	data, err := os.ReadFile(multipartLayoutMetaPath(dst))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		// A real I/O failure must not silently discard legacy data.
-		return nil, false, err
-	}
-	if err == nil {
-		ranges, ok, merr := migrateLegacyParts(ctx, dst, out, size, data)
-		if merr != nil {
-			return nil, false, merr
-		}
-		if ok {
-			return ranges, true, nil
-		}
-	}
-	// No usable .part-NN/.parts.json layout. Any part files present have an
-	// unknown byte-range contract and must not be reused; dst.part is a
-	// sequential prefix and remains migratable below.
-	_ = removeMultipartResumeFiles(dst)
-	return migrateLegacySinglePart(ctx, dst, out, size, workers, it, job, commit, commitPinned)
-}
-
-// validateLegacyPartsLayout parses a legacy .parts.json record and checks that
-// it tiles [0, size) exactly with contiguous, indexed ranges. It is shared by
-// the one-time migration and by the pre-routing resume-state detection so both
-// accept exactly the same layouts.
-func validateLegacyPartsLayout(data []byte, size int64) ([]multipartPartRange, bool) {
-	var layout multipartResumeLayout
-	if err := json.Unmarshal(data, &layout); err != nil {
-		return nil, false
-	}
-	if layout.Size != size || len(layout.Parts) == 0 {
-		return nil, false
-	}
-	var off int64
-	for i, p := range layout.Parts {
-		if p.Index != i || p.Start != off || p.End < p.Start || p.End >= size {
-			return nil, false
-		}
-		off = p.End + 1
-	}
-	if off != size {
-		return nil, false
-	}
-	return layout.Parts, true
-}
-
-// multipartResumeState describes usable pre-existing multipart state detected
-// before an item is routed to the single-request path.
-type multipartResumeState struct {
-	// legacy reports a valid pre-#140 .part-NN/.parts.json layout with at
-	// least one part contributing usable bytes.
-	legacy bool
-	// versionedStaging is the staging payload path of a valid,
-	// identity-matching versioned staging pair, or empty when no such pair
-	// exists.
-	versionedStaging string
-}
-
-// hasUsableLegacyMultipartState reports whether dst has a valid pre-#140
-// .part-NN/.parts.json layout with at least one part that can contribute usable
-// bytes. It is used before routing an item to the single-request path: routing
-// a ranged-capable item with valid legacy state to a full single GET would
-// ignore the partial and (after success) delete it, violating the upgrade
-// contract. A layout whose every part is missing/empty/oversized is not
-// "usable" and is left to the normal migration/discard path. Detection is a
-// routing hint, not a migrated-bytes count: the migration reserves each
-// contributing part's final byte, so a part holding a single byte routes here
-// and then contributes nothing (the family is discarded by that same path).
-func hasUsableLegacyMultipartState(dst string, size int64) bool {
-	if size <= 0 {
-		return false
-	}
-	data, err := os.ReadFile(multipartLayoutMetaPath(dst))
-	if err != nil {
-		return false
-	}
-	parts, ok := validateLegacyPartsLayout(data, size)
-	if !ok {
-		return false
-	}
-	for i, p := range parts {
-		fi, err := os.Stat(fmt.Sprintf("%s.part-%02d", dst, i))
-		if err != nil {
-			continue
-		}
-		want := p.End - p.Start + 1
-		if fi.Size() > 0 && fi.Size() <= want {
-			return true
-		}
-	}
-	return false
-}
-
 // hasResumableStagingState reports whether a versioned staging pair carries a valid,
 // identity-matching range layout and a payload at the expected logical size.
 // Ownership/liveness is deliberately not part of this check: the multipart
@@ -1383,222 +1223,6 @@ func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, co
 		return false
 	}
 	return stagingPayloadSizeOK(staging, it.Size)
-}
-
-// migrateLegacyParts validates a .parts.json layout and copies each part's
-// valid prefix into the staging file. ok=false means the layout is absent,
-// unvalidatable, or contributes no bytes at all (every part missing, empty,
-// oversized, or contributing only its single reserved byte); the caller then
-// discards the part family and tries the single-part path. A layout that
-// contributes nothing must not be reported as a usable migrated state, because
-// the caller would delete a valid dst.part on the strength of an empty
-// migration.
-//
-// A part's byte count is never completion proof: the legacy layout records
-// ranges, not response framing, so every contributing part is imported as a
-// PREFIX with its final byte reserved and its range left not-Done. A worker
-// then re-requests that byte (and the rest of a short part's range) and the
-// range becomes Done only on clean framing. This is the same rule the
-// single-request path applies to an exactly-sized `.part`, and it is what
-// stops a torn last byte of a "complete" legacy part from being published with
-// zero GETs when the item has no known digest and Verify is "size".
-func migrateLegacyParts(ctx context.Context, dst string, out *os.File, size int64, data []byte) ([]RangeProgress, bool, error) {
-	parts, ok := validateLegacyPartsLayout(data, size)
-	if !ok {
-		return nil, false, nil
-	}
-	ranges := make([]RangeProgress, len(parts))
-	for i, p := range parts {
-		ranges[i] = RangeProgress{Start: p.Start, End: p.End}
-	}
-
-	copiedAny := false
-	for i := range ranges {
-		partPath := fmt.Sprintf("%s.part-%02d", dst, i)
-		fi, err := os.Stat(partPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue // missing part: nothing committed for this range
-			}
-			return nil, false, err
-		}
-		want := ranges[i].End - ranges[i].Start + 1
-		committed := fi.Size()
-		if committed == 0 || committed > want {
-			// Empty or oversize (stale/corrupt) part: its bytes are not
-			// valid.
-			continue
-		}
-		// A part's byte count is not completion proof either. The legacy
-		// `.parts.json` layout records byte ranges, never clean response
-		// framing, so a part that reaches its last byte may still hold a torn
-		// one (the response can end badly after the final WriteAt). Reserve
-		// that byte for EVERY contributing part: the range is imported as a
-		// prefix only, is never marked Done, and a worker re-requests the
-		// final byte (and, for a short part, the rest of the range). A part
-		// that contributes nothing after the reserve is skipped, exactly like
-		// an empty one.
-		committed--
-		if committed == 0 {
-			continue
-		}
-		in, err := os.Open(partPath)
-		if err != nil {
-			return nil, false, err
-		}
-		_, cerr := io.CopyN(newBoundedAtWriter(out, ranges[i].Start, committed), contextReader{ctx: ctx, r: in}, committed)
-		in.Close()
-		if cerr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, false, ctxErr
-			}
-			return nil, false, cerr
-		}
-		ranges[i].Committed = committed
-		// Never Done: the reserved final byte has no clean-framing proof.
-		ranges[i].Done = false
-		copiedAny = true
-	}
-	if !copiedAny {
-		// The layout exists but no part contributed usable bytes: this is not
-		// migrated state. The caller removes the unusable family and falls
-		// back to dst.part instead of trusting a layout with zero committed
-		// bytes (which would set LegacyMigrated without importing anything).
-		return nil, false, nil
-	}
-	return ranges, true, nil
-}
-
-// migrateLegacySinglePart migrates a leftover sequential dst.part prefix. The
-// file must be no larger than the expected size: the old single downloader
-// truncated at the expected size and never wrote past it, so an oversized
-// .part is stale/corrupt and is discarded rather than clamped to a prefix that
-// nobody can vouch for ("discard stale/mismatched part files rather than
-// guessing"). The prefix is tiled across the first ranges of the fresh worker
-// layout, so the caller can persist one normal versioned record and resume with any
-// future concurrency.
-//
-// A sidecar-bearing .part is not legacy state: it is the current-version
-// single-request staging name and its sidecar names the object the bytes
-// belong to. The prefix is imported ONLY when that identity is inheritable by
-// the current plan - same repo, resolved commit, path and size, PINNED on both
-// sides. A mismatch (including an unpinned identity) or an unreadable sidecar
-// imports nothing and returns errNoLegacyState, leaving the .part and its
-// sidecar in place for the route that can use them. Only a .part WITHOUT a
-// sidecar keeps the historical pre-#140 prefix migration - and even that is a
-// PREFIX, never completion proof: without a sidecar nothing records clean
-// response framing, so a fully-sized sidecarless .part has its final byte
-// reserved exactly like a sidecar that lacks the framing proof.
-func migrateLegacySinglePart(ctx context.Context, dst string, out *os.File, size int64, workers int, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool, error) {
-	partPath := dst + ".part"
-	fi, err := os.Stat(partPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, errNoLegacyState
-		}
-		return nil, false, err
-	}
-	recorded, ierr := readSinglePartIdentity(singlePartIdentityPath(dst))
-	if ierr != nil {
-		// The record exists but cannot be read or understood: whether these
-		// bytes belong to the current object can be proven neither way, so
-		// they are not imported. The record and the partial are preserved:
-		// discarding them is the single-request route's decision, made only
-		// when it can establish that the bytes are unusable.
-		downloadLog.Warn("refusing to migrate single-path partial with an unreadable identity record",
-			"repo", job.Repo,
-			"path", it.RelativePath,
-			"partial", partPath,
-			"error", ierr,
-		)
-		return nil, false, errNoLegacyState
-	}
-	if recorded != nil {
-		current := singleIdentityFor(job, it, singleOpts{Commit: commit, CommitPinned: commitPinned})
-		if !recorded.inheritableBy(current) {
-			// The .part is the current-version single-request staging name of
-			// another object or another revision. Importing its prefix and
-			// fetching the current object's suffix would publish a mixture,
-			// which a digest-less item cannot content-prove. Start fresh and
-			// keep the partial (and its record) for its own route.
-			downloadLog.Warn("refusing to migrate single-path partial staged for another identity",
-				"repo", job.Repo,
-				"path", it.RelativePath,
-				"partial", partPath,
-				"recorded_commit", recorded.Commit,
-				"current_commit", current.Commit,
-				"recorded_pinned", recorded.Pinned,
-				"current_pinned", current.Pinned,
-			)
-			return nil, false, errNoLegacyState
-		}
-	}
-	committed := fi.Size()
-	if committed <= 0 {
-		// An empty partial has no bytes worth preserving. Its identity record,
-		// if any, must not outlive it.
-		_ = removeLegacySinglePart(dst)
-		return nil, false, errNoLegacyState
-	}
-	if committed > size {
-		// Oversized: not a prefix this destination can ever finish.
-		_ = removeLegacySinglePart(dst)
-		return nil, false, errNoLegacyState
-	}
-	// Written byte count alone is NOT completion proof. A fully-sized `.part`
-	// is imported as a completed layout only when a matching, pinned sidecar
-	// records a cleanly framed body at the exact expected size; otherwise the
-	// final byte may be torn (a process can exit after the last WriteAt and
-	// before the response body ends), so it is reserved and a ranged worker
-	// re-requests [size-1, size) with clean framing. A SIDECARLESS pre-#140
-	// `.part` has no framing proof at all, so the reserve applies to it too:
-	// importing it whole would mark every range Done and publish a torn final
-	// byte with zero GETs, which nothing catches in Verify=size mode for an
-	// item without a known digest (LegacyMigrated needs no content proof
-	// there). A shorter prefix needs no reserve - every one of its bytes was
-	// written by a completed WriteAt - so it keeps its exact length.
-	if committed == size && !(recorded != nil && recorded.FramingComplete) {
-		committed--
-		if committed <= 0 {
-			// There is no usable prefix to import; keep the partial for the
-			// single-request route instead of reporting a zero-byte
-			// migration.
-			return nil, false, errNoLegacyState
-		}
-	}
-	ranges := buildRangeLayout(size, workers)
-	if len(ranges) == 0 {
-		return nil, false, errNoLegacyState
-	}
-	remaining := committed
-	for i := range ranges {
-		want := ranges[i].End - ranges[i].Start + 1
-		switch {
-		case remaining >= want:
-			ranges[i].Committed = want
-			ranges[i].Done = true
-			remaining -= want
-		case remaining > 0:
-			ranges[i].Committed = remaining
-			remaining = 0
-		}
-		if remaining == 0 {
-			break
-		}
-	}
-
-	in, err := os.Open(partPath)
-	if err != nil {
-		return nil, false, err
-	}
-	defer in.Close()
-	if _, cerr := io.CopyN(newBoundedAtWriter(out, 0, committed), contextReader{ctx: ctx, r: in}, committed); cerr != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, false, ctxErr
-		}
-		return nil, false, cerr
-	}
-	return ranges, true, nil
 }
 
 // parseContentRange parses a Content-Range header value strictly. Accepted
@@ -1774,15 +1398,9 @@ type stagingDownload struct {
 	domain *blobDomain
 
 	// partCtx is the part-scoped cancellable context, stored so every
-	// post-claim phase (migration, transfer, hash, publish) can apply the same
+	// post-claim phase (transfer, hash, publish) can apply the same
 	// cancel-cleanup semantics.
 	partCtx context.Context
-
-	// legacyMigrated marks bytes imported from a pre-#140 partial. They have
-	// layout/prefix structure but no validated provenance, so one full-file
-	// content proof is required before publication when a digest is known.
-	// The flag is persisted in the record so a crash/resume cannot skip it.
-	legacyMigrated bool
 
 	// proofPending is the durable known-digest publication gate. It is set
 	// before any pre-publication proof starts and cleared only after the proof
@@ -1852,12 +1470,11 @@ func (d *stagingDownload) flushMeta() error {
 // and must still name this process instance before it is replaced: a flush or
 // heartbeat can never race a take-over, overwrite the new owner's claim, or
 // resurrect ownership this process has lost. A nil range layout (the window
-// between claim creation and the initial migration/flush) writes an
+// between claim creation and the initial layout flush) writes an
 // ownership-only record that claims no bytes.
 func (d *stagingDownload) flushMetaLocked() error {
 	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
-	meta.LegacyMigrated = d.legacyMigrated
 	meta.ProofPending = d.proofPending
 	meta.LockFenced = d.osExclusive
 	if d.ranges != nil {
@@ -1880,12 +1497,11 @@ func (d *stagingDownload) flushMetaLocked() error {
 
 // startHeartbeat runs the single claim heartbeat for this download. It begins
 // immediately after the claim is opened and covers every post-claim phase —
-// the one-time legacy migration copy, transfers, retry waits, strict
-// verification and finalization — so even a multi-gigabyte local migration
-// cannot let the claim go stale. It is stopped before any removal of the meta
-// record (including the publish path). A heartbeat write failure is recorded
-// and cancels the part context: staying active under a stale record (or after
-// a take-over) would invite a second writer to write the same staging file.
+// transfers, retry waits, strict verification and finalization. It is stopped
+// before any removal of the meta record (including the publish path). A
+// heartbeat write failure is recorded and cancels the part context: staying
+// active under a stale record (or after a take-over) would invite a second
+// writer to write the same staging file.
 func (d *stagingDownload) startHeartbeat(interval time.Duration, cancel context.CancelCauseFunc) {
 	if interval <= 0 {
 		return
@@ -1975,8 +1591,6 @@ func (d *stagingDownload) closeOut() error {
 // and record state require the known-digest proof before publication:
 //
 //   - Verify=sha256 or Verify=etag with a known digest (fresh or resumed);
-//   - Verify=size (or any other non-"none" value) with legacy-migrated bytes,
-//     which have no validated provenance (the migration exception);
 //   - any non-"none" mode whose record still carries ProofPending, so a crash
 //     mid-proof, a failed mismatch cleanup, or a later mode change cannot
 //     launder unproven all-Done ranges into a published blob;
@@ -2002,7 +1616,7 @@ func (d *stagingDownload) requiresPrePublicationProof() bool {
 		// rule still applies to a PINNED identity.
 		return true
 	}
-	return d.cfg.Verify == "sha256" || d.cfg.Verify == "etag" || d.legacyMigrated || d.proofPending
+	return d.cfg.Verify == "sha256" || d.cfg.Verify == "etag" || d.proofPending
 }
 
 // poisonStagingLocked truncates the staging payload to zero so a later claim
@@ -2086,7 +1700,12 @@ func (d *stagingDownload) applyCancelCleanup() {
 	if !claimRecordOwnedLocked(d.meta) {
 		return
 	}
-	cleanupLegacyPartials(d.dst)
+	// Only the obsolete pre-#140 multipart family is discarded here. The
+	// single-route <dst>.part and its sidecar are NOT this route's artifacts:
+	// the multipart route creates no .part, so that route owns their cleanup.
+	if err := removeMultipartResumeFiles(d.dst); err != nil {
+		downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", d.dst, "error", err)
+	}
 	removeStagingArtifactsLocked(d.stg, d.meta)
 }
 
@@ -2160,10 +1779,9 @@ type rangeTask struct {
 // cache mode (the staging file is the future blob, so finalization is
 // rename-only), dst-adjacent staging otherwise. The returned bool reports
 // whether a content proof against it.SHA256 already completed inside this
-// call before the publish rename (hash-on-write, the single pre-publish
-// pass, or the one-time legacy-migration proof), so the caller must not
-// repeat it. A known digest is proven pre-publication in both Verify=sha256
-// and Verify=etag modes.
+// call before the publish rename (hash-on-write or the single pre-publish
+// pass), so the caller must not repeat it. A known digest is proven
+// pre-publication in both Verify=sha256 and Verify=etag modes.
 //
 // Reliability invariants preserved from the previous implementation:
 // stall watchdog + resume from the durable current offset, bounded retry
@@ -2325,7 +1943,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		commit:           opts.Commit,
 		commitPinned:     opts.CommitPinned,
 		startedAt:        time.Now().UTC(),
-		legacyMigrated:   state.legacyMigrated,
 		proofPending:     state.proofPending,
 		own:              state.own,
 		osExclusive:      state.osExclusive,
@@ -2339,7 +1956,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// cancel cause is an abortCause wrapping the original error (see
 	// abortError), which lets a sibling worker that exits via its ctx path
 	// distinguish an internal abort from a user cancel/pause. Every post-claim
-	// phase (migration, transfer, strict hash, publish) uses this same context.
+	// phase (transfer, strict hash, publish) uses this same context.
 	partCtx, partCancel := context.WithCancelCause(ctx)
 	defer partCancel(nil)
 	d.partCtx = partCtx
@@ -2364,7 +1981,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			state.ranges = nil
 			d.metaMu.Lock()
 			d.ranges = nil
-			d.legacyMigrated = false
 			d.metaMu.Unlock()
 		}
 	}
@@ -2384,7 +2000,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			state.ranges = nil
 			d.metaMu.Lock()
 			d.ranges = nil
-			d.legacyMigrated = false
 			d.metaMu.Unlock()
 		}
 	}
@@ -2400,68 +2015,50 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		// which would discard resumable committed ranges on the next claim.
 		d.metaMu.Lock()
 		d.ranges = append([]RangeProgress(nil), state.ranges...)
-		d.legacyMigrated = state.legacyMigrated
 		d.startedAt = time.Now().UTC() // resumed run keeps its own clock
 		d.metaMu.Unlock()
 	}
 
-	// One heartbeat for every post-claim phase: the one-time legacy migration
-	// copy, transfers, retry/Retry-After waits, the strict SHA pass, and
-	// finalization. It shares metaMu with range flushes (so the temp+rename
-	// record write stays atomic) and the metadata gate with every other
-	// record mutation. It is started BEFORE the migration so a long local copy
-	// cannot let the claim go stale. Stops before any meta removal.
+	// One heartbeat for every post-claim phase: transfers, retry/Retry-After
+	// waits, the strict SHA pass, and finalization. It shares metaMu with range
+	// flushes (so the temp+rename record write stays atomic) and the metadata
+	// gate with every other record mutation. Stops before any meta removal.
 	d.startHeartbeat(stagingHeartbeatEvery, partCancel)
 	defer d.stopHeartbeat()
 
-	// Determine the authoritative range layout. The copy is context-bounded:
-	// an explicit cancel during a multi-gigabyte legacy migration returns
-	// promptly instead of after the whole local copy.
-	legacyCleanup := false
+	// Determine the authoritative range layout. A fresh claim starts from
+	// zero: partial downloads from old or unsupported formats are discarded,
+	// never migrated, and only a current-format record can resume. An obsolete
+	// pre-#140 .part-NN/.parts.json family next to this destination is
+	// discarded here, while the claim owns the staging and its domain; the
+	// transfer itself ignores it. The single-route <dst>.part and its sidecar
+	// are NOT touched: they belong to the single-request route (this route
+	// creates no .part), so only that route discards them.
 	if state.fresh {
-		// No valid versioned staging state: legacy .part-NN/.parts.json state or a single
-		// .part sequential prefix may hold validated bytes; migrate once.
-		ranges, migrated, merr := migrateLegacyMultipart(partCtx, dst, out, it.Size, cfg.Concurrency,
-			it, job, opts.Commit, opts.CommitPinned)
-		switch {
-		case merr == nil:
-			d.metaMu.Lock()
-			d.ranges = ranges
-			// Migrated bytes have layout/prefix structure but no validated
-			// provenance: persist the flag so the content proof below still
-			// runs after a crash/resume. Set it in the same critical section
-			// that publishes the ranges, so a heartbeat tick can never flush
-			// all-Done migrated ranges without the durable gate.
-			d.legacyMigrated = migrated
-			if migrated && it.SHA256 != "" && cfg.Verify != "none" {
-				d.proofPending = true
-			}
-			d.metaMu.Unlock()
-			// The migrated layout replaces the legacy artifacts as the
-			// resume authority — but only once it is durable. Until the
-			// flush below succeeds, the legacy bytes remain the only
-			// finishable copy of the partial (criterion 11).
-			legacyCleanup = migrated
-		case errors.Is(merr, errNoLegacyState):
-			d.metaMu.Lock()
-			d.ranges = buildRangeLayout(it.Size, cfg.Concurrency)
-			d.metaMu.Unlock()
-		default:
-			// A real I/O failure must not silently discard legacy data; a
-			// user cancel runs the shared cancel-cleanup policy.
-			d.applyCancelCleanup()
-			if cerr := partCtx.Err(); cerr != nil {
-				if herr := d.heartbeatError(); herr != nil {
-					return false, herr
-				}
-				return false, cerr
-			}
-			return false, merr
+		d.metaMu.Lock()
+		d.ranges = buildRangeLayout(it.Size, cfg.Concurrency)
+		d.metaMu.Unlock()
+
+		var obsolete []string
+		if files, ferr := multipartPartFiles(dst); ferr == nil {
+			obsolete = files
+		}
+		if _, lerr := os.Stat(multipartLayoutMetaPath(dst)); lerr == nil {
+			obsolete = append(obsolete, multipartLayoutMetaPath(dst))
+		}
+		if len(obsolete) > 0 {
+			downloadLog.Warn("discarding obsolete multipart artifacts from an older format; re-downloading from zero",
+				"path", dst,
+				"artifacts", len(obsolete),
+			)
+		}
+		if err := removeMultipartResumeFiles(dst); err != nil {
+			// The obsolete family is ignored resume state, not a reason to
+			// fail the transfer; it is left for the existing success/cleanup
+			// path.
+			downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", dst, "error", err)
 		}
 	}
-	// The legacy migration may have discovered migrated bytes that were not
-	// visible at claim time. If they now require the proof, set the flag so the
-	// layout flush below persists it before any transfer.
 	d.metaMu.Lock()
 	if d.requiresPrePublicationProof() {
 		d.proofPending = true
@@ -2488,20 +2085,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			return false, cerr
 		}
 		return false, err
-	}
-	if legacyCleanup {
-		// The migrated range layout is now durable in the staging record,
-		// so the legacy artifacts are obsolete and can be removed. A
-		// single dst.part loses to a valid .part-NN/layout or was itself the
-		// migrated prefix; either way it is removed only after the flush.
-		// A removal failure is surfaced (not hidden) and leaves the
-		// artifacts for a later retry.
-		if err := removeMultipartResumeFiles(dst); err != nil {
-			return false, err
-		}
-		if err := removeLegacySinglePart(dst); err != nil {
-			return false, err
-		}
 	}
 
 	// Missing work: the uncommitted suffix of every incomplete range. The
@@ -2728,11 +2311,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// Content proof before publication.
 	//
 	// The durable ProofPending flag was already set and flushed before the
-	// transfer (and again after a legacy migration); it forces the proof here
-	// regardless of the current mode, including size, whenever the item has a
-	// known digest and Verify is not "none". This is why a crash mid-proof, a
-	// mismatch whose cleanup failed, or a later
-	// mode change cannot publish an all-Done but unproven record.
+	// transfer; it forces the proof here regardless of the current mode,
+	// including size, whenever the item has a known digest and Verify is not
+	// "none". This is why a crash mid-proof, a mismatch whose cleanup failed,
+	// or a later mode change cannot publish an all-Done but unproven record.
 	//
 	//   - Verify=sha256 or Verify=etag with a known digest: at most one full
 	//     read, always before the rename/publish. With parallel direct writes
@@ -2741,11 +2323,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	//     every other case performs exactly one sequential pass here. This is
 	//     why a known-digest mismatch can never reach the final destination or
 	//     the content-addressed blob key: publication follows this gate.
-	//   - Legacy-migrated bytes: layout/prefix structure only, no validated
-	//     provenance. When the item carries a digest and Verify is not "none",
-	//     force one full-file pass even in size mode (the documented one-time
-	//     migration exception). The flag is persisted in the record, so a
-	//     crash/resume repeats the proof before publication.
 	//
 	// No known digest means only the size/coverage contract applies here; a
 	// non-LFS ETag fallback HEAD is a separate, historical post-publication
@@ -2810,10 +2387,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					it.RelativePath)
 			}
 			if err := removeMultipartResumeFiles(dst); err != nil {
-				log.Printf("warning: cleanup legacy multipart artifacts for %s after a known-digest mismatch: %v", dst, err)
-			}
-			if err := removeLegacySinglePart(dst); err != nil {
-				log.Printf("warning: cleanup legacy single-part artifact for %s after a known-digest mismatch: %v", dst, err)
+				log.Printf("warning: cleanup obsolete multipart artifacts for %s after a known-digest mismatch: %v", dst, err)
 			}
 			return false, fmt.Errorf("sha256 verify failed: %s: expected %s got %s", it.RelativePath, it.SHA256, sum)
 		}
@@ -2834,7 +2408,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 }
 
 // publish atomically renames the staging file onto the destination and
-// removes the resume metadata, then removes any obsolete legacy part
+// removes the resume metadata, then removes any obsolete pre-#140 multipart
 // artifacts for dst. The staging file and its publish target share a
 // directory, so the normal path is rename-only — no payload copy. The rename
 // replaces any pre-existing file at the target atomically: for a
@@ -2985,14 +2559,13 @@ func (d *stagingDownload) publish() error {
 	// claim first.
 	removeStagingArtifactsLocked(d.stg, d.meta)
 	// Obsolete artifacts from a pre-#140 version, if any linger next to
-	// dst, must not survive a successful finalization. Finalization has
-	// already succeeded, so a cleanup failure is logged and does not turn the
-	// published file into an error.
+	// dst, must not survive a successful finalization; they are ignored
+	// resume state, so a cleanup failure is logged and does not turn the
+	// published file into an error. The single-route <dst>.part and its
+	// sidecar are deliberately NOT removed: this route creates no .part, so
+	// only the single-request route discards its own partial.
 	if err := removeMultipartResumeFiles(d.dst); err != nil {
-		log.Printf("warning: cleanup legacy multipart artifacts for %s after publish: %v", d.dst, err)
-	}
-	if err := removeLegacySinglePart(d.dst); err != nil {
-		log.Printf("warning: cleanup legacy single-part artifact for %s after publish: %v", d.dst, err)
+		log.Printf("warning: cleanup obsolete multipart artifacts for %s after publish: %v", d.dst, err)
 	}
 	return nil
 }

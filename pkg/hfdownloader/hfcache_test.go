@@ -5,7 +5,6 @@ package hfdownloader
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -350,42 +349,6 @@ func TestRepoDir_WriteAndReadRef(t *testing.T) {
 			t.Errorf("ReadRef() = %q, want empty string", read)
 		}
 	})
-}
-
-func TestRepoDir_WriteIncompleteMeta(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
-	repo, _ := cache.Repo("owner/name", RepoTypeModel)
-	repo.EnsureDirs()
-
-	sha := "test123"
-	size := int64(1024)
-
-	if err := repo.WriteIncompleteMeta(sha, size); err != nil {
-		t.Fatalf("WriteIncompleteMeta error: %v", err)
-	}
-
-	// Read and verify metadata
-	metaPath := repo.IncompleteMetaPath(sha)
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		t.Fatalf("ReadFile error: %v", err)
-	}
-
-	var meta IncompleteMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
-		t.Fatalf("Unmarshal error: %v", err)
-	}
-
-	if meta.PID != os.Getpid() {
-		t.Errorf("PID = %d, want %d", meta.PID, os.Getpid())
-	}
-	if meta.Size != size {
-		t.Errorf("Size = %d, want %d", meta.Size, size)
-	}
-	if meta.SHA256 != sha {
-		t.Errorf("SHA256 = %q, want %q", meta.SHA256, sha)
-	}
 }
 
 func TestRepoDir_CleanupIncomplete(t *testing.T) {

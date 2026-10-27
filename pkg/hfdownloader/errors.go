@@ -65,7 +65,7 @@ var (
 
 	// ErrStagingOwnershipUnproven is returned when a staging record exists
 	// but its owner can be proven neither alive nor dead: the record was
-	// written without the lifetime OS ownership lock fence (a legacy/unfenced
+	// written without the lifetime OS ownership lock fence (an unfenced
 	// record), or it cannot be read or parsed at all.
 	//
 	// No live owner is proven, so this must NOT be reported as "being

@@ -1486,18 +1486,17 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-seed resumable bytes in a legacy part file together with a
-	// matching layout file, so the one-time upgrade migration carries them
-	// into the staging file as a committed range; they must then survive the
-	// fail-fast abort. Without matching metadata the pre-existing behavior
-	// discards stale parts before any network I/O, which would mask this
-	// check.
-	if err := os.WriteFile(dst+".part-01", bytes.Repeat([]byte("y"), 500), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(100_000, 2, 50_000)); err != nil {
-		t.Fatal(err)
-	}
+	// Seed CURRENT-FORMAT resumable bytes: a version-4 record whose second
+	// range holds a 499-byte committed prefix. The internal fail-fast abort
+	// must preserve that staging state. (Old-format .part-NN artifacts are
+	// not resume state and are covered separately.)
+	full := bytes.Repeat([]byte("p"), 100_000)
+	seedRangedState(t, dst+".incomplete", "o/r", "pa.bin", 100_000,
+		[]RangeProgress{
+			{Start: 0, End: 49_999},
+			{Start: 50_000, End: 99_999, Committed: 499},
+		}, full)
+	opts := multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}
 
 	it := PlanItem{RelativePath: "pa.bin", URL: srv.URL + "/pa.bin", Size: 100_000, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 5, BackoffInitial: "5ms", BackoffMax: "10ms", StallTimeout: "0"}
@@ -1507,7 +1506,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
 		done <- derr
 	}()
 
@@ -1521,10 +1520,8 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	}
 
 	// T3: the pre-existing resumable bytes must not have been deleted: the
-	// migration moved the 500-byte legacy part into the staging file at its
-	// range offset as a PREFIX (its final byte reserved, so 499 bytes are
-	// committed), and the internal abort must preserve both the staging file
-	// and its committed-range metadata.
+	// second range's 499 committed bytes survive the internal abort, and so do
+	// the staging file and its committed-range metadata.
 	staging := dst + ".incomplete"
 	if fi, err := os.Stat(staging); err != nil || fi.Size() != 100_000 {
 		t.Errorf("staging file was removed/modified by the internal abort (stat err=%v)", err)
@@ -1534,7 +1531,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatalf("staging meta was removed by the internal abort: %v", merr)
 	}
 	if len(meta.Ranges) != 2 || meta.Ranges[1].Committed != 499 || meta.Ranges[1].Done {
-		t.Errorf("migrated resumable range state lost: %+v", meta.Ranges)
+		t.Errorf("resumable range state lost: %+v", meta.Ranges)
 	}
 	if meta.Ranges[0].Committed != 0 || meta.Ranges[0].Done {
 		t.Errorf("failing range must hold no committed bytes: %+v", meta.Ranges[0])
@@ -2367,20 +2364,12 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		// Seed a complete legacy part set plus layout: the one-time upgrade
-		// migration carries it into the staging file as prefixes, and only
-		// the reserved final byte of each part is re-requested, so the run
-		// reaches finalization without any full re-transfer.
+		// Seed a CURRENT-FORMAT complete staging record (version 4, all ranges
+		// Done) so the run reaches finalization without any transfer. Old
+		// formats are not resume state and are covered separately.
 		full := bytes.Repeat([]byte("p"), 20_000)
-		if err := os.WriteFile(dst+".part-00", full[:10_000], 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst+".part-01", full[10_000:], 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(20_000, 2, 10_000)); err != nil {
-			t.Fatal(err)
-		}
+		seedRangedState(t, dst+".incomplete", "o/r", "fin.bin", 20_000,
+			[]RangeProgress{{Start: 0, End: 19_999, Committed: 20_000, Done: true}}, full)
 		return dst, full
 	}
 
@@ -2399,9 +2388,8 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
-			// The migrated parts are prefixes: only their reserved final
-			// bytes are re-requested, and serving them completes the layout
-			// without re-transferring a whole part.
+			// The seeded CURRENT-format record is fully committed, so no
+			// payload bytes are requested before finalization.
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		}))
 		defer srv.Close()
@@ -2413,7 +2401,8 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 		}
 
 		it := PlanItem{RelativePath: "fin.bin", URL: srv.URL + "/fin.bin", Size: 20_000, AcceptRanges: true}
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, emit)
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+			multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, emit)
 		if err == nil {
 			t.Fatal("expected a cancellation error")
 		}
@@ -2431,11 +2420,7 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 			t.Fatalf("staging resume metadata was removed by the internal abort: %v", merr)
 		}
 		if got := committedTotal(meta.Ranges); got != 20_000 {
-			t.Errorf("committed bytes after fully-migrated abort = %d, want 20000", got)
-		}
-		// The legacy part files were consumed by the migration.
-		if files, _ := multipartPartFiles(dst); len(files) != 0 {
-			t.Errorf("legacy part files should be gone after migration, got %v", files)
+			t.Errorf("committed bytes after the fully-committed abort = %d, want 20000", got)
 		}
 		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
 			t.Errorf("final dst should not exist (stat err=%v)", statErr)
@@ -2450,9 +2435,6 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 		}
 		if _, statErr := os.Stat(staging + ".meta"); !os.IsNotExist(statErr) {
 			t.Errorf("staging metadata should be removed by user-cancel cleanup (stat err=%v)", statErr)
-		}
-		if files, _ := multipartPartFiles(dst); len(files) != 0 {
-			t.Errorf("user-cancel cleanup should remove legacy part files, got %v", files)
 		}
 	})
 }

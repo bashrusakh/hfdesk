@@ -18,16 +18,15 @@ package hfdownloader
 //     they are stored under - a corruption CheckBlob then reports as
 //     complete, permanently;
 //   - the ranged route treated the single route's LIVE partial
-//     (blobs/tmp-<sha>.part) as a pre-#140 leftover, migrated those live
-//     bytes as a committed prefix and deleted them. The published blob was
-//     then a MIXTURE of two writers' byte streams, and the single writer's
-//     own job failed because its partial was gone.
+//     (blobs/tmp-<sha>.part) as residue it could adopt and delete. The
+//     published blob was then a MIXTURE of two writers' byte streams, and the
+//     single writer's own job failed because its partial was gone.
 //
 // The invariant these tests pin:
 //
 //   - ONE ownership domain per blob key, held by both routes for the whole
 //     operation on that key, so a live partial of one route is never
-//     adopted, migrated or deleted by the other route;
+//     adopted or deleted by the other route;
 //   - the publication places the bytes with a no-replace primitive, so an
 //     existing blobs/<sha> is completion proof and is not replaced by a
 //     writer of the same blob key (see blob_publish.go for the two tiers:
@@ -380,8 +379,7 @@ func TestConcurrentBlobPublicationKeepsTheProvenDigest(t *testing.T) {
 
 // TestCrossRouteLivePartialIsNeitherAdoptedNorDeleted pins the partial
 // namespace rule: while the single-request writer owns the blob key, its LIVE
-// partial must be neither adopted (migrated as a committed prefix) nor
-// deleted by the ranged route.
+// partial must be neither adopted nor deleted by the ranged route.
 func TestCrossRouteLivePartialIsNeitherAdoptedNorDeleted(t *testing.T) {
 	const total = 4_096
 	streams := newPublicationStreams(total)
@@ -409,44 +407,6 @@ func TestCrossRouteLivePartialIsNeitherAdoptedNorDeleted(t *testing.T) {
 	if !streams.isSingleStream(out.blob) {
 		t.Error("the published blob mixes the two writers' byte streams")
 	}
-}
-
-// TestNegativeControlNoDomainAdoptsTheLiveCrossRoutePartial is the negative
-// control for the two tests above: with the shared ownership domain removed
-// (the historical behavior), the ranged route adopts the single route's LIVE
-// partial as a pre-#140 leftover, deletes it, and the published blob is a
-// mixture of the two writers' streams.
-//
-// The control proves that the tests above really detect the defect: with the
-// domain in place they pass, without it the same scenario fails.
-func TestNegativeControlNoDomainAdoptsTheLiveCrossRoutePartial(t *testing.T) {
-	const total = 4_096
-	streams := newPublicationStreams(total)
-	sha := singleTestSHA(streams.a)
-	cacheDir := t.TempDir()
-	hub := newTwoWriterHub(t, total, sha, streams)
-
-	// Remove the shared domain: every writer keeps its own private ownership.
-	oldAcquire := blobDomainAcquire
-	blobDomainAcquire = func(context.Context, string, string) (*blobDomain, error) {
-		return &blobDomain{}, nil
-	}
-	defer func() { blobDomainAcquire = oldAcquire }()
-
-	out := runTwoWriters(t, hub, cacheDir, sha, streams)
-
-	if out.domainWaited {
-		t.Fatal("the negative control still enforced the ownership domain")
-	}
-	// The defect the domain removes: the live partial of the other route was
-	// taken over (and deleted), and the published blob is a mixture.
-	if out.single.err == nil {
-		t.Fatalf("the negative control did not reproduce the defect: the single writer's live partial survived")
-	}
-	if streams.isSingleStream(out.blob) {
-		t.Fatalf("the negative control did not reproduce a mixed publication: the blob is one writer's stream")
-	}
-	t.Logf("negative control reproduced the defect: single writer err=%v, published %d mixed bytes", out.single.err, len(out.blob))
 }
 
 // TestPublishBlobNoReplaceRefusesToOverwrite pins the placement primitive
