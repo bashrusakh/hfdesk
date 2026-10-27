@@ -136,9 +136,12 @@ and leaves the notification area.
 
 The desktop app can install the Windows service from that menu. **Install
 service…** confirms the machine-wide change first, needs the console program
-— the program paired with this desktop program, then `hfdesk.exe`, then exactly
-one `hfdesk*.exe` of a release — in the same folder as the desktop program
-(nothing is downloaded or copied), and then asks Windows for administrator
+in the same folder as the desktop program (nothing is downloaded or copied) —
+for a release that is the program paired with this desktop program, and a
+desktop program whose name carries a version has no other candidate, so a
+missing pair is an error that names the console file it expected; a local build
+without a version falls back to `hfdesk.exe` and then to exactly one
+`hfdesk*.exe` in the folder — and then asks Windows for administrator
 rights. The elevated helper waits until the desktop app has
 stopped its own server through the graceful shutdown and exited, so the two
 never serve the same address; it then installs and starts the service from that

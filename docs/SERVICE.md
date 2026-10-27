@@ -496,16 +496,22 @@ same service at the same time.
   only when the registration has none: three automatic restarts, after 5 s,
   30 s and 60 s, with the failure count reset after one day without a failure.
   A policy that is already registered — for example one an administrator set —
-  is kept. An instance that ends without reporting its stop is therefore
-  restarted by the platform; the platform repeats the **last** action — the
-  restart after 60 s — for every further failure until the failure count is
-  reset after a day without a failure, so a program that cannot come up is
-  retried once a minute and never in a tight loop. An explicit user stop
-  reports the stopped state, so it is not a failure and never triggers a
-  restart. A policy that cannot be read is not taken for an absent one: the
-  installation configures the HFDesk policy then. A recovery policy that
-  cannot be configured fails the installation, which rolls the registration
-  back.
+  is kept, including its switch for non-crash failures. An instance that ends
+  without reporting its stop, and an instance that reports a stopped state with
+  a non-zero exit code, are therefore restarted by the platform: the
+  installation enables the recovery of a non-crash failure together with those
+  actions, so a failure the instance reports itself does not leave the service
+  stopped. The platform repeats the **last** action — the restart after 60 s —
+  for every further failure until the failure count is reset after a day
+  without a failure, so a program that cannot come up is retried once a minute
+  and never in a tight loop. An explicit user stop reports a clean stop with
+  the exit code 0, so it is not a failure and never triggers a restart. The
+  non-crash switch is documented by Microsoft to take effect at the next start
+  of Windows: the installation writes it and reports the policy it wrote, and
+  a machine that is already running applies it after the next boot. A policy
+  that cannot be read is not taken for an absent one: the installation
+  configures the HFDesk policy then. A recovery policy that cannot be
+  configured fails the installation, which rolls the registration back.
 - The service identity is `LocalService`, a least-privilege Windows service
   account, not `LocalSystem`. It is **not configurable**: the built-in account
   has no name of its own and needs no credential, so a Windows instance
@@ -531,16 +537,31 @@ replaces the other.
   running without the desktop app, needs administrator rights, downloads and
   copies nothing, and keeps its own data. It then requires the console program
   in the folder of the desktop program — the program paired with this desktop
-  program (the same name with the `hfdesk-desktop` prefix replaced by
-  `hfdesk`), then `hfdesk.exe`, then exactly one `hfdesk*.exe` of a release —
-  and installs the service from that folder: the desktop host never downloads
-  and never copies a binary. Install the service from a folder that only
+  program, the same name with the `hfdesk-desktop` prefix replaced by
+  `hfdesk` — and installs the service from that folder: the desktop host never
+  downloads and never copies a binary. A desktop program whose name carries a
+  version has no other candidate: a missing pair is an error that names the
+  console file it expected and the folder it looked in, so a new desktop
+  program never registers the console program of another release and the
+  version the report names is the version the registration runs. A desktop
+  program without a version — a local build such as `hfdesk-desktop.exe` —
+  keeps the fallbacks: `hfdesk.exe` next, then exactly one `hfdesk*.exe` of a
+  release in the folder. Install the service from a folder that only
   administrators can modify: the service runs that program as `LocalService`,
   and HFDesk never changes the permissions of a user folder. Windows shows its
   standard administrator prompt, the elevated helper installs the service,
   starts it and verifies that it runs, and reports the result in a message box.
   A declined prompt or a missing console program changes nothing and leaves the
   desktop app running.
+
+  An installation that registered the service and then failed to start it, or
+  failed to verify the start, does not leave the user with a registration that
+  serves nothing: when the machine had no registration before, the helper
+  removes that registration again — the registration only, the data stays where
+  it is — and the report says that the desktop app can be started normally
+  again. A registration that existed before the attempt, and a machine whose
+  state could not be read before the attempt, are left in place, and the report
+  names `hfdesk service uninstall` from an elevated shell instead.
 - **No second server.** Once the helper is started, the desktop app stops its
   own server through the graceful shutdown and ends. The helper starts the
   service only after that process has exited, so the desktop app and the service
@@ -563,6 +584,12 @@ replaces the other.
   stopped offers **Start service**. A service that is still starting or
   stopping when the wait ends is reported with a short notice that the launch
   changes nothing, and the launch starts no server of its own.
+
+  A registration that cannot be read is not a machine without one: an installed
+  service may be running and bind the address this launch would bind. The
+  launch starts no server, publishes no state and reports the failure with a
+  notice that names `hfdesk service status` from an elevated shell and asks the
+  user to start the desktop app again.
 
   **Open HFDesk** opens the registered address, **Start service** starts the
   registered service, and **Cancel** changes nothing. **Update service**
@@ -731,11 +758,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   account, and the installation then reports the running state with the
   registered program and records that the image was not compared. On Linux no
   process image is read: the installation asks systemd for the state and the
-  `ExecStart` of the loaded unit, so it verifies that the unit that was written
-  and reloaded is active with the program of the reloaded registration. An
-  instance that was stopped, failed, broken or absent is **not** started:
-  `install` never starts a service that was not running, and starting stays an
-  explicit `service start`.
+  `ExecStart` of the loaded unit, and it waits until the restarted instance
+  also answers on the listen address of that unit with the same readiness
+  probe the Windows handler uses. A unit that systemd reports active is a
+  forked process and not a server — a process that dies on a bind error is
+  reported active for a moment — so "runs" means the server answers, and a
+  probe that does not succeed within the budget is a failed update that rolls
+  back. An instance that was stopped, failed, broken or absent is **not**
+  started: `install` never starts a service that was not running, and starting
+  stays an explicit `service start`.
 - **A failure says what it restored.** A failure before the registration is
   written leaves a running instance untouched. A failure after the registration
   was written restores the previous registration, and a failure after the
