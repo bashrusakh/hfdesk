@@ -556,12 +556,15 @@ replaces the other.
 
   An installation that registered the service and then failed to start it, or
   failed to verify the start, does not leave the user with a registration that
-  serves nothing: when the machine had no registration before, the helper
-  removes that registration again — the registration only, the data stays where
-  it is — and the report says that the desktop app can be started normally
-  again. A registration that existed before the attempt, and a machine whose
-  state could not be read before the attempt, are left in place, and the report
-  names `hfdesk service uninstall` from an elevated shell instead.
+  serves nothing: when the machine had no registration before, and the state
+  read after the failure reports a service that is neither running nor still
+  starting or stopping, the helper removes that registration again — the
+  registration only, the data stays where it is — and the report says that the
+  desktop app can be started normally again. A service that is running, starting
+  or stopping at that read, a state that cannot be read then, a registration
+  that existed before the attempt, and a machine whose state could not be read
+  before the attempt, keep their registration, and the report says what stays
+  and names `hfdesk service uninstall` from an elevated shell instead.
 - **No second server.** Once the helper is started, the desktop app stops its
   own server through the graceful shutdown and ends. The helper starts the
   service only after that process has exited, so the desktop app and the service
@@ -769,13 +772,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   stays an explicit `service start`.
 - **A failure says what it restored.** A failure before the registration is
   written leaves a running instance untouched. A failure after the registration
-  was written restores the previous registration, and a failure after the
-  restart brings the previous program back into service: the restart rollback
-  stops the instance the failed update started before it restores the previous
-  registration, and when that stop cannot be proven it keeps the failed
-  registration instead of leaving a registration that names another program
-  than the one that runs. The error names the proven outcome in every case, so a
-  failed installation never reports success from the registration write alone.
+  was written restores the previous registration: its configuration is written
+  back, and the failure recovery the attempt configured is not part of that
+  restore and stays in place. A failure after the restart brings the previous
+  program back into service: the restart rollback stops the instance the failed
+  update started before it restores the previous registration, and when that
+  stop cannot be proven it keeps the failed registration instead of leaving a
+  registration that names another program than the one that runs. The error
+  names the proven outcome in every case, so a failed installation never reports
+  success from the registration write alone.
 
 macOS is unchanged: `install` there replaces the registration, so an upgrade on
 macOS stays the stop/replace/start procedure above.
