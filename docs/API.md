@@ -318,6 +318,86 @@ Important response fields:
 
 `recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
+### EXL2/EXL3 branch variants
+
+For a model repository whose main tree has no recognized model weights and whose
+refs contain EXL2/EXL3 bitrate branches (for example `4.00bpw`,
+`SC_6.00bpw_H6_V6`, `4_25`, or `exl/4_25`), `GET /api/analyze` exposes each
+branch as a selectable item:
+
+```json
+{
+  "id": "exl-branch:4.00bpw-h6",
+  "label": "4.00bpw-h6",
+  "category": "quantization",
+  "revision": "4.00bpw-h6",
+  "branch_variant": true,
+  "method": "exl3",
+  "bits_per_weight": 4,
+  "head_bits": 6,
+  "recommended": true
+}
+```
+
+`revision` is the branch to download, `branch_variant` distinguishes it from an
+ordinary revision-backed selection, and `bits_per_weight`/`head_bits` describe
+the branch metadata when it is available. One branch is marked `recommended`.
+The per-branch metadata lookups are bounded. A branch whose quant method
+follows from the repository name or the main configuration is always listed; a
+branch whose method can only be established from its own branch metadata is
+listed only when the lookup reached it, so a slow Hub can return fewer branches
+than the repository has refs. The discovery warning below covers the
+uncertainty of the main tree's file roles, not this truncation.
+
+`recommended_download` then names that branch and asks for the whole branch
+without file filters:
+
+```json
+{
+  "repo": "owner/name",
+  "revision": "4.00bpw-h6",
+  "branchVariant": true
+}
+```
+
+That is the whole body: a branch variant is unfiltered and model-only, so the
+empty `dataset`, `filters` and `exactMatch` fields are omitted from the JSON
+rather than sent as empty values.
+
+GGUF, APEX, MTP, mmproj, and lineage behavior is unchanged.
+
+Isolation is a property of `branchVariant` downloads: they never write the
+shared friendly view, while their blobs and per-commit snapshots remain
+content/commit isolated. A generic revision download of the same branch (for
+example through the revision picker) remains an ordinary download and follows
+the existing revisionless friendly-view behavior. The existing rebuild fallback
+that mirrors an arbitrary snapshot when no main ref exists likewise may
+populate the friendly view. Neither path overwrites the stored blobs or another
+variant's per-commit snapshot.
+
+### Analysis warnings
+
+`analysis_warnings` is omitted when no warning applies. Otherwise it is an
+array of bounded, non-fatal diagnostics:
+
+```json
+{
+  "code": "exl_branch_discovery_incomplete",
+  "message": "EXL branch discovery could not be completed because one or more main file roles could not be safely established. Retry analysis to try again.",
+  "causes": ["header_unavailable", "header_uninterpretable"],
+  "retryable": true
+}
+```
+
+`code` identifies the warning. The only code currently emitted is
+`exl_branch_discovery_incomplete`. `causes` contains stable reason codes, not
+upstream response bodies or URLs: `header_unavailable`,
+`header_uninterpretable`, `probe_timeout`, `probe_limit`, and
+`weight_role_unrecognized`. `retryable` indicates that repeating the same
+analyze request may complete the optional discovery. A retry repeats the same
+repository, namespace, and revision request; it does not change the selection
+or start a download.
+
 ### Model/dataset selection
 
 If the repository exists as both a model and a dataset, auto-detection returns
@@ -449,7 +529,8 @@ selection.
 
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
-no root architecture config):
+no root architecture config, and for repositories whose `config.json` carries a
+nested `quantization_config` object):
 
 ```json
 "quantized": {
@@ -659,7 +740,8 @@ Request:
   "dataset": false,
   "filters": ["q4_k_m"],
   "excludes": [],
-  "exactMatch": false
+  "exactMatch": false,
+  "branchVariant": false
 }
 ```
 
@@ -708,6 +790,100 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
+  `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
+  must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
+  rejected with `400`. The revision must have the analyzer's branch shape and
+  must also be a valid completion-manifest path component sequence:
+  slash-separated, with no empty, `.`, or `..` component, no backslash or
+  control characters, and no component longer than 255 bytes. The branch shape
+  is either a bitrate token whose digits are immediately followed by `bpw`
+  (for example `4.00bpw` or `SC_6.00bpw_H6_V6`, optionally with a head-bits
+  token such as `-h6`; the digits must touch `bpw`, so `4_625-bpw-h6` is not a
+  recognized branch shape), or a final path component of exactly the form
+  `N_M` (for example `4_25` or `exl/4_25`; a component that merely starts with
+  `N_M`, such as `4_25-bpw-h6`, is not recognized). A branch variant also
+  requires the Hub revision lookup to resolve the branch to a commit, because
+  the commit is what keys the stored artifact: the per-commit snapshot tree in
+  HF cache mode and the completion record in both modes. When the lookup yields
+  no commit, the job fails with
+  `branch variant "<revision>" requires a resolved commit from the Hub`. The
+  same failure applies in both storage modes, and it happens before anything
+  is written to disk: no payload file, no completion record, and no directory
+  are created.
+  A branch download
+  stores the whole revision in an isolated location, so two variants with
+  identical file names cannot overwrite each other: HF cache mode uses the
+  per-commit `snapshots/<commit>/` tree and content-addressed blobs (with no
+  friendly-view entries), while local/flat mode writes into the app-owned
+  reserved space
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>/`.
+  That space lives outside the ordinary repository tree, so the ordinary
+  payload and the branch payload never share a path: a repository whose own
+  tree contains `.hfdesk-variants-payload/...` or `.hfdesk-variants/...` keeps
+  those files, and a branch-variant download of the same repository does not
+  replace them. The reserved directory is a top-level entry of the local root,
+  so it is excluded from the ordinary local repository scan: it is never
+  reported as an owner and nothing inside it is listed as a repository. The
+  reserved name is reserved: an ordinary local download whose repository
+  owner is the reserved name `.hfdesk-branch-variants` is accepted as a job
+  and then fails with
+  `repository owner "<owner>" is reserved for the app's branch-variant storage`
+  instead of writing into the app's own space. The refusal is a job failure,
+  not a `400` rejection at admission. A repository whose name is that
+  string is not affected, because the space is one level deeper. The app-owned
+  trees are verified before use, and a symlinked or non-directory app-owned
+  entry fails the download. A completed variant manifest at
+  `hub/models--<owner>--<repo>/.hfdesk-variants/<revision>/<commit>/hfd.yaml`
+  (HF cache) or
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/records/<revision>/<commit>/hfd.yaml`
+  (local) records the exact revision, commit, and files. The manifest is keyed
+  by revision and commit, so branches that share a commit keep separate
+  records, and its local location is outside the payload tree, so a
+  repository-owned `hfd.yaml` is never overwritten. `noManifest` only suppresses
+  the optional friendly-view manifest; a branch variant's completion manifest
+  is always written, because presence reads it. In HF cache mode a branch
+  variant does not skip a file whose content-addressed blob is already being
+  downloaded by another download: it waits for that shared download to
+  resolve, and then materializes its own snapshot entry for the file, so the
+  variant's completion record only ever lists files the branch actually holds.
+  The wait is bounded: if the shared download does not resolve, the job fails
+  instead of reporting the variant as downloaded, and if the shared download
+  is gone or abandoned, the variant fetches the file itself. A branch variant
+  that cannot create the snapshot entry for one of its files fails the job for
+  the same reason: reporting the variant as downloaded would publish a variant
+  that is not complete. After a local branch-variant
+  plan succeeds and before any payload byte changes, the download invalidates
+  the revision's prior local completion records: the app's own
+  `records/<revision>/<commit>/hfd.yaml` records. A file at the same path that
+  is not one of those records is left untouched, and the payload is never
+  touched. If that invalidation fails, the download fails without touching the
+  payload. A local re-download that fails or is cancelled after that
+  invalidation reports `missing` instead of complete.
+  A local branch-variant transfer stages its bytes in the app-owned,
+  commit-scoped staging area
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/staging/<revision>/<commit>/`
+  and publishes them into the payload directory afterwards. The staging area
+  is transient: it holds the partial bytes of one transfer (`.part`,
+  `.part-NN`, `.parts.json`) until they are verified, and the verified file is
+  then moved into
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>/<path>`
+  with an atomic rename, so the payload path never holds a partially written
+  file and the payload directory holds only the variant's own file names.
+  Because the staging area is keyed by the resolved commit, a partial left
+  behind by an interrupted transfer belongs to exactly one commit: a transfer
+  of a moved branch starts from zero instead of resuming another commit's
+  bytes, while a retry of the same commit resumes its own partial. The
+  staging area lives inside the reserved space, so it is excluded from the
+  ordinary local repository scan like the rest of that space, and it is
+  verified like the other app-owned trees.
+  A local branch-variant re-download reuses a published file only when its
+  content hash matches the planned commit's digest: a file without a known
+  digest is re-fetched, because equal size proves nothing. Together with the
+  commit-scoped staging area, which keeps a moved branch from resuming another
+  commit's bytes, this means a moved branch cannot retain same-size stale
+  bytes. An ordinary download is unaffected: it keeps reusing a non-LFS file
+  on size equality, and an LFS file with a known SHA on its SHA.
 - A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
@@ -830,6 +1006,12 @@ When `localDir` is set, downloads use real files under
 for the Cache browser and local badges in Hub search results. A selected GGUF
 entry there can be deleted through `DELETE /api/cache-selection`; these roots do
 not thereby become download destinations.
+
+Every scanned local root may contain the app's reserved
+`.hfdesk-branch-variants` entry, which holds the local branch-variant payloads
+and completion records. It is not a repository owner: the Cache browser never
+reports it as an owner and never lists anything inside it as a repository, and
+the single-repository lookup and the selection list skip it as well.
 
 `downloadRoutes` is an opt-in map from an internal route key to a destination directory. When a download request sends a `routeKey` that resolves in this map, the job is written to that folder instead of `localDir`/HF cache. Route destinations are also scanned by the Cache browser and accepted by `/api/diskfree?path=...`.
 
@@ -1073,6 +1255,80 @@ Cache entries may come from:
 - `complete`
 - `filtered`
 - `unknown`
+
+### Branch-variant presence
+
+A qualified lookup reports whether one EXL branch revision is completely
+downloaded:
+
+```http
+GET /api/cache/{owner}/{repo}?branchVariant=true&revision=4.00bpw
+```
+
+Optional `routeKey` and `localDir` resolve the destination exactly like
+`POST /api/download`; either explicit selector checks only that destination.
+When both are omitted, the default destination is checked first and then every
+configured download route, returning the first complete variant. If none is
+complete, the default destination's `missing` response is returned. `type`,
+when present, must be `model`. The response is always `200` for a valid query,
+with `downloaded: false` when the variant is absent or incomplete:
+
+```json
+{
+  "repo": "owner/name",
+  "type": "model",
+  "branchVariant": true,
+  "revision": "4.00bpw",
+  "downloaded": true,
+  "downloadStatus": "complete",
+  "storageMode": "hf-cache",
+  "destinationRoot": "/cache/hub/models--owner--name",
+  "commit": "2222222222222222222222222222222222222222",
+  "artifactPath": "/cache/hub/models--owner--name/.hfdesk-variants/4.00bpw/2222.../hfd.yaml",
+  "expectedFiles": 3,
+  "files": [{"name": "config.json", "size": 123}]
+}
+```
+
+In local mode the same response reports the app-owned payload directory as
+`destinationRoot` and the completion record as `artifactPath`:
+
+```json
+{
+  "repo": "owner/name",
+  "type": "model",
+  "branchVariant": true,
+  "revision": "4.00bpw",
+  "downloaded": true,
+  "downloadStatus": "complete",
+  "storageMode": "local",
+  "destinationRoot": "/models/.hfdesk-branch-variants/owner/name/payload/4.00bpw",
+  "commit": "2222222222222222222222222222222222222222",
+  "artifactPath": "/models/.hfdesk-branch-variants/owner/name/records/4.00bpw/2222.../hfd.yaml",
+  "expectedFiles": 3,
+  "files": [{"name": "config.json", "size": 123}]
+}
+```
+
+`downloadStatus` is `complete` or `missing` for this endpoint. HF cache mode
+reads `refs/<revision>` and requires the revision/commit manifest at
+`.hfdesk-variants/<revision>/<commit>/hfd.yaml` to match `branchVariant`, `repo`,
+`branch == revision`, `commit`, a non-zero completion time, `total_files > 0`,
+and `len(files) == total_files`; every snapshot entry must resolve to a regular
+file of the recorded size. Local mode reads the completion records under
+`<root>/.hfdesk-branch-variants/<owner>/<repo>/records/<revision>/<commit>/` and
+considers only the newest valid record for the revision (latest completion time,
+then lexicographic commit); it checks every file of that record against the
+revision payload directory
+`<root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>/`, which
+`destinationRoot` reports in local mode. The completion record lives in the
+records tree beside the payload tree, never inside it, and the whole reserved
+space lives outside the ordinary repository tree. If the newest record's
+files are not all present at the recorded sizes, the revision reports
+`missing`; older records are not consulted, because local records carry no
+content hash and cannot prove that a replaced or mixed payload still matches
+them. An ordinary `GET /api/cache/{owner}/{repo}` without `branchVariant=true` is
+unchanged.
 
 `GET /api/cache` includes effective R as `cacheDir`, plus `effectiveHubDir` and
 `hubDirSource`. HF entries' `path` is under selected H, while `friendlyPath` is

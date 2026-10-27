@@ -112,7 +112,6 @@ func (t RepoType) Description() string {
 
 // FileInfo represents a file in the repository.
 type FileInfo struct {
-	// Path is the relative path within the repository.
 	Path string `json:"path"`
 
 	// Name is the filename (basename of path).
@@ -121,22 +120,18 @@ type FileInfo struct {
 	// Size is the file size in bytes.
 	Size int64 `json:"size"`
 
-	// SizeHuman is the human-readable size (e.g., "4.1 GB").
 	SizeHuman string `json:"size_human"`
 
-	// IsLFS indicates if the file is stored in Git LFS.
 	IsLFS bool `json:"is_lfs"`
 
 	// SHA256 is the file hash (for LFS files).
 	SHA256 string `json:"sha256,omitempty"`
 
-	// Directory is the parent directory path.
 	Directory string `json:"directory,omitempty"`
 }
 
 // RepoRef represents a branch or tag in the repository.
 type RepoRef struct {
-	// Name is the ref name (e.g., "main", "v1.0", "fp16").
 	Name string `json:"name"`
 
 	// Type is "branch" or "tag".
@@ -151,37 +146,28 @@ type RepoInfo struct {
 	// Repo is the repository ID in "owner/name" format.
 	Repo string `json:"repo"`
 
-	// IsDataset indicates if this is a dataset repository.
 	IsDataset bool `json:"is_dataset"`
 
-	// Type is the detected repository type.
 	Type RepoType `json:"type"`
 
-	// TypeDescription is a human-readable description of the type.
 	TypeDescription string `json:"type_description"`
 
-	// Files is the list of all files in the repository.
 	Files []FileInfo `json:"files"`
 
 	// TotalSize is the sum of all file sizes in bytes.
 	TotalSize int64 `json:"total_size"`
 
-	// TotalSizeHuman is the human-readable total size.
 	TotalSizeHuman string `json:"total_size_human"`
 
-	// FileCount is the number of files.
 	FileCount int `json:"file_count"`
 
 	// Commit is the resolved commit SHA.
 	Commit string `json:"commit,omitempty"`
 
-	// Branch is the branch/revision name.
 	Branch string `json:"branch,omitempty"`
 
-	// Refs is the list of available branches and tags.
 	Refs []RepoRef `json:"refs,omitempty"`
 
-	// AnalyzedAt is when the analysis was performed.
 	AnalyzedAt time.Time `json:"analyzed_at"`
 
 	// Metadata contains raw parsed metadata from config files.
@@ -204,7 +190,6 @@ type RepoInfo struct {
 	// For GGUF: quantizations, for Diffusers: components/variants, for Transformers: formats, etc.
 	SelectableItems []SelectableItem `json:"selectable_items,omitempty"`
 
-	// RecommendedFilters are the filter values for default/recommended items.
 	RecommendedFilters []string `json:"recommended_filters,omitempty"`
 
 	// RecommendedDownload is a ready-to-send request body for /api/download
@@ -215,8 +200,22 @@ type RepoInfo struct {
 	// identifies the repository their Files paths belong to.
 	RecommendedDownload *DownloadSelection `json:"recommended_download,omitempty"`
 
-	// RelatedDownloads lists related repositories (e.g., base model for LoRA).
 	RelatedDownloads []RelatedDownload `json:"related_downloads,omitempty"`
+
+	// AnalysisWarnings reports bounded, non-fatal analysis work that could not
+	// be completed. The repository analysis remains usable; callers may present
+	// the warning and offer the indicated user-triggered retry.
+	AnalysisWarnings []AnalysisWarning `json:"analysis_warnings,omitempty"`
+}
+
+// AnalysisWarning is a non-fatal limitation encountered while analyzing a
+// repository. Causes are stable, non-secret reason codes rather than raw
+// upstream errors, response bodies, or URLs.
+type AnalysisWarning struct {
+	Code      string   `json:"code"`
+	Message   string   `json:"message"`
+	Causes    []string `json:"causes,omitempty"`
+	Retryable bool     `json:"retryable"`
 }
 
 // ModelChainEntry is one node in the provenance chain from base model to the
@@ -242,7 +241,6 @@ type GGUFInfo struct {
 	// ParameterCount is the detected parameter count (e.g., "7B", "13B").
 	ParameterCount string `json:"parameter_count,omitempty"`
 
-	// Quantizations is the list of available quantizations.
 	Quantizations []GGUFQuantization `json:"quantizations"`
 
 	// MMProjFiles is the list of multimodal projector (vision-encoder) files
@@ -269,25 +267,20 @@ type GGUFInfo struct {
 
 // GGUFQuantization represents a single GGUF quantization option.
 type GGUFQuantization struct {
-	// Name is the quantization name (e.g., "Q4_K_M").
 	Name string `json:"name"`
 
-	// File is the file info for this quantization.
 	File FileInfo `json:"file"`
 
 	// Quality is the quality rating (1-5 stars).
 	Quality int `json:"quality"`
 
-	// QualityStars is the star representation (e.g., "★★★★☆").
 	QualityStars string `json:"quality_stars"`
 
 	// EstimatedRAM is the estimated RAM needed in bytes.
 	EstimatedRAM int64 `json:"estimated_ram"`
 
-	// EstimatedRAMHuman is the human-readable RAM estimate.
 	EstimatedRAMHuman string `json:"estimated_ram_human"`
 
-	// Description is a human-readable description of this quantization level.
 	Description string `json:"description,omitempty"`
 
 	// Recommended indicates if this quantization is recommended for the user's system.
@@ -315,43 +308,34 @@ type DiffusersInfo struct {
 	// PipelineType is the pipeline class name (e.g., "StableDiffusionXLPipeline").
 	PipelineType string `json:"pipeline_type"`
 
-	// PipelineDescription is a human-readable description of the pipeline.
 	PipelineDescription string `json:"pipeline_description,omitempty"`
 
 	// DiffusersVersion is the diffusers library version from model_index.json.
 	DiffusersVersion string `json:"diffusers_version,omitempty"`
 
-	// Components is the list of pipeline components.
 	Components []DiffusersComponent `json:"components"`
 
 	// Variants is the list of available precision variants (fp16, fp32, bf16).
 	Variants []string `json:"variants,omitempty"`
 
-	// Precisions is the list of detected model precisions.
 	Precisions []string `json:"precisions,omitempty"`
 }
 
 // DiffusersComponent represents a component in a diffusers pipeline.
 type DiffusersComponent struct {
-	// Name is the component name (e.g., "unet", "vae").
 	Name string `json:"name"`
 
-	// Library is the source library (e.g., "diffusers", "transformers").
 	Library string `json:"library,omitempty"`
 
-	// ClassName is the component class (e.g., "UNet2DConditionModel").
 	ClassName string `json:"class_name,omitempty"`
 
 	// Size is the total size of this component's files.
 	Size int64 `json:"size"`
 
-	// SizeHuman is the human-readable size.
 	SizeHuman string `json:"size_human"`
 
-	// Files is the list of files belonging to this component.
 	Files []FileInfo `json:"files,omitempty"`
 
-	// Required indicates if this component is required for the pipeline.
 	Required bool `json:"required"`
 }
 
@@ -360,7 +344,6 @@ type LoRAInfo struct {
 	// AdapterType is the adapter type (e.g., "lora", "qlora", "ia3").
 	AdapterType string `json:"adapter_type"`
 
-	// AdapterDescription is a human-readable description of the adapter type.
 	AdapterDescription string `json:"adapter_description,omitempty"`
 
 	// BaseModel is the base model this adapter is trained for.
@@ -375,7 +358,6 @@ type LoRAInfo struct {
 	// Dropout is the LoRA dropout rate.
 	Dropout float64 `json:"dropout,omitempty"`
 
-	// TargetModules is the list of targeted module names.
 	TargetModules []string `json:"target_modules,omitempty"`
 
 	// Bias is the bias training mode ("none", "all", "lora_only").
@@ -399,7 +381,6 @@ type QuantizedInfo struct {
 	// Method is the quantization method (e.g., "gptq", "awq", "exl2").
 	Method string `json:"method"`
 
-	// MethodDescription is a human-readable description of the method.
 	MethodDescription string `json:"method_description,omitempty"`
 
 	// Bits is the declared bit width of the quantized tensors when the config
@@ -435,19 +416,16 @@ type QuantizedInfo struct {
 	ExpertBitsMin float64 `json:"expert_bits_min,omitempty"`
 	ExpertBitsMax float64 `json:"expert_bits_max,omitempty"`
 
-	// GroupSize is the quantization group size.
 	GroupSize int `json:"group_size,omitempty"`
 
 	// DescAct indicates if GPTQ desc_act is enabled.
 	DescAct bool `json:"desc_act,omitempty"`
 
-	// Symmetric indicates if symmetric quantization is used.
 	Symmetric bool `json:"symmetric,omitempty"`
 
 	// ZeroPoint indicates if zero-point quantization is used (AWQ).
 	ZeroPoint bool `json:"zero_point,omitempty"`
 
-	// Version is the quantization format version.
 	Version string `json:"version,omitempty"`
 
 	// BitsPerWeight is the EXL2 bits per weight.
@@ -472,19 +450,15 @@ type QuantizedInfo struct {
 	// EstimatedVRAM is the estimated VRAM needed for inference.
 	EstimatedVRAM int64 `json:"estimated_vram,omitempty"`
 
-	// EstimatedVRAMHuman is the human-readable VRAM estimate.
 	EstimatedVRAMHuman string `json:"estimated_vram_human,omitempty"`
 }
 
 // DatasetInfo contains dataset-specific analysis results.
 type DatasetInfo struct {
-	// Splits is the list of available splits.
 	Splits []DatasetSplit `json:"splits"`
 
-	// Configs is the list of available configurations/subsets.
 	Configs []string `json:"configs,omitempty"`
 
-	// Formats is the list of file formats found.
 	Formats []string `json:"formats,omitempty"`
 
 	// PrimaryFormat is the recommended format to download.
@@ -496,16 +470,13 @@ type DatasetSplit struct {
 	// Name is the split name (e.g., "train", "test", "validation").
 	Name string `json:"name"`
 
-	// Files is the list of files in this split.
 	Files []FileInfo `json:"files,omitempty"`
 
-	// FileCount is the number of files in this split.
 	FileCount int `json:"file_count"`
 
 	// Size is the total size of this split.
 	Size int64 `json:"size"`
 
-	// SizeHuman is the human-readable size.
 	SizeHuman string `json:"size_human"`
 }
 
@@ -514,10 +485,8 @@ type AudioInfo struct {
 	// Task is the audio task (e.g., "automatic-speech-recognition", "text-to-speech").
 	Task string `json:"task"`
 
-	// TaskDescription is a human-readable description of the task.
 	TaskDescription string `json:"task_description,omitempty"`
 
-	// FeatureExtractorType is the feature extractor class name.
 	FeatureExtractorType string `json:"feature_extractor_type,omitempty"`
 
 	// SampleRate is the expected audio sample rate in Hz.
@@ -541,10 +510,8 @@ type VisionInfo struct {
 	// Task is the vision task (e.g., "image-classification", "object-detection").
 	Task string `json:"task"`
 
-	// TaskDescription is a human-readable description of the task.
 	TaskDescription string `json:"task_description,omitempty"`
 
-	// ImageProcessorType is the image processor class name.
 	ImageProcessorType string `json:"image_processor_type,omitempty"`
 
 	// ImageSize is the expected input image size.
@@ -559,7 +526,6 @@ type VisionInfo struct {
 	// Normalization contains mean and std for image normalization.
 	Normalization *ImageNormalization `json:"normalization,omitempty"`
 
-	// Framework is the model framework.
 	Framework string `json:"framework,omitempty"`
 }
 
@@ -582,25 +548,20 @@ type SelectableItem struct {
 	// ID is a unique identifier for this item (e.g., "q4_k_m", "fp16", "train").
 	ID string `json:"id"`
 
-	// Label is the display name shown in UI.
 	Label string `json:"label"`
 
-	// Description provides additional context about this option.
 	Description string `json:"description,omitempty"`
 
 	// Size is the item size in bytes.
 	Size int64 `json:"size,omitempty"`
 
-	// SizeHuman is the human-readable size (e.g., "4.1 GiB").
 	SizeHuman string `json:"size_human,omitempty"`
 
 	// Quality is the quality rating (1-5 stars, 0 if not applicable).
 	Quality int `json:"quality,omitempty"`
 
-	// QualityStars is the star representation (e.g., "★★★★☆").
 	QualityStars string `json:"quality_stars,omitempty"`
 
-	// Recommended indicates if this is the default/recommended selection.
 	Recommended bool `json:"recommended,omitempty"`
 
 	// Category groups items (e.g., "quantization", "variant", "component", "split", "format").
@@ -611,13 +572,11 @@ type SelectableItem struct {
 	// artifacts and remains for compatibility with existing consumers.
 	FilterValue string `json:"filter_value"`
 
-	// Files is the list of files included in this selection.
 	Files []string `json:"files,omitempty"`
 
 	// RAM is the estimated RAM needed (for GGUF quantizations).
 	RAM int64 `json:"ram,omitempty"`
 
-	// RAMHuman is the human-readable RAM estimate.
 	RAMHuman string `json:"ram_human,omitempty"`
 
 	// UpstreamRepo is the "owner/name" of a different repository from which
@@ -625,6 +584,23 @@ type SelectableItem struct {
 	// sourced from an upstream base-model repo (i.e. when MMProjUpstreamRepo is
 	// set). Empty means the download targets the current repo.
 	UpstreamRepo string `json:"upstream_repo,omitempty"`
+
+	// Revision is the branch/revision for a branch-backed model option. When
+	// set, selection is by revision rather than by Files or FilterValue; an
+	// unfiltered download includes the branch's model support files.
+	Revision string `json:"revision,omitempty"`
+	// BranchVariant marks an analyzer-recognized EXL2/EXL3 branch choice. It is
+	// separate from Revision so ordinary revision-backed downloads retain their
+	// existing storage behavior.
+	BranchVariant bool `json:"branch_variant,omitempty"`
+
+	// Method, BitsPerWeight, and HeadBits describe branch-backed EXL variants.
+	// BitsPerWeight is the bitrate named by the branch or declared in its
+	// quantization config; HeadBits is a tensor-group width, not a model-wide
+	// precision declaration.
+	Method        string  `json:"method,omitempty"`
+	BitsPerWeight float64 `json:"bits_per_weight,omitempty"`
+	HeadBits      float64 `json:"head_bits,omitempty"`
 }
 
 // RelatedDownload represents a related repository that may be needed.
@@ -636,10 +612,8 @@ type RelatedDownload struct {
 	// Repo is the HuggingFace repository ID.
 	Repo string `json:"repo"`
 
-	// Label is the display name.
 	Label string `json:"label"`
 
-	// Description explains why this download is related.
 	Description string `json:"description,omitempty"`
 
 	// Required indicates if this is required for the main download to work.
@@ -648,17 +622,17 @@ type RelatedDownload struct {
 	// Size is the estimated size if known.
 	Size int64 `json:"size,omitempty"`
 
-	// SizeHuman is the human-readable size.
 	SizeHuman string `json:"size_human,omitempty"`
 }
 
 // DownloadSelection is the web/API representation of a repo download choice.
 type DownloadSelection struct {
-	Repo       string   `json:"repo"`
-	Dataset    bool     `json:"dataset,omitempty"`
-	Revision   string   `json:"revision,omitempty"`
-	Filters    []string `json:"filters,omitempty"`
-	ExactMatch bool     `json:"exactMatch,omitempty"`
+	Repo          string   `json:"repo"`
+	Dataset       bool     `json:"dataset,omitempty"`
+	Revision      string   `json:"revision,omitempty"`
+	Filters       []string `json:"filters,omitempty"`
+	ExactMatch    bool     `json:"exactMatch,omitempty"`
+	BranchVariant bool     `json:"branchVariant,omitempty"`
 }
 
 // RecommendedFilterValues returns filters for recommended selectable items.
@@ -672,10 +646,22 @@ type DownloadSelection struct {
 func (r *RepoInfo) RecommendedFilterValues() []string {
 	var recommended []string
 	for _, item := range r.SelectableItems {
+		if item.Recommended && item.UpstreamRepo == "" && item.Revision != "" {
+			// A revision-backed choice selects an entire branch, so filters from
+			// any other recommended row must not leak into that request.
+			return nil
+		}
+	}
+	for _, item := range r.SelectableItems {
 		if !item.Recommended {
 			continue
 		}
 		if item.UpstreamRepo != "" {
+			continue
+		}
+		if item.Revision != "" {
+			// Branch-backed choices select a complete branch, not a path or
+			// legacy filter token.
 			continue
 		}
 		if item.Category == "quantization" || item.Category == "vision_encoder" {
@@ -705,16 +691,30 @@ func exactArtifactFilter(repoPath string) string {
 // PopulateDownloadSelection sets recommended download fields for the web UI.
 func (r *RepoInfo) PopulateDownloadSelection() {
 	r.RecommendedFilters = r.RecommendedFilterValues()
+	var recommendedRevision string
+	var recommendedBranchVariant bool
+	for _, item := range r.SelectableItems {
+		if item.Recommended && item.UpstreamRepo == "" && item.Revision != "" {
+			recommendedRevision = item.Revision
+			recommendedBranchVariant = item.BranchVariant
+			break
+		}
+	}
+
 	r.RecommendedDownload = &DownloadSelection{
-		Repo:       r.Repo,
-		Dataset:    r.IsDataset,
-		Filters:    r.RecommendedFilters,
-		ExactMatch: r.IsDataset || r.Type == TypeGGUF,
+		Repo:          r.Repo,
+		Dataset:       r.IsDataset,
+		Filters:       r.RecommendedFilters,
+		ExactMatch:    r.IsDataset || r.Type == TypeGGUF,
+		BranchVariant: recommendedBranchVariant,
 	}
 	if r.Branch != "" && r.Branch != "main" {
 		r.RecommendedDownload.Revision = r.Branch
 	}
-	if len(r.RecommendedFilters) == 0 {
+	if recommendedRevision != "" {
+		r.RecommendedDownload.Revision = recommendedRevision
+	}
+	if len(r.RecommendedFilters) == 0 && recommendedRevision == "" {
 		r.RecommendedDownload = nil
 	}
 }
@@ -740,40 +740,31 @@ type MultimodalInfo struct {
 	// Task is the multimodal task (e.g., "visual-question-answering", "image-to-text").
 	Task string `json:"task"`
 
-	// TaskDescription is a human-readable description of the task.
 	TaskDescription string `json:"task_description,omitempty"`
 
 	// Modalities is the list of supported modalities (e.g., ["text", "image"]).
 	Modalities []string `json:"modalities"`
 
-	// ProcessorType is the processor class name.
 	ProcessorType string `json:"processor_type,omitempty"`
 
-	// VisionEncoder is info about the vision encoder component.
 	VisionEncoder string `json:"vision_encoder,omitempty"`
 
-	// TextEncoder is info about the text encoder component.
 	TextEncoder string `json:"text_encoder,omitempty"`
 
 	// ImageSize is the expected input image size.
 	ImageSize ImageSize `json:"image_size,omitempty"`
 
-	// MaxTextLength is the maximum text input length.
 	MaxTextLength int `json:"max_text_length,omitempty"`
 
-	// Framework is the model framework.
 	Framework string `json:"framework,omitempty"`
 }
 
 // ONNXInfo contains ONNX model-specific analysis results.
 type ONNXInfo struct {
-	// Models is the list of ONNX model files.
 	Models []ONNXModel `json:"models"`
 
-	// Optimized indicates if optimized versions are available.
 	Optimized bool `json:"optimized,omitempty"`
 
-	// Quantized indicates if quantized versions are available.
 	Quantized bool `json:"quantized,omitempty"`
 
 	// Runtimes is the list of compatible runtimes.
@@ -782,7 +773,6 @@ type ONNXInfo struct {
 
 // ONNXModel represents a single ONNX model file.
 type ONNXModel struct {
-	// Path is the file path.
 	Path string `json:"path"`
 
 	// Name is the model name extracted from the path.
@@ -791,13 +781,11 @@ type ONNXModel struct {
 	// Size is the file size in bytes.
 	Size int64 `json:"size"`
 
-	// SizeHuman is the human-readable size.
 	SizeHuman string `json:"size_human"`
 
 	// Variant indicates the model variant (e.g., "fp32", "fp16", "int8").
 	Variant string `json:"variant,omitempty"`
 
-	// Optimized indicates if this is an optimized model.
 	Optimized bool `json:"optimized,omitempty"`
 }
 
@@ -806,34 +794,27 @@ type TransformersInfo struct {
 	// Architecture is the model architecture class (e.g., "LlamaForCausalLM", "BertForSequenceClassification").
 	Architecture string `json:"architecture"`
 
-	// ArchitectureDescription is a human-readable description of the architecture.
 	ArchitectureDescription string `json:"architecture_description,omitempty"`
 
 	// Task is the primary task the model is designed for.
 	Task string `json:"task,omitempty"`
 
-	// TaskDescription is a human-readable description of the task.
 	TaskDescription string `json:"task_description,omitempty"`
 
 	// ModelType is the model type identifier (e.g., "llama", "bert", "gpt2").
 	ModelType string `json:"model_type,omitempty"`
 
-	// HiddenSize is the dimensionality of the hidden layers.
 	HiddenSize int `json:"hidden_size,omitempty"`
 
-	// NumHiddenLayers is the number of hidden layers.
 	NumHiddenLayers int `json:"num_hidden_layers,omitempty"`
 
-	// NumAttentionHeads is the number of attention heads.
 	NumAttentionHeads int `json:"num_attention_heads,omitempty"`
 
 	// IntermediateSize is the size of the intermediate (feed-forward) layer.
 	IntermediateSize int `json:"intermediate_size,omitempty"`
 
-	// VocabSize is the vocabulary size.
 	VocabSize int `json:"vocab_size,omitempty"`
 
-	// MaxPositionEmbeddings is the maximum sequence length.
 	MaxPositionEmbeddings int `json:"max_position_embeddings,omitempty"`
 
 	// ContextLength is the effective context window (may differ from max_position_embeddings).
@@ -854,10 +835,8 @@ type TransformersInfo struct {
 	// ShardCount is the number of shards if sharded.
 	ShardCount int `json:"shard_count,omitempty"`
 
-	// WeightFiles lists the model weight files.
 	WeightFiles []WeightFile `json:"weight_files,omitempty"`
 
-	// Tokenizer contains tokenizer information.
 	Tokenizer *TokenizerInfo `json:"tokenizer,omitempty"`
 
 	// TorchDtype is the torch dtype from config (e.g., "float16", "bfloat16").
@@ -866,25 +845,20 @@ type TransformersInfo struct {
 	// Backends lists compatible inference backends.
 	Backends []string `json:"backends,omitempty"`
 
-	// SpecialTokens contains special token information.
 	SpecialTokens map[string]interface{} `json:"special_tokens,omitempty"`
 
-	// GenerationConfig contains generation configuration if present.
 	GenerationConfig map[string]interface{} `json:"generation_config,omitempty"`
 }
 
 // WeightFile represents a model weight file.
 type WeightFile struct {
-	// Path is the file path.
 	Path string `json:"path"`
 
-	// Name is the filename.
 	Name string `json:"name"`
 
 	// Size is the file size in bytes.
 	Size int64 `json:"size"`
 
-	// SizeHuman is the human-readable size.
 	SizeHuman string `json:"size_human"`
 
 	// Format is the file format (safetensors, bin, pt).
@@ -893,7 +867,6 @@ type WeightFile struct {
 	// ShardIndex is the shard index (0-based) if sharded.
 	ShardIndex int `json:"shard_index,omitempty"`
 
-	// ShardTotal is the total number of shards.
 	ShardTotal int `json:"shard_total,omitempty"`
 }
 
@@ -902,16 +875,13 @@ type TokenizerInfo struct {
 	// Type is the tokenizer class (e.g., "LlamaTokenizerFast", "GPT2Tokenizer").
 	Type string `json:"type,omitempty"`
 
-	// VocabSize is the vocabulary size.
 	VocabSize int `json:"vocab_size,omitempty"`
 
-	// ModelMaxLength is the maximum input length.
 	ModelMaxLength int `json:"model_max_length,omitempty"`
 
 	// PaddingSide is the padding side ("left" or "right").
 	PaddingSide string `json:"padding_side,omitempty"`
 
-	// TruncationSide is the truncation side.
 	TruncationSide string `json:"truncation_side,omitempty"`
 
 	// AddBosToken indicates if BOS token is added.
@@ -920,9 +890,7 @@ type TokenizerInfo struct {
 	// AddEosToken indicates if EOS token is added.
 	AddEosToken bool `json:"add_eos_token,omitempty"`
 
-	// ChatTemplate is the chat template string if present.
 	ChatTemplate string `json:"chat_template,omitempty"`
 
-	// HasChatTemplate indicates if a chat template is defined.
 	HasChatTemplate bool `json:"has_chat_template,omitempty"`
 }

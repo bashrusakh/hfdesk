@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -205,7 +206,35 @@ type PlanItem struct {
 // Plan contains the list of files to download.
 type Plan struct {
 	Items  []PlanItem `json:"items"`
-	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	Commit string     `json:"commit,omitempty"` // The commit resolved from the Hub lookup, else the revision-name fallback; see CommitResolved
+	// CommitResolved reports whether Commit came from a successful Hub
+	// revision response rather than the job's revision-name fallback. Branch
+	// variants require a resolved commit so their content-addressed blobs and
+	// per-commit snapshots cannot be confused with another revision.
+	CommitResolved bool `json:"commitResolved,omitempty"`
+}
+
+// safeCommitName reports whether commit is a single, non-escaping path
+// component. A real Hub commit is a hex SHA, but callers may also see fixture
+// or mirror values; accepting any plain name keeps ordinary behavior while
+// still rejecting separators, traversal segments, and control characters
+// before the value is used as snapshots/<commit> or a variant metadata
+// directory.
+func safeCommitName(commit string) bool {
+	if commit == "" || len(commit) > 128 || commit == "." || commit == ".." {
+		return false
+	}
+	for _, r := range commit {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // PlanRepo builds the file list without downloading.
@@ -239,22 +268,40 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	directFilterMatch := false
 	datasetMembershipMatch := false
 
-	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+	commitSHA := job.Revision
+	commitResolved := false
 	if err != nil {
 		// Fall back to revision name if API call fails (e.g., some mirrors)
 		repoInfo = &RepoInfo{SHA: job.Revision}
+	} else if repoInfo != nil {
+		if repoInfo.SHA != "" {
+			commitSHA = repoInfo.SHA
+		}
+		commitResolved = safeCommitName(repoInfo.SHA)
 	}
-	commitSHA := repoInfo.SHA
-	if commitSHA == "" {
-		commitSHA = job.Revision // fallback
+
+	// Only a branch variant reads the tree and file bytes at the resolved
+	// commit. Its payload is keyed by that commit (HF-cache snapshot and
+	// completion record), and a branch name can move between the revision
+	// lookup and the later tree/file reads, which would otherwise combine one
+	// commit's planned file list with another commit's contents.
+	//
+	// An ordinary download keeps addressing the caller's revision/branch name.
+	// Commit pinning is not required for it, and a user-configured mirror may
+	// resolve the revision to a SHA while serving file bytes only by branch
+	// name; pinning would break such a mirror. Refs, destination naming,
+	// manifest Branch, and progress keep the caller's revision name below.
+	contentJob := job
+	if job.BranchVariant && commitResolved {
+		contentJob.Revision = commitSHA
 	}
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, job, "", func(n hfNode) error {
+	err = walkTree(ctx, httpc, token, cfg.Endpoint, contentJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -441,7 +488,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		rel := n.Path
 
-		// Deduplicate by relative path
 		if _, ok := seen[rel]; ok {
 			continue
 		}
@@ -573,12 +619,14 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size
+		// The URL addresses the revision the contentJob reads: the resolved
+		// commit for a branch variant, the caller's branch name for an
+		// ordinary download.
 		var urlStr string
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, job, rel)
+			urlStr = lfsURL(cfg.Endpoint, contentJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, job, rel)
+			urlStr = rawURL(cfg.Endpoint, contentJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64
@@ -659,7 +707,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA}, nil
+	return &Plan{Items: items, Commit: commitSHA, CommitResolved: commitResolved}, nil
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the
@@ -1163,16 +1211,64 @@ func isREADMEPath(filePath string) bool {
 	}
 }
 
-// destinationBase returns the base output directory for a job.
+// localDownloadBase returns the destination directory of a local (flat)
+// download.
+//
+// An ordinary download writes into the repository directory; a branch variant
+// writes into the app-owned reserved space. The two never share a
+// constructor, and the reserved-name refusal lives here, in the local
+// download's destination resolver, so the app's own space cannot be
+// rejected by it (see refuseReservedLocalOwner).
+func localDownloadBase(job Job, cfg Settings, space *BranchVariantLocalSpace) (string, error) {
+	if !job.BranchVariant {
+		// The refusal is on the owner component only: the reserved space is
+		// one level deeper than the repository directory, so a repository
+		// whose NAME is the reserved name still lives in its own subtree and
+		// never collides with the space.
+		if err := refuseReservedLocalOwner(localRepoFolder(job)); err != nil {
+			return "", err
+		}
+		return destinationBase(job, cfg)
+	}
+	if space == nil {
+		return "", errors.New("branch variant space is not resolved")
+	}
+	return space.PayloadDir(job.Revision)
+}
+
+// destinationBase returns the base output directory of an ordinary local
+// download.
+//
+// It is a pure path computation: the reserved-name refusal belongs to the
+// local download's destination resolver (see localDownloadBase).
 func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
 	// (e.g. mmproj from a base model saved next to the current model's quants).
-	repoForPath := job.Repo
+	return DestinationBase(cfg.OutputDir, localRepoFolder(job))
+}
+
+// localRepoFolder returns the repository folder a local download writes into:
+// the LocalRepo redirection when it is set, the job's repository otherwise.
+func localRepoFolder(job Job) string {
 	if job.LocalRepo != "" {
-		repoForPath = job.LocalRepo
+		return job.LocalRepo
 	}
-	return DestinationBase(cfg.OutputDir, repoForPath)
+	return job.Repo
+}
+
+// refuseReservedLocalOwner refuses a repository whose owner component is the
+// reserved app-owned branch-variant space name: an ordinary download would
+// then write into the app's own space.
+func refuseReservedLocalOwner(repo string) error {
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return nil
+	}
+	if IsBranchVariantReservedName(owner) {
+		return fmt.Errorf("repository owner %q is reserved for the app's branch-variant storage", owner)
+	}
+	return nil
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

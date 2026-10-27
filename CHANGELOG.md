@@ -4,6 +4,7 @@
 
 ### Added
 
+- Analyze and download EXL2/EXL3 bitrate branch quantizations (for example `4.00bpw` or `4_25`) as whole-branch variants: Model Details lists each branch with its BPW/head bits and recommends one, `POST /api/download` accepts `branchVariant: true` with the branch `revision`, and the downloader stores each `branchVariant` download without writing the shared friendly view, using HF cache blobs plus per-commit snapshots (or, in local mode, an app-owned reserved space `<root>/.hfdesk-branch-variants/<owner>/<repo>/` that holds the branch payload, its completion records and the transient staging area of a transfer, outside the ordinary repository tree, so a repository's own files are never replaced by a branch download). A generic revision download of the same branch remains an ordinary download and keeps the existing friendly-view behavior. `GET /api/cache/{owner}/{repo}?branchVariant=true&revision=...` reports a variant as downloaded only when its completed manifest and every expected file are present (#100).
 
 - Add a service mode: `hfdesk service install|uninstall|start|stop|restart|status` registers HFDesk with the native supervisor of the platform (systemd on Linux, launchd on macOS, the Windows Service Control Manager on Windows). The supervisor owns the lifecycle and HFDesk stays a headless foreground process, the instance resolves deterministic runtime paths of its scope (its own config file, state root and log directory), and it binds loopback by default; exposing it to the network needs an explicit `--listen`. Credentials stay in the service-owned config file and are never written into a supervisor registration (#142).
 
@@ -18,6 +19,7 @@
 
 ### Changed
 
+- A Transformers repository whose `config.json` carries a nested `quantization_config` object is now reported with the same `quantized` projection as a repository that has a root `quantization_config.json`: `GET /api/analyze` fills the projection for it instead of leaving it empty, which is also how the quant method of an EXL branch is discovered (#100).
 - `hfdownloader.PlanRepo` and `hfdownloader.Download` now reject a path-shaped filter combined with `AppendFilterSubdir` (typed `ErrAppendFilterSubdirPathFilter`) before any network or plan work: only single-component group/token filters can name a destination subdirectory. Path filters remain valid with `AppendFilterSubdir` disabled.
 - README rendering and Hugging Face repository-link classification now have a single Go implementation: the bundled UI renders the server-sanitized `html` from `GET /api/readme` and no longer carries a client Markdown renderer or duplicate URL classifier (#135, #147).
 - Remote repository tree paths must now use their canonical spelling: a raw path whose `path.Clean` form differs (for example a `./` segment, duplicate slash, or trailing slash) fails planning with a non-canonical-path error instead of being normalized, so two spellings of one remote file cannot both be planned and race to write a single cache entry.

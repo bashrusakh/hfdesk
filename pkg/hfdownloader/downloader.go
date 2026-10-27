@@ -5,6 +5,8 @@ package hfdownloader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -238,7 +240,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		return err
 	}
 
-	// Apply defaults
 	if job.Revision == "" {
 		job.Revision = "main"
 	}
@@ -288,8 +289,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if err != nil {
 			return fmt.Errorf("create repo dir: %w", err)
 		}
-		if err := repoDir.EnsureDirs(); err != nil {
-			return fmt.Errorf("ensure repo dirs: %w", err)
+		// Branch variants wait until the plan proves a resolved commit before
+		// touching the cache (see the branch-variant block below).
+		if !job.BranchVariant {
+			if err := repoDir.EnsureDirs(); err != nil {
+				return fmt.Errorf("ensure repo dirs: %w", err)
+			}
 		}
 	} else {
 		// Legacy mode: use OutputDir
@@ -297,6 +302,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			cfg.OutputDir = "Storage"
 		}
 	}
+
+	// Branch variants never populate the friendly view: two branches can carry
+	// identical file names with different content, and the friendly view has no
+	// revision dimension. Their isolation comes from blobs + per-commit
+	// snapshots (HF cache) or the app-owned payload directory (local mode).
+	friendlyView := !cfg.NoFriendlyView && !job.BranchVariant
 
 	thresholdBytes, err := parseSizeString(cfg.MultipartThreshold, 256<<20)
 	if err != nil {
@@ -318,6 +329,21 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			}
 			progress(ev)
 		}
+	}
+
+	// failBranchVariant reports a branch-variant failure as the job's outcome.
+	// It is the single reporting path of the branch variant, so both storage
+	// modes report the same failure the same way. The error progress event
+	// carries the message to the UI, and the returned error carries it into
+	// the job's outcome.
+	//
+	// Presence derives downloaded status from the ref and completion manifest,
+	// so a branch variant that cannot publish them (or invalidate a stale
+	// local record) must not report done: that would show a finished job whose
+	// variant is not downloaded.
+	failBranchVariant := func(err error) error {
+		emit(ProgressEvent{Level: "error", Event: "error", Message: err.Error()})
+		return err
 	}
 
 	emit(ProgressEvent{Event: "scan_start", Message: "scanning repo"})
@@ -343,6 +369,68 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.OnPlanComplete(completedPlan)
 	}
 
+	// localSpace is the app-owned reserved space that holds this job's local
+	// branch variant (see BranchVariantLocalSpace). It is resolved once, so
+	// the payload destination, the completion record and the record
+	// invalidation cannot disagree about where the variant lives. It stays nil
+	// in HF-cache mode, where the variant lives in the per-commit snapshot
+	// tree instead.
+	var localSpace *BranchVariantLocalSpace
+
+	if job.BranchVariant {
+		// A branch variant's stored artifact is keyed by the resolved commit:
+		// the HF-cache snapshot tree is snapshots/<commit>/ and the completion
+		// record is keyed by revision and commit. A plan whose revision lookup
+		// failed carries the revision name instead of a commit, so the
+		// artifact would not be keyed by a commit at all, and a revision that
+		// contains a slash would not even be a valid record path.
+		//
+		// The requirement is the same in both storage modes, so the check
+		// lives here, above the mode split: one condition cannot drift
+		// apart from the other. It runs before any filesystem write of the
+		// job — no payload byte, no completion record, no directory creation
+		// and no record invalidation — so a branch variant that cannot be
+		// keyed by a commit leaves nothing behind.
+		if !plan.CommitResolved {
+			return failBranchVariant(fmt.Errorf("branch variant %q requires a resolved commit from the Hub", job.Revision))
+		}
+		if useHFCache {
+			if err := repoDir.EnsureDirs(); err != nil {
+				return fmt.Errorf("ensure repo dirs: %w", err)
+			}
+		} else {
+			// Local mode: the branch variant lives in the app-owned reserved
+			// space under the local root (see BranchVariantLocalSpaceName).
+			//
+			// Local presence derives completion from the revision's completion
+			// records, so a new attempt must invalidate the previous record
+			// before any payload byte changes (see
+			// BranchVariantLocalSpace.InvalidateRecords).
+			//
+			// The job's repository identifies the records: the completion
+			// record names the repository it describes, and a branch variant
+			// rejects a LocalRepo redirection, so the record's repository and
+			// the space agree here.
+			space, err := NewBranchVariantLocalSpace(cfg.OutputDir, job.Repo)
+			if err != nil {
+				return failBranchVariant(fmt.Errorf("resolve branch variant space: %w", err))
+			}
+			localSpace = &space
+			if err := space.InvalidateRecords(job.Revision); err != nil {
+				return failBranchVariant(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
+			}
+			// The transfer stages its bytes in the app-owned staging tree
+			// before it publishes them into the payload directory. The
+			// staging tree is app-owned like the payload and record trees,
+			// so it carries the same per-component check: a symlinked
+			// component would redirect the transfer outside the reserved
+			// space. It is verified before any payload byte is written.
+			if err := space.ensureStagingTree(job.Revision, plan.Commit); err != nil {
+				return failBranchVariant(fmt.Errorf("unsafe branch variant layout: %w", err))
+			}
+		}
+	}
+
 	// Emit ALL plan_item events upfront so TUI knows total size immediately
 	for _, item := range plan.Items {
 		displayRel := item.RelativePath
@@ -355,7 +443,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Ensure destination root exists (only for legacy mode)
 	// HF cache mode already created directories via repoDir.EnsureDirs()
 	if !useHFCache {
-		base, err := destinationBase(job, cfg)
+		base, err := localDownloadBase(job, cfg, localSpace)
 		if err != nil {
 			return err
 		}
@@ -404,25 +492,39 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	var skippedCount int64
 	var downloadedCount int64
 
-	// Build manifest during download (thread-safe)
-	// Manifest is always written unless explicitly disabled with NoManifest
+	// Build manifest during download (thread-safe).
+	// HF cache manifests are written unless explicitly disabled with NoManifest.
+	// A branch variant's completion manifest is its downloaded-status record,
+	// so it is always built.
 	var manifestBuilder *ManifestBuilder
 	var manifestMu sync.Mutex
-	if useHFCache && !cfg.NoManifest {
+	if job.BranchVariant || (!cfg.NoManifest && useHFCache) {
 		manifestBuilder = NewManifestBuilder(job, cfg.Command)
 		manifestBuilder.SetCommit(plan.Commit)
-		// RepoPath describes the selected physical repository, relative to the
-		// friendly root when possible (absolute on different Windows volumes).
-		rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
-		if err != nil {
-			rel = repoDir.Path()
+		if useHFCache {
+			// RepoPath describes the selected physical repository, relative to the
+			// friendly root when possible (absolute on different Windows volumes).
+			rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
+			if err != nil {
+				rel = repoDir.Path()
+			}
+			manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
+		} else {
+			// The completion record describes the local payload tree, not a
+			// repository-relative path (see BranchVariantLocalSpace.PayloadDir).
+			if localSpace == nil {
+				return errors.New("branch variant space is not resolved")
+			}
+			repoPath, err := localSpace.PayloadRepoPath(job.Revision)
+			if err != nil {
+				return fmt.Errorf("branch variant revision %q: %w", job.Revision, err)
+			}
+			manifestBuilder.manifest.RepoPath = repoPath
 		}
-		manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
 	}
 
 LOOP:
 	for _, item := range plan.Items {
-		// Stop scheduling more work once canceled
 		select {
 		case <-jobCtx.Done():
 			break LOOP
@@ -431,7 +533,6 @@ LOOP:
 
 		it := item // capture for goroutine
 
-		// Acquire a slot or abort if canceled
 		select {
 		case lim <- token{}:
 		case <-jobCtx.Done():
@@ -457,10 +558,14 @@ LOOP:
 			}
 
 			var dst string
+			// publishPath is the file's final path in the payload tree. It
+			// differs from dst only for a local branch variant, which stages
+			// the transfer in the commit-scoped staging area and publishes
+			// the verified bytes afterwards.
+			var publishPath string
 			var skipCheck func() (bool, string, error)
 
 			if useHFCache {
-				// HF Cache mode: check blob existence
 				skipCheck = func() (bool, string, error) {
 					if it.SHA256 != "" {
 						status, _, err := repoDir.CheckBlob(it.SHA256)
@@ -468,26 +573,63 @@ LOOP:
 							return false, "", err
 						}
 						if status == BlobComplete {
-							// Blob exists, but ensure snapshot entries are in place
 							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err == nil {
-								if !cfg.NoFriendlyView {
+								if friendlyView {
 									repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
 								}
+							} else if job.BranchVariant {
+								// A branch variant's completion record lists this
+								// file, and presence resolves it through the
+								// branch's own snapshot entry. A missing entry
+								// must fail the job: reporting success would
+								// publish a variant that is not downloaded.
+								return false, "", fmt.Errorf("create branch variant snapshot entry for %s: %w", it.RelativePath, err)
 							}
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
-							return true, "downloading by another process", nil
+							if !job.BranchVariant {
+								return true, "downloading by another process", nil
+							}
+							// A branch variant is complete only when its own
+							// snapshot holds the file, and no snapshot entry
+							// exists for a blob another process is still
+							// fetching. Wait for the shared download to
+							// resolve and materialize the entry instead of
+							// skipping: a skip here would publish a
+							// completion record for a file the branch does
+							// not contain.
+							resolved, err := waitForSharedBlob(fileCtx, repoDir, it.SHA256, branchVariantSharedBlobWaitTimeout)
+							if err != nil {
+								return false, "", fmt.Errorf("wait for shared blob %s: %w", it.SHA256, err)
+							}
+							if resolved != BlobComplete {
+								// The shared download is gone or abandoned:
+								// fetch the file in this job instead.
+								return false, "", nil
+							}
+							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err != nil {
+								return false, "", fmt.Errorf("create branch variant snapshot entry for %s: %w", it.RelativePath, err)
+							}
+							return true, "blob exists", nil
 						}
 					}
 					return false, "", nil
 				}
-				// Download to temp location, will be moved to blob later
-				// Use SHA256 as temp name to avoid collisions (e.g., multiple config.json files)
+				// Download to temp location, will be moved to blob later.
+				// Use SHA256 as temp name to avoid collisions (e.g., multiple
+				// config.json files). Branch variants use a revision- and commit-scoped
+				// name (see branchVariantStagingName) because two variants can be active
+				// at once and may carry identical non-LFS paths with different bytes, so
+				// the legacy tmp-<path> name would let them write the same staging file.
 				tmpName := "tmp-" + it.SHA256
 				if it.SHA256 == "" {
-					// Fallback: sanitize path to avoid collisions
-					tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
+					if job.BranchVariant {
+						tmpName = branchVariantStagingName(job.Revision, plan.Commit, it)
+					} else {
+						// Fallback: sanitize path to avoid collisions
+						tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
+					}
 				}
 				// Guard: SafeJoin so the remote-controlled temp name (SHA256
 				// or path-derived) cannot escape the blobs directory — the
@@ -506,8 +648,7 @@ LOOP:
 				}
 				dst = safeDst
 			} else {
-				// Legacy mode: flat directory structure
-				base, err := destinationBase(job, cfg)
+				base, err := localDownloadBase(job, cfg, localSpace)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %w", err)
 					setFatalErr(fatal)
@@ -519,7 +660,7 @@ LOOP:
 				}
 				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
 				// output directory via path traversal.
-				safeDst, err := SafeJoin(base, finalRel)
+				publishPath, err = SafeJoin(base, finalRel)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
 					setFatalErr(fatal)
@@ -529,9 +670,50 @@ LOOP:
 					}
 					return
 				}
-				dst = safeDst
+				if job.BranchVariant {
+					// The payload directory is keyed by revision only, so a
+					// partial left behind there by an interrupted transfer
+					// belongs to whatever commit that transfer read. Resuming
+					// it after the branch moved would publish a file holding
+					// two commits' bytes. The transfer therefore writes into
+					// the commit-scoped staging path and publishes the
+					// verified bytes into the payload path afterwards.
+					stagingPath, err := localSpace.stagingPath(job.Revision, plan.Commit, finalRel)
+					if err != nil {
+						fatal := fmt.Errorf("resolve branch variant staging path: %w", err)
+						setFatalErr(fatal)
+						select {
+						case errCh <- fatal:
+						default:
+						}
+						return
+					}
+					dst = stagingPath
+				} else {
+					dst = publishPath
+				}
 				skipCheck = func() (bool, string, error) {
-					return shouldSkipLocalCtx(fileCtx, it, dst)
+					if job.BranchVariant {
+						// A branch variant is pinned to the newly planned
+						// commit, so a published file may be reused only
+						// when its content is proven to be that commit's
+						// content: with a known digest the published file's
+						// hash must match it, and without one equal size
+						// proves nothing, so the file is re-fetched. A moved
+						// branch can change a file's bytes while keeping its
+						// length.
+						//
+						// The skip is decided on the published file: it is
+						// the file the variant's payload holds, and its
+						// content hash is what proves it belongs to the
+						// planned commit.
+						return shouldSkipLocalByHashCtx(fileCtx, it, publishPath)
+					}
+					// The ordinary download keeps its own rule: a file with
+					// a known digest is reused only when that digest
+					// matches (LFS files), and every other file is reused
+					// on size equality.
+					return shouldSkipLocalCtx(fileCtx, it, publishPath)
 				}
 			}
 
@@ -543,7 +725,6 @@ LOOP:
 				return
 			}
 
-			// Check if we can skip
 			alreadyOK, reason, err := skipCheck()
 			if err != nil {
 				select {
@@ -559,7 +740,11 @@ LOOP:
 					// Add to manifest (skipped files are still part of the download job)
 					if manifestBuilder != nil {
 						manifestMu.Lock()
-						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+						blobHash := it.SHA256
+						if !useHFCache {
+							blobHash = ""
+						}
+						manifestBuilder.AddFile(it.RelativePath, blobHash, it.Size, it.LFS)
 						manifestMu.Unlock()
 					}
 				}
@@ -586,7 +771,6 @@ LOOP:
 			itForIO := it
 			itForIO.RelativePath = finalRel
 
-			// Choose single/multipart path
 			var dlErr error
 			if it.Size >= thresholdBytes && it.AcceptRanges {
 				dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
@@ -622,7 +806,6 @@ LOOP:
 			// only covers work after every file is done).
 			emit(ProgressEvent{Event: "file_finalizing", Path: finalRel, Message: "verifying"})
 
-			// Verify after download
 			if it.LFS && it.SHA256 != "" {
 				if err := verifySHA256Ctx(fileCtx, dst, it.SHA256); err != nil {
 					downloadLog.Warn("verification failed",
@@ -700,7 +883,7 @@ LOOP:
 			var finalSHA256 string
 			if useHFCache {
 				sha := it.SHA256
-				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.storeDownloadedFileCtx(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, !friendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -710,6 +893,20 @@ LOOP:
 				}
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			} else {
+				if job.BranchVariant {
+					// The verified bytes are published into the payload
+					// directory now: the rename is atomic, so the payload
+					// path never holds a partially written file, and the
+					// payload directory keeps only the variant's own file
+					// names.
+					if err := publishBranchVariantFile(dst, publishPath); err != nil {
+						select {
+						case errCh <- fmt.Errorf("publish branch variant file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
 				finalSHA256 = it.SHA256
 			}
 
@@ -725,7 +922,11 @@ LOOP:
 			// Add to manifest with actual LFS info from API and final SHA256
 			if manifestBuilder != nil {
 				manifestMu.Lock()
-				manifestBuilder.AddFile(it.RelativePath, finalSHA256, it.Size, it.LFS)
+				blobHash := finalSHA256
+				if !useHFCache {
+					blobHash = ""
+				}
+				manifestBuilder.AddFile(it.RelativePath, blobHash, it.Size, it.LFS)
 				manifestMu.Unlock()
 			}
 
@@ -775,40 +976,64 @@ LOOP:
 	// script, manifest) can take a while — copying the friendly view on
 	// filesystems without symlink support is the slow part — so signal the
 	// phase to the UI instead of leaving the job stuck at 100%.
-	if useHFCache && repoDir != nil && !cfg.NoFriendlyView {
+	if useHFCache && repoDir != nil && friendlyView {
 		emit(ProgressEvent{Event: "finalizing", Message: "finalizing"})
 	}
 
 	// For HF Cache mode: write ref file and ensure friendly directory exists
 	if useHFCache && repoDir != nil {
-		// Write refs/main (or the revision used)
 		ref := job.Revision
 		if ref == "" {
 			ref = "main"
 		}
 		if err := repoDir.WriteRef(ref, plan.Commit); err != nil {
+			if job.BranchVariant {
+				return failBranchVariant(fmt.Errorf("write ref %q: %w", ref, err))
+			}
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write ref: %v", err)})
 		}
 		// Ensure friendly directory structure exists (unless disabled)
-		if !cfg.NoFriendlyView {
+		if friendlyView {
 			if err := repoDir.EnsureFriendlyDir(); err != nil {
 				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to create friendly dir: %v", err)})
 			}
 		}
 	}
 
-	// Write/update the rebuild shell script if using HF cache (unless friendly view disabled)
-	if hfCache != nil && !cfg.NoFriendlyView {
+	if hfCache != nil && friendlyView {
 		if _, err := hfCache.WriteRebuildScript(); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write rebuild script: %v", err)})
 		}
 	}
 
-	// Write manifest file (hfd.yaml) if using HF cache (unless friendly view disabled)
-	if manifestBuilder != nil && repoDir != nil && !cfg.NoFriendlyView {
+	if manifestBuilder != nil && repoDir != nil && friendlyView {
 		manifest := manifestBuilder.Build()
 		if _, err := manifest.Write(repoDir.FriendlyPath()); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", err)})
+		}
+	}
+
+	// A branch variant's completion manifest is the downloaded-status record
+	// for exactly this revision/commit; it is never written for an ordinary
+	// download. The path is keyed by revision and commit, so branches that
+	// share a commit keep distinct records.
+	if job.BranchVariant {
+		manifest := manifestBuilder.Build()
+		var manifestDir string
+		var err error
+		if useHFCache {
+			manifestDir, err = BranchVariantManifestDir(repoDir, job.Revision, plan.Commit)
+		} else {
+			if localSpace == nil {
+				return failBranchVariant(errors.New("branch variant space is not resolved"))
+			}
+			manifestDir, err = localSpace.RecordDir(job.Revision, plan.Commit)
+		}
+		if err == nil {
+			_, err = manifest.Write(manifestDir)
+		}
+		if err != nil {
+			return failBranchVariant(fmt.Errorf("write branch variant completion manifest: %w", err))
 		}
 	}
 
@@ -822,6 +1047,98 @@ LOOP:
 		"skipped", skippedCount,
 	)
 	return nil
+}
+
+// branchVariantStagingName returns the blobs-directory staging name for one
+// branch-variant file. A content SHA already names the bytes uniquely; a
+// file without one has no such name, so the staging name is derived from the
+// identity of the download: the revision the job reads, the commit that
+// revision resolved to, and the file's full relative path.
+//
+// The revision is folded into the digest rather than inserted into the name:
+// it is remote-controlled, can be long, and can contain a separator (an EXL
+// branch such as "exl/4_25"), so it must not become a path component. The
+// relative path is hashed as well, rather than having "/" replaced with "_",
+// so distinct paths such as a/b_c and a_b/c keep separate staging files.
+//
+// Folding the revision in is what keeps two branch variants of one repository
+// apart when they resolve to the same commit: the commit and the path are
+// identical for them, so without the revision they would share one staging
+// file and write into it concurrently. The result is one hex-only path
+// component (plus the commit, which a branch variant's resolved-commit check
+// has already constrained to a plain name) that SafeJoin can join under
+// blobs/.
+func branchVariantStagingName(revision, commit string, item PlanItem) string {
+	if item.SHA256 != "" {
+		return "tmp-" + item.SHA256
+	}
+	sum := sha256.Sum256([]byte(revision + "\x00" + item.RelativePath))
+	return "tmp-" + commit + "-" + hex.EncodeToString(sum[:])
+}
+
+// publishBranchVariantFile moves the verified staging file at src into the
+// variant's payload path at dst.
+//
+// The rename is atomic, so the payload path never holds a partially written
+// file: a reader sees either the previous file or the complete new one. The
+// destination directory is created first, because the repository's own file
+// names decide how deep the payload tree is.
+//
+// The staging file is bound to one commit (see BranchVariantLocalSpace), so
+// the bytes published here are the bytes of the planned commit and of no
+// other.
+func publishBranchVariantFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
+// branchVariantSharedBlobWaitTimeout bounds how long a branch-variant file
+// waits for another process's in-flight download of the same
+// content-addressed blob to resolve. The bound is generous because the shared
+// download may be a multi-gigabyte model, but it is finite: a wait that never
+// ends would keep the job alive indefinitely.
+const branchVariantSharedBlobWaitTimeout = 30 * time.Minute
+
+// branchVariantSharedBlobPollInterval is how often the wait re-checks the
+// shared blob's state.
+const branchVariantSharedBlobPollInterval = 250 * time.Millisecond
+
+// waitForSharedBlob waits for another process's in-flight download of the
+// content-addressed blob sha to resolve and reports the resulting status.
+//
+// The wait ends when the shared download publishes the blob (BlobComplete),
+// when the shared download is gone or abandoned (BlobMissing or BlobStale, so
+// the caller must fetch the file itself), when ctx is done (the job was
+// paused, cancelled, or shut down), or when the timeout expires. Every
+// non-resolving outcome is an error or a "fetch it yourself" answer, never a
+// success: a wait that cannot finish must not become a completed file.
+func waitForSharedBlob(ctx context.Context, repoDir *RepoDir, sha string, timeout time.Duration) (BlobStatus, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		status, _, err := repoDir.CheckBlob(sha)
+		if err != nil {
+			return BlobMissing, err
+		}
+		if status != BlobDownloading {
+			return status, nil
+		}
+		wait := branchVariantSharedBlobPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			return BlobDownloading, fmt.Errorf("timed out after %s waiting for another process to finish downloading blob %s", timeout, sha)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return BlobDownloading, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // cleanupPartialsOnCancel removes partial download artifacts (.part,
@@ -1390,7 +1707,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
-	// Plan parts
 	n := cfg.Concurrency
 	chunk := it.Size / int64(n)
 	if chunk <= 0 {
@@ -1407,7 +1723,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
 	}
 
-	// Download parts in parallel
 	var wg sync.WaitGroup
 	errCh := make(chan error, n)
 
@@ -1462,7 +1777,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 				return
 			}
 			pos := fi.Size()
-			// Already fully downloaded.
 			if pos == expected {
 				return
 			}

@@ -82,6 +82,12 @@ func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
 // job; with ctx it aborts promptly. Successful skip behavior is unchanged: a
 // cancelled ctx returns ctx.Err() so the caller surfaces the cancellation
 // instead of skipping.
+//
+// This is the ordinary download's rule and it is unchanged: a file with a
+// known digest is reused only when that digest matches (LFS files), and every
+// other file is reused on size equality. A branch variant has a stricter rule,
+// because it is pinned to a commit (see shouldSkipLocalByHashCtx); both rules
+// share the hash comparison (skipLocalByHashCtx), so they cannot drift apart.
 func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
 	fi, err := os.Stat(dst)
 	if err != nil {
@@ -96,14 +102,7 @@ func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, str
 
 	// LFS with known sha: compute and compare
 	if it.LFS && it.SHA256 != "" {
-		if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
-			return true, "sha256 match", nil
-		} else if verr := ctx.Err(); verr != nil {
-			// Cancelled mid-verify: surface the cancellation, do not skip.
-			return false, "", verr
-		}
-		// size matched but sha mismatched -> re-download
-		return false, "", nil
+		return skipLocalByHashCtx(ctx, it, dst)
 	}
 
 	// Non-LFS (or unknown sha): size match is sufficient
@@ -111,5 +110,54 @@ func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, str
 		return true, "size match", nil
 	}
 
+	return false, "", nil
+}
+
+// shouldSkipLocalByHashCtx is the branch variant's rule, bounded by ctx.
+//
+// A branch variant is pinned to the commit its plan resolved, so a published
+// file may be reused only when its content is proven to be that commit's
+// content: a plan item with a known digest is compared by hash, and a plan
+// item without one is re-fetched, because equal size proves nothing. A moved
+// branch can change a file's bytes while keeping its length.
+//
+// The hash comparison is the shared piece with the ordinary rule
+// (skipLocalByHashCtx), so the two rules cannot disagree about what "the
+// content matches" means, and the reason a hash-verified skip reports is the
+// one the ordinary path has always reported.
+func shouldSkipLocalByHashCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
+	if it.SHA256 == "" {
+		// Equal size proves nothing for a pinned commit: re-fetch the file.
+		return false, "", nil
+	}
+	// A size mismatch is decisive on its own: the file cannot hold the
+	// planned content, so there is nothing to compare.
+	if it.Size > 0 {
+		fi, err := os.Stat(dst)
+		if err != nil {
+			// no file
+			return false, "", nil
+		}
+		if fi.Size() != it.Size {
+			return false, "", nil
+		}
+	}
+	return skipLocalByHashCtx(ctx, it, dst)
+}
+
+// skipLocalByHashCtx reports whether the file at dst holds exactly the
+// content the plan item describes, proven by comparing the file's SHA-256
+// with the plan item's digest.
+//
+// It is the single owner of the hash comparison of a local skip, so the
+// ordinary rule and the branch variant's rule cannot drift apart.
+func skipLocalByHashCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
+	if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
+		return true, "sha256 match", nil
+	} else if verr := ctx.Err(); verr != nil {
+		// Cancelled mid-verify: surface the cancellation, do not skip.
+		return false, "", verr
+	}
+	// size matched but sha mismatched -> re-download
 	return false, "", nil
 }

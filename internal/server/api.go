@@ -22,8 +22,6 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
 
-// --- Handlers ---
-
 // Version is the application version reported by the API and shown in the web
 // UI. main() sets it from the build-time version, so bumping VERSION and
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
@@ -62,13 +60,11 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate
 	if req.Repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing required field: repo", "")
 		return
 	}
 
-	// Parse filters from repo:filter syntax
 	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
 		parts := strings.SplitN(req.Repo, ":", 2)
 		req.Repo = parts[0]
@@ -86,14 +82,16 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
+		return
+	}
 
-	// If dry-run, return the plan
 	if req.DryRun {
 		s.handlePlanInternal(w, req)
 		return
 	}
 
-	// Create and start the job (or return existing if duplicate)
 	job, wasExisting, err := s.jobs.CreateJob(req)
 	if err != nil {
 		if errors.Is(err, errInvalidDestination) {
@@ -112,15 +110,12 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return appropriate status
 	if wasExisting {
-		// Job already exists for this repo - return it with 200
 		writeJSON(w, http.StatusOK, map[string]any{
 			"job":     job,
 			"message": "Download already in progress",
 		})
 	} else {
-		// New job created
 		writeJSON(w, http.StatusAccepted, job)
 	}
 }
@@ -147,7 +142,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		return
 	}
 
-	// Parse filters from repo:filter syntax
 	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
 		parts := strings.SplitN(req.Repo, ":", 2)
 		req.Repo = parts[0]
@@ -165,8 +159,11 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	if revision == "" {
 		revision = "main"
 	}
+	if err := validateBranchVariantRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
+		return
+	}
 
-	// Create job for scanning
 	dlJob := hfdownloader.Job{
 		Repo:               req.Repo,
 		Revision:           revision,
@@ -175,6 +172,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		Excludes:           req.Excludes,
 		ExactMatch:         req.ExactMatch,
 		AppendFilterSubdir: req.AppendFilterSubdir,
+		BranchVariant:      req.BranchVariant,
 	}
 
 	// Take a snapshot of the server config; every read below uses it
@@ -195,7 +193,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		Proxy:     cfg.Proxy,
 	}
 
-	// Collect plan items
 	var files []PlanFile
 	var totalSize int64
 
@@ -210,12 +207,9 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		}
 	}
 
-	// Run in dry-run mode (plan only)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// We need to get the plan - use a modified Run that returns early
-	// For now, we'll scan the repo manually
 	err := hfdownloader.ScanPlan(ctx, dlJob, settings, progressFunc)
 	if err != nil {
 		// A filtered request whose filters matched no file is a client-side
@@ -597,7 +591,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			if req.Proxy.InsecureSkipVerify != nil {
 				newProxy.InsecureSkipVerify = *req.Proxy.InsecureSkipVerify
 			}
-			// Clear proxy if URL is empty, otherwise swap in the new struct.
 			if newProxy.URL == "" {
 				c.Proxy = nil
 			} else {
@@ -627,7 +620,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// re-runs the scheduler, so a raised max-active starts queued jobs now.
 	s.jobs.UpdateConfig(finalCfg)
 
-	// Persist settings to config file
 	retries := finalCfg.Retries
 	fileCfg := &ConfigFile{
 		CacheDir:           finalCfg.CacheDir,
@@ -643,7 +635,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Endpoint:           finalCfg.Endpoint,
 		DownloadRoutes:     finalCfg.DownloadRoutes,
 	}
-	// Add proxy to config file if set
 	if finalCfg.Proxy != nil {
 		fileCfg.Proxy = &ProxyConfig{
 			URL:                finalCfg.Proxy.URL,
@@ -675,11 +666,8 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- Smart Analyzer ---
-
 // handleAnalyze analyzes a HuggingFace repository.
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
-	// Get repo from path (supports owner/name format)
 	repo := r.PathValue("repo")
 	if repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/analyze/owner/name")
@@ -716,13 +704,11 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get revision (defaults to "main")
 	revision := query.Get("revision")
 	if revision == "" {
 		revision = "main"
 	}
 
-	// Create analyzer
 	cfg := s.snapshotConfig()
 	client, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
 	if err != nil {
@@ -736,7 +722,6 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 	analyzer := smartdl.NewAnalyzer(opts)
 
-	// Analyze with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
@@ -882,8 +867,6 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "README not found", "")
 }
 
-// --- Cache Browser ---
-
 // CachedRepoInfo represents a cached repository for the API response.
 type CachedRepoInfo struct {
 	Repo           string           `json:"repo"`
@@ -950,6 +933,14 @@ type localCacheRoot struct {
 
 // skipsOwner applies the root's exclusion policy only to a top-level owner.
 func (root localCacheRoot) skipsOwner(owner string) bool {
+	// The app-owned branch-variant space is a reserved top-level entry of
+	// EVERY local root, not only of the HF cache root: it holds the
+	// branch-variant payloads and completion records, not repositories. It is
+	// skipped wherever a local root's top level is walked, so it is never
+	// reported as an owner.
+	if hfdownloader.IsBranchVariantReservedName(owner) {
+		return true
+	}
 	if root.SkipSpecial {
 		switch strings.ToLower(owner) {
 		case "hub", "models", "datasets", "blobs", "snapshots", "refs":
@@ -1406,7 +1397,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 	cfg := s.snapshotConfig()
 	cacheDir := cfg.cacheRoot()
 
-	// Get query params
 	repoType := r.URL.Query().Get("type") // "model" or "dataset"
 	search := strings.ToLower(r.URL.Query().Get("search"))
 
@@ -1425,7 +1415,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		rdType := string(rd.Type())
 		repoID := rd.RepoID()
 
-		// Filter by type if specified
 		if repoType != "" {
 			if repoType == "dataset" && rdType != "dataset" {
 				continue
@@ -1435,12 +1424,10 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Filter by search term
 		if search != "" && !strings.Contains(strings.ToLower(repoID), search) {
 			continue
 		}
 
-		// Get size by walking blobs directory
 		blobsDir := rd.BlobsDir()
 		var totalSize int64
 		var fileCount int
@@ -1452,7 +1439,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 
-		// Update stats
 		if rdType == "model" {
 			stats.TotalModels++
 		} else {
@@ -1461,30 +1447,25 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		stats.TotalSize += totalSize
 		stats.TotalFiles += fileCount
 
-		// Try to read commit from refs/main
 		branch := "main"
 		commit, _ := rd.ReadRef("main")
 		if commit == "" {
-			// Try other common refs
 			commit, _ = rd.ReadRef("master")
 			if commit != "" {
 				branch = "master"
 			}
 		}
 
-		// Get modification time from blobs dir
 		var downloaded string
 		if info, err := os.Stat(blobsDir); err == nil {
 			downloaded = info.ModTime().Format("2006-01-02")
 		}
 
-		// Try to read manifest from friendly path
 		var manifest *ManifestInfo
 		var downloadStatus string
 		friendlyPath := rd.FriendlyPath()
 		manifestPath := filepath.Join(friendlyPath, hfdownloader.ManifestFilename)
 		if m, err := hfdownloader.ReadManifest(manifestPath); err == nil && manifestBelongsToRepo(cache, rd, m) {
-			// Parse command for filter flags
 			isFiltered, filters := parseCommandFilters(m.Command)
 
 			manifest = &ManifestInfo{
@@ -1497,7 +1478,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 				IsFiltered: isFiltered,
 				Filters:    filters,
 			}
-			// Override with manifest data if available
 			if m.Branch != "" {
 				branch = m.Branch
 			}
@@ -1506,7 +1486,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			}
 			downloaded = m.CompletedAt.Format("2006-01-02")
 
-			// Set download status based on manifest
 			if isFiltered {
 				downloadStatus = "filtered"
 			} else {
@@ -1517,7 +1496,6 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 			downloadStatus = "unknown"
 		}
 
-		// Shorten commit hash
 		shortCommit := commit
 		if len(shortCommit) > 7 {
 			shortCommit = shortCommit[:7]
@@ -1586,6 +1564,10 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 
 // handleCacheInfo returns details about a specific cached repository.
 func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("branchVariant") == "true" {
+		s.handleBranchVariantPresence(w, r)
+		return
+	}
 	repo := r.PathValue("repo")
 	if repo == "" {
 		writeError(w, http.StatusBadRequest, "Missing repository", "Format: /api/cache/owner/name")
@@ -1617,7 +1599,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 
 	// Preserve the legacy untyped model-then-dataset lookup. Explicit type is authoritative.
 	if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) && !suppliedType {
-		// Try as dataset
 		repoDir, _ = cache.Repo(repo, hfdownloader.RepoTypeDataset)
 		if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
 			localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, repo, true)
@@ -1640,17 +1621,14 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get snapshots
 	snapshots, _ := repoDir.ListSnapshots()
 
-	// Get size and file list by walking blobs directory
 	blobsDir := repoDir.BlobsDir()
 	var totalSize int64
 	var files []CachedFileInfo
 
 	// If we have snapshots, walk the latest one to get file names
 	if len(snapshots) > 0 {
-		// Use the first snapshot (usually the most recent)
 		snapshotDir, sderr := repoDir.SnapshotDir(snapshots[0])
 		if sderr != nil {
 			writeError(w, http.StatusBadRequest, "Invalid snapshot", sderr.Error())
@@ -1660,7 +1638,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			if err != nil || info.IsDir() {
 				return nil
 			}
-			// Get actual size by following symlink to blob
 			realPath, err := filepath.EvalSymlinks(path)
 			if err != nil {
 				return nil
@@ -1680,7 +1657,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 	} else {
-		// No snapshots, just count blobs
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
 				totalSize += info.Size()
@@ -1695,7 +1671,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Try to read commit and branch
 	branch := "main"
 	commit, _ := repoDir.ReadRef("main")
 	if commit == "" {
@@ -1705,13 +1680,11 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Try to read manifest
 	var manifest *ManifestInfo
 	var downloadStatus string
 	friendlyPath := repoDir.FriendlyPath()
 	manifestPath := filepath.Join(friendlyPath, hfdownloader.ManifestFilename)
 	if m, err := hfdownloader.ReadManifest(manifestPath); err == nil && manifestBelongsToRepo(cache, repoDir, m) {
-		// Parse command for filter flags
 		isFiltered, filters := parseCommandFilters(m.Command)
 
 		manifest = &ManifestInfo{
@@ -1731,7 +1704,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			commit = m.Commit
 		}
 
-		// Set download status based on manifest
 		if isFiltered {
 			downloadStatus = "filtered"
 		} else {
@@ -1799,7 +1771,6 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	// Parse options from request body
 	var req struct {
 		Clean bool `json:"clean"` // Remove orphaned symlinks
 	}
@@ -2074,7 +2045,6 @@ func parseCommandFilters(command string) (bool, string) {
 	filters := ""
 	isFiltered := false
 
-	// Split command into parts (respecting quotes)
 	parts := splitCommand(command)
 
 	for i := 0; i < len(parts); i++ {
