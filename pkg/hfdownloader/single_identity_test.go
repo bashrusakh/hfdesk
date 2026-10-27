@@ -458,7 +458,7 @@ func TestDownloadSinglePlanWithCollidingStagingNamesPublishesExactBytes(t *testi
 		t.Fatalf("Download: %v", err)
 	}
 
-	repoDir, err := NewHFCache(cacheDir, 0).Repo("o/r", RepoTypeModel)
+	repoDir, err := NewHFCache(cacheDir).Repo("o/r", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -569,7 +569,10 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   current-version mutators and makes the gate intra-item state. The staging
   record is diagnostics/resume state, not a freshness-based ownership lease:
   it is not rewritten on a timer, and record age is never an ownership signal.
-  Ownership is the destination domain plus `LockFenced`.
+  Ownership is the destination domain plus `LockFenced`. The former age-based
+  configuration (`Settings.StaleTimeout`, `HFCache.StaleTimeout` and
+  `DefaultStaleTimeout`) has been removed; do not reintroduce an age-based
+  timeout, lease or takeover input.
   Never recover a transition by age or unlink a lock that a suspended holder may
   still own. Re-read claim identity before mutation; cleanup and publish require
   the held domain, and publish checks cancellation immediately before
@@ -666,7 +669,12 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   therefore not inheritable: the safe direction, and no released version ever
   wrote these records. A pinned, matching record keeps its resume exactly as
   before: only the missing bytes are re-fetched. The two routes consult ONE
-  shared rule, so they cannot drift apart.
+  shared identity rule: each persisted record exposes its object identity as
+  the same in-memory `resumeIdentity` value, and both compare it with the single
+  `matches` rule, so the routes cannot drift apart while the version-1
+  `<dst>.part.meta` sidecar and the version-4 ranged record keep their own
+  formats, versions and lifecycle fields. Do not merge the two records to share
+  the rule.
 - STAGING ARTIFACTS AND PUBLISHED CONTENT ARE SEPARATED BY ONE EXHAUSTIVE
   CLASSIFIER. The downloader creates: the single-request staging name
   `tmp-<name>` (including the path-derived `tmp-path-<sanitized path>` form)

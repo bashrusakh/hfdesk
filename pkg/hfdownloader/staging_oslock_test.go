@@ -59,7 +59,7 @@ func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
-	cache := NewHFCache(t.TempDir(), time.Minute)
+	cache := NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/name", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +305,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	}
 	// Deliberately age the payload and record: an age-based model would call
 	// this owner stale. Only the OS ownership lock keeps ownership here.
-	past := time.Now().Add(-2 * DefaultStaleTimeout)
+	past := time.Now().Add(-2 * time.Hour)
 	for _, p := range []string{cfg.Staging, metaPath} {
 		if err := os.Chtimes(p, past, past); err != nil {
 			writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
@@ -433,8 +433,9 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Pre-condition: the record is already older than the cache's stale
-	// timeout; its timestamp cannot grant another process ownership.
+	// Pre-condition: the record is already old enough that an age-based model
+	// would call it stale; its timestamp cannot grant another process
+	// ownership.
 	metaBefore, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("helper record: %v", err)
@@ -443,8 +444,8 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	if statErr != nil {
 		t.Fatalf("helper record stat: %v", statErr)
 	}
-	if age := time.Since(metaInfo.ModTime()); age < DefaultStaleTimeout {
-		t.Fatalf("the helper record must look stale to an age-based model (age=%v, timeout=%v)", age, DefaultStaleTimeout)
+	if age := time.Since(metaInfo.ModTime()); age < time.Hour {
+		t.Fatalf("the helper record must look stale to an age-based model (age=%v)", age)
 	}
 	var beforeMeta IncompleteMeta
 	if err := json.Unmarshal(metaBefore, &beforeMeta); err != nil {

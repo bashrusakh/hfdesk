@@ -26,14 +26,7 @@ type HFCache struct {
 	// Root is the cache root directory (e.g., ~/.cache/huggingface)
 	Root   string
 	hubDir string // Resolved once; never reinterpret ambient ENV in accessors.
-
-	// StaleTimeout is the duration after which an .incomplete file
-	// with no writes is considered stale and can be taken over.
-	StaleTimeout time.Duration
 }
-
-// DefaultStaleTimeout is the default timeout for stale .incomplete files.
-const DefaultStaleTimeout = 5 * time.Minute
 
 // DefaultCacheDir returns the default HuggingFace cache directory.
 // Priority: HF_HOME env > ~/.cache/huggingface
@@ -50,11 +43,11 @@ func DefaultCacheDir() string {
 
 // NewHFCache creates a new HFCache with the given root directory.
 // If root is empty, it uses DefaultCacheDir().
-func NewHFCache(root string, staleTimeout time.Duration) *HFCache {
+func NewHFCache(root string) *HFCache {
 	if root == "" {
 		root = DefaultCacheDir()
 	}
-	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"), staleTimeout)
+	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"))
 }
 
 // rootedOrFallback returns p when p is a rooted (absolute) filesystem path
@@ -72,7 +65,7 @@ func rootedOrFallback(p, fallback string) string {
 // NewHFCacheResolved constructs a cache from an already selected root/Hub
 // association without consulting ENV. An empty hubDir means root/hub.
 // Callers freezing destinations must supply the resolved nonempty root.
-func NewHFCacheResolved(root, hubDir string, staleTimeout time.Duration) *HFCache {
+func NewHFCacheResolved(root, hubDir string) *HFCache {
 	// Cache instances carry physical paths, not paths that can silently change
 	// meaning if the caller later changes its working directory.
 	if absolute, err := filepath.Abs(root); err == nil {
@@ -90,13 +83,9 @@ func NewHFCacheResolved(root, hubDir string, staleTimeout time.Duration) *HFCach
 		hubDir = absolute
 	}
 	hubDir = rootedOrFallback(hubDir, filepath.Join(root, "hub"))
-	if staleTimeout == 0 {
-		staleTimeout = DefaultStaleTimeout
-	}
 	return &HFCache{
-		Root:         root,
-		hubDir:       hubDir,
-		StaleTimeout: staleTimeout,
+		Root:   root,
+		hubDir: hubDir,
 	}
 }
 

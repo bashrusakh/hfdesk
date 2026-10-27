@@ -228,7 +228,7 @@ type twoWriterOutcome struct {
 // about the live state and not about the residue.
 func runTwoWriters(t *testing.T, hub *twoWriterHub, cacheDir, sha string, streams publicationStreams) twoWriterOutcome {
 	t.Helper()
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestConcurrentBlobPublicationKeepsTheProvenDigest(t *testing.T) {
 	if got := singleTestSHA(out.blob); got != sha {
 		t.Errorf("the published blob hashes to %s, want %s", got, sha)
 	}
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

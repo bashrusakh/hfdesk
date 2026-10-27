@@ -89,7 +89,7 @@ func runOwnershipContractDownload(ctx context.Context, cfg Settings) ownershipCo
 // ownershipContractRepo builds the cache repository of the contract cases.
 func ownershipContractRepo(t *testing.T, cacheDir string) *RepoDir {
 	t.Helper()
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

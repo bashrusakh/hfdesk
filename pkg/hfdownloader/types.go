@@ -4,7 +4,6 @@
 package hfdownloader
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -166,12 +165,6 @@ type Settings struct {
 	// HubDir freezes the exact Hub storage directory when nonempty. Empty
 	// retains normal ENV resolution at cache construction, even with CacheDir.
 	HubDir string
-
-	// StaleTimeout is the duration after which an incomplete download
-	// with no writes is considered stale and can be taken over by
-	// another process. Accepts duration strings: "5m", "10m", "1h".
-	// If empty, defaults to "5m".
-	StaleTimeout string
 
 	// OutputDir is DEPRECATED. Use CacheDir instead.
 	// If set, falls back to legacy flat directory structure for compatibility.
@@ -482,7 +475,6 @@ type ProgressFunc func(ProgressEvent)
 func DefaultSettings() Settings {
 	return Settings{
 		CacheDir:           "", // Empty = use DefaultCacheDir()
-		StaleTimeout:       "5m",
 		Concurrency:        8,
 		MaxActiveDownloads: 4,
 		MultipartThreshold: "256MiB",
@@ -497,20 +489,12 @@ func DefaultSettings() Settings {
 // BuildHFCache creates an HFCache from Settings.
 // This is the recommended way to get a cache instance.
 func (s Settings) BuildHFCache() (*HFCache, error) {
-	staleTimeout := DefaultStaleTimeout
-	if s.StaleTimeout != "" {
-		var err error
-		staleTimeout, err = time.ParseDuration(s.StaleTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid stale-timeout %q: %w", s.StaleTimeout, err)
-		}
-	}
 	if s.HubDir != "" {
 		root := s.CacheDir
 		if root == "" {
 			root = DefaultCacheDir()
 		}
-		return NewHFCacheResolved(root, s.HubDir, staleTimeout), nil
+		return NewHFCacheResolved(root, s.HubDir), nil
 	}
-	return NewHFCache(s.CacheDir, staleTimeout), nil
+	return NewHFCache(s.CacheDir), nil
 }

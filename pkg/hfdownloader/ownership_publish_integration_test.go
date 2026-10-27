@@ -409,7 +409,7 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	// so both same-SHA paths WAIT for the domain while the blob is still
 	// absent. Under the one-destination-domain model the domain IS the
 	// ownership fence; the record needs no separate claim to block them.
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +620,7 @@ func TestDownloadUnknownSizeLFSStoresSinglePathFallbackCorrectly(t *testing.T) {
 				t.Fatalf("unknown-size known-digest verification performed %d passes, want one", hashPassCount.Load())
 			}
 
-			repo, rerr := NewHFCache(cacheDir, DefaultStaleTimeout).Repo(job.Repo, RepoTypeModel)
+			repo, rerr := NewHFCache(cacheDir).Repo(job.Repo, RepoTypeModel)
 			if rerr != nil {
 				t.Fatal(rerr)
 			}

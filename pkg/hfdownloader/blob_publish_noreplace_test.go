@@ -66,7 +66,7 @@ func forceUnsupportedHardLinks(t *testing.T) {
 // newPublicationRepo creates an HF cache repo with its directories.
 func newPublicationRepo(t *testing.T) *RepoDir {
 	t.Helper()
-	repo, err := NewHFCache(t.TempDir(), time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(t.TempDir()).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *test
 		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)
 	}
 
-	repo, rerr := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, rerr := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
@@ -471,7 +471,7 @@ func TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock(t *testin
 		t.Errorf("the single-request route transferred the file %d times although the ownership lock was denied", n)
 	}
 
-	repo, rerr := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, rerr := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
@@ -497,7 +497,7 @@ func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.
 	cacheDir := t.TempDir()
 	hub, served := newPlainHub(t, total, sha, body)
 
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +547,7 @@ func TestPublishedBlobSurvivesTheDomainExclusiveTierEndToEnd(t *testing.T) {
 		t.Fatalf("the download failed: %v", err)
 	}
 
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

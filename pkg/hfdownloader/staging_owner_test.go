@@ -197,7 +197,7 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 // same-host process death can be proven.
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, time.Minute)
+	cache := NewHFCache(tmpDir)
 	repo, err := cache.Repo("owner/name", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

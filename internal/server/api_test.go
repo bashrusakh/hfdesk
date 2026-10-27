@@ -764,7 +764,7 @@ func TestAPI_CacheHFFriendlyMetadata_Ownership(t *testing.T) {
 			}
 			t.Run(string(repoType)+"/"+tc.name, func(t *testing.T) {
 				base := t.TempDir()
-				cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"), 0)
+				cache := hfdownloader.NewHFCache(filepath.Join(base, "cache"))
 				parent, err := cache.Repo("parent/real", repoType)
 				if err != nil {
 					t.Fatal(err)
@@ -888,7 +888,7 @@ func TestAPI_CacheHFFriendlyMetadata_NoProjection(t *testing.T) {
 	t.Setenv("HF_HUB_CACHE", "")
 	for _, repoType := range []hfdownloader.RepoType{hfdownloader.RepoTypeModel, hfdownloader.RepoTypeDataset} {
 		t.Run(string(repoType), func(t *testing.T) {
-			cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+			cache := hfdownloader.NewHFCache(t.TempDir())
 			parent, err := cache.Repo("parent/real", repoType)
 			if err != nil {
 				t.Fatal(err)
@@ -921,7 +921,7 @@ func TestAPI_CacheHFFriendlyMetadata_ConfigSnapshot(t *testing.T) {
 		t.Skip("production HF projection helpers do not create symlinks on Windows")
 	}
 	t.Setenv("HF_HUB_CACHE", "")
-	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	cache := hfdownloader.NewHFCache(t.TempDir())
 	parent, err := cache.Repo("parent/real", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

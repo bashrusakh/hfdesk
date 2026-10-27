@@ -89,7 +89,7 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
-			repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+			repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
@@ -79,7 +78,7 @@ func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
 		return syscall.Flock(fd, how)
 	}
 
-	cache := NewHFCache(t.TempDir(), time.Minute)
+	cache := NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/repo", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

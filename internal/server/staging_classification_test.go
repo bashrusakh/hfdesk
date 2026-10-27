@@ -257,7 +257,7 @@ func TestStagingArtifactsDoNotAffectTheDeletionPath(t *testing.T) {
 	hub := filepath.Join(root, "hub")
 	stagingFixtureRepo(t, hub)
 
-	cache := hfdownloader.NewHFCache(root, 0)
+	cache := hfdownloader.NewHFCache(root)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -303,7 +303,7 @@ func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
 	cacheRoot := t.TempDir()
 	hub := filepath.Join(cacheRoot, "hub")
 
-	cache := hfdownloader.NewHFCache(cacheRoot, 0)
+	cache := hfdownloader.NewHFCache(cacheRoot)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

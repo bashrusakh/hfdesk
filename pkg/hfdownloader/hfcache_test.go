@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestDefaultCacheDir(t *testing.T) {
@@ -39,30 +38,16 @@ func TestDefaultCacheDir(t *testing.T) {
 
 func TestNewHFCache(t *testing.T) {
 	t.Run("empty root uses default", func(t *testing.T) {
-		cache := NewHFCache("", 0)
+		cache := NewHFCache("")
 		if cache.Root == "" {
 			t.Error("cache.Root should not be empty when passing empty string")
 		}
 	})
 
 	t.Run("custom root", func(t *testing.T) {
-		cache := NewHFCache("/my/cache", 0)
+		cache := NewHFCache("/my/cache")
 		if cache.Root != "/my/cache" {
 			t.Errorf("cache.Root = %q, want /my/cache", cache.Root)
-		}
-	})
-
-	t.Run("default stale timeout", func(t *testing.T) {
-		cache := NewHFCache("/test", 0)
-		if cache.StaleTimeout != DefaultStaleTimeout {
-			t.Errorf("StaleTimeout = %v, want %v", cache.StaleTimeout, DefaultStaleTimeout)
-		}
-	})
-
-	t.Run("custom stale timeout", func(t *testing.T) {
-		cache := NewHFCache("/test", 10*time.Minute)
-		if cache.StaleTimeout != 10*time.Minute {
-			t.Errorf("StaleTimeout = %v, want 10m", cache.StaleTimeout)
 		}
 	})
 }
@@ -73,7 +58,7 @@ func TestHFCache_Directories(t *testing.T) {
 		defer os.Setenv("HF_HUB_CACHE", origHFHubCache)
 		os.Unsetenv("HF_HUB_CACHE")
 
-		cache := NewHFCache("/root", 0)
+		cache := NewHFCache("/root")
 		if cache.HubDir() != "/root/hub" {
 			t.Errorf("HubDir() = %q, want /root/hub", cache.HubDir())
 		}
@@ -84,21 +69,21 @@ func TestHFCache_Directories(t *testing.T) {
 		defer os.Setenv("HF_HUB_CACHE", origHFHubCache)
 
 		os.Setenv("HF_HUB_CACHE", "/custom/hub")
-		cache := NewHFCache("/root", 0)
+		cache := NewHFCache("/root")
 		if cache.HubDir() != "/custom/hub" {
 			t.Errorf("HubDir() = %q, want /custom/hub", cache.HubDir())
 		}
 	})
 
 	t.Run("ModelsDir", func(t *testing.T) {
-		cache := NewHFCache("/root", 0)
+		cache := NewHFCache("/root")
 		if cache.ModelsDir() != "/root/models" {
 			t.Errorf("ModelsDir() = %q, want /root/models", cache.ModelsDir())
 		}
 	})
 
 	t.Run("DatasetsDir", func(t *testing.T) {
-		cache := NewHFCache("/root", 0)
+		cache := NewHFCache("/root")
 		if cache.DatasetsDir() != "/root/datasets" {
 			t.Errorf("DatasetsDir() = %q, want /root/datasets", cache.DatasetsDir())
 		}
@@ -106,7 +91,7 @@ func TestHFCache_Directories(t *testing.T) {
 }
 
 func TestHFCache_Repo(t *testing.T) {
-	cache := NewHFCache("/root", 0)
+	cache := NewHFCache("/root")
 
 	t.Run("valid model repo", func(t *testing.T) {
 		repo, err := cache.Repo("TheBloke/Mistral-7B-GGUF", RepoTypeModel)
@@ -157,7 +142,7 @@ func TestRepoDir_Paths(t *testing.T) {
 	defer os.Setenv("HF_HUB_CACHE", origHFHubCache)
 	os.Unsetenv("HF_HUB_CACHE")
 
-	cache := NewHFCache("/root", 0)
+	cache := NewHFCache("/root")
 
 	t.Run("model paths", func(t *testing.T) {
 		repo, _ := cache.Repo("TheBloke/Mistral-7B", RepoTypeModel)
@@ -222,7 +207,7 @@ func TestRepoDir_Paths(t *testing.T) {
 
 func TestRepoDir_EnsureDirs(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 
 	if err := repo.EnsureDirs(); err != nil {
@@ -261,7 +246,7 @@ func TestBlobStatus_String(t *testing.T) {
 
 func TestRepoDir_CheckBlob(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 100*time.Millisecond) // Short stale timeout for testing
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 	repo.EnsureDirs()
 
@@ -321,7 +306,7 @@ func TestRepoDir_CheckBlob(t *testing.T) {
 
 func TestRepoDir_WriteAndReadRef(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 	repo.EnsureDirs()
 
@@ -353,7 +338,7 @@ func TestRepoDir_WriteAndReadRef(t *testing.T) {
 
 func TestRepoDir_CleanupIncomplete(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 	repo.EnsureDirs()
 
@@ -380,7 +365,7 @@ func TestRepoDir_CleanupIncomplete(t *testing.T) {
 
 func TestRepoDir_FinalizeBlob(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 	repo.EnsureDirs()
 
@@ -415,7 +400,7 @@ func TestRepoDir_FinalizeBlob(t *testing.T) {
 
 func TestRepoDir_ListSnapshots(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 	repo.EnsureDirs()
 
@@ -497,7 +482,7 @@ func TestIsProcessAlive(t *testing.T) {
 
 func TestRepoDir_EnsureFriendlyDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir, 0)
+	cache := NewHFCache(tmpDir)
 	repo, _ := cache.Repo("owner/name", RepoTypeModel)
 
 	if err := repo.EnsureFriendlyDir(); err != nil {
@@ -544,7 +529,7 @@ func TestCopyFileAtomicCtxPreservesMode(t *testing.T) {
 // directory, no matter what blob name it is handed, while legitimate
 // (single-component) names keep the exact blobs/<name> result.
 func TestBlobPathConfinesToBlobsDir(t *testing.T) {
-	c := NewHFCache("/root", 0)
+	c := NewHFCache("/root")
 	repo, err := c.Repo("owner/name", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

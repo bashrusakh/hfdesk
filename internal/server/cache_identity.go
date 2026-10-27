@@ -63,7 +63,7 @@ func (cfg Config) cacheForRoot(root string) *hfdownloader.HFCache {
 	if hub == "" {
 		hub = filepath.Join(root, "hub")
 	}
-	return hfdownloader.NewHFCacheResolved(root, hub, 0)
+	return hfdownloader.NewHFCacheResolved(root, hub)
 }
 
 func (cfg Config) cache() *hfdownloader.HFCache { return cfg.cacheForRoot(cfg.cacheRoot()) }
@@ -72,7 +72,7 @@ func (cfg Config) cache() *hfdownloader.HFCache { return cfg.cacheForRoot(cfg.ca
 // resolved once in LoadState, so normal runners/cleanup never take this fallback.
 func jobCache(cfg Config, job *Job) *hfdownloader.HFCache {
 	if job.HubDir != "" {
-		return hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir, 0)
+		return hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir)
 	}
 	return cfg.cacheForRoot(job.OutputDir)
 }

@@ -82,7 +82,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 		t.Fatalf("claim/cleanup changed metadata: err=%v", err)
 	}
 
-	cache := NewHFCache(dir, time.Minute)
+	cache := NewHFCache(dir)
 	repo, err := cache.Repo("o/r", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 	sha := singleTestSHA(full)
 
 	cacheDir := t.TempDir()
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 		{name: "malformed metadata", meta: []byte("{")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cache := NewHFCache(t.TempDir(), time.Minute)
+			cache := NewHFCache(t.TempDir())
 			repo, err := cache.Repo("owner/repo", RepoTypeModel)
 			if err != nil {
 				t.Fatal(err)
@@ -250,7 +250,7 @@ func TestCheckBlobProvenOwnerAndStaleRemainDistinct(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
-	cache := NewHFCache(t.TempDir(), time.Minute)
+	cache := NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/repo", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +308,7 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	sha := singleTestSHA(full)
 
 	cacheDir := t.TempDir()
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

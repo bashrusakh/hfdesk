@@ -24,6 +24,69 @@ package hfdownloader
 // without the pinned flag (or with it false) is not inheritable. That is the
 // safe direction - unproven bytes are never published - and no released
 // version ever wrote these records.
+//
+// ONE identity rule, TWO record formats. The single-request sidecar
+// (version 1, <dst>.part.meta) and the ranged staging record (version 4,
+// <staging>.incomplete.meta) keep their own formats, versions and
+// lifecycle-specific fields, because they describe different staging states.
+// They do NOT duplicate the identity decision: each exposes its object
+// identity as a resumeIdentity value, and both routes compare it with the
+// single resumeIdentity.matches rule.
+
+// resumeIdentity is the in-memory identity of a staged payload: the object a
+// persisted record or the current plan names. It is deliberately not a record
+// format - the version, the range layout, the framing proof and the ownership
+// diagnostics stay in the lifecycle-specific records.
+type resumeIdentity struct {
+	Repo   string
+	Commit string
+	Path   string
+	Size   int64
+	Pinned bool
+}
+
+// matches reports whether current names the same immutable object as id.
+//
+// Both routes call this one comparison, so the identity rule cannot drift
+// between the single-request and the ranged path. An unpinned identity pins
+// nothing: it names a revision whose content may have moved, so a record is
+// inheritable only when BOTH sides are pinned, however well the repository,
+// commit string, path and size match.
+func (id resumeIdentity) matches(current resumeIdentity) bool {
+	if !resumeIdentityPinned(id.Pinned, current.Pinned) {
+		return false
+	}
+	if id.Repo != current.Repo || id.Commit != current.Commit || id.Path != current.Path {
+		return false
+	}
+	return id.Size == current.Size
+}
+
+// identity returns the shared resume identity of the single-request sidecar.
+// Version, the framing-complete proof and diagnostics are not part of the
+// object identity and stay in the record.
+func (id singlePartIdentity) identity() resumeIdentity {
+	return resumeIdentity{
+		Repo:   id.Repo,
+		Commit: id.Commit,
+		Path:   id.Path,
+		Size:   id.Size,
+		Pinned: id.Pinned,
+	}
+}
+
+// identity returns the shared resume identity of the ranged staging record.
+// The range layout, ProofPending, LockFenced and diagnostics are not part of
+// the object identity and stay in the record.
+func (meta IncompleteMeta) identity() resumeIdentity {
+	return resumeIdentity{
+		Repo:   meta.Repo,
+		Commit: meta.Commit,
+		Path:   meta.Path,
+		Size:   meta.Size,
+		Pinned: meta.CommitPinned,
+	}
+}
 
 // resumeIdentityPinned reports whether the recorded identity and the current
 // plan both name a PINNED (resolved, immutable) commit.

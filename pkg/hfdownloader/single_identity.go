@@ -199,12 +199,13 @@ func singleIdentityFor(job Job, it PlanItem, opts singleOpts) singlePartIdentity
 // the staged bytes for the current item.
 //
 // The bytes may be inherited only when the record was written for exactly
-// this object: the same repository, the same resolved commit, the same item
-// path and the same expected size - and when the identity is PINNED on both
-// sides. An unpinned identity names a revision whose content may have moved,
-// so nothing under that name may be inherited, no matter how well the names
-// match. The pinned rule is the shared one (resumeIdentityPinned), so this
-// route and the ranged staging route cannot drift apart.
+// this object. The comparison is the shared resumeIdentity.matches rule, so
+// this route and the ranged staging route cannot drift apart even though their
+// records keep separate formats: same repository, same resolved commit, same
+// item path and same expected size, with the identity PINNED on both sides.
+// An unpinned identity names a revision whose content may have moved, so
+// nothing under that name may be inherited, no matter how well the names
+// match.
 //
 // FramingComplete is deliberately NOT compared here: it is completion proof
 // for the response body, not part of the object identity. A matching record
@@ -214,13 +215,7 @@ func (id *singlePartIdentity) inheritableBy(current singlePartIdentity) bool {
 	if id == nil {
 		return false
 	}
-	if !resumeIdentityPinned(id.Pinned, current.Pinned) {
-		return false
-	}
-	if id.Repo != current.Repo || id.Commit != current.Commit || id.Path != current.Path {
-		return false
-	}
-	return id.Size == current.Size
+	return id.identity().matches(current.identity())
 }
 
 // singlePartialInheritable decides whether the bytes already staged at a

@@ -1192,7 +1192,7 @@ func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 	}
 	staleMtime := func(t *testing.T, path string) {
 		t.Helper()
-		past := time.Now().Add(-2 * DefaultStaleTimeout)
+		past := time.Now().Add(-2 * time.Hour)
 		if err := os.Chtimes(path, past, past); err != nil {
 			t.Fatal(err)
 		}
@@ -1207,7 +1207,7 @@ func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 			t.Fatal(err)
 		}
 		seedForeignOwned(t, staging, full, 4000)
-		staleMtime(t, staging) // payload silent for > stale timeout
+		staleMtime(t, staging) // payload deliberately older than any age-based model
 		before, err := os.ReadFile(staging)
 		if err != nil {
 			t.Fatal(err)

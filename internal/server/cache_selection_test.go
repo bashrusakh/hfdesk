@@ -672,7 +672,7 @@ func TestSelectedHFDeleteRefusesUnresolvedConfiguredDescendant(t *testing.T) {
 		}
 		storage := filepath.Join(fixtureRoot, "cache")
 		alias := filepath.Join(fixtureRoot, "private", "snapshot-library")
-		rd, err := hfdownloader.NewHFCache(storage, 0).Repo("owner/model", hfdownloader.RepoTypeModel)
+		rd, err := hfdownloader.NewHFCache(storage).Repo("owner/model", hfdownloader.RepoTypeModel)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -729,7 +729,7 @@ func TestSelectedHFDeleteRefusesUnresolvedConfiguredDescendant(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage := filepath.Join(fixtureRoot, "cache")
-	rd, err := hfdownloader.NewHFCache(storage, 0).Repo("owner/model", hfdownloader.RepoTypeModel)
+	rd, err := hfdownloader.NewHFCache(storage).Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +820,7 @@ func TestSelectedHFDeleteRefusesUnresolvedConfiguredDescendant(t *testing.T) {
 
 func TestConfiguredHFProtectedRootsProjectsAliasesAndAllowsMissingUnrelatedRoots(t *testing.T) {
 	storage := t.TempDir()
-	rd, err := hfdownloader.NewHFCache(storage, 0).Repo("owner/model", hfdownloader.RepoTypeModel)
+	rd, err := hfdownloader.NewHFCache(storage).Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,7 +857,7 @@ func TestConfiguredHFProtectedRootsProjectsAliasesAndAllowsMissingUnrelatedRoots
 
 func TestHFSelectionKeepsKnownAliasedConfiguredChildIndependent(t *testing.T) {
 	storage := t.TempDir()
-	rd, err := hfdownloader.NewHFCache(storage, 0).Repo("owner/model", hfdownloader.RepoTypeModel)
+	rd, err := hfdownloader.NewHFCache(storage).Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +908,7 @@ func TestHFSelectionKeepsKnownAliasedConfiguredChildIndependent(t *testing.T) {
 
 func TestSelectedDeleteConflictsWithHFWriterSnapshotPrescan(t *testing.T) {
 	storage := t.TempDir()
-	cache := hfdownloader.NewHFCache(storage, 0)
+	cache := hfdownloader.NewHFCache(storage)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -981,7 +981,7 @@ func TestCompletePlanUsesActualSnapshotDestinations(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			storage := t.TempDir()
-			cache := hfdownloader.NewHFCache(storage, 0)
+			cache := hfdownloader.NewHFCache(storage)
 			rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 			if err != nil {
 				t.Fatal(err)
@@ -1045,7 +1045,7 @@ func TestCompletePlanUsesActualSnapshotDestinations(t *testing.T) {
 // manager's complete-plan callback and selected-delete admission path.
 func TestPaginatedPlanReservesLaterPageBeforeTransfer(t *testing.T) {
 	storage := t.TempDir()
-	cache := hfdownloader.NewHFCache(storage, 0)
+	cache := hfdownloader.NewHFCache(storage)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -1166,7 +1166,7 @@ func TestSelectedDeleteAndRebuildReserveDatasetFriendlyTree(t *testing.T) {
 }
 
 func TestReservationProducersFreezeEntryAndDirectoryScopes(t *testing.T) {
-	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	cache := hfdownloader.NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -1629,7 +1629,7 @@ func TestInvalidRestoredHFRepoCannotResumeRetryOrDispatch(t *testing.T) {
 }
 
 func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
-	cache := hfdownloader.NewHFCache(t.TempDir(), 0)
+	cache := hfdownloader.NewHFCache(t.TempDir())
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -1655,7 +1655,7 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 
 func TestSelectedDeleteReservationsUseRepoRelativeFilterPaths(t *testing.T) {
 	cacheDir := t.TempDir()
-	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	cache := hfdownloader.NewHFCache(cacheDir)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -1744,7 +1744,7 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 		t.Fatal("pre-plan model projection must allow for unmatched non-LFS companions")
 	}
 
-	cache := hfdownloader.NewHFCache(storage, 0)
+	cache := hfdownloader.NewHFCache(storage)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -2097,7 +2097,7 @@ func TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase(t *testing.T) {
 // jobPlannedWriteEntries produces for commit saved-commit.
 func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
 	storage := t.TempDir()
-	cache := hfdownloader.NewHFCache(storage, 0)
+	cache := hfdownloader.NewHFCache(storage)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -2210,7 +2210,7 @@ func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
 // jobPlannedWriteEntries produces for commit feature/v2.
 func TestSelectedDeleteBlocksMultiComponentRevisionSnapshotWriter(t *testing.T) {
 	storage := t.TempDir()
-	cache := hfdownloader.NewHFCache(storage, 0)
+	cache := hfdownloader.NewHFCache(storage)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -5421,7 +5421,7 @@ func TestHFReservationUsesFrozenDestinationAndBothSelectedScopes(t *testing.T) {
 
 func TestHFReservationRejectsCompletedPlanWriter(t *testing.T) {
 	root := t.TempDir()
-	cache := hfdownloader.NewHFCache(root, 0)
+	cache := hfdownloader.NewHFCache(root)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -5451,7 +5451,7 @@ func TestHFReservationRejectsCompletedPlanWriter(t *testing.T) {
 
 func TestHFReservationKeepsBroadJobRepoScopeForCompleteEmptyPlan(t *testing.T) {
 	root := t.TempDir()
-	cache := hfdownloader.NewHFCache(root, 0)
+	cache := hfdownloader.NewHFCache(root)
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -5485,7 +5485,7 @@ func TestHFReservationBlocksCurrentRawWriterMapping(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	cache := hfdownloader.NewHFCacheResolved(parent, filepath.Join(alias, "hub"), 0)
+	cache := hfdownloader.NewHFCacheResolved(parent, filepath.Join(alias, "hub"))
 	rd, err := cache.Repo("owner/model", hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

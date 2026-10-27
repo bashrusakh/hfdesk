@@ -315,7 +315,7 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	if err := writeStagingMeta(metaPath, &meta); err != nil {
 		t.Fatal(err)
 	}
-	past := time.Now().Add(-2 * DefaultStaleTimeout)
+	past := time.Now().Add(-2 * time.Hour)
 	for _, p := range []string{staging, metaPath} {
 		if err := os.Chtimes(p, past, past); err != nil {
 			t.Fatal(err)

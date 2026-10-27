@@ -753,33 +753,32 @@ func checkStagingPayloadSize(staging string, size int64) error {
 }
 
 // stagingMetaResumable validates a staging record against the exact remote
-// object and returns its normalized range layout. It is resumable only when
-// its version is the current one (stagingMetaVersion), repo, path, size and
-// resolved commit match, the identity is PINNED on both sides (the record's own
-// flag and the current plan's), the blob SHA is
-// present on both sides or neither (and equal when present), and every range
-// carries a conservative completion marker.
+// object and returns its normalized range layout. It first compares the shared
+// resume identity (the same rule the single-request path applies), then adds
+// the checks that are specific to this record format: its version, the
+// all-or-nothing blob SHA claim and the range layout.
 //
-// The pinned rule is the SAME one the single-request path applies (see
-// resumeIdentityPinned): a record written under an unpinned identity names a
-// revision whose content may have moved, so its bytes are never inherited,
-// however well the repository, commit string, path and size match. A record
-// written without the pinned flag is unpinned and therefore not inheritable.
+// The record is resumable only when its identity matches the current item -
+// repo, path, size and resolved commit - and is PINNED on both sides (the
+// record's own flag and the current plan's). A record written under an
+// unpinned identity names a revision whose content may have moved, so its
+// bytes are never inherited, however well the repository, commit string, path
+// and size match. A record written without the pinned flag is unpinned and
+// therefore not inheritable.
 //
 // A record from any other version is not understood and is never resumed: old
 // or unsupported formats are discarded and the file is re-downloaded.
 func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool) {
-	if meta.Version != stagingMetaVersion || meta.Size != it.Size || meta.Size <= 0 {
+	if meta.Version != stagingMetaVersion || meta.Size <= 0 {
 		return nil, false
 	}
-	if meta.Repo != job.Repo || meta.Path != it.RelativePath || meta.Commit != commit {
-		return nil, false
-	}
-	// The identity must be PINNED on both sides. An unpinned commit is the
-	// planner's fallback to the requested revision, so the content behind
-	// that name can differ between the run that staged the bytes and this
-	// one.
-	if !resumeIdentityPinned(meta.CommitPinned, commitPinned) {
+	if !meta.identity().matches(resumeIdentity{
+		Repo:   job.Repo,
+		Commit: commit,
+		Path:   it.RelativePath,
+		Size:   it.Size,
+		Pinned: commitPinned,
+	}) {
 		return nil, false
 	}
 	// A blob SHA is an all-or-nothing identity claim. If either side has one,

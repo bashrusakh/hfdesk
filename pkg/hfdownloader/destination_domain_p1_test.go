@@ -103,7 +103,7 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	sha := singleTestSHA(full)
 
 	cacheDir := t.TempDir()
-	repo, err := NewHFCache(cacheDir, time.Minute).Repo("o/r", RepoTypeModel)
+	repo, err := NewHFCache(cacheDir).Repo("o/r", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
-	cache := NewHFCache(t.TempDir(), time.Minute)
+	cache := NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

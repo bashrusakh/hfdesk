@@ -25,7 +25,7 @@ func selectedDeleteCacheRoot(t *testing.T) string {
 
 func selectedDeleteFixture(t *testing.T) (*RepoDir, string, string, string) {
 	t.Helper()
-	cache := NewHFCache(selectedDeleteCacheRoot(t), 0)
+	cache := NewHFCache(selectedDeleteCacheRoot(t))
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +246,7 @@ func TestDeleteSelectedGGUFRetainsBlobDependencyThroughFriendlyDirectoryAlias(t 
 }
 
 func TestDeleteSelectedGGUFRefusesRegularSnapshotDependencyThroughFriendlyDirectoryAlias(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
 // the deletion path - so a blob published under such a name would be stored
 // and invisible. The boundary that accepts the name therefore refuses it.
 func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +462,7 @@ func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
 // creates it (see TestStoreDownloadedFileRefusesReservedCollisionName); the
 // deletion path must still refuse such a target if it finds one.
 func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,7 @@ func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
 // exported writer of blobs/<key>: a staging-shaped blob key is refused before
 // anything is created or moved.
 func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +527,7 @@ func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
 // The public storage API's tolerance for unusual published names is
 // unchanged; only the downloader's own staging namespace is refused.
 func TestStoreDownloadedFileAcceptsUnusualNonReservedName(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestDeleteSelectedGGUFRefusesMixedIncompleteCompositionBeforeAnyUnlink(t *t
 // true, independent copies otherwise) instead of symlinks.
 func selectedDeleteFallbackFixture(t *testing.T, hardlink bool) (*RepoDir, string, string, string, []byte) {
 	t.Helper()
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

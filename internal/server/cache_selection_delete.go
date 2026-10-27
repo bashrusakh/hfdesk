@@ -190,7 +190,7 @@ func jobDestinationBase(job *Job) string {
 	// Resolve through the HF cache owner so validation and the reservation path
 	// exactly match the repository/type and friendly view used by the writer.
 	// HFCache.Repo is a pure validation/path constructor; it performs no probes.
-	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir, 0).Repo(repoID, repoType)
+	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir).Repo(repoID, repoType)
 	if err != nil {
 		return ""
 	}
@@ -974,7 +974,7 @@ func hfJobRepoDir(job *Job) (*hfdownloader.RepoDir, error) {
 	if job.IsDataset {
 		repoType = hfdownloader.RepoTypeDataset
 	}
-	cache := hfdownloader.NewHFCacheResolved(job.OutputDir, hub, 0)
+	cache := hfdownloader.NewHFCacheResolved(job.OutputDir, hub)
 	repo, err := cache.Repo(repoID, repoType)
 	if err != nil {
 		return nil, err
