@@ -174,15 +174,15 @@ func inspectBranchVariantDestination(cfg Config, presence branchVariantPresence,
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
 		}
-		variantDir, err := hfdownloader.SafeJoin(base, revision)
+		variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(base, revision)
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
 		}
 		presence.DestinationRoot = variantDir
-		// The completion manifest lives beside the payload tree, keyed by
-		// revision and commit. Local mode has no ref file, so every existing
-		// record for this revision is inspected; the payload directory is
-		// shared across commits of one revision.
+		// The completion manifest lives in the app-owned metadata tree beside
+		// the payload tree, keyed by revision and commit. Local mode has no ref
+		// file, so every existing record for this revision is inspected; the
+		// payload directory is shared across commits of one revision.
 		manifestDirs, err := hfdownloader.BranchVariantManifestDirs(base, revision)
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
@@ -190,11 +190,8 @@ func inspectBranchVariantDestination(cfg Config, presence branchVariantPresence,
 		records := make([]branchVariantLocalRecord, 0, len(manifestDirs))
 		for _, manifestDir := range manifestDirs {
 			manifest, err := hfdownloader.ReadManifest(filepath.Join(manifestDir, hfdownloader.ManifestFilename))
-			if err != nil || !branchVariantManifestMatches(manifest, repo, revision) {
-				continue
-			}
 			// The directory name is the commit the record must describe.
-			if manifest.Commit != filepath.Base(manifestDir) {
+			if err != nil || !hfdownloader.BranchVariantRecordMatches(manifest, repo, revision, filepath.Base(manifestDir)) {
 				continue
 			}
 			records = append(records, branchVariantLocalRecord{dir: manifestDir, manifest: manifest})
@@ -251,7 +248,7 @@ func inspectBranchVariantDestination(cfg Config, presence branchVariantPresence,
 	presence.Commit = commit
 	presence.ArtifactPath = filepath.Join(manifestDir, hfdownloader.ManifestFilename)
 	manifest, err := hfdownloader.ReadManifest(presence.ArtifactPath)
-	if err != nil || !branchVariantManifestMatches(manifest, repo, revision) || manifest.Commit != commit {
+	if err != nil || !hfdownloader.BranchVariantRecordMatches(manifest, repo, revision, commit) {
 		presence.DownloadStatus = "missing"
 		return presence, nil
 	}
@@ -268,19 +265,6 @@ func inspectBranchVariantDestination(cfg Config, presence branchVariantPresence,
 
 func branchVariantDestinationIdentity(presence branchVariantPresence) string {
 	return presence.StorageMode + "\x00" + presence.DestinationRoot
-}
-
-// branchVariantManifestMatches checks the revision-independent completion
-// contract. Commit matching (HF cache) and file presence are checked by the
-// caller because those differ between storage modes.
-func branchVariantManifestMatches(manifest *hfdownloader.DownloadManifest, repo, revision string) bool {
-	return manifest != nil &&
-		manifest.BranchVariant &&
-		manifest.Repo == repo &&
-		manifest.Branch == revision &&
-		!manifest.CompletedAt.IsZero() &&
-		manifest.TotalFiles > 0 &&
-		len(manifest.Files) == manifest.TotalFiles
 }
 
 func branchVariantSnapshotFilesPresent(repoDir *hfdownloader.RepoDir, commit string, manifest *hfdownloader.DownloadManifest, presence *branchVariantPresence) bool {

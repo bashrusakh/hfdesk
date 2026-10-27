@@ -811,9 +811,9 @@ func TestDownload_PermanentStatusFailsFast(t *testing.T) {
 				switch {
 				case r.URL.Path == "/api/models/o/r/revision/main":
 					json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-				case r.URL.Path == "/api/models/o/r/tree/abc123":
+				case r.URL.Path == "/api/models/o/r/tree/main":
 					json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 128}})
-				case r.URL.Path == "/o/r/raw/abc123/config.json":
+				case r.URL.Path == "/o/r/raw/main/config.json":
 					mu.Lock()
 					fileGets++
 					mu.Unlock()

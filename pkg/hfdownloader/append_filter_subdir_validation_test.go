@@ -162,7 +162,7 @@ func TestPathFilterSucceedsWithoutAppendFilterSubdir(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "deadbeef"})
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_ = json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "weights/model.gguf", Size: 4}})
-		case r.URL.Path == "/owner/model/raw/deadbeef/weights/model.gguf":
+		case r.URL.Path == "/owner/model/raw/main/weights/model.gguf":
 			_, _ = w.Write([]byte("data"))
 		default:
 			http.NotFound(w, r)

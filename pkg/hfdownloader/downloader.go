@@ -308,7 +308,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Branch variants never populate the friendly view: two branches can carry
 	// identical file names with different content, and the friendly view has no
 	// revision dimension. Their isolation comes from blobs + per-commit
-	// snapshots (HF cache) or the revision subdirectory (local mode).
+	// snapshots (HF cache) or the app-owned payload directory (local mode).
 	friendlyView := !cfg.NoFriendlyView && !job.BranchVariant
 
 	thresholdBytes, err := parseSizeString(cfg.MultipartThreshold, 256<<20)
@@ -380,11 +380,16 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			// planning and before any payload byte changes. Otherwise a failed or
 			// cancelled re-download would leave an old record claiming the mixed
 			// or replaced payload is complete.
+			//
+			// The job's repository identifies the records: the completion
+			// record names the repository it describes, and a branch variant
+			// rejects a LocalRepo redirection, so the record's repository and
+			// the destination folder name agree here.
 			base, err := destinationBase(job, cfg)
 			if err != nil {
 				return failBranchVariantCompletion(fmt.Errorf("resolve branch variant destination: %w", err))
 			}
-			if err := InvalidateBranchVariantLocalManifests(base, job.Revision); err != nil {
+			if err := InvalidateBranchVariantLocalManifests(base, job.Revision, job.Repo); err != nil {
 				return failBranchVariantCompletion(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
 			}
 		}
@@ -407,7 +412,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			return err
 		}
 		if job.BranchVariant {
-			base, err = SafeJoin(base, job.Revision)
+			base, err = BranchVariantLocalPayloadDir(base, job.Revision)
 			if err != nil {
 				return fmt.Errorf("branch variant revision %q: %w", job.Revision, err)
 			}
@@ -479,7 +484,10 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			if job.LocalRepo != "" {
 				repoForPath = job.LocalRepo
 			}
-			manifestBuilder.manifest.RepoPath = filepath.ToSlash(filepath.Join(repoForPath, job.Revision))
+			// The completion record describes the local payload tree, which
+			// lives in the app-owned payload directory, not at a
+			// repository-relative path.
+			manifestBuilder.manifest.RepoPath = filepath.ToSlash(filepath.Join(repoForPath, BranchVariantPayloadDir, job.Revision))
 		}
 	}
 
@@ -536,11 +544,41 @@ LOOP:
 								if friendlyView {
 									repoDir.createFriendlySymlinkCtx(fileCtx, plan.Commit, it.RelativePath, filterSubdir)
 								}
+							} else if job.BranchVariant {
+								// A branch variant's completion record lists this
+								// file, and presence resolves it through the
+								// branch's own snapshot entry. A missing entry
+								// must fail the job: reporting success would
+								// publish a variant that is not downloaded.
+								return false, "", fmt.Errorf("create branch variant snapshot entry for %s: %w", it.RelativePath, err)
 							}
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
-							return true, "downloading by another process", nil
+							if !job.BranchVariant {
+								return true, "downloading by another process", nil
+							}
+							// A branch variant is complete only when its own
+							// snapshot holds the file, and no snapshot entry
+							// exists for a blob another process is still
+							// fetching. Wait for the shared download to
+							// resolve and materialize the entry instead of
+							// skipping: a skip here would publish a
+							// completion record for a file the branch does
+							// not contain.
+							resolved, err := waitForSharedBlob(fileCtx, repoDir, it.SHA256, branchVariantSharedBlobWaitTimeout)
+							if err != nil {
+								return false, "", fmt.Errorf("wait for shared blob %s: %w", it.SHA256, err)
+							}
+							if resolved != BlobComplete {
+								// The shared download is gone or abandoned:
+								// fetch the file in this job instead.
+								return false, "", nil
+							}
+							if err := repoDir.createSnapshotSymlink(fileCtx, plan.Commit, it.RelativePath, it.SHA256); err != nil {
+								return false, "", fmt.Errorf("create branch variant snapshot entry for %s: %w", it.RelativePath, err)
+							}
+							return true, "blob exists", nil
 						}
 					}
 					return false, "", nil
@@ -583,7 +621,7 @@ LOOP:
 				// Legacy mode: flat directory structure
 				base, err := destinationBase(job, cfg)
 				if err == nil && job.BranchVariant {
-					base, err = SafeJoin(base, job.Revision)
+					base, err = BranchVariantLocalPayloadDir(base, job.Revision)
 				}
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %w", err)
@@ -912,8 +950,8 @@ LOOP:
 	// for exactly this revision/commit. It is written even when cfg.NoManifest
 	// or the friendly view is disabled, and never for ordinary downloads. The
 	// path is <repo>/.hfdesk-variants/<revision>/<commit>, outside the local
-	// payload tree and keyed by revision so branches sharing a commit keep
-	// distinct records.
+	// payload tree (<repo>/.hfdesk-variants-payload/<revision>) and keyed by
+	// revision so branches sharing a commit keep distinct records.
 	if job.BranchVariant {
 		manifest := manifestBuilder.Build()
 		var manifestDir string
@@ -957,6 +995,53 @@ func branchVariantStagingName(commit string, item PlanItem) string {
 	}
 	sum := sha256.Sum256([]byte(item.RelativePath))
 	return "tmp-" + commit + "-" + hex.EncodeToString(sum[:])
+}
+
+// branchVariantSharedBlobWaitTimeout bounds how long a branch-variant file
+// waits for another process's in-flight download of the same
+// content-addressed blob to resolve. The bound is generous because the shared
+// download may be a multi-gigabyte model, but it is finite: a wait that never
+// ends would keep the job alive indefinitely.
+const branchVariantSharedBlobWaitTimeout = 30 * time.Minute
+
+// branchVariantSharedBlobPollInterval is how often the wait re-checks the
+// shared blob's state.
+const branchVariantSharedBlobPollInterval = 250 * time.Millisecond
+
+// waitForSharedBlob waits for another process's in-flight download of the
+// content-addressed blob sha to resolve and reports the resulting status.
+//
+// The wait ends when the shared download publishes the blob (BlobComplete),
+// when the shared download is gone or abandoned (BlobMissing or BlobStale, so
+// the caller must fetch the file itself), when ctx is done (the job was
+// paused, cancelled, or shut down), or when the timeout expires. Every
+// non-resolving outcome is an error or a "fetch it yourself" answer, never a
+// success: a wait that cannot finish must not become a completed file.
+func waitForSharedBlob(ctx context.Context, repoDir *RepoDir, sha string, timeout time.Duration) (BlobStatus, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		status, _, err := repoDir.CheckBlob(sha)
+		if err != nil {
+			return BlobMissing, err
+		}
+		if status != BlobDownloading {
+			return status, nil
+		}
+		wait := branchVariantSharedBlobPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			return BlobDownloading, fmt.Errorf("timed out after %s waiting for another process to finish downloading blob %s", timeout, sha)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return BlobDownloading, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // cleanupPartialsOnCancel removes partial download artifacts (.part,

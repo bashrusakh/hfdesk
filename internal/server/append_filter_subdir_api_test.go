@@ -127,7 +127,7 @@ func TestNormalDownloadPathFilterWithAppendSubdirStillRuns(t *testing.T) {
 			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte(`[{"type":"file","path":"weights/model.gguf","size":4}]`))
-		case r.URL.Path == "/owner/model/raw/deadbeef/weights/model.gguf":
+		case r.URL.Path == "/owner/model/raw/main/weights/model.gguf":
 			_, _ = w.Write([]byte(payload))
 		default:
 			http.NotFound(w, r)

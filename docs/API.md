@@ -793,7 +793,15 @@ Notes:
   identical file names cannot overwrite each other: HF cache mode uses the
   per-commit `snapshots/<commit>/` tree and content-addressed blobs (with no
   friendly-view entries), while local/flat mode writes under
-  `<root>/<repo>/<revision>/`. A completed variant manifest at
+  `<root>/<repo>/.hfdesk-variants-payload/<revision>/`. That local payload
+  directory is a different subtree of the repository directory from the
+  ordinary payload, and the ordinary payload never uses the app-owned
+  directory name, so an ordinary download and a branch-variant download of the
+  same repository do not write the same file. The exception is a repository
+  whose own tree contains a top-level entry named exactly like the app-owned
+  directory: that directory is then shared with the app-owned content. The
+  app-owned trees are verified before use, and a symlinked or non-directory
+  app-owned entry fails the download. A completed variant manifest at
   `hub/models--<owner>--<repo>/.hfdesk-variants/<revision>/<commit>/hfd.yaml`
   (HF cache) or `<root>/<repo>/.hfdesk-variants/<revision>/<commit>/hfd.yaml`
   (local) records the exact revision, commit, and files. The manifest is keyed
@@ -803,10 +811,12 @@ Notes:
   the optional friendly-view manifest; a branch variant's completion manifest
   is always written, because presence reads it. After a local branch-variant
   plan succeeds and before any payload byte changes, the download invalidates
-  the revision's prior local completion records (only the app-owned
-  `.hfdesk-variants/<revision>` metadata; never the payload). If that
-  invalidation fails, the download fails without touching the payload. A failed
-  or cancelled local re-download therefore reports `missing` instead of complete.
+  the revision's prior local completion records: the app's own
+  `.hfdesk-variants/<revision>/<commit>/hfd.yaml` records and nothing else,
+  never the payload and never repository content that happens to live in the
+  same directory. If that invalidation fails, the download fails without
+  touching the payload. A failed or cancelled local re-download therefore
+  reports `missing` instead of complete.
   A local re-download re-fetches hashless/non-LFS files instead of trusting size
   equality, so a moved branch cannot retain same-size stale bytes; LFS files
   continue to use their known SHA.
@@ -1210,6 +1220,26 @@ with `downloaded: false` when the variant is absent or incomplete:
 }
 ```
 
+In local mode the same response reports the app-owned payload directory as
+`destinationRoot` and the completion record as `artifactPath`:
+
+```json
+{
+  "repo": "owner/name",
+  "type": "model",
+  "branchVariant": true,
+  "revision": "4.00bpw",
+  "downloaded": true,
+  "downloadStatus": "complete",
+  "storageMode": "local",
+  "destinationRoot": "/models/owner/name/.hfdesk-variants-payload/4.00bpw",
+  "commit": "2222222222222222222222222222222222222222",
+  "artifactPath": "/models/owner/name/.hfdesk-variants/4.00bpw/2222.../hfd.yaml",
+  "expectedFiles": 3,
+  "files": [{"name": "config.json", "size": 123}]
+}
+```
+
 `downloadStatus` is `complete` or `missing` for this endpoint. HF cache mode
 reads `refs/<revision>` and requires the revision/commit manifest at
 `.hfdesk-variants/<revision>/<commit>/hfd.yaml` to match `branchVariant`, `repo`,
@@ -1219,11 +1249,14 @@ file of the recorded size. Local mode reads the completion records under
 `<root>/<repo>/.hfdesk-variants/<revision>/<commit>/` and considers only the
 newest valid record for the revision (latest completion time, then
 lexicographic commit); it checks every file of that record against the revision
-payload directory `<root>/<repo>/<revision>/`. If the newest record's files are
-not all present at the recorded sizes, the revision reports `missing`; older
-records are not consulted, because local records carry no content hash and
-cannot prove that a replaced or mixed payload still matches them. An ordinary
-`GET /api/cache/{owner}/{repo}` without `branchVariant=true` is unchanged.
+payload directory `<root>/<repo>/.hfdesk-variants-payload/<revision>/`, which
+`destinationRoot` reports in local mode. The completion record lives in the
+metadata tree beside the payload tree, never inside it. If the newest record's
+files are not all present at the recorded sizes, the revision reports
+`missing`; older records are not consulted, because local records carry no
+content hash and cannot prove that a replaced or mixed payload still matches
+them. An ordinary `GET /api/cache/{owner}/{repo}` without `branchVariant=true` is
+unchanged.
 
 `GET /api/cache` includes effective R as `cacheDir`, plus `effectiveHubDir` and
 `hubDirSource`. HF entries' `path` is under selected H, while `friendlyPath` is

@@ -27,6 +27,21 @@ const ManifestFilename = "hfd.yaml"
 // itself contain slashes (for example "exl/4_25").
 const BranchVariantMetadataDir = ".hfdesk-variants"
 
+// BranchVariantPayloadDir is the app-owned directory that holds a local
+// branch variant's payload files. It is a sibling of BranchVariantMetadataDir
+// inside the repository directory, and the ordinary repository payload never
+// uses this directory name, so the ordinary payload and the branch payload
+// live in different subtrees of the repository directory and an ordinary
+// download and a branch-variant download of the same repository do not write
+// the same file.
+//
+// The one case where the separation does not hold is a repository whose own
+// tree contains a top-level entry named exactly like this directory: that
+// directory is then shared with the app-owned content. The app-owned trees are
+// verified before use, so a symlinked or non-directory app-owned entry is
+// refused and the download fails rather than proceeding.
+const BranchVariantPayloadDir = ".hfdesk-variants-payload"
+
 // BranchVariantManifestDir returns the directory that receives hfd.yaml for an
 // HF-cache branch variant revision at commit. The revision and commit are
 // validated so the result stays inside the repository's metadata directory.
@@ -45,6 +60,30 @@ func BranchVariantLocalManifestDir(repoBase, revision, commit string) (string, e
 	return branchVariantManifestDir(repoBase, revision, commit)
 }
 
+// BranchVariantLocalPayloadDir returns the directory that receives the
+// payload files of a local/flat branch variant revision.
+//
+// The payload must not live at a repository-relative path: a repository whose
+// ordinary tree contains a top-level directory named like the revision (for
+// example "4.00bpw/config.json") would otherwise make the branch download
+// write the very same file as the ordinary download and replace its bytes.
+// The payload therefore lives in the app-owned payload directory, a different
+// subtree of the repository directory. The ordinary repository payload never
+// uses the app-owned directory name, so an ordinary download and a
+// branch-variant download of the same repository do not write the same file.
+//
+// The one case where the separation does not hold is a repository whose own
+// tree contains a top-level entry named exactly like the app-owned directory:
+// that directory is then shared with the app-owned content. The app-owned
+// trees are verified before use, so a symlinked or non-directory app-owned
+// entry is refused and the download fails rather than proceeding.
+func BranchVariantLocalPayloadDir(repoBase, revision string) (string, error) {
+	if !ValidBranchVariantRevision(revision) {
+		return "", fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	return SafeJoin(repoBase, filepath.Join(BranchVariantPayloadDir, revision))
+}
+
 // branchVariantManifestDir is the single owner of the completion-manifest
 // layout: <base>/.hfdesk-variants/<revision>/<commit>.
 func branchVariantManifestDir(base, revision, commit string) (string, error) {
@@ -58,21 +97,216 @@ func branchVariantManifestDir(base, revision, commit string) (string, error) {
 }
 
 // InvalidateBranchVariantLocalManifests removes the app-owned completion
-// records for revision under a local repository base. Only
-// <base>/.hfdesk-variants/<revision> is removed; the payload tree is never
-// touched. A local branch-variant download calls this after planning and
-// before any payload effect, so a failed or cancelled re-download cannot leave
-// an older record claiming a mixed or replaced payload is complete.
-func InvalidateBranchVariantLocalManifests(base, revision string) error {
+// records for revision of repo under a local repository base.
+//
+// Only the app's own records are removed: the completion record
+// <base>/.hfdesk-variants/<revision>/<commit>/hfd.yaml of every record
+// directory <commit> under the revision directory, plus the record and
+// revision directories themselves once they are empty. Nothing else is
+// removed. The app-owned metadata tree lives inside the repository directory,
+// so the ordinary payload of the same repository can share it: a repository
+// file that happens to live there (for example
+// <base>/.hfdesk-variants/<revision>/config.json) is not a completion record
+// and survives, and the directories are pruned with os.Remove, which fails
+// harmlessly on a non-empty directory, so content that must stay keeps its
+// directory.
+//
+// A record directory name is only a candidate, not proof: the repository's
+// own tree can place a file at exactly the record path (for example
+// <base>/.hfdesk-variants/<revision>/<commit>/hfd.yaml). Such a file is
+// removed only when its content proves that it is this variant's completion
+// record (see BranchVariantRecordMatches). A file that does not parse as a
+// manifest, or that describes another repository, revision or commit, is
+// repository content and is left completely untouched.
+//
+// A local branch-variant download calls this after planning and before any
+// payload effect, so a failed or cancelled re-download cannot leave an older
+// record claiming a mixed or replaced payload is complete.
+//
+// The app-owned trees the local branch-variant layout uses are verified
+// first: a symlinked tree would make the removal reach outside the repository
+// and would make the payload writes land outside it too, so an unsafe layout
+// is refused before anything is removed or written. A missing tree is not
+// unsafe: the first download creates it.
+func InvalidateBranchVariantLocalManifests(base, revision, repo string) error {
 	if !ValidBranchVariantRevision(revision) {
 		return fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	for _, tree := range []string{BranchVariantMetadataDir, BranchVariantPayloadDir} {
+		if err := ensureLocalBranchVariantTree(base, branchVariantLocalTreeComponents(tree, revision)); err != nil {
+			return fmt.Errorf("unsafe branch variant layout: %w", err)
+		}
 	}
 	revisionDir, err := SafeJoin(base, filepath.Join(BranchVariantMetadataDir, revision))
 	if err != nil {
 		return err
 	}
-	if err := os.RemoveAll(revisionDir); err != nil {
-		return fmt.Errorf("remove branch variant completion records: %w", err)
+	entries, err := os.ReadDir(revisionDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No revision directory means no completion record.
+			return nil
+		}
+		return fmt.Errorf("read branch variant completion records: %w", err)
+	}
+	// The record directories are the ones the presence lookup enumerates: a
+	// plain directory named like a commit. Every other entry of the revision
+	// directory is repository content or another entry of the shared
+	// app-owned tree, and is left alone. The name only selects a candidate:
+	// the record file inside it is removed only when its content proves that
+	// it is this variant's completion record.
+	for _, entry := range branchVariantRecordEntries(entries) {
+		recordDir := filepath.Join(revisionDir, entry.Name())
+		// Inspect the record directory before reaching into it: a symlinked
+		// one would make the record removal below delete a file outside the
+		// repository, and would make the completion record written at the end
+		// of the download land outside it too.
+		info, err := os.Lstat(recordDir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect branch variant completion record %s: %w", recordDir, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe branch variant layout: %s is a symbolic link", recordDir)
+		}
+		if !info.IsDir() {
+			// Not a record directory: leave it alone, do not traverse it.
+			continue
+		}
+		if err := removeBranchVariantCompletionRecord(filepath.Join(recordDir, ManifestFilename), repo, revision, entry.Name()); err != nil {
+			return err
+		}
+		// Prune the record directory when the record was its only content.
+		// os.Remove fails on a non-empty directory, which is exactly the case
+		// where content that must survive lives in it.
+		_ = os.Remove(recordDir)
+	}
+	// Prune the revision directory when the removed records were its only
+	// content. A revision directory that still holds repository content stays
+	// exactly where it is.
+	_ = os.Remove(revisionDir)
+	return nil
+}
+
+// removeBranchVariantCompletionRecord removes one app-owned completion record
+// file, but only when the file really is the completion record of the branch
+// variant of repo at revision and commit.
+//
+// The file name is not proof: the app-owned trees live inside the repository
+// directory, so the repository's own tree can place a file with the record's
+// name at exactly the record path. The content decides, through the shared
+// record contract: a file that does not parse as a manifest, or that parses
+// as a manifest for another repository, revision or commit, is repository
+// content and is left completely untouched.
+//
+// Only the record file is removed. A missing record is not an error, and a
+// record path that is a directory is left alone: it is not a record the app
+// wrote, and os.Remove would delete a directory the repository may own. A
+// symlink is removed as a link only, so a record that points outside the
+// repository keeps its target.
+func removeBranchVariantCompletionRecord(record, repo, revision, commit string) error {
+	info, err := os.Lstat(record)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect branch variant completion record %s: %w", record, err)
+	}
+	if info.IsDir() {
+		return nil
+	}
+	manifest, err := ReadManifest(record)
+	if err != nil {
+		// Not a manifest at all: repository content that carries the record's
+		// name, so it stays.
+		return nil
+	}
+	if !BranchVariantRecordMatches(manifest, repo, revision, commit) {
+		// A manifest of something else: it is not this variant's record, so
+		// it stays.
+		return nil
+	}
+	if err := os.Remove(record); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove branch variant completion record %s: %w", record, err)
+	}
+	return nil
+}
+
+// BranchVariantRecordMatches reports whether manifest is the completion
+// record of the branch variant of repo at revision and commit.
+//
+// It is the single owner of the question "is this file this variant's
+// completion record?", so the presence lookup and the local invalidation
+// answer it the same way and the rule cannot drift. The conditions are the
+// ones the presence lookup requires: the manifest must be a branch-variant
+// manifest, it must name the expected repository, revision and commit, and it
+// must be a complete record (a completion time, and a file list that matches
+// the recorded file count).
+//
+// A file that is not a manifest, or a manifest for another repository,
+// revision or commit, is not a record of this variant: it is repository
+// content that happens to carry the record's name.
+func BranchVariantRecordMatches(manifest *DownloadManifest, repo, revision, commit string) bool {
+	return manifest != nil &&
+		manifest.BranchVariant &&
+		manifest.Repo == repo &&
+		manifest.Branch == revision &&
+		manifest.Commit == commit &&
+		!manifest.CompletedAt.IsZero() &&
+		manifest.TotalFiles > 0 &&
+		len(manifest.Files) == manifest.TotalFiles
+}
+
+// branchVariantLocalTreeComponents returns the path components of one
+// app-owned local branch-variant tree: the tree's own name followed by the
+// revision's components. A revision may contain slashes (a real branch like
+// "exl/4_25"), so every component below the tree is checked on its own.
+func branchVariantLocalTreeComponents(tree, revision string) []string {
+	return append([]string{tree}, strings.Split(revision, "/")...)
+}
+
+// ensureLocalBranchVariantTree verifies that every component of an app-owned
+// local branch-variant tree is a real directory inside base and never a
+// symlink.
+//
+// Every component is resolved through SafeJoin, the package's containment
+// primitive: the revision reaches this function from an HTTP request, and
+// SafeJoin's filepath.IsLocal check is the barrier code scanning
+// (go/path-injection) recognizes, so a component is proven to stay under the
+// component above it before it reaches the filesystem. A component SafeJoin
+// refuses is reported as an unsafe layout instead of being inspected.
+//
+// SafeJoin proves textual containment only: it never inspects the
+// filesystem, so a symlinked component would silently redirect the tree
+// outside the repository. The check uses os.Lstat so a symlink is detected
+// instead of followed, and it inspects every component rather than only the
+// leaf, because a symlinked intermediate component redirects everything below
+// it: the completion records the invalidation removes and the payload bytes
+// the download writes. A missing component is not unsafe: nothing below it
+// can exist, and the downloader creates the tree.
+func ensureLocalBranchVariantTree(base string, components []string) error {
+	current := base
+	for _, part := range components {
+		next, err := SafeJoin(current, part)
+		if err != nil {
+			return fmt.Errorf("resolve %q inside %s: %w", part, current, err)
+		}
+		current = next
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symbolic link", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", current)
+		}
 	}
 	return nil
 }
@@ -97,12 +331,27 @@ func BranchVariantManifestDirs(base, revision string) ([]string, error) {
 		return nil, nil
 	}
 	dirs := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() && safeCommitName(entry.Name()) {
+	for _, entry := range branchVariantRecordEntries(entries) {
+		if entry.IsDir() {
 			dirs = append(dirs, filepath.Join(revisionDir, entry.Name()))
 		}
 	}
 	return dirs, nil
+}
+
+// branchVariantRecordEntries returns the entries of a revision directory that
+// name a completion record directory, using the one name rule the completion
+// record layout is keyed by: a plain, non-escaping commit name. The callers
+// decide what to do with an entry that is not a plain directory: the presence
+// lookup ignores it, and the invalidation refuses a symlinked one.
+func branchVariantRecordEntries(entries []os.DirEntry) []os.DirEntry {
+	records := make([]os.DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if safeCommitName(entry.Name()) {
+			records = append(records, entry)
+		}
+	}
+	return records
 }
 
 // ValidBranchVariantRevision reports whether revision is a slash-separated

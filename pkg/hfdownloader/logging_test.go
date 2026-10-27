@@ -103,9 +103,9 @@ func newTestHub(t *testing.T, content []byte) (*httptest.Server, func() []string
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/abc123":
+		case "/api/models/o/r/tree/main":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: int64(len(content))}})
-		case "/o/r/raw/abc123/config.json":
+		case "/o/r/raw/main/config.json":
 			mu.Lock()
 			authSeen = append(authSeen, r.Header.Get("Authorization"))
 			mu.Unlock()
@@ -248,7 +248,7 @@ func TestDownloadFailureRecordsReachPipeline(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/abc123":
+		case "/api/models/o/r/tree/main":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 7}})
 		default:
 			// A permanent status: the file fails and the job fails with it.
@@ -293,7 +293,7 @@ func TestDownloadCancellationRecordReachesPipeline(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/abc123":
+		case "/api/models/o/r/tree/main":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 7}})
 		default:
 			<-r.Context().Done()

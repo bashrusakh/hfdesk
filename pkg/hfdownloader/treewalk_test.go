@@ -32,7 +32,7 @@ func TestPlanRepo_PaginationOriginBoundary(t *testing.T) {
 					if dataset {
 						api = "datasets"
 					}
-					treePath := "/api/" + api + "/owner/repo/tree/cafebabe"
+					treePath := "/api/" + api + "/owner/repo/tree/main"
 					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						wantAuth := ""
 						if token != "" {
@@ -67,7 +67,7 @@ func TestPlanRepo_PaginationOriginBoundary(t *testing.T) {
 							case "root relative":
 								next = treePath + next
 							case "path relative":
-								next = "cafebabe" + next
+								next = "main" + next
 							}
 							w.Header().Set("Link", "<"+next+">; rel=next")
 						}
@@ -359,7 +359,7 @@ func TestPlanRepo_PaginationCompletion(t *testing.T) {
 					if dataset {
 						api = "datasets"
 					}
-					if r.URL.Path != "/api/"+api+"/owner/repo/tree/cafebabe" {
+					if r.URL.Path != "/api/"+api+"/owner/repo/tree/main" {
 						t.Errorf("unexpected tree API path: %s", r.URL.Path)
 					}
 					page := reqs.Add(1)
@@ -421,13 +421,13 @@ func TestPlanRepo_BackslashDirectoryPreservesFileValidation(t *testing.T) {
 				reqs.Add(1)
 				nodes := []hfNode{{Type: "file", Path: "ok.bin", Size: 1}}
 				switch {
-				case strings.HasSuffix(r.URL.Path, "/tree/cafebabe"):
+				case strings.HasSuffix(r.URL.Path, "/tree/main"):
 					if tc.direct {
 						nodes = append(nodes, hfNode{Type: "file", Path: `win\dir/evil/file.bin`})
 					} else {
 						nodes = append(nodes, hfNode{Type: "directory", Path: `win\dir`})
 					}
-				case strings.HasSuffix(r.URL.Path, `/tree/cafebabe/win\dir`):
+				case strings.HasSuffix(r.URL.Path, `/tree/main/win\dir`):
 					if !strings.Contains(r.URL.EscapedPath(), "win%5Cdir") {
 						t.Errorf("backslash not escaped: %s", r.URL.EscapedPath())
 					}

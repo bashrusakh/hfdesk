@@ -61,9 +61,9 @@ func newModelCompanionHub(t *testing.T) (*httptest.Server, *modelCompanionHub) {
 				{"type": "file", "path": "weights/model.safetensors", "size": len(modelCompanionSafetensors), "lfs": map[string]any{"size": len(modelCompanionSafetensors)}},
 				{"type": "file", "path": "model-Q4_K_M.gguf", "size": len(modelCompanionGGUF)},
 			})
-		case strings.HasSuffix(r.URL.Path, "/resolve/deadbeef/weights/model.safetensors"):
+		case strings.HasSuffix(r.URL.Path, "/resolve/main/weights/model.safetensors"):
 			_, _ = w.Write([]byte(modelCompanionSafetensors))
-		case strings.HasSuffix(r.URL.Path, "/raw/deadbeef/model-Q4_K_M.gguf"):
+		case strings.HasSuffix(r.URL.Path, "/raw/main/model-Q4_K_M.gguf"):
 			h.ggufOnce.Do(func() { close(h.ggufStarted) })
 			select {
 			case <-h.allowGGUF:

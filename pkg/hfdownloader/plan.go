@@ -281,13 +281,19 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		commitResolved = safeCommitName(repoInfo.SHA)
 	}
 
-	// Once the Hub reports the commit, read the tree and file bytes at that
-	// exact commit. A branch name can move between the revision lookup and the
-	// later tree/file reads, which would otherwise combine one commit's planned
-	// file list with another commit's contents. Refs, destination naming,
+	// Only a branch variant reads the tree and file bytes at the resolved
+	// commit. Its payload is keyed by that commit (HF-cache snapshot and
+	// completion record), and a branch name can move between the revision
+	// lookup and the later tree/file reads, which would otherwise combine one
+	// commit's planned file list with another commit's contents.
+	//
+	// An ordinary download keeps addressing the caller's revision/branch name.
+	// Commit pinning is not required for it, and a user-configured mirror may
+	// resolve the revision to a SHA while serving file bytes only by branch
+	// name; pinning would break such a mirror. Refs, destination naming,
 	// manifest Branch, and progress keep the caller's revision name below.
 	contentJob := job
-	if commitResolved {
+	if job.BranchVariant && commitResolved {
 		contentJob.Revision = commitSHA
 	}
 
@@ -614,8 +620,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size. The URL is pinned to the resolved commit
-		// (contentJob), not the possibly-moved branch name.
+		// Build URL and file size. The URL addresses the revision the
+		// contentJob reads: the resolved commit for a branch variant, the
+		// caller's branch name for an ordinary download.
 		var urlStr string
 		if isLFS {
 			urlStr = lfsURL(cfg.Endpoint, contentJob, rel)

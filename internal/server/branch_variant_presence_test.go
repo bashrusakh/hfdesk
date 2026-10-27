@@ -82,7 +82,10 @@ func writeLocalPresenceVariant(t *testing.T, root string) string {
 	t.Helper()
 	const commit = "2222222222222222222222222222222222222222"
 	repoBase := filepath.Join(root, presenceRepo)
-	variantDir := filepath.Join(repoBase, presenceRevision)
+	variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, presenceRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(variantDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +411,10 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 		t.Fatalf("local branch download: %v", err)
 	}
 
-	payloadDir := filepath.Join(root, presenceRepo, revision)
+	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(filepath.Join(root, presenceRepo), revision)
+	if err != nil {
+		t.Fatal(err)
+	}
 	payload, err := os.ReadFile(filepath.Join(payloadDir, hfdownloader.ManifestFilename))
 	if err != nil || string(payload) != repoManifest {
 		t.Fatalf("payload hfd.yaml = %q err=%v, want repository content", payload, err)
@@ -437,12 +443,16 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 
 // writeLocalPresenceRecord writes one local completion record under
 // <root>/<repo>/.hfdesk-variants/<revision>/<commit> and optionally the payload
-// files it should describe. listed is the manifest file set, so a test can list
-// a file that the payload does not contain.
+// files it should describe, which live in the app-owned payload directory
+// <root>/<repo>/.hfdesk-variants-payload/<revision>. listed is the manifest
+// file set, so a test can list a file that the payload does not contain.
 func writeLocalPresenceRecord(t *testing.T, root, revision, commit string, completedAt time.Time, listed, payload map[string]string) string {
 	t.Helper()
 	repoBase := filepath.Join(root, presenceRepo)
-	variantDir := filepath.Join(repoBase, revision)
+	variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if payload != nil {
 		if err := os.MkdirAll(variantDir, 0755); err != nil {
 			t.Fatal(err)
@@ -680,6 +690,90 @@ func TestBranchVariantLocalRedownloadInvalidatesOlderRecord(t *testing.T) {
 	}
 }
 
+// TestBranchVariantLocalPresenceReportsPayloadDestination pins the local
+// presence contract of the app-owned payload directory: the completion record
+// stays in the metadata tree, the payload lives in the payload directory, and
+// presence reports that directory as the destination root.
+func TestBranchVariantLocalPresenceReportsPayloadDestination(t *testing.T) {
+	const (
+		revision = "9.00bpw"
+		commit   = "9999999999999999999999999999999999999999"
+	)
+	files := map[string]string{
+		"config.json":       `{"model_type":"exl3","bits":4}`,
+		"model.safetensors": "local-branch-weights",
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			nodes := make([]map[string]any, 0, len(files))
+			for name, body := range files {
+				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			body, ok := files[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	root := t.TempDir()
+	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{
+		Repo:          presenceRepo,
+		Revision:      revision,
+		BranchVariant: true,
+	}, hfdownloader.Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil); err != nil {
+		t.Fatalf("local branch download: %v", err)
+	}
+
+	repoBase := filepath.Join(root, presenceRepo)
+	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	// The payload must not be reachable at a repository-relative path.
+	if _, err := os.Stat(filepath.Join(repoBase, revision)); !os.IsNotExist(err) {
+		t.Fatalf("branch payload used a repository-relative directory (err=%v)", err)
+	}
+	// The completion record stays in the metadata tree.
+	recordDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, revision, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(recordDir, hfdownloader.ManifestFilename)); err != nil {
+		t.Fatalf("completion record: %v", err)
+	}
+
+	s := newTestServerWithConfig(t, Config{LocalDir: root})
+	w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
+	}
+	var got branchVariantPresence
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
+		t.Fatalf("presence = %+v", got)
+	}
+	if got.StorageMode != "local" || got.DestinationRoot != payloadDir {
+		t.Fatalf("presence destination = %+v, want the payload dir %q", got, payloadDir)
+	}
+}
+
 // TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile pins the
 // hashless re-download rule: a moved local branch can keep a non-LFS file's
 // size while changing its bytes, so a size-only skip would publish commit A's
@@ -763,7 +857,7 @@ func TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile(t *testing.T)
 	if err := hfdownloader.Download(context.Background(), job, cfg, nil); err != nil {
 		t.Fatalf("download A: %v", err)
 	}
-	payload := filepath.Join(root, presenceRepo, revision, "config.json")
+	payload := filepath.Join(root, presenceRepo, hfdownloader.BranchVariantPayloadDir, revision, "config.json")
 	if body, err := os.ReadFile(payload); err != nil || string(body) != configA {
 		t.Fatalf("payload after A = %q err=%v, want %q", body, err, configA)
 	}
@@ -802,5 +896,119 @@ func TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile(t *testing.T)
 	}
 	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commitB {
 		t.Fatalf("presence after B = %+v", got)
+	}
+}
+
+// TestBranchVariantLocalSlashRevisionRoundTrip covers the positive local
+// round trip of a revision that contains a slash ("exl/4_25"): the payload
+// and the completion record live in the app-owned trees at the revision's own
+// path, the presence lookup reports the revision as downloaded with the
+// payload directory as its destination root, and a re-download of the same
+// revision works.
+func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
+	const (
+		revision = "exl/4_25"
+		commit   = "4444444444444444444444444444444444444444"
+	)
+	files := map[string]string{
+		"config.json":       `{"model_type":"exl3","bits":4}`,
+		"model.safetensors": "slash-branch-weights",
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			nodes := make([]map[string]any, 0, len(files))
+			for name, body := range files {
+				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			body, ok := files[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	root := t.TempDir()
+	cfg := hfdownloader.Settings{
+		OutputDir:          root,
+		Endpoint:           hub.URL,
+		Verify:             "size",
+		Concurrency:        1,
+		MaxActiveDownloads: 1,
+	}
+	job := hfdownloader.Job{Repo: presenceRepo, Revision: revision, BranchVariant: true}
+	if err := hfdownloader.Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("local branch download: %v", err)
+	}
+
+	repoBase := filepath.Join(root, presenceRepo)
+	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(repoBase, hfdownloader.BranchVariantPayloadDir, "exl", "4_25"); payloadDir != want {
+		t.Fatalf("payload dir = %q, want %q", payloadDir, want)
+	}
+	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	// The payload must not land at a repository-relative path.
+	if _, err := os.Stat(filepath.Join(repoBase, "exl")); !os.IsNotExist(err) {
+		t.Fatalf("branch payload used a repository-relative directory (err=%v)", err)
+	}
+
+	recordDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, revision, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(repoBase, hfdownloader.BranchVariantMetadataDir, "exl", "4_25", commit); recordDir != want {
+		t.Fatalf("completion record dir = %q, want %q", recordDir, want)
+	}
+	manifest, err := hfdownloader.ReadManifest(filepath.Join(recordDir, hfdownloader.ManifestFilename))
+	if err != nil {
+		t.Fatalf("completion record: %v", err)
+	}
+	if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != commit {
+		t.Fatalf("completion record = %+v, want the %q variant at %q", manifest, revision, commit)
+	}
+
+	// The presence lookup reports the revision as downloaded, with the
+	// payload directory as the destination root.
+	s := newTestServerWithConfig(t, Config{LocalDir: root})
+	w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
+	}
+	var got branchVariantPresence
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
+		t.Fatalf("presence = %+v", got)
+	}
+	if got.StorageMode != "local" || got.DestinationRoot != payloadDir {
+		t.Fatalf("presence destination = %+v, want the payload dir %q", got, payloadDir)
+	}
+
+	// A re-download of the same revision works and republishes its record.
+	if err := hfdownloader.Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("re-download of %q: %v", revision, err)
+	}
+	manifest, err = hfdownloader.ReadManifest(filepath.Join(recordDir, hfdownloader.ManifestFilename))
+	if err != nil {
+		t.Fatalf("completion record after the re-download: %v", err)
+	}
+	if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != commit {
+		t.Fatalf("completion record after the re-download = %+v", manifest)
 	}
 }

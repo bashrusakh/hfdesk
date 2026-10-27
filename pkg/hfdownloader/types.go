@@ -47,9 +47,10 @@ type Job struct {
 	// BranchVariant marks an analyzer-recognized EXL2/EXL3 quantization branch.
 	// The download covers the whole branch named by Revision (filters are not
 	// allowed) and is stored in an isolated location keyed by the resolved
-	// commit (HF cache) or by the revision (local/flat mode), so two variants
-	// with identical file names cannot overwrite each other. A completed
-	// variant manifest is written for presence checks.
+	// commit (HF cache) or by the revision in an app-owned payload directory
+	// (local/flat mode), so two variants with identical file names cannot
+	// overwrite each other. A completed variant manifest is written for
+	// presence checks.
 	BranchVariant bool
 
 	// Filters define case-insensitive direct selection matches against the full
