@@ -206,7 +206,7 @@ type PlanItem struct {
 // Plan contains the list of files to download.
 type Plan struct {
 	Items  []PlanItem `json:"items"`
-	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	Commit string     `json:"commit,omitempty"` // The commit resolved from the Hub lookup, else the revision-name fallback; see CommitResolved
 	// CommitResolved reports whether Commit came from a successful Hub
 	// revision response rather than the job's revision-name fallback. Branch
 	// variants require a resolved commit so their content-addressed blobs and
@@ -268,7 +268,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	directFilterMatch := false
 	datasetMembershipMatch := false
 
-	// Fetch actual commit SHA for the revision
 	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
 	commitSHA := job.Revision
 	commitResolved := false
@@ -489,7 +488,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		rel := n.Path
 
-		// Deduplicate by relative path
 		if _, ok := seen[rel]; ok {
 			continue
 		}
@@ -621,9 +619,9 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size. The URL addresses the revision the
-		// contentJob reads: the resolved commit for a branch variant, the
-		// caller's branch name for an ordinary download.
+		// The URL addresses the revision the contentJob reads: the resolved
+		// commit for a branch variant, the caller's branch name for an
+		// ordinary download.
 		var urlStr string
 		if isLFS {
 			urlStr = lfsURL(cfg.Endpoint, contentJob, rel)
@@ -1219,19 +1217,14 @@ func isREADMEPath(filePath string) bool {
 // An ordinary download writes into the repository directory; a branch variant
 // writes into the app-owned reserved space. The two never share a
 // constructor, and the reserved-name refusal lives here, in the local
-// download's destination resolver: the app's own space is built UNDER the
-// reserved name, so a refusal that the space construction consulted would
-// reject the app's own space. The ordinary destination constructor
-// (destinationBase) and the shared DestinationBase helper stay free of it for
-// the same reason.
+// download's destination resolver, so the app's own space cannot be
+// rejected by it (see refuseReservedLocalOwner).
 func localDownloadBase(job Job, cfg Settings, space *BranchVariantLocalSpace) (string, error) {
 	if !job.BranchVariant {
-		// The reserved app-owned branch-variant space name must not be used
-		// as a repository owner: an ordinary download would then write into
-		// the app's own space. The refusal is on the owner component only:
-		// the reserved space is one level deeper than the repository
-		// directory, so a repository whose NAME is the reserved name still
-		// lives in its own subtree and never collides with the space.
+		// The refusal is on the owner component only: the reserved space is
+		// one level deeper than the repository directory, so a repository
+		// whose NAME is the reserved name still lives in its own subtree and
+		// never collides with the space.
 		if err := refuseReservedLocalOwner(localRepoFolder(job)); err != nil {
 			return "", err
 		}
@@ -1247,8 +1240,7 @@ func localDownloadBase(job Job, cfg Settings, space *BranchVariantLocalSpace) (s
 // download.
 //
 // It is a pure path computation: the reserved-name refusal belongs to the
-// local download's destination resolver (see localDownloadBase), because the
-// app's own branch-variant space is built under the reserved name.
+// local download's destination resolver (see localDownloadBase).
 func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
@@ -1266,7 +1258,8 @@ func localRepoFolder(job Job) string {
 }
 
 // refuseReservedLocalOwner refuses a repository whose owner component is the
-// reserved app-owned branch-variant space name.
+// reserved app-owned branch-variant space name: an ordinary download would
+// then write into the app's own space.
 func refuseReservedLocalOwner(repo string) error {
 	owner, _, ok := strings.Cut(repo, "/")
 	if !ok {

@@ -198,7 +198,6 @@ const wsBroadcastMinGap = 250 * time.Millisecond
 var errJobManagerStopping = errors.New("job manager is stopping")
 var errJobManagerPersistenceClosed = errors.New("job manager persistence is closed")
 
-// NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 	return newJobManagerWithStatePath(cfg.captureCacheEnvironment(), wsHub, JobsStatePath())
 }
@@ -383,7 +382,6 @@ func (m *JobManager) saveStateAndLog() {
 	}
 }
 
-// generateID creates a short random ID.
 func generateID() string {
 	b := make([]byte, 6)
 	rand.Read(b)
@@ -442,7 +440,6 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 		j.partialFilesMu.Unlock()
 	}
 
-	// Deep-copy slices/pointers.
 	if j.Filters != nil {
 		clone.Filters = append([]string(nil), j.Filters...)
 	}
@@ -485,10 +482,10 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-// CreateJob creates a new download job.
-// Returns existing job only when repo, revision, dataset, destination and
-// filters match an active job. Different filters on the same repo (e.g.
-// Q4_K_M vs mmproj-f16) create independent jobs.
+// CreateJob creates a new download job, or returns the existing one when
+// repo, revision, dataset, destination and filters match an active job.
+// Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16) create
+// independent jobs.
 //
 // The destination is resolved from the current settings at creation and
 // frozen on the job: later settings changes never move an existing job's
@@ -1012,7 +1009,6 @@ func (m *JobManager) DeleteJob(id string) bool {
 	}
 	m.opWG.Add(1)
 
-	// Cancel if running
 	if job.cancel != nil && (job.Status == JobStatusQueued || job.Status == JobStatusRunning) {
 		job.cancel()
 	}
@@ -1510,7 +1506,6 @@ const speedWindow = 10 * time.Second
 // derived from it) jump around. Samples are throttled to a few per second so
 // the window stays small. now is passed in for deterministic testing.
 func updateJobSpeed(job *Job, transferred int64, now time.Time) {
-	// Throttle to a few samples per second.
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
@@ -1692,7 +1687,6 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	}
 }
 
-// runJob executes the download job.
 func (m *JobManager) runJob(job *Job, activityID uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
@@ -1707,7 +1701,6 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		m.runWG.Done()
 	}()
 
-	// Increment generation and store our generation number
 	m.mu.Lock()
 	if m.fenced {
 		job.starting = false
@@ -1729,7 +1722,6 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	m.mu.Unlock()
 	m.notifyListeners(startSnap)
 
-	// Create download job and settings
 	dlJob := hfdownloader.Job{
 		Repo:               job.Repo,
 		Revision:           job.Revision,
@@ -1852,10 +1844,8 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		m.notifyListeners(progressSnap)
 	}
 
-	// Run the download
 	err := hfdownloader.Run(ctx, dlJob, settings, progressFunc)
 
-	// Update final status
 	m.mu.Lock()
 	// Don't update status if:
 	// 1. Job was paused (user intentionally stopped it)

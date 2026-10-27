@@ -356,10 +356,8 @@ type ProgressEvent struct {
 	// Empty defaults to "info".
 	Level string `json:"level,omitempty"`
 
-	// Event is the event type identifier.
 	Event string `json:"event"`
 
-	// Repo is the repository being processed.
 	Repo string `json:"repo,omitempty"`
 
 	// Revision is the branch/tag/commit being downloaded.
@@ -368,7 +366,6 @@ type ProgressEvent struct {
 	// Path is the relative file path within the repository.
 	Path string `json:"path,omitempty"`
 
-	// Bytes is the number of bytes in the current progress update.
 	// Used in "file_progress" events.
 	Bytes int64 `json:"bytes,omitempty"`
 
@@ -386,7 +383,6 @@ type ProgressEvent struct {
 	// For "file_done" events, may contain "skip (reason)" if skipped.
 	Message string `json:"message,omitempty"`
 
-	// IsLFS indicates whether this file is stored in Git LFS.
 	IsLFS bool `json:"isLfs,omitempty"`
 }
 

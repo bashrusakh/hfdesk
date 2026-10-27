@@ -88,10 +88,8 @@ func BranchVariantManifestDir(repoDir *RepoDir, revision, commit string) (string
 // server's presence lookup and the completion-record write cannot disagree
 // about where a variant lives.
 //
-// The space lives outside the ordinary repository tree, so the ordinary
-// downloader and the app's own writes never share a path: a repository whose
-// tree carries the app's former directory names keeps those files, and the
-// branch variant writes only inside the space.
+// See BranchVariantLocalSpaceName for the layout this space owns and why it
+// lives outside the ordinary repository tree.
 type BranchVariantLocalSpace struct {
 	root    string
 	repo    string
@@ -110,11 +108,6 @@ type BranchVariantLocalSpace struct {
 // repository id must be an owner/name pair of plain path components, and
 // every path component of the space is resolved through SafeJoin, the
 // package's containment primitive.
-//
-// The construction is deliberately independent of the ordinary destination
-// helper: the app's own space is built UNDER the reserved name, so a
-// reserved-name refusal that the space construction consulted would reject
-// the app's own space.
 func NewBranchVariantLocalSpace(root, repo string) (BranchVariantLocalSpace, error) {
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -164,8 +157,7 @@ func (space BranchVariantLocalSpace) Path() string {
 // ordinary tree contains a top-level directory named like the revision (for
 // example "4.00bpw/config.json") would otherwise make the branch download
 // write the very same file as the ordinary download and replace its bytes.
-// The payload therefore lives in the app-owned reserved space, outside the
-// ordinary repository tree altogether.
+// See BranchVariantLocalSpaceName for the reserved space that holds it.
 func (space BranchVariantLocalSpace) PayloadDir(revision string) (string, error) {
 	if !ValidBranchVariantRevision(revision) {
 		return "", fmt.Errorf("invalid branch variant revision %q", revision)
@@ -201,8 +193,7 @@ func (space BranchVariantLocalSpace) RecordDirs(revision string) ([]string, erro
 	entries, err := os.ReadDir(revisionDir)
 	if err != nil {
 		// A missing, obstructed, or unreadable record store holds no
-		// completion record; presence reports the revision as not downloaded,
-		// matching the previous single-manifest lookup.
+		// completion record; presence reports the revision as not downloaded.
 		return nil, nil
 	}
 	dirs := make([]string, 0, len(entries))
@@ -239,16 +230,16 @@ func (space BranchVariantLocalSpace) recordRevisionDir(revision string) (string,
 }
 
 // treeComponents returns the path components of one app-owned tree of the
-// space, relative to the local output root: the reserved space name, the
-// repository id, the tree name, and the revision's components. A revision may
-// contain slashes (a real branch like "exl/4_25"), so every component below
-// the tree is checked on its own.
+// space, relative to the local output root. A revision may contain slashes (a
+// real branch like "exl/4_25"), so every component below the tree is checked
+// on its own.
 func (space BranchVariantLocalSpace) treeComponents(tree, revision string) []string {
 	return append([]string{BranchVariantLocalSpaceName, space.owner, space.name, tree}, strings.Split(revision, "/")...)
 }
 
-// branchVariantManifestDir is the single owner of the HF-cache
-// completion-manifest layout: <base>/.hfdesk-variants/<revision>/<commit>.
+// branchVariantManifestDir returns the completion-manifest directory of an
+// HF-cache branch variant revision at commit, composed from
+// BranchVariantMetadataDir.
 func branchVariantManifestDir(base, revision, commit string) (string, error) {
 	if !ValidBranchVariantRevision(revision) {
 		return "", fmt.Errorf("invalid branch variant revision %q", revision)
@@ -267,27 +258,20 @@ func branchVariantManifestDir(base, revision, commit string) (string, error) {
 // <commit> under the revision directory, plus the record and revision
 // directories themselves once they are empty. Nothing else is removed.
 //
-// The space is app-owned and lives outside the ordinary repository tree, so
-// the ordinary payload of the same repository cannot share it. A file that
-// nevertheless carries the record's name is not a completion record and
-// survives: the content decides, through the shared record contract (see
-// BranchVariantRecordMatches). A file that does not parse as a manifest, or
-// that describes another repository, revision or commit, is left completely
-// untouched.
+// A file that carries the record's name at the record path is not a
+// completion record and survives: the content decides, through the shared
+// record contract (see BranchVariantRecordMatches). A file that does not
+// parse as a manifest, or that describes another repository, revision or
+// commit, is left completely untouched.
 //
 // A local branch-variant download calls this after planning and before any
 // payload effect, so a failed or cancelled re-download cannot leave an older
 // record claiming a mixed or replaced payload is complete.
 //
-// The app-owned trees the space uses are verified first: a symlinked tree
-// would make the removal reach outside the space and would make the payload
-// writes land outside it too, so an unsafe layout is refused before anything
-// is removed or written. A missing tree is not unsafe: the first download
-// creates it. A record slot occupied by something that is not a directory is
-// refused the same way as a symlinked one: the app-owned tree must be a real
-// directory at every level the invalidation walks, because the completion
-// record is written into that slot at the end of the download and would fail
-// there, after the payload was already written.
+// The app-owned trees the space uses are verified first, so a symlinked tree
+// cannot redirect the removal or the later payload writes outside the space
+// (see ensureLocalBranchVariantTree). A missing tree is not unsafe: the first
+// download creates it.
 func (space BranchVariantLocalSpace) InvalidateRecords(revision string) error {
 	if !ValidBranchVariantRevision(revision) {
 		return fmt.Errorf("invalid branch variant revision %q", revision)
@@ -313,7 +297,7 @@ func (space BranchVariantLocalSpace) InvalidateRecords(revision string) error {
 	// plain directory named like a commit. Every other entry of the revision
 	// directory is left alone. The name only selects a candidate: the record
 	// file inside it is removed only when its content proves that it is this
-	// variant's completion record.
+	// variant's completion record (see BranchVariantRecordMatches).
 	for _, entry := range branchVariantRecordEntries(entries) {
 		recordDir := filepath.Join(revisionDir, entry.Name())
 		// Inspect the record directory before reaching into it: a symlinked
@@ -359,9 +343,7 @@ func (space BranchVariantLocalSpace) InvalidateRecords(revision string) error {
 //
 // The file name is not proof: a file that carries the record's name can sit
 // at exactly the record path. The content decides, through the shared record
-// contract: a file that does not parse as a manifest, or that parses as a
-// manifest for another repository, revision or commit, is not this variant's
-// record and is left completely untouched.
+// contract (see BranchVariantRecordMatches).
 //
 // Only the record file is removed. A missing record is not an error, and a
 // record path that is a directory is left alone: it is not a record the app
@@ -510,31 +492,37 @@ func ValidBranchVariantRevision(revision string) bool {
 // DownloadManifest captures the complete record of a download job.
 // This file is written to the friendly view root (e.g., models/Owner/Repo/hfd.yaml)
 // and contains all information needed to understand and reproduce the download.
+//
+// A branch variant's manifest is its completion record rather than a
+// friendly-view manifest: it is written to the branch-variant completion-record
+// directory (see BranchVariantMetadataDir in HF-cache mode and
+// BranchVariantLocalSpace.RecordDir in local mode).
+//
+// Type is "model" or "dataset" and Repo is an "owner/name" id. Branch is the
+// revision name (usually "main"). RepoPath is relative to the app root, and
+// absolute when the Hub is on another volume. TotalSize is the sum of the
+// recorded file sizes, in bytes.
 type DownloadManifest struct {
-	// Metadata
-	Version string `yaml:"version" json:"version"` // Manifest format version
+	Version string `yaml:"version" json:"version"`
 
-	// Repository info
-	Type     string `yaml:"type" json:"type"`           // "model" or "dataset"
-	Repo     string `yaml:"repo" json:"repo"`           // "owner/name"
-	Branch   string `yaml:"branch" json:"branch"`       // Branch name (usually "main")
-	Commit   string `yaml:"commit" json:"commit"`       // Commit hash
-	RepoPath string `yaml:"repo_path" json:"repo_path"` // Relative to app root; absolute if Hub is on another volume.
+	Type     string `yaml:"type" json:"type"`
+	Repo     string `yaml:"repo" json:"repo"`
+	Branch   string `yaml:"branch" json:"branch"`
+	Commit   string `yaml:"commit" json:"commit"`
+	RepoPath string `yaml:"repo_path" json:"repo_path"`
 
 	// BranchVariant marks a manifest for an analyzer-recognized EXL2/EXL3
 	// branch stored in isolation. Ordinary repo manifests leave it false.
 	BranchVariant bool `yaml:"branch_variant,omitempty" json:"branch_variant,omitempty"`
 
-	// Timing
-	StartedAt   time.Time `yaml:"started_at" json:"started_at"`     // When download started
-	CompletedAt time.Time `yaml:"completed_at" json:"completed_at"` // When download completed
+	StartedAt   time.Time `yaml:"started_at" json:"started_at"`
+	CompletedAt time.Time `yaml:"completed_at" json:"completed_at"`
 
 	// CLI command used (token stripped for security)
 	Command string `yaml:"command" json:"command"`
 
-	// Results
-	TotalSize  int64          `yaml:"total_size" json:"total_size"`   // Total bytes downloaded
-	TotalFiles int            `yaml:"total_files" json:"total_files"` // Number of files
+	TotalSize  int64          `yaml:"total_size" json:"total_size"`
+	TotalFiles int            `yaml:"total_files" json:"total_files"`
 	Files      []ManifestFile `yaml:"files" json:"files"`
 
 	// Deleted records snapshot names intentionally removed after the download
@@ -553,23 +541,21 @@ type ManifestDeletion struct {
 	Versions []string `yaml:"versions,omitempty" json:"versions,omitempty"`
 }
 
-// ManifestFile represents a single file in the manifest.
-// The Blob field contains the relative path from the repo directory to the blob,
-// making it easy for automation scripts to locate and copy files.
+// ManifestFile is one file in the manifest. The Blob field contains the
+// relative path from the repo directory to the blob, making it easy for
+// automation scripts to locate and copy files. Size is the file size in bytes.
 type ManifestFile struct {
-	Name string `yaml:"name" json:"name"` // Original filename (e.g., "model.Q4_K_M.gguf")
-	Blob string `yaml:"blob" json:"blob"` // Relative path to blob (e.g., "blobs/abc123...")
-	Size int64  `yaml:"size" json:"size"` // File size in bytes
-	LFS  bool   `yaml:"lfs" json:"lfs"`   // Is LFS file
+	Name string `yaml:"name" json:"name"`
+	Blob string `yaml:"blob" json:"blob"`
+	Size int64  `yaml:"size" json:"size"`
+	LFS  bool   `yaml:"lfs" json:"lfs"`
 }
 
-// ManifestBuilder helps construct a manifest during download.
 type ManifestBuilder struct {
 	manifest  *DownloadManifest
 	startTime time.Time
 }
 
-// NewManifestBuilder creates a new manifest builder for a download job.
 func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 	repoType := "model"
 	if job.IsDataset {
@@ -581,7 +567,6 @@ func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 		branch = "main"
 	}
 
-	// Build repo path (relative to cache root)
 	repoPath := "hub/" + RepoTypeName(job.IsDataset) + "--" + strings.ReplaceAll(job.Repo, "/", "--")
 
 	return &ManifestBuilder{
@@ -600,12 +585,11 @@ func NewManifestBuilder(job Job, command string) *ManifestBuilder {
 	}
 }
 
-// SetCommit sets the commit hash.
 func (b *ManifestBuilder) SetCommit(commit string) {
 	b.manifest.Commit = commit
 }
 
-// AddFile adds a file to the manifest.
+// AddFile adds a file to the manifest and accumulates the size and file count.
 func (b *ManifestBuilder) AddFile(name, blobHash string, size int64, isLFS bool) {
 	// An HF-cache entry points at its content-addressed blob. Local/flat mode
 	// has no blob, so leave the field empty instead of emitting a broken
@@ -624,7 +608,7 @@ func (b *ManifestBuilder) AddFile(name, blobHash string, size int64, isLFS bool)
 	b.manifest.TotalFiles++
 }
 
-// Build finalizes the manifest with completion time.
+// Build finalizes the manifest and stamps its completion time.
 func (b *ManifestBuilder) Build() *DownloadManifest {
 	b.manifest.CompletedAt = time.Now().UTC()
 	return b.manifest
@@ -640,7 +624,6 @@ func (b *ManifestBuilder) Build() *DownloadManifest {
 func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
 
-	// Ensure directory exists
 	if err := os.MkdirAll(friendlyPath, 0o755); err != nil {
 		return "", fmt.Errorf("create manifest dir: %w", err)
 	}
@@ -650,7 +633,6 @@ func (m *DownloadManifest) Write(friendlyPath string) (string, error) {
 		return "", fmt.Errorf("marshal manifest: %w", err)
 	}
 
-	// Add header comment
 	header := fmt.Sprintf("# HuggingFace %s: %s\n", m.Type, m.Repo)
 	header += fmt.Sprintf("# Downloaded: %s\n", m.CompletedAt.Format(time.RFC3339))
 	header += "# Generated by hfdesk\n"
@@ -671,7 +653,7 @@ var manifestCreateTemp = createManifestTemp
 
 // createManifestTemp creates an exclusive sibling staging file using the
 // requested permissions. Unlike os.CreateTemp (which always uses 0600),
-// OpenFile applies the process umask to 0644 just as the former WriteFile did.
+// OpenFile applies the process umask to 0644.
 func createManifestTemp(dir, pattern string) (*os.File, error) {
 	for range 100 {
 		var suffix [12]byte
@@ -726,7 +708,6 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(stagingPath, path)
 }
 
-// ReadManifest reads a manifest from a file.
 func ReadManifest(path string) (*DownloadManifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -794,7 +775,6 @@ func (m *DownloadManifest) IsDeleted(name, version string) bool {
 	return false
 }
 
-// RepoTypeName returns the type name prefix for repo directories.
 func RepoTypeName(isDataset bool) string {
 	if isDataset {
 		return "datasets"

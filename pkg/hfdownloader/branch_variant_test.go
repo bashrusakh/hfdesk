@@ -1690,143 +1690,65 @@ func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 	}
 }
 
-// TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords
-// discriminates the third local invalidation defect: a record directory name
-// was treated as proof that the hfd.yaml inside it is a completion record, so
-// a file that carried the app's record path lost that file to a
-// branch-variant download of the same repository. The name only selects a
-// candidate: the content decides whether the file is this variant's
-// completion record, and a foreign file is left completely untouched.
+// TestLocalBranchVariantInvalidationKeepsForeignFiles pins the invalidation's
+// content rule: only the app's own completion record of this variant is
+// removed. Every other file that carries a record path, and every file of the
+// ordinary repository, survives the branch-variant download unchanged.
 //
 // The reserved space is app-owned and lives outside the ordinary repository
-// tree, so the files are planted in the space directly: the contract under
-// test is the content check, not how the files got there.
-func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.T) {
+// tree, so the foreign files are planted in the space directly: the contract
+// under test is the content check, not how the files got there.
+func TestLocalBranchVariantInvalidationKeepsForeignFiles(t *testing.T) {
 	const (
-		revision    = "4.00bpw"
-		commit      = "2222222222222222222222222222222222222222"
-		otherCommit = "3333333333333333333333333333333333333333"
+		revision     = "4.00bpw"
+		commit       = "2222222222222222222222222222222222222222"
+		otherCommit  = "3333333333333333333333333333333333333333"
+		farCommit    = "4444444444444444444444444444444444444444"
+		ordinaryFile = ".hfdesk-variants/4.00bpw/" + otherCommit + "/" + ManifestFilename
+		ordinaryBody = "# the repository's own hfd.yaml\nnot a completion record\n"
 	)
-	// The space carries files at the app's own record paths: one that is not
-	// a manifest at all, one that is a real completion record of another
-	// repository, and one at the record path of this variant's own commit.
-	notAManifest := "# foreign hfd.yaml\nnot a completion record\n"
+	// A complete record of another repository: only its identity separates
+	// it from a record of this variant.
 	foreignRecord := &DownloadManifest{
 		Version:       "1.0",
 		Type:          "model",
 		Repo:          "owner/other-model",
 		Branch:        revision,
-		Commit:        commit,
+		Commit:        farCommit,
 		BranchVariant: true,
 		StartedAt:     time.Now().UTC(),
 		CompletedAt:   time.Now().UTC(),
 		TotalFiles:    1,
 		Files:         []ManifestFile{{Name: "config.json", Size: 12}},
 	}
-	// The foreign record is a complete record, but of another repository: only
-	// the identity differs, so the content check has to reject it.
-	if BranchVariantRecordMatches(foreignRecord, branchFixtureRepo, revision, commit) {
+	if BranchVariantRecordMatches(foreignRecord, branchFixtureRepo, revision, farCommit) {
 		t.Fatal("a record of another repository matches this variant's record contract")
 	}
-	foreignRecordPath, err := foreignRecord.Write(t.TempDir())
+	foreignPath, err := foreignRecord.Write(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	foreignRecordBytes, err := os.ReadFile(foreignRecordPath)
+	foreignBytes, err := os.ReadFile(foreignPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherRepoManifest := string(foreignRecordBytes)
+
+	notAManifest := "# foreign hfd.yaml\nnot a completion record\n"
+	// The space carries files at the app's own record paths: one that is not
+	// a manifest at all, one that is a complete record of another repository
+	// under a name that is not a commit, and one that is a complete record of
+	// another repository at a commit-shaped path.
 	foreignFiles := map[string]string{
 		filepath.Join("records", revision, otherCommit, ManifestFilename): notAManifest,
-		filepath.Join("records", revision, "docs", ManifestFilename):      otherRepoManifest,
-		filepath.Join("records", revision, commit, ManifestFilename):      notAManifest,
+		filepath.Join("records", revision, "docs", ManifestFilename):      string(foreignBytes),
+		filepath.Join("records", revision, farCommit, ManifestFilename):   string(foreignBytes),
 	}
-	foreignAtOwnRecordPath := filepath.Join("records", revision, commit, ManifestFilename)
+	// The variant's own record path carries a file that is not a record at
+	// all: the invalidation leaves it alone and the variant's own record
+	// replaces it.
+	ownRecordPath := filepath.Join("records", revision, commit, ManifestFilename)
+	foreignFiles[ownRecordPath] = notAManifest
 
-	revisions := map[string]branchHubRevision{
-		"main": {
-			sha: "1111111111111111111111111111111111111111",
-			files: map[string]string{
-				"config.json":       `{"model_type":"main"}`,
-				"model.safetensors": "ordinary-main-weights",
-			},
-		},
-		revision: {
-			sha: commit,
-			files: map[string]string{
-				"config.json":       `{"model_type":"exl3","bits":4}`,
-				"model.safetensors": "branch-a-weights",
-			},
-		},
-	}
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-	root := t.TempDir()
-	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
-	spaceDir := branchLocalSpaceDir(root)
-
-	// The foreign files sit at the app's own record paths inside the space.
-	for path, body := range foreignFiles {
-		full := filepath.Join(spaceDir, path)
-		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// The branch-variant download invalidates the revision's prior completion
-	// records before it writes any payload byte.
-	downloadBranchFixture(t, cfg, revision)
-
-	// The foreign files at the app's record paths survive the invalidation
-	// with their original content.
-	for path, body := range foreignFiles {
-		if path == foreignAtOwnRecordPath {
-			// This one is the record path of the variant's own commit, so the
-			// variant's own record replaces it below.
-			continue
-		}
-		got, err := os.ReadFile(filepath.Join(spaceDir, path))
-		if err != nil {
-			t.Fatalf("foreign file %s was removed by the invalidation: %v", path, err)
-		}
-		if string(got) != body {
-			t.Fatalf("foreign file %s = %q, want %q", path, got, body)
-		}
-	}
-
-	// The variant's own record is present and correct at its record path.
-	manifest := readBranchFixtureManifest(t, filepath.Join(spaceDir, foreignAtOwnRecordPath))
-	assertBranchFixtureManifest(t, manifest, revision, commit)
-}
-
-// TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile is
-// the end-to-end form of the invalidation's content rule: an ordinary
-// download of the same repository and a local branch-variant download of one
-// revision must leave every file that is not the app's own completion record
-// untouched.
-//
-// Two foreign files are in play. The repository's own tree carries a file at
-// the app's former record path, so the ordinary download writes it into the
-// ordinary repository directory. The app-owned records tree carries a file at
-// the record path of a commit that is not this variant's own, holding a
-// complete manifest of another repository: only its identity separates it
-// from a record of this variant.
-//
-// A removal that trusted the record directory's name would delete that second
-// file. The name only selects a candidate: the content decides, through the
-// shared record contract.
-func TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile(t *testing.T) {
-	const (
-		revision     = "4.00bpw"
-		commit       = "2222222222222222222222222222222222222222"
-		otherCommit  = "3333333333333333333333333333333333333333"
-		ordinaryFile = ".hfdesk-variants/4.00bpw/" + otherCommit + "/" + ManifestFilename
-		ordinaryBody = "# the repository's own hfd.yaml\nnot a completion record\n"
-	)
 	revisions := map[string]branchHubRevision{
 		"main": {
 			sha: "1111111111111111111111111111111111111111",
@@ -1847,6 +1769,7 @@ func TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile(t *te
 	defer hub.Close()
 	root := t.TempDir()
 	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+	spaceDir := branchLocalSpaceDir(root)
 
 	// The ordinary download writes the repository's own tree, including the
 	// file at the app's former record path.
@@ -1857,50 +1780,35 @@ func TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile(t *te
 		t.Fatalf("ordinary file = %q err=%v, want %q", body, err, ordinaryBody)
 	}
 
-	// The app-owned records tree carries a file at the record path of another
-	// commit: a complete manifest, but of another repository. The reserved
-	// space is app-owned and lives outside the ordinary repository tree, so
-	// the file is planted in the space directly.
-	foreign := &DownloadManifest{
-		Version:       "1.0",
-		Type:          "model",
-		Repo:          "owner/other-model",
-		Branch:        revision,
-		Commit:        otherCommit,
-		BranchVariant: true,
-		StartedAt:     time.Now().UTC(),
-		CompletedAt:   time.Now().UTC(),
-		TotalFiles:    1,
-		Files:         []ManifestFile{{Name: "config.json", Size: 12}},
-	}
-	foreignPath, err := foreign.Write(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreignBytes, err := os.ReadFile(foreignPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreignRecordPath := filepath.Join(branchLocalRecordDir(root, revision, otherCommit), ManifestFilename)
-	if err := os.MkdirAll(filepath.Dir(foreignRecordPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(foreignRecordPath, foreignBytes, 0o644); err != nil {
-		t.Fatal(err)
+	// The foreign files sit at the app's own record paths inside the space.
+	for path, content := range foreignFiles {
+		full := filepath.Join(spaceDir, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// The branch-variant download invalidates the revision's prior completion
 	// records before it writes any payload byte.
 	downloadBranchFixture(t, cfg, revision)
 
-	// The foreign file at the app's own record path survives the invalidation
-	// with its original bytes.
-	got, err := os.ReadFile(foreignRecordPath)
-	if err != nil {
-		t.Fatalf("foreign record file was removed by the invalidation: %v", err)
-	}
-	if string(got) != string(foreignBytes) {
-		t.Fatalf("foreign record file = %q, want %q", got, foreignBytes)
+	// Every foreign file survives the invalidation with its original
+	// content. The one at the variant's own record path is the exception: the
+	// variant's own record replaces it.
+	for path, content := range foreignFiles {
+		if path == ownRecordPath {
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(spaceDir, path))
+		if err != nil {
+			t.Fatalf("foreign file %s was removed by the invalidation: %v", path, err)
+		}
+		if string(got) != content {
+			t.Fatalf("foreign file %s = %q, want %q", path, got, content)
+		}
 	}
 	// The repository's own file at the app's former record path survives the
 	// branch-variant download too.
@@ -1908,8 +1816,8 @@ func TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile(t *te
 	if err != nil || string(body) != ordinaryBody {
 		t.Fatalf("ordinary file after the branch download = %q err=%v, want %q", body, err, ordinaryBody)
 	}
-	// The variant's own record is present and correct.
-	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, commit), ManifestFilename))
+	// The variant's own record is present and correct at its record path.
+	manifest := readBranchFixtureManifest(t, filepath.Join(spaceDir, ownRecordPath))
 	assertBranchFixtureManifest(t, manifest, revision, commit)
 }
 
@@ -2018,10 +1926,15 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 }
 
 // TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent covers the
-// intermediate components of the app-owned tree: a symlinked revision
-// directory or record directory would redirect the completion records and the
-// payload writes outside the reserved space, so the download must fail before
-// anything is removed or written.
+// app-owned tree check: a symlinked component of the app-owned tree would
+// redirect the completion records and the payload writes outside the reserved
+// space, so the download must fail before anything is removed or written, and
+// nothing outside the reserved space may be touched.
+//
+// The cases differ only in which component of the app-owned tree is the
+// symlink: the records tree root, the payload tree root, the revision
+// directory of the records tree, a revision component of the records tree,
+// the record directory and the revision directory of the payload tree.
 func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 	const (
 		revision    = "4.00bpw"
@@ -2053,10 +1966,18 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 		revision string
 		// link is the path below the reserved space that is a symlink.
 		link []string
+		// payloadTree is true when the payload path already exists in the
+		// fixture, so the assertion that the payload directory must not have
+		// been created after the unsafe-layout refusal does not apply to the
+		// case.
+		payloadTree bool
 	}{
+		{name: "records tree", revision: revision, link: []string{branchVariantLocalRecordsDirName}},
+		{name: "payload tree", revision: revision, link: []string{branchVariantLocalPayloadDirName}, payloadTree: true},
 		{name: "revision directory", revision: revision, link: []string{"records", revision}},
 		{name: "revision component", revision: multiRev, link: []string{"records", "exl"}},
 		{name: "record directory", revision: revision, link: []string{"records", revision, commit}},
+		{name: "payload revision directory", revision: revision, link: []string{"payload", revision}, payloadTree: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2112,164 +2033,141 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 				}
 				t.Fatalf("external tree entries = %v, want only keep.txt", names)
 			}
-			// The payload was not written either.
-			if _, statErr := os.Stat(filepath.Join(branchLocalSpaceDir(root), "payload")); !os.IsNotExist(statErr) {
-				t.Fatalf("payload directory was created after the unsafe-layout refusal (err=%v)", statErr)
+			body, readErr := os.ReadFile(keep)
+			if readErr != nil || string(body) != "keep" {
+				t.Fatalf("external file = %q err=%v, want %q", body, readErr, "keep")
+			}
+			// The payload was not written through the symlink either.
+			for _, name := range []string{"config.json", "model.safetensors"} {
+				if _, statErr := os.Stat(filepath.Join(external, name)); !os.IsNotExist(statErr) {
+					t.Fatalf("payload %q was written through the symlink (err=%v)", name, statErr)
+				}
+			}
+			// A refusal on the records side happens before the payload tree is
+			// created at all.
+			if !tc.payloadTree {
+				if _, statErr := os.Stat(filepath.Join(branchLocalSpaceDir(root), "payload")); !os.IsNotExist(statErr) {
+					t.Fatalf("payload directory was created after the unsafe-layout refusal (err=%v)", statErr)
+				}
 			}
 		})
 	}
 }
 
-// TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory covers the
-// payload side of the app-owned tree check: a symlinked revision directory
-// inside the payload tree would redirect the payload writes outside the
-// reserved space, so the download must refuse before anything is written and
-// leave the external target untouched.
-func TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory(t *testing.T) {
-	const (
-		revision = "4.00bpw"
-		commit   = "2222222222222222222222222222222222222222"
-	)
-	revisions := map[string]branchHubRevision{
-		revision: {
-			sha: commit,
-			files: map[string]string{
-				"config.json":       `{"model_type":"exl3","bits":4}`,
-				"model.safetensors": "branch-a-weights",
-			},
-		},
-	}
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-
-	external := t.TempDir()
-	keep := filepath.Join(external, "keep.txt")
-	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	root := t.TempDir()
-	payloadTree := filepath.Join(branchLocalSpaceDir(root), "payload")
-	if err := os.MkdirAll(payloadTree, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The revision directory inside the payload tree is a symlink to a
-	// directory outside the reserved space.
-	if err := os.Symlink(external, filepath.Join(payloadTree, revision)); err != nil {
-		t.Skipf("symlink creation is not permitted on this platform: %v", err)
-	}
-
-	var (
-		mu     sync.Mutex
-		events []ProgressEvent
-	)
-	err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true},
-		Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, func(ev ProgressEvent) {
-			mu.Lock()
-			events = append(events, ev)
-			mu.Unlock()
-		})
-	if err == nil {
-		t.Fatal("local branch variant accepted a symlinked payload revision directory")
-	}
-	if !strings.Contains(err.Error(), "unsafe branch variant layout") {
-		t.Fatalf("local branch variant error = %v, want the unsafe-layout refusal", err)
-	}
-	mu.Lock()
-	for _, ev := range events {
-		if ev.Event == "done" {
-			mu.Unlock()
-			t.Fatal("local branch variant with a symlinked payload directory reported done")
-		}
-	}
-	mu.Unlock()
-
-	// Nothing outside the reserved space was written: the external target
-	// keeps exactly the content it had.
-	entries, readErr := os.ReadDir(external)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if len(entries) != 1 || entries[0].Name() != "keep.txt" {
-		names := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-		}
-		t.Fatalf("external tree entries = %v, want only keep.txt", names)
-	}
-	body, readErr := os.ReadFile(keep)
-	if readErr != nil || string(body) != "keep" {
-		t.Fatalf("external file = %q err=%v, want %q", body, readErr, "keep")
-	}
-	// The payload was not written through the symlink either.
-	if _, statErr := os.Stat(filepath.Join(external, "config.json")); !os.IsNotExist(statErr) {
-		t.Fatalf("payload was written through the symlink (err=%v)", statErr)
-	}
-}
-
-// TestBranchVariantFetchesSharedBlobWhenSharedDownloadIsStale covers the
-// stale end of the shared-blob wait: the other process was abandoned but its
-// .incomplete file is still there, so the blob status is stale rather than
-// missing. The branch variant must fetch the file itself and end up with a
-// correct snapshot entry and a correct completion record.
-func TestBranchVariantFetchesSharedBlobWhenSharedDownloadIsStale(t *testing.T) {
+// TestBranchVariantFetchesSharedBlobWhenSharedDownloadDoesNotDeliver pins
+// both ends of the shared-blob wait: when the other process was abandoned and
+// left a stale .incomplete file behind, and when it goes away without
+// publishing the blob, the branch variant must fetch the file itself instead
+// of waiting for it or claiming success.
+func TestBranchVariantFetchesSharedBlobWhenSharedDownloadDoesNotDeliver(t *testing.T) {
 	const (
 		revision = "4.00bpw"
 		commit   = "2222222222222222222222222222222222222222"
 		body     = "branch-a-weights"
 	)
-	revisions := sharedBlobRevision(revision, commit, body)
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-	cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
+	cases := []struct {
+		name string
+		// prepare puts the shared blob into the state this case describes.
+		prepare func(t *testing.T, repoDir *RepoDir, sha string)
+		// abandon removes the shared download while the branch variant waits
+		// for it. It is nil for a state that is already abandoned.
+		abandon func(t *testing.T, repoDir *RepoDir, sha string)
+	}{
+		{
+			name: "stale shared download",
+			prepare: func(t *testing.T, repoDir *RepoDir, sha string) {
+				if err := repoDir.EnsureDirs(); err != nil {
+					t.Fatal(err)
+				}
+				// The abandoned download left its .incomplete file behind
+				// without an owner record, so the blob status is stale
+				// instead of missing.
+				if err := os.WriteFile(repoDir.IncompletePath(sha), []byte("partial"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				status, _, err := repoDir.CheckBlob(sha)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status != BlobStale {
+					t.Fatalf("abandoned blob status = %v, want %v", status, BlobStale)
+				}
+			},
+		},
+		{
+			name:    "shared download disappears",
+			prepare: startSharedBlobDownload,
+			abandon: func(t *testing.T, repoDir *RepoDir, sha string) {
+				if err := repoDir.CleanupIncomplete(sha); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			revisions := sharedBlobRevision(revision, commit, body)
+			hub := fakeBranchVariantHub(t, revisions)
+			defer hub.Close()
+			cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
 
-	cache, err := cfg.BuildHFCache()
-	if err != nil {
-		t.Fatal(err)
-	}
-	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repoDir.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256([]byte(body))
-	sha := hex.EncodeToString(sum[:])
-	// The abandoned download left its .incomplete file behind without an
-	// owner record, so the blob status is stale instead of missing.
-	if err := os.WriteFile(repoDir.IncompletePath(sha), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	status, _, err := repoDir.CheckBlob(sha)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != BlobStale {
-		t.Fatalf("abandoned blob status = %v, want %v", status, BlobStale)
-	}
+			cache, err := cfg.BuildHFCache()
+			if err != nil {
+				t.Fatal(err)
+			}
+			repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256([]byte(body))
+			sha := hex.EncodeToString(sum[:])
+			tc.prepare(t, repoDir, sha)
 
-	// The download must not wait for a shared download that is already
-	// abandoned, so it is bounded by a deadline instead of the shared-blob
-	// wait budget.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil); err != nil {
-		t.Fatalf("branch variant after the shared download was abandoned: %v", err)
-	}
+			// The download must not wait for a shared download that will
+			// never finish, so it is bounded by a deadline instead of the
+			// shared-blob wait budget.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil)
+			}()
 
-	// The branch variant fetched the file itself, so its own snapshot holds
-	// it and its completion record lists it.
-	snapshot := filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")
-	got, err := os.ReadFile(snapshot)
-	if err != nil || string(got) != body {
-		t.Fatalf("branch snapshot = %q err=%v, want %q", got, err, body)
-	}
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.Path(), BranchVariantMetadataDir, revision, commit, ManifestFilename))
-	if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != commit {
-		t.Fatalf("branch completion record identity = %+v", manifest)
-	}
-	if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
-		t.Fatalf("branch completion record files = %+v", manifest.Files)
+			if tc.abandon != nil {
+				// The job waits for the shared download, which then
+				// disappears.
+				select {
+				case err := <-done:
+					t.Fatalf("branch variant finished while the blob was still downloading: %v", err)
+				case <-time.After(300 * time.Millisecond):
+				}
+				tc.abandon(t, repoDir, sha)
+			}
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("branch variant after the shared download did not complete: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("branch variant did not finish after the shared download did not complete")
+			}
+
+			// The branch variant fetched the file itself, so its own snapshot
+			// holds it and its completion record lists it.
+			snapshot := filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")
+			got, err := os.ReadFile(snapshot)
+			if err != nil || string(got) != body {
+				t.Fatalf("branch snapshot = %q err=%v, want %q", got, err, body)
+			}
+			manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.Path(), BranchVariantMetadataDir, revision, commit, ManifestFilename))
+			if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != commit {
+				t.Fatalf("branch completion record identity = %+v", manifest)
+			}
+			if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
+				t.Fatalf("branch completion record files = %+v", manifest.Files)
+			}
+		})
 	}
 }
 
@@ -2473,72 +2371,117 @@ func TestBranchVariantSharedBlobWaitFailsWhenCancelled(t *testing.T) {
 	}
 }
 
-// TestOrdinaryDownloadKeepsSharedBlobSkip pins the preserved ordinary
-// behavior: a blob another process is downloading is skipped with the
-// existing reason, and the job still succeeds.
-func TestOrdinaryDownloadKeepsSharedBlobSkip(t *testing.T) {
+// TestOrdinaryDownloadKeepsLenientSkipBehavior pins the preserved ordinary
+// behavior: a file the ordinary downloader cannot materialize is skipped with
+// a reason and the job still succeeds, whether the blob is still being fetched
+// by another process or the snapshot entry cannot be created.
+func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 	const (
 		revision = "main"
 		commit   = "1111111111111111111111111111111111111111"
 		body     = "ordinary-main-weights"
 	)
-	revisions := sharedBlobRevision(revision, commit, body)
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-	cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
+	cases := []struct {
+		name string
+		// prepare puts the shared blob into the state this case describes.
+		prepare func(t *testing.T, repoDir *RepoDir, sha string)
+		// wantReason is the skip reason the ordinary download reports.
+		wantReason string
+		// check asserts the state the case leaves behind.
+		check func(t *testing.T, repoDir *RepoDir)
+	}{
+		{
+			name:       "blob downloaded by another process",
+			prepare:    startSharedBlobDownload,
+			wantReason: "downloading by another process",
+			check: func(t *testing.T, repoDir *RepoDir) {
+				if _, err := os.Stat(filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")); !os.IsNotExist(err) {
+					t.Fatalf("ordinary shared-blob skip created a snapshot entry (err=%v)", err)
+				}
+			},
+		},
+		{
+			name: "snapshot entry cannot be created",
+			prepare: func(t *testing.T, repoDir *RepoDir, sha string) {
+				if err := repoDir.EnsureDirs(); err != nil {
+					t.Fatal(err)
+				}
+				// The blob already exists, so the file takes the skip path.
+				if err := os.WriteFile(repoDir.BlobPath(sha), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				// A regular file where the snapshot directory belongs makes
+				// the snapshot entry impossible to create.
+				if err := os.WriteFile(filepath.Join(repoDir.SnapshotsDir(), commit), []byte("blocked"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: "blob exists",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			revisions := sharedBlobRevision(revision, commit, body)
+			hub := fakeBranchVariantHub(t, revisions)
+			defer hub.Close()
+			cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
 
-	cache, err := cfg.BuildHFCache()
-	if err != nil {
-		t.Fatal(err)
-	}
-	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256([]byte(body))
-	sha := hex.EncodeToString(sum[:])
-	startSharedBlobDownload(t, repoDir, sha)
+			cache, err := cfg.BuildHFCache()
+			if err != nil {
+				t.Fatal(err)
+			}
+			repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256([]byte(body))
+			sha := hex.EncodeToString(sum[:])
+			tc.prepare(t, repoDir, sha)
 
-	var (
-		mu     sync.Mutex
-		events []ProgressEvent
-	)
-	// The download is bounded by a deadline: if the ordinary path ever
-	// regressed to waiting for the shared blob, the job ends with a clear
-	// error instead of blocking for the whole shared-blob wait budget.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision}, cfg, func(ev ProgressEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}); err != nil {
-		t.Fatalf("ordinary download with a shared blob: %v", err)
-	}
+			var (
+				mu     sync.Mutex
+				events []ProgressEvent
+			)
+			// The download is bounded by a deadline: if the ordinary path ever
+			// regressed to waiting for the shared blob, the job ends with a
+			// clear error instead of blocking for the whole shared-blob wait
+			// budget.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision}, cfg, func(ev ProgressEvent) {
+				mu.Lock()
+				events = append(events, ev)
+				mu.Unlock()
+			}); err != nil {
+				t.Fatalf("ordinary download with a shared blob: %v", err)
+			}
 
-	mu.Lock()
-	skipped := ""
-	for _, ev := range events {
-		if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
-			skipped = ev.Message
-		}
-	}
-	mu.Unlock()
-	if !strings.Contains(skipped, "downloading by another process") {
-		t.Fatalf("ordinary download skip reason = %q, want the shared-blob skip", skipped)
-	}
+			mu.Lock()
+			skipped := ""
+			for _, ev := range events {
+				if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
+					skipped = ev.Message
+				}
+			}
+			mu.Unlock()
+			if !strings.Contains(skipped, tc.wantReason) {
+				t.Fatalf("ordinary download skip reason = %q, want %q", skipped, tc.wantReason)
+			}
 
-	// The ordinary skip keeps its lenient shape: the file is recorded in the
-	// friendly manifest even though no snapshot entry was materialized.
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
-	if manifest.BranchVariant {
-		t.Fatalf("ordinary manifest gained branch_variant: %+v", manifest)
-	}
-	if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
-		t.Fatalf("ordinary manifest files = %+v", manifest.Files)
-	}
-	if _, err := os.Stat(filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")); !os.IsNotExist(err) {
-		t.Fatalf("ordinary shared-blob skip created a snapshot entry (err=%v)", err)
+			// The ordinary skip keeps its lenient shape: the file is recorded
+			// in the friendly manifest even though no snapshot entry was
+			// materialized.
+			manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
+			if manifest.BranchVariant {
+				t.Fatalf("ordinary manifest gained branch_variant: %+v", manifest)
+			}
+			if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
+				t.Fatalf("ordinary manifest files = %+v", manifest.Files)
+			}
+			if tc.check != nil {
+				tc.check(t, repoDir)
+			}
+		})
 	}
 }
 
@@ -2708,94 +2651,6 @@ func TestBranchVariantFailsWhenSnapshotEntryCannotBeCreatedAfterSharedBlobComple
 	}
 }
 
-// TestLocalBranchVariantRefusesSymlinkedAppOwnedTree discriminates the
-// security defect: os.RemoveAll resolves an intermediate symlink, so a
-// symlinked app-owned tree made the cleanup delete a directory outside the
-// reserved space, and the payload writes landed outside it too.
-func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
-	const (
-		revision = "4.00bpw"
-		commit   = "2222222222222222222222222222222222222222"
-		body     = "branch-a-weights"
-	)
-	revisions := sharedBlobRevision(revision, commit, body)
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-
-	for _, tree := range []string{branchVariantLocalRecordsDirName, branchVariantLocalPayloadDirName} {
-		t.Run(tree, func(t *testing.T) {
-			external := t.TempDir()
-			keepDir := filepath.Join(external, revision)
-			if err := os.MkdirAll(keepDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			keep := filepath.Join(keepDir, "keep.txt")
-			if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			root := t.TempDir()
-			spaceDir := branchLocalSpaceDir(root)
-			if err := os.MkdirAll(spaceDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			// The app-owned tree is a symlink to a directory outside the
-			// reserved space.
-			if err := os.Symlink(external, filepath.Join(spaceDir, tree)); err != nil {
-				t.Skipf("symlink creation is not permitted on this platform: %v", err)
-			}
-
-			var (
-				mu     sync.Mutex
-				events []ProgressEvent
-			)
-			err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true},
-				Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, func(ev ProgressEvent) {
-					mu.Lock()
-					events = append(events, ev)
-					mu.Unlock()
-				})
-			if err == nil {
-				t.Fatal("local branch variant accepted a symlinked app-owned tree")
-			}
-			mu.Lock()
-			for _, ev := range events {
-				if ev.Event == "done" {
-					mu.Unlock()
-					t.Fatal("local branch variant with a symlinked tree reported done")
-				}
-			}
-			mu.Unlock()
-
-			// Nothing outside the reserved space was removed or written.
-			if _, statErr := os.Stat(keep); statErr != nil {
-				t.Fatalf("external file was removed through the symlink: %v", statErr)
-			}
-			entries, readErr := os.ReadDir(external)
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			if len(entries) != 1 || entries[0].Name() != revision {
-				names := make([]string, 0, len(entries))
-				for _, entry := range entries {
-					names = append(names, entry.Name())
-				}
-				t.Fatalf("external tree entries = %v, want only %q", names, revision)
-			}
-			inside, readErr := os.ReadDir(filepath.Join(keepDir))
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			if len(inside) != 1 || inside[0].Name() != "keep.txt" {
-				names := make([]string, 0, len(inside))
-				for _, entry := range inside {
-					names = append(names, entry.Name())
-				}
-				t.Fatalf("external revision entries = %v, want only keep.txt", names)
-			}
-		})
-	}
-}
-
 // TestEnsureLocalBranchVariantTreeRefusesEscapingComponent covers the
 // containment barrier of the app-owned tree check: a component that is not a
 // plain name inside the tree is refused with a clear error, and the check
@@ -2866,134 +2721,6 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 			t.Fatalf("error = %v, want a missing component to be accepted", err)
 		}
 	})
-}
-
-// TestBranchVariantFetchesSharedBlobWhenSharedDownloadDisappears covers the
-// other end of the shared-blob wait: when the other process goes away without
-// publishing the blob, the branch variant must fetch the file itself instead
-// of waiting or claiming success.
-func TestBranchVariantFetchesSharedBlobWhenSharedDownloadDisappears(t *testing.T) {
-	const (
-		revision = "4.00bpw"
-		commit   = "2222222222222222222222222222222222222222"
-		body     = "branch-a-weights"
-	)
-	revisions := sharedBlobRevision(revision, commit, body)
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-	cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
-
-	cache, err := cfg.BuildHFCache()
-	if err != nil {
-		t.Fatal(err)
-	}
-	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256([]byte(body))
-	sha := hex.EncodeToString(sum[:])
-	startSharedBlobDownload(t, repoDir, sha)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil)
-	}()
-
-	// The job waits for the shared download, which then disappears.
-	select {
-	case err := <-done:
-		t.Fatalf("branch variant finished while the blob was still downloading: %v", err)
-	case <-time.After(300 * time.Millisecond):
-	}
-	if err := repoDir.CleanupIncomplete(sha); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("branch variant after the shared download disappeared: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("branch variant did not finish after the shared download disappeared")
-	}
-
-	// The branch variant fetched the file itself, so its own snapshot holds it.
-	snapshot := filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")
-	got, err := os.ReadFile(snapshot)
-	if err != nil || string(got) != body {
-		t.Fatalf("branch snapshot = %q err=%v, want %q", got, err, body)
-	}
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.Path(), BranchVariantMetadataDir, revision, commit, ManifestFilename))
-	if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
-		t.Fatalf("branch completion record files = %+v", manifest.Files)
-	}
-}
-
-// TestOrdinaryDownloadKeepsLenientSnapshotFailure pins the preserved
-// asymmetry: an ordinary download still treats a failed snapshot entry as a
-// skip, so only a branch variant fails the job.
-func TestOrdinaryDownloadKeepsLenientSnapshotFailure(t *testing.T) {
-	const (
-		revision = "main"
-		commit   = "1111111111111111111111111111111111111111"
-		body     = "ordinary-main-weights"
-	)
-	revisions := sharedBlobRevision(revision, commit, body)
-	hub := fakeBranchVariantHub(t, revisions)
-	defer hub.Close()
-	cfg := Settings{CacheDir: t.TempDir(), Endpoint: hub.URL, Verify: "size"}
-
-	cache, err := cfg.BuildHFCache()
-	if err != nil {
-		t.Fatal(err)
-	}
-	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repoDir.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256([]byte(body))
-	sha := hex.EncodeToString(sum[:])
-	// The blob already exists, so the file takes the skip path.
-	if err := os.WriteFile(repoDir.BlobPath(sha), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A regular file where the snapshot directory belongs makes the snapshot
-	// entry impossible to create.
-	if err := os.WriteFile(filepath.Join(repoDir.SnapshotsDir(), commit), []byte("blocked"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	var (
-		mu     sync.Mutex
-		events []ProgressEvent
-	)
-	if err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision}, cfg, func(ev ProgressEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}); err != nil {
-		t.Fatalf("ordinary download with an impossible snapshot entry: %v", err)
-	}
-	mu.Lock()
-	skipped := ""
-	for _, ev := range events {
-		if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
-			skipped = ev.Message
-		}
-	}
-	mu.Unlock()
-	if !strings.Contains(skipped, "blob exists") {
-		t.Fatalf("ordinary download skip reason = %q, want the blob-exists skip", skipped)
-	}
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
-	if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
-		t.Fatalf("ordinary manifest files = %+v", manifest.Files)
-	}
 }
 
 // TestBranchVariantStagingNameSeparatesRevisionsAtOneCommit pins the branch

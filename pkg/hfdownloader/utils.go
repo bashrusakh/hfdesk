@@ -42,10 +42,10 @@ func validate(job Job, cfg Settings) error {
 		return fmt.Errorf("invalid repo id %q (expected owner/name)", job.Repo)
 	}
 	if job.BranchVariant {
-		// A branch variant is one whole EXL2/EXL3 branch: the analyzer chose
-		// it by revision, not by file filters. Rejecting the incompatible
-		// selection fields here keeps direct library callers from producing a
-		// manifest that claims completeness for only a subset of the branch.
+		// The branch-variant shape is enforced at the server's request
+		// boundary too; repeating the incompatible-field check here keeps
+		// direct library callers from producing a manifest that claims
+		// completeness for only a subset of the branch.
 		if job.IsDataset {
 			return errors.New("branch variant requires a model repository")
 		}

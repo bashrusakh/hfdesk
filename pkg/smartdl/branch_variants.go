@@ -429,8 +429,8 @@ func parseEXLBranchRevisionShape(name string) (exlBranchCandidate, bool) {
 }
 
 func safeEXLRevision(revision string) bool {
-	// Match the existing revision checks used before an HF revision is placed
-	// in an analyze URL or DOM attribute; slash is intentionally permitted for
+	// The same checks that guard an HF revision before it is placed in an
+	// analyze URL or DOM attribute: slash is intentionally permitted for
 	// nested branch paths, but no path segment may be "." or "..".
 	if revision == "" || strings.ContainsAny(revision, "\\\x00") {
 		return false

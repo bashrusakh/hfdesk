@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-// Quantization method descriptions.
 var quantMethodDescriptions = map[string]string{
 	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
 	"awq":          "AWQ - Activation-aware Weight Quantization",
@@ -50,7 +49,6 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		return nil
 	}
 
-	// Detect quantization method
 	if method, ok := config["quant_method"].(string); ok {
 		info.Method = method
 		if desc, exists := quantMethodDescriptions[method]; exists {
@@ -142,7 +140,6 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		info.Symmetric = symm
 	}
 
-	// AWQ specific fields
 	if zeroPoint, ok := config["zero_point"].(bool); ok {
 		info.ZeroPoint = zeroPoint
 	}
@@ -151,12 +148,10 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		info.Version = version
 	}
 
-	// EXL2 specific
 	if bpw, ok := config["bits_per_weight"].(float64); ok {
 		info.BitsPerWeight = bpw
 	}
 
-	// Module quantization info
 	if modules, ok := config["modules_to_not_convert"].([]interface{}); ok {
 		for _, m := range modules {
 			if s, ok := m.(string); ok {
@@ -165,10 +160,8 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		}
 	}
 
-	// Backend compatibility
 	info.Backends = detectBackends(info)
 
-	// Get model architecture from config.json if available
 	if configJson, ok := metadata["config.json"].(map[string]interface{}); ok {
 		if arch, ok := configJson["architectures"].([]interface{}); ok && len(arch) > 0 {
 			if s, ok := arch[0].(string); ok {
@@ -176,7 +169,6 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 			}
 		}
 
-		// Model size for VRAM estimation
 		if hiddenSize, ok := configJson["hidden_size"].(float64); ok {
 			if numLayers, ok := configJson["num_hidden_layers"].(float64); ok {
 				info.EstimatedVRAM = estimateVRAM(int(hiddenSize), int(numLayers), info.Bits)
@@ -286,7 +278,6 @@ func expertBitRange(value interface{}) (minBits, maxBits float64, complete bool)
 	return minBits, maxBits, complete
 }
 
-// detectBackends returns compatible inference backends.
 func detectBackends(info *QuantizedInfo) []string {
 	var backends []string
 
@@ -322,7 +313,6 @@ func estimateVRAM(hiddenSize, numLayers, bits int) int64 {
 	// params ≈ 12 * hidden_size^2 * num_layers (simplified)
 	paramsApprox := int64(12) * int64(hiddenSize) * int64(hiddenSize) * int64(numLayers)
 
-	// Bytes per parameter based on bit width
 	bytesPerParam := float64(bits) / 8.0
 
 	// Add 20% overhead for KV cache and activations
@@ -331,17 +321,14 @@ func estimateVRAM(hiddenSize, numLayers, bits int) int64 {
 	return vram
 }
 
-// IsGPTQ checks if the model uses GPTQ quantization.
 func IsGPTQ(info *QuantizedInfo) bool {
 	return info.Method == "gptq"
 }
 
-// IsAWQ checks if the model uses AWQ quantization.
 func IsAWQ(info *QuantizedInfo) bool {
 	return info.Method == "awq"
 }
 
-// IsEXL2 checks if the model uses EXL2 quantization.
 func IsEXL2(info *QuantizedInfo) bool {
 	return info.Method == "exl2"
 }
@@ -370,7 +357,6 @@ func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []Selecta
 
 	var items []SelectableItem
 
-	// Check for safetensors vs bin files
 	hasSafetensors := false
 	hasPytorchBin := false
 	var safetensorsSize, pytorchBinSize int64
@@ -386,7 +372,6 @@ func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []Selecta
 		}
 	}
 
-	// Add format options if both are available
 	if hasSafetensors && hasPytorchBin {
 		items = append(items, SelectableItem{
 			ID:           "safetensors",

@@ -1606,28 +1606,7 @@ func TestLocalBranchVariantDestinationIsReservedPayloadDir(t *testing.T) {
 		"config.json":       `{"model_type":"exl3","bits":4}`,
 		"model.safetensors": "branch-weights",
 	}
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": "2222222222222222222222222222222222222222"})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			nodes := make([]map[string]any, 0, len(files))
-			for name, body := range files {
-				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
-			}
-			_ = json.NewEncoder(w).Encode(nodes)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			body, ok := files[name]
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = w.Write([]byte(body))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	hub := newPresenceBranchHub(t, "2222222222222222222222222222222222222222", files)
 	defer hub.Close()
 
 	root := t.TempDir()

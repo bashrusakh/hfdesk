@@ -133,6 +133,35 @@ func writeLocalPresenceVariant(t *testing.T, root string) string {
 	return variantDir
 }
 
+// newPresenceBranchHub serves the minimal Hub API a branch-variant download
+// needs: the revision lookup that resolves the commit, the tree listing of the
+// revision, and the raw bytes of its files.
+func newPresenceBranchHub(t *testing.T, commit string, files map[string]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			nodes := make([]map[string]any, 0, len(files))
+			for name, body := range files {
+				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			body, ok := files[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
 func TestBranchVariantPresenceRequiresManifestAndEveryFile(t *testing.T) {
 	root := t.TempDir()
 	repoDir := writePresenceRepo(t, root, presenceRevision)
@@ -389,28 +418,7 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 		hfdownloader.ManifestFilename: repoManifest,
 		"model.safetensors":           "local-branch-weights",
 	}
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			nodes := make([]map[string]any, 0, len(files))
-			for name, body := range files {
-				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
-			}
-			_ = json.NewEncoder(w).Encode(nodes)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			body, ok := files[name]
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = io.WriteString(w, body)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	hub := newPresenceBranchHub(t, commit, files)
 	defer hub.Close()
 
 	root := t.TempDir()
@@ -468,28 +476,7 @@ func TestBranchVariantLocalRoundTripUsesReservedSpace(t *testing.T) {
 		"config.json":       `{"model_type":"exl3","bits":4}`,
 		"model.safetensors": "local-branch-weights",
 	}
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			nodes := make([]map[string]any, 0, len(files))
-			for name, body := range files {
-				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
-			}
-			_ = json.NewEncoder(w).Encode(nodes)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			body, ok := files[name]
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = io.WriteString(w, body)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	hub := newPresenceBranchHub(t, commit, files)
 	defer hub.Close()
 
 	root := t.TempDir()
@@ -511,6 +498,22 @@ func TestBranchVariantLocalRoundTripUsesReservedSpace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(recordDir, hfdownloader.ManifestFilename)); err != nil {
 		t.Fatalf("completion record: %v", err)
+	}
+	// The space's own helpers resolve the same directories.
+	space := presenceLocalSpace(t, root)
+	spacePayloadDir, err := space.PayloadDir(revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spacePayloadDir != payloadDir {
+		t.Fatalf("space payload dir = %q, want %q", spacePayloadDir, payloadDir)
+	}
+	spaceRecordDir, err := space.RecordDir(revision, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaceRecordDir != recordDir {
+		t.Fatalf("space completion record dir = %q, want %q", spaceRecordDir, recordDir)
 	}
 
 	// Neither is reachable at a repository-relative path.
@@ -861,91 +864,6 @@ func TestBranchVariantLocalRedownloadInvalidatesOlderRecord(t *testing.T) {
 	}
 }
 
-// TestBranchVariantLocalPresenceReportsPayloadDestination pins the local
-// presence contract of the app-owned payload directory: the completion record
-// stays in the metadata tree, the payload lives in the payload directory, and
-// presence reports that directory as the destination root.
-func TestBranchVariantLocalPresenceReportsPayloadDestination(t *testing.T) {
-	const (
-		revision = "9.00bpw"
-		commit   = "9999999999999999999999999999999999999999"
-	)
-	files := map[string]string{
-		"config.json":       `{"model_type":"exl3","bits":4}`,
-		"model.safetensors": "local-branch-weights",
-	}
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			nodes := make([]map[string]any, 0, len(files))
-			for name, body := range files {
-				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
-			}
-			_ = json.NewEncoder(w).Encode(nodes)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			body, ok := files[name]
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = io.WriteString(w, body)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	root := t.TempDir()
-	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{
-		Repo:          presenceRepo,
-		Revision:      revision,
-		BranchVariant: true,
-	}, hfdownloader.Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil); err != nil {
-		t.Fatalf("local branch download: %v", err)
-	}
-
-	repoBase := filepath.Join(root, presenceRepo)
-	space := presenceLocalSpace(t, root)
-	payloadDir, err := space.PayloadDir(revision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
-		t.Fatalf("payload file: %v", err)
-	}
-	// The payload must not be reachable at a repository-relative path.
-	if _, err := os.Stat(filepath.Join(repoBase, revision)); !os.IsNotExist(err) {
-		t.Fatalf("branch payload used a repository-relative directory (err=%v)", err)
-	}
-	// The completion record stays in the records tree of the reserved space.
-	recordDir, err := space.RecordDir(revision, commit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(recordDir, hfdownloader.ManifestFilename)); err != nil {
-		t.Fatalf("completion record: %v", err)
-	}
-
-	s := newTestServerWithConfig(t, Config{LocalDir: root})
-	w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
-	}
-	var got branchVariantPresence
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
-		t.Fatalf("presence = %+v", got)
-	}
-	if got.StorageMode != "local" || got.DestinationRoot != payloadDir {
-		t.Fatalf("presence destination = %+v, want the payload dir %q", got, payloadDir)
-	}
-}
-
 // TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile pins the
 // hashless re-download rule: a moved local branch can keep a non-LFS file's
 // size while changing its bytes, so a size-only skip would publish commit A's
@@ -1086,28 +1004,7 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 		"config.json":       `{"model_type":"exl3","bits":4}`,
 		"model.safetensors": "slash-branch-weights",
 	}
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			nodes := make([]map[string]any, 0, len(files))
-			for name, body := range files {
-				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
-			}
-			_ = json.NewEncoder(w).Encode(nodes)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			body, ok := files[name]
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = io.WriteString(w, body)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	hub := newPresenceBranchHub(t, commit, files)
 	defer hub.Close()
 
 	root := t.TempDir()

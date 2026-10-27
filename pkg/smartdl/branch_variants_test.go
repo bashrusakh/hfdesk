@@ -276,65 +276,82 @@ func TestEXLBranchVariantsRemainAvailableAfterSpecializedMetadataClassification(
 	}
 }
 
+// TestEXLBranchVariantsPreserveMainWeights pins the preserved behavior of a
+// main revision that carries model weights: it gets no EXL branch option, and
+// the analyzer makes no optional branch request for it.
+//
+// The weight file's name is the data that differs: a model-weight file is
+// recognized by its content, not by a name that happens to look like one.
 func TestEXLBranchVariantsPreserveMainWeights(t *testing.T) {
-	const repo = "owner/exl3-model"
-	modelHeader := makeSafetensorsHeader(t, `{"layers.0.mlp.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]}}`, 500)
-	var branchRequests, headerRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model.safetensors","size":500},{"type":"file","path":"quantization_config.json","size":20}]`)
-				return
-			}
-			branchRequests.Add(1)
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			if strings.HasSuffix(r.URL.Path, "/main/config.json") {
-				io.WriteString(w, `{"model_type":"llama"}`)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/main/quantization_config.json") {
-				io.WriteString(w, `{"quant_method":"exl3","bits":4,"head_bits":6}`)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/main/model.safetensors") {
-				headerRequests.Add(1)
-				serveSafetensorsHeaderRange(w, r, modelHeader, 500)
-				return
-			}
-			if strings.Contains(r.URL.Path, "/raw/4.00bpw/") {
-				branchRequests.Add(1)
-			}
-			http.NotFound(w, r)
-		default:
-			t.Errorf("unexpected request: %s", r.URL)
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
+	for _, tc := range []struct {
+		name   string
+		file   string
+		header string
+	}{
+		{
+			name:   "standard weight file name",
+			file:   "model.safetensors",
+			header: `{"layers.0.mlp.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]}}`,
+		},
+		{
+			name:   "arbitrary weight file name",
+			file:   "opaque-export-part.safetensors",
+			header: `{"layers.0.attn.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]},"layers.0.attn.q_scale":{"dtype":"F16","shape":[1],"data_offsets":[16,18]}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const repo = "owner/exl3-model"
+			modelHeader := makeSafetensorsHeader(t, tc.header, 500)
+			var branchRequests, headerRequests atomic.Int64
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/tree/"):
+					if strings.HasSuffix(r.URL.Path, "/tree/main") {
+						fmt.Fprintf(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":%q,"size":500},{"type":"file","path":"quantization_config.json","size":20}]`, tc.file)
+						return
+					}
+					branchRequests.Add(1)
+					http.NotFound(w, r)
+				case strings.HasSuffix(r.URL.Path, "/refs"):
+					io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
+				case strings.HasSuffix(r.URL.Path, "/auth-check"):
+					http.NotFound(w, r)
+				case strings.HasSuffix(r.URL.Path, "/raw/main/"+tc.file):
+					headerRequests.Add(1)
+					serveSafetensorsHeaderRange(w, r, modelHeader, 500)
+				case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
+					io.WriteString(w, `{"model_type":"llama"}`)
+				case strings.HasSuffix(r.URL.Path, "/raw/main/quantization_config.json"):
+					io.WriteString(w, `{"quant_method":"exl3","bits":4,"head_bits":6}`)
+				case strings.Contains(r.URL.Path, "/raw/4.00bpw/"):
+					branchRequests.Add(1)
+					http.NotFound(w, r)
+				default:
+					t.Errorf("unexpected request: %s", r.URL)
+					http.NotFound(w, r)
+				}
+			}))
+			defer hub.Close()
 
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("analyze main with weights: %v", err)
-	}
-	if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" {
-		t.Fatalf("main analysis changed: type=%s quantized=%+v", info.Type, info.Quantized)
-	}
-	for _, item := range info.SelectableItems {
-		if item.Revision != "" {
-			t.Fatalf("main-with-weights repo gained branch item: %+v", item)
-		}
-	}
-	if branchRequests.Load() != 0 {
-		t.Fatalf("main-with-weights repo made %d optional branch requests, want 0", branchRequests.Load())
-	}
-	if headerRequests.Load() != 2 {
-		t.Fatalf("main model header range requests = %d, want prefix and bounded header", headerRequests.Load())
+			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
+			if err != nil {
+				t.Fatalf("analyze main with weights: %v", err)
+			}
+			if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" {
+				t.Fatalf("main analysis changed: type=%s quantized=%+v", info.Type, info.Quantized)
+			}
+			if len(info.AnalysisWarnings) != 0 {
+				t.Fatalf("confirmed model-weight header produced an analysis warning: %+v", info.AnalysisWarnings)
+			}
+			for _, item := range info.SelectableItems {
+				if item.Revision != "" {
+					t.Fatalf("main-with-weights repo gained branch item: %+v", item)
+				}
+			}
+			if headerRequests.Load() != 2 || branchRequests.Load() != 0 {
+				t.Fatalf("header/branch requests = %d/%d, want 2/0", headerRequests.Load(), branchRequests.Load())
+			}
+		})
 	}
 }
 
@@ -445,56 +462,6 @@ func TestIsCalibrationOnlySafetensorsHeader(t *testing.T) {
 	}
 }
 
-func TestEXLBranchVariantsPreserveArbitraryNamedModelSafetensors(t *testing.T) {
-	const repo = "owner/exl3-model"
-	modelHeader := makeSafetensorsHeader(t, `{"layers.0.attn.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]},"layers.0.attn.q_scale":{"dtype":"F16","shape":[1],"data_offsets":[16,18]}}`, 500)
-	var headerRequests, branchRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"opaque-export-part.safetensors","size":500},{"type":"file","path":"quantization_config.json","size":20}]`)
-				return
-			}
-			branchRequests.Add(1)
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/raw/main/opaque-export-part.safetensors"):
-			headerRequests.Add(1)
-			serveSafetensorsHeaderRange(w, r, modelHeader, 500)
-		case strings.Contains(r.URL.Path, "/raw/") && strings.HasSuffix(r.URL.Path, "/main/config.json"):
-			io.WriteString(w, `{"model_type":"llama"}`)
-		case strings.Contains(r.URL.Path, "/raw/") && strings.HasSuffix(r.URL.Path, "/main/quantization_config.json"):
-			io.WriteString(w, `{"quant_method":"exl3","bits":4,"head_bits":6}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("analyze real-weight main: %v", err)
-	}
-	if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" {
-		t.Fatalf("main analysis changed: type=%s quantized=%+v", info.Type, info.Quantized)
-	}
-	if len(info.AnalysisWarnings) != 0 {
-		t.Fatalf("confirmed model-weight header produced an analysis warning: %+v", info.AnalysisWarnings)
-	}
-	for _, item := range info.SelectableItems {
-		if item.Revision != "" {
-			t.Fatalf("arbitrarily named real model weights gained a branch option: %+v", item)
-		}
-	}
-	if headerRequests.Load() != 2 || branchRequests.Load() != 0 {
-		t.Fatalf("header/branch requests = %d/%d, want 2/0", headerRequests.Load(), branchRequests.Load())
-	}
-}
-
 func TestEXLBranchEligibilityConservativelyHandlesUnsupportedSafetensorsRange(t *testing.T) {
 	const repo = "owner/exl3-model"
 	var rangeRequests atomic.Int64
@@ -558,106 +525,108 @@ func TestEXLBranchEligibilityConservativelyHandlesUnsupportedSafetensorsRange(t 
 	}
 }
 
-func TestEXLBranchEligibilityUnknownDoesNotOverrideLaterCalibrationEvidence(t *testing.T) {
+// TestEXLBranchEligibilityDiscoveryOutcomes pins the outcomes of the optional
+// safetensors header probe: an unknown main file role never exposes a branch
+// row on its own, a known weight suppresses the uncertainty, and every
+// incomplete discovery is reported as one retryable diagnostic.
+func TestEXLBranchEligibilityDiscoveryOutcomes(t *testing.T) {
+	weightHeader := makeSafetensorsHeader(t, `{"layers.0.q_weight":{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}`, 1024)
 	calibrationHeader := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[1,1],"data_offsets":[0,8]}}`, 1024)
 	malformedHeader := makeSafetensorsHeader(t, `{"input_ids":`, 1024)
-	info, headerRequests := analyzeEXLHeaderFixture(t, []exlHeaderFixtureFile{
-		{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-		{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
-		{path: "calibration.safetensors", mode: "header", header: calibrationHeader, size: 1024},
-	})
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("unknown main file role exposed %d branch rows despite an unprobed weight role", got)
-	}
-	if len(info.AnalysisWarnings) != 1 || !reflect.DeepEqual(info.AnalysisWarnings[0].Causes, []string{"header_unavailable", "header_uninterpretable"}) {
-		t.Fatalf("analysis warnings = %+v, want both unavailable and uninterpretable causes", info.AnalysisWarnings)
-	}
-	if headerRequests != 5 {
-		t.Fatalf("header HTTP requests = %d, want one failed prefix plus two bounded reads for each remaining file", headerRequests)
-	}
-}
-
-func TestEXLBranchEligibilityKnownSafetensorsWeightWinsOverEarlierUnknown(t *testing.T) {
-	weightHeader := makeSafetensorsHeader(t, `{"layers.0.q_weight":{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}`, 1024)
-	info, headerRequests := analyzeEXLHeaderFixture(t, []exlHeaderFixtureFile{
-		{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-		{path: "model.safetensors", mode: "header", header: weightHeader, size: 1024},
-	})
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("known model-weight header exposed %d branch rows", got)
-	}
-	if len(info.AnalysisWarnings) != 0 {
-		t.Fatalf("known model-weight evidence was confused with unknown evidence: %+v", info.AnalysisWarnings)
-	}
-	if headerRequests != 3 {
-		t.Fatalf("header HTTP requests = %d, want the failed and later weight probes", headerRequests)
-	}
-}
-
-func TestEXLBranchEligibilityOtherKnownWeightSuppressesUnknownHeaderWarning(t *testing.T) {
-	info, headerRequests := analyzeEXLHeaderFixture(t, []exlHeaderFixtureFile{
-		{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-		{path: "model.gguf", size: 1024},
-	})
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("known GGUF main weight exposed %d EXL branch rows", got)
-	}
-	if len(info.AnalysisWarnings) != 0 {
-		t.Fatalf("known GGUF main weight was reported as uncertain: %+v", info.AnalysisWarnings)
-	}
-	if headerRequests != 0 {
-		t.Fatalf("made %d safetensors requests despite independent known weight evidence", headerRequests)
-	}
-}
-
-func TestEXLBranchEligibilityMalformedHeaderReportsIncompleteDiscovery(t *testing.T) {
-	malformedHeader := makeSafetensorsHeader(t, `{"input_ids":`, 1024)
-	info, _ := analyzeEXLHeaderFixture(t, []exlHeaderFixtureFile{
-		{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
-	})
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("malformed header exposed %d EXL branch rows", got)
-	}
-	if len(info.AnalysisWarnings) != 1 || !reflect.DeepEqual(info.AnalysisWarnings[0].Causes, []string{"header_uninterpretable"}) {
-		t.Fatalf("analysis warnings = %+v, want malformed-header diagnostic", info.AnalysisWarnings)
-	}
-}
-
-func TestEXLBranchEligibilityProbeLimitReportsIncompleteDiscovery(t *testing.T) {
-	header := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[1,1],"data_offsets":[0,8]}}`, 1024)
-	files := make([]exlHeaderFixtureFile, 0, maxEXLSafeTensorHeaderProbes+1)
+	probeLimitFiles := make([]exlHeaderFixtureFile, 0, maxEXLSafeTensorHeaderProbes+1)
 	for i := 0; i < maxEXLSafeTensorHeaderProbes+1; i++ {
-		files = append(files, exlHeaderFixtureFile{
+		probeLimitFiles = append(probeLimitFiles, exlHeaderFixtureFile{
 			path:   fmt.Sprintf("calibration-%02d.safetensors", i),
 			mode:   "header",
-			header: header,
+			header: calibrationHeader,
 			size:   1024,
 		})
 	}
-	info, headerRequests := analyzeEXLHeaderFixture(t, files)
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("probe-budget exhaustion exposed %d EXL branch rows", got)
-	}
-	if len(info.AnalysisWarnings) != 1 || !reflect.DeepEqual(info.AnalysisWarnings[0].Causes, []string{"probe_limit"}) {
-		t.Fatalf("analysis warnings = %+v, want probe-limit diagnostic", info.AnalysisWarnings)
-	}
-	if want := int64(2 * maxEXLSafeTensorHeaderProbes); headerRequests != want {
-		t.Fatalf("header HTTP requests = %d, want exactly %d bounded requests", headerRequests, want)
-	}
-}
-
-func TestEXLBranchEligibilityProbeTimeoutReportsIncompleteDiscovery(t *testing.T) {
-	info, headerRequests := analyzeEXLHeaderFixture(t, []exlHeaderFixtureFile{
-		{path: "slow.safetensors", mode: "timeout", size: 1024},
-	})
-	if got := exlBranchRevisionCount(info); got != 0 {
-		t.Fatalf("header-probe timeout exposed %d EXL branch rows", got)
-	}
-	if len(info.AnalysisWarnings) != 1 || !reflect.DeepEqual(info.AnalysisWarnings[0].Causes, []string{"probe_timeout"}) {
-		t.Fatalf("analysis warnings = %+v, want probe-timeout diagnostic", info.AnalysisWarnings)
-	}
-	if headerRequests != 1 {
-		t.Fatalf("header HTTP requests = %d, want one timed-out bounded attempt", headerRequests)
+	for _, tc := range []struct {
+		name string
+		// files are the main tree files the analyzer inspects.
+		files []exlHeaderFixtureFile
+		// wantCauses are the diagnostic causes of the incomplete discovery. An
+		// empty list means the discovery was complete and reported no warning.
+		wantCauses []string
+		// wantRequests is the number of header HTTP requests the probe may
+		// make.
+		wantRequests int64
+	}{
+		{
+			name: "unknown role does not override later calibration evidence",
+			files: []exlHeaderFixtureFile{
+				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
+				{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
+				{path: "calibration.safetensors", mode: "header", header: calibrationHeader, size: 1024},
+			},
+			wantCauses:   []string{"header_unavailable", "header_uninterpretable"},
+			wantRequests: 5,
+		},
+		{
+			name: "known safetensors weight wins over an earlier unknown",
+			files: []exlHeaderFixtureFile{
+				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
+				{path: "model.safetensors", mode: "header", header: weightHeader, size: 1024},
+			},
+			wantRequests: 3,
+		},
+		{
+			name: "another known weight suppresses the unknown header warning",
+			files: []exlHeaderFixtureFile{
+				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
+				{path: "model.gguf", size: 1024},
+			},
+			wantRequests: 0,
+		},
+		{
+			name: "malformed header reports incomplete discovery",
+			files: []exlHeaderFixtureFile{
+				{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
+			},
+			wantCauses:   []string{"header_uninterpretable"},
+			wantRequests: 2,
+		},
+		{
+			name:         "probe limit reports incomplete discovery",
+			files:        probeLimitFiles,
+			wantCauses:   []string{"probe_limit"},
+			wantRequests: 2 * int64(maxEXLSafeTensorHeaderProbes),
+		},
+		{
+			name: "probe timeout reports incomplete discovery",
+			files: []exlHeaderFixtureFile{
+				{path: "slow.safetensors", mode: "timeout", size: 1024},
+			},
+			wantCauses:   []string{"probe_timeout"},
+			wantRequests: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, headerRequests := analyzeEXLHeaderFixture(t, tc.files)
+			if got := exlBranchRevisionCount(info); got != 0 {
+				t.Fatalf("unknown main file role exposed %d branch rows, want 0", got)
+			}
+			if len(tc.wantCauses) == 0 {
+				if len(info.AnalysisWarnings) != 0 {
+					t.Fatalf("analysis warnings = %+v, want none", info.AnalysisWarnings)
+				}
+			} else {
+				if len(info.AnalysisWarnings) != 1 {
+					t.Fatalf("analysis warnings = %+v, want one incomplete-branch diagnostic", info.AnalysisWarnings)
+				}
+				warning := info.AnalysisWarnings[0]
+				if warning.Code != exlBranchDiscoveryWarningCode || !warning.Retryable {
+					t.Fatalf("analysis warning = %+v, want the retryable incomplete-branch diagnostic", warning)
+				}
+				if !reflect.DeepEqual(warning.Causes, tc.wantCauses) {
+					t.Fatalf("analysis warning causes = %v, want %v", warning.Causes, tc.wantCauses)
+				}
+			}
+			if headerRequests != tc.wantRequests {
+				t.Fatalf("header HTTP requests = %d, want %d", headerRequests, tc.wantRequests)
+			}
+		})
 	}
 }
 
@@ -1086,15 +1055,12 @@ func TestEXLBranchMethodPriorityAndFallback(t *testing.T) {
 		t.Fatalf("branch-config method = %+v, want exl2 variant", got)
 	}
 
-	// An unavailable additional lookup must retain the recognized repo fallback;
-	// head_bits alone, without config or repo evidence, must not classify EXL.
+	// An unavailable additional lookup must retain the method evidence the
+	// caller already has; head_bits alone, without config or repo evidence,
+	// must not classify EXL.
 	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "missing", bpw: 4.25, headBits: 6}, "exl3", "exl2", true)
 	if !got.include || got.item.Method != "exl2" {
 		t.Fatalf("failed branch-config lookup did not retain main-config priority: %+v", got)
-	}
-	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "missing", bpw: 4.25, headBits: 6}, "exl3", "exl2", true)
-	if !got.include || got.item.Method != "exl2" {
-		t.Fatalf("failed branch-config lookup hid repo fallback: %+v", got)
 	}
 	got = a.lookupEXLBranch(context.Background(), "owner/metadata-model", exlBranchCandidate{revision: "missing", bpw: 4.25, headBits: 6}, "", "", false)
 	if got.include {
@@ -1141,145 +1107,89 @@ func TestAnalyzeEXLBranchDoesNotOverrideKnownNonEXLMainMethod(t *testing.T) {
 	}
 }
 
+// TestAnalyzeEXLBranchUsesMainConfigBeforeRepoNameFallback pins the method
+// evidence order: the main config establishes the method, so a branch whose
+// own config is unavailable is still classified as an EXL variant, and the
+// repository name is only a fallback.
 func TestAnalyzeEXLBranchUsesMainConfigBeforeRepoNameFallback(t *testing.T) {
-	const (
-		repo       = "owner/model-exl3"
-		branch     = "4.25bpw"
-		mainConfig = `{"model_type":"llama","quantization_config":{"quant_method":"exl2"}}`
-	)
-	var mainConfigRequests, unavailableBranchConfigRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			switch {
-			case strings.HasSuffix(r.URL.Path, "/tree/main"):
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":100}]`)
-			case strings.HasSuffix(r.URL.Path, "/tree/"+branch):
-				io.WriteString(w, `[{"type":"file","path":"README.md","size":10}]`)
-			default:
-				t.Errorf("unexpected tree request %q", r.URL.Path)
-				http.NotFound(w, r)
-			}
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.25bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			switch {
-			case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
-				mainConfigRequests.Add(1)
-				io.WriteString(w, mainConfig)
-			case strings.Contains(r.URL.Path, "/raw/"+branch+"/"):
-				// The branch has no method metadata, so its output must use the
-				// main config rather than accidentally proving branch priority.
-				unavailableBranchConfigRequests.Add(1)
-				http.NotFound(w, r)
-			default:
-				t.Errorf("unexpected raw request %q", r.URL.Path)
-				http.NotFound(w, r)
-			}
-		default:
-			t.Errorf("unexpected request %q", r.URL)
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
+	const mainConfig = `{"model_type":"llama","quantization_config":{"quant_method":"exl2"}}`
+	for _, tc := range []struct {
+		name   string
+		repo   string
+		branch string
+		// branchFile is the only file of the branch tree.
+		branchFile string
+		branchSize int
+	}{
+		{name: "bpw branch of an EXL-named repository", repo: "owner/model-exl3", branch: "4.25bpw", branchFile: "README.md", branchSize: 10},
+		{name: "N_M branch without a repository hint", repo: "owner/metadata-model", branch: "4_25", branchFile: "pytorch_model.bin", branchSize: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mainConfigRequests, unavailableBranchConfigRequests atomic.Int64
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/tree/"):
+					switch {
+					case strings.HasSuffix(r.URL.Path, "/tree/main"):
+						io.WriteString(w, `[{"type":"file","path":"config.json","size":100}]`)
+					case strings.HasSuffix(r.URL.Path, "/tree/"+tc.branch):
+						fmt.Fprintf(w, `[{"type":"file","path":%q,"size":%d}]`, tc.branchFile, tc.branchSize)
+					default:
+						t.Errorf("unexpected tree request %q", r.URL.Path)
+						http.NotFound(w, r)
+					}
+				case strings.HasSuffix(r.URL.Path, "/refs"):
+					fmt.Fprintf(w, `{"branches":[{"name":"main"},{"name":%q}],"tags":[]}`, tc.branch)
+				case strings.HasSuffix(r.URL.Path, "/auth-check"):
+					http.NotFound(w, r)
+				case strings.Contains(r.URL.Path, "/raw/"):
+					switch {
+					case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
+						mainConfigRequests.Add(1)
+						io.WriteString(w, mainConfig)
+					case strings.Contains(r.URL.Path, "/raw/"+tc.branch+"/"):
+						// The branch has no method metadata, so its output must
+						// use the main config rather than accidentally proving
+						// branch priority.
+						unavailableBranchConfigRequests.Add(1)
+						http.NotFound(w, r)
+					default:
+						t.Errorf("unexpected raw request %q", r.URL.Path)
+						http.NotFound(w, r)
+					}
+				default:
+					t.Errorf("unexpected request %q", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer hub.Close()
 
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("analyze main: %v", err)
-	}
-	if mainConfigRequests.Load() == 0 {
-		t.Fatal("analysis did not fetch the main config that establishes the method")
-	}
-	mainMetadata, ok := info.Metadata["config.json"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("main config metadata = %+v, want fetched config object", info.Metadata["config.json"])
-	}
-	mainQuantization, ok := mainMetadata["quantization_config"].(map[string]interface{})
-	if !ok || mainQuantization["quant_method"] != "exl2" {
-		t.Fatalf("main quantization config = %+v, want explicit exl2", mainMetadata["quantization_config"])
-	}
-	if unavailableBranchConfigRequests.Load() == 0 {
-		t.Fatal("analysis did not attempt optional branch-config lookup")
-	}
-	if len(info.SelectableItems) != 1 {
-		t.Fatalf("selectable items = %+v, want the EXL branch", info.SelectableItems)
-	}
-	item := info.SelectableItems[0]
-	if item.Revision != branch || !item.BranchVariant || item.Method != "exl2" || item.BitsPerWeight != 4.25 || !item.Recommended {
-		t.Fatalf("branch item = %+v, want recommended EXL2 4.25 BPW from main config", item)
-	}
-}
-
-func TestAnalyzeEXLNMBranchUsesMainConfigWithoutRepoOrBranchMethod(t *testing.T) {
-	const (
-		repo       = "owner/metadata-model"
-		branch     = "4_25"
-		mainConfig = `{"model_type":"llama","quantization_config":{"quant_method":"exl2"}}`
-	)
-	var mainConfigRequests, unavailableBranchConfigRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			switch {
-			case strings.HasSuffix(r.URL.Path, "/tree/main"):
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":100}]`)
-			case strings.HasSuffix(r.URL.Path, "/tree/"+branch):
-				io.WriteString(w, `[{"type":"file","path":"pytorch_model.bin","size":100}]`)
-			default:
-				t.Errorf("unexpected tree request %q", r.URL.Path)
-				http.NotFound(w, r)
+			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), tc.repo, "main")
+			if err != nil {
+				t.Fatalf("analyze main: %v", err)
 			}
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4_25"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/raw/"):
-			switch {
-			case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
-				mainConfigRequests.Add(1)
-				io.WriteString(w, mainConfig)
-			case strings.Contains(r.URL.Path, "/raw/"+branch+"/"):
-				// No branch metadata supplies a method; only the main config can
-				// establish that this ambiguous N_M ref is an EXL variant.
-				unavailableBranchConfigRequests.Add(1)
-				http.NotFound(w, r)
-			default:
-				t.Errorf("unexpected raw request %q", r.URL.Path)
-				http.NotFound(w, r)
+			if mainConfigRequests.Load() == 0 {
+				t.Fatal("analysis did not fetch the main config that establishes the method")
 			}
-		default:
-			t.Errorf("unexpected request %q", r.URL)
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("analyze main: %v", err)
-	}
-	if mainConfigRequests.Load() == 0 {
-		t.Fatal("analysis did not fetch the main config that establishes the method")
-	}
-	mainMetadata, ok := info.Metadata["config.json"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("main config metadata = %+v, want fetched config object", info.Metadata["config.json"])
-	}
-	mainQuantization, ok := mainMetadata["quantization_config"].(map[string]interface{})
-	if !ok || mainQuantization["quant_method"] != "exl2" {
-		t.Fatalf("main quantization config = %+v, want explicit exl2", mainMetadata["quantization_config"])
-	}
-	if unavailableBranchConfigRequests.Load() == 0 {
-		t.Fatal("analysis did not attempt optional branch-config lookup")
-	}
-	if len(info.SelectableItems) != 1 {
-		t.Fatalf("selectable items = %+v, want the N_M EXL branch", info.SelectableItems)
-	}
-	item := info.SelectableItems[0]
-	if item.Revision != branch || !item.BranchVariant || item.Method != "exl2" || item.BitsPerWeight != 4.25 || !item.Recommended {
-		t.Fatalf("branch item = %+v, want recommended EXL2 4.25 BPW from main config", item)
+			mainMetadata, ok := info.Metadata["config.json"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("main config metadata = %+v, want fetched config object", info.Metadata["config.json"])
+			}
+			mainQuantization, ok := mainMetadata["quantization_config"].(map[string]interface{})
+			if !ok || mainQuantization["quant_method"] != "exl2" {
+				t.Fatalf("main quantization config = %+v, want explicit exl2", mainMetadata["quantization_config"])
+			}
+			if unavailableBranchConfigRequests.Load() == 0 {
+				t.Fatal("analysis did not attempt optional branch-config lookup")
+			}
+			if len(info.SelectableItems) != 1 {
+				t.Fatalf("selectable items = %+v, want the EXL branch", info.SelectableItems)
+			}
+			item := info.SelectableItems[0]
+			if item.Revision != tc.branch || !item.BranchVariant || item.Method != "exl2" || item.BitsPerWeight != 4.25 || !item.Recommended {
+				t.Fatalf("branch item = %+v, want recommended EXL2 4.25 BPW from main config", item)
+			}
+		})
 	}
 }
 
@@ -1639,23 +1549,6 @@ func TestEXLNMBranchRejectsNonBitrateNames(t *testing.T) {
 	}
 }
 
-func TestEXLNMBranchRecognizedFromEXLRepoNameWithoutConfig(t *testing.T) {
-	// Issue #100: bartowski-style N_M branches must remain usable without any
-	// branch or main quantization config when the repository name names EXL3.
-	info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
-		repo:     "owner/example-exl3-model",
-		branches: []string{"main", "4_25"},
-	})
-	items := exlBranchSelectableItems(info)
-	if len(items) != 1 {
-		t.Fatalf("branch items = %+v, want the N_M branch from the EXL repository name", items)
-	}
-	item := items[0]
-	if item.Revision != "4_25" || !item.BranchVariant || item.Method != "exl3" || item.BitsPerWeight != 4.25 || !item.Recommended {
-		t.Fatalf("branch item = %+v, want recommended EXL3 4.25 BPW", item)
-	}
-}
-
 func TestEXLNMBranchRejectGenericRepo(t *testing.T) {
 	// This exercises the production analyzer path, not a parser zero value:
 	// without branch config, main config, or an EXL repository name there is no
@@ -1672,69 +1565,45 @@ func TestEXLNMBranchRejectGenericRepo(t *testing.T) {
 	}
 }
 
-func TestEXLNMBranchExcludedByKnownNonEXLMethod(t *testing.T) {
-	t.Run("branch config", func(t *testing.T) {
-		info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
-			repo:          "owner/example-exl3-model",
-			branches:      []string{"main", "4_25"},
-			branchConfigs: map[string]string{"4_25": `{"quant_method":"gptq","bits":4}`},
-		})
-		if items := exlBranchSelectableItems(info); len(items) != 0 {
-			t.Fatalf("known non-EXL branch config exposed N_M variants: %+v", items)
-		}
-	})
-
-	t.Run("main config", func(t *testing.T) {
-		info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
-			repo:     "owner/example-exl3-model",
-			branches: []string{"main", "4_25"},
-			mainFiles: []string{
-				"config.json",
-				"quantization_config.json",
-			},
-			mainFileBody: map[string]string{
-				"config.json":              `{"architectures":["LlamaForCausalLM"],"model_type":"llama"}`,
-				"quantization_config.json": `{"quant_method":"gptq","bits":4}`,
-			},
-		})
-		mainConfig, ok := info.Metadata["quantization_config.json"].(map[string]interface{})
-		if !ok || mainConfig["quant_method"] != "gptq" {
-			t.Fatalf("main quantization metadata = %+v, want explicit gptq", info.Metadata["quantization_config.json"])
-		}
-		if items := exlBranchSelectableItems(info); len(items) != 0 {
-			t.Fatalf("known non-EXL main config exposed N_M variants: %+v", items)
-		}
-	})
-}
-
+// TestEXLNMBranchUnknownMethodFallsBackToNameEvidence pins the fallback: an
+// unknown method string is not known-negative evidence, so the
+// repository-name fallback still classifies the branch.
 func TestEXLNMBranchUnknownMethodFallsBackToNameEvidence(t *testing.T) {
-	info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
-		repo:          "owner/example-exl3-model",
-		branches:      []string{"main", "4_25"},
-		branchConfigs: map[string]string{"4_25": `{"quant_method":"mystery_quant","bits":4}`},
-	})
-	items := exlBranchSelectableItems(info)
-	if len(items) != 1 || items[0].Revision != "4_25" || items[0].Method != "exl3" {
-		t.Fatalf("unknown branch method must preserve the repository-name fallback: %+v", items)
-	}
-}
-
-func TestEXLNMBranchUnknownMainMethodFallsBackToNameEvidence(t *testing.T) {
-	info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
-		repo:     "owner/example-exl3-model",
-		branches: []string{"main", "4_25"},
-		mainFiles: []string{
-			"config.json",
-			"quantization_config.json",
+	for _, tc := range []struct {
+		name    string
+		fixture exlNMBranchFixture
+	}{
+		{
+			name: "unknown branch method",
+			fixture: exlNMBranchFixture{
+				repo:          "owner/example-exl3-model",
+				branches:      []string{"main", "4_25"},
+				branchConfigs: map[string]string{"4_25": `{"quant_method":"mystery_quant","bits":4}`},
+			},
 		},
-		mainFileBody: map[string]string{
-			"config.json":              `{"architectures":["LlamaForCausalLM"],"model_type":"llama"}`,
-			"quantization_config.json": `{"quant_method":"mystery_quant","bits":4}`,
+		{
+			name: "unknown main method",
+			fixture: exlNMBranchFixture{
+				repo:     "owner/example-exl3-model",
+				branches: []string{"main", "4_25"},
+				mainFiles: []string{
+					"config.json",
+					"quantization_config.json",
+				},
+				mainFileBody: map[string]string{
+					"config.json":              `{"architectures":["LlamaForCausalLM"],"model_type":"llama"}`,
+					"quantization_config.json": `{"quant_method":"mystery_quant","bits":4}`,
+				},
+			},
 		},
-	})
-	items := exlBranchSelectableItems(info)
-	if len(items) != 1 || items[0].Revision != "4_25" || items[0].Method != "exl3" {
-		t.Fatalf("unknown main method must preserve the repository-name fallback: %+v", items)
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := analyzeEXLNMBranchFixture(t, tc.fixture)
+			items := exlBranchSelectableItems(info)
+			if len(items) != 1 || items[0].Revision != "4_25" || items[0].Method != "exl3" {
+				t.Fatalf("unknown method must preserve the repository-name fallback: %+v", items)
+			}
+		})
 	}
 }
 

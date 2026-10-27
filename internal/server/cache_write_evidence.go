@@ -17,9 +17,7 @@ import (
 // It carries every field that shapes where the job writes: the destination
 // root, the storage mode, the repository folder override and the branch
 // variant flag, because the branch variant writes into the app-owned reserved
-// space instead of the ordinary repository tree. A descriptor that dropped
-// that flag would model a branch variant as an ordinary writer of the
-// repository tree.
+// space instead of the ordinary repository tree.
 type writeDecisionJob struct {
 	id, repo, revision, output, hub, local, localRepo string
 	status                                            JobStatus

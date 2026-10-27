@@ -167,10 +167,9 @@ func frozenMutationOverlapsRawEntryWithKey(frozen frozenMutationPath, incoming s
 //
 // An ordinary local job writes into its repository directory below the local
 // root. A local branch variant does not: the downloader writes the branch
-// payload into the app-owned reserved space, outside the ordinary repository
-// tree, so modeling it as a writer of the repository tree would both invent a
-// conflict with the ordinary tree and miss the reserved space it really
-// writes. The reserved space is the single owner of that layout, so the
+// payload into the app-owned reserved space, so modeling it as a writer of
+// the ordinary repository tree would invent a conflict with that tree and
+// miss the space it really writes. The space owns that layout, so the
 // destination is resolved through it and names the very path the downloader
 // writes to.
 func jobDestinationBase(job *Job) string {
@@ -180,10 +179,8 @@ func jobDestinationBase(job *Job) string {
 			root = job.OutputDir
 		}
 		if job.BranchVariant {
-			// The space is built from the job's repository, like the
-			// downloader builds it: the branch variant's completion record
-			// names that repository, and a branch variant rejects a LocalRepo
-			// redirection.
+			// The space is built from the job's repository, like the downloader
+			// builds it.
 			space, err := hfdownloader.NewBranchVariantLocalSpace(root, job.Repo)
 			if err != nil {
 				return ""
