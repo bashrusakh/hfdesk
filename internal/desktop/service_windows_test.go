@@ -51,6 +51,10 @@ type fakeServiceManager struct {
 	installErr error
 	// startErr is the failure of a start.
 	startErr error
+	// uninstallErr is the failure of a removal of the registration.
+	uninstallErr error
+	// statusErr is the failure of every read of the state.
+	statusErr error
 	// steps records the calls in order, so a test can prove what the helper
 	// did before it touched the service.
 	steps []string
@@ -75,10 +79,10 @@ func (m *fakeServiceManager) Install(_ context.Context, opts service.InstallOpti
 	return opts, nil
 }
 
-// Uninstall records the call.
+// Uninstall records the call and reports the configured outcome.
 func (m *fakeServiceManager) Uninstall(context.Context) error {
 	m.steps = append(m.steps, "uninstall")
-	return nil
+	return m.uninstallErr
 }
 
 // Start records the start and reports the configured outcome.
@@ -103,6 +107,9 @@ func (m *fakeServiceManager) Restart(context.Context) error {
 // Status reports the next state of the test.
 func (m *fakeServiceManager) Status(context.Context) (service.Status, error) {
 	m.steps = append(m.steps, "status")
+	if m.statusErr != nil {
+		return service.Status{}, m.statusErr
+	}
 	if len(m.statuses) == 0 {
 		return service.Status{}, errors.New("the test configured no state")
 	}
@@ -247,10 +254,76 @@ func TestServiceGateContinuesWhenNoServiceIsInstalled(t *testing.T) {
 	}
 }
 
-// TestServiceGateContinuesWhenTheRegistrationCannotBeRead proves that a
-// registration the host cannot read does not keep the desktop host from
-// starting: the host behaves this way since before the service existed.
-func TestServiceGateContinuesWhenTheRegistrationCannotBeRead(t *testing.T) {
+// TestLaunchWithAnUnreadableServiceStartsNoServer proves that the production
+// startup ends at the service gate when the registration cannot be read.
+//
+// The launch is driven through run(), so the order of the steps cannot be
+// swapped: a gate that continues creates a server of its own next to the service
+// the machine may be running. The launch publishes no state either, because the
+// state file belongs to a launch that really serves.
+func TestLaunchWithAnUnreadableServiceStartsNoServer(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return service.Status{}, errors.New("the service control manager did not answer")
+	})
+	replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+		t.Fatal("the launch asked the user although it could not read the registration")
+		return serviceChoiceCancel
+	})
+	messages := recordMessages(t)
+
+	// The launching goroutine starts a logging pipeline, so the logger of the
+	// process is put back when the test ends.
+	previousLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	logFile := filepath.Join(t.TempDir(), "hfdesk.log")
+	done := make(chan error, 1)
+	go func() { done <- run(Options{}, logFile) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the launch with an unreadable service failed: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the launch with an unreadable service did not end: it started a server of its own")
+	}
+
+	if _, ok := readPublishedState(publishedStatePath()); ok {
+		t.Error("the launch published a state file although it started no server")
+	}
+
+	// The test binary is a console subsystem program, so this launch also
+	// reports its build: the notice of the gate is searched among the
+	// messages instead of counting all of them.
+	var notices []shownMessage
+	for _, message := range *messages {
+		if message.caption == serviceGateUnreadableCaption {
+			notices = append(notices, message)
+		}
+		if message.caption == serviceGateCaption {
+			t.Errorf("the launch asked the user to choose although it could not read the registration: %q",
+				message.text)
+		}
+	}
+	if len(notices) != 1 {
+		t.Fatalf("the launch showed %v, want the notice of the unreadable registration", *messages)
+	}
+	if !strings.Contains(notices[0].text, "started no server") {
+		t.Errorf("the notice %q does not say that the launch started no server", notices[0].text)
+	}
+}
+
+// TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead proves that a
+// registration the host cannot read ends the launch with a notice.
+//
+// A service that is installed may be running and bind the address the desktop
+// server would bind, so a launch that cannot read the state starts no server of
+// its own: it reports what it could not read, that a service may be running, and
+// how to read the state and to try again.
+func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 		return service.Status{}, errors.New("the service control manager did not answer")
 	})
@@ -258,9 +331,50 @@ func TestServiceGateContinuesWhenTheRegistrationCannotBeRead(t *testing.T) {
 		t.Fatal("the service gate asked the user although it could not read the registration")
 		return serviceChoiceCancel
 	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the service gate launched a helper although it could not read the registration")
+		return 0, nil
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the service gate opened a browser although it could not read the registration")
+		return nil
+	})
+	messages := recordMessages(t)
+	records := &recordedMessages{}
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(records))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
-	if !serviceGate() {
-		t.Fatal("the service gate stopped a launch whose registration could not be read")
+	if serviceGate() {
+		t.Fatal("the service gate let a launch whose registration could not be read start its own server")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the gate showed %v, want the notice of the unreadable registration", *messages)
+	}
+	if caption := serviceGateUnreadableCaption; (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	if icon := uint32(windows.MB_ICONERROR); (*messages)[0].icon != icon {
+		t.Errorf("the icon is %d, want the error icon %d", (*messages)[0].icon, icon)
+	}
+	for _, want := range []string{
+		"the service control manager did not answer",
+		"may be installed and running",
+		"started no server",
+		"hfdesk service status",
+		"elevated shell",
+		"start the desktop app again",
+	} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+	// The launch writes the record as well: the helper installs no logging
+	// pipeline, and the record of a launch that ended at the gate is the
+	// material a later support request has.
+	if !records.contains("could not read the Windows service registration: this launch starts no server") {
+		t.Errorf("the records of the launch are %v, want the record of the unreadable registration",
+			records.messages)
 	}
 }
 
@@ -938,6 +1052,208 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
 	for _, want := range []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "not needed to use the service"} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallRemovesTheRegistrationOfAFailedFirstInstallation
+// proves that a failed first installation does not leave a registration behind.
+//
+// The service gate of the desktop app ends every launch that finds a
+// registration, so a registration that serves nothing would keep the user from
+// the desktop app. The state before the installation reported no service, so the
+// registration is the result of this action and is removed again.
+func TestServiceHelperInstallRemovesTheRegistrationOfAFailedFirstInstallation(t *testing.T) {
+	const console = `C:\portable\hfdesk.exe`
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return console, nil
+	})
+	manager := &fakeServiceManager{
+		statuses: []service.Status{{State: service.StateNotInstalled}},
+		startErr: errors.New("the service did not start"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install", Version: "1.4.0"}); err == nil {
+		t.Fatal("the installation succeeded although the service did not start")
+	}
+	install := stepIndex(manager.steps, "install")
+	uninstall := stepIndex(manager.steps, "uninstall")
+	if install < 0 || uninstall < install {
+		t.Fatalf("the steps of the helper are %v, want the registration removed after the failed start",
+			manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	for _, want := range []string{
+		"the service did not start",
+		"not installed as a Windows service",
+		"start the desktop app normally again",
+		console,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+	if strings.Contains((*messages)[0].text, "hfdesk service uninstall") {
+		t.Errorf("the report %q names a removal although the registration was removed", (*messages)[0].text)
+	}
+}
+
+// TestServiceHelperInstallKeepsAnExistingRegistrationWhenTheStartFails proves
+// that an installation never removes a registration it did not write.
+//
+// The service existed before the action, so its settings and its data belong to
+// an instance this installation did not create. The report names what remains and
+// the elevated command that removes it.
+func TestServiceHelperInstallKeepsAnExistingRegistrationWhenTheStartFails(t *testing.T) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	manager := &fakeServiceManager{
+		statuses: []service.Status{runningServiceStatus(service.StateStopped, "127.0.0.1:18080")},
+		startErr: errors.New("the service did not start"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service did not start")
+	}
+	if step := stepIndex(manager.steps, "uninstall"); step >= 0 {
+		t.Fatalf("the steps of the helper are %v, want the existing registration left in place", manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{
+		"left in place",
+		"stays installed, but it does not run",
+		"elevated shell",
+		`"hfdesk service uninstall"`,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallKeepsTheRegistrationWhenItsStateBeforeIsUnreadable
+// proves that an unreadable state before the installation is not evidence of a
+// machine without a service: nothing is removed.
+func TestServiceHelperInstallKeepsTheRegistrationWhenItsStateBeforeIsUnreadable(t *testing.T) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	manager := &fakeServiceManager{
+		statusErr: errors.New("the registration cannot be read"),
+		startErr:  errors.New("the service did not start"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service did not start")
+	}
+	if step := stepIndex(manager.steps, "uninstall"); step >= 0 {
+		t.Fatalf("the steps of the helper are %v, want the unreadable registration left in place", manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{
+		"could not be read",
+		`"hfdesk service uninstall"`,
+	} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallReportsARegistrationItCouldNotRemove proves that a
+// removal that fails is reported with its reason and with the command that
+// removes the registration.
+func TestServiceHelperInstallReportsARegistrationItCouldNotRemove(t *testing.T) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	manager := &fakeServiceManager{
+		statuses:     []service.Status{{State: service.StateNotInstalled}},
+		startErr:     errors.New("the service did not start"),
+		uninstallErr: errors.New("the registration is marked for deletion"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service did not start")
+	}
+	if step := stepIndex(manager.steps, "uninstall"); step < 0 {
+		t.Fatalf("the steps of the helper are %v, want the removal of the failed registration", manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{
+		"could not be removed again",
+		"stays installed as a Windows service although it does not run",
+		"the registration is marked for deletion",
+		`"hfdesk service uninstall"`,
+	} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallRemovesARegistrationThatNeverRan proves that the
+// removal covers the verification of the start as well: a registration whose
+// service does not reach the running state serves nothing either.
+func TestServiceHelperInstallRemovesARegistrationThatNeverRan(t *testing.T) {
+	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	manager := &fakeServiceManager{statuses: []service.Status{
+		{State: service.StateNotInstalled},
+		runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service never reached the running state")
+	}
+	install := stepIndex(manager.steps, "install")
+	uninstall := stepIndex(manager.steps, "uninstall")
+	if install < 0 || uninstall < install {
+		t.Fatalf("the steps of the helper are %v, want the registration removed after the failed verification",
+			manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{"not installed as a Windows service", "start the desktop app normally again"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}

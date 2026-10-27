@@ -46,6 +46,45 @@ const (
 	serviceActionStart serviceAction = "start"
 )
 
+// serviceInstallAftermath describes what a failed installation left on the
+// machine.
+//
+// A failed first installation must not leave the user with a registration that
+// serves nothing: the service gate finds it on the next launch and the desktop
+// app never starts its own server again. The registration that the action wrote
+// itself is therefore removed again, and only that one: a registration that was
+// there before the action carries the settings and the data of an instance this
+// installation did not create, so it is never removed.
+type serviceInstallAftermath int
+
+const (
+	// serviceInstallRemoved means that the registration the failed
+	// installation wrote was removed again, so HFDesk is not installed as a
+	// Windows service.
+	serviceInstallRemoved serviceInstallAftermath = iota
+	// serviceInstallKept means that the registration was left in place: it
+	// existed before the action, or the state before the action could not be
+	// read.
+	serviceInstallKept
+	// serviceInstallRemovalFailed means that the registration the failed
+	// installation wrote could not be removed again.
+	serviceInstallRemovalFailed
+)
+
+// String returns the aftermath for a log record.
+func (a serviceInstallAftermath) String() string {
+	switch a {
+	case serviceInstallRemoved:
+		return "removed"
+	case serviceInstallKept:
+		return "kept"
+	case serviceInstallRemovalFailed:
+		return "removal-failed"
+	default:
+		return "unknown"
+	}
+}
+
 // ServiceActionOptions describes one invocation of the elevated helper.
 //
 // The flags are private to the desktop executable: they are not part of the
@@ -205,15 +244,25 @@ var findSiblingExecutable = findConsoleExecutable
 // runs from, and an update re-registers the program of the folder the helper
 // runs from.
 //
-// The program paired with the desktop program is preferred: a release ships
+// The program paired with the desktop program is required when the name of the
+// desktop program carries a version: a release ships
 // hfdesk_windows_amd64_1.3.0.exe next to hfdesk-desktop_windows_amd64_1.3.0.exe,
 // and unpacking a new release next to the old one leaves two version-stamped
 // pairs in the same folder. The pair of the program that asks is the one the
-// user meant, so its exact name is looked up first. The plain name hfdesk.exe
-// is the next fallback, and a folder with exactly one hfdesk*.exe is accepted
-// as well. Zero and several candidates without a pair are an error that names
-// the folder: registering one of several programs would register a program the
-// user did not choose.
+// user meant, so its exact name is looked up first. A version-stamped desktop
+// program has no other candidate: copying only
+// hfdesk-desktop_windows_amd64_1.4.0.exe next to an old hfdesk.exe would
+// register the old console program while the success text names 1.4.0, so a
+// missing pair is an error that names the expected file and the folder. With
+// this rule the paired console program always belongs to the same release as the
+// desktop program, and the version the success text names is the version of the
+// program the registration runs.
+//
+// A desktop program without a version stamp names no release, so the existing
+// fallbacks stay: the plain name hfdesk.exe is taken next, and a folder with
+// exactly one hfdesk*.exe is accepted as well. Zero and several candidates
+// without a pair are an error that names the folder: registering one of several
+// programs would register a program the user did not choose.
 //
 // The desktop program is never a candidate, whatever its name carries: it is
 // the program that asks for the console program, and registering it would
@@ -225,6 +274,7 @@ func findConsoleExecutable(dir, desktop string) (string, error) {
 	}
 
 	paired := pairedConsoleExecutableName(desktop)
+	stamp, versioned := desktopVersionStamp(desktop)
 	pairedPath := ""
 	preferred := ""
 	var candidates []string
@@ -250,6 +300,13 @@ func findConsoleExecutable(dir, desktop string) (string, error) {
 	}
 	if pairedPath != "" {
 		return pairedPath, nil
+	}
+	// A version-stamped desktop program is only installed with the console
+	// program of its own release: another program in the folder belongs to
+	// another release, so it is not a fallback but a different version.
+	if versioned && paired != "" {
+		return "", fmt.Errorf("there is no %s in %s: %s is the desktop program of the release %s, and the service only runs the console program of that release. Copy %s of the release next to the desktop app",
+			paired, dir, filepath.Base(desktop), stamp, paired)
 	}
 	if preferred != "" {
 		return preferred, nil
@@ -281,6 +338,61 @@ func pairedConsoleExecutableName(desktop string) string {
 		return ""
 	}
 	return consoleExecutableName + base[len(desktopExecutableName):]
+}
+
+// desktopVersionStamp returns the version segment of the name of a desktop
+// program, and whether the name carries one.
+//
+// The release names both programs with the same version stamp:
+// hfdesk-desktop_windows_amd64_1.4.0.exe sits next to
+// hfdesk_windows_amd64_1.4.0.exe, and the local build hfdesk-desktop.exe carries
+// no stamp at all. The stamp is the first segment of the rest of the name that
+// reads as a release version, so a name that only carries the platform
+// (hfdesk-desktop_windows_amd64.exe) is a name without a version. A name
+// without the desktop prefix names no release of HFDesk, so it carries no
+// stamp either.
+func desktopVersionStamp(desktop string) (string, bool) {
+	base := filepath.Base(desktop)
+	if !strings.HasPrefix(strings.ToLower(base), desktopExecutableName) {
+		return "", false
+	}
+	rest := strings.TrimSuffix(strings.ToLower(base[len(desktopExecutableName):]), executableSuffix)
+	for _, segment := range strings.Split(rest, "_") {
+		if isVersionSegment(segment) {
+			return segment, true
+		}
+	}
+	return "", false
+}
+
+// isVersionSegment reports whether a segment of a program name is a release
+// version, e.g. "1.4.0", "v1.3.0" or "1.3.0-beta.1".
+//
+// A version is numeric parts joined by dots, at least two of them, with an
+// optional pre-release or build suffix: the platform name amd64 and a build
+// number such as 2024 are not read as one, because they name no release, and
+// treating them as a version would refuse the fallbacks for a program that has
+// no release of its own.
+func isVersionSegment(segment string) bool {
+	segment = strings.TrimPrefix(strings.ToLower(segment), "v")
+	if index := strings.IndexAny(segment, "-+"); index >= 0 {
+		segment = segment[:index]
+	}
+	parts := strings.Split(segment, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isConsoleExecutableName reports whether name is a candidate for the console

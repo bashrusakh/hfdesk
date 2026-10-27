@@ -90,20 +90,22 @@ func TestParseServiceActionRejectsEveryOtherValue(t *testing.T) {
 	}
 }
 
-// TestFindConsoleExecutablePrefersThePlainName proves that the console program
-// of the service is the program with the plain name when the folder has one.
+// TestFindConsoleExecutableFindsThePlainNameOfALocalBuild proves that the plain
+// name hfdesk.exe is the console program of a desktop program without a version
+// stamp.
 //
 // The comparison is case-insensitive, because the file systems of Windows are:
 // a folder that carries HFDesk.EXE has the program under the name the
-// installation looks for. The desktop program of another release names a pair
-// that is not in the folder, so the plain name is the fallback that decides.
-func TestFindConsoleExecutablePrefersThePlainName(t *testing.T) {
+// installation looks for. A local build carries no version, so no release pins
+// the name of its console program, and the plain name decides over the
+// version-stamped program of another release in the same folder.
+func TestFindConsoleExecutableFindsThePlainNameOfALocalBuild(t *testing.T) {
 	dir := t.TempDir()
 	preferred := filepath.Join(dir, "HFDesk.EXE")
 	writeFile(t, preferred)
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe"))
 
-	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.2.0.exe"))
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
 	if err != nil {
 		t.Fatalf("find the console program: %v", err)
 	}
@@ -112,24 +114,84 @@ func TestFindConsoleExecutablePrefersThePlainName(t *testing.T) {
 	}
 }
 
-// TestFindConsoleExecutableAcceptsASingleVersionedProgram proves that a folder
-// of one release artifact installs the program of that artifact.
+// TestFindConsoleExecutableAcceptsTheSingleProgramOfALocalBuild proves that the
+// fallback of a desktop program without a version stamp accepts the only
+// console program of the folder.
 //
-// The release carries the version in the name of the program, so a single
-// hfdesk*.exe is the program the user put next to the desktop host. The desktop
-// program of another release has no pair in the folder, so the single candidate
-// is accepted.
-func TestFindConsoleExecutableAcceptsASingleVersionedProgram(t *testing.T) {
+// The release carries the version in the name of the program, and a local build
+// has no version that could name one program: a single hfdesk*.exe is the
+// program the user put next to the desktop host.
+func TestFindConsoleExecutableAcceptsTheSingleProgramOfALocalBuild(t *testing.T) {
 	dir := t.TempDir()
 	want := filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe")
 	writeFile(t, want)
+
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
+	if err != nil {
+		t.Fatalf("find the console program: %v", err)
+	}
+	if found != want {
+		t.Errorf("the console program is %q, want %q", found, want)
+	}
+}
+
+// TestFindConsoleExecutableRequiresThePairOfAVersionedProgram proves that a
+// version-stamped desktop program is only installed with the console program of
+// its own release.
+//
+// Copying only the new desktop program next to an old hfdesk.exe leaves a folder
+// whose only console program belongs to another release. Registering it would
+// name the new version in the success report while the service runs the old
+// program, so the lookup refuses the folder and names the file it expects. The
+// single candidate of an older release is refused the same way: the fallbacks
+// belong to a desktop program without a version.
+func TestFindConsoleExecutableRequiresThePairOfAVersionedProgram(t *testing.T) {
+	const desktop = "hfdesk-desktop_windows_amd64_1.4.0.exe"
+
+	plain := t.TempDir()
+	writeFile(t, filepath.Join(plain, "hfdesk.exe"))
+	versioned := t.TempDir()
+	writeFile(t, filepath.Join(versioned, "hfdesk_windows_amd64_1.3.0.exe"))
+
+	for _, dir := range []string{plain, versioned} {
+		found, err := findConsoleExecutable(dir, filepath.Join(dir, desktop))
+		if err == nil {
+			t.Errorf("the version-stamped desktop program in %s yielded %q, want an error", dir, found)
+			continue
+		}
+		for _, want := range []string{"hfdesk_windows_amd64_1.4.0.exe", dir} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error is %q, want it to mention %q", err, want)
+			}
+		}
+	}
+}
+
+// TestFindConsoleExecutableFindsThePairOfAVersionedProgram proves that the
+// console program of the same release is registered for a version-stamped
+// desktop program.
+//
+// The folder also holds an older hfdesk.exe, which is not the program of this
+// release: the pair decides, so the success report and the registration name the
+// same version.
+func TestFindConsoleExecutableFindsThePairOfAVersionedProgram(t *testing.T) {
+	dir := t.TempDir()
+	want := filepath.Join(dir, "hfdesk_windows_amd64_1.4.0.exe")
+	for _, name := range []string{
+		"hfdesk.exe",
+		"hfdesk_windows_amd64_1.3.0.exe",
+		"hfdesk_windows_amd64_1.4.0.exe",
+		"hfdesk-desktop_windows_amd64_1.4.0.exe",
+	} {
+		writeFile(t, filepath.Join(dir, name))
+	}
 
 	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.4.0.exe"))
 	if err != nil {
 		t.Fatalf("find the console program: %v", err)
 	}
 	if found != want {
-		t.Errorf("the console program is %q, want %q", found, want)
+		t.Errorf("the console program is %q, want the pair %q", found, want)
 	}
 }
 
@@ -203,19 +265,55 @@ func TestPairedConsoleExecutableName(t *testing.T) {
 // error that names the folder.
 //
 // Registering one of several programs would register a program the user did
-// not choose, so the installation refuses the folder instead of guessing.
+// not choose, so the installation refuses the folder instead of guessing. The
+// desktop program of the test carries no version, so the folder is decided by
+// the fallbacks and not by the pair rule.
 func TestFindConsoleExecutableRefusesSeveralPrograms(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe"))
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.4.0.exe"))
 
-	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.2.0.exe"))
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
 	if err == nil {
 		t.Fatalf("the folder with two candidates yielded %q, want an error", found)
 	}
 	for _, want := range []string{dir, "hfdesk_windows_amd64_1.3.0.exe", "hfdesk_windows_amd64_1.4.0.exe"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error is %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestDesktopVersionStamp proves which names of a desktop program carry a
+// release version.
+//
+// The release names both programs with the same version stamp, and the pair rule
+// depends on reading that stamp: a name that only carries the platform or the
+// architecture is a local build without a release, so it keeps the fallbacks.
+func TestDesktopVersionStamp(t *testing.T) {
+	tests := []struct {
+		desktop string
+		want    string
+		version bool
+	}{
+		{"hfdesk-desktop_windows_amd64_1.4.0.exe", "1.4.0", true},
+		{"hfdesk-desktop_windows_amd64_v1.3.0.exe", "v1.3.0", true},
+		{"hfdesk-desktop_windows_amd64_1.3.0-beta.1.exe", "1.3.0-beta.1", true},
+		{"HFDESK-DESKTOP_WINDOWS_AMD64_1.4.0.EXE", "1.4.0", true},
+		{"hfdesk-desktop_windows_amd64_1.4.exe", "1.4", true},
+		// The CI build carries a marker instead of a version, and the
+		// platform alone names no release.
+		{"hfdesk-desktop_windows_amd64_ci.exe", "", false},
+		{"hfdesk-desktop.exe", "", false},
+		{"hfdesk-desktop_windows_amd64.exe", "", false},
+		{"hfdesk.exe", "", false},
+		{"", "", false},
+	}
+	for _, test := range tests {
+		stamp, versioned := desktopVersionStamp(test.desktop)
+		if stamp != test.want || versioned != test.version {
+			t.Errorf("desktopVersionStamp(%q) = %q, %v, want %q, %v",
+				test.desktop, stamp, versioned, test.want, test.version)
 		}
 	}
 }

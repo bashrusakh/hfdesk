@@ -28,6 +28,10 @@ const (
 	// that found the service in the middle of a transition.
 	serviceGatePendingCaption = "HFDesk - the service is starting or stopping"
 
+	// serviceGateUnreadableCaption is the caption of the notice of a
+	// launch that could not read the registration of the service.
+	serviceGateUnreadableCaption = "HFDesk - the service state cannot be read"
+
 	// serviceSiblingMissingCaption is the caption of the notice that the
 	// console program of the service is missing.
 	serviceSiblingMissingCaption = "HFDesk - the hfdesk program is missing"
@@ -150,6 +154,25 @@ func serviceGatePendingText(state service.State) string {
 	return "The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
 		"This launch changes nothing: it starts no server of its own, so two instances never compete for the same address.\n\n" +
 		"Start the desktop app again when the service has settled, or read its state with \"hfdesk service status\"."
+}
+
+// serviceGateUnreadableText returns the text of the notice of a launch that
+// could not read the registration of the Windows service.
+//
+// The launch cannot tell a machine without a service from a machine whose
+// service is installed, so it decides on neither: a service that is installed
+// may be running, and it binds the address the desktop server would bind. The
+// notice says what that means for this launch, that a service may be installed
+// and running, that this launch started no server, and how to read the state and
+// to try again.
+func serviceGateUnreadableText(err error) string {
+	text := "HFDesk could not read the state of the Windows service.\n\n"
+	if err != nil {
+		text += err.Error() + "\n\n"
+	}
+	return text + "An HFDesk service may be installed and running on this machine. " +
+		"This launch started no server of its own, so it cannot compete with that instance for the same address.\n\n" +
+		"Check the service state with \"hfdesk service status\" from an elevated shell, then start the desktop app again."
 }
 
 // serviceGateOpenLabel returns the label of the first button of the choice
@@ -300,6 +323,10 @@ func serviceNotInstalledText(action serviceAction) string {
 // program: the helper installs no logging pipeline, so the failure report is
 // the only surface this reason has. program is the program of the action, empty
 // when the caller does not know it.
+//
+// An installation that wrote a registration and could not start it does not end
+// here: the registration may have been removed again, and
+// serviceInstallFailureText reports that outcome instead.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
 	detail := ""
 	if err != nil {
@@ -324,6 +351,53 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 			access + "\n\n" +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	}
+}
+
+// serviceInstallFailureText returns the report of an installation that wrote the
+// registration and did not confirm the service as running.
+//
+// The report depends on what the failed installation left on the machine, and it
+// says so: a registration that this action wrote is removed again, so the user
+// reads that HFDesk is not installed and that the desktop app starts normally
+// again. A registration that was there before the action, or one whose state
+// before the action could not be read, stays in place, and the report names what
+// remains and the elevated command that removes it. A removal that failed is
+// reported with its reason and with the same command, because the registration
+// is still there.
+//
+// The account and program guidance of a failed installation is part of every
+// outcome: it is the reason a first installation commonly fails, and it is what
+// makes a second attempt work.
+func serviceInstallFailureText(err error, program string, aftermath serviceInstallAftermath, removalErr error) string {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	access := serviceAccountAccessText(program)
+
+	var outcome string
+	switch aftermath {
+	case serviceInstallRemoved:
+		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, and you can start the desktop app normally again.\n\n" +
+			"Only the registration was removed. The data directory of the service, if this attempt created one, stays where it is."
+	case serviceInstallRemovalFailed:
+		outcome = "The registration of this attempt could not be removed again: HFDesk stays installed as a Windows service although it does not run."
+		if removalErr != nil {
+			outcome += "\n\nThe removal failed: " + removalErr.Error()
+		}
+		outcome += "\n\nWhile that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
+			"Remove it from an elevated shell with \"hfdesk service uninstall\"."
+	default:
+		outcome = "The registration was left in place: it was installed before this attempt, or its state before the attempt could not be read. " +
+			"The service stays installed, but it does not run.\n\n" +
+			"While that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
+			"Remove it from an elevated shell with \"hfdesk service uninstall\" if you do not want to keep it."
+	}
+
+	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" + outcome + "\n\n" +
+		"The settings, jobs and models of the desktop app were not touched. " +
+		access + "\n\n" +
+		"Run \"hfdesk service status\" to read the current state of the service."
 }
 
 // serviceAccountAccessText returns the sentence that names what to check when

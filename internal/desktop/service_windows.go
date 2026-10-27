@@ -78,10 +78,12 @@ func lookupServiceStatus(ctx context.Context) (service.Status, error) {
 // machine has no registration, which is the launch the desktop host had before
 // the service existed.
 //
-// A registration that cannot be read is logged and treated like a machine
-// without one: a service control manager that does not answer has no running
-// instance to compete with, and the desktop host must not refuse to start
-// because it could not look.
+// A registration that cannot be read is not a machine without one: an installed
+// service may be running and bind the address this launch would bind. The gate
+// therefore starts no server, publishes no state and reports the failure with a
+// notice that names the way to read the state of the service and to try again.
+// Starting the desktop server on a guess would serve the address next to an
+// instance that the machine starts on its own.
 //
 // A service that is starting or stopping is not a state to decide on: it is
 // neither a running nor a stopped service, so the gate waits for it to settle
@@ -101,8 +103,13 @@ func serviceGate() bool {
 				serviceGatePendingText(status.State), windows.MB_ICONINFORMATION)
 			return false
 		}
-		desktopLog.Warn("could not read the Windows service registration", "error", err)
-		return true
+		// The launch cannot tell a machine without a service from a machine
+		// with one, so it decides on neither: it starts no server and leaves
+		// the state of the machine as it is.
+		desktopLog.Error("could not read the Windows service registration: this launch starts no server", "error", err)
+		showMessage(serviceGateUnreadableCaption,
+			serviceGateUnreadableText(err), windows.MB_ICONERROR)
+		return false
 	}
 	if status.State == service.StateNotInstalled {
 		return true

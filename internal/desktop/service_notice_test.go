@@ -323,6 +323,88 @@ func TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount(t *testing
 	}
 }
 
+// TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft proves that
+// the report of an installation whose service did not run states what happened
+// to the registration.
+//
+// A failed first installation removes its own registration again, so the report
+// says that HFDesk is not installed and that the desktop app starts normally
+// again. A registration that was there before, or whose state before could not be
+// read, stays, and the report names what remains and the elevated command that
+// removes it. A removal that failed is reported with its reason and with the same
+// command: the registration is still there.
+func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing.T) {
+	reason := errors.New("the service did not start")
+	const program = `C:\portable\hfdesk.exe`
+
+	removed := serviceInstallFailureText(reason, program, serviceInstallRemoved, nil)
+	for _, want := range []string{
+		reason.Error(),
+		"not installed as a Windows service",
+		"start the desktop app normally again",
+		program,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains(removed, want) {
+			t.Errorf("the report of the removed registration %q does not mention %q", removed, want)
+		}
+	}
+	if strings.Contains(removed, "hfdesk service uninstall") {
+		t.Errorf("the report of the removed registration %q names a removal that is not needed", removed)
+	}
+
+	kept := serviceInstallFailureText(reason, program, serviceInstallKept, nil)
+	for _, want := range []string{
+		reason.Error(),
+		"left in place",
+		"stays installed, but it does not run",
+		`"hfdesk service uninstall"`,
+		"elevated shell",
+		program,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains(kept, want) {
+			t.Errorf("the report of the kept registration %q does not mention %q", kept, want)
+		}
+	}
+
+	removalErr := errors.New("the registration is marked for deletion")
+	failed := serviceInstallFailureText(reason, program, serviceInstallRemovalFailed, removalErr)
+	for _, want := range []string{
+		reason.Error(),
+		"could not be removed again",
+		removalErr.Error(),
+		`"hfdesk service uninstall"`,
+		"elevated shell",
+		program,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains(failed, want) {
+			t.Errorf("the report of the failed removal %q does not mention %q", failed, want)
+		}
+	}
+}
+
+// TestServiceGateUnreadableTextStatesWhatTheLaunchDid proves that the notice of
+// an unreadable registration names the risk, the launch that started no server
+// and the way to read the state and to try again.
+func TestServiceGateUnreadableTextStatesWhatTheLaunchDid(t *testing.T) {
+	reason := errors.New("the service control manager did not answer")
+	text := serviceGateUnreadableText(reason)
+	for _, want := range []string{
+		reason.Error(),
+		"may be installed and running",
+		"started no server",
+		"hfdesk service status",
+		"elevated shell",
+		"start the desktop app again",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the notice %q does not mention %q", text, want)
+		}
+	}
+}
+
 // TestServiceLaunchFailedTextSaysWhatDidNotHappen proves that a launch the user
 // refused is reported as an action that changed nothing.
 func TestServiceLaunchFailedTextSaysWhatDidNotHappen(t *testing.T) {

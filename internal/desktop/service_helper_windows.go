@@ -46,6 +46,19 @@ var serviceVerifyBudget = 30 * time.Second
 // service.
 const serviceVerifyInterval = 200 * time.Millisecond
 
+// serviceRemovalBudget bounds the removal of a registration that a failed
+// installation wrote.
+//
+// The removal runs on a context that the end of the action cannot cancel: the
+// budget of the action may already be spent by the start that failed, and a
+// registration that is left behind because that budget ended is exactly the
+// state the removal exists to prevent. The removal may also have to stop an
+// instance that the failed start left behind, so its budget covers the shutdown
+// budget of the service layer and the removal of the registration itself. It is
+// still bounded, so a service control manager that does not answer cannot keep
+// the failure report from the user.
+const serviceRemovalBudget = service.ShutdownBudget + 5*time.Second
+
 // newServiceManager returns the manager of the Windows service control manager
 // for the given scope.
 //
@@ -117,6 +130,17 @@ func RunServiceAction(o ServiceActionOptions) error {
 // step of the same action. A service that was installed but cannot be started is
 // reported as a failure of the installation instead of leaving the user with a
 // registered instance that serves nothing.
+//
+// A failed first installation must not trap the user either: the service gate
+// of the desktop app finds every registration and ends the launch, so a
+// registration that serves nothing keeps the desktop app from starting its own
+// server. The state of the machine is therefore read before the installation:
+// when it reports no service, the registration is the result of this action and
+// is removed again when the start or its verification fails. Only that
+// registration is removed. A registration that existed before the action, and a
+// state that could not be read, are never touched: their settings and their data
+// belong to an instance this action did not create, so the failure report names
+// how to remove the registration instead.
 func installWindowsService(action serviceAction, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
@@ -127,19 +151,47 @@ func installWindowsService(action serviceAction, version string) error {
 		return err
 	}
 
+	// The state before the installation decides what a failure may remove: a
+	// registration that existed before the action is not this action's to
+	// delete, and a state that cannot be read is not evidence of a machine
+	// without a service. The installation proceeds either way; only the
+	// removal after a failure depends on this read.
+	before, beforeErr := manager.Status(ctx)
+	freshInstall := beforeErr == nil && before.State == service.StateNotInstalled
+	if beforeErr != nil {
+		desktopLog.Warn("the state of the service before the installation cannot be read",
+			"error", beforeErr)
+	} else {
+		desktopLog.Info("the state of the service before the installation",
+			"state", string(before.State), "freshInstall", freshInstall)
+	}
+
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
 		reportServiceFailure(action, err, opts.Executable)
 		return err
 	}
-	if err := manager.Start(ctx); err != nil {
-		reportServiceFailure(action, err, serviceProgram(installed, opts))
+	program := serviceProgram(installed, opts)
+
+	// The failure of the start and the failure of its verification are the
+	// same outcome for the user: the service does not run, and what happens
+	// to the registration depends on whether this action wrote it.
+	fail := func(err error) error {
+		aftermath, removalErr := removeFailedInstallation(ctx, manager, freshInstall)
+		desktopLog.Error("the service action failed",
+			"action", string(action), "error", err, "program", program,
+			"aftermath", aftermath.String(), "removalError", removalErr)
+		showMessage(serviceFailureCaption(action),
+			serviceInstallFailureText(err, program, aftermath, removalErr), windows.MB_ICONERROR)
 		return err
+	}
+
+	if err := manager.Start(ctx); err != nil {
+		return fail(err)
 	}
 	status, err := waitForServiceState(ctx, manager, true)
 	if err != nil {
-		reportServiceFailure(action, err, serviceProgram(installed, opts))
-		return err
+		return fail(err)
 	}
 
 	// The installation reports the registration as written. A manager that
@@ -151,6 +203,35 @@ func installWindowsService(action serviceAction, version string) error {
 		serviceInstalledText(version, report, status.Paths.StateDir, serviceWebAddress(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
+}
+
+// removeFailedInstallation removes the registration of a failed installation and
+// reports what is left on the machine.
+//
+// freshInstall reports whether the registration was written by this action: the
+// state before the action was read successfully and reported no service. Only
+// that registration is removed, and the removal removes the registration only:
+// the data directory of the service, if the installation created one, stays
+// where it is.
+//
+// The removal runs on a context of its own that is never cancelled with the
+// action, so a budget that the failed start spent cannot keep the registration
+// behind. A failed removal is reported with the failure that caused it: the
+// registration is still there, and the user has to know that.
+func removeFailedInstallation(ctx context.Context, manager service.Manager, freshInstall bool) (serviceInstallAftermath, error) {
+	if !freshInstall {
+		desktopLog.Info("the registration of the service is left in place: it was not written by this installation")
+		return serviceInstallKept, nil
+	}
+
+	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRemovalBudget)
+	defer cancel()
+	if err := manager.Uninstall(removeCtx); err != nil {
+		desktopLog.Error("the registration of the failed installation could not be removed", "error", err)
+		return serviceInstallRemovalFailed, err
+	}
+	desktopLog.Info("the registration of the failed installation was removed again")
+	return serviceInstallRemoved, nil
 }
 
 // updateWindowsService re-registers the service from the folder of the helper
