@@ -14,8 +14,8 @@ package hfdownloader
 //     discarded and re-downloaded, never published as zeros;
 //   - a foreign instance token with our own PID is not self-ownership;
 //   - a resolved-commit mismatch invalidates the record;
-//   - the claim heartbeat covers the finalization phase, and a heartbeat
-//     failure while active is fatal.
+//   - the destination ownership domain is the only exclusion fence, and an
+//     unproven record is refused rather than taken over.
 
 import (
 	"bytes"
@@ -395,18 +395,6 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 			if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			// A stale heartbeat makes the fixture independent of whether the
-			// hostname lookup succeeded; a live owner would still be protected
-			// by its fresh record.
-			past := time.Now().Add(-2 * claimGracePeriod)
-			if err := os.Chtimes(staging+".meta", past, past); err != nil {
-				t.Fatal(err)
-			}
-			if _, serr := os.Stat(staging); serr == nil {
-				if err := os.Chtimes(staging, past, past); err != nil {
-					t.Fatal(err)
-				}
-			}
 
 			srv, gotRanges := rangedTestServer(t, full)
 			it := PlanItem{RelativePath: "ghost.bin", URL: srv.URL + "/ghost.bin", Size: total, AcceptRanges: true}
@@ -435,8 +423,7 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 // 3b's namespace/PID-reuse half: our PID with a different instance token is a
 // foreign live owner while it holds the OS ownership lock (the fence a real
 // writer keeps for its whole interval), and only becomes take-over-able when
-// that lock is gone and the same-host owner is provably dead with a stale
-// heartbeat.
+// that lock is gone and the same-host owner is provably dead.
 func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -477,10 +464,10 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatalf("error = %v, want the unproven-ownership refusal: a different instance token with our PID must not be taken over", err)
 	}
 
-	// Stale heartbeat + provably dead same-host owner and no ownership lock:
-	// take-over resumes its validated prefix. The record states a RESOLVED,
-	// PINNED identity in the CURRENT format, so the fixture exercises the
-	// take-over and not the pinned-identity or version gate.
+	// Provably dead same-host owner and no ownership lock: take-over resumes
+	// its validated prefix. The record states a RESOLVED, PINNED identity in
+	// the CURRENT format, so the fixture exercises the take-over and not the
+	// pinned-identity or version gate.
 	staleMeta := fmt.Sprintf(
 		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":4,"repo":"o/r","path":"pid-reuse.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
 		host, total, rangedSeedCommit, total-1)
@@ -497,12 +484,6 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Close()
-	past := time.Now().Add(-2 * DefaultStaleTimeout)
-	for _, p := range []string{staging, staging + ".meta"} {
-		if err := os.Chtimes(p, past, past); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	srv2, gotRanges := rangedTestServer(t, full)
 	it.URL = srv2.URL + "/pid-reuse.bin"
@@ -572,127 +553,6 @@ func TestRangedMultipart_ResolvedCommitMismatchDiscardsStaging(t *testing.T) {
 	}
 	if !startedAtZero {
 		t.Errorf("commit mismatch resumed old bytes; requests=%v", *gotRanges)
-	}
-}
-
-// TestRangedMultipart_HeartbeatCoversFinalization exercises the single
-// heartbeat during a finalization-length pause. The download blocks in the
-// file_finalizing event (emitted before the strict hash/publish work); the
-// claim record must still be rewritten while it is blocked.
-func TestRangedMultipart_HeartbeatCoversFinalization(t *testing.T) {
-	oldInterval := stagingHeartbeatEvery
-	stagingHeartbeatEvery = 20 * time.Millisecond
-	defer func() { stagingHeartbeatEvery = oldInterval }()
-
-	tmpDir := t.TempDir()
-	const total = 8000
-	full := rangedTestPayload(total)
-	dst := filepath.Join(tmpDir, "heartbeat-finalize.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	srv, _ := rangedTestServer(t, full)
-
-	reached := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	emit := func(ev ProgressEvent) {
-		if ev.Event == "file_finalizing" {
-			once.Do(func() { close(reached) })
-			<-release
-		}
-	}
-
-	done := make(chan error, 1)
-	it := PlanItem{RelativePath: "heartbeat-finalize.bin", URL: srv.URL + "/heartbeat-finalize.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-	go func() {
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), emit)
-		done <- err
-	}()
-
-	select {
-	case <-reached:
-	case err := <-done:
-		t.Fatalf("download finished before finalization: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("download never reached the finalization phase")
-	}
-
-	metaPath := dst + ".incomplete.meta"
-	before, err := os.Stat(metaPath)
-	if err != nil {
-		t.Fatalf("claim record missing during finalization: %v", err)
-	}
-	time.Sleep(4*stagingHeartbeatEvery + 30*time.Millisecond)
-	during, err := os.Stat(metaPath)
-	if err != nil {
-		t.Fatalf("claim record disappeared during finalization: %v", err)
-	}
-	if !during.ModTime().After(before.ModTime()) {
-		t.Errorf("claim record was not heartbeated during finalization: mtime stayed %v", before.ModTime())
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-	assertExactFile(t, dst, full)
-}
-
-// TestRangedMultipart_HeartbeatFailureIsFatal forces the heartbeat's atomic
-// meta rewrite to fail while the download is still active. The failure must
-// be surfaced and the payload must not be published.
-func TestRangedMultipart_HeartbeatFailureIsFatal(t *testing.T) {
-	oldInterval := stagingHeartbeatEvery
-	stagingHeartbeatEvery = 20 * time.Millisecond
-	defer func() { stagingHeartbeatEvery = oldInterval }()
-
-	tmpDir := t.TempDir()
-	const total = 4000
-	full := rangedTestPayload(total)
-	dst := filepath.Join(tmpDir, "HeartbeatFailure.bin")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	srv, _ := rangedTestServer(t, full)
-
-	reached := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	emit := func(ev ProgressEvent) {
-		if ev.Event == "file_finalizing" {
-			once.Do(func() { close(reached) })
-			<-release
-		}
-	}
-	done := make(chan error, 1)
-	it := PlanItem{RelativePath: "heartbeat-failure.bin", URL: srv.URL + "/heartbeat-failure.bin", Size: total, AcceptRanges: true}
-	go func() {
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, it, dst, withTestDomain(t, dst, multipartOpts{}), emit)
-		done <- err
-	}()
-
-	select {
-	case <-reached:
-	case err := <-done:
-		t.Fatalf("download finished before finalization: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("download never reached the finalization phase")
-	}
-	// The atomic meta write stages through meta+".tmp"; a directory there
-	// makes every heartbeat write fail.
-	if err := os.Mkdir(dst+".incomplete.meta.tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(4*stagingHeartbeatEvery + 50*time.Millisecond)
-	close(release)
-
-	err := <-done
-	if err == nil {
-		t.Fatal("download succeeded despite a heartbeat write failure")
-	}
-	if _, serr := os.Stat(dst); serr == nil {
-		t.Error("payload was published after the claim heartbeat failed")
 	}
 }
 

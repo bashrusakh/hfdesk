@@ -273,8 +273,8 @@ func (r *RepoDir) EnsureDirs() error {
 // IncompleteMeta contains metadata about an incomplete download.
 //
 // The base fields (PID, StartedAt, Size, SHA256) describe the transfer, while
-// Instance and Host carry the cross-process ownership identity and staleness
-// state used by CheckBlob and the claim/take-over logic. PID alone is only a
+// Instance and Host carry the cross-process identity and same-host liveness
+// hints used by CheckBlob and the claim/take-over logic. PID alone is only a
 // hint: a reused PID or two containers reporting PID 1 must not be treated as
 // the same owner. The Version/Ranges fields extend the record into the
 // ranged-download resume state (issue #140): versioned metadata describes a
@@ -300,17 +300,17 @@ type IncompleteMeta struct {
 	// PID and Host are hints; Instance is never inferred from them.
 	Instance string `json:"instance,omitempty"`
 	// Host is the hostname that wrote the record. It allows a same-host
-	// liveness check of PID; an empty or different host leaves heartbeat
-	// freshness as the only ownership signal.
+	// liveness check of PID; an empty or different host disables PID-based
+	// liveness, so the owner cannot be proven dead.
 	Host string `json:"host,omitempty"`
 	// LockFenced records that this claim was made while holding the OS-level
 	// staging ownership lock (the persistent <staging>.lock). On a platform
 	// that supports the lock, its state is then authoritative for CheckBlob:
 	// busy means a live writer, and a free lock means the owner crashed or
 	// released the claim, so the record is stale and take-over-able regardless
-	// of PID reuse or heartbeat freshness. Records written on a fallback
-	// platform (or by an older version) carry false and keep the lease
-	// heuristic.
+	// of PID reuse or record age. Records written on a fallback
+	// platform (or by an older version) carry false and are protected unless
+	// same-host owner death is proven.
 	LockFenced bool `json:"lock_fenced,omitempty"`
 	// Version is 0 for pre-range records and 4 for the ranged staging records
 	// written by this downloader. Only version 4 is resumable: every other
@@ -447,8 +447,8 @@ func (s BlobStatus) String() string {
 // A held OS-level DESTINATION-domain ownership lock (the persistent
 // blobs/tmp-<sha>.lock) means a live writer owns the destination and is
 // reported as BlobDownloading before any record heuristic: a suspended owner
-// can stop heartbeating and still resume writing through an open handle, so the
-// lock, not the lease, decides liveness wherever it is supported. A free lock
+// can still resume writing through an open handle, so the lock, not record age,
+// decides liveness wherever it is supported. A free lock
 // plus a lock-fenced record proves the current-version owner is gone. A free
 // lock plus an UNFENCED record is not stale: no live owner is proven either, so
 // the record is preserved, and the claim refuses it with the unproven-ownership
@@ -473,11 +473,10 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 	}
 
 	// A busy destination ownership lock is the authoritative "a live writer
-	// owns this destination" signal. It covers a suspended owner whose
-	// heartbeat went stale (and which could still resume writing through an
-	// open handle) and an in-process download whose record looks
-	// take-over-able. The probe never blocks, never creates the lock file, and
-	// releases immediately.
+	// owns this destination" signal. It covers a suspended owner (which could
+	// still resume writing through an open handle) and an in-process download
+	// whose record looks take-over-able. The probe never blocks, never creates
+	// the lock file, and releases immediately.
 	//
 	// The probed lock is the DESTINATION DOMAIN's: blobs/tmp-<sha>.lock. That
 	// is the fence every writer of this destination holds for its whole

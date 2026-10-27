@@ -566,7 +566,10 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   cleanup.
 - Serialize current-process record transitions with the per-staging metadata
   mutex; the destination ownership domain (held by the item) excludes foreign
-  current-version mutators and makes the gate intra-item state.
+  current-version mutators and makes the gate intra-item state. The staging
+  record is diagnostics/resume state, not a freshness-based ownership lease:
+  it is not rewritten on a timer, and record age is never an ownership signal.
+  Ownership is the destination domain plus `LockFenced`.
   Never recover a transition by age or unlink a lock that a suspended holder may
   still own. Re-read claim identity before mutation; cleanup and publish require
   the held domain, and publish checks cancellation immediately before

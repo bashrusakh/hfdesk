@@ -119,7 +119,7 @@ func TestPublishKeepsMidFlightContentAddressedBlob(t *testing.T) {
 
 // TestDownload_FreeLockFencedRecordWithLivePIDResumes covers B2: a lock-fenced
 // record whose owner lock is free is stale even when the record carries our
-// live PID and a fresh heartbeat. Download must resume and publish, not skip.
+// live PID. Download must resume and publish, not skip.
 func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -133,9 +133,9 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A foreign instance token with our live PID and a fresh record: the lease
-	// heuristic alone would call this "downloading". The free lock says the
-	// owner is gone.
+	// A foreign instance token with our live PID: record identity alone would
+	// call this "downloading", and record age is not an ownership signal. The
+	// free domain lock says the owner is gone.
 	meta.Instance = "foreign-reused-pid"
 	meta.PID = os.Getpid()
 	meta.Host = processHostname

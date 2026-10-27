@@ -8,15 +8,14 @@ package hfdownloader
 //
 // Two owner-level shared objects are covered here:
 //
-//  1. The staging record's range layout. The claim heartbeat rewrites the
-//     record periodically and normalizes the layout in place while it holds
-//     the download's metadata gate; the download itself derives its task list
-//     and its committed baseline from the same layout. Every access to the
-//     layout's mutable fields (RangeProgress.Committed/Done) must be
-//     serialized by that gate, otherwise the heartbeat's normalization and
-//     the task derivation race on the same bytes. The range layout's
-//     Start/End bounds are immutable once the layout is installed, so only
-//     Committed/Done need the gate.
+//  1. The staging record's range layout. Every checkpoint flush normalizes the
+//     layout in place while it holds the download's metadata gate; the
+//     download itself derives its task list and its committed baseline from
+//     the same layout. Every access to the layout's mutable fields
+//     (RangeProgress.Committed/Done) must be serialized by that gate,
+//     otherwise a checkpoint's normalization and the task derivation race on
+//     the same bytes. The range layout's Start/End bounds are immutable once
+//     the layout is installed, so only Committed/Done need the gate.
 //
 //  2. The strict hash-on-write state. Every range worker inspects it on each
 //     write and invalidates it when a response's framing cannot be trusted,
@@ -45,8 +44,8 @@ import (
 
 // blockingRangeServer serves a fixed payload with correct HEAD/Range
 // handling, but holds every ranged GET until release() is called. That keeps
-// the download inside its post-claim phase while the test observes the claim
-// record, so the heartbeat's liveness is established rather than assumed.
+// several range workers inside their post-claim transfers at the same time,
+// so concurrent checkpoint normalization can be exercised deterministically.
 //
 // The recorded Range headers are appended under mu and returned by requests().
 func blockingRangeServer(t *testing.T, full []byte) (srv *httptest.Server, requests func() []string, release func()) {
@@ -77,81 +76,17 @@ func blockingRangeServer(t *testing.T, full []byte) (srv *httptest.Server, reque
 	}, func() { releaseOnce.Do(func() { close(released) }) }
 }
 
-// recordRewriter observes the claim record at metaPath and reports whether
-// it was ever replaced by a different file while it watched.
-//
-// The claim record is rewritten atomically (staged file plus rename), so a
-// changed file identity proves a real rewrite happened. That is the
-// liveness precondition of the race this file covers: without a live
-// heartbeat the shared layout is never normalized concurrently and the
-// race-detector result would be vacuous.
-type recordRewriter struct {
-	mu      sync.Mutex
-	changes int
-	stop    chan struct{}
-	done    chan struct{}
-}
-
-// watchRecordRewrites starts observing the claim record at metaPath.
-func watchRecordRewrites(metaPath string) *recordRewriter {
-	rw := &recordRewriter{stop: make(chan struct{}), done: make(chan struct{})}
-	go func() {
-		defer close(rw.done)
-		var prev os.FileInfo
-		for {
-			select {
-			case <-rw.stop:
-				return
-			default:
-			}
-			if fi, err := os.Stat(metaPath); err == nil {
-				rw.mu.Lock()
-				if prev != nil && !os.SameFile(prev, fi) {
-					rw.changes++
-				}
-				prev = fi
-				rw.mu.Unlock()
-			}
-			time.Sleep(200 * time.Microsecond)
-		}
-	}()
-	return rw
-}
-
-// stop ends the observation and returns the number of observed rewrites.
-func (rw *recordRewriter) stopWatching() int {
-	close(rw.stop)
-	<-rw.done
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
-	return rw.changes
-}
-
 // TestRangedMultipart_ResumedTaskDerivationIsRaceFree drives a resumed
-// download whose layout already carries Done ranges while the claim
-// heartbeat runs at its shortest cadence, so the heartbeat's in-place
-// normalization of the shared layout overlaps the derivation of the missing
-// work.
+// download whose layout already carries Done ranges, so the derivation of the
+// missing work reads the shared layout under the metadata gate and produces a
+// private task snapshot.
 //
-// The download must (a) issue exactly the missing suffix requests, (b)
-// produce byte-exact output, and (c) run without a data race between the
-// heartbeat and the task derivation. Under -race the third property is
-// enforced by the race detector itself.
-//
-// The layout variants place the Done ranges at different positions and use
-// different missing-work shapes, so the derived task index and the requested
-// byte ranges differ per variant: a fix that only handled one position, or
-// one missing-work shape, would fail the others.
-//
-// The heartbeat interval is a package-level seam. It is restored only after
-// every download returned; downloadMultipart joins its heartbeat goroutine
-// before it returns, so the seam is never mutated while a heartbeat is
-// alive.
+// The download must (a) issue exactly the missing suffix requests and
+// (b) produce byte-exact output. The layout variants place the Done ranges at
+// different positions and use different missing-work shapes, so the derived
+// task index and the requested byte ranges differ per variant: a fix that only
+// handled one position, or one missing-work shape, would fail the others.
 func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
-	oldInterval := stagingHeartbeatEvery
-	stagingHeartbeatEvery = time.Nanosecond
-	t.Cleanup(func() { stagingHeartbeatEvery = oldInterval })
-
 	const total = 8000
 	full := rangedTestPayload(total)
 	const relPath = "resumed-race.bin"
@@ -215,7 +150,7 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 				metaPath := staging + ".meta"
 				seedRangedState(t, staging, "o/r", relPath, total, v.ranges, full)
 
-				srv, requests, release := blockingRangeServer(t, full)
+				srv, requests := rangedTestServer(t, full)
 				it := PlanItem{RelativePath: relPath, URL: srv.URL + "/" + relPath, Size: total, AcceptRanges: true}
 				cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
@@ -225,28 +160,14 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 					done <- err
 				}()
 
-				// The download is blocked in its ranged GET, so the claim
-				// heartbeat is live. The record must be rewritten while it
-				// watches: that proves the heartbeat's shared-layout
-				// normalization really ran, so the race result below is not
-				// vacuous.
-				rw := watchRecordRewrites(metaPath)
-				time.Sleep(50 * time.Millisecond)
-				changes := rw.stopWatching()
-				release()
-
 				if err := <-done; err != nil {
 					t.Fatalf("iteration %d: downloadMultipart: %v", i, err)
-				}
-				if changes == 0 {
-					t.Fatalf("iteration %d: claim record was never rewritten while the download was active: "+
-						"the heartbeat never ran, so this run would not exercise the concurrent normalization", i)
 				}
 
 				// Exact missing-range request oracle: only the uncommitted
 				// suffix of the incomplete range is requested, and the
 				// already-Done range is never re-requested.
-				if got := requests(); !slices.Equal(got, v.wantRanges) {
+				if got := *requests; !slices.Equal(got, v.wantRanges) {
 					t.Errorf("iteration %d: ranged requests = %v, want %v", i, got, v.wantRanges)
 				}
 				assertExactFile(t, dst, full)
@@ -254,6 +175,109 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 					t.Errorf("iteration %d: claim record survived publication (stat err = %v)", i, err)
 				}
 			})
+		}
+	}
+}
+
+// TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree drives one
+// download whose complete range layout starts empty with a worker per range.
+// Every worker finishes concurrently and advances its range's Committed/Done
+// fields, and every completion flushes the record, whose writer normalizes the
+// whole shared layout in place. All those layout accesses must be serialized
+// by the metadata gate: otherwise the concurrent checkpoint normalizations and
+// record writes race on the same bytes. Under -race that property is enforced
+// by the race detector.
+//
+// The finalization event is held so the record can be inspected before the
+// publication removes it: every range must be persisted as Done and the
+// committed total must cover the payload.
+func TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree(t *testing.T) {
+	const total = 64 * 1024
+	const workers = 8
+	full := rangedTestPayload(total)
+	const relPath = "checkpoint-race.bin"
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, relPath)
+	staging := dst + ".incomplete"
+	metaPath := staging + ".meta"
+	ranges := buildRangeLayout(total, workers)
+	seedRangedState(t, staging, "o/r", relPath, total, ranges, full)
+
+	srv, requests, releaseTransfer := blockingRangeServer(t, full)
+	reachedFinalize := make(chan struct{})
+	releaseFinalize := make(chan struct{})
+	var reachedOnce, releaseOnce sync.Once
+	releaseFinalization := func() { releaseOnce.Do(func() { close(releaseFinalize) }) }
+	// Unblock the server and the finalization gate if an assertion exits the
+	// test early: httptest.Server.Close waits for outstanding handlers.
+	defer releaseTransfer()
+	defer releaseFinalization()
+	emit := func(ev ProgressEvent) {
+		if ev.Event == "file_finalizing" {
+			reachedOnce.Do(func() { close(reachedFinalize) })
+			<-releaseFinalize
+		}
+	}
+
+	it := PlanItem{RelativePath: relPath, URL: srv.URL + "/" + relPath, Size: total, AcceptRanges: true}
+	cfg := Settings{Concurrency: workers, Retries: 0, StallTimeout: "0"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), emit)
+		done <- err
+	}()
+
+	// Wait until every worker has entered its ranged GET, so the transfer
+	// completions and their checkpoint flushes really overlap.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(requests()) < workers {
+		select {
+		case err := <-done:
+			t.Fatalf("download finished before all workers started: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d range workers started", len(requests()), workers)
+		}
+	}
+	releaseTransfer()
+
+	select {
+	case <-reachedFinalize:
+	case err := <-done:
+		t.Fatalf("download finished before finalization: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("download never reached the finalization phase")
+	}
+
+	meta, merr := readStagingMeta(metaPath)
+	if merr != nil {
+		t.Fatalf("read persisted record before publication: %v", merr)
+	}
+	if !stagingLayoutComplete(meta.Ranges, total) {
+		t.Fatalf("concurrent checkpoint flushes persisted an incomplete layout: %+v", meta.Ranges)
+	}
+	if got := committedTotal(meta.Ranges); got != total {
+		t.Fatalf("persisted committed total = %d, want %d", got, total)
+	}
+
+	releaseFinalization()
+	if err := <-done; err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+	assertExactFile(t, dst, full)
+	if _, serr := os.Stat(metaPath); !os.IsNotExist(serr) {
+		t.Errorf("claim record survived publication (stat err = %v)", serr)
+	}
+	got := requests()
+	if len(got) != workers {
+		t.Fatalf("ranged requests = %d (%v), want %d (one per range)", len(got), got, workers)
+	}
+	for i := range ranges {
+		want := fmt.Sprintf("bytes=%d-%d", ranges[i].Start, ranges[i].End)
+		if !slices.Contains(got, want) {
+			t.Errorf("missing ranged request %q; got %v", want, got)
 		}
 	}
 }

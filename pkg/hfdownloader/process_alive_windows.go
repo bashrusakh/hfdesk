@@ -27,8 +27,8 @@ const (
 // Signal(0): Go returns EWINDOWS for signal 0 on Windows, which would make
 // every live owner look dead. OpenProcess/GetExitCodeProcess is the real
 // platform check. Access-denied and other indeterminate failures are treated
-// as alive so a live owner is never displaced on an uncertain answer; the
-// heartbeat staleness path still recovers a genuinely hung owner.
+// as alive so a live owner is never displaced on an uncertain answer; an owner
+// whose same-host death cannot be proven is preserved rather than displaced.
 func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false

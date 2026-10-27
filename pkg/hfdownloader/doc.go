@@ -414,9 +414,10 @@ unsupported: its record is an old/unsupported format (discarded) or an unfenced
 v4 record (refused as unproven and preserved), and no current code competes for
 its obsolete lock.
 
-The claim record remains the identity/resume state and is heartbeated through
-transfers, retry waits, strict verification and finalization. Every mutation
-re-reads claim identity; a heartbeat cannot resurrect a replaced claim. The
+The claim record is diagnostics/resume state, not a freshness-based ownership
+lease: no periodic rewrite is needed, because the held destination domain is the
+ownership signal. Every mutation re-reads claim identity; a checkpoint cannot
+resurrect a replaced claim. The
 claim carries a per-process instance token plus PID/host diagnostics, so PID
 reuse and containers sharing PID 1 are not treated as the same writer. Publish
 checks the record and the still-held domain lock before rename; a missing or

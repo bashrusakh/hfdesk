@@ -242,8 +242,8 @@ func headOnlyServer(t *testing.T, size int64) *httptest.Server {
 	return srv
 }
 
-// T5: cancel during the strict hash pass. The shared cancel semantics must stop
-// the heartbeat, close the staging handle and run cleanupPartialsOnCancel,
+// T5: cancel during the strict hash pass. The shared cancel semantics must
+// close the staging handle and run cleanupPartialsOnCancel,
 // instead of leaving the staging pair behind.
 func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 	// A sparse 1 GiB payload keeps the single hash pass running far longer than

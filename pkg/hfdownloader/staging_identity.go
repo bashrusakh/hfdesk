@@ -10,8 +10,8 @@ package hfdownloader
 // directory. The record therefore carries a random per-process instance token
 // written once at process start. The token distinguishes "an earlier run of
 // this same process instance" (resumable, no live writer) from "a different
-// process that happens to report the same PID" (foreign; only heartbeat
-// freshness and a same-host liveness check may decide).
+// process that happens to report the same PID" (foreign; only a same-host
+// liveness check may prove it dead; record age is not an ownership signal).
 //
 // The token is the record's identity, not the exclusion fence. The lifetime OS
 // lock excludes current-version writers; a free lock is sufficient only for a
@@ -39,8 +39,8 @@ var processInstanceToken = newProcessInstanceToken()
 
 // processHostname is the local hostname used to decide whether a PID recorded
 // by another process instance names a process on this host. An empty value
-// (hostname lookup failed) disables PID-based liveness and leaves heartbeat
-// freshness as the only ownership signal.
+// (hostname lookup failed) disables PID-based liveness, so the record's owner
+// cannot be proven dead and the claim refuses to take it over.
 var processHostname = func() string {
 	h, err := os.Hostname()
 	if err != nil {

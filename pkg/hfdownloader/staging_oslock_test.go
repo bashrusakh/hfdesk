@@ -303,8 +303,8 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
 		return
 	}
-	// Deliberately age the payload and record: the lease model would call this
-	// owner stale. Only the OS ownership lock keeps ownership here.
+	// Deliberately age the payload and record: an age-based model would call
+	// this owner stale. Only the OS ownership lock keeps ownership here.
 	past := time.Now().Add(-2 * DefaultStaleTimeout)
 	for _, p := range []string{cfg.Staging, metaPath} {
 		if err := os.Chtimes(p, past, past); err != nil {
@@ -433,8 +433,8 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Pre-condition: the record is already older than the former lease grace;
-	// its timestamp cannot grant another process ownership.
+	// Pre-condition: the record is already older than the cache's stale
+	// timeout; its timestamp cannot grant another process ownership.
 	metaBefore, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("helper record: %v", err)
@@ -443,8 +443,8 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	if statErr != nil {
 		t.Fatalf("helper record stat: %v", statErr)
 	}
-	if age := time.Since(metaInfo.ModTime()); age < claimGracePeriod {
-		t.Fatalf("the helper record must look stale to the lease model (age=%v, grace=%v)", age, claimGracePeriod)
+	if age := time.Since(metaInfo.ModTime()); age < DefaultStaleTimeout {
+		t.Fatalf("the helper record must look stale to an age-based model (age=%v, timeout=%v)", age, DefaultStaleTimeout)
 	}
 	var beforeMeta IncompleteMeta
 	if err := json.Unmarshal(metaBefore, &beforeMeta); err != nil {

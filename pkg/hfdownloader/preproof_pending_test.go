@@ -110,13 +110,6 @@ func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 	staging := filepath.Join(blobsDir, sha+".incomplete")
 	metaPath := staging + ".meta"
 
-	// Keep the heartbeat out of the deterministic finalization window; a real
-	// local metadata gate held across proof finalization blocks only owned
-	// mismatch cleanup, exercising the durable ProofPending fallback.
-	oldHeartbeat := stagingHeartbeatEvery
-	stagingHeartbeatEvery = time.Hour
-	defer func() { stagingHeartbeatEvery = oldHeartbeat }()
-
 	cfg := Settings{
 		CacheDir:           cacheDir,
 		Endpoint:           srv.URL,

@@ -1147,100 +1147,11 @@ func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 	}
 }
 
-// A live owner parked in a long Retry-After wait continues to refresh its
-// diagnostic claim record. The held lifetime OS lock, not record age, is the
-// exclusion fence; the test also preserves prompt cancellation of the wait.
-func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
-	tmpDir := t.TempDir()
-	const total = 8_000
-
-	dst := filepath.Join(tmpDir, "heartbeat.bin")
-	staging := dst + ".incomplete"
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// HEAD resolves the size; every range GET is throttled with a Retry-After
-	// larger than the diagnostic heartbeat interval, so the owner spends the
-	// test inside a wait with no payload writes.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(total))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		w.Header().Set("Retry-After", "30")
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer srv.Close()
-
-	it := PlanItem{RelativePath: "heartbeat.bin", URL: srv.URL + "/heartbeat.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: 1, Retries: 2, StallTimeout: "0"}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	type runResult struct {
-		err error
-	}
-	done := make(chan runResult, 1)
-	go func() {
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
-		done <- runResult{err}
-	}()
-
-	// Observe the claim record as soon as the owner claims the staging.
-	metaPath := staging + ".meta"
-	metaDeadline := time.Now().Add(15 * time.Second)
-	for {
-		if _, err := os.Stat(metaPath); err == nil {
-			break
-		}
-		select {
-		case r := <-done:
-			t.Fatalf("download finished before the claim was observed: %v", r.err)
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(metaDeadline) {
-			t.Fatal("claim record was never created")
-		}
-	}
-	metaBefore, err := os.Stat(metaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait past the diagnostic heartbeat interval with zero payload writes.
-	time.Sleep(claimGracePeriod + 2*time.Second)
-
-	metaAfter, err := os.Stat(metaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !metaAfter.ModTime().After(metaBefore.ModTime()) {
-		t.Errorf("claim record was not rewritten while the live owner waited: mtime still %v", metaAfter.ModTime())
-	}
-	if !metaFreshWithin(metaPath, claimGracePeriod) {
-		t.Error("claim metadata was not refreshed during the retry wait")
-	}
-
-	// The heartbeat wait stays cancellation-prompt.
-	cancel()
-	select {
-	case r := <-done:
-		if !errors.Is(r.err, context.Canceled) {
-			t.Errorf("download error = %v, want context.Canceled after cancel", r.err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("download did not stop promptly after cancel")
-	}
-}
-
-// The claimant's side of the heartbeat contract, both sides of the
-// freshness boundary: a live foreign owner whose payload has gone stale
-// still owns the staging while its record is fresh (heartbeatted), and
-// loses the claim only once BOTH the payload and the record have gone
-// stale — a hung process must not lock a blob forever.
-func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
+// The claimant's side of the unproven-record rule: an UNFENCED record whose
+// live foreign owner cannot be proven dead is refused and preserved, even when
+// its payload looks stale. Record age is not an ownership signal; only the
+// destination domain plus same-host process evidence can decide.
+func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 	foreign := os.Getppid()
 	if foreign == os.Getpid() || !isProcessAlive(foreign) {
 		t.Skip("no live foreign PID available for this test process")
@@ -1287,7 +1198,7 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		}
 	}
 
-	t.Run("fresh record with stale payload is not taken over", func(t *testing.T) {
+	t.Run("live foreign owner is not taken over", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		full := rangedTestPayload(total)
 		dst := filepath.Join(tmpDir, "hb-fresh.bin")
@@ -1297,14 +1208,13 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		}
 		seedForeignOwned(t, staging, full, 4000)
 		staleMtime(t, staging) // payload silent for > stale timeout
-		// The record was just rewritten: the owner heartbeated.
 		before, err := os.ReadFile(staging)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// The record is UNFENCED and its owner cannot be proven dead, so the
-		// claim refuses it: a fresh (heartbeatted) record is protected by its
-		// identity rule, independently of any free lock.
+		// claim refuses it: the record's identity rule protects it, independently
+		// of any free lock and of its age.
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodHead {
@@ -1312,14 +1222,14 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
-			http.Error(w, "body must not be requested while a heartbeatted live owner holds the staging", http.StatusInternalServerError)
+			http.Error(w, "body must not be requested while a live foreign owner holds the staging", http.StatusInternalServerError)
 		}))
 		defer srv.Close()
 
 		it := PlanItem{RelativePath: "hb.bin", URL: srv.URL + "/hb.bin", Size: total, AcceptRanges: true}
 		_, err = downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, errBlobIncompleteOwned) {
-			t.Fatalf("error = %v, want errBlobIncompleteOwned for a live owner with a fresh (heartbeatted) record and a stale payload", err)
+			t.Fatalf("error = %v, want errBlobIncompleteOwned for a live foreign owner with an unfenced record and a stale payload", err)
 		}
 		assertExactFile(t, staging, before)
 	})

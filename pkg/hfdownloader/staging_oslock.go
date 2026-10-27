@@ -7,7 +7,7 @@ package hfdownloader
 //
 // The per-path in-process metadata gate serializes local record updates. The
 // lifetime lock is the cross-process fence: a suspended owner keeps it for as
-// long as its process and open handle live, regardless of heartbeat age.
+// long as its process and open handle live, regardless of record age.
 //
 // This file adds the long-lived exclusivity primitive: an OS-level exclusive
 // lock on the persistent sibling file "<staging>.lock", acquired before the
@@ -17,7 +17,7 @@ package hfdownloader
 // suspended (but alive) process keeps ownership — the documented tradeoff:
 // there is no takeover while the owner is alive; terminate it to recover.
 //
-// The record and heartbeat remain for identity and diagnostics. Unsupported or
+// The record remains for identity, resume and diagnostics. Unsupported or
 // failed lock acquisition is an operation error; no lease-only mutation path is
 // used. Existing partial data remains untouched on that error.
 //

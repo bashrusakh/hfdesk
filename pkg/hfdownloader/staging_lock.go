@@ -117,8 +117,8 @@ func (l *stagingStateLock) release() {
 
 // errStagingClaimLost reports that this process no longer owns the staging
 // record: a take-over replaced it while this writer was active. Every metadata
-// mutation checks ownership under the metadata gate, so a heartbeat or
-// checkpoint can never overwrite (and thereby steal back) a newer claim.
+// mutation checks ownership under the metadata gate, so a checkpoint can never
+// overwrite (and thereby steal back) a newer claim.
 var errStagingClaimLost = errors.New("staging claim is no longer owned by this process")
 
 // claimRecordOwnedLocked reports whether the record still names this process

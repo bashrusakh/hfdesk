@@ -79,8 +79,8 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			os.Getppid(), host, total, stagingMetaVersion, total-1)
 		writeRawStagingMeta(t, metaPath, raw)
 		// A live owner holds the destination's ownership-domain lock for its
-		// whole interval; cleanup must treat that (not a heartbeat heuristic)
-		// as the authoritative ownership signal.
+		// whole interval; cleanup must treat that, not record age, as the
+		// authoritative ownership signal.
 		hold, _ := acquireStagingOwnershipLock(dst)
 		if hold != nil {
 			defer hold.release()
@@ -193,8 +193,8 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 // TestCheckBlob_OwnershipIdentity pins the CheckBlob consumer of the ownership
 // classification. A lock-fenced record on a platform with the OS lock is
 // authoritative: a free lock means the current-version owner is gone even when
-// the record carries our live PID and a fresh heartbeat. Unfenced records stay
-// "downloading" unless same-host process death can be proven.
+// the record carries our live PID. Unfenced records stay "downloading" unless
+// same-host process death can be proven.
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir, time.Minute)

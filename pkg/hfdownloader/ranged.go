@@ -35,20 +35,18 @@ package hfdownloader
 // before any create/truncate. A record whose payload vanished is discarded and
 // re-downloaded; it is never allowed to publish a preallocated zero file.
 //
-// Ownership has three levels. A random per-process instance token distinguishes
-// this process instance from another (PID reuse, containers sharing PID 1),
-// and a single heartbeat goroutine keeps the claim record fresh through
-// transfers, retry waits, strict verification and finalization for identity
-// and diagnostics. The exclusion fence is an OS-level exclusive lock on the
-// persistent sibling file <staging>.lock, acquired before the claim transition
-// and held for the whole ownership interval — claim read, create/resume,
-// transfer, hash, publish/cleanup. A busy lock means a live owner, including a
-// suspended process that stopped heartbeating but could still resume writing
+// Ownership rests on the per-process instance token for identity and one
+// exclusion fence. The staging record is diagnostics/resume state, not a
+// freshness-based ownership lease. The fence is an OS-level exclusive lock on
+// the persistent sibling file <staging>.lock, acquired before the claim
+// transition and held for the whole ownership interval — claim read,
+// create/resume, transfer, hash, publish/cleanup. A busy lock means a live
+// owner, including a suspended process that could still resume writing
 // through an open handle; a crashed process releases the lock at death, so
 // takeover/resume is immediate. Every record transition — claim, take-over,
-// checkpoint, heartbeat, removal — use the per-path in-process metadata gate;
-// the lifetime OS lock excludes every current-version foreign mutator. There
-// is no lease-only mutation fallback: unsupported or failed lock acquisition
+// checkpoint, removal — uses the per-path in-process metadata gate; the
+// lifetime OS lock excludes every current-version foreign mutator. There is no
+// lease-only mutation fallback: unsupported or failed lock acquisition
 // returns an operation error before claim/payload mutation. A legacy record
 // without LockFenced remains protected unless same-host owner death is proven.
 // Publish re-checks the record under the metadata gate and verifies the held OS
@@ -117,19 +115,6 @@ var renameStagingClaimRecord = os.Rename
 // authoritative staging record. The staged file holds a complete record that
 // is installed by an atomic link or rename; it is never authoritative itself.
 const stagingRecordTempSuffix = ".tmp"
-
-// claimGracePeriod is the maximum diagnostic heartbeat interval before an
-// owner rewrites its metadata. It is not ownership authority: only the lifetime
-// OS lock permits or excludes a current-version mutation.
-const claimGracePeriod = 10 * time.Second
-
-// claimHeartbeatEvery is how often an owner rewrites diagnostic/resume metadata.
-const claimHeartbeatEvery = claimGracePeriod / 2
-
-// stagingHeartbeatEvery is the running heartbeat cadence. It is a variable so
-// tests can shorten the finalization-length pause they simulate; production
-// keeps the derived constant.
-var stagingHeartbeatEvery = claimHeartbeatEvery
 
 var (
 	// errBlobIncompleteOwned reports that the staging file for this
@@ -876,16 +861,6 @@ func normalizeRangesInPlace(ranges []RangeProgress, size int64) bool {
 	return off == size
 }
 
-// metaFreshWithin reports whether path's mtime is within d of now. A
-// missing file is not fresh.
-func metaFreshWithin(path string, d time.Duration) bool {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return time.Since(fi.ModTime()) < d
-}
-
 // removeStagingArtifactsLocked removes the staging meta record and then the
 // staging payload (best-effort; missing files are not an error). The caller
 // holds the staging metadata gate, so no concurrent transition can recreate
@@ -1181,7 +1156,7 @@ type stagingDownload struct {
 
 	// metaMu guards the range layout and every meta rewrite. The layout's
 	// mutable fields (RangeProgress.Committed/Done) are owner-shared state:
-	// the claim heartbeat normalizes them in place, and every range worker
+	// every checkpoint flush normalizes them in place, and every range worker
 	// advances its own range's committed prefix. They are therefore only
 	// read or written while this gate is held.
 	metaMu sync.Mutex
@@ -1211,16 +1186,6 @@ type stagingDownload struct {
 	// and the invalidation that switches the transfer over to the single
 	// final full-file pass. It is never held across network I/O.
 	seqMu sync.Mutex
-
-	// One heartbeat goroutine per download keeps the claim record fresh
-	// through every post-claim phase: transfers, retry/Retry-After waits, the
-	// strict SHA pass, and finalization. It shares metaMu with range flushes,
-	// so writeStagingMeta's temp+rename atomicity is never violated.
-	heartbeatStop chan struct{}
-	heartbeatDone chan struct{}
-	heartbeatOnce sync.Once
-	heartbeatErr  error
-	heartbeatMu   sync.Mutex
 }
 
 // hashWriter is the subset of hash.Hash used for hash-on-write.
@@ -1246,8 +1211,8 @@ func (d *stagingDownload) flushMeta() error {
 
 // flushMetaLocked persists the current range state; caller holds metaMu. The
 // local per-path metadata gate is acquired inside, and the record is re-read
-// and must still name this process instance before it is replaced: a flush or
-// heartbeat can never race a take-over, overwrite the new owner's claim, or
+// and must still name this process instance before it is replaced: a flush
+// can never race a take-over, overwrite the new owner's claim, or
 // resurrect ownership this process has lost. A nil range layout (the window
 // between claim creation and the initial layout flush) writes an
 // ownership-only record that claims no bytes.
@@ -1272,65 +1237,6 @@ func (d *stagingDownload) flushMetaLocked() error {
 	}
 	defer lock.release()
 	return writeStagingMetaOwnedLocked(d.meta, &meta)
-}
-
-// startHeartbeat runs the single claim heartbeat for this download. It begins
-// immediately after the claim is opened and covers every post-claim phase —
-// transfers, retry waits, strict verification and finalization. It is stopped
-// before any removal of the meta record (including the publish path). A
-// heartbeat write failure is recorded and cancels the part context: staying
-// active under a stale record (or after a take-over) would invite a second
-// writer to write the same staging file.
-func (d *stagingDownload) startHeartbeat(interval time.Duration, cancel context.CancelCauseFunc) {
-	if interval <= 0 {
-		return
-	}
-	d.heartbeatStop = make(chan struct{})
-	d.heartbeatDone = make(chan struct{})
-	go func() {
-		defer close(d.heartbeatDone)
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-d.heartbeatStop:
-				return
-			case <-t.C:
-				if err := d.flushMeta(); err != nil {
-					d.heartbeatMu.Lock()
-					if d.heartbeatErr == nil {
-						d.heartbeatErr = err
-					}
-					d.heartbeatMu.Unlock()
-					if cancel != nil {
-						cancel(abortError(err))
-					}
-					return
-				}
-			}
-		}
-	}()
-}
-
-// stopHeartbeat stops and joins the heartbeat goroutine. It is idempotent and
-// safe to call when no heartbeat was started. Removing the meta record before
-// this returns could race a heartbeat that recreates it.
-func (d *stagingDownload) stopHeartbeat() {
-	d.heartbeatOnce.Do(func() {
-		if d.heartbeatStop != nil {
-			close(d.heartbeatStop)
-		}
-		if d.heartbeatDone != nil {
-			<-d.heartbeatDone
-		}
-	})
-}
-
-// heartbeatError returns the first heartbeat write failure, if any.
-func (d *stagingDownload) heartbeatError() error {
-	d.heartbeatMu.Lock()
-	defer d.heartbeatMu.Unlock()
-	return d.heartbeatErr
 }
 
 // seqHashDigest returns the hex digest of the hash-on-write state and
@@ -1453,7 +1359,7 @@ func (d *stagingDownload) clearProofPending() error {
 
 // applyCancelCleanup applies the caller's explicit-cancel cleanup policy after
 // a post-claim phase observed a done part context. Internal aborts (a
-// fail-fast sibling or a heartbeat/claim failure) preserve the resumable
+// fail-fast sibling or a claim failure) preserve the resumable
 // staging bytes. The ownership check and every removal happen inside one
 // locked transition, so a take-over cannot interleave between the check and
 // the deletions, and a writer that lost its claim never removes the new
@@ -1465,7 +1371,6 @@ func (d *stagingDownload) applyCancelCleanup() {
 	if abortPartAttempt(d.partCtx) {
 		return
 	}
-	d.stopHeartbeat()
 	_ = d.closeOut()
 	if d.cfg.CleanupPartialsOnCancel == nil || !d.cfg.CleanupPartialsOnCancel() {
 		return
@@ -1534,9 +1439,10 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	return open, nil
 }
 
-// retryWaitSleep waits out a retry/backoff pause. Claim freshness during the
-// wait is maintained by the single heartbeat goroutine, not by rewriting the
-// record from this loop; sleepCtx keeps pause/cancel/shutdown prompt.
+// retryWaitSleep waits out a retry/backoff pause. The record needs no rewrite
+// during the wait: the held destination ownership domain is the ownership
+// signal, and committed checkpoints are already durable. sleepCtx keeps
+// pause/cancel/shutdown prompt.
 //
 // ok reports whether the full wait elapsed; false means ctx was done and the
 // caller must treat the attempt as cancelled (as with sleepCtx).
@@ -1685,7 +1591,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// Claim the staging record under the destination domain the item already
 	// holds: the claim verifies that the domain covers the staging path, then
 	// performs its record transitions under the local metadata gate. A live
-	// owner - including a suspended one that stopped heartbeating - cannot
+	// owner - including a suspended one - cannot
 	// exist while this item holds the domain; only a content-addressed publish
 	// target is treated as already complete.
 	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain)
@@ -1773,21 +1679,14 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			return false, err
 		}
 	} else {
-		// Install the validated layout BEFORE the heartbeat starts: a
-		// heartbeat tick must never rewrite the record with a nil layout,
-		// which would discard resumable committed ranges on the next claim.
+		// Install the validated layout before the initial flush, so the first
+		// persisted record carries the resumable committed ranges instead of
+		// a nil layout that would discard them on the next claim.
 		d.metaMu.Lock()
 		d.ranges = append([]RangeProgress(nil), state.ranges...)
 		d.startedAt = time.Now().UTC() // resumed run keeps its own clock
 		d.metaMu.Unlock()
 	}
-
-	// One heartbeat for every post-claim phase: transfers, retry/Retry-After
-	// waits, the strict SHA pass, and finalization. It shares metaMu with range
-	// flushes (so the temp+rename record write stays atomic) and the metadata
-	// gate with every other record mutation. Stops before any meta removal.
-	d.startHeartbeat(stagingHeartbeatEvery, partCancel)
-	defer d.stopHeartbeat()
 
 	// Determine the authoritative range layout. A fresh claim starts from
 	// zero: partial downloads from old or unsupported formats are discarded,
@@ -1828,9 +1727,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 	proofPendingForFlush := d.proofPending
 	// The committed baseline is read from the shared layout, so it is
-	// derived under the same gate that guards the layout. The heartbeat
-	// rewrites the layout concurrently; reading it unlocked would race
-	// with the heartbeat's in-place normalization.
+	// derived under the same gate that guards every layout mutation.
 	d.baseCommitted = committedTotal(d.ranges)
 	d.metaMu.Unlock()
 
@@ -1842,9 +1739,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			d.poisonStagingIfOwned()
 		}
 		if cerr := partCtx.Err(); cerr != nil {
-			if herr := d.heartbeatError(); herr != nil {
-				return false, herr
-			}
 			return false, cerr
 		}
 		return false, err
@@ -1857,12 +1751,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// defensively here too: a complete-prefix range is never turned into a
 	// bytes=End+1-End request.
 	//
-	// The layout is owner-shared state: the claim heartbeat normalizes the
-	// same Committed/Done fields in place while this download derives its
-	// work. The derivation therefore runs under the metadata gate, so the
-	// heartbeat's normalization and this read-modify-write of the same
-	// fields are serialized. The gate is released before any network work:
-	// the derived task list is a private snapshot of the layout.
+	// The layout is owner-shared state: every checkpoint flush normalizes the
+	// same Committed/Done fields in place, and the derivation below mutates
+	// them too. The derivation therefore runs under the metadata gate, so
+	// the flush normalization and this read-modify-write of the same fields
+	// are serialized. The gate is released before any network work: the
+	// derived task list is a private snapshot of the layout.
 	d.metaMu.Lock()
 	tasks := make([]rangeTask, 0, len(d.ranges))
 	for i := range d.ranges {
@@ -1999,15 +1893,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return false, permanentErr
 	}
 
-	// A heartbeat write failure while this download is still active is fatal:
-	// without a durable, fresh record the claim cannot be defended, and
-	// staying active would invite a second writer to take over. Surface it
-	// before the cancellation guard (the heartbeat itself cancels partCtx with
-	// an abort cause, which must not be mistaken for a user cancel).
-	if herr := d.heartbeatError(); herr != nil {
-		return false, herr
-	}
-
 	// If the context was cancelled while workers were running (pause /
 	// abort / timeout), return the cancellation error immediately. Workers
 	// that exit via their ctx-aware retry/sleep path do NOT push to errCh,
@@ -2017,7 +1902,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// flushed the committed high-water marks, so a pause preserves exactly
 	// the durable resume state.
 	if ctx.Err() != nil || partCtx.Err() != nil {
-		// User cancel: stop the heartbeat, close the staging handle (Windows
+		// User cancel: close the staging handle (Windows
 		// cannot unlink an open file) and run the caller's cancel-cleanup
 		// policy, all only while this process still owns the claim. An internal
 		// abort preserves the resumable bytes.
@@ -2056,19 +1941,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// staging bytes; a user cancel runs the same cancel-cleanup as every other
 	// post-claim phase.
 	if cerr := partCtx.Err(); cerr != nil {
-		// A heartbeat failure cancels partCtx with an abort cause; surface the
-		// durable-record failure rather than its "context canceled" symptom.
-		if herr := d.heartbeatError(); herr != nil {
-			return false, herr
-		}
 		d.applyCancelCleanup()
 		return false, cerr
-	}
-
-	// The claim must stay fresh through the finalization phase too; a
-	// heartbeat failure since the guard above is fatal for the same reason.
-	if herr := d.heartbeatError(); herr != nil {
-		return false, herr
 	}
 
 	// Content proof before publication.
@@ -2110,18 +1984,15 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}
 		if !usedSeqHash {
 			// One sequential full-file pass over the completed staging file,
-			// bounded by the part context so a user cancel, a heartbeat failure
-			// or a sibling abort stops the pass promptly; computeSHA256Ctx
-			// records it in the hash-pass counters.
+			// bounded by the part context so a user cancel or a sibling abort
+			// stops the pass promptly; computeSHA256Ctx records it in the
+			// hash-pass counters.
 			computed, herr := computeSHA256Ctx(partCtx, stg)
 			if herr != nil {
-				if heartbeatErr := d.heartbeatError(); heartbeatErr != nil {
-					return false, heartbeatErr
-				}
-				// User cancel during the strict hash: the same stop-heartbeat /
-				// close-handle / cleanup sequence as every other post-claim
-				// phase. An internal abort keeps the resumable bytes; the
-				// durable ProofPending flag keeps them untrusted.
+				// User cancel during the strict hash: the same close-handle /
+				// cleanup sequence as every other post-claim phase. An internal
+				// abort keeps the resumable bytes; the durable ProofPending flag
+				// keeps them untrusted.
 				d.applyCancelCleanup()
 				if cerr := ctx.Err(); cerr != nil {
 					return false, cerr
@@ -2142,7 +2013,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			// discards (size mismatch) or re-proves (flag) and refuses again.
 			// The explicit redownload policy remains this actionable error plus
 			// a fresh transfer on retry.
-			d.stopHeartbeat()
 			d.poisonStagingIfOwned()
 			if !removeStagingArtifactsOwned(stg, metaPath) {
 				log.Printf("warning: staging data for %s survived a known-digest mismatch; "+
@@ -2196,11 +2066,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 // checked invariant here and not only an implication of the control flow that
 // reached publish.
 func (d *stagingDownload) publish() error {
-	// A heartbeat failure while finalization is still active is fatal; never
-	// rename a payload whose claim record could no longer be kept fresh.
-	if herr := d.heartbeatError(); herr != nil {
-		return herr
-	}
 	// Publication is gated on the durable known-digest proof. The finalization
 	// path clears ProofPending only after a successful proof; reaching publish
 	// with it still set means the proof was skipped or its clear was not made
@@ -2208,11 +2073,7 @@ func (d *stagingDownload) publish() error {
 	if d.proofPending && d.it.SHA256 != "" && d.cfg.Verify != "none" {
 		return fmt.Errorf("refusing to publish %s: durable known-digest proof is still pending", d.it.RelativePath)
 	}
-	// Stop the heartbeat before taking the metadata gate: the heartbeat
-	// needs that same gate for every record flush, and it must not rewrite the
-	// record after publication. Close before renaming so the unlink-on-rename
-	// also works on Windows.
-	d.stopHeartbeat()
+	// Close before renaming so the unlink-on-rename also works on Windows.
 	if err := d.closeOut(); err != nil {
 		return fmt.Errorf("close staging file %s before publish: %w", d.stg, err)
 	}
@@ -2232,8 +2093,7 @@ func (d *stagingDownload) publish() error {
 	// BEFORE the metadata gate below is acquired, so the gate order stays
 	// metaMu -> metadata gate everywhere (the flush path takes them in that
 	// order) and no inversion is possible. The snapshot cannot be stale: the
-	// range workers have joined and the heartbeat is stopped, so nothing
-	// mutates the layout any more.
+	// range workers have joined, so nothing mutates the layout any more.
 	d.metaMu.Lock()
 	live := append([]RangeProgress(nil), d.ranges...)
 	d.metaMu.Unlock()
