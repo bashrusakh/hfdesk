@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -54,9 +55,17 @@ type branchHubRevision struct {
 	lfs   map[string]hfLfsInfo
 }
 
+// branchHubBodyServer serves the raw bytes of one file. It returns true when
+// it served the response, so the fixture's default one-shot body write is
+// skipped. A test uses it to control when and how a body is delivered.
+type branchHubBodyServer func(w http.ResponseWriter, rel, body string) bool
+
 // fakeBranchVariantHub serves the minimal Hub API used by the downloader:
 // revision metadata, recursive tree listings, and raw file bytes.
-func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision) *httptest.Server {
+//
+// An optional body server replaces the default one-shot body write; without
+// one the fixture serves every file in a single write.
+func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision, bodyServers ...branchHubBodyServer) *httptest.Server {
 	t.Helper()
 	// A real Hub serves a tree or file request addressed by the resolved commit
 	// SHA as readily as one addressed by the branch name. Explicit keys win so a
@@ -132,6 +141,11 @@ func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision) 
 			if !ok {
 				http.NotFound(w, r)
 				return
+			}
+			for _, serve := range bodyServers {
+				if serve(w, parts[1], body) {
+					return
+				}
 			}
 			_, _ = io.WriteString(w, body)
 		default:
@@ -1189,10 +1203,13 @@ func TestBranchVariantManifestDirKeysByRevisionAndCommit(t *testing.T) {
 // TestBranchVariantStagingNameSeparatesCollidingHashlessPaths discriminates
 // defect 5: replacing "/" with "_" made a/b_c and a_b/c share one staging file.
 func TestBranchVariantStagingNameSeparatesCollidingHashlessPaths(t *testing.T) {
-	const commit = "8888888888888888888888888888888888888888"
+	const (
+		revision = "4.00bpw"
+		commit   = "8888888888888888888888888888888888888888"
+	)
 	names := []string{
-		branchVariantStagingName(commit, PlanItem{RelativePath: "a/b_c"}),
-		branchVariantStagingName(commit, PlanItem{RelativePath: "a_b/c"}),
+		branchVariantStagingName(revision, commit, PlanItem{RelativePath: "a/b_c"}),
+		branchVariantStagingName(revision, commit, PlanItem{RelativePath: "a_b/c"}),
 	}
 	if names[0] == names[1] {
 		t.Fatalf("collapsing paths share staging name %q", names[0])
@@ -1212,7 +1229,7 @@ func TestBranchVariantStagingNameSeparatesCollidingHashlessPaths(t *testing.T) {
 	}
 
 	const contentSHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	if got := branchVariantStagingName(commit, PlanItem{RelativePath: "a/b_c", SHA256: contentSHA}); got != "tmp-"+contentSHA {
+	if got := branchVariantStagingName(revision, commit, PlanItem{RelativePath: "a/b_c", SHA256: contentSHA}); got != "tmp-"+contentSHA {
 		t.Errorf("content-addressed staging name = %q, want tmp-%s", got, contentSHA)
 	}
 }
@@ -2976,5 +2993,277 @@ func TestOrdinaryDownloadKeepsLenientSnapshotFailure(t *testing.T) {
 	manifest := readBranchFixtureManifest(t, filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
 	if len(manifest.Files) != 1 || manifest.Files[0].Name != "model.safetensors" {
 		t.Fatalf("ordinary manifest files = %+v", manifest.Files)
+	}
+}
+
+// TestBranchVariantStagingNameSeparatesRevisionsAtOneCommit pins the branch
+// identity in the branch-variant staging name. Two branch variants of one
+// repository can resolve to the same commit — a branch and a tag at one
+// commit, or two EXL branch names at one commit — so the commit and the file
+// path are identical for them and only the revision can tell them apart.
+func TestBranchVariantStagingNameSeparatesRevisionsAtOneCommit(t *testing.T) {
+	const (
+		revA   = "4.00bpw"
+		revB   = "exl/4_25"
+		commit = "9999999999999999999999999999999999999999"
+	)
+	item := PlanItem{RelativePath: "model/config.json"}
+
+	nameA := branchVariantStagingName(revA, commit, item)
+	nameB := branchVariantStagingName(revB, commit, item)
+	if nameA == nameB {
+		t.Fatalf("revisions %q and %q share the staging name %q", revA, revB, nameA)
+	}
+
+	// Deterministic: the same (revision, commit, path) keeps its name, so a
+	// resumed download finds its own partial file.
+	if again := branchVariantStagingName(revA, commit, item); again != nameA {
+		t.Fatalf("staging name is not deterministic: %q then %q", nameA, again)
+	}
+
+	// Distinct relative paths keep distinct names, including the pair that
+	// collapses when "/" is replaced with "_".
+	for _, path := range []string{"a/b_c", "a_b/c", "model/config.json.bak"} {
+		other := branchVariantStagingName(revA, commit, PlanItem{RelativePath: path})
+		if other == nameA {
+			t.Errorf("relative path %q shares the staging name %q", path, nameA)
+		}
+	}
+
+	// The name is one safe path component that SafeJoin can place under the
+	// blobs directory, whatever the revision looks like.
+	blobsDir := t.TempDir()
+	for _, name := range []string{nameA, nameB} {
+		if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) {
+			t.Errorf("staging name %q is not a single path component", name)
+		}
+		if name == "." || name == ".." {
+			t.Errorf("staging name %q is a traversal segment", name)
+		}
+		if !filepath.IsLocal(name) {
+			t.Errorf("staging name %q is not a local path", name)
+		}
+		joined, err := SafeJoin(blobsDir, name)
+		if err != nil {
+			t.Errorf("SafeJoin(%q): %v", name, err)
+			continue
+		}
+		if !PathInside(blobsDir, joined) {
+			t.Errorf("SafeJoin(%q) = %q, outside %q", name, joined, blobsDir)
+		}
+	}
+}
+
+// branchChunkSize and branchChunkDelay shape the fixture's chunked body
+// delivery: the body arrives in pieces, so concurrent jobs hold an open write
+// to their staging file at the same time. The overlap itself is created by
+// the gate, never by this delay.
+const (
+	branchChunkSize  = 8 * 1024
+	branchChunkDelay = 2 * time.Millisecond
+)
+
+// branchGateTimeout bounds how long a request waits at the gate. A job that
+// never asks for the file must fail the test with a clear message instead of
+// blocking the whole run.
+const branchGateTimeout = 20 * time.Second
+
+// branchOverlapGate holds the raw-body responses of a fixture until the
+// expected number of concurrent downloads have asked for the file, so the
+// jobs really write at the same time instead of running one after the other.
+//
+// It also snapshots the blobs directory at the moment the last request
+// arrives: by then every job has created its staging file and no body byte
+// has been released yet, so the snapshot shows exactly the staging files the
+// concurrent jobs used.
+type branchOverlapGate struct {
+	mu          sync.Mutex
+	arrived     int
+	want        int
+	release     chan struct{}
+	releaseOnce sync.Once
+	observed    []string
+	expired     bool
+}
+
+func newBranchOverlapGate(want int) *branchOverlapGate {
+	return &branchOverlapGate{want: want, release: make(chan struct{})}
+}
+
+// enter blocks the calling request until want requests have arrived.
+func (g *branchOverlapGate) enter(blobsDir string) {
+	g.mu.Lock()
+	g.arrived++
+	reached := g.arrived >= g.want
+	if reached {
+		g.observed = branchStagingFiles(blobsDir)
+	}
+	g.mu.Unlock()
+	if reached {
+		g.releaseOnce.Do(func() { close(g.release) })
+	}
+	select {
+	case <-g.release:
+	case <-time.After(branchGateTimeout):
+		g.mu.Lock()
+		g.expired = true
+		g.mu.Unlock()
+	}
+}
+
+// stagingFiles returns the staging file names observed when the last
+// request arrived.
+func (g *branchOverlapGate) stagingFiles() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.observed...)
+}
+
+// timedOut reports whether a request gave up waiting for the other download.
+func (g *branchOverlapGate) timedOut() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.expired
+}
+
+// branchStagingFiles lists the staging files of a blobs directory. A file is
+// staged as "<staging name>.part" while it downloads and renamed to
+// "<staging name>" once its bytes are complete, so both spellings name the
+// same staging file.
+func branchStagingFiles(blobsDir string) []string {
+	entries, err := os.ReadDir(blobsDir)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "tmp-") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(name, ".part"))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// branchFixtureRepoDir returns the cache directory of the fixture repository
+// under a cache root.
+func branchFixtureRepoDir(t *testing.T, cacheRoot string) *RepoDir {
+	t.Helper()
+	cache, err := Settings{CacheDir: cacheRoot}.BuildHFCache()
+	if err != nil {
+		t.Fatalf("build hf cache: %v", err)
+	}
+	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
+	if err != nil {
+		t.Fatalf("repo dir: %v", err)
+	}
+	return repoDir
+}
+
+// TestBranchVariantConcurrentRevisionsAtOneCommitUseSeparateStagingFiles is
+// the end-to-end counterpart of the staging-name unit test: two branch
+// variants of one repository that resolve to the same commit must not share a
+// staging file, even when they download the same hashless path at the same
+// time.
+//
+// The fixture holds both responses until both downloads have asked for the
+// file, so the two jobs really write at the same time. Before the fix both
+// jobs staged into the same file: the loser of the rename race failed the
+// job, and the winner could publish a blob holding the bytes the other job
+// was still writing.
+func TestBranchVariantConcurrentRevisionsAtOneCommitUseSeparateStagingFiles(t *testing.T) {
+	const (
+		revA   = "4.00bpw"
+		revB   = "exl/4_25"
+		commit = "7777777777777777777777777777777777777777"
+		rel    = "weights.bin"
+	)
+	// Both revisions resolve to the same commit, so they carry the same
+	// bytes for the same path.
+	body := strings.Repeat("shared-commit-payload-", 4096)
+	revisions := map[string]branchHubRevision{
+		revA: {sha: commit, files: map[string]string{rel: body}},
+		revB: {sha: commit, files: map[string]string{rel: body}},
+	}
+
+	cacheRoot := t.TempDir()
+	blobsDir := branchFixtureRepoDir(t, cacheRoot).BlobsDir()
+	gate := newBranchOverlapGate(2)
+	hub := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, gotRel, gotBody string) bool {
+		if gotRel != rel {
+			return false
+		}
+		gate.enter(blobsDir)
+		w.Header().Set("Content-Length", strconv.Itoa(len(gotBody)))
+		for off := 0; off < len(gotBody); off += branchChunkSize {
+			end := min(off+branchChunkSize, len(gotBody))
+			if _, err := io.WriteString(w, gotBody[off:end]); err != nil {
+				return true
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(branchChunkDelay)
+		}
+		return true
+	})
+	defer hub.Close()
+
+	cfg := Settings{CacheDir: cacheRoot, Endpoint: hub.URL, Verify: "size", MaxActiveDownloads: 2}
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, revision := range []string{revA, revB} {
+		wg.Add(1)
+		go func(revision string) {
+			defer wg.Done()
+			errs <- Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil)
+		}(revision)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent branch variant download failed: %v", err)
+		}
+	}
+
+	// The two jobs must not have staged into one file.
+	if gate.timedOut() {
+		t.Errorf("the two downloads never overlapped: the gate timed out")
+	}
+	staging := gate.stagingFiles()
+	distinct := make(map[string]bool, len(staging))
+	for _, name := range staging {
+		distinct[name] = true
+	}
+	if len(distinct) != 2 {
+		t.Errorf("the two branch variants used %d staging files (%v), want one each", len(distinct), staging)
+	}
+
+	// The published blob holds the complete body under its own digest, and
+	// the snapshot entry resolves to it.
+	sum := sha256.Sum256([]byte(body))
+	blobPath := filepath.Join(blobsDir, hex.EncodeToString(sum[:]))
+	published, err := os.ReadFile(blobPath)
+	if err != nil {
+		t.Fatalf("published blob %s: %v", blobPath, err)
+	}
+	if string(published) != body {
+		t.Fatalf("published blob holds %d bytes, want %d", len(published), len(body))
+	}
+	snapshot := filepath.Join(branchFixtureRepoDir(t, cacheRoot).SnapshotsDir(), commit, filepath.FromSlash(rel))
+	got, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatalf("snapshot entry %s: %v", snapshot, err)
+	}
+	if string(got) != body {
+		t.Fatalf("snapshot entry holds %d bytes, want %d", len(got), len(body))
+	}
+
+	// No staging file is left behind.
+	if leftover := branchStagingFiles(blobsDir); len(leftover) != 0 {
+		t.Errorf("staging files were left behind: %v", leftover)
 	}
 }

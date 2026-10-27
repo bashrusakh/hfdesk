@@ -615,16 +615,20 @@ LOOP:
 				// Download to temp location, will be moved to blob later.
 				// Use SHA256 as temp name to avoid collisions (e.g., multiple
 				// config.json files). Branch variants additionally hash the
-				// full path and scope it by commit: two variants can be active
-				// at once and may carry identical non-LFS paths with different
-				// bytes, so the legacy tmp-<path> name would let them write the
-				// same staging file. Hashing the path (rather than replacing
-				// "/" with "_") also keeps distinct paths such as a/b_c and
-				// a_b/c from collapsing onto one staging file.
+				// full path and scope it by commit and revision: two variants
+				// can be active at once and may carry identical non-LFS paths
+				// with different bytes, so the legacy tmp-<path> name would
+				// let them write the same staging file. Hashing the path
+				// (rather than replacing "/" with "_") also keeps distinct
+				// paths such as a/b_c and a_b/c from collapsing onto one
+				// staging file. The revision belongs in the scope because two
+				// branch variants can resolve to the same commit — a branch
+				// and a tag at one commit, or two EXL branch names at one
+				// commit — and the commit alone cannot tell them apart.
 				tmpName := "tmp-" + it.SHA256
 				if it.SHA256 == "" {
 					if job.BranchVariant {
-						tmpName = branchVariantStagingName(plan.Commit, it)
+						tmpName = branchVariantStagingName(job.Revision, plan.Commit, it)
 					} else {
 						// Fallback: sanitize path to avoid collisions
 						tmpName = "tmp-" + strings.ReplaceAll(it.RelativePath, "/", "_")
@@ -1013,14 +1017,29 @@ LOOP:
 }
 
 // branchVariantStagingName returns the blobs-directory staging name for one
-// branch-variant file. A content SHA already names the bytes uniquely; without
-// one, derive the name from the full relative path so distinct paths that would
-// collapse under "/"->"_" ("a/b_c" and "a_b/c") keep separate staging files.
-func branchVariantStagingName(commit string, item PlanItem) string {
+// branch-variant file. A content SHA already names the bytes uniquely; a
+// file without one has no such name, so the staging name is derived from the
+// identity of the download: the revision the job reads, the commit that
+// revision resolved to, and the file's full relative path.
+//
+// The revision is folded into the digest rather than inserted into the name:
+// it is remote-controlled, can be long, and can contain a separator (an EXL
+// branch such as "exl/4_25"), so it must not become a path component. The
+// relative path is hashed as well, rather than having "/" replaced with "_",
+// so distinct paths such as a/b_c and a_b/c keep separate staging files.
+//
+// Folding the revision in is what keeps two branch variants of one repository
+// apart when they resolve to the same commit: the commit and the path are
+// identical for them, so without the revision they would share one staging
+// file and write into it concurrently. The result is one hex-only path
+// component (plus the commit, which a branch variant's resolved-commit check
+// has already constrained to a plain name) that SafeJoin can join under
+// blobs/.
+func branchVariantStagingName(revision, commit string, item PlanItem) string {
 	if item.SHA256 != "" {
 		return "tmp-" + item.SHA256
 	}
-	sum := sha256.Sum256([]byte(item.RelativePath))
+	sum := sha256.Sum256([]byte(revision + "\x00" + item.RelativePath))
 	return "tmp-" + commit + "-" + hex.EncodeToString(sum[:])
 }
 
