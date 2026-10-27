@@ -3599,7 +3599,17 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 // HFDESK_TEST_SYSTEMCTL_RESTARTED names a marker file, the supervisor creates it
 // on the first restart and reports HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART
 // from then on. A restart returns as soon as the unit was forked, so a test can
-// drive a restart that is accepted while the unit is dead.
+// drive a restart that is accepted while the unit is dead. When
+// HFDESK_TEST_SYSTEMCTL_RESTART_COUNT names a file, the number of restarts is
+// written to it; the program of the ExecStart property is then reported as
+// HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART from the second restart on, so a
+// test can drive a restart of an update and a restart of a restore that bring
+// different programs into service.
+//
+// The readiness probe is replaced for the run of the test: the fake supervisor
+// forks no instance, so no server of the instance answers on the registered
+// address. A test that drives the probe installs one of its own after this
+// helper returned.
 //
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
@@ -3630,12 +3640,24 @@ show)
 	echo "LoadState=loaded"
 	echo "ActiveState=$active"
 	echo "SubState=$sub"
-	if [ -n "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE" ]; then
-		echo "ExecStart={ path=$HFDESK_TEST_SYSTEMCTL_EXECUTABLE ; argv[]=$HFDESK_TEST_SYSTEMCTL_EXECUTABLE service run ; ignore_errors=no }"
+	exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ "$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")" -ge 2 ]; then
+		exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART"
+	fi
+	if [ -n "$exe" ]; then
+		echo "ExecStart={ path=$exe ; argv[]=$exe service run ; ignore_errors=no }"
 	fi
 	exit 0
 	;;
 restart)
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ]; then
+		count=0
+		if [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ]; then
+			count=$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")
+		fi
+		count=$((count + 1))
+		printf '%s' "$count" > "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" || exit 1
+	fi
 	if [ "$HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE" = "1" ] && [ ! -e "$HFDESK_TEST_SYSTEMCTL_RESTART_MARKER" ]; then
 		: > "$HFDESK_TEST_SYSTEMCTL_RESTART_MARKER"
 		echo "the fake supervisor refuses the restart" >&2
@@ -3654,6 +3676,12 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOG", logPath)
+	// The fake supervisor forks no instance, so the readiness probe of the
+	// service layer is replaced for the run of the test. A test that drives
+	// the probe installs its own after this helper returned.
+	previous := serviceReadinessProbe
+	serviceReadinessProbe = func(string) error { return nil }
+	t.Cleanup(func() { serviceReadinessProbe = previous })
 	return logPath
 }
 
@@ -3924,6 +3952,111 @@ func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 	calls := systemdSupervisorCalls(t, logPath)
 	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
 		t.Errorf("the unit was restarted %d times, want the failed restart and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate checks that a restarted
+// instance counts as verified only when it really serves.
+//
+// The supervisor reports the unit active with the registered program, which is
+// all a Type=simple unit proves: the process was forked. The instance of the
+// test does not answer, the way a process that died on a bind error does not, so
+// the update is a failure: the previous registration is restored and the
+// previous instance is started again, which is verified before it is reported.
+func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The supervisor reports what a restarted simple unit reports: the unit
+	// is active with the program it was started with, and the restart of the
+	// restore brings the previous program back.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART", oldExecutable)
+	m.restartWait = 250 * time.Millisecond
+
+	// The instance of the new registration does not answer: the probe fails
+	// until the restore restarted the previous instance, and the instance of
+	// the restored registration answers.
+	restartCount := filepath.Join(t.TempDir(), "restarts")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", restartCount)
+	serviceReadinessProbe = func(listen string) error {
+		count := 0
+		if content, err := os.ReadFile(restartCount); err == nil {
+			count, _ = strconv.Atoi(strings.TrimSpace(string(content)))
+		}
+		if count < 2 {
+			return errors.New("dial tcp " + probeServiceAddress(listen) + ": connect: connection refused")
+		}
+		return nil
+	}
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the verification of the instance that does not serve")
+	}
+	for _, want := range []string{
+		"does not answer on",
+		previous.Listen,
+		"the previous registration was restored",
+		"the previous instance was started again",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed update and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdVerifiedRestartProbesTheListenAddressOfTheUnit checks that the
+// readiness probe asks the address the registration names.
+//
+// The address is read from the unit that was written, not from the request of
+// the installation: a reinstall keeps the listen address of the registration,
+// and the probe has to reach that instance.
+func TestSystemdVerifiedRestartProbesTheListenAddressOfTheUnit(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, _, _ := systemdExistingInstallation(t, previous)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+	var probed []string
+	serviceReadinessProbe = func(listen string) error {
+		probed = append(probed, listen)
+		return nil
+	}
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+	if len(probed) == 0 {
+		t.Fatal("the readiness probe was never called for a restarted instance")
+	}
+	for _, listen := range probed {
+		if listen != previous.Listen {
+			t.Errorf("the readiness probe asked %q, want the listen address of the registration %q", listen, previous.Listen)
+		}
 	}
 }
 

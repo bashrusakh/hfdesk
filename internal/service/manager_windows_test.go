@@ -720,8 +720,10 @@ func TestSCMLifecycle(t *testing.T) {
 //
 // The check reads the recovery from the service control manager, so it proves
 // what the registration really holds and not what the installation meant to
-// write. The switch for the non-crash failures is part of the check: it stays
-// off, so an explicit stop and a failed start are never turned into a restart.
+// write. The switch for the non-crash failures is part of the policy as well:
+// the handler of the instance reports a failed start, a failed host and a
+// failed stop with an error code, and only the switch makes the platform
+// recover those failures.
 func scmTestCheckRecoveryActions(t *testing.T) {
 	t.Helper()
 	manager, err := mgr.Connect()
@@ -753,8 +755,8 @@ func scmTestCheckRecoveryActions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoveryActionsOnNonCrashFailures() = %v, want nil", err)
 	}
-	if nonCrash {
-		t.Error("the registration restarts the instance on non-crash failures, want the crash recovery only")
+	if !nonCrash {
+		t.Error("the registration recovers a crash only, want the recovery of a non-crash failure as well: an instance that reports its failure has to be restarted")
 	}
 }
 

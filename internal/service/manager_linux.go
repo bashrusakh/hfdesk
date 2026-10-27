@@ -835,7 +835,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		// starting is an explicit, separate command.
 		return nil
 	}
-	if err := m.restartAndVerify(ctx, opts.Executable); err != nil {
+	if err := m.restartAndVerify(ctx, opts.Executable, parseUnit(unit).listen()); err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
 			return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
 		}
@@ -855,9 +855,9 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 // A restart that the supervisor accepted is not a running instance: the
 // supervisor reports a restart of a Type=simple unit as soon as the process was
 // forked, so a unit that dies right away still ends the command with a success.
-// The running state is therefore read back before the restore is reported, and
-// a restart that was issued but not confirmed is returned as an error that says
-// exactly that.
+// The running state and the readiness of the instance are therefore read back
+// before the restore is reported, and a restart that was issued but not
+// confirmed is returned as an error that says exactly that.
 //
 // The restore is best effort and never replaces the original failure: a
 // failed restore is reported with the outcome of the restore, so a caller
@@ -879,8 +879,11 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	}
 	// The restored registration names the program the previous instance ran.
 	// A unit whose command line cannot be read names no program, so the
-	// running state alone is verified then.
-	if err := m.verifyRunningExecutable(cleanup, parseUnit(string(previous.content)).ExecStart); err != nil {
+	// running state alone is verified then. The readiness probe uses the
+	// bind address of the restored unit, which is the address the restored
+	// instance serves on.
+	restored := parseUnit(string(previous.content))
+	if err := m.verifyRunningExecutable(cleanup, restored.ExecStart, restored.listen()); err != nil {
 		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
 	}
 	return nil
@@ -909,16 +912,19 @@ func verifyRestoredUnit(previous previousRegistration) error {
 }
 
 // restartAndVerify restarts the unit and verifies that the supervisor runs the
-// new executable.
+// new executable and that the instance serves on the listen address of the
+// unit.
 //
 // The restart is what switches a running instance to the new program: the
 // unit file was reloaded, but the process that is already running keeps the
-// image it was started from.
-func (m *systemdManager) restartAndVerify(ctx context.Context, executable string) error {
+// image it was started from. The listen address comes from the unit that was
+// written, so the verification probes the address the registration names and
+// not a default of the request.
+func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen string) error {
 	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
 		return fmt.Errorf("service: restart %s: %w", unitName, err)
 	}
-	return m.verifyRunningExecutable(ctx, executable)
+	return m.verifyRunningExecutable(ctx, executable, listen)
 }
 
 // restartPollInterval is the interval between two checks whether a restarted
@@ -939,7 +945,8 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 }
 
 // verifyRunningExecutable waits until the supervisor reports the unit as
-// running with the given program.
+// running with the given program and the instance answers on the listen address
+// of the unit.
 //
 // The check is the effective one for this platform: it asks the supervisor for
 // the state and the ExecStart of the loaded unit. systemctl show reports the
@@ -949,19 +956,31 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // succeeds only when the supervisor reports the reloaded unit active with the
 // new program, after the restart was requested.
 //
-// An empty executable checks the running state alone: a registration whose
-// command line names no program has no program to compare, and the caller then
-// reports the state it observed instead of a program it does not know.
+// The state of the supervisor is not a serving instance either: the unit is of
+// type simple, so the supervisor reports it active as soon as the process was
+// forked, and a process that dies right after, on a bind error for example,
+// is reported active for a moment. The readiness probe therefore has to answer
+// as well, and it asks the instance itself. A probe that does not answer within
+// the wait is a failed verification, exactly like a state that never becomes
+// running, so the caller rolls the installation back instead of reporting an
+// update that left no server behind.
+//
+// An empty executable checks the running state and the probe alone: a
+// registration whose command line names no program has no program to compare,
+// and the caller then reports the state it observed instead of a program it
+// does not know.
 //
 // The wait is bounded by the shutdown budget of the service layer and the
 // context of the installation: an instance that does not come up within it is
 // a failed installation, not a success that is reported from the registration
 // alone.
-func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable string) error {
+func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen string) error {
 	budget := m.restartVerifyWait()
 	deadline := time.Now().Add(budget)
+	address := probeServiceAddress(listen)
 	detail := "the supervisor did not report a state"
 	for {
+		probeFailed := false
 		out, err := m.runSystemctl(ctx, "show", unitName,
 			"--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=ExecStart")
 		if err != nil {
@@ -969,20 +988,38 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 		} else {
 			show := parseSystemdShow(out)
 			path := execStartPath(out)
-			if show.State == StateRunning && (executable == "" || path == executable) {
-				return nil
-			}
-			if executable == "" {
+			programMatches := show.State == StateRunning && (executable == "" || path == executable)
+			switch {
+			case !programMatches && executable == "":
 				detail = fmt.Sprintf("the supervisor reports the state %q", show.State)
-			} else {
+			case !programMatches:
 				detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
+			default:
+				// The supervisor reports the instance the registration
+				// names. The instance itself has to answer before the
+				// start counts: an active unit is a forked process, not
+				// a server.
+				if probeErr := serviceReadinessProbe(listen); probeErr != nil {
+					probeFailed = true
+					if executable == "" {
+						detail = fmt.Sprintf("the supervisor reports the state %q, but the instance does not answer on %s: %v", show.State, address, probeErr)
+					} else {
+						detail = fmt.Sprintf("the supervisor reports the state %q with the program %q, but the instance does not answer on %s: %v", show.State, path, address, probeErr)
+					}
+				} else {
+					return nil
+				}
 			}
 		}
 		if !time.Now().Before(deadline) {
-			if executable == "" {
+			switch {
+			case probeFailed:
+				return fmt.Errorf("the restarted %s does not answer on %s within %s: %s", unitName, address, budget, detail)
+			case executable == "":
 				return fmt.Errorf("the %s is not active within %s: %s", unitName, budget, detail)
+			default:
+				return fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
 			}
-			return fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
 		}
 		select {
 		case <-ctx.Done():

@@ -191,12 +191,17 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // in before. An instance that was stopped, broken or absent, and a first
 // installation, are never started: starting is an explicit, separate command.
 //
-// The registration carries the failure recovery of the platform, so the service
-// control manager restarts an instance that ends without reporting its stop. An
-// explicit stop is never turned into a restart. An installation that finds a
-// recovery policy registered already keeps it, so the settings of the instance
-// and the policy of an administrator survive a reinstall; the policy of HFDesk is
-// configured only for a registration without one.
+// The registration carries the failure recovery of the platform: the service
+// control manager restarts an instance that ends without reporting its stop,
+// and, with the non-crash switch of the recovery policy, an instance that ends
+// with an error code. An explicit stop reports the stopped state with the exit
+// code 0, so it is never turned into a restart. The switch of the policy is
+// documented to take effect at the next start of the machine: the installation
+// writes it and reports the policy it wrote, never a recovery the running
+// system did not perform yet. An installation that finds a recovery policy
+// registered already keeps it, switch included, so the settings of the
+// instance and the policy of an administrator survive a reinstall; the policy
+// of HFDesk is configured only for a registration without one.
 //
 // A failure after the registration was written restores the previous
 // registration. A failure after the restart of a running instance stops the
@@ -1013,23 +1018,31 @@ func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRec
 
 // configureSCMRecovery configures the failure recovery of the registration.
 //
-// The recovery is the crash recovery of the instance and not its lifecycle: the
-// platform performs an action of the list only for an instance that ended without
-// reporting its stop. An explicit stop reports the stopped state, so the platform
-// never turns it into a restart.
+// The recovery is the recovery of a failed instance and not its lifecycle: the
+// platform performs an action of the list for an instance that ended without
+// reporting its stop, and, with the non-crash switch of the registration set,
+// for an instance that reported a non-zero exit code. An explicit stop reports
+// the stopped state with the exit code 0, so the platform never turns it into a
+// restart, whatever the orderly shutdown observed on the way.
 //
-// A registration that carries a recovery policy keeps it: the installation only
-// configures the policy of HFDesk when the registration has none, so a reinstall
-// neither resets the settings of the instance nor the policy of an administrator.
-// A read that fails does not skip the policy of HFDesk: the installation
-// configures it and records why.
+// The non-crash switch is part of the policy of HFDesk and it is set with the
+// actions: the handler of the instance reports a failed start and a failed host
+// with a non-zero exit code, and without the switch the platform would recover a
+// crashed process only and leave a service that reports its own failure stopped.
+// The switch is documented to take effect at the next start of the machine, so
+// an installation reports the policy it wrote and never a restart that the
+// running system did not perform yet.
 //
-// The "restart on non-crash failures" switch of the platform stays off: it would
-// turn the failed start of a misconfigured instance into a restart loop, and a
-// service that cannot start is reported to the user instead.
+// A registration that carries a recovery policy keeps it, and its switch is
+// kept as well: the installation only configures the policy of HFDesk when the
+// registration has none, so a reinstall neither resets the settings of the
+// instance nor the policy of an administrator. A read that fails does not skip
+// the policy of HFDesk: the installation configures it and records why.
 //
 // A recovery that cannot be configured is a failed installation: a service the
-// machine never restarts after a crash is not the instance that was asked for.
+// machine never restarts after a failure is not the instance that was asked
+// for. The actions and the switch are one policy, so a switch that cannot be
+// set fails the installation like the actions do.
 func configureSCMRecovery(handle *mgr.Service) error {
 	existing, err := handle.RecoveryActions()
 	if scmRecoveryDecisionFor(existing, err) == scmRecoveryKeep {
@@ -1041,7 +1054,13 @@ func configureSCMRecovery(handle *mgr.Service) error {
 	} else {
 		log.Printf("service: the registration of %s has no failure recovery, the recovery policy of HFDesk is configured", ServiceName)
 	}
-	return handle.SetRecoveryActions(scmRecoveryActions(), scmRecoveryResetPeriod)
+	if err := handle.SetRecoveryActions(scmRecoveryActions(), scmRecoveryResetPeriod); err != nil {
+		return err
+	}
+	// The switch takes effect at the next start of the machine, which is
+	// documented by the platform: an installation never reports more than
+	// the policy it wrote.
+	return handle.SetRecoveryActionsOnNonCrashFailures(true)
 }
 
 // scmInstallDirs returns the directories an installation creates, in the
