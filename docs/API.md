@@ -737,6 +737,22 @@ POST   /api/jobs/{id}/dismiss
 
 `dismiss` removes terminal jobs from the UI/state. Running or queued jobs must be cancelled first.
 
+A job that reports `completed` means the requested files are present in the
+cache (or at the flat output root) AND reachable at their snapshot/friendly
+paths. A file that another live writer owns is not present, so it is never
+counted as a completed skip: the item waits for that destination (bounded, up
+to five minutes) and then downloads the file or fails with an actionable error.
+Such a job reports `failed`, never `completed` with a missing file. A failed
+link creation fails the affected item the same way, in the transfer path and in
+both skip paths, so a job never reports `completed` with an unreachable path
+either. A disabled friendly view is not an error. Skipped same-SHA items are
+reconciled after all files finish and receive their own snapshot/friendly
+entries. A waiting item does not occupy one of the job's active-download slots,
+so other files proceed even with a low limit. Progress reports distinguish
+transfer, finalizing, completion, skipped, error, and cancellation states, and
+`file_finalizing` is emitted before the pre-publication proof. The detailed
+ownership and resume contract is in `pkg/hfdownloader/doc.go`.
+
 Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
 `outputDir` keeps its existing meaning: the app/friendly root in cache mode,
 or the local output root in flat mode. Jobs and history record both roots;
@@ -765,11 +781,83 @@ Settings include runtime paths, concurrency, verification, endpoint, proxy setti
 
 Download reliability settings:
 
+- `verify` — the post-download verification mode, applied to LFS files as well: `none` performs no post-download content hash (HTTP and ranged-response validation still apply during the transfer); `size` (the default) checks the exact expected size and complete validated transfer coverage on both the multipart and single-request paths and performs no full-file SHA-256 reread on the normal transfer path (the pre-download skip check, an inherited single-path `.part` proof, an unpinned-identity proof, and a known digest with no known expected size may still hash); `sha256` verifies the full file against the known digest with at most one full-file read, always before the destination/blob is published when a known digest exists, so a mismatch never publishes corrupt bytes and the staging data is discarded (a retry re-downloads from scratch); when `sha256` has no known digest, the HEAD-ETag fallback remains a post-publication check; `etag` proves a known SHA-256 digest with that same single pre-publication pass, while non-LFS ETag-only files keep the historical no-post-check behavior. A known digest is never hashed only after publication. Resume state from an older or unsupported format is not migrated: only a valid version-4 ranged record, or a single-request `.part` with a matching pinned identity sidecar, is resumed (an exactly-sized partial is published without a request only when clean response framing is also recorded); the file is otherwise re-downloaded from zero while already-published content is untouched, while an unfenced older/unsupported record that cannot be proven dead is refused as unproven and preserved. The detailed proof and resume rules are in `pkg/hfdownloader/doc.go`.
 - `retries` — the non-progress retry budget per file/part request. A non-truncating attempt that advances the on-disk resume offset strictly beyond the highest offset reached refunds this budget and resets the backoff. For a single-file transfer, a response that ignores Range with `200 OK` restarts the partial and does not refund the budget, even if that attempt writes beyond the previous high-water mark; the new high-water mark is still recorded, so a later bodyless failure earns no refund. Multipart transfers still require `206 Partial Content` and do not accept `200` as a part. Progress refunds can increase the number of retries, but a separate lifetime retry-count ceiling limits retries after individual attempts return. That ceiling does not bound the duration or bytes of a single request that continues delivering data.
 - `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
-- Retry backoff defaults to 400ms initially and 10s maximum. Library callers may override these values; the Settings API does not expose them. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes. Retries include `429` and all `5xx`; other `4xx` responses are terminal for that file, while `401`, `403`, and `404` fail the whole job. Optional verification `HEAD` metadata failures are ignored; the actual file request remains authoritative. Cache storage normally moves a completed temporary file into place by rename. If that rename fails, the fallback copies to a staging file in the destination directory and renames the completed stage into place; this prevents a partial fallback copy from appearing at the final blob path, but does not provide crash durability or rollback guarantees.
+- The obsolete record-age `StaleTimeout` library setting is removed (`Settings.StaleTimeout`, `HFCache.StaleTimeout` and `DefaultStaleTimeout` no longer exist, and the cache constructors no longer take it): ownership is fenced by the destination ownership domain and a record's age never authorizes a takeover, so there is no replacement setting.
+- Retry backoff defaults to 400ms initially and 10s maximum. Library callers may override these values; the Settings API does not expose them. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes. Retries include `429` and all `5xx`; other `4xx` responses are terminal for that file, while `401`, `403`, and `404` fail the whole job with an actionable message (accept the repository terms / use a token with access, or file not found). Optional verification `HEAD` metadata failures are ignored; the actual file request remains authoritative.
+- A completed cache blob is placed with a no-replace primitive, so an existing `blobs/<known-sha>` is not replaced by a domain participant; on a filesystem without hard links the placement is a check-then-rename performed while the blob key's ownership domain is held exclusively. If placement fails (for example a cross-device move), the cache store copies the payload to a staging file in the destination directory under the same domain and renames it into place; that final rename is not a no-replace primitive, and the fallback provides no crash durability or rollback guarantees. A writer that loses the race discards its own staging pair and reports the item complete. Every writer of one blob key, including both transfer routes and the exported `FinalizeBlob`, shares that one domain. The detailed publication tiers are in `pkg/hfdownloader/doc.go`.
 
-A permanent `401`, `403`, or `404` response for a file fails the whole job immediately with an actionable message (accept the repository terms / use a token with access, or file not found). `429` and every `5xx` are retryable. Other `4xx` statuses fail only the affected file and are not retried. Multipart transfers still require `206 Partial Content`; a `200` response to a part-range request is not accepted as a part.
+Multipart transfers write ranged workers directly into one staging file and
+resume from durable per-range metadata, including when the connection count
+changes between runs, so finalization is an atomic rename plus link work, never
+a full-file assembly copy. Never assemble or publish after cancellation or a
+known part error. Resume state is trusted only when it matches the
+resolved commit, repository, path and expected size, is pinned on both sides,
+and tiles the file with normalized completion; a record whose payload is missing
+or resized is discarded rather than published as zeros, and a staging file's
+on-disk length is not completion evidence because staging files are preallocated.
+The transfer is built from that resolved commit (tree walk and per-file URLs);
+when the endpoint resolves no commit, an unpinned identity with a known digest is
+content-proved once before publication. The ranged record is version 4 and is
+the only resumable version. A fenced other-version record (or one whose owner is
+provably dead or is this process) is discarded, never migrated, and the file is
+re-downloaded from zero while already-published content is untouched; an
+unfenced other-version record whose owner cannot be proven dead is refused as
+unproven and preserved. Every pre-#140 `.part-NN`/`.parts.json` family is
+likewise discarded and never migrated. Existing version-4 state keeps the
+multipart route even below the
+configured threshold; without range support the downloader warns, downloads the
+full file through the single path, and removes the obsolete state only after the
+final file is durable. The single-request `.part` is a sequential prefix
+identified by a versioned sidecar; its bytes are inherited only under a matching,
+pinned identity, and an exactly-sized partial is published without a request
+only when clean framing at the exact expected byte count is recorded. Otherwise
+the final byte is re-requested, and a body error during that revalidation leaves
+it uncommitted for a later retry; unknown expected size means no resume. The
+sidecar survives an interrupted run and is removed with its partial. Every 206
+must match the exact requested `Content-Range`, expected total and body length,
+writes are bounded to the requested range, and the file must have exactly the
+expected size before the rename. The multipart route never imports a
+single-route `.part`; a `.part` without a matching identity record is never
+inherited. A durable proof-pending flag forces a re-proof on resume in every
+mode except `none`. If
+an LFS item remains unknown-size after HEAD, Download uses the single-path temp
+and the normal cache-store path, so the blob and its snapshot/friendly entries
+are created from the completed file.
+
+Every destination has ONE ownership domain, acquired once after the skip
+decision and before the HEAD/claim and held through transfer, publication/store
+and cancel cleanup. A live owner is waited for (bounded, context-aware, effective
+five minutes), never skipped and never taken over; when the wait expires the
+item fails with an actionable error and the job does not report success. A
+suspended owner keeps the lock and a crashed owner releases it at death. A writer
+that cannot acquire the domain fails before writing a payload and preserves
+existing partial data. Mixed-version writers from a branch-only build that
+still held the obsolete `<staging>.lock` are unsupported: a fenced (or provably
+dead/self) old/unsupported record is discarded, while an unfenced record whose
+owner cannot be proven dead — of any version — is refused as unproven and
+preserved. In flat mode the persistent
+`<destination>.incomplete.lock` remains next to the model file and is never
+removed; every flat TRANSFER leaves it, even when no multipart transfer ran (a
+destination skipped before the item-level acquisition leaves no lock). A
+waiting writer that obtains the domain downloads a flat destination or an item
+without a known digest itself; only a published content-addressed blob is
+completion proof by existence. Cleanup of a destination's staging
+artifacts, including obsolete pre-#140 parts, runs only while that destination's
+domain is held, so a cancelled job never deletes another live writer's partial.
+A route removes only the artifacts it creates.
+
+An unproven staging record (unfenced, unreadable or unparseable current-format
+state) is preserved, never taken over, and refused with
+`ErrStagingOwnershipUnproven`; the operator removes the staging pair and retries,
+and never removes the persistent domain lock or a pair whose owner is a proven
+live owner. A proven live owner keeps the transient "blob <sha> is being
+downloaded by another process; try again later" message. `CheckBlob` reports
+`BlobDownloading`, `BlobStale`, or `BlobOwnershipUnknown` plus an
+`ErrBlobOwnershipUnknown` error; the incomplete payload is preserved and an
+unknown state is never a successful skip. The exact domain keys, staging names
+and publication tiers are in `pkg/hfdownloader/doc.go`.
 
 Token handling:
 
@@ -860,6 +948,24 @@ DELETE /api/cache-selection
 POST   /api/cache/rebuild
 DELETE /api/cache/{owner}/{repo}?type=model
 ```
+
+Every cache surface separates published content from the downloader's staging
+artifacts with one exhaustive, name-based classification. Staging names include
+the single-request `tmp-<name>` family (with `.part`, `.part.meta` and
+`.lock`), the ranged `<name>.incomplete`/`.meta` pair and its temp, the
+persistent `<name>.lock`, the obsolete pre-#140 `<name>.part-NN` and
+`<name>.parts.json` family, the flat-mode partials, and the cache store's
+`<name>.tmp-<random>` copy temp. A published blob is a canonical 64-hex SHA-256
+name; any other name in `blobs/` is an unusual published name and is treated as
+content. A `blobs/` name that carries a staging shape is treated as a staging
+artifact by every surface, including deletion, even if it was published
+content, so it is never counted, listed as cached content, copied, verified or
+deleted. The exclusion is scoped to `blobs/`: a file outside that namespace
+(for example a snapshot entry named `tokenizer.model.meta`) is content and is
+both copied and verified by the mirror. A blob key that names a staging shape is
+refused before placement by the public storage paths (`StoreDownloadedFile`,
+`FinalizeBlob`), so a successful store always has a reachable result. The
+canonical list and boundary rules are in `pkg/hfdownloader/doc.go`.
 
 `GET /api/cache-selection` returns a read-only, fresh view of GGUF groups for
 the requested repository and explicit repository type. `type` is required and
@@ -1108,6 +1214,20 @@ Mirror operations compare and synchronize selected local H with the explicit
 target root's `hub` child, regardless of local ENV. Mapping, verification, and
 `deleteExtra` remain bounded to those Hub roots. Mirror diff retains `localPath`
 as R and adds local `effectiveHubDir` and `hubDirSource`.
+
+The mirror's scan, copy and verification use the same staging-artifact
+classification as the cache surfaces, scoped to the `blobs/` namespace: a
+staging artifact is never copied, counted or verified, so an unfinished
+download or legacy residue is never published as ready content. Copy and
+verification cover the same set, so a legitimate file outside `blobs/` (a
+snapshot entry named `tokenizer.model.meta`, for example) is copied and
+verified. A published blob is verified by size, a snapshot entry by its link
+target, and an unusual published blob name is copied and verified like any
+other content. The mirror copy is outside the downloader's destination
+ownership domain and uses a non-atomic truncate-and-write with a size-only
+check, so it is not fenced against a concurrent download of the same blob; the
+selected-GGUF delete path also removes blob payloads outside that domain. The
+canonical classification is in `pkg/hfdownloader/doc.go`.
 
 ## History and Disk
 

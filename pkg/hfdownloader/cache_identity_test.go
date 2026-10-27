@@ -39,7 +39,7 @@ func TestHFCacheCapturesHubIdentity(t *testing.T) {
 	r := filepath.Join(t.TempDir(), "hub")
 	h := filepath.Join(t.TempDir(), "exact ' shared")
 	t.Setenv("HF_HUB_CACHE", h)
-	c := NewHFCache(r, 0)
+	c := NewHFCache(r)
 	repo, err := c.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -54,13 +54,13 @@ func TestHFCacheCapturesDefaultRoot(t *testing.T) {
 	r := filepath.Join(t.TempDir(), "home")
 	t.Setenv("HF_HOME", r)
 	t.Setenv("HF_HUB_CACHE", "")
-	c := NewHFCache("", 0)
+	c := NewHFCache("")
 	t.Setenv("HF_HOME", filepath.Join(t.TempDir(), "changed"))
 	t.Setenv("HF_HUB_CACHE", filepath.Join(t.TempDir(), "other"))
 	if c.Root != r || c.HubDir() != filepath.Join(r, "hub") {
 		t.Fatalf("default instance moved: R=%q H=%q", c.Root, c.HubDir())
 	}
-	fresh := NewHFCache("", 0)
+	fresh := NewHFCache("")
 	if fresh.Root == c.Root || fresh.HubDir() == c.HubDir() {
 		t.Fatal("fresh library construction did not resolve current ENV")
 	}
@@ -137,7 +137,7 @@ func TestCacheIdentityCompletedDownload(t *testing.T) {
 		t.Fatalf("rebuilt content=%q %v", got, err)
 	}
 	oldScript, _ := os.ReadFile(filepath.Join(r, "rebuild.sh"))
-	if _, err := NewHFCacheResolved(r, later, 0).WriteRebuildScript(); err != nil {
+	if _, err := NewHFCacheResolved(r, later).WriteRebuildScript(); err != nil {
 		t.Fatal(err)
 	}
 	newScript, _ := os.ReadFile(filepath.Join(r, "rebuild.sh"))
@@ -167,7 +167,7 @@ func TestRebuildScriptDefaultPortability(t *testing.T) {
 	t.Setenv("HF_HUB_CACHE", "")
 	base := t.TempDir()
 	r := filepath.Join(base, "old")
-	c := NewHFCache(r, 0)
+	c := NewHFCache(r)
 	rd, _ := c.Repo("owner/model", RepoTypeModel)
 	if err := rd.EnsureDirs(); err != nil {
 		t.Fatal(err)

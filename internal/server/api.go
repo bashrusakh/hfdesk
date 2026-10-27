@@ -29,6 +29,27 @@ import (
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
 var Version = "dev"
 
+// isBlobStagingArtifactName reports whether a blobs/ directory entry belongs to
+// the download staging family rather than to published content.
+//
+// The shapes are owned by the downloader (hfdownloader.IsStagingArtifactName),
+// which knows every producer it has: the single-request staging name with its
+// partial and identity sidecar, the ranged staging pair with its atomic record
+// temp, the persistent ownership locks, the legacy multipart family and the
+// atomic copy temp. Cache statistics, listings, selections, deletions and
+// mirrors must not count them as cached blobs.
+//
+// The exclusion applies INSIDE blobs/ only. A file outside that namespace - a
+// snapshot entry named "tokenizer.model.meta", for example - is content even
+// when its name has one of these shapes, so the mirror copies AND verifies it.
+//
+// It is a variable so the negative control can install the historical
+// suffix-only predicate and prove that the classification regressions are
+// discriminating.
+var isBlobStagingArtifactName = func(name string) bool {
+	return hfdownloader.IsStagingArtifactName(name)
+}
+
 // effectiveEndpointURL returns the configured Hugging Face endpoint in the
 // normalized form exposed to clients: the public Hub when no custom endpoint is
 // configured, without a trailing slash, and preserving any path prefix (for
@@ -1445,7 +1466,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		var totalSize int64
 		var fileCount int
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				fileCount++
 			}
@@ -1682,7 +1703,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// No snapshots, just count blobs
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				files = append(files, CachedFileInfo{
 					Name:      filepath.Base(path),

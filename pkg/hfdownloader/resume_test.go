@@ -17,6 +17,13 @@ import (
 	"time"
 )
 
+// downloadSingleErr adapts downloadSingle's (contentVerified, error) result to
+// the error-only shape used by goroutine result channels.
+func downloadSingleErr(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts singleOpts, emit func(ProgressEvent)) error {
+	_, err := downloadSingle(ctx, httpc, token, job, cfg, it, dst, opts, emit)
+	return err
+}
+
 // TestDownloadSingle_ResumesFromExistingPartial verifies that when a .part file
 // already exists on disk with partial bytes (e.g. left over from a Ctrl+C'd run),
 // downloadSingle issues a Range request for the remaining bytes instead of
@@ -31,9 +38,15 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst+".part", full[:partialN], 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: false,
 	}
+	// The staged bytes are inherited only when the identity record proves
+	// they belong to this item, so the fixture carries that record.
+	seedSinglePartial(t, dst, full[:partialN], job, it, singleTestIdentity)
 
 	var (
 		mu           sync.Mutex
@@ -60,15 +73,10 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-		AcceptRanges: false,
-	}
+	it.URL = srv.URL + "/test.bin"
 	cfg := Settings{Retries: 0}
 
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -108,9 +116,15 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst+".part", full, 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
 	}
+	// The complete partial is published without a request only when its
+	// identity record proves the bytes belong to this item AND records that
+	// the producing run saw the response body end cleanly at the exact size.
+	seedSinglePartial(t, dst, full, job, it, completeSingleIdentity())
 
 	var requestCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -119,12 +133,8 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	it.URL = srv.URL + "/test.bin"
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -152,10 +162,14 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Pre-seed with garbage partial
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte("x"), partialN), 0o644); err != nil {
-		t.Fatal(err)
+	job := Job{Repo: "o/r"}
+	it := PlanItem{
+		RelativePath: "test.bin",
+		Size:         int64(len(full)),
 	}
+	// Pre-seed with a garbage partial that the identity record ties to this
+	// item, so the ignored-Range restart is what discards it.
+	seedSinglePartial(t, dst, bytes.Repeat([]byte("x"), partialN), job, it, singleTestIdentity)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Intentionally ignore Range header and return 200 with full body.
@@ -165,12 +179,8 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
-		Size:         int64(len(full)),
-	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	it.URL = srv.URL + "/test.bin"
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -183,39 +193,50 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_ResumesPartialPart verifies that when a part file has
-// been partially written (not fully complete, not empty), downloadMultipart
-// resumes from the existing offset via a Range request rather than truncating
-// and restarting. Also verifies that fully-complete parts are skipped.
-func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
+// TestDownloadMultipart_OldMultipartArtifactsAreNotResumed pins the S0
+// behavior: a pre-#140 .part-NN/.parts.json family and a sidecarless
+// single-route .part are old/unsupported formats, so they are neither resumed
+// nor migrated. The file is downloaded from zero (one fresh range layout), the
+// obsolete multipart family is discarded under the claim, the single-route
+// .part is left byte-identically untouched, and the published content is
+// exactly the served payload.
+func TestDownloadMultipart_OldMultipartArtifactsAreNotResumed(t *testing.T) {
 	tmpDir := t.TempDir()
-	// Build a deterministic payload where each byte is its index mod 251.
-	const totalSize = 10000
+	const totalSize = 16000
 	full := make([]byte, totalSize)
 	for i := range full {
 		full[i] = byte(i % 251)
 	}
-	const nParts = 4
-	const partSize = totalSize / nParts // 2500
 
-	dst := filepath.Join(tmpDir, "blobs", "tmp-multi")
+	dst := filepath.Join(tmpDir, "blobs", "tmp-old-family")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Part 0: fully complete
-	if err := os.WriteFile(dst+".part-00", full[0:partSize], 0o644); err != nil {
+	// A structurally valid pre-#140 layout with two fully-sized parts. The
+	// layout is irrelevant now: nothing parses it.
+	const oldParts = 2
+	oldChunk := totalSize / oldParts
+	for i := 0; i < oldParts; i++ {
+		start := i * oldChunk
+		end := start + oldChunk
+		if i == oldParts-1 {
+			end = totalSize
+		}
+		if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, i), full[start:end], 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(multipartLayoutMetaPath(dst), []byte(`{"size":16000,"concurrency":2,"parts":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Part 1: half done (correct prefix)
-	const part1Have = partSize / 2
-	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
+	// The single-request route's own staging file: a sidecarless prefix of
+	// DIFFERENT bytes. The multipart route must neither import it nor remove
+	// it (B1: a route removes only the artifacts it creates).
+	stalePrefix := bytes.Repeat([]byte("x"), 4_000)
+	if err := os.WriteFile(dst+".part", stalePrefix, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(len(full)), nParts, int64(partSize))); err != nil {
-		t.Fatal(err)
-	}
-	// Parts 2, 3: missing
 
 	var (
 		mu        sync.Mutex
@@ -235,132 +256,51 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	defer srv.Close()
 
 	it := PlanItem{
-		RelativePath: "test.bin",
-		URL:          srv.URL + "/test.bin",
+		RelativePath: "old.bin",
+		URL:          srv.URL + "/old.bin",
 		Size:         int64(len(full)),
 		AcceptRanges: true,
 	}
-	cfg := Settings{Concurrency: nParts, Retries: 0}
+	cfg := Settings{Concurrency: 4, Retries: 0, StallTimeout: "0"}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
-	if err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
 	mu.Lock()
 	gotRanges := append([]string(nil), rangeHdrs...)
 	mu.Unlock()
-
-	// Part 0 should never have been requested (fully complete on disk).
-	part0Range := fmt.Sprintf("bytes=0-%d", partSize-1)
-	for _, rh := range gotRanges {
-		if rh == part0Range {
-			t.Errorf("part 0 was re-downloaded (range %q); ranges=%v", part0Range, gotRanges)
-			break
+	// The fresh claim re-downloads the whole file with the configured worker
+	// count; no old-format prefix may contribute a committed byte.
+	wantLayout := buildRangeLayout(int64(len(full)), cfg.Concurrency)
+	if len(gotRanges) != len(wantLayout) {
+		t.Fatalf("payload GET ranges = %v, want one request per fresh range (%d)", gotRanges, len(wantLayout))
+	}
+	for _, r := range wantLayout {
+		want := fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
+		if !containsRange(gotRanges, want) {
+			t.Errorf("payload GET ranges = %v, missing fresh range %q", gotRanges, want)
 		}
 	}
 
-	// Part 1 should have been resumed from part1Have bytes in, not from the part start.
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have, 2*partSize-1)
-	found := false
-	for _, rh := range gotRanges {
-		if rh == wantPart1 {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("part 1 not resumed from offset: wanted %q in ranges=%v", wantPart1, gotRanges)
-	}
+	assertExactFile(t, dst, full)
 
-	// Final file should match.
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
-	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch: len got=%d want=%d", len(got), len(full))
-	}
-	// Part files should have been cleaned up after assembly.
-	for i := 0; i < nParts; i++ {
-		p := fmt.Sprintf("%s.part-%02d", dst, i)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("part file %s should be removed, stat err: %v", p, err)
-		}
-	}
-}
-
-// TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts verifies that part
-// files from a previous run are not reused when the multipart layout changes.
-// Reusing part-XX by index is unsafe because changing the connection count
-// changes each part's byte range; the final file can have the right size but
-// wrong bytes and fail SHA-256 verification.
-func TestDownloadMultipart_ConcurrencyChangeDiscardsOldParts(t *testing.T) {
-	tmpDir := t.TempDir()
-	const totalSize = 16000
-	full := make([]byte, totalSize)
-	for i := range full {
-		full[i] = byte(i % 251)
-	}
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-change-concurrency")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Simulate an interrupted previous run with 8 connections. The next run
-	// below uses 4 connections, so these part files have incompatible ranges.
-	const oldParts = 8
-	oldChunk := totalSize / oldParts
-	for i := 0; i < oldParts; i++ {
-		start := i * oldChunk
-		end := start + oldChunk
-		if i == oldParts-1 {
-			end = totalSize
-		}
-		if err := os.WriteFile(fmt.Sprintf("%s.part-%02d", dst, i), full[start:end], 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-
-	it := PlanItem{
-		RelativePath: "change.bin",
-		URL:          srv.URL + "/change.bin",
-		Size:         int64(len(full)),
-		AcceptRanges: true,
-	}
-	cfg := Settings{Concurrency: 4, Retries: 0}
-
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
-	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch after concurrency change")
-	}
 	parts, err := multipartPartFiles(dst)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(parts) != 0 {
-		t.Errorf("stale part files were not cleaned up: %v", parts)
+		t.Errorf("obsolete pre-#140 part files were not discarded: %v", parts)
 	}
 	if _, err := os.Stat(multipartLayoutMetaPath(dst)); !os.IsNotExist(err) {
-		t.Errorf("multipart layout metadata should be removed after success, stat err: %v", err)
+		t.Errorf("obsolete pre-#140 layout should be discarded after success, stat err: %v", err)
+	}
+	gotPart, err := os.ReadFile(dst + ".part")
+	if err != nil {
+		t.Fatalf("the multipart route removed the single-route .part: %v", err)
+	}
+	if !bytes.Equal(gotPart, stalePrefix) {
+		t.Errorf("the multipart route rewrote the single-route .part: got %d bytes, want %d", len(gotPart), len(stalePrefix))
 	}
 }
 
@@ -405,7 +345,7 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 		mu.Unlock()
 	}
 
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, emit); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), emit); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 

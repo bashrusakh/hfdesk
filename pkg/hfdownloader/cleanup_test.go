@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -339,6 +340,105 @@ func TestCleanupJobPartFiles_LegacyRejectsOutOfRootDst(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("out-of-root path %s should survive cleanup: %v", path, err)
 		}
+	}
+}
+
+// TestCleanupJobPartFiles_HFCacheBlobStaging verifies the derivation that
+// bridges the caller-tracked tmp-<sha> dst and the blob-keyed staging the
+// ranged downloader uses for LFS files (issue #140): cleanup removes
+// blobs/<sha>.incomplete and its .meta for a tracked tmp-<sha> dst, plus
+// the dst-adjacent staging family, while unrelated .incomplete files
+// (other keys, non-canonical names) survive.
+func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
+	cacheDir := t.TempDir()
+	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--repo", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	otherSha := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+	// Artifacts of the tracked dst tmp-<sha> must be removed...
+	tracked := map[string]string{
+		"tmp-" + sha:                      "completed temp window residue",
+		"tmp-" + sha + ".part":            "single-path partial",
+		sha + ".incomplete":               "blob-keyed staging payload",
+		sha + ".incomplete.meta":          "blob-keyed staging metadata",
+		"tmp-" + sha + ".incomplete":      "dst-adjacent staging payload",
+		"tmp-" + sha + ".incomplete.meta": "dst-adjacent staging metadata",
+	}
+	// ...while everything else survives.
+	survive := map[string]string{
+		otherSha + ".incomplete":         "another blob's staging",
+		otherSha + ".incomplete.meta":    "another blob's staging metadata",
+		"other-file.incomplete":          "unrelated incomplete file",
+		"tmp-" + strings.Repeat("x", 64): "non-canonical tmp- name (no blob staging derived)",
+	}
+	for name, body := range tracked {
+		if strings.HasSuffix(name, ".meta") {
+			body = `{"lock_fenced":true}`
+		}
+		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range survive {
+		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The .meta payloads identify current-version, lock-fenced records. A free
+	// OS lock therefore proves the prior writer is gone and permits cleanup.
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	for name := range tracked {
+		if _, err := os.Stat(filepath.Join(blobsDir, name)); !os.IsNotExist(err) {
+			t.Errorf("tracked artifact %q survived cleanup (stat err=%v)", name, err)
+		}
+	}
+	for name := range survive {
+		if _, err := os.Stat(filepath.Join(blobsDir, name)); err != nil {
+			t.Errorf("unrelated file %q was removed by cleanup: %v", name, err)
+		}
+	}
+}
+
+// TestCleanupJobPartFiles_LegacyRangedStaging verifies the legacy (flat
+// output) mode removes the ranged staging family for exactly the tracked
+// dsts: dst+".incomplete" and dst+".incomplete.meta".
+func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "owner", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"model.bin.incomplete":      "A/model.bin staging payload",
+		"model.bin.incomplete.meta": "A/model.bin staging metadata",
+		"weights.bin.incomplete":    "B/weights.bin staging (concurrent job)",
+	}
+	for name, body := range files {
+		if strings.HasSuffix(name, ".meta") {
+			body = `{"lock_fenced":true}`
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A lock-fenced record with a free lifetime lock is safely reclaimable.
+	if err := CleanupJobPartFiles(Settings{OutputDir: tmpDir}, []string{filepath.Join(repoDir, "model.bin")}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model.bin.incomplete")); !os.IsNotExist(err) {
+		t.Error("model.bin.incomplete should be removed")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model.bin.incomplete.meta")); !os.IsNotExist(err) {
+		t.Error("model.bin.incomplete.meta should be removed")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "weights.bin.incomplete")); err != nil {
+		t.Errorf("concurrent job's staging was removed: %v", err)
 	}
 }
 

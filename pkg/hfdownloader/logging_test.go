@@ -103,9 +103,9 @@ func newTestHub(t *testing.T, content []byte) (*httptest.Server, func() []string
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/main":
+		case "/api/models/o/r/tree/abc123":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: int64(len(content))}})
-		case "/o/r/raw/main/config.json":
+		case "/o/r/raw/abc123/config.json":
 			mu.Lock()
 			authSeen = append(authSeen, r.Header.Get("Authorization"))
 			mu.Unlock()
@@ -123,9 +123,9 @@ func newTestHub(t *testing.T, content []byte) (*httptest.Server, func() []string
 }
 
 // TestCleanupWarningReachesPipelineWithDownloadComponent proves that a
-// migrated cleanup warning reaches the application pipeline with the
-// download component and at warning level, and that the downloader no longer
-// writes that message through the standard library logger.
+// cleanup warning reaches the application pipeline with the download
+// component and at warning level, and that the downloader no longer writes
+// that message through the standard library logger.
 //
 // A .part path that is a non-empty directory cannot be removed, so the
 // cleanup reaches the branch that reports a failure it cannot act on.
@@ -248,7 +248,7 @@ func TestDownloadFailureRecordsReachPipeline(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/main":
+		case "/api/models/o/r/tree/abc123":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 7}})
 		default:
 			// A permanent status: the file fails and the job fails with it.
@@ -293,7 +293,7 @@ func TestDownloadCancellationRecordReachesPipeline(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/models/o/r/revision/main":
 			json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-		case "/api/models/o/r/tree/main":
+		case "/api/models/o/r/tree/abc123":
 			json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 7}})
 		default:
 			<-r.Context().Done()

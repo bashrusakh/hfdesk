@@ -15,15 +15,164 @@
 - Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
 - Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
 - Model Details now opens README, lineage, and related-download repository links in-place, with Back/Forward history across models, datasets, and revisions (#135).
+- Opt-in local-I/O benchmark for multipart finalization (`go test -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`) recording total staging bytes written (including the transfer landing on disk), extra local payload writes beyond one file size, full-file hash bytes read, and the network-complete → file-done elapsed time: `Verify=size` shows ≈0×S extra local payload writes and no hash reread, `Verify=sha256` ≈1×S hash read (#140).
 
 ### Changed
 
+- The destination ownership domain is now the ONE ownership fence of every
+  route (#140): an item takes it once, after its pre-download skip decision and
+  before the HEAD/claim, and holds it through the claim, transfer,
+  publication/store and cancel cleanup. The multipart claim trusts the held
+  domain instead of taking a second lock, `CheckBlob` probes the destination
+  domain lock, and the cleanup entry points collapse to one owner-checked
+  removal and one record-checked removal. Every cache destination owns one
+  domain, including digest-less path-derived destinations; a flat destination
+  uses the persistent `<destination>.incomplete.lock` next to the model file.
+  A live owner is waited for (bounded, context-aware, effective five minutes),
+  never skipped or taken over; a writer that cannot acquire the domain fails
+  before writing a payload and preserves existing partial data. The lock file is
+  persistent and is never unlinked. Mixed-version branch-only writers that still
+  held the obsolete `<staging>.lock` are intentionally unsupported: a fenced (or
+  provably dead/self) old/unsupported record is discarded, while an unfenced
+  record whose owner cannot be proven dead, of any version, is refused as
+  unproven and preserved.
+- The exported `(*hfdownloader.RepoDir).CleanupIncomplete` helper has been
+  removed (#140): it deleted a staging payload and its record without the
+  destination ownership domain or a record check, so it could remove another
+  live writer's partial. No in-tree code called it, and cleanup now runs only
+  through the two domain-fenced entry points.
+- Multipart downloads write ranged workers directly into one preallocated
+  staging file at their assigned offsets and resume from durable per-range
+  metadata, so finalization is an atomic rename plus link work, never a
+  full-file assembly copy (#140). A record is trusted only when it matches the
+  resolved commit, repository, path and expected size, is pinned on both sides,
+  tiles the file with normalized completion, and its payload exists at the
+  expected size before any create/truncate; a record whose payload was deleted
+  or resized is discarded rather than published as zeros. The ranged record is
+  version 4 and is the only resumable version; a fenced older/unsupported record
+  (or one whose owner is provably dead or is this process, including a
+  branch-only version-3 record that described imported bytes) is discarded,
+  never migrated, and the file is re-downloaded from zero while already-published
+  content stays untouched, while an unfenced record whose owner cannot be
+  proven dead is refused as unproven and preserved. Every pre-#140
+  `.part-NN`/`.parts.json` family is likewise discarded, never migrated. Existing version-4 state keeps the
+  multipart route for a ranged-capable item even below the configured threshold,
+  so a threshold change does not ignore valid state; an item without usable
+  state keeps the configured routing. Without range support the downloader
+  warns, downloads the full file through the single path, and removes the
+  obsolete versioned pair only after the final file is durable (claim-checked).
+  A staging record is installed as a complete document; hard-link support is not
+  required because an atomic rename is the fallback.
+- The transfer is pinned to the commit the planner resolved (#140): the tree
+  walk and every per-file URL are built from that commit. When the endpoint
+  resolves no commit, the requested revision is used and an unpinned identity
+  with a known digest is content-proved once before publication, on both
+  routes, so a moved branch cannot publish unproven bytes.
+- The single-request path inherits staged bytes only under a proven identity
+  (#140): its versioned sidecar records repository, resolved commit, path,
+  expected size and whether that commit was pinned, and separately whether the
+  producing run observed clean response framing. An exactly-sized partial is
+  published without a request only when the identity matches and clean framing
+  is recorded; otherwise the final byte is reserved and re-requested. A
+  permanent 401/403/404 keeps the sidecar with a non-empty partial, and an
+  oversized partial is discarded rather than clamped. The sidecar is removed
+  only when the partial it describes is actually gone; a stat failure other
+  than not-exist leaves it in place so the bytes keep their resume identity.
+- `Settings.Verify` now controls LFS verification too (#140): `none` performs
+  no post-download content hash; `size` (the default) checks exact expected
+  size and complete validated transfer coverage on both paths and performs no
+  full-file SHA-256 reread on the normal path; `sha256` verifies with at most
+  one full-file read, always before publication when a known digest exists;
+  `etag` proves a known digest with that same single pre-publication pass while
+  non-LFS ETag-only files keep the historical no-post-check behavior. A known
+  digest is never hashed only after publication. A durable `ProofPending` flag
+  forces a re-proof on resume in every mode except `none`, so a crash mid-proof
+  or a later mode change cannot publish unproven ranges.
+- The mirror writer's non-atomic, size-only blob copy and the selected-GGUF
+  delete path remain the documented writers outside the destination ownership
+  domain, so the downloader's publication invariant does not depend on their
+  behavior (#140).
 - `hfdownloader.PlanRepo` and `hfdownloader.Download` now reject a path-shaped filter combined with `AppendFilterSubdir` (typed `ErrAppendFilterSubdirPathFilter`) before any network or plan work: only single-component group/token filters can name a destination subdirectory. Path filters remain valid with `AppendFilterSubdir` disabled.
 - README rendering and Hugging Face repository-link classification now have a single Go implementation: the bundled UI renders the server-sanitized `html` from `GET /api/readme` and no longer carries a client Markdown renderer or duplicate URL classifier (#135, #147).
 - Remote repository tree paths must now use their canonical spelling: a raw path whose `path.Clean` form differs (for example a `./` segment, duplicate slash, or trailing slash) fails planning with a non-canonical-path error instead of being normalized, so two spellings of one remote file cannot both be planned and race to write a single cache entry.
 
+### Removed
+
+- The obsolete stale-timeout configuration was removed with the age-based
+  ownership lease (#140): `hfdownloader.Settings.StaleTimeout`,
+  `hfdownloader.HFCache.StaleTimeout`, `hfdownloader.DefaultStaleTimeout` and
+  the third `staleTimeout` argument of `NewHFCache`/`NewHFCacheResolved` no
+  longer exist. Ownership is fenced by the destination's persistent ownership
+  domain, with `LockFenced` describing the record written under it, and record
+  age never authorizes a takeover; there is no compatibility shim or
+  replacement setting.
+- The diagnostic-only staging-record heartbeat was removed (#140). The record
+  is not rewritten on a timer; it is diagnostics/resume state, not a
+  freshness-based lease, and only the destination domain plus `LockFenced`
+  determines ownership.
+
 ### Fixed
 
+- A download job no longer reports success while a requested file is missing
+  because another writer owns it (#140): `completed` now means the file is
+  present and reachable at its snapshot/friendly path. The item waits for a
+  proven live owner (bounded, effective five minutes) and re-checks the
+  published content-addressed blob, downloads the file itself when the owner
+  released the domain without publishing, or fails with the actionable
+  live-owner error. A path-derived destination always re-downloads after the
+  wait. A waiting item no longer occupies a `MaxActiveDownloads` slot, so other
+  files of the job proceed even with a low limit. A link-creation failure now
+  fails the item in both transfer and skip paths with
+  `ErrCacheLinkUnreachable`, and the end-of-job link reconciliation reports a
+  job error, so a job cannot finish successful with a missing path; a disabled
+  friendly view is not an error.
+- The ranged publication now asserts two independent gates: a complete range
+  layout (every range `Done` and the committed total equal to the expected
+  size, in both the live and persisted layout) and the exact payload length
+  after the handle is flushed. A failure renames nothing and leaves the staged
+  bytes for a resume. A content-addressed blob is placed with a no-replace
+  primitive: atomic hard-link on filesystems that support it,
+  domain-exclusive check-then-rename otherwise. `FinalizeBlob` now uses that
+  same primitive and domain instead of renaming over a published blob, and a
+  writer that loses the race discards its own staging pair.
+- A staging record whose owner cannot be proven alive or dead is no longer
+  reported as "another live writer" (#140). Such a record (unfenced, unreadable
+  or unparseable current-format state) is preserved and refused with
+  `ErrStagingOwnershipUnproven`; the operator removes the staging pair and
+  retries, and never removes the persistent domain lock or a pair whose owner
+  is a proven live owner. `CheckBlob` now distinguishes `BlobDownloading` for a
+  proven live owner, `BlobStale` for a provably dead one, and
+  `BlobOwnershipUnknown` plus an `ErrBlobOwnershipUnknown` error for an unknown
+  state; the incomplete payload is preserved and an unknown state is never a
+  successful skip.
+- Cache surfaces and the mirror now separate published content from staging
+  artifacts with one exhaustive name-shape classification (#140): the
+  single-request `tmp-<name>` family, the ranged `.incomplete`/`.meta` pair and
+  temp, persistent `.lock`, obsolete pre-#140 `.part-NN`/`.parts.json`,
+  flat-mode partials and the cache store's `.tmp-<random>` copy temp are never
+  counted, listed as cached content, copied, verified or deleted, even when a
+  published name carries such a shape. Unusual non-canonical published names
+  remain content. A blob key whose name belongs to the staging namespace is
+  refused by `StoreDownloadedFile` and `FinalizeBlob` before placement.
+- Cleanup now participates in the destination ownership protocol (#140):
+  staging artifacts, including obsolete pre-#140 parts, are removed only while
+  the destination's domain is held, so cancelling a job no longer deletes
+  another live job's partial. The entry points collapse to one owner-checked
+  removal and one record-checked removal. A route removes only the artifacts it
+  creates: the multipart HEAD failure no longer removes a single-route
+  `.part`/sidecar.
+- An explicit cancel during the single-path known-digest proof now closes the
+  partial's writable handle before cleanup, so Windows does not retain the
+  cancelled `.part` and its sidecar; pause/internal aborts still preserve
+  resumable state. Unknown-size LFS items that fall back from multipart to the
+  single path are stored through the cache store, creating the blob and its
+  snapshot/friendly entries.
+- A shared staging mutation now requires the supported lifetime OS lock:
+  unsupported, denied or failed acquisition returns an operation error before
+  claim/payload mutation and preserves partial data; there is no lease-only
+  fallback. Unfenced records are retained unless same-host owner death is
+  proven, and cancellation while waiting to publish is observed before the
+  rename.
 - A proxy URL without a host leaked its password: a proxy URL of the shape `http://user:password` is read by a parser as the host `user` with the port `password`, and the parse failure of that URL quotes the port, so the reason of a proxy configuration failure carried the proxy password into the log records and into the error response of `GET /api/search`, which is not served to loopback clients only. The reason of a proxy failure now names the cause of the failure without quoting any part of the URL that could be a credential, and the human readable proxy description drops the userinfo of the URL and the separately configured credentials as well. A normal proxy URL still reports its host and its port, so a misconfiguration stays visible (#141).
 - Cache selection now exposes a downloaded mmproj companion as its own deletable group instead of dropping it from the selectable model: `GET /api/cache-selection` reports a group `kind` of `llm` or `vision_encoder`, a companion group carries an `mmproj-` group id and no model-quantization label, and the Model Details view renders a distinct "Vision encoder" badge with its own Delete action. The delete confirmation names the vision-encoder role in both the local and the HF case and never claims the selected artifact class remains. Deleting a companion removes only that companion, deleting an LLM group never removes a companion, coexisting F16/BF16/F32 companions stay independently selectable and deletable, and the existing writer, snapshot, and identity-pinning protections still apply (#138).
 - The artifact-role rule for multimodal projector companions now has a single owner in `pkg/smartdl` (`IsMMProjFile`, the previously unexported helper), which the download picker, the cache metadata, and the cache-selection model all use. The rule is a case-insensitive "mmproj" match anywhere in the file's basename, so a dot-separated companion (`model.mmproj-f16.gguf`) and a name that merely starts with "mmproj" (`mmprojector-f16.gguf`) are both companions. `GET /api/cache/{owner}/{repo}` therefore reports a dot-separated companion under `hasMMProj`/`mmprojFiles` instead of listing it as an `F16` quantization, and a repository whose only companion is dot-separated now also reports the `vision` capability; the cache selection reports a companion as a `vision_encoder` group instead of a model quantization (#138).

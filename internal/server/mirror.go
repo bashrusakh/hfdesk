@@ -470,7 +470,7 @@ func scanHubForMirror(hubDir string) ([]mirrorEntry, error) {
 		blobsDir := filepath.Join(hubDir, name, "blobs")
 		var totalSize int64
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 			}
 			return nil
@@ -661,7 +661,20 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			return err
 		}
 
-		dst := filepath.Join(dstPath, rel)
+		// Guard: SafeJoin so the walked repository-relative path cannot escape
+		// the destination repository. SafeJoin's filepath.IsLocal check also
+		// makes this barrier visible to CodeQL's go/path-injection analysis.
+		// The symlinked-parent check below still applies: SafeJoin is lexical
+		// and does not see symlinks.
+		dst, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
+		// Staging payloads, records, their atomic-write temp and ownership lock
+		// files are not stored content; mirrors copy only finished blobs.
+		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
 		// Existing destination directory links must never redirect writes
 		// outside the selected repository/Hub. Snapshot leaf links are replaced
 		// below, but their parents must be real directories.
@@ -692,6 +705,8 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
 			os.Remove(dst)
+			// The link target is contained: an absolute target is rejected and the resolved target must stay inside repoPath.
+			// lgtm[go/path-injection]
 			return os.Symlink(link, dst)
 		}
 
@@ -729,16 +744,30 @@ func copyFileForMirror(src, dst string) error {
 	return out.Close()
 }
 
+// mirrorVerifyCoversEntry reports whether the mirror verification covers the
+// repository-relative entry. The production path covers every entry the copy
+// produces, so copy and verify always agree on the same set. It is a variable
+// so the negative control can install the historical blobs/-only scope and
+// prove that the copy/verify agreement regression is discriminating.
+var mirrorVerifyCoversEntry = func(rel string) bool { return true }
+
 // verifyRepoCache verifies that a copied repo matches the source.
+//
+// It verifies exactly the set the copy produces: every file of the repository
+// except the downloader staging artifacts INSIDE blobs/. The exclusion is
+// scoped to that namespace, so copy and verify always agree on the same set
+// and a legitimate file outside it - a snapshot entry named
+// "tokenizer.model.meta", for example - is copied AND verified.
+//
+// A snapshot entry is a link, and the copy reproduces the link, so the link
+// target is what has to match; a regular file is compared by size.
 func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
 	}
 
-	blobsDir := filepath.Join(repoPath, "blobs")
-
-	return filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -750,8 +779,47 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return err
 		}
+		// Staging artifacts are not copied content and have no destination to
+		// verify. The exclusion is scoped to blobs/, exactly like the copy's.
+		if filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
+		if !mirrorVerifyCoversEntry(rel) {
+			return nil
+		}
 
-		dstFile := filepath.Join(dstPath, rel)
+		// Guard: SafeJoin so the walked repository-relative path cannot escape
+		// the destination repository. SafeJoin's filepath.IsLocal check also
+		// makes this barrier visible to CodeQL's go/path-injection analysis.
+		dstFile, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			// A snapshot entry is a link and the copy reproduces the link, so
+			// the link target is what has to match. Only the parent chain is
+			// confined: the leaf IS the link.
+			if err := mirrorNoSymlinkPath(srcCache, filepath.Dir(path)); err != nil {
+				return err
+			}
+			if err := mirrorNoSymlinkPath(dstCache, filepath.Dir(dstFile)); err != nil {
+				return err
+			}
+			want, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			got, err := os.Readlink(dstFile)
+			if err != nil {
+				return fmt.Errorf("missing link %s: %w", rel, err)
+			}
+			if got != want {
+				return fmt.Errorf("link mismatch for %s: src=%s dst=%s", rel, want, got)
+			}
+			return nil
+		}
+
 		if err := mirrorNoSymlinkPath(srcCache, path); err != nil {
 			return err
 		}
@@ -760,13 +828,11 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 		dstInfo, err := os.Stat(dstFile)
 		if err != nil {
-			return fmt.Errorf("missing blob %s: %w", rel, err)
+			return fmt.Errorf("missing file %s: %w", rel, err)
 		}
-
 		if dstInfo.Size() != info.Size() {
 			return fmt.Errorf("size mismatch for %s: src=%d dst=%d", rel, info.Size(), dstInfo.Size())
 		}
-
 		return nil
 	})
 }
@@ -841,7 +907,7 @@ func countBlobs(repoPath string) int {
 	blobsDir := filepath.Join(repoPath, "blobs")
 	count := 0
 	filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
+		if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 			count++
 		}
 		return nil

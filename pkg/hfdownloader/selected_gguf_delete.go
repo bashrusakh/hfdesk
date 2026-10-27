@@ -116,41 +116,18 @@ func safeDirectoryChain(name string) error {
 	return nil
 }
 
+// isIncompleteBlobPath reports whether a blob path names a downloader staging
+// artifact rather than a deletable published blob.
+//
+// The decision is the shared, exhaustive staging-shape classification (see
+// staging_names.go): every producer shape the downloader creates - the
+// single-request staging name and its partial and identity sidecar, the
+// ranged staging pair and its atomic record temp, the persistent ownership
+// locks, the legacy multipart family and the atomic copy temp - is refused.
+// A published blob whose name is not one of those shapes stays deletable,
+// exactly like the reserved-collision rule refuses the producer namespace.
 func (r *RepoDir) isIncompleteBlobPath(name string) bool {
-	base := filepath.Base(name)
-	trimSuffix := strings.TrimSuffix
-	pathEqual := func(a, b string) bool { return a == b }
-	if runtime.GOOS == "windows" {
-		trimSuffix = func(s, suffix string) string {
-			if len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix) {
-				return s[:len(s)-len(suffix)]
-			}
-			return s
-		}
-		pathEqual = strings.EqualFold
-	}
-	if sha := trimSuffix(base, ".incomplete.meta"); sha != base && pathEqual(name, r.IncompleteMetaPath(sha)) {
-		return true
-	}
-	sha := trimSuffix(base, ".incomplete")
-	if sha != base && pathEqual(name, r.IncompletePath(sha)) {
-		return true
-	}
-	// The downloader's verification/transfer destination is blobs/tmp-<sha-or-
-	// path>, with single-part and multipart artifacts appended to that name.
-	// Separately, StoreDownloadedFile's atomic-copy fallback stages beside the
-	// final blob as <key>.tmp-<CreateTemp random string>. Keep both producer
-	// namespaces anchored; ordinary completed names with unrelated suffixes
-	// remain eligible.
-	stagingPrefix := "tmp-"
-	startsWithStagingPrefix := strings.HasPrefix(base, stagingPrefix)
-	if runtime.GOOS == "windows" {
-		startsWithStagingPrefix = len(base) >= len(stagingPrefix) && strings.EqualFold(base[:len(stagingPrefix)], stagingPrefix)
-	}
-	if startsWithStagingPrefix && len(base) > len(stagingPrefix) {
-		return true
-	}
-	return isAtomicCopyStagingName(base, runtime.GOOS == "windows")
+	return IsStagingArtifactName(filepath.Base(name))
 }
 
 func isAtomicCopyStagingName(base string, windows bool) bool {
