@@ -303,14 +303,16 @@ type IncompleteMeta struct {
 	// liveness check of PID; an empty or different host disables PID-based
 	// liveness, so the owner cannot be proven dead.
 	Host string `json:"host,omitempty"`
-	// LockFenced records that this claim was made while holding the OS-level
-	// staging ownership lock (the persistent <staging>.lock). On a platform
+	// LockFenced records that this claim was made while holding the
+	// destination's ownership domain: the OS-level exclusive lock on the
+	// persistent domain lock (blobs/tmp-<name>.lock for a cache destination,
+	// <destination>.incomplete.lock for a flat/output-mode one). On a platform
 	// that supports the lock, its state is then authoritative for CheckBlob:
 	// busy means a live writer, and a free lock means the owner crashed or
 	// released the claim, so the record is stale and take-over-able regardless
-	// of PID reuse or record age. Records written on a fallback
-	// platform (or by an older version) carry false and are protected unless
-	// same-host owner death is proven.
+	// of PID reuse or record age. Records written on a fallback platform (or by
+	// an older version) carry false: they are protected unless same-host owner
+	// death is proven, and a free domain lock never makes them stale.
 	LockFenced bool `json:"lock_fenced,omitempty"`
 	// Version is 0 for pre-range records and 4 for the ranged staging records
 	// written by this downloader. Only version 4 is resumable: every other
@@ -328,12 +330,9 @@ type IncompleteMeta struct {
 	// planner's fallback to the requested revision) pins nothing, so the
 	// record is inheritable only when the flag is set here AND on the
 	// current plan.
-	Repo string `json:"repo,omitempty"`
-	// Revision is a legacy advisory field written by earlier records. It is
-	// not part of the resume identity (the resolved Commit is).
-	Revision string `json:"revision,omitempty"`
-	Commit   string `json:"commit,omitempty"`
-	Path     string `json:"path,omitempty"`
+	Repo   string `json:"repo,omitempty"`
+	Commit string `json:"commit,omitempty"`
+	Path   string `json:"path,omitempty"`
 	// CommitPinned records whether Commit is a RESOLVED, immutable commit
 	// identity rather than the planner's fallback to the requested revision.
 	// An unpinned identity pins nothing: the branch may have moved, so the
@@ -385,7 +384,13 @@ const (
 	// BlobComplete means the blob exists and is complete.
 	BlobComplete
 
-	// BlobDownloading means another process is currently downloading this blob.
+	// BlobDownloading means the blob is not available and its state is not
+	// stale. In the proven case a live owner - another process, or another
+	// writer of this one - holds the destination's ownership domain, so the
+	// file is not present and the caller must not skip the item. A free domain
+	// lock plus an UNFENCED record is conservatively reported as downloading
+	// too: no live owner is proven there, but the record is not provably stale
+	// either, so the claim refuses it as unproven instead of taking it over.
 	BlobDownloading
 
 	// BlobStale means an incomplete download exists but is stale (can be taken over).

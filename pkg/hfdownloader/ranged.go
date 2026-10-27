@@ -36,21 +36,25 @@ package hfdownloader
 // re-downloaded; it is never allowed to publish a preallocated zero file.
 //
 // Ownership rests on the per-process instance token for identity and one
-// exclusion fence. The staging record is diagnostics/resume state, not a
-// freshness-based ownership lease. The fence is an OS-level exclusive lock on
-// the persistent sibling file <staging>.lock, acquired before the claim
-// transition and held for the whole ownership interval — claim read,
-// create/resume, transfer, hash, publish/cleanup. A busy lock means a live
-// owner, including a suspended process that could still resume writing
-// through an open handle; a crashed process releases the lock at death, so
-// takeover/resume is immediate. Every record transition — claim, take-over,
-// checkpoint, removal — uses the per-path in-process metadata gate; the
-// lifetime OS lock excludes every current-version foreign mutator. There is no
-// lease-only mutation fallback: unsupported or failed lock acquisition
-// returns an operation error before claim/payload mutation. A legacy record
-// without LockFenced remains protected unless same-host owner death is proven.
-// Publish re-checks the record under the metadata gate and verifies the held OS
-// lock before rename; a missing or foreign record returns errStagingClaimLost.
+// exclusion fence: the DESTINATION's ownership domain. Its OS-level exclusive
+// lock is the persistent domain lock — blobs/tmp-<name>.lock for a cache
+// destination, <destination>.incomplete.lock for a flat/output-mode one — and
+// the domain is acquired ONCE at item level, after the pre-download skip
+// decision and before the HEAD/claim. It is held for the whole ownership
+// interval: claim read, create/resume, transfer, hash, publish/cleanup. A busy
+// lock means a live owner, including a suspended process that could still
+// resume writing through an open handle; a crashed process releases the lock
+// at death, so takeover/resume is immediate. The claim takes no second OS lock:
+// it receives the held domain and fails closed unless that domain covers its
+// staging path. Every record transition — claim, take-over, checkpoint,
+// removal — uses the per-path in-process metadata gate, which serializes
+// intra-item transitions only: while the domain is held no other
+// current-version writer of this destination exists. There is no lease-only
+// mutation fallback: a domain that cannot be acquired returns an operation
+// error before claim/payload mutation. A legacy record without LockFenced
+// remains protected unless same-host owner death is proven. Publish re-checks
+// the record under the metadata gate and verifies that the domain is still held
+// before the rename; a missing or foreign record returns errStagingClaimLost.
 //
 // Completion is content-addressed: only a publish target whose name IS the
 // known blob digest proves the transfer is complete. An arbitrary destination

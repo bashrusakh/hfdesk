@@ -10,9 +10,11 @@ package hfdownloader
 // long as its process and open handle live, regardless of record age.
 //
 // This file adds the long-lived exclusivity primitive: an OS-level exclusive
-// lock on the persistent sibling file "<staging>.lock", acquired before the
-// claim transition and held through transfer, hashing and publish/cleanup. A
-// busy lock means a live owner. The kernel releases it when the process exits
+// lock on the persistent destination-domain lock file — blobs/tmp-<name>.lock
+// for a cache destination, <destination>.incomplete.lock for a flat/output-mode
+// one — acquired ONCE at item level before the HEAD/claim and held through the
+// claim, transfer, hashing, publication, store and cancel cleanup. A busy lock
+// means a live owner. The kernel releases it when the process exits
 // or the handle is closed, so a crash is recoverable immediately, while a
 // suspended (but alive) process keeps ownership — the documented tradeoff:
 // there is no takeover while the owner is alive; terminate it to recover.
@@ -155,19 +157,13 @@ func acquireStagingOwnershipLock(staging string) (*stagingOwnershipLock, error) 
 // relying on root-sensitive filesystem permissions.
 var stagingOwnershipAcquire = acquireStagingOwnershipLock
 
-// stagingOwnershipAcquireWait bounds how long a claimant waits for a
-// contended ownership lock before it must decide what the contention meant.
-//
-// The wait exists because the lock file serves two purposes: a real writer
-// holds it exclusively, and a read-only status probe touches it briefly. A
-// non-owning observation tells the claimant whether an EXCLUSIVE holder
-// exists, but a reader may still be mid-probe when the claimant looks, so the
-// claimant waits for the reader to finish instead of deciding from a single
-// observation.
-//
-// The bound is short and finite: a suspended owner keeps the lock
-// indefinitely, so waiting forever would hang the download instead of
-// reporting a usable outcome.
+// stagingOwnershipAcquireWait is the historical acquisition window the
+// destination-domain wait budget is derived from. No production acquisition is
+// bounded by it directly any more: the download path waits for a PROVEN live
+// owner within blobOwnershipWaitBudget (a multiple of this value) and the
+// cleanup path within stagingLockCleanupWait. Keeping the unit named preserves
+// the documented derivation of the 5-minute budget instead of replacing it with
+// an unexplained constant.
 var stagingOwnershipAcquireWait = 5 * time.Second
 
 // stagingOwnershipRetryDelay is the pause between two acquisition attempts

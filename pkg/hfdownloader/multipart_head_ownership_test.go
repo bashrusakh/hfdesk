@@ -6,22 +6,28 @@ package hfdownloader
 // Cross-route artifact ownership at the MULTIPART HEAD fail-fast.
 //
 // downloadMultipart stages at <staging>.incomplete and creates no `.part` of
-// its own, and in flat/output mode the destination's ownership domain is taken
-// at the Download level only for the route that does not take it internally.
-// A multipart item therefore performs its HEAD holding nothing, so a permanent
-// (401/403/404) HEAD response must not touch the single-request route's
-// `<dst>.part` and `<dst>.part.meta`: those artifacts belong to another route
-// (possibly a LIVE writer of it) or to an earlier run. Unlinking them would
-// remove a live writer's open partial, whose later publication then fails with
-// ENOENT, and would let one route delete another route's resume state.
+// its own. In flat/output mode the destination's ownership domain is taken at
+// item level before the HEAD, so the multipart HEAD no longer runs unowned: a
+// concurrent single-route writer of the same destination excludes it, and the
+// multipart writer waits for the domain instead of reaching its HEAD.
+//
+// That fence does not make the OTHER route's staging the multipart route's
+// own, though. A permanent (401/403/404) HEAD response must still not touch the
+// single-request route's `<dst>.part` and `<dst>.part.meta`: those artifacts
+// belong to another route (possibly a LIVE writer of it) or to an earlier run.
+// Unlinking them would remove a live writer's open partial, whose later
+// publication then fails with ENOENT, and would let one route delete another
+// route's resume state.
 //
 // The cases below drive the real Download path. The first pre-creates the pair
-// and asserts it survives the fail-fast byte-identically. The second keeps a
-// live single-route writer blocked INSIDE its payload GET (so its `.part` is
-// still empty and its sidecar already written), fails a second, multipart
-// writer of the same destination on HEAD, and then releases the first writer:
-// it must publish its own bytes, which is only possible when its staging inode
-// was never unlinked.
+// while the domain is free and asserts it survives the fail-fast
+// byte-identically. The second keeps a live single-route writer blocked INSIDE
+// its payload GET (so its `.part` is still empty and its sidecar already
+// written) and starts a second, multipart writer of the same destination: it
+// must wait for the domain - running no HEAD and touching nothing - and may
+// run its own permanent-404 HEAD only after the first writer releases the
+// domain. The released first writer must publish its own bytes, which is only
+// possible when its staging inode was never unlinked.
 
 import (
 	"bytes"

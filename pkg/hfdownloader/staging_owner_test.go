@@ -294,9 +294,8 @@ func TestStagingMetaResumableIdentity(t *testing.T) {
 		{name: "one-sided record SHA", mutate: func(m *IncompleteMeta) { m.SHA256 = "" }, item: it, commit: "commit-a", pinned: true},
 		{name: "one-sided item SHA", mutate: func(m *IncompleteMeta) {}, item: PlanItem{RelativePath: "x.bin", Size: size}, commit: "commit-a", pinned: true},
 		{name: "different SHA", mutate: func(m *IncompleteMeta) { m.SHA256 = shaB }, item: it, commit: "commit-a", pinned: true},
-		{name: "legacy revision does not substitute for commit", mutate: func(m *IncompleteMeta) {
+		{name: "empty record commit does not fall back to the requested revision", mutate: func(m *IncompleteMeta) {
 			m.Commit = ""
-			m.Revision = "main"
 		}, item: it, commit: "main", pinned: true},
 		// The pinned rule: an unpinned identity names a revision whose
 		// content may have moved, so it inherits nothing.

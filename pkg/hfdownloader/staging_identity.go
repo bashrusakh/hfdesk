@@ -67,8 +67,8 @@ func newRandomToken() string {
 
 // stagingOwnerIsSelf reports whether the record belongs to this exact process
 // instance. A matching token means an earlier run of this process wrote the
-// record; the in-process staging registry, not the PID, distinguishes that
-// case from a currently running goroutine.
+// record; the per-process instance token, not the PID, distinguishes that case
+// from a different process instance that happens to report the same PID.
 func stagingOwnerIsSelf(meta *IncompleteMeta) bool {
 	return meta != nil && meta.Instance != "" && meta.Instance == processInstanceToken
 }

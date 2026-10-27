@@ -79,13 +79,14 @@ import (
 // blobOwnershipWaitBudget bounds how long a writer waits for a PROVEN live
 // owner of a blob key to release it.
 //
-// The budget reuses the existing ownership-lock convention: ONE acquisition
-// attempt is bounded by stagingOwnershipAcquireWait (5s - long enough for a
-// status probe to finish, short enough not to stall a download), while a live
-// owner is transferring a file and may hold the key for minutes. The budget is
-// therefore a multiple of that window, and it is FINITE: a suspended owner
-// keeps the lock for as long as its process lives, so the wait has to end in
-// an actionable error instead of blocking the job forever.
+// The budget is DERIVED from stagingOwnershipAcquireWait, the historical 5s
+// acquisition window (long enough for a status probe to finish, short enough
+// not to stall a download). No production acquisition is bounded by that window
+// any more; it remains the named unit of the convention, so the budget stays a
+// multiple of it: a live owner is transferring a file and may hold the key for
+// minutes. The budget is FINITE: a suspended owner keeps the lock for as long
+// as its process lives, so the wait has to end in an actionable error instead
+// of blocking the job forever.
 //
 // It is a package-level knob, not a user setting: the wait is an internal
 // detail of the ownership protocol, so the Settings API stays unchanged. The

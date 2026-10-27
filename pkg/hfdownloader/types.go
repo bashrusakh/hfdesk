@@ -359,9 +359,11 @@ type Settings struct {
 	// path), the legacy dst+".part-NN"/dst+".parts.json" family, and the
 	// ranged staging file with its resume metadata
 	// (dst+".incomplete"/".incomplete.meta", or blobs/<sha>.incomplete in
-	// HF cache mode). The persistent `<staging>.lock` ownership file is not
-	// removed: it carries no payload and is reused by later claims. When nil
-	// (default), partial files are preserved for resume (useful for
+	// HF cache mode). The persistent destination ownership-domain lock
+	// (blobs/tmp-<name>.lock in HF cache mode,
+	// <destination>.incomplete.lock in flat/output mode) is not removed: it
+	// carries no payload and a later writer of the destination reuses it. When
+	// nil (default), partial files are preserved for resume (useful for
 	// pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
 

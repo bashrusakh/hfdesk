@@ -8,8 +8,9 @@ package hfdownloader
 //
 // The ownership check has three possible outcomes and must never guess:
 //
-//   - a PROVEN live owner (the persistent <staging>.lock is held
-//     exclusively) -> BlobDownloading: the caller does NOT skip the item,
+//   - a PROVEN live owner (the destination domain lock - blobs/tmp-<sha>.lock
+//     for a cache destination - is held exclusively) -> BlobDownloading: the
+//     caller does NOT skip the item,
 //     because the file is not present while the owner holds it. The downloader
 //     waits for the blob key's ownership domain and re-checks the published
 //     target instead;

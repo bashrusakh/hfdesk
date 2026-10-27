@@ -144,10 +144,10 @@ func removeOwnedStagingLocked(staging, metaPath string) bool {
 // pair only if the record still names this process instance. Owner-side
 // discard paths (hash mismatch) use it so a writer that lost a stale claim
 // cannot delete the new owner's data. The caller must already hold the
-// DESTINATION's ownership domain, whose lifetime lock fences the pair; the
-// metadata gate is the only lock this helper takes, because the domain is a
-// different lock (and, in flat/output mode, the same file the domain already
-// holds: re-taking it here would self-conflict).
+// DESTINATION's ownership domain, whose lifetime OS lock fences the pair. The
+// metadata gate is the only lock this helper takes: it is a pure in-process map
+// gate, not the flat/output-mode domain lock, and the caller already holds the
+// domain, so there is no self-conflict and no second OS lock.
 func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
