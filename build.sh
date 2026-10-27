@@ -89,8 +89,13 @@ generate_windows_versioninfo() {
     # The desktop host needs its own resource file: the linker picks up the
     # .syso file of the package it builds, so the desktop host cannot borrow
     # the resource of the console host.
+    #
+    # The desktop resource also carries the application manifest, so a build
+    # made with this script loads Common-Controls 6 exactly like CI and the
+    # release do. The console host keeps its icon-only resource: it shows no
+    # dialog of its own.
     echo "  Generating Windows icon resource of the desktop host..."
-    (cd "${SCRIPT_DIR}" && rsrc -ico "${MAIN_PKG}/hfdesk.ico" -o "${DESKTOP_PKG}/resource_windows_amd64.syso")
+    (cd "${SCRIPT_DIR}" && rsrc -ico "${MAIN_PKG}/hfdesk.ico" -manifest "${DESKTOP_PKG}/hfdesk.manifest" -o "${DESKTOP_PKG}/resource_windows_amd64.syso")
 
     return 0
 }

@@ -94,6 +94,7 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 		runTray(iconBytes, "HFDesk - test", trayActions{
 			open:    func() {},
 			runtime: func() {},
+			install: func() {},
 			quit:    func() {},
 		}, ready)
 	}()

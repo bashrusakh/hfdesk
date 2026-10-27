@@ -197,6 +197,24 @@ func run(o Options, logPath string) (err error) {
 		showSubsystemWarning(subsystemWarningText)
 	}
 
+	// The Windows service is the second HFDesk of the machine, and it binds
+	// the same address. The gate reads the registration before the
+	// application is created: a launch that finds a registration asks the
+	// user what to do and ends without ever starting a server, so the two
+	// instances can never compete for the listen address.
+	//
+	// The gate runs after the logging pipeline is installed (its records
+	// are the support material of the launch) and before app.New, which is
+	// the first step that can create a server. A launch that ends here
+	// publishes no state: the published state belongs to a launch that
+	// really serves, and it is written further down.
+	//
+	// A machine without a registration continues exactly as the desktop host
+	// always did.
+	if !serviceGate() {
+		return nil
+	}
+
 	application, err := app.New(o.App, o.Version)
 	if err != nil {
 		reportStartupFailure("HFDesk could not start",
@@ -375,6 +393,24 @@ func run(o Options, logPath string) (err error) {
 			// comes up.
 			go guard.runBackground(func() {
 				showRuntimeWindow(window, url, webview2Ready)
+			})
+		},
+		install: func() {
+			// The confirmation, the prompt of the user account control and
+			// the graceful shutdown all take a moment, and the shutdown has
+			// to run outside the message loop of the tray. The action
+			// therefore runs on a goroutine of its own.
+			//
+			// The host quits only after a successful launch of the elevated
+			// helper: a refused prompt or a missing console program leaves
+			// the running desktop untouched. The quit is the quit of the
+			// menu and of the signal handler, so the server is stopped
+			// through the graceful path before the process ends, and the
+			// helper starts the service only after this process exited.
+			go guard.runBackground(func() {
+				if installServiceFromTray() {
+					requestQuit()
+				}
 			})
 		},
 		quit: requestQuit,
