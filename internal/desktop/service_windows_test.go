@@ -408,7 +408,7 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 		confirmed = text
 		return true
 	})
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 
@@ -472,7 +472,7 @@ func TestTrayServiceInstallNamesTheDataDirectoryOfTheRegistration(t *testing.T) 
 			Paths: runtimepaths.Paths{StateDir: `D:\hfdesk`},
 		}, nil
 	})
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	var confirmed string
@@ -500,7 +500,7 @@ func TestTrayServiceInstallDoesNothingWhenTheConfirmationIsDeclined(t *testing.T
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
 	replaceSeam(t, &confirmServiceInstall, func(string) bool { return false })
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
@@ -531,7 +531,7 @@ func TestTrayServiceInstallReportsAMissingConsoleProgram(t *testing.T) {
 		t.Error("the tray action asked for a confirmation although the console program is missing")
 		return true
 	})
-	replaceSeam(t, &findSiblingExecutable, func(dir string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(dir, _ string) (string, error) {
 		return "", errors.New("there is no hfdesk.exe in " + dir)
 	})
 	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
@@ -560,7 +560,7 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
 	replaceSeam(t, &confirmServiceInstall, func(string) bool { return true })
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
@@ -596,7 +596,7 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
@@ -652,7 +652,7 @@ func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 // starts nothing itself and the service reports the stopped state afterwards.
 func TestServiceHelperUpdateNeverStartsAStoppedService(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 
@@ -709,7 +709,7 @@ func TestServiceHelperUpdateNeverStartsAStoppedService(t *testing.T) {
 // running service reports the address it serves afterwards.
 func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 
@@ -732,7 +732,7 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the report of the update", len(*messages))
 	}
-	for _, want := range []string{"http://127.0.0.1:18080", "no longer needed"} {
+	for _, want := range []string{"http://127.0.0.1:18080", "not needed to use the service"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
@@ -744,7 +744,7 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 // leave a running one behind.
 func TestServiceHelperUpdateFailsWhenAStoppedServiceRuns(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 50*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 
@@ -781,7 +781,7 @@ func TestServiceHelperUpdateFailsWhenAStoppedServiceRuns(t *testing.T) {
 // service and reports the address it serves.
 func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 
@@ -807,7 +807,7 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	if caption := serviceInstalledCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "no longer needed"} {
+	for _, want := range []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "not needed to use the service"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
@@ -822,7 +822,7 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 // address the desktop still holds.
 func TestServiceHelperWaitsForTheDesktopBeforeItInstalls(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	manager := &fakeServiceManager{
@@ -916,7 +916,7 @@ func TestServiceHelperStartReportsAMissingRegistration(t *testing.T) {
 // starts what it registers, and an update of a stopped service would leave the
 // user with an instance that serves nothing.
 func TestServiceHelperUpdateRefusesAMachineWithoutARegistration(t *testing.T) {
-	replaceSeam(t, &findSiblingExecutable, func(string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	manager := &fakeServiceManager{statuses: []service.Status{{State: service.StateNotInstalled}}}
@@ -991,7 +991,7 @@ func TestWaitForProcessExitReportsATimeout(t *testing.T) {
 // folder of the helper already. The helper reports the folder and leaves the
 // machine as it was.
 func TestServiceHelperInstallReportsAMissingConsoleProgram(t *testing.T) {
-	replaceSeam(t, &findSiblingExecutable, func(dir string) (string, error) {
+	replaceSeam(t, &findSiblingExecutable, func(dir, _ string) (string, error) {
 		return "", errors.New("there is no hfdesk.exe in " + dir)
 	})
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
@@ -1041,7 +1041,7 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	if caption := serviceStartedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "no longer needed"} {
+	for _, want := range []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "not needed to use the service"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}

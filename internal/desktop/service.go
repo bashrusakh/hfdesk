@@ -188,7 +188,8 @@ const (
 )
 
 // findSiblingExecutable locates the console program that sits next to a
-// desktop binary.
+// desktop binary: the folder of the desktop program and the program itself,
+// which names the pair the release ships.
 //
 // It is a package level variable so the tests can drive a folder that has no
 // console program: the folder of the running test executable is the folder of
@@ -204,21 +205,27 @@ var findSiblingExecutable = findConsoleExecutable
 // runs from, and an update re-registers the program of the folder the helper
 // runs from.
 //
-// The plain name hfdesk.exe is preferred. A release artifact carries the
-// version in its name (hfdesk_windows_amd64_1.3.0.exe), so exactly one
-// hfdesk*.exe is accepted as well. Zero and several candidates are an error
-// that names the folder: registering one of several programs would register a
-// program the user did not choose.
+// The program paired with the desktop program is preferred: a release ships
+// hfdesk_windows_amd64_1.3.0.exe next to hfdesk-desktop_windows_amd64_1.3.0.exe,
+// and unpacking a new release next to the old one leaves two version-stamped
+// pairs in the same folder. The pair of the program that asks is the one the
+// user meant, so its exact name is looked up first. The plain name hfdesk.exe
+// is the next fallback, and a folder with exactly one hfdesk*.exe is accepted
+// as well. Zero and several candidates without a pair are an error that names
+// the folder: registering one of several programs would register a program the
+// user did not choose.
 //
 // The desktop program is never a candidate, whatever its name carries: it is
 // the program that asks for the console program, and registering it would
 // start a second desktop host as the service.
-func findConsoleExecutable(dir string) (string, error) {
+func findConsoleExecutable(dir, desktop string) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("the folder %s cannot be read: %w", dir, err)
 	}
 
+	paired := pairedConsoleExecutableName(desktop)
+	pairedPath := ""
 	preferred := ""
 	var candidates []string
 	for _, entry := range entries {
@@ -232,11 +239,17 @@ func findConsoleExecutable(dir string) (string, error) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		if strings.EqualFold(entry.Name(), consoleExecutableName+executableSuffix) {
+		switch {
+		case paired != "" && strings.EqualFold(entry.Name(), paired):
+			pairedPath = path
+		case strings.EqualFold(entry.Name(), consoleExecutableName+executableSuffix):
 			preferred = path
-			break
+		default:
+			candidates = append(candidates, path)
 		}
-		candidates = append(candidates, path)
+	}
+	if pairedPath != "" {
+		return pairedPath, nil
 	}
 	if preferred != "" {
 		return preferred, nil
@@ -251,6 +264,23 @@ func findConsoleExecutable(dir string) (string, error) {
 		return "", fmt.Errorf("there are %d programs that could be the console program of HFDesk in %s: %s",
 			len(candidates), dir, strings.Join(baseNames(candidates), ", "))
 	}
+}
+
+// pairedConsoleExecutableName returns the name of the console program the
+// release ships next to desktop, or an empty string when the program carries no
+// pair.
+//
+// The two programs of a release differ only by the prefix of their names, so the
+// pair is derived from the name of the desktop program: the leading
+// hfdesk-desktop prefix is replaced with hfdesk, and the rest of the name (the
+// version stamp and the suffix) is kept. A desktop program that does not carry
+// the prefix names no pair, so nothing is preferred for it.
+func pairedConsoleExecutableName(desktop string) string {
+	base := filepath.Base(desktop)
+	if !strings.HasPrefix(strings.ToLower(base), desktopExecutableName) {
+		return ""
+	}
+	return consoleExecutableName + base[len(desktopExecutableName):]
 }
 
 // isConsoleExecutableName reports whether name is a candidate for the console

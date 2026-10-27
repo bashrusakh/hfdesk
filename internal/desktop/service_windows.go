@@ -179,7 +179,7 @@ func installServiceFromTray() bool {
 		return false
 	}
 
-	console, err := findSiblingExecutable(filepath.Dir(executable))
+	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
 	if err != nil {
 		desktopLog.Warn("the console program of the service is missing",
 			"folder", filepath.Dir(executable), "error", err)

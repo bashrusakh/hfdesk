@@ -173,12 +173,12 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 
 // TestServiceUpdatedTextReportsARunningService proves that the report of an
 // update of a running service names the address and tells the user that the
-// desktop app is no longer needed.
+// desktop app is not needed to use the service.
 func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
 	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true)
 
-	for _, want := range []string{address, "no longer needed", `C:\portable\hfdesk.exe`, "keeps the settings"} {
+	for _, want := range []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the report %q does not mention %q", text, want)
 		}
@@ -205,7 +205,7 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 		console,
 		"starts at boot",
 		address,
-		"no longer needed",
+		"not needed to use the service",
 		dataDir,
 		"do not appear in the service",
 	} {

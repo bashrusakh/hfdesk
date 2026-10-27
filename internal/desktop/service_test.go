@@ -95,14 +95,15 @@ func TestParseServiceActionRejectsEveryOtherValue(t *testing.T) {
 //
 // The comparison is case-insensitive, because the file systems of Windows are:
 // a folder that carries HFDesk.EXE has the program under the name the
-// installation looks for.
+// installation looks for. The desktop program of another release names a pair
+// that is not in the folder, so the plain name is the fallback that decides.
 func TestFindConsoleExecutablePrefersThePlainName(t *testing.T) {
 	dir := t.TempDir()
 	preferred := filepath.Join(dir, "HFDesk.EXE")
 	writeFile(t, preferred)
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe"))
 
-	found, err := findConsoleExecutable(dir)
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.2.0.exe"))
 	if err != nil {
 		t.Fatalf("find the console program: %v", err)
 	}
@@ -115,13 +116,15 @@ func TestFindConsoleExecutablePrefersThePlainName(t *testing.T) {
 // of one release artifact installs the program of that artifact.
 //
 // The release carries the version in the name of the program, so a single
-// hfdesk*.exe is the program the user put next to the desktop host.
+// hfdesk*.exe is the program the user put next to the desktop host. The desktop
+// program of another release has no pair in the folder, so the single candidate
+// is accepted.
 func TestFindConsoleExecutableAcceptsASingleVersionedProgram(t *testing.T) {
 	dir := t.TempDir()
 	want := filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe")
 	writeFile(t, want)
 
-	found, err := findConsoleExecutable(dir)
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.4.0.exe"))
 	if err != nil {
 		t.Fatalf("find the console program: %v", err)
 	}
@@ -130,8 +133,74 @@ func TestFindConsoleExecutableAcceptsASingleVersionedProgram(t *testing.T) {
 	}
 }
 
+// TestFindConsoleExecutablePrefersThePairedProgram proves that the console
+// program of the running desktop program is chosen when the folder holds two
+// releases.
+//
+// Unpacking a new release next to the old one leaves two version-stamped console
+// programs and two version-stamped desktop programs in the folder. The pair of the
+// program that asks is the program the user meant, so the installation registers
+// it instead of refusing the folder.
+func TestFindConsoleExecutablePrefersThePairedProgram(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"hfdesk-desktop_windows_amd64_v1.3.0.exe",
+		"hfdesk-desktop_windows_amd64_v1.4.0.exe",
+		"hfdesk_windows_amd64_v1.3.0.exe",
+		"hfdesk_windows_amd64_v1.4.0.exe",
+	} {
+		writeFile(t, filepath.Join(dir, name))
+	}
+
+	tests := []struct {
+		name    string
+		desktop string
+		want    string
+	}{
+		{"the running release", "hfdesk-desktop_windows_amd64_v1.4.0.exe", "hfdesk_windows_amd64_v1.4.0.exe"},
+		{"the older release", "hfdesk-desktop_windows_amd64_v1.3.0.exe", "hfdesk_windows_amd64_v1.3.0.exe"},
+		// The prefix is matched without regard to case, as the file systems
+		// of Windows name a program.
+		{"another case", "HFDESK-DESKTOP_WINDOWS_AMD64_V1.4.0.EXE", "hfdesk_windows_amd64_v1.4.0.exe"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			found, err := findConsoleExecutable(dir, filepath.Join(dir, test.desktop))
+			if err != nil {
+				t.Fatalf("find the console program of %q: %v", test.desktop, err)
+			}
+			if want := filepath.Join(dir, test.want); found != want {
+				t.Errorf("the console program is %q, want the pair %q", found, want)
+			}
+		})
+	}
+}
+
+// TestPairedConsoleExecutableName proves how the pair of a desktop program is
+// derived, and that a program without the prefix names no pair.
+func TestPairedConsoleExecutableName(t *testing.T) {
+	tests := []struct {
+		desktop string
+		want    string
+	}{
+		{"hfdesk-desktop_windows_amd64_v1.4.0.exe", "hfdesk_windows_amd64_v1.4.0.exe"},
+		{"HFDesk-Desktop_windows_amd64_v1.4.0.exe", "hfdesk_windows_amd64_v1.4.0.exe"},
+		{"hfdesk-desktop.exe", "hfdesk.exe"},
+		{filepath.Join("portable", "hfdesk-desktop_windows_amd64_v1.4.0.exe"), "hfdesk_windows_amd64_v1.4.0.exe"},
+		{"hfdesk.exe", ""},
+		{"desktop.exe", ""},
+		{"", ""},
+	}
+	for _, test := range tests {
+		if got := pairedConsoleExecutableName(test.desktop); got != test.want {
+			t.Errorf("pairedConsoleExecutableName(%q) = %q, want %q", test.desktop, got, test.want)
+		}
+	}
+}
+
 // TestFindConsoleExecutableRefusesSeveralPrograms proves that a folder with
-// more than one candidate is an error that names the folder.
+// more than one candidate and no pair for the running desktop program is an
+// error that names the folder.
 //
 // Registering one of several programs would register a program the user did
 // not choose, so the installation refuses the folder instead of guessing.
@@ -140,7 +209,7 @@ func TestFindConsoleExecutableRefusesSeveralPrograms(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe"))
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.4.0.exe"))
 
-	found, err := findConsoleExecutable(dir)
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.2.0.exe"))
 	if err == nil {
 		t.Fatalf("the folder with two candidates yielded %q, want an error", found)
 	}
@@ -160,7 +229,7 @@ func TestFindConsoleExecutableRefusesAFolderWithoutTheProgram(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.3.0.exe"))
 	writeFile(t, filepath.Join(dir, "README.txt"))
 
-	found, err := findConsoleExecutable(dir)
+	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
 	if err == nil {
 		t.Fatalf("the folder without the console program yielded %q, want an error", found)
 	}

@@ -183,13 +183,14 @@ func serviceVersionName(version string) string {
 //
 // The report names the program the registration runs, the address the service
 // serves and the data directory it owns. The last sentence tells the user the
-// consequence they need: the desktop app is no longer needed, and its own data
-// stays where it is.
+// consequence they need: the desktop app is not needed to use the service, and
+// its own data stays where it is. The helper runs only after the desktop process
+// ended, so the report never tells the user to quit an app that is gone.
 func serviceInstalledText(version, console, dataDir, address string) string {
 	text := serviceVersionName(version) + " is installed as a Windows service.\n\n" +
 		"The service runs " + console + ", starts at boot and keeps running after this window closes.\n\n"
 	text += serviceAddressText(address)
-	text += "The desktop app is no longer needed: quit it and use the address above."
+	text += "The desktop app is not needed to use the service: open the address above."
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
 	}
@@ -214,7 +215,7 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool)
 		"The registration now runs " + console + " and keeps the settings of the service and its data.\n\n"
 	if running {
 		text += serviceAddressText(address)
-		text += "The desktop app is no longer needed: quit it and use the address above."
+		text += "The desktop app is not needed to use the service: open the address above."
 	} else {
 		text += "The service stays stopped: it was stopped before the update, and an update never starts a stopped service. Nothing serves HFDesk right now.\n\n" +
 			"Start the desktop app again and choose Start service, or run \"hfdesk service start\" from an elevated shell."
@@ -232,7 +233,7 @@ func serviceStartedText(console, address string) string {
 		text += "It runs " + console + ".\n\n"
 	}
 	text += serviceAddressText(address)
-	text += "The desktop app is no longer needed: quit it and use the address above."
+	text += "The desktop app is not needed to use the service: open the address above."
 	return text
 }
 

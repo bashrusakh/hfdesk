@@ -266,7 +266,7 @@ func serviceInstallation() (service.InstallOptions, service.Manager, error) {
 	if err != nil {
 		return service.InstallOptions{}, nil, err
 	}
-	console, err := findSiblingExecutable(filepath.Dir(executable))
+	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
 	if err != nil {
 		return service.InstallOptions{}, nil, fmt.Errorf("the console program of the service is missing: %w", err)
 	}
