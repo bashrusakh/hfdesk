@@ -55,6 +55,11 @@ type branchHubRevision struct {
 	sha   string
 	files map[string]string
 	lfs   map[string]hfLfsInfo
+	// sha256 carries a known content digest for a tree entry that has no
+	// LFS block. The Hub API accepts a top-level sha256 on a tree entry, and
+	// the planner takes it as the plan item's digest, so such a file has a
+	// known content hash even though it is not an LFS file.
+	sha256 map[string]string
 }
 
 // branchHubBodyServer serves the raw bytes of one file. It returns true when
@@ -119,6 +124,9 @@ func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision, 
 					if lfsCopy.Size > 0 {
 						node.Size = lfsCopy.Size
 					}
+				}
+				if digest, ok := entry.sha256[name]; ok {
+					node.Sha256 = digest
 				}
 				nodes = append(nodes, node)
 			}
@@ -428,17 +436,22 @@ func TestLocalBranchVariantSkippedLFSManifestOmitsBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var skipped bool
+	var skipped string
 	err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, func(ev ProgressEvent) {
 		if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
-			skipped = true
+			skipped = ev.Message
 		}
 	})
 	if err != nil {
 		t.Fatalf("download skipped local branch: %v", err)
 	}
-	if !skipped {
+	if skipped == "" {
 		t.Fatal("local branch download did not take the skip path")
+	}
+	// A hash-verified skip reports the reason the ordinary path reports for
+	// the same case.
+	if !strings.Contains(skipped, "sha256 match") {
+		t.Fatalf("local branch skip reason = %q, want the hash-verified reason", skipped)
 	}
 
 	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, revisions[revision].sha), ManifestFilename))
@@ -1937,7 +1950,8 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 // The cases differ only in which component of the app-owned tree is the
 // symlink: the records tree root, the payload tree root, the revision
 // directory of the records tree, a revision component of the records tree,
-// the record directory and the revision directory of the payload tree.
+// the record directory, the revision directory of the payload tree and the
+// staging tree with its revision and commit directories.
 func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 	const (
 		revision    = "4.00bpw"
@@ -1981,6 +1995,9 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 		{name: "revision component", revision: multiRev, link: []string{"records", "exl"}},
 		{name: "record directory", revision: revision, link: []string{"records", revision, commit}},
 		{name: "payload revision directory", revision: revision, link: []string{"payload", revision}, payloadTree: true},
+		{name: "staging tree", revision: revision, link: []string{branchVariantLocalStagingDirName}},
+		{name: "staging revision directory", revision: revision, link: []string{"staging", revision}},
+		{name: "staging commit directory", revision: revision, link: []string{"staging", revision, commit}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3218,6 +3235,103 @@ func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommit(t *testing.T) {
 
 	// The published file holds the moved branch's bytes and nothing else.
 	body, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "config.json"))
+	if err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	if string(body) != secondBytes {
+		t.Fatalf("payload = %q, want the moved branch's bytes %q", body, secondBytes)
+	}
+}
+
+// TestLocalBranchVariantMovedBranchReFetchesNonLFSFileWithKnownDigest
+// discriminates the remaining same-size stale-bytes hole: the branch
+// variant's skip rule verified the content hash only for LFS files, so a
+// tree entry that carries a known digest but no LFS block fell back to size
+// equality. A moved branch that changes such a file's bytes while keeping
+// its length therefore kept the old commit's bytes in the payload, and the
+// completion record reported the variant as complete.
+//
+// The file is not an LFS file, so the ordinary download's size-equality skip
+// still applies to it there. The branch variant is pinned to a commit, so it
+// must re-fetch the file instead.
+func TestLocalBranchVariantMovedBranchReFetchesNonLFSFileWithKnownDigest(t *testing.T) {
+	const (
+		revision     = "4.00bpw"
+		firstCommit  = "2222222222222222222222222222222222222222"
+		secondCommit = "4444444444444444444444444444444444444444"
+		firstBytes   = "AAAAAAAA"
+		secondBytes  = "BBBBBBBB"
+	)
+	firstSum := sha256.Sum256([]byte(firstBytes))
+	secondSum := sha256.Sum256([]byte(secondBytes))
+	firstEntry := branchHubRevision{
+		sha:   firstCommit,
+		files: map[string]string{"config.json": firstBytes},
+		// The tree entry carries a known content digest and no LFS block.
+		sha256: map[string]string{"config.json": hex.EncodeToString(firstSum[:])},
+	}
+	secondEntry := branchHubRevision{
+		sha:    secondCommit,
+		files:  map[string]string{"config.json": secondBytes},
+		sha256: map[string]string{"config.json": hex.EncodeToString(secondSum[:])},
+	}
+	revisions := map[string]branchHubRevision{
+		revision:    firstEntry,
+		firstCommit: firstEntry,
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+	job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
+
+	// The plan knows the content digest of a file that is not an LFS file.
+	plan, err := PlanRepo(context.Background(), job, cfg)
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("plan items = %+v, want one file", plan.Items)
+	}
+	item := plan.Items[0]
+	if item.LFS {
+		t.Fatalf("plan item is an LFS file, want a plain file: %+v", item)
+	}
+	if want := hex.EncodeToString(firstSum[:]); item.SHA256 != want {
+		t.Fatalf("plan item digest = %q, want %q", item.SHA256, want)
+	}
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("download of the first commit: %v", err)
+	}
+	payload := filepath.Join(branchLocalPayloadDir(root, revision), "config.json")
+	body, err := os.ReadFile(payload)
+	if err != nil || string(body) != firstBytes {
+		t.Fatalf("payload = %q err=%v, want %q", body, err, firstBytes)
+	}
+
+	// The branch moves to another commit whose file has the same length and
+	// different bytes.
+	revisions[revision] = secondEntry
+	revisions[secondCommit] = secondEntry
+	moved := fakeBranchVariantHub(t, revisions)
+	defer moved.Close()
+	cfg.Endpoint = moved.URL
+
+	var skipped bool
+	if err := Download(context.Background(), job, cfg, func(ev ProgressEvent) {
+		if ev.Event == "file_done" && strings.Contains(ev.Message, "skip") {
+			skipped = true
+		}
+	}); err != nil {
+		t.Fatalf("download of the moved branch: %v", err)
+	}
+	if skipped {
+		t.Error("the moved branch's file was skipped, want it re-fetched")
+	}
+
+	// The published file holds the moved branch's bytes and nothing else.
+	body, err = os.ReadFile(payload)
 	if err != nil {
 		t.Fatalf("payload file: %v", err)
 	}

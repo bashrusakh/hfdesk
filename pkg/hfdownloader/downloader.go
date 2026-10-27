@@ -693,17 +693,26 @@ LOOP:
 					dst = publishPath
 				}
 				skipCheck = func() (bool, string, error) {
-					// A branch variant is pinned to the newly planned commit.
-					// Without a content SHA, equal size cannot prove the payload
-					// still matches that commit: a moved branch can change a
-					// non-LFS file's bytes while keeping its size. Re-fetch it.
-					// LFS files with a known SHA keep the verified skip.
-					if job.BranchVariant && it.SHA256 == "" {
-						return false, "", nil
+					if job.BranchVariant {
+						// A branch variant is pinned to the newly planned
+						// commit, so a published file may be reused only
+						// when its content is proven to be that commit's
+						// content: with a known digest the published file's
+						// hash must match it, and without one equal size
+						// proves nothing, so the file is re-fetched. A moved
+						// branch can change a file's bytes while keeping its
+						// length.
+						//
+						// The skip is decided on the published file: it is
+						// the file the variant's payload holds, and its
+						// content hash is what proves it belongs to the
+						// planned commit.
+						return shouldSkipLocalByHashCtx(fileCtx, it, publishPath)
 					}
-					// The skip is decided on the published file: it is the
-					// file the variant's payload holds, and its content hash
-					// is what proves it belongs to the planned commit.
+					// The ordinary download keeps its own rule: a file with
+					// a known digest is reused only when that digest
+					// matches (LFS files), and every other file is reused
+					// on size equality.
 					return shouldSkipLocalCtx(fileCtx, it, publishPath)
 				}
 			}

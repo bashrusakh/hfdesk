@@ -869,10 +869,13 @@ Notes:
   staging area lives inside the reserved space, so it is excluded from the
   ordinary local repository scan like the rest of that space, and it is
   verified like the other app-owned trees.
-  A local re-download re-fetches hashless/non-LFS files instead of trusting size
-  equality, and the commit-scoped staging area keeps a moved branch from
-  resuming another commit's bytes, so a moved branch cannot retain same-size
-  stale bytes; LFS files continue to use their known SHA.
+  A local branch-variant re-download reuses a published file only when its
+  content hash matches the planned commit's digest: a file without a known
+  digest is re-fetched, because equal size proves nothing. Together with the
+  commit-scoped staging area, which keeps a moved branch from resuming another
+  commit's bytes, this means a moved branch cannot retain same-size stale
+  bytes. An ordinary download is unaffected: it keeps reusing a non-LFS file
+  on size equality, and an LFS file with a known SHA on its SHA.
 - A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.
