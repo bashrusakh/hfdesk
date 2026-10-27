@@ -534,7 +534,9 @@ replaces the other.
   program (the same name with the `hfdesk-desktop` prefix replaced by
   `hfdesk`), then `hfdesk.exe`, then exactly one `hfdesk*.exe` of a release —
   and installs the service from that folder: the desktop host never downloads
-  and never copies a binary. Windows shows its
+  and never copies a binary. Install the service from a folder that only
+  administrators can modify: the service runs that program as `LocalService`,
+  and HFDesk never changes the permissions of a user folder. Windows shows its
   standard administrator prompt, the elevated helper installs the service,
   starts it and verifies that it runs, and reports the result in a message box.
   A declined prompt or a missing console program changes nothing and leaves the
@@ -664,9 +666,11 @@ the user: **Install service…** in its tray, and **Update service** or
 **Start service** in its startup dialog, ask Windows for administrator rights
 through the standard prompt before an elevated helper performs the action (see
 [The Windows desktop host](#the-windows-desktop-host)). A declined prompt
-changes nothing and leaves the desktop app running. Every `hfdesk service`
-command keeps its guarantee: a machine-wide operation refuses without an elevated
-shell and never prompts.
+changes nothing: the tray installation leaves the running desktop app untouched,
+while a declined **Start service** or **Update service** from the startup dialog
+simply ends that launch, because it never started a server. Every
+`hfdesk service` command keeps its guarantee: a machine-wide operation refuses
+without an elevated shell and never prompts.
 
 The **machine-wide scope** needs an **elevated shell** (root on Linux) for
 `install`, `uninstall`, `start`, `stop` and `restart`: the registration lives

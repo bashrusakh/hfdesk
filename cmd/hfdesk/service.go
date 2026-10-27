@@ -533,9 +533,10 @@ type installFlags struct {
 // directory: the parent of the config file is the directory the
 // installation prepares.
 //
-// The cache directories are derived from the runtime paths, so they are
-// resolved after the overrides: a machine-wide instance keeps its cache
-// inside its own state root even when the state root was overridden.
+// The cache directories are derived from the runtime paths of the request,
+// so a fresh machine-wide instance keeps its cache inside its own state
+// root. A reinstall that names only one path inherits the cache directory of
+// the registration, because an unnamed setting is kept.
 //
 // The cache root and the hub directory are one layout, so an explicit cache
 // root moves the hub directory with it: a registration that names a cache
