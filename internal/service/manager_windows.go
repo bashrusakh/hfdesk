@@ -193,7 +193,10 @@ func newPlatformManager(scope Scope) (Manager, error) {
 //
 // The registration carries the failure recovery of the platform, so the service
 // control manager restarts an instance that ends without reporting its stop. An
-// explicit stop is never turned into a restart.
+// explicit stop is never turned into a restart. An installation that finds a
+// recovery policy registered already keeps it, so the settings of the instance
+// and the policy of an administrator survive a reinstall; the policy of HFDesk is
+// configured only for a registration without one.
 //
 // A failure after the registration was written restores the previous
 // registration. A failure after the restart of a running instance stops the
@@ -446,7 +449,9 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	}
 
 	// The failure recovery is part of the registration: a service the machine
-	// never restarts after a crash is not the instance that was asked for.
+	// never restarts after a crash is not the instance that was asked for. A
+	// policy that is registered already is kept, so a reinstall never resets
+	// what the instance or an administrator decided.
 	if err := configureSCMRecovery(handle); err != nil {
 		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRegistration,
 			fmt.Errorf("service: configure the failure recovery of %s: %w", ServiceName, err))
@@ -975,12 +980,49 @@ func scmRecoveryActions() []mgr.RecoveryAction {
 // failures of the instance, in seconds: one day.
 const scmRecoveryResetPeriod uint32 = 24 * 60 * 60
 
+// scmRecoveryDecision is what an installation does with the failure recovery of
+// the registration.
+type scmRecoveryDecision int
+
+const (
+	// scmRecoveryConfigure writes the recovery policy of HFDesk: the
+	// registration has none.
+	scmRecoveryConfigure scmRecoveryDecision = iota
+	// scmRecoveryKeep keeps the recovery policy the registration carries.
+	scmRecoveryKeep
+)
+
+// scmRecoveryDecisionFor returns what an installation does with the failure
+// recovery of a registration, from the actions the registration carries and the
+// outcome of reading them.
+//
+// A registration with at least one action keeps its policy: a repeat installation
+// keeps the settings the instance already has, and an administrator may have set a
+// policy of their own. The policy of HFDesk is configured only for a registration
+// without one.
+//
+// A read that fails is not evidence that the registration has no recovery: the
+// policy of HFDesk is configured then, because a service the machine never
+// restarts after a crash is the state the installation exists to prevent.
+func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRecoveryDecision {
+	if readErr != nil || len(existing) == 0 {
+		return scmRecoveryConfigure
+	}
+	return scmRecoveryKeep
+}
+
 // configureSCMRecovery configures the failure recovery of the registration.
 //
 // The recovery is the crash recovery of the instance and not its lifecycle: the
 // platform performs an action of the list only for an instance that ended without
 // reporting its stop. An explicit stop reports the stopped state, so the platform
 // never turns it into a restart.
+//
+// A registration that carries a recovery policy keeps it: the installation only
+// configures the policy of HFDesk when the registration has none, so a reinstall
+// neither resets the settings of the instance nor the policy of an administrator.
+// A read that fails does not skip the policy of HFDesk: the installation
+// configures it and records why.
 //
 // The "restart on non-crash failures" switch of the platform stays off: it would
 // turn the failed start of a misconfigured instance into a restart loop, and a
@@ -989,6 +1031,16 @@ const scmRecoveryResetPeriod uint32 = 24 * 60 * 60
 // A recovery that cannot be configured is a failed installation: a service the
 // machine never restarts after a crash is not the instance that was asked for.
 func configureSCMRecovery(handle *mgr.Service) error {
+	existing, err := handle.RecoveryActions()
+	if scmRecoveryDecisionFor(existing, err) == scmRecoveryKeep {
+		log.Printf("service: %s keeps the failure recovery of its registration", ServiceName)
+		return nil
+	}
+	if err != nil {
+		log.Printf("service: the failure recovery of %s cannot be read (%v), the recovery policy of HFDesk is configured", ServiceName, err)
+	} else {
+		log.Printf("service: the registration of %s has no failure recovery, the recovery policy of HFDesk is configured", ServiceName)
+	}
 	return handle.SetRecoveryActions(scmRecoveryActions(), scmRecoveryResetPeriod)
 }
 

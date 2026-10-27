@@ -3375,6 +3375,47 @@ func TestSCMRecoveryActionsRestartTheFailedInstance(t *testing.T) {
 	}
 }
 
+// TestSCMRecoveryDecisionKeepsARegisteredPolicy checks what an installation does
+// with the failure recovery of a registration: the policy of HFDesk is configured
+// only when the registration has none, and a policy that is registered already is
+// kept, because a repeat installation keeps the settings of the instance and an
+// administrator may have set a policy of their own.
+//
+// A read that fails does not skip the required policy: a service without recovery
+// is the state the installation exists to prevent, so the policy of HFDesk is
+// configured then.
+func TestSCMRecoveryDecisionKeepsARegisteredPolicy(t *testing.T) {
+	administrator := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+	}
+	readFailure := errors.New("the failure actions of the registration cannot be read")
+
+	tests := []struct {
+		name     string
+		existing []mgr.RecoveryAction
+		readErr  error
+		want     scmRecoveryDecision
+	}{
+		{"a registration without actions", nil, nil, scmRecoveryConfigure},
+		{"an empty list of actions", []mgr.RecoveryAction{}, nil, scmRecoveryConfigure},
+		{"the policy of HFDesk is registered already", scmRecoveryActions(), nil, scmRecoveryKeep},
+		{"a policy of an administrator", administrator, nil, scmRecoveryKeep},
+		{"an explicitly registered policy of no action", []mgr.RecoveryAction{{Type: mgr.NoAction}}, nil, scmRecoveryKeep},
+		{"a read that fails", nil, readFailure, scmRecoveryConfigure},
+		{"a read that fails although actions were returned", administrator, readFailure, scmRecoveryConfigure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := scmRecoveryDecisionFor(test.existing, test.readErr); got != test.want {
+				t.Errorf("scmRecoveryDecisionFor(%v, %v) = %v, want %v",
+					test.existing, test.readErr, got, test.want)
+			}
+		})
+	}
+}
+
 // TestSCMSameExecutablePath checks the comparison of two paths that name a
 // program: the platform stores the path of a program in the case and the
 // spelling it was given, so the comparison is case-insensitive and made on the
