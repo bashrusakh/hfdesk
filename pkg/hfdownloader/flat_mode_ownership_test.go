@@ -9,12 +9,11 @@ package hfdownloader
 // routes and the cleanup resolve that ONE identity. The domain's lifetime
 // lock is the persistent sibling of the MULTIPART staging name:
 // <destination>.incomplete.lock - the zero-byte artifact the multipart route
-// already leaves next to the user's model file and never unlinks. The
-// MULTIPART route takes that lock through its staging claim; the
-// SINGLE-REQUEST route holds the same domain while it transfers. One lock
-// file therefore excludes every pair of writers of the same flat
-// destination: single-vs-single, single-vs-multipart and
-// multipart-vs-multipart.
+// already leaves next to the user's model file and never unlinks. The lock is
+// the item-level destination domain lock: it is acquired ONCE for every route,
+// and the multipart staging claim takes no second lock. One lock file
+// therefore excludes every pair of writers of the same flat destination:
+// single-vs-single, single-vs-multipart and multipart-vs-multipart.
 //
 // Before the flat destination owned a domain, the single-request route took
 // no lock at all, so two writers of the same flat destination interleaved

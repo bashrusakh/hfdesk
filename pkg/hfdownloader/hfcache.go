@@ -273,11 +273,14 @@ func (r *RepoDir) EnsureDirs() error {
 // Settings.Concurrency re-fetches only missing bytes. Crash-safety contract:
 // payload data is written before Committed is advanced, and Committed must not
 // claim bytes that were not written. The current version is 4; Done requires
-// clean response framing. A record of any other version is not understood: it
-// is discarded under the claim's ownership and the file is re-downloaded from
-// zero (old/unsupported partials are never migrated). The staging file is
-// preallocated, so its length is never evidence of completion — only Ranges is,
-// after payload existence and logical size have been checked.
+// clean response framing. Other versions are not resumable and are never
+// migrated: a fenced old-version record (or one whose owner is provably dead or
+// is this process) is discarded under the claim's ownership and the file is
+// re-downloaded from zero, while an unfenced old-version record whose owner
+// cannot be proven dead is refused as unproven and preserved (the ownership
+// gate runs before the version branch). The staging file is preallocated, so
+// its length is never evidence of completion — only Ranges is, after payload
+// existence and logical size have been checked.
 type IncompleteMeta struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started"`
@@ -305,9 +308,13 @@ type IncompleteMeta struct {
 	LockFenced bool `json:"lock_fenced,omitempty"`
 	// Version is 0 for pre-range records and 4 for the ranged staging records
 	// written by this downloader. Only version 4 is resumable: every other
-	// version is an old or unsupported format, so its record and partial are
-	// discarded under the claim's ownership and the file is re-downloaded from
-	// zero. A version-3 record written by an earlier branch (whose
+	// version is an old or unsupported format and is never migrated. A fenced
+	// old-version record (or one whose owner is provably dead or is this
+	// process) is discarded under the claim's ownership and the file is
+	// re-downloaded from zero; an unfenced old-version record whose owner
+	// cannot be proven dead is refused as unproven and preserved (the
+	// ownership gate runs before the version branch). A version-3 record
+	// written by an earlier branch (whose
 	// legacy_migrated flag described migrated bytes) is therefore never
 	// trusted as ordinary resume state.
 	Version int `json:"version,omitempty"`
@@ -425,7 +432,8 @@ func (s BlobStatus) String() string {
 // CheckBlob checks the status of a blob in the cache.
 // Returns the status and any existing incomplete metadata.
 //
-// The result distinguishes three ownership outcomes, and never guesses:
+// The result distinguishes three ownership outcomes once an `.incomplete`
+// staging record exists, and never guesses:
 //
 //   - a PROVEN live owner (the persistent destination domain lock
 //     blobs/tmp-<sha>.lock is held exclusively) is reported as
@@ -447,11 +455,19 @@ func (s BlobStatus) String() string {
 //     unproven claim that turns into a successful download with the blob
 //     still missing.
 //
+// A live writer that has not created an `.incomplete` staging record is not
+// described by those outcomes: the single-request route stages at
+// blobs/tmp-<sha>.part, so the `.incomplete` stat returns BlobMissing before
+// the domain probe. BlobMissing is therefore not evidence that no writer
+// exists, and the caller still does not skip: it acquires the blob key's
+// ownership domain and waits there like any other item.
+//
 // A held OS-level DESTINATION-domain ownership lock (the persistent
-// blobs/tmp-<sha>.lock) means a live writer owns the destination and is
-// reported as BlobDownloading before any record heuristic: a suspended owner
-// can still resume writing through an open handle, so the lock, not record age,
-// decides liveness wherever it is supported. A free lock
+// blobs/tmp-<sha>.lock) means a live writer owns the destination; when an
+// `.incomplete` record exists it is reported as BlobDownloading before any
+// record heuristic: a suspended owner can still resume writing through an open
+// handle, so the lock, not record age, decides liveness wherever it is
+// supported. A free lock
 // plus a lock-fenced record proves the current-version owner is gone. A free
 // lock plus an UNFENCED record is not stale: no live owner is proven either, so
 // the record is preserved, and the claim refuses it with the unproven-ownership

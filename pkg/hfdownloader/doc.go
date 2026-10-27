@@ -825,8 +825,11 @@ incompatible. Use context-aware sleeps and requests so pause, cancel, shutdown
 and requeue stop promptly. Cancellation is checked after `file_finalizing` and
 again immediately before the single-path rename; an explicit cancel applies the
 claim-checked cleanup, while a pause or internal abort preserves resumable
-partials. Keep progress unique across the final-byte revalidation so a
-re-requested byte is not counted twice.
+partials. A cancel inside the ranged pre-placement window is the exception:
+it leaves the already-proven, complete staging pair on disk for a resume,
+because the explicit-cancel cleanup is not run there by design. Keep progress
+unique across the final-byte revalidation so a re-requested byte is not
+counted twice.
 
 `Settings.Retries` bounds non-progress retries per request; a non-truncating
 attempt that advances the on-disk resume offset strictly beyond the highest

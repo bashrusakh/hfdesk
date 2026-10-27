@@ -160,9 +160,14 @@ or job ownership behavior. This section is the agent-level summary; when it and
   and refused with `ErrStagingOwnershipUnproven`; never auto-delete such a
   record or its persistent domain lock.
 - Resume is v4-only: the version-4 `<staging>.incomplete`/`.meta` record and
-  the version-1 `<dst>.part.meta` sidecar are the only resume state. Every other
-  version and every pre-#140 `.part-NN`/`.parts.json` family is discarded, never
-  migrated, and re-downloaded from zero. Inherit staged bytes only under a
+  the version-1 `<dst>.part.meta` sidecar are the only resume state. Any other
+  version is never migrated: a fenced old-version record (or one whose owner is
+  provably dead or is this process) is discarded under the claim and
+  re-downloaded from zero, while an unfenced old-version record whose owner
+  cannot be proven dead is refused as unproven and preserved (the ownership
+  gate runs before the version branch). Every pre-#140 `.part-NN`/`.parts.json`
+  family is discarded, never migrated, and re-downloaded from zero. Inherit
+  staged bytes only under a
   matching identity pinned on both sides (repo, commit, path, size, through the
   one shared `resumeIdentity.matches` rule); the single-path exact-size shortcut
   also requires `framing_complete`. The whole transfer (tree walk and every

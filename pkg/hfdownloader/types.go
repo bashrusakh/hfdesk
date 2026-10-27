@@ -351,11 +351,13 @@ type Settings struct {
 	// path), the legacy dst+".part-NN"/dst+".parts.json" family, and the
 	// ranged staging file with its resume metadata
 	// (dst+".incomplete"/".incomplete.meta", or blobs/<sha>.incomplete in
-	// HF cache mode). The persistent destination ownership-domain lock
-	// (blobs/tmp-<name>.lock in HF cache mode,
-	// <destination>.incomplete.lock in flat/output mode) is not removed: it
-	// carries no payload and a later writer of the destination reuses it. When
-	// nil (default), partial files are preserved for resume (useful for
+	// HF cache mode). A cancel inside the ranged pre-placement window leaves
+	// the already-proven, complete staging pair on disk for a resume; the
+	// explicit-cancel cleanup is not run there by design. The persistent
+	// destination ownership-domain lock (blobs/tmp-<name>.lock in HF cache
+	// mode, <destination>.incomplete.lock in flat/output mode) is not removed:
+	// it carries no payload and a later writer of the destination reuses it.
+	// When nil (default), partial files are preserved for resume (useful for
 	// pause/resume workflows).
 	CleanupPartialsOnCancel func() bool
 
