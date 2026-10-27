@@ -273,10 +273,24 @@ func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.
 	const program = `C:\portable\hfdesk.exe`
 
 	install := serviceActionFailureText(serviceActionInstall, reason, program)
-	for _, want := range []string{reason.Error(), "did not confirm the service as running", "were not touched", "hfdesk service status"} {
+	for _, want := range []string{
+		reason.Error(),
+		"did not confirm the service as running",
+		"were not touched",
+		"A registration may remain",
+		"service gate",
+		`"hfdesk service uninstall"`,
+		"elevated shell",
+		"hfdesk service status",
+	} {
 		if !strings.Contains(install, want) {
 			t.Errorf("the report %q does not mention %q", install, want)
 		}
+	}
+	// The report states a possibility, never a fact: a failed installation
+	// may have written a registration, and it may not have.
+	if strings.Contains(install, "A registration is installed") || strings.Contains(install, "a registration remains") {
+		t.Errorf("the report %q claims that a registration exists", install)
 	}
 
 	update := serviceActionFailureText(serviceActionUpdate, reason, program)
@@ -285,12 +299,18 @@ func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.
 			t.Errorf("the report %q does not mention %q", update, want)
 		}
 	}
+	if strings.Contains(update, "A registration may remain") {
+		t.Errorf("the report of the update %q carries the outcome of a failed installation", update)
+	}
 
 	start := serviceActionFailureText(serviceActionStart, reason, program)
 	for _, want := range []string{reason.Error(), "start attempt was not confirmed", "hfdesk service status"} {
 		if !strings.Contains(start, want) {
 			t.Errorf("the report %q does not mention %q", start, want)
 		}
+	}
+	if strings.Contains(start, "A registration may remain") {
+		t.Errorf("the report of the start %q carries the outcome of a failed installation", start)
 	}
 }
 
@@ -382,6 +402,30 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		if !strings.Contains(failed, want) {
 			t.Errorf("the report of the failed removal %q does not mention %q", failed, want)
 		}
+	}
+
+	// A removal that was not attempted because the instance could not be
+	// proven stopped says what remains instead of claiming that it stopped:
+	// the service may still be running or coming up.
+	skipped := serviceInstallFailureText(reason, program, serviceInstallKept, errServiceRemovalSkipped)
+	for _, want := range []string{
+		reason.Error(),
+		"not removed",
+		"may still be running, starting or stopping",
+		"state could not be read",
+		"stays in place",
+		"service gate",
+		`"hfdesk service uninstall"`,
+		"elevated shell",
+		program,
+		`NT AUTHORITY\LocalService`,
+	} {
+		if !strings.Contains(skipped, want) {
+			t.Errorf("the report of the skipped removal %q does not mention %q", skipped, want)
+		}
+	}
+	if strings.Contains(skipped, "it does not run") {
+		t.Errorf("the report of the skipped removal %q claims that the service stopped", skipped)
 	}
 }
 

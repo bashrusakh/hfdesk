@@ -6,8 +6,11 @@
 package desktop
 
 import (
+	"strings"
 	"testing"
 	"unsafe"
+
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // TestTaskDialogConfigLayoutMatchesTheWindowsAPI proves that the configuration
@@ -116,5 +119,77 @@ func TestShellExecuteInfoLayoutMatchesTheWindowsAPI(t *testing.T) {
 	}
 	if size, want := unsafe.Sizeof(shellExecuteInfo{}), uintptr(112); size != want {
 		t.Errorf("the size of the shell execute info is %d, want %d", size, want)
+	}
+}
+
+// TestServiceGateChoiceForButtonMapsTheFirstButtonOntoItsLabel proves that the
+// first button of the task dialog performs the action its label names.
+//
+// The button id is the same for both states, so a dialog that mapped the id
+// unconditionally would open the browser under a "Start service" label. The
+// mapping and the label are checked side by side, so a change of one without
+// the other fails here.
+func TestServiceGateChoiceForButtonMapsTheFirstButtonOntoItsLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state service.State
+		label string
+		want  serviceChoice
+	}{
+		{name: "running", state: service.StateRunning, label: "Open HFDesk", want: serviceChoiceOpen},
+		{name: "starting", state: service.StateStarting, label: "Open HFDesk", want: serviceChoiceOpen},
+		{name: "stopped", state: service.StateStopped, label: "Start service", want: serviceChoiceStart},
+		{name: "failed", state: service.StateFailed, label: "Start service", want: serviceChoiceStart},
+		{name: "broken", state: service.StateBroken, label: "Start service", want: serviceChoiceStart},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt := serviceChoicePrompt{State: tc.state}
+			if got := serviceGateOpenLabel(prompt); got != tc.label {
+				t.Errorf("the first button of the %s service is labelled %q, want %q", tc.state, got, tc.label)
+			}
+
+			choice, err := serviceGateChoiceForButton(tc.state, serviceGateOpenButtonID)
+			if err != nil {
+				t.Fatalf("the first button of the %s service returned an error: %v", tc.state, err)
+			}
+			if choice != tc.want {
+				t.Errorf("the first button of the %s service performs %v, want %v", tc.state, choice, tc.want)
+			}
+		})
+	}
+}
+
+// TestServiceGateChoiceForButtonMapsTheOtherIds proves that the update button
+// maps onto the update and that every way of leaving the dialog changes
+// nothing.
+func TestServiceGateChoiceForButtonMapsTheOtherIds(t *testing.T) {
+	if choice, err := serviceGateChoiceForButton(service.StateRunning, serviceGateUpdateButtonID); err != nil || choice != serviceChoiceUpdate {
+		t.Errorf("the update button returned (%v, %v), want the update", choice, err)
+	}
+
+	// Both states matter for the cancel ids as well: the answer may never
+	// depend on the state when the user did not ask for an action.
+	for _, state := range []service.State{service.StateRunning, service.StateStopped} {
+		for _, pressed := range []int32{serviceGateCancelButtonID, messageBoxCancel, 0} {
+			choice, err := serviceGateChoiceForButton(state, pressed)
+			if err != nil {
+				t.Errorf("the cancel id %d of the %s service returned an error: %v", pressed, state, err)
+			}
+			if choice != serviceChoiceCancel {
+				t.Errorf("the cancel id %d of the %s service performs %v, want no action", pressed, state, choice)
+			}
+		}
+	}
+
+	// An id the dialog never sends is reported instead of guessed: a button
+	// the host does not know must not start or open anything.
+	choice, err := serviceGateChoiceForButton(service.StateStopped, 999)
+	if err == nil {
+		t.Error("the unknown button returned no error")
+	} else if !strings.Contains(err.Error(), "999") {
+		t.Errorf("the error of the unknown button is %q, want it to name the id", err)
+	}
+	if choice != serviceChoiceCancel {
+		t.Errorf("the unknown button performs %v, want no action", choice)
 	}
 }

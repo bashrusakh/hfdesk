@@ -37,10 +37,22 @@ const serviceActionBudget = 2 * time.Minute
 // serviceVerifyBudget bounds the wait for the state an action expects.
 //
 // The service control manager reports a started instance as pending first, so
-// the state of an action is read until it settles. It is a variable so a test
-// can shorten the wait: an action whose expectation never holds has to fail,
-// and a test must not wait for the whole budget to prove that.
-var serviceVerifyBudget = 30 * time.Second
+// the state of an action is read until it settles.
+//
+// The wait wraps a wait of the instance itself: a service that starts probes its
+// HTTP server for up to its own readiness budget before it reports the running
+// state, and that clock starts only when the service control manager has started
+// the process, which is after this one. A budget of the inner size alone would
+// declare a legitimate start failed at the moment the instance is about to
+// become ready, and a failed first installation would then remove a registration
+// that is about to serve. The budget is therefore twice the 30 s readiness
+// budget of the service layer (scmReadinessTimeout), which leaves the whole
+// inner budget as the margin of the outer wait.
+//
+// It is a variable so a test can shorten the wait: an action whose expectation
+// never holds has to fail, and a test must not wait for the whole budget to
+// prove that.
+var serviceVerifyBudget = 60 * time.Second
 
 // serviceVerifyInterval is the pause between two reads of the state of the
 // service.
@@ -214,6 +226,14 @@ func installWindowsService(action serviceAction, version string) error {
 // the data directory of the service, if the installation created one, stays
 // where it is.
 //
+// A destructive step is taken only on a state that was observed. The failure that
+// brought the caller here is a start, and a start that reported a failure may
+// still have left an instance that runs or is coming up. The state is therefore
+// read again, and the registration is removed only when that read reports a
+// settled state that does not serve. A running or still starting instance is
+// never torn down, and a state that cannot be read is not evidence of a stopped
+// service: both are reported as a registration that stays.
+//
 // The removal runs on a context of its own that is never cancelled with the
 // action, so a budget that the failed start spent cannot keep the registration
 // behind. A failed removal is reported with the failure that caused it: the
@@ -226,6 +246,19 @@ func removeFailedInstallation(ctx context.Context, manager service.Manager, fres
 
 	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRemovalBudget)
 	defer cancel()
+
+	status, err := manager.Status(removeCtx)
+	if err != nil {
+		desktopLog.Warn("the state of the failed installation cannot be read: the registration is left in place",
+			"error", err)
+		return serviceInstallKept, errServiceRemovalSkipped
+	}
+	if serviceStateRunning(status.State) || !serviceStateSettled(status.State) {
+		desktopLog.Info("the instance of the failed installation is running or still in transition: the registration is left in place",
+			"state", string(status.State))
+		return serviceInstallKept, errServiceRemovalSkipped
+	}
+
 	if err := manager.Uninstall(removeCtx); err != nil {
 		desktopLog.Error("the registration of the failed installation could not be removed", "error", err)
 		return serviceInstallRemovalFailed, err

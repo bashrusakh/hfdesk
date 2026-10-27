@@ -55,6 +55,11 @@ type fakeServiceManager struct {
 	uninstallErr error
 	// statusErr is the failure of every read of the state.
 	statusErr error
+	// statusFailures are the failures of the reads of the state, in order: a
+	// nil entry is a read that succeeds, and a read beyond the list succeeds
+	// as well. It lets a test fail one read without failing the read before
+	// it, which is the state an installation reads first.
+	statusFailures []error
 	// steps records the calls in order, so a test can prove what the helper
 	// did before it touched the service.
 	steps []string
@@ -114,10 +119,13 @@ func (m *fakeServiceManager) Status(context.Context) (service.Status, error) {
 		return service.Status{}, errors.New("the test configured no state")
 	}
 	index := m.reads
+	m.reads++
+	if index < len(m.statusFailures) && m.statusFailures[index] != nil {
+		return service.Status{}, m.statusFailures[index]
+	}
 	if index >= len(m.statuses) {
 		index = len(m.statuses) - 1
 	}
-	m.reads++
 	return m.statuses[index], nil
 }
 
@@ -1254,6 +1262,97 @@ func TestServiceHelperInstallRemovesARegistrationThatNeverRan(t *testing.T) {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
 	}
 	for _, want := range []string{"not installed as a Windows service", "start the desktop app normally again"} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperInstallLeavesARegistrationWhoseServiceStillRuns proves that a
+// failed first installation never removes a registration whose instance may
+// still serve.
+//
+// The start that failed may have left an instance that runs or is still coming
+// up. The state is read again before the destructive step, and only a settled
+// state that does not serve is removed: a running, starting or stopping instance
+// is never torn down, and the report says that the registration stays.
+func TestServiceHelperInstallLeavesARegistrationWhoseServiceStillRuns(t *testing.T) {
+	const console = `C:\portable\hfdesk.exe`
+	for _, state := range []service.State{service.StateRunning, service.StateStarting, service.StateStopping} {
+		t.Run(string(state), func(t *testing.T) {
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+				return console, nil
+			})
+			manager := &fakeServiceManager{
+				statuses: []service.Status{
+					{State: service.StateNotInstalled},
+					runningServiceStatus(state, "127.0.0.1:18080"),
+				},
+				startErr: errors.New("the service did not start"),
+			}
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				return manager, nil
+			})
+			messages := recordMessages(t)
+
+			if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+				t.Fatal("the installation succeeded although the service did not start")
+			}
+			if step := stepIndex(manager.steps, "uninstall"); step >= 0 {
+				t.Fatalf("the steps of the helper are %v, want the %s registration left in place", manager.steps, state)
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+			}
+			for _, want := range []string{
+				"not removed",
+				"may still be running, starting or stopping",
+				"stays in place",
+				`"hfdesk service uninstall"`,
+			} {
+				if !strings.Contains((*messages)[0].text, want) {
+					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+				}
+			}
+		})
+	}
+}
+
+// TestServiceHelperInstallLeavesARegistrationWhoseStateCannotBeRead proves that
+// an unreadable state before the removal is not evidence of a stopped service.
+//
+// The registration of the failed attempt stays, and the report says so: removing
+// it on a guess could end an instance that is still running or starting.
+func TestServiceHelperInstallLeavesARegistrationWhoseStateCannotBeRead(t *testing.T) {
+	const console = `C:\portable\hfdesk.exe`
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return console, nil
+	})
+	manager := &fakeServiceManager{
+		statuses:       []service.Status{{State: service.StateNotInstalled}},
+		statusFailures: []error{nil, errors.New("the service control manager did not answer")},
+		startErr:       errors.New("the service did not start"),
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+		t.Fatal("the installation succeeded although the service did not start")
+	}
+	if step := stepIndex(manager.steps, "uninstall"); step >= 0 {
+		t.Fatalf("the steps of the helper are %v, want the unreadable registration left in place", manager.steps)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+	}
+	for _, want := range []string{
+		"not removed",
+		"state could not be read",
+		"stays in place",
+		`"hfdesk service uninstall"`,
+	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}

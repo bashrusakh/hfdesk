@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"unsafe"
 
+	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
 )
 
@@ -221,9 +222,38 @@ func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 		return serviceChoiceCancel, fmt.Errorf("the service choice dialog could not be shown (HRESULT 0x%08x)", uint32(result))
 	}
 
+	return serviceGateChoiceForButton(prompt.State, pressed)
+}
+
+// serviceGateFirstChoice returns the action of the first button of the choice
+// dialog.
+//
+// The first button is the action the user asked for by starting HFDesk again:
+// a running service is opened, and a service that does not run is started. The
+// label of the button is derived from the same predicate, so the label and the
+// action are two renderings of one decision and cannot drift apart.
+func serviceGateFirstChoice(state service.State) serviceChoice {
+	if serviceStateRunning(state) {
+		return serviceChoiceOpen
+	}
+	return serviceChoiceStart
+}
+
+// serviceGateChoiceForButton maps the id of a pressed button onto the action it
+// performs.
+//
+// The task dialog reports ids and not positions, so the answer is read from the
+// id alone, together with the state the dialog was opened for. The first button
+// is the only id whose action depends on the state: it opens a running service
+// and starts one that is not running. Everything else is a fixed answer.
+//
+// The mapping is a pure function, so a test can prove both states of the first
+// button and the other ids without a dialog: the real dialog blocks the process
+// until the user answers it.
+func serviceGateChoiceForButton(state service.State, pressed int32) (serviceChoice, error) {
 	switch pressed {
 	case serviceGateOpenButtonID:
-		return serviceChoiceOpen, nil
+		return serviceGateFirstChoice(state), nil
 	case serviceGateUpdateButtonID:
 		return serviceChoiceUpdate, nil
 	case serviceGateCancelButtonID, messageBoxCancel, 0:

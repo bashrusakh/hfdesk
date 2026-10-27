@@ -4,11 +4,23 @@
 package desktop
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
+
+// errServiceRemovalSkipped reports that the registration of a failed
+// installation was left in place because the service may still be running,
+// starting or stopping, or because its state could not be read.
+//
+// The registration of a first installation is only removed once the instance is
+// provably settled and not running: a running instance serves, and a pending one
+// may still reach the running state. Removing either would end an instance that
+// is coming up instead of cleaning up an attempt that failed.
+var errServiceRemovalSkipped = errors.New(
+	"the registration was not removed: the service may still be running, starting or stopping, or its state cannot be read")
 
 // The captions of the message boxes of the service actions.
 //
@@ -339,6 +351,9 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 			"This attempt did not confirm the service as running. The settings, jobs and models of the desktop app were not touched. " +
 			access + "\n\n" +
+			"A registration may remain: a previous one, or the one this attempt wrote while its instance could not be proven stopped. " +
+			"While a registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
+			"If you do not want to keep it, remove it from an elevated shell with \"hfdesk service uninstall\".\n\n" +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	case serviceActionUpdate:
 		return "HFDesk could not update the Windows service.\n\n" + detail + "\n\n" +
@@ -361,9 +376,11 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 // reads that HFDesk is not installed and that the desktop app starts normally
 // again. A registration that was there before the action, or one whose state
 // before the action could not be read, stays in place, and the report names what
-// remains and the elevated command that removes it. A removal that failed is
-// reported with its reason and with the same command, because the registration
-// is still there.
+// remains and the elevated command that removes it. The same holds for a
+// registration that was not removed because its instance still runs or starts, or
+// because its state could not be read; the report says what remains and never
+// claims that the instance stopped. A removal that failed is reported with its
+// reason and with the same command, because the registration is still there.
 //
 // The account and program guidance of a failed installation is part of every
 // outcome: it is the reason a first installation commonly fails, and it is what
@@ -376,17 +393,22 @@ func serviceInstallFailureText(err error, program string, aftermath serviceInsta
 	access := serviceAccountAccessText(program)
 
 	var outcome string
-	switch aftermath {
-	case serviceInstallRemoved:
-		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, and you can start the desktop app normally again.\n\n" +
-			"Only the registration was removed. The data directory of the service, if this attempt created one, stays where it is."
-	case serviceInstallRemovalFailed:
+	switch {
+	case errors.Is(removalErr, errServiceRemovalSkipped):
+		outcome = "The registration of this attempt was not removed, because the service may still be running, starting or stopping, or its state could not be read. " +
+			"The registration stays in place.\n\n" +
+			"While that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
+			"Remove it from an elevated shell with \"hfdesk service uninstall\" if you do not want to keep it."
+	case aftermath == serviceInstallRemovalFailed:
 		outcome = "The registration of this attempt could not be removed again: HFDesk stays installed as a Windows service although it does not run."
 		if removalErr != nil {
 			outcome += "\n\nThe removal failed: " + removalErr.Error()
 		}
 		outcome += "\n\nWhile that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
 			"Remove it from an elevated shell with \"hfdesk service uninstall\"."
+	case aftermath == serviceInstallRemoved:
+		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, and you can start the desktop app normally again.\n\n" +
+			"Only the registration was removed. The data directory of the service, if this attempt created one, stays where it is."
 	default:
 		outcome = "The registration was left in place: it was installed before this attempt, or its state before the attempt could not be read. " +
 			"The service stays installed, but it does not run.\n\n" +
