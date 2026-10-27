@@ -879,8 +879,8 @@ func TestServiceHelperReportsAWaitThatTimesOut(t *testing.T) {
 	if !strings.Contains((*messages)[0].text, "did not exit") {
 		t.Errorf("the report %q does not carry the reason of the failure", (*messages)[0].text)
 	}
-	if !strings.Contains((*messages)[0].text, "not started by this attempt") {
-		t.Errorf("the report %q does not say that the service was not started", (*messages)[0].text)
+	if !strings.Contains((*messages)[0].text, "did not confirm the service as running") {
+		t.Errorf("the report %q does not say that the attempt did not confirm the service", (*messages)[0].text)
 	}
 }
 

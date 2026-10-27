@@ -227,8 +227,8 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 }
 
 // TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData proves that a
-// failed service action reports the underlying error and the state that is
-// known afterwards.
+// failed service action reports the underlying error and what the attempt did
+// not confirm, instead of asserting a state it may not have observed.
 //
 // The desktop and the service keep separate data, so a failed action never
 // touches the settings, jobs and models of the desktop app. The report says so,
@@ -238,7 +238,7 @@ func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.
 	reason := errors.New("the service control manager refused the registration")
 
 	install := serviceActionFailureText(serviceActionInstall, reason)
-	for _, want := range []string{reason.Error(), "not started by this attempt", "were not touched"} {
+	for _, want := range []string{reason.Error(), "did not confirm the service as running", "were not touched", "hfdesk service status"} {
 		if !strings.Contains(install, want) {
 			t.Errorf("the report %q does not mention %q", install, want)
 		}
@@ -252,7 +252,7 @@ func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.
 	}
 
 	start := serviceActionFailureText(serviceActionStart, reason)
-	for _, want := range []string{reason.Error(), "is not running"} {
+	for _, want := range []string{reason.Error(), "start attempt was not confirmed", "hfdesk service status"} {
 		if !strings.Contains(start, want) {
 			t.Errorf("the report %q does not mention %q", start, want)
 		}

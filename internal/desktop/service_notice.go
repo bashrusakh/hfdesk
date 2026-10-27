@@ -268,10 +268,10 @@ func serviceNotInstalledText(action serviceAction) string {
 // serviceActionFailureText returns the report of a failed service action.
 //
 // The report carries the underlying error, so the user can see what the
-// service control manager refused, and the state that is known afterwards. It
-// never claims that a registration was restored: a failure can happen after
-// the registration was written, and the state of the service has to be read
-// before it is described.
+// service control manager refused, and what the attempt did not confirm about
+// the state afterwards. It never claims that a registration was restored: a
+// failure can happen after the registration was written, and the state of the
+// service has to be read before it is described.
 func serviceActionFailureText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
@@ -281,14 +281,16 @@ func serviceActionFailureText(action serviceAction, err error) string {
 	switch action {
 	case serviceActionInstall:
 		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
-			"The service was not started by this attempt. The settings, jobs and models of the desktop app were not touched."
+			"This attempt did not confirm the service as running. The settings, jobs and models of the desktop app were not touched. " +
+			"Run \"hfdesk service status\" to read the current state of the service."
 	case serviceActionUpdate:
 		return "HFDesk could not update the Windows service.\n\n" + detail + "\n\n" +
 			"The desktop app and the service keep separate data: the settings, jobs and models of the desktop app were not touched. " +
 			"Run \"hfdesk service status\" to read the current state of the service."
 	default:
 		return "HFDesk could not start the Windows service.\n\n" + detail + "\n\n" +
-			"The service is not running."
+			"The start attempt was not confirmed. " +
+			"Run \"hfdesk service status\" to read the current state of the service."
 	}
 }
 
