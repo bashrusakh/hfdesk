@@ -3621,7 +3621,7 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			name:     "the previous instance was started again",
 			facts:    scmRestartRollback{stopped: true, restored: true, programKnown: true, started: true, verified: true},
 			reason:   "",
-			want:     []string{"was stopped", "was restored", scmRollbackSuccessClaim},
+			want:     []string{"was stopped", "was restored", scmRollbackSuccessClaim, "the failure recovery of the registration was not part of the restore"},
 			verified: true,
 		},
 	}
@@ -3645,8 +3645,8 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			// A rollback that did not prove the stop never claims the
 			// restore: the registration of the failed installation is the
 			// one that describes the process that may still run.
-			if !tc.facts.stopped && strings.Contains(sentence, "the previous registration was restored") {
-				t.Errorf("the sentence %q claims the previous registration was restored while the instance of the failed installation was not proven to be stopped", sentence)
+			if !tc.facts.stopped && strings.Contains(sentence, "the configuration of the previous registration was restored") {
+				t.Errorf("the sentence %q claims the previous configuration was restored while the instance of the failed installation was not proven to be stopped", sentence)
 			}
 		})
 	}

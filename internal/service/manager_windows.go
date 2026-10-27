@@ -391,17 +391,18 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 // its identity and the status keeps describing one service.
 //
 // The directories of the instance are already created when the function is
-// called. A failure after the registration was written restores the previous
-// registration: the caller removes the directories the installation created, so
-// a failed installation leaves no half configured service and no empty
-// directories behind.
+// called. A failure after the registration was written restores the
+// configuration of the previous registration: the caller removes the
+// directories the installation created, so a failed installation leaves no
+// half configured service and no empty directories behind.
 //
 // A replaced registration that was running is restarted and verified. A
 // registration alone does not switch the process that already runs, so a
 // failure of that restart or of the verification stops the instance the
-// installation started, restores the previous registration, brings the previous
-// program back into service and verifies it: the machine never keeps a
-// registration the installation failed to put into service.
+// installation started, restores the configuration of the previous
+// registration, brings the previous program back into service and verifies it:
+// the machine never keeps a registration the installation failed to put into
+// service.
 func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) error {
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
@@ -510,12 +511,19 @@ const (
 	scmRollbackRestart
 )
 
-// rollbackInstallation restores the registration a failed installation replaced.
+// rollbackInstallation restores the configuration of the registration a failed
+// installation replaced.
 //
 // The failure of the installation is the error the caller gets; the outcome of
 // the restore is reported next to it, so a caller never sees an unqualified
-// failure for a registration that was restored and never a success for one that
-// was not.
+// failure for a configuration that was restored and never a success for one
+// that was not.
+//
+// The restore is the configuration of the registration and not the whole
+// registration: the failure recovery is not part of it. An installation that
+// found a registration without a policy configured the policy of HFDesk, and
+// the write back leaves that policy in place. The report therefore names what
+// was restored instead of claiming a registration that is back as it was.
 //
 // The running instance is only touched when the installation had switched it: a
 // failure that happens while it still runs leaves it alone. The restart rollback
@@ -541,7 +549,7 @@ func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Servi
 		// previous one to restore, and the registration is removed again.
 		return fmt.Errorf("%w (the registration of the failed installation was removed)", failure)
 	}
-	return fmt.Errorf("%w (the previous registration was restored, the running instance was not restarted)", failure)
+	return fmt.Errorf("%w (the configuration of the previous registration was restored, the running instance was not restarted; the failure recovery of the registration is not part of the restore)", failure)
 }
 
 // scmRestartRollback is what the restart rollback of a failed installation
@@ -549,16 +557,21 @@ func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Servi
 //
 // The facts are what the rollback observed and not what it attempted: a
 // sentence composed from them never claims more than the rollback can prove.
-// The registration and the process that runs are only described together: a
-// rollback that cannot prove that the instance of the failed installation
-// stopped never claims that the previous registration was restored, because a
-// registration that names one program while another one runs describes the
-// machine wrongly.
+// They describe the configuration of the registration and the instance that
+// runs, not the whole registration: the restore writes the configuration back
+// and leaves the failure recovery as the installation configured it, so no
+// sentence reports the recovery as restored. The registration and the process
+// that runs are only described together: a rollback that cannot prove that the
+// instance of the failed installation stopped never claims that the previous
+// configuration was restored, because a registration that names one program
+// while another one runs describes the machine wrongly.
 type scmRestartRollback struct {
 	// stopped reports whether the instance the failed installation started
 	// was proven to be stopped.
 	stopped bool
-	// restored reports whether the previous registration is in place again.
+	// restored reports whether the configuration of the previous
+	// registration is in place again. The failure recovery is not part of
+	// that configuration, and the rollback never restores it.
 	restored bool
 	// programKnown reports whether the restored registration names the
 	// program the previous instance ran.
@@ -581,6 +594,13 @@ type scmRestartRollback struct {
 // did not reach: the claim that the previous instance was started again is made
 // for a verified rollback only, and a start that could not be proven reports
 // what was proven instead.
+//
+// The sentence names what the rollback really restored: the configuration of
+// the previous registration, which is the command line and the settings the
+// registration is written with. The failure recovery of the registration is not
+// part of that configuration and the rollback does not touch it, so the
+// sentence of a completed rollback says that the failure recovery stays in
+// place instead of claiming the whole registration back.
 func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string {
 	switch {
 	case !facts.stopped:
@@ -597,16 +617,16 @@ func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string 
 		// read, so there is no program to start: the rollback reports the
 		// registration and the state of the instance and never claims a
 		// start it did not make.
-		return fmt.Sprintf("the instance of the failed installation was stopped and the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
+		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
 	case !facts.started:
 		// The start was refused, or it was accepted and the instance never
 		// proved to run the previous program. Neither is a claim about the
 		// program that runs: the reason names what was observed.
-		return fmt.Sprintf("the instance of the failed installation was stopped and the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
+		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
 	case !facts.verified:
-		return "the instance of the failed installation was stopped and the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
+		return "the instance of the failed installation was stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
 	default:
-		return "the instance of the failed installation was stopped, the previous registration was restored and the previous instance was started again"
+		return "the instance of the failed installation was stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it"
 	}
 }
 
@@ -687,15 +707,21 @@ func scmRunningProcessID(handle *mgr.Service) uint32 {
 	return status.ProcessId
 }
 
-// restoreSCMRegistration puts the registration back that a failed installation
-// replaced.
+// restoreSCMRegistration puts the configuration of the registration back that a
+// failed installation replaced.
 //
 // A registration of a first installation is removed: there was none before it,
 // and a failed installation leaves nothing behind.
 //
 // A replaced registration is written back with its full configuration, and the
-// configuration is read back afterwards. A caller is only told that the previous
-// registration was restored when it really holds it again.
+// configuration is read back afterwards: the read back proves the command line,
+// which is what names the program of the instance. A caller is only told that
+// the previous configuration was restored when the registration holds the
+// previous command line again.
+//
+// The failure recovery is not part of a registration configuration: the write
+// back leaves the recovery actions and the non-crash switch as the installation
+// configured them, so a policy the installation wrote stays in place.
 func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistration) error {
 	if !previous.present {
 		if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
