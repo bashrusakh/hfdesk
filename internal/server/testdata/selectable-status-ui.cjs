@@ -6,6 +6,11 @@
 // before syncLocalAnalysisStatus, then renderSelectableItems reads the result.
 // It also feeds real job_update/init WebSocket messages through
 // handleWSMessage and flushes the coalesced live reconciliation.
+//
+// The EXL branch-variant path is covered the same way: a branch item is keyed
+// by its revision, its presence comes from the qualified branch-variant lookup
+// (GET /api/cache/<repo>?branchVariant=true&revision=...) instead of the
+// repository file list, and its download control posts a whole-branch request.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -23,6 +28,12 @@ const ARTIFACT_KEY = `artifact:${JSON.stringify(FILES.map(name => name.toLowerCa
 const MODEL_STORAGE = `dlStatus:${REPO}:model`;
 const DATASET_STORAGE = `dlStatus:${REPO}:dataset`;
 const LEGACY_STORAGE = `dlStatus:${REPO}`;
+// An EXL branch variant is one whole revision. Its status is keyed by the
+// revision instead of a file set, and its presence comes from the qualified
+// branch-variant lookup instead of the repository file list.
+const BRANCH_REVISION = '4.00bpw';
+const BRANCH_COMMIT = '2222222222222222222222222222222222222222';
+const BRANCH_KEY = `branchVariant:${BRANCH_REVISION}`;
 
 let assertions = 0;
 function eq(actual, expected, message) { assertions++; assert.equal(actual, expected, message); }
@@ -70,22 +81,93 @@ const localStorage = {
 const cacheRequests = [];
 function lastCacheRequest() { return cacheRequests[cacheRequests.length - 1] || ''; }
 
+// The download control previews its destination and then posts the download
+// request. The captured body is what the server's branch-variant admission
+// has to accept.
+const downloadRequests = [];
+
 let cacheState = { status: 200, files: [], error: null, parseError: null };
-const fetch = async (rawPath) => {
-  const requestPath = String(rawPath);
-  if (!requestPath.startsWith('/api/cache/')) {
-    throw new Error('unexpected fetch: ' + rawPath);
-  }
-  cacheRequests.push(requestPath);
-  if (cacheState.error) throw cacheState.error;
-  return {
-    status: cacheState.status,
-    ok: cacheState.status >= 200 && cacheState.status < 300,
-    json: async () => {
-      if (cacheState.parseError) throw cacheState.parseError;
-      return { files: cacheState.files.map(name => ({ name })) };
-    }
+let branchState = { status: 200, downloaded: false, error: null, parseError: null };
+
+// The presence response mirrors the documented shape of
+// GET /api/cache/<repo>?branchVariant=true&revision=<rev>: a qualified lookup
+// for one revision, not the repository file list.
+function branchPresence(revision, downloaded) {
+  const presence = {
+    repo: REPO,
+    type: 'model',
+    branchVariant: true,
+    revision,
+    downloaded,
+    downloadStatus: downloaded ? 'complete' : 'missing',
+    storageMode: 'hf-cache',
+    destinationRoot: '/cache/hub/models--owner--model',
+    expectedFiles: downloaded ? 1 : 0,
+    files: downloaded ? [{ name: 'config.json', size: 123 }] : []
   };
+  if (downloaded) {
+    presence.commit = BRANCH_COMMIT;
+    presence.artifactPath = `/cache/hub/models--owner--model/.hfdesk-variants/${revision}/${BRANCH_COMMIT}/hfd.yaml`;
+  }
+  return presence;
+}
+
+const fetch = async (rawPath, options = {}) => {
+  const requestPath = String(rawPath);
+  if (requestPath.startsWith('/api/cache/')) {
+    cacheRequests.push(requestPath);
+    const query = new URLSearchParams(requestPath.split('?')[1] || '');
+    if (query.get('branchVariant') === 'true') {
+      if (branchState.error) throw branchState.error;
+      const revision = query.get('revision') || '';
+      // The server rejects a presence query that names no branch revision.
+      if (!revision) {
+        return { status: 400, ok: false, json: async () => ({ error: 'Invalid revision' }) };
+      }
+      return {
+        status: branchState.status,
+        ok: branchState.status >= 200 && branchState.status < 300,
+        json: async () => {
+          if (branchState.parseError) throw branchState.parseError;
+          return branchPresence(revision, branchState.downloaded);
+        }
+      };
+    }
+    if (cacheState.error) throw cacheState.error;
+    return {
+      status: cacheState.status,
+      ok: cacheState.status >= 200 && cacheState.status < 300,
+      json: async () => {
+        if (cacheState.parseError) throw cacheState.parseError;
+        return { files: cacheState.files.map(name => ({ name })) };
+      }
+    };
+  }
+  if (requestPath === '/api/diskfree') {
+    return {
+      status: 200,
+      ok: true,
+      json: async () => ({ free: 1024 * 1024 * 1024, path: '/cache/hub/models--owner--model' })
+    };
+  }
+  if (requestPath === '/api/download') {
+    const body = options?.body ? JSON.parse(options.body) : null;
+    downloadRequests.push({ path: requestPath, body });
+    return {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        id: 'branch-download',
+        repo: body?.repo,
+        revision: body?.revision,
+        status: 'queued',
+        branchVariant: body?.branchVariant === true,
+        filters: [],
+        excludes: []
+      })
+    };
+  }
+  throw new Error('unexpected fetch: ' + rawPath);
 };
 
 const window = {
@@ -162,7 +244,20 @@ vm.runInNewContext(source, context);
 const ui = window.test;
 ui.state.settings = {};
 
-function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = null, cacheParseError = null, initial = {}, dataset = false, items = [] } = {}) {
+function reset({
+  jobs = [],
+  cacheFiles = [],
+  cacheStatus = 200,
+  cacheError = null,
+  cacheParseError = null,
+  initial = {},
+  dataset = false,
+  items = [],
+  branchDownloaded = false,
+  branchStatus = 200,
+  branchError = null,
+  branchParseError = null
+} = {}) {
   ui.state.jobs.clear();
   jobs.forEach((job, index) => ui.state.jobs.set(job.id || `job-${index}`, job));
   ui.state.settings = {};
@@ -170,11 +265,13 @@ function reset({ jobs = [], cacheFiles = [], cacheStatus = 200, cacheError = nul
   ui.resetLiveReconcile();
   domNodes.delete('#selectableItems');
   cacheRequests.length = 0;
+  downloadRequests.length = 0;
   storage.clear();
   if (Object.keys(initial).length) {
     storage.set(dataset ? DATASET_STORAGE : MODEL_STORAGE, JSON.stringify(initial));
   }
   cacheState = { status: cacheStatus, files: cacheFiles, error: cacheError, parseError: cacheParseError };
+  branchState = { status: branchStatus, downloaded: branchDownloaded, error: branchError, parseError: branchParseError };
 }
 
 async function reconcile(items, { dataset = false } = {}) {
@@ -246,6 +343,37 @@ function visionItem(files, label = 'MMProj', filterValue = 'mmproj') {
   };
 }
 
+// An EXL branch variant is offered as one whole-revision item. It selects no
+// files: the branch is named by its revision.
+function branchItem(revision = BRANCH_REVISION, label = revision) {
+  return {
+    id: `exl-branch:${revision}`,
+    category: 'quantization',
+    label,
+    revision,
+    branch_variant: true,
+    method: 'exl3',
+    bits_per_weight: 4,
+    head_bits: 5
+  };
+}
+
+// A branch job is a whole-revision download: it selects no files.
+function branchJob(overrides = {}) {
+  return {
+    id: 'branch',
+    repo: REPO,
+    revision: BRANCH_REVISION,
+    status: 'running',
+    isDataset: false,
+    branchVariant: true,
+    filters: [],
+    excludes: [],
+    files: [],
+    ...overrides
+  };
+}
+
 function liveJob(overrides = {}) {
   return {
     id: 'live',
@@ -280,6 +408,29 @@ function assertRunning(html, message) {
 function assertQueued(html, message) {
   match(html, /quant-dl-btn-queued/, `${message}: queued chip`);
   doesNotMatch(html, /data-download=/, `${message}: no Download button while queued`);
+}
+
+// A done branch variant keeps its download control: the user can download the
+// branch again. The done marker is the chip class, not the absence of a
+// button, so the branch row needs its own assertion.
+function assertBranchDone(html, label, message) {
+  const row = label ? rowFor(html, label) : html;
+  match(row, /quant-dl-btn-done/, `${message}: done chip`);
+  doesNotMatch(row, /quant-dl-btn-running|quant-dl-btn-queued/, `${message}: no active chip`);
+}
+
+// The rendered control carries the request payload the download button posts.
+function downloadPayload(rowHtml) {
+  const found = /data-download="([^"]*)"/.exec(String(rowHtml));
+  if (!found) throw new Error('row has no download control');
+  return JSON.parse(decodeURIComponent(found[1]));
+}
+
+function downloadButton(payload) {
+  return {
+    dataset: { download: encodeURIComponent(JSON.stringify(payload)) },
+    closest: () => null
+  };
 }
 
 const scenarios = [];
@@ -778,6 +929,152 @@ scenario('analysis warning renders escaped message, causes, and retry', async ()
     }]
   }, { showRetry: false });
   doesNotMatch(pickerHtml, /data-analysis-warning-retry/, 'revision picker warning omits the retry button');
+});
+
+scenario('branch variant reported present is done', async () => {
+  const item = branchItem();
+  eq(ui.selectableStatusKey(item), BRANCH_KEY, 'a branch item is keyed by its revision');
+  reset({ branchDownloaded: true, items: [item] });
+  const { map, html } = await reconcile([item]);
+  eq(map[BRANCH_KEY], 'done', 'a present branch variant must be done');
+  assertBranchDone(html, BRANCH_REVISION, 'present branch variant');
+  match(lastCacheRequest(), /^\/api\/cache\/owner\/model\?branchVariant=true&revision=/, 'branch presence uses the qualified lookup');
+  const branchQuery = new URLSearchParams({ branchVariant: 'true', revision: BRANCH_REVISION }).toString();
+  eq(lastCacheRequest(), `/api/cache/${REPO}?${branchQuery}`, 'the qualified lookup names the branch revision');
+  eq(cacheRequests.length, 1, 'a branch-only analysis does not read the repository file list');
+});
+
+scenario('running branch job is not done', async () => {
+  const item = branchItem();
+  reset({ jobs: [branchJob({ status: 'running' })], items: [item] });
+  const { map, html } = await reconcile([item]);
+  eq(map[BRANCH_KEY], 'running', 'a running branch job must keep the running state');
+  assertRunning(rowFor(html, BRANCH_REVISION), 'running branch variant');
+
+  // A branch whose download is still running is not finished, even when the
+  // presence lookup already reports the variant as downloaded.
+  reset({ jobs: [branchJob({ status: 'running' })], branchDownloaded: true, items: [item] });
+  const active = await reconcile([item]);
+  eq(active.map[BRANCH_KEY], 'running', 'a running branch job stays running while the variant is present');
+  assertRunning(rowFor(active.html, BRANCH_REVISION), 'running branch variant with presence');
+});
+
+scenario('queued branch job is not done', async () => {
+  const item = branchItem();
+  reset({ jobs: [branchJob({ status: 'queued' })], items: [item] });
+  const { map, html } = await reconcile([item]);
+  eq(map[BRANCH_KEY], 'queued', 'a queued branch job must keep the queued state');
+  assertQueued(rowFor(html, BRANCH_REVISION), 'queued branch variant');
+});
+
+scenario('branch job for another revision does not mark the branch', async () => {
+  const item = branchItem();
+  const other = branchItem('8.00bpw');
+  reset({
+    jobs: [branchJob({ id: 'other-branch', revision: '8.00bpw', status: 'running' })],
+    items: [item, other]
+  });
+  const { map, html } = await reconcile([item, other]);
+  eq(map[BRANCH_KEY], undefined, 'another revision\'s job must not mark this branch');
+  eq(map[ui.selectableStatusKey(other)], 'running', 'the job marks the branch with its own revision');
+  assertIdle(html, BRANCH_REVISION, 'unrelated branch row');
+  assertRunning(rowFor(html, '8.00bpw'), 'matching branch row');
+});
+
+scenario('branch job with file selection does not mark the branch', async () => {
+  // A whole-branch job selects no files. A job that carries a file selection
+  // is not the branch download, whatever its branch flag says.
+  const item = branchItem();
+  reset({
+    jobs: [branchJob({ status: 'running', filters: ['./config.json'] })],
+    items: [item]
+  });
+  const { map, html } = await reconcile([item]);
+  eq(map[BRANCH_KEY], undefined, 'a branch job that selects files must not mark the branch');
+  assertIdle(html, BRANCH_REVISION, 'unselected branch row');
+});
+
+scenario('live branch job updates the branch row', async () => {
+  const item = branchItem();
+  reset({ items: [item] });
+  const rows = installRows([item]);
+  ui.handleWSMessage({ type: 'job_update', data: branchJob({ status: 'running' }) });
+  await ui.flushLiveReconcile();
+  eq(ui.getDlStatus(REPO, false)[BRANCH_KEY], 'running', 'the live branch job marks the branch row');
+  eq(rows[0].dataset.dlStatus, 'running', 'the branch row shows running');
+  match(rows[0].chip.outerHTML, /quant-dl-btn-running/, 'the branch row chip shows running');
+  doesNotMatch(rows[0].chip.outerHTML, /quant-dl-btn-done/, 'the branch row is not done while its job runs');
+});
+
+scenario('completed branch job is not proof that the variant is present', async () => {
+  const item = branchItem();
+  reset({ jobs: [branchJob({ status: 'completed' })], items: [item] });
+  const { map, html } = await reconcile([item]);
+  eq(map[BRANCH_KEY], undefined, 'a completed branch job must not make the variant done');
+  assertIdle(html, BRANCH_REVISION, 'absent branch variant');
+
+  // A failing presence lookup cannot confirm the variant either.
+  reset({
+    jobs: [branchJob({ status: 'completed' })],
+    branchError: new Error('branch presence lookup failed'),
+    initial: { [BRANCH_KEY]: 'done' },
+    items: [item]
+  });
+  const failed = await reconcile([item]);
+  eq(failed.map[BRANCH_KEY], undefined, 'a failed branch presence lookup must clear a stored done');
+  assertIdle(failed.html, BRANCH_REVISION, 'unverified branch variant');
+
+  // A presence endpoint that answers with a server error is not a confirmation.
+  reset({
+    jobs: [branchJob({ status: 'completed' })],
+    branchStatus: 500,
+    initial: { [BRANCH_KEY]: 'done' },
+    items: [item]
+  });
+  const errored = await reconcile([item]);
+  eq(errored.map[BRANCH_KEY], undefined, 'a failed branch presence status must clear a stored done');
+  assertIdle(errored.html, BRANCH_REVISION, 'failed branch presence variant');
+});
+
+scenario('branch and artifact statuses stay independent', async () => {
+  const artifact = artifactItem(FILES, 'Q4_0');
+  const branch = branchItem();
+  reset({ cacheFiles: FILES, branchDownloaded: true, items: [artifact, branch] });
+  const { map, html } = await reconcile([artifact, branch]);
+  eq(ui.selectableStatusKey(artifact), ARTIFACT_KEY, 'the artifact keeps its own status key');
+  eq(ui.selectableStatusKey(branch), BRANCH_KEY, 'the branch keeps its own status key');
+  eq(map[ARTIFACT_KEY], 'done', 'the artifact is done from the repository file list');
+  eq(map[BRANCH_KEY], 'done', 'the branch is done from the qualified lookup');
+  assertDone(html, 'Q4_0', 'artifact row');
+  assertBranchDone(html, BRANCH_REVISION, 'branch row');
+});
+
+scenario('branch download control posts a whole-branch request', async () => {
+  const item = branchItem();
+  reset({ items: [item] });
+  const row = rowFor(ui.renderSelectableItems([item], 'selectableItems'), BRANCH_REVISION);
+  match(row, /data-download="/, 'the branch row offers a download control');
+  const payload = downloadPayload(row);
+  eq(payload.branchVariant, true, 'the control marks the request as a branch variant');
+  eq(payload.revision, BRANCH_REVISION, 'the control carries the branch revision');
+  eq(payload.isDataset, false, 'the control is not a dataset download');
+  eq(payload.localRepo, undefined, 'the control does not redirect to a local repository');
+
+  await window.downloadQuantFromButton(downloadButton(payload));
+
+  eq(downloadRequests.length, 1, 'the branch control posts one download request');
+  const body = downloadRequests[0].body;
+  eq(body.repo, REPO, 'the request names the analyzed repository');
+  eq(body.revision, BRANCH_REVISION, 'the request names the branch revision');
+  eq(body.branchVariant, true, 'the request selects a whole branch');
+  eq(body.dataset, false, 'the request is not a dataset download');
+  eq((body.filters || []).length, 0, 'the request carries no file selection');
+  eq((body.excludes || []).length, 0, 'the request carries no excludes');
+  eq(body.appendFilterSubdir || false, false, 'the request does not ask for a filter subdir');
+  eq(body.localRepo || '', '', 'the request carries no localRepo redirection');
+  eq(ui.getDlStatus(REPO, false)[BRANCH_KEY], 'queued', 'the branch row is queued after the request');
+  // The Go test feeds this body to the server's own branch-variant admission.
+  console.log('BRANCH_DOWNLOAD_REQUEST ' + JSON.stringify(body));
 });
 
 (async () => {
