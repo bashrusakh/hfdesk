@@ -9,8 +9,9 @@ package hfdownloader
 // and the cleanup resolve that ONE identity:
 //
 //   - the domain's lifetime lock is the persistent sibling of the MULTIPART
-//     staging name, <destination>.incomplete.lock - the very lock the
-//     multipart route's staging claim already takes;
+//     staging name, <destination>.incomplete.lock - the item-level
+//     destination-domain lock every route acquires exactly once; the multipart
+//     claim takes no lock of its own;
 //   - the single-request route holds that domain while it transfers.
 //
 // One lock file therefore excludes every pair of writers of the same flat

@@ -164,10 +164,12 @@ The domain identity is name-based and differs by destination kind:
     path and the lifetime lock is the persistent sibling
     `<destination>.incomplete.lock`. No new artifact name appears next to the
     user's model file. Because every route takes that domain, every flat
-    download leaves the persistent zero-byte `<destination>.incomplete.lock`
-    next to the file, even when no multipart transfer ran: the shared
-    domain/staging lock is created by the item-level acquisition, not by a
-    multipart transfer. The unknown-size hand-off from the multipart route to
+    TRANSFER leaves the persistent zero-byte
+    `<destination>.incomplete.lock` next to the file, even when no multipart
+    transfer ran: the shared domain/staging lock is created by the item-level
+    acquisition, not by a multipart transfer. A destination skipped before that
+    acquisition (an already complete file) leaves no lock. The unknown-size
+    hand-off from the multipart route to
     the single-request path keeps the domain the item already holds instead of
     taking it a second time.
 
@@ -238,10 +240,11 @@ reintroduced: in flat/output mode it was literally the same file as the domain
 lock, and a writer that took it from inside the transfer would contend with
 itself. MIXED-VERSION WRITERS ARE INTENTIONALLY UNSUPPORTED: a branch-only
 build that still held `<staging>.lock` instead of the destination domain is not
-supported, because such a writer's record is either an old/unsupported format
-(discarded) or an unfenced version-4 record (refused as unproven and preserved),
-and no current code competes for its obsolete lock. Do not reintroduce a
-compatibility path for mixed-version writers.
+supported: a fenced (or provably dead/self) old/unsupported record is discarded,
+while an unfenced record whose owner cannot be proven dead — of any version —
+is refused as unproven and preserved, and no current code competes for its
+obsolete lock. Do not reintroduce a compatibility path for mixed-version
+writers.
 
 The same distinction applies to claims and cleanup: a free domain lock is
 authoritative only for a `LockFenced` record. An unfenced record belongs to a
@@ -280,7 +283,10 @@ is deliberately not consulted, because no current writer takes it and treating
 it as ownership would report a live writer that does not exist. A PROVEN live
 owner (the domain lock is held exclusively) is `BlobDownloading`; the caller
 must NOT skip that item, because the file is not present while the owner holds
-it. A provably dead owner is `BlobStale` and may be resumed. An unknown
+it. A provably dead owner is `BlobStale` and may be resumed. A free lock plus
+an unreadable or malformed record is also `BlobStale`, but conservatively: the
+report does not prove the record is resumable, and the claim refuses it as
+unproven and preserves it. An unknown
 ownership state — the ownership probe failed, or the platform cannot represent
 the lock — is `BlobOwnershipUnknown` together with an error that wraps
 `ErrBlobOwnershipUnknown`. The caller surfaces that failure instead of skipping
@@ -343,12 +349,15 @@ otherwise) and persist their committed byte ranges in versioned metadata next
 to it, so an interrupted transfer resumes from its durable high-water marks
 without re-downloading valid bytes — even when the connection count changes
 between runs. Range-record version 4 marks ranges Done only after the response
-body reaches clean EOF. It is the ONLY resumable version: a record of any other
-version — including a branch-only version-3 record whose `legacy_migrated` flag
-described imported bytes — is an old or unsupported format, so it is discarded
-under the claim's ownership and local metadata serialization, and the file is
-re-downloaded from zero. Partial downloads from old formats are never migrated;
-a warning is logged when old artifacts are discarded.
+body reaches clean EOF. It is the ONLY resumable version. A FENCED record of
+any other version — including a branch-only version-3 record whose
+`legacy_migrated` flag described imported bytes — is discarded under the
+claim's ownership and local metadata serialization, and the file is
+re-downloaded from zero. So is an unfenced old-version record whose owner is
+provably dead or is this process. An UNFENCED old-version record whose owner
+cannot be proven dead is refused as unproven before the version-discard branch
+and preserved. Partial downloads from old formats are never migrated; a warning
+is logged when old artifacts are discarded.
 
 A current version-4 record is resumable only when its identity matches the
 current item exactly: same repository, resolved commit, relative path and

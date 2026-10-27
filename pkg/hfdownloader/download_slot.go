@@ -67,8 +67,7 @@ type downloadSlotWaitNotice interface {
 }
 
 // downloadSlotWaitNoticeKey is the context key under which an item's slot
-// notice is carried to the ownership-domain acquisition and the multipart
-// staging claim.
+// notice is carried to the item's destination ownership-domain acquisition.
 type downloadSlotWaitNoticeKey struct{}
 
 // withDownloadSlotWaitNotice attaches an item's download-slot notice to its
@@ -126,8 +125,7 @@ func (l *downloadSlotLease) release() {
 	<-l.lim
 }
 
-// beginWait returns the slot for the duration of an ownership-domain wait or
-// a staging-claim wait.
+// beginWait returns the slot for the duration of an ownership-domain wait.
 func (l *downloadSlotLease) beginWait() {
 	l.release()
 }

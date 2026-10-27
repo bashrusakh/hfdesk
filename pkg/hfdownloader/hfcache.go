@@ -382,7 +382,13 @@ const (
 	// either, so the claim refuses it as unproven instead of taking it over.
 	BlobDownloading
 
-	// BlobStale means an incomplete download exists but is stale (can be taken over).
+	// BlobStale means an incomplete download exists and no live owner is
+	// proven: on supported platforms a free destination domain lock plus a
+	// lock-fenced record proves the owner gone, as does same-host process
+	// evidence. A free lock plus an unreadable or malformed record is reported
+	// stale CONSERVATIVELY: that report is not proof the record is resumable,
+	// and the claim refuses it as unproven (ErrStagingOwnershipUnproven)
+	// instead of taking it over.
 	BlobStale
 
 	// BlobOwnershipUnknown means the ownership of the incomplete download could
@@ -429,7 +435,10 @@ func (s BlobStatus) String() string {
 //     content-addressed target afterwards;
 //   - a PROVABLY dead owner (a free lock plus a lock-fenced record, or
 //     same-host process evidence that the recorded owner is gone) is reported
-//     as BlobStale, so the caller may resume it;
+//     as BlobStale, so the caller may resume it. A free lock plus an
+//     unreadable or malformed record is also reported as BlobStale, but only
+//     conservatively: that report proves nothing about resumability, and the
+//     claim refuses the record as unproven instead of taking it over;
 //   - an UNKNOWN ownership state (the ownership probe failed, or this
 //     platform cannot represent the lock) is reported as
 //     BlobOwnershipUnknown together with an error that wraps
@@ -446,7 +455,10 @@ func (s BlobStatus) String() string {
 // plus a lock-fenced record proves the current-version owner is gone. A free
 // lock plus an UNFENCED record is not stale: no live owner is proven either, so
 // the record is preserved, and the claim refuses it with the unproven-ownership
-// error rather than taking it over.
+// error rather than taking it over. A free lock plus an unreadable or malformed
+// record is reported BlobStale conservatively for the caller, but the record is
+// preserved and the claim likewise refuses it as unproven; the status alone is
+// never a resumability decision.
 func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) {
 	blobPath := r.BlobPath(sha256)
 	incompletePath := r.IncompletePath(sha256)
@@ -537,24 +549,6 @@ func (r *RepoDir) readIncompleteMeta(path string) (*IncompleteMeta, error) {
 		return nil, err
 	}
 	return &meta, nil
-}
-
-// CleanupIncomplete removes the .incomplete.meta and .incomplete files. The
-// metadata is removed first so a crash cannot leave a record claiming bytes
-// whose payload no longer exists.
-func (r *RepoDir) CleanupIncomplete(sha256 string) error {
-	var errs []error
-	if err := os.Remove(r.IncompleteMetaPath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		// Do not delete the payload if its record could not be removed:
-		// that would leave a record claiming bytes that no longer exist.
-		errs = append(errs, err)
-	} else if err := os.Remove(r.IncompletePath(sha256)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("cleanup incomplete: %v", errs)
-	}
-	return nil
 }
 
 // FinalizeBlob moves a completed .incomplete file to its final blob location.

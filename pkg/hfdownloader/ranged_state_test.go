@@ -662,6 +662,64 @@ func TestStagingPublishAlreadyCanceledContextCannotPublish(t *testing.T) {
 	}
 }
 
+// cancelAfterEarlyGuardContext cancels its inner context the first time Err is
+// consulted and reports nil for that first consultation. It models a
+// cancellation that arrives after publish's early ownership/cancellation guard
+// but before placement, so only the final pre-placement check can observe it.
+type cancelAfterEarlyGuardContext struct {
+	context.Context
+	cancel context.CancelFunc
+	checks int
+}
+
+func (c *cancelAfterEarlyGuardContext) Err() error {
+	c.checks++
+	if c.checks == 1 {
+		c.cancel()
+		return nil
+	}
+	return c.Context.Err()
+}
+
+// TestStagingPublishCancellationAfterEarlyGuardStopsBeforePlacement pins the
+// final cancellation check immediately before placement: a cancellation that
+// lands after the earlier guard must still prevent the rename, and the staged
+// payload and record must stay on disk for a resume.
+func TestStagingPublishCancellationAfterEarlyGuardStopsBeforePlacement(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "late-cancel.incomplete")
+	dst := filepath.Join(dir, "late-cancel.bin")
+	metaPath := staging + ".meta"
+	if err := os.WriteFile(staging, []byte("complete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	it := PlanItem{RelativePath: "late-cancel.bin", Size: 8}
+	meta := newClaimMeta(it, Job{Repo: "o/r"}, "commit", true)
+	meta.LockFenced = true
+	meta.Ranges = buildRangeLayout(8, 1)
+	meta.Ranges[0].Committed, meta.Ranges[0].Done = 8, true
+	if err := writeStagingMeta(metaPath, &meta); err != nil {
+		t.Fatal(err)
+	}
+	domain := acquireTestDomain(t, dst)
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAfterEarlyGuardContext{Context: base, cancel: cancel}
+	d := &stagingDownload{ctx: ctx, stg: staging, dst: dst, pub: dst, meta: metaPath, it: it, job: Job{Repo: "o/r"}, domain: domain, ranges: meta.Ranges}
+	if err := d.publish(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish error = %v, want context canceled by the final pre-placement guard", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("destination published after the late cancellation: %v", err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("the staged payload was not preserved for a resume: %v", err)
+	}
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Fatalf("the staged record was not preserved for a resume: %v", err)
+	}
+}
+
 // TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4 pins the S0
 // format break: a version-3 record carrying legacy_migrated:true is not resume
 // state. Its record and payload are discarded under the claim, the file is

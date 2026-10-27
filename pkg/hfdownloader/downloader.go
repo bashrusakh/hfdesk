@@ -1339,13 +1339,14 @@ func removePartialWithIdentity(dst string) {
 // A legacy/output-mode destination is not cache-scoped: it has no blobs/
 // style internal identity of its own. It nevertheless owns ONE domain, and
 // that domain borrows the MULTIPART staging name: the destination's domain
-// lock is the persistent sibling of <destination>.incomplete, which is the
-// very lock the multipart route's staging claim already takes. Both routes
-// and the cleanup therefore resolve the SAME lock file, so no new artifact
-// name appears next to the user's model file, and the cleanup protects a
-// flat destination exactly like a cache one: a live owner of the destination
-// keeps its .part/.incomplete/.meta artifacts, and the job that owns the
-// destination can still clean up its own.
+// lock is the persistent sibling of <destination>.incomplete. That is the
+// item-level destination-domain lock every route acquires exactly once,
+// before the HEAD/claim; the multipart claim takes no lock of its own. Both
+// routes and the cleanup therefore resolve the SAME lock file, so no new
+// artifact name appears next to the user's model file, and the cleanup
+// protects a flat destination exactly like a cache one: a live owner of the
+// destination keeps its .part/.incomplete/.meta artifacts, and the job that
+// owns the destination can still clean up its own.
 //
 // settings determines the mode (HF cache vs legacy) the same way
 // Download() does: HF cache is the default when neither CacheDir nor

@@ -32,9 +32,15 @@
   never skipped or taken over; a writer that cannot acquire the domain fails
   before writing a payload and preserves existing partial data. The lock file is
   persistent and is never unlinked. Mixed-version branch-only writers that still
-  held the obsolete `<staging>.lock` are intentionally unsupported: their
-  records are old/unsupported (discarded) or unfenced version-4 (refused as
-  unproven and preserved).
+  held the obsolete `<staging>.lock` are intentionally unsupported: a fenced (or
+  provably dead/self) old/unsupported record is discarded, while an unfenced
+  record whose owner cannot be proven dead, of any version, is refused as
+  unproven and preserved.
+- The exported `(*hfdownloader.RepoDir).CleanupIncomplete` helper has been
+  removed (#140): it deleted a staging payload and its record without the
+  destination ownership domain or a record check, so it could remove another
+  live writer's partial. No in-tree code called it, and cleanup now runs only
+  through the two domain-fenced entry points.
 - Multipart downloads write ranged workers directly into one preallocated
   staging file at their assigned offsets and resume from durable per-range
   metadata, so finalization is an atomic rename plus link work, never a
@@ -43,11 +49,13 @@
   tiles the file with normalized completion, and its payload exists at the
   expected size before any create/truncate; a record whose payload was deleted
   or resized is discarded rather than published as zeros. The ranged record is
-  version 4 and is the only resumable version; every older/unsupported record
-  (including a branch-only version-3 record that described imported bytes) and
-  every pre-#140 `.part-NN`/`.parts.json` family
-  is discarded, never migrated, and the file is re-downloaded from zero while
-  already-published content stays untouched. Existing version-4 state keeps the
+  version 4 and is the only resumable version; a fenced older/unsupported record
+  (or one whose owner is provably dead or is this process, including a
+  branch-only version-3 record that described imported bytes) is discarded,
+  never migrated, and the file is re-downloaded from zero while already-published
+  content stays untouched, while an unfenced record whose owner cannot be
+  proven dead is refused as unproven and preserved. Every pre-#140
+  `.part-NN`/`.parts.json` family is likewise discarded, never migrated. Existing version-4 state keeps the
   multipart route for a ranged-capable item even below the configured threshold,
   so a threshold change does not ignore valid state; an item without usable
   state keeps the configured routing. Without range support the downloader

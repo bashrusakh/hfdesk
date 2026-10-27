@@ -302,6 +302,37 @@ func TestRepoDir_CheckBlob(t *testing.T) {
 			t.Errorf("status = %v, want BlobStale", status)
 		}
 	})
+
+	t.Run("free lock with malformed record is conservatively stale and preserved", func(t *testing.T) {
+		sha3 := "badmeta789"
+		incompletePath := repo.IncompletePath(sha3)
+		metaPath := repo.IncompleteMetaPath(sha3)
+		if err := os.WriteFile(incompletePath, []byte("partial"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(metaPath, []byte("{not json"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		status, meta, err := repo.CheckBlob(sha3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status != BlobStale {
+			t.Errorf("status = %v, want the conservative BlobStale report", status)
+		}
+		if meta != nil {
+			t.Errorf("meta = %+v, want nil for an unreadable record", meta)
+		}
+		// CheckBlob only reports; it never removes. The claim refuses this
+		// record as unproven, so both artifacts must survive the status query.
+		if _, err := os.Stat(incompletePath); err != nil {
+			t.Errorf("the unreadable record's payload was not preserved: %v", err)
+		}
+		if _, err := os.Stat(metaPath); err != nil {
+			t.Errorf("the unreadable record was not preserved: %v", err)
+		}
+	})
 }
 
 func TestRepoDir_WriteAndReadRef(t *testing.T) {
@@ -334,33 +365,6 @@ func TestRepoDir_WriteAndReadRef(t *testing.T) {
 			t.Errorf("ReadRef() = %q, want empty string", read)
 		}
 	})
-}
-
-func TestRepoDir_CleanupIncomplete(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache := NewHFCache(tmpDir)
-	repo, _ := cache.Repo("owner/name", RepoTypeModel)
-	repo.EnsureDirs()
-
-	sha := "cleanup123"
-
-	// Create incomplete files
-	incompletePath := repo.IncompletePath(sha)
-	metaPath := repo.IncompleteMetaPath(sha)
-	os.WriteFile(incompletePath, []byte("partial"), 0644)
-	os.WriteFile(metaPath, []byte("{}"), 0644)
-
-	if err := repo.CleanupIncomplete(sha); err != nil {
-		t.Fatalf("CleanupIncomplete error: %v", err)
-	}
-
-	// Verify files are removed
-	if _, err := os.Stat(incompletePath); !os.IsNotExist(err) {
-		t.Error("incomplete file should be removed")
-	}
-	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
-		t.Error("incomplete meta file should be removed")
-	}
 }
 
 func TestRepoDir_FinalizeBlob(t *testing.T) {

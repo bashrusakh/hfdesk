@@ -474,8 +474,8 @@ const flatDomainKeyPrefix = "flat:"
 // destination path itself. The LIFETIME LOCK of that domain is not derived
 // from the key but from the destination's MULTIPART staging name (see
 // flatDomainLockSrc): both routes and the cleanup must resolve the SAME lock
-// file, and that file is the one the multipart route's staging claim already
-// takes.
+// file. That lock is the item's one destination-domain lock, acquired once for
+// every route; the multipart claim takes no lock of its own.
 func flatDomainKey(dst string) string {
 	return flatDomainKeyPrefix + filepath.Clean(dst)
 }
@@ -483,12 +483,14 @@ func flatDomainKey(dst string) string {
 // flatDomainLockSrc is the staging name whose persistent ".lock" sibling is
 // the lifetime OS ownership lock of a flat destination's domain.
 //
-// It is the MULTIPART staging name (<destination>.incomplete), because the
-// multipart route's staging claim already takes exactly that lock. Reusing it
-// is what excludes the single-request route from the multipart route - and
-// the cleanup from both - without a second artifact next to the user's model
-// file: the lock file is <destination>.incomplete.lock, the zero-byte
-// artifact the multipart route already leaves there and never unlinks.
+// It is the MULTIPART staging name (<destination>.incomplete), so the
+// destination's one item-level destination-domain lock keeps the artifact name
+// the flat route already uses, and no second lock file appears next to the
+// user's model file. Every route acquires this ONE lock exactly once, at item
+// level before the HEAD/claim, and the multipart claim takes no lock of its
+// own, so the item never conflicts with itself. The lock file is
+// <destination>.incomplete.lock, the persistent zero-byte artifact that the
+// item-level acquisition creates and never unlinks.
 func flatDomainLockSrc(dst string) string {
 	return dst + ".incomplete"
 }

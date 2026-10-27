@@ -97,10 +97,13 @@ import (
 )
 
 // stagingMetaVersion is the IncompleteMeta.Version value written by this
-// downloader. Version 4 is the only resumable version: a record of any other
-// version is discarded under the claim/domain and the transfer starts from
-// zero (old branch records, including a version-3 record whose
-// legacy_migrated flag described migrated bytes, are never trusted).
+// downloader. Version 4 is the only resumable version: a FENCED record of any
+// other version (or one whose owner is provably dead or is this process) is
+// discarded under the claim/domain and the transfer starts from zero (old
+// branch records, including a version-3 record whose legacy_migrated flag
+// described migrated bytes, are never trusted). An UNFENCED record whose owner
+// cannot be proven dead is refused as ErrStagingOwnershipUnproven before the
+// version-discard branch and preserved.
 const stagingMetaVersion = 4
 
 // linkStagingClaimRecord atomically publishes a complete fresh record without
@@ -1515,16 +1518,15 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		// and creates no `.part` of its own, so a `<dst>.part` and its
 		// `.part.meta` sidecar next to this destination belong to the
 		// SINGLE-REQUEST route - possibly to a LIVE writer of it - or to an
-		// earlier run, and this route holds no ownership of the destination
-		// at this point: in flat/output mode the destination domain is taken
-		// at the Download level only for the route that does not take it
-		// internally, so a multipart item reaches this HEAD holding nothing.
-		// Unlinking those files would unlink another writer's open partial
-		// (its later publication would fail with ENOENT) and would let one
-		// route delete another route's resume state. The single-request HEAD
-		// failure keeps its own cleanup, because that route holds the
-		// destination domain and knows the partial is the one its attempt
-		// created.
+		// earlier run. The item DOES hold the destination ownership domain
+		// here: it is acquired once at item level for every route, before the
+		// HEAD. That domain excludes other writers of the destination, not
+		// the single-request route's own artifacts: route ownership is why
+		// this route removes nothing. Unlinking those files would delete the
+		// single-request writer's resume state (and unlink its open partial,
+		// whose later publication would fail with ENOENT). The single-request
+		// HEAD failure keeps its own cleanup, because that route creates the
+		// partial and knows it is the one its attempt created.
 		if apiErr != nil && apiErr.IsFailFast() {
 			return false, apiErr
 		}
@@ -2148,6 +2150,13 @@ func (d *stagingDownload) publish() error {
 	if meta.Size != d.it.Size || !stagingLayoutComplete(meta.Ranges, d.it.Size) {
 		return fmt.Errorf("refusing to publish %s: the persisted staging layout is incomplete (%d of %d bytes committed); the staged bytes are preserved for a resume: %w",
 			d.it.RelativePath, committedTotal(meta.Ranges), d.it.Size, errStagingLayoutIncomplete)
+	}
+	// Final cancellation check immediately before placement: everything above
+	// validated the staged payload, but a cancellation that arrived after the
+	// early ownership guard must still stop the publication. The staged bytes
+	// stay on disk for a resume.
+	if err := d.ctx.Err(); err != nil {
+		return err
 	}
 	if d.contentAddressed {
 		// The target is a content-addressed blob: its existence is completion

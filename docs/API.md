@@ -781,7 +781,7 @@ Settings include runtime paths, concurrency, verification, endpoint, proxy setti
 
 Download reliability settings:
 
-- `verify` — the post-download verification mode, applied to LFS files as well: `none` performs no post-download content hash (HTTP and ranged-response validation still apply during the transfer); `size` (the default) checks the exact expected size and complete validated transfer coverage on both the multipart and single-request paths and performs no full-file SHA-256 reread on the normal transfer path (the pre-download skip check, an inherited single-path `.part` proof, an unpinned-identity proof, and a known digest with no known expected size may still hash); `sha256` verifies the full file against the known digest with at most one full-file read, always before the destination/blob is published when a known digest exists, so a mismatch never publishes corrupt bytes and the staging data is discarded (a retry re-downloads from scratch); when `sha256` has no known digest, the HEAD-ETag fallback remains a post-publication check; `etag` proves a known SHA-256 digest with that same single pre-publication pass, while non-LFS ETag-only files keep the historical no-post-check behavior. A known digest is never hashed only after publication. Resume state from an older or unsupported format is not migrated: only a valid version-4 ranged record, or a single-request `.part` with a matching pinned identity sidecar, is resumed (an exactly-sized partial is published without a request only when clean response framing is also recorded); the file is otherwise re-downloaded from zero while already-published content is untouched. The detailed proof and resume rules are in `pkg/hfdownloader/doc.go`.
+- `verify` — the post-download verification mode, applied to LFS files as well: `none` performs no post-download content hash (HTTP and ranged-response validation still apply during the transfer); `size` (the default) checks the exact expected size and complete validated transfer coverage on both the multipart and single-request paths and performs no full-file SHA-256 reread on the normal transfer path (the pre-download skip check, an inherited single-path `.part` proof, an unpinned-identity proof, and a known digest with no known expected size may still hash); `sha256` verifies the full file against the known digest with at most one full-file read, always before the destination/blob is published when a known digest exists, so a mismatch never publishes corrupt bytes and the staging data is discarded (a retry re-downloads from scratch); when `sha256` has no known digest, the HEAD-ETag fallback remains a post-publication check; `etag` proves a known SHA-256 digest with that same single pre-publication pass, while non-LFS ETag-only files keep the historical no-post-check behavior. A known digest is never hashed only after publication. Resume state from an older or unsupported format is not migrated: only a valid version-4 ranged record, or a single-request `.part` with a matching pinned identity sidecar, is resumed (an exactly-sized partial is published without a request only when clean response framing is also recorded); the file is otherwise re-downloaded from zero while already-published content is untouched, while an unfenced older/unsupported record that cannot be proven dead is refused as unproven and preserved. The detailed proof and resume rules are in `pkg/hfdownloader/doc.go`.
 - `retries` — the non-progress retry budget per file/part request. A non-truncating attempt that advances the on-disk resume offset strictly beyond the highest offset reached refunds this budget and resets the backoff. For a single-file transfer, a response that ignores Range with `200 OK` restarts the partial and does not refund the budget, even if that attempt writes beyond the previous high-water mark; the new high-water mark is still recorded, so a later bodyless failure earns no refund. Multipart transfers still require `206 Partial Content` and do not accept `200` as a part. Progress refunds can increase the number of retries, but a separate lifetime retry-count ceiling limits retries after individual attempts return. That ceiling does not bound the duration or bytes of a single request that continues delivering data.
 - `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
 - The obsolete record-age `StaleTimeout` library setting is removed (`Settings.StaleTimeout`, `HFCache.StaleTimeout` and `DefaultStaleTimeout` no longer exist, and the cache constructors no longer take it): ownership is fenced by the destination ownership domain and a record's age never authorizes a takeover, so there is no replacement setting.
@@ -800,9 +800,13 @@ on-disk length is not completion evidence because staging files are preallocated
 The transfer is built from that resolved commit (tree walk and per-file URLs);
 when the endpoint resolves no commit, an unpinned identity with a known digest is
 content-proved once before publication. The ranged record is version 4 and is
-the only resumable version. Every other version and every pre-#140
-`.part-NN`/`.parts.json` family is discarded, never migrated, and the file is
-re-downloaded from zero while already-published content is untouched. Existing version-4 state keeps the multipart route even below the
+the only resumable version. A fenced other-version record (or one whose owner is
+provably dead or is this process) is discarded, never migrated, and the file is
+re-downloaded from zero while already-published content is untouched; an
+unfenced other-version record whose owner cannot be proven dead is refused as
+unproven and preserved. Every pre-#140 `.part-NN`/`.parts.json` family is
+likewise discarded and never migrated. Existing version-4 state keeps the
+multipart route even below the
 configured threshold; without range support the downloader warns, downloads the
 full file through the single path, and removes the obsolete state only after the
 final file is durable. The single-request `.part` is a sequential prefix
@@ -830,10 +834,13 @@ item fails with an actionable error and the job does not report success. A
 suspended owner keeps the lock and a crashed owner releases it at death. A writer
 that cannot acquire the domain fails before writing a payload and preserves
 existing partial data. Mixed-version writers from a branch-only build that
-still held the obsolete `<staging>.lock` are unsupported; their records are
-discarded or refused as unproven. In flat mode the persistent
+still held the obsolete `<staging>.lock` are unsupported: a fenced (or provably
+dead/self) old/unsupported record is discarded, while an unfenced record whose
+owner cannot be proven dead — of any version — is refused as unproven and
+preserved. In flat mode the persistent
 `<destination>.incomplete.lock` remains next to the model file and is never
-removed; every flat download leaves it, even when no multipart transfer ran. A
+removed; every flat TRANSFER leaves it, even when no multipart transfer ran (a
+destination skipped before the item-level acquisition leaves no lock). A
 waiting writer that obtains the domain downloads a flat destination or an item
 without a known digest itself; only a published content-addressed blob is
 completion proof by existence. Cleanup of a destination's staging

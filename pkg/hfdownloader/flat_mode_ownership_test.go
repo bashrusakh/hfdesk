@@ -281,8 +281,9 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 //
 // A flat destination owns ONE domain, and the domain's lifetime lock is the
 // persistent sibling of the MULTIPART staging name:
-// <destination>.incomplete.lock - the very lock the multipart route's staging
-// claim already takes. The single-request route holds that same domain while
+// <destination>.incomplete.lock - the item-level destination-domain lock every
+// route acquires exactly once before the HEAD/claim; the multipart claim takes
+// no lock of its own. The single-request route holds that same domain while
 // it transfers, so the two routes are mutually excluded, and the cleanup
 // resolves the same lock.
 //

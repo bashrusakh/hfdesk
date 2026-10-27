@@ -76,6 +76,25 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 			},
 		},
 		{
+			// The version-discard branch runs only AFTER the ownership gate:
+			// an unfenced old-version record whose owner is neither provably
+			// dead nor this process is unproven, not discardable resume state.
+			name: "unfenced old-version record",
+			seed: func(t *testing.T, metaPath string) {
+				t.Helper()
+				meta := IncompleteMeta{
+					PID: os.Getpid(), Instance: "legacy-instance", Host: "another-host",
+					StartedAt: time.Now().UTC(), Size: total, SHA256: sha,
+					Version: 3, Repo: "owner/model", Path: "model.bin",
+					Commit: "commit123", LockFenced: false,
+					Ranges: buildRangeLayout(total, 1),
+				}
+				if err := writeStagingMeta(metaPath, &meta); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			name: "unreadable record",
 			seed: func(t *testing.T, metaPath string) {
 				t.Helper()
