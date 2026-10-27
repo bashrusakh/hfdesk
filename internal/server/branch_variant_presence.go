@@ -170,20 +170,25 @@ func inspectBranchVariantDestination(cfg Config, presence branchVariantPresence,
 		}
 		outputDir = absolute
 		presence.StorageMode = "local"
-		base, err := hfdownloader.DestinationBase(outputDir, repo)
+		// The local branch variant lives in the app-owned reserved space under
+		// the local root, outside the ordinary repository tree. The space is
+		// the single owner of that layout, so the payload directory and the
+		// completion records are resolved the same way the downloader writes
+		// them.
+		space, err := hfdownloader.NewBranchVariantLocalSpace(outputDir, repo)
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
 		}
-		variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(base, revision)
+		variantDir, err := space.PayloadDir(revision)
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
 		}
 		presence.DestinationRoot = variantDir
-		// The completion manifest lives in the app-owned metadata tree beside
+		// The completion records live in the app-owned records tree beside
 		// the payload tree, keyed by revision and commit. Local mode has no ref
 		// file, so every existing record for this revision is inspected; the
 		// payload directory is shared across commits of one revision.
-		manifestDirs, err := hfdownloader.BranchVariantManifestDirs(base, revision)
+		manifestDirs, err := space.RecordDirs(revision)
 		if err != nil {
 			return presence, fmt.Errorf("%w: %v", errInvalidBranchVariantPresence, err)
 		}

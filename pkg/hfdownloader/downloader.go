@@ -333,12 +333,18 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		}
 	}
 
-	// failBranchVariantCompletion reports a branch-variant completion-record
-	// failure as the job's outcome. Presence derives downloaded status from the
-	// ref and completion manifest, so a branch variant that cannot publish them
-	// (or invalidate a stale local record) must not report done: that would show
-	// a finished job whose variant is not downloaded.
-	failBranchVariantCompletion := func(err error) error {
+	// failBranchVariant reports a branch-variant failure as the job's outcome.
+	// It is the single reporting path of the branch variant, so both storage
+	// modes report the same failure the same way. The error progress event
+	// carries the message to the UI, and the returned error carries it into
+	// the job's outcome.
+	//
+	// Presence derives downloaded status from the ref and completion manifest,
+	// so a branch variant that cannot publish them (or invalidate a stale
+	// local record) must not report done: that would show a finished job whose
+	// variant is not downloaded. The same holds for a branch variant that
+	// cannot be keyed by a commit at all.
+	failBranchVariant := func(err error) error {
 		emit(ProgressEvent{Level: "error", Event: "error", Message: err.Error()})
 		return err
 	}
@@ -366,15 +372,40 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.OnPlanComplete(completedPlan)
 	}
 
+	// localSpace is the app-owned reserved space that holds this job's local
+	// branch variant. It is resolved once, so the payload destination, the
+	// completion record and the record invalidation cannot disagree about
+	// where the variant lives. It stays nil in HF-cache mode, where the
+	// variant lives in the per-commit snapshot tree instead.
+	var localSpace *BranchVariantLocalSpace
+
 	if job.BranchVariant {
+		// A branch variant's stored artifact is keyed by the resolved commit:
+		// the HF-cache snapshot tree is snapshots/<commit>/ and the completion
+		// record is <revision>/<commit>/hfd.yaml. A plan whose revision lookup
+		// failed carries the revision name instead of a commit, so the
+		// artifact would not be keyed by a commit at all, and a revision that
+		// contains a slash would not even be a valid record path.
+		//
+		// The requirement is the same in both storage modes, so the check
+		// lives here, above the mode split: one condition cannot drift
+		// apart from the other. It runs before any filesystem write of the
+		// job — no payload byte, no completion record, no directory creation
+		// and no record invalidation — so a branch variant that cannot be
+		// keyed by a commit leaves nothing behind.
+		if !plan.CommitResolved {
+			return failBranchVariant(fmt.Errorf("branch variant %q requires a resolved commit from the Hub", job.Revision))
+		}
 		if useHFCache {
-			if !plan.CommitResolved {
-				return fmt.Errorf("branch variant %q requires a resolved commit from the Hub", job.Revision)
-			}
 			if err := repoDir.EnsureDirs(); err != nil {
 				return fmt.Errorf("ensure repo dirs: %w", err)
 			}
 		} else {
+			// Local mode: the branch variant lives in the app-owned reserved
+			// space under the local root, outside the ordinary repository
+			// tree, so the ordinary payload and the branch payload never
+			// share a path.
+			//
 			// Local presence derives completion from the revision's completion
 			// records, so a new attempt must invalidate the previous record after
 			// planning and before any payload byte changes. Otherwise a failed or
@@ -384,13 +415,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			// The job's repository identifies the records: the completion
 			// record names the repository it describes, and a branch variant
 			// rejects a LocalRepo redirection, so the record's repository and
-			// the destination folder name agree here.
-			base, err := destinationBase(job, cfg)
+			// the space agree here.
+			space, err := NewBranchVariantLocalSpace(cfg.OutputDir, job.Repo)
 			if err != nil {
-				return failBranchVariantCompletion(fmt.Errorf("resolve branch variant destination: %w", err))
+				return failBranchVariant(fmt.Errorf("resolve branch variant space: %w", err))
 			}
-			if err := InvalidateBranchVariantLocalManifests(base, job.Revision, job.Repo); err != nil {
-				return failBranchVariantCompletion(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
+			localSpace = &space
+			if err := space.InvalidateRecords(job.Revision); err != nil {
+				return failBranchVariant(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
 			}
 		}
 	}
@@ -407,15 +439,9 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	// Ensure destination root exists (only for legacy mode)
 	// HF cache mode already created directories via repoDir.EnsureDirs()
 	if !useHFCache {
-		base, err := destinationBase(job, cfg)
+		base, err := localDownloadBase(job, cfg, localSpace)
 		if err != nil {
 			return err
-		}
-		if job.BranchVariant {
-			base, err = BranchVariantLocalPayloadDir(base, job.Revision)
-			if err != nil {
-				return fmt.Errorf("branch variant revision %q: %w", job.Revision, err)
-			}
 		}
 		if err := os.MkdirAll(base, 0o755); err != nil {
 			return err
@@ -480,14 +506,17 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			}
 			manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
 		} else {
-			repoForPath := job.Repo
-			if job.LocalRepo != "" {
-				repoForPath = job.LocalRepo
-			}
 			// The completion record describes the local payload tree, which
-			// lives in the app-owned payload directory, not at a
+			// lives in the app-owned reserved space, not at a
 			// repository-relative path.
-			manifestBuilder.manifest.RepoPath = filepath.ToSlash(filepath.Join(repoForPath, BranchVariantPayloadDir, job.Revision))
+			if localSpace == nil {
+				return errors.New("branch variant space is not resolved")
+			}
+			repoPath, err := localSpace.PayloadRepoPath(job.Revision)
+			if err != nil {
+				return fmt.Errorf("branch variant revision %q: %w", job.Revision, err)
+			}
+			manifestBuilder.manifest.RepoPath = repoPath
 		}
 	}
 
@@ -619,10 +648,7 @@ LOOP:
 				dst = safeDst
 			} else {
 				// Legacy mode: flat directory structure
-				base, err := destinationBase(job, cfg)
-				if err == nil && job.BranchVariant {
-					base, err = BranchVariantLocalPayloadDir(base, job.Revision)
-				}
+				base, err := localDownloadBase(job, cfg, localSpace)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %w", err)
 					setFatalErr(fatal)
@@ -919,7 +945,7 @@ LOOP:
 		}
 		if err := repoDir.WriteRef(ref, plan.Commit); err != nil {
 			if job.BranchVariant {
-				return failBranchVariantCompletion(fmt.Errorf("write ref %q: %w", ref, err))
+				return failBranchVariant(fmt.Errorf("write ref %q: %w", ref, err))
 			}
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write ref: %v", err)})
 		}
@@ -949,9 +975,11 @@ LOOP:
 	// A branch variant's completion manifest is the downloaded-status record
 	// for exactly this revision/commit. It is written even when cfg.NoManifest
 	// or the friendly view is disabled, and never for ordinary downloads. The
-	// path is <repo>/.hfdesk-variants/<revision>/<commit>, outside the local
-	// payload tree (<repo>/.hfdesk-variants-payload/<revision>) and keyed by
-	// revision so branches sharing a commit keep distinct records.
+	// path is keyed by revision and commit: <repo>/.hfdesk-variants/<revision>/
+	// <commit> in HF-cache mode, and <space>/records/<revision>/<commit> in
+	// local mode, where the space is the app-owned reserved directory outside
+	// the ordinary repository tree. Keyed by revision, branches that share a
+	// commit keep distinct records.
 	if job.BranchVariant {
 		manifest := manifestBuilder.Build()
 		var manifestDir string
@@ -959,17 +987,16 @@ LOOP:
 		if useHFCache {
 			manifestDir, err = BranchVariantManifestDir(repoDir, job.Revision, plan.Commit)
 		} else {
-			var base string
-			base, err = destinationBase(job, cfg)
-			if err == nil {
-				manifestDir, err = BranchVariantLocalManifestDir(base, job.Revision, plan.Commit)
+			if localSpace == nil {
+				return failBranchVariant(errors.New("branch variant space is not resolved"))
 			}
+			manifestDir, err = localSpace.RecordDir(job.Revision, plan.Commit)
 		}
 		if err == nil {
 			_, err = manifest.Write(manifestDir)
 		}
 		if err != nil {
-			return failBranchVariantCompletion(fmt.Errorf("write branch variant completion manifest: %w", err))
+			return failBranchVariant(fmt.Errorf("write branch variant completion manifest: %w", err))
 		}
 	}
 

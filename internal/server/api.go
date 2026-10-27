@@ -959,6 +959,15 @@ type localCacheRoot struct {
 
 // skipsOwner applies the root's exclusion policy only to a top-level owner.
 func (root localCacheRoot) skipsOwner(owner string) bool {
+	// The app-owned branch-variant space is a reserved top-level entry of
+	// EVERY local root, not only of the HF cache root: it holds the
+	// branch-variant payloads and completion records, not repositories. It is
+	// skipped wherever a local root's top level is walked, so the reserved
+	// directory is never reported as an owner and nothing under it is listed
+	// as a repository.
+	if hfdownloader.IsBranchVariantReservedName(owner) {
+		return true
+	}
 	if root.SkipSpecial {
 		switch strings.ToLower(owner) {
 		case "hub", "models", "datasets", "blobs", "snapshots", "refs":

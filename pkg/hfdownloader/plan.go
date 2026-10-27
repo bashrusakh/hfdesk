@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -1212,16 +1213,69 @@ func isREADMEPath(filePath string) bool {
 	}
 }
 
-// destinationBase returns the base output directory for a job.
+// localDownloadBase returns the destination directory of a local (flat)
+// download.
+//
+// An ordinary download writes into the repository directory; a branch variant
+// writes into the app-owned reserved space. The two never share a
+// constructor, and the reserved-name refusal lives here, in the local
+// download's destination resolver: the app's own space is built UNDER the
+// reserved name, so a refusal that the space construction consulted would
+// reject the app's own space. The ordinary destination constructor
+// (destinationBase) and the shared DestinationBase helper stay free of it for
+// the same reason.
+func localDownloadBase(job Job, cfg Settings, space *BranchVariantLocalSpace) (string, error) {
+	if !job.BranchVariant {
+		// The reserved app-owned branch-variant space name must not be used
+		// as a repository owner: an ordinary download would then write into
+		// the app's own space. The refusal is on the owner component only:
+		// the reserved space is one level deeper than the repository
+		// directory, so a repository whose NAME is the reserved name still
+		// lives in its own subtree and never collides with the space.
+		if err := refuseReservedLocalOwner(localRepoFolder(job)); err != nil {
+			return "", err
+		}
+		return destinationBase(job, cfg)
+	}
+	if space == nil {
+		return "", errors.New("branch variant space is not resolved")
+	}
+	return space.PayloadDir(job.Revision)
+}
+
+// destinationBase returns the base output directory of an ordinary local
+// download.
+//
+// It is a pure path computation: the reserved-name refusal belongs to the
+// local download's destination resolver (see localDownloadBase), because the
+// app's own branch-variant space is built under the reserved name.
 func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
 	// (e.g. mmproj from a base model saved next to the current model's quants).
-	repoForPath := job.Repo
+	return DestinationBase(cfg.OutputDir, localRepoFolder(job))
+}
+
+// localRepoFolder returns the repository folder a local download writes into:
+// the LocalRepo redirection when it is set, the job's repository otherwise.
+func localRepoFolder(job Job) string {
 	if job.LocalRepo != "" {
-		repoForPath = job.LocalRepo
+		return job.LocalRepo
 	}
-	return DestinationBase(cfg.OutputDir, repoForPath)
+	return job.Repo
+}
+
+// refuseReservedLocalOwner refuses a repository whose owner component is the
+// reserved app-owned branch-variant space name.
+func refuseReservedLocalOwner(repo string) error {
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return nil
+	}
+	if IsBranchVariantReservedName(owner) {
+		return fmt.Errorf("repository owner %q is reserved for the app's branch-variant storage", owner)
+	}
+	return nil
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.

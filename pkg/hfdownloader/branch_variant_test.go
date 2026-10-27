@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,31 @@ import (
 )
 
 const branchFixtureRepo = "owner/example-EXL3-model"
+
+// branchLocalSpaceDir returns the app-owned reserved space of the fixture
+// repository under root. The path is spelled out literally, so the test pins
+// the layout instead of re-deriving it from the implementation.
+func branchLocalSpaceDir(root string) string {
+	return filepath.Join(root, BranchVariantLocalSpaceName, "owner", "example-EXL3-model")
+}
+
+// branchLocalPayloadDir returns the payload directory of one revision in the
+// fixture repository's reserved space.
+func branchLocalPayloadDir(root, revision string) string {
+	return filepath.Join(branchLocalSpaceDir(root), "payload", filepath.FromSlash(revision))
+}
+
+// branchLocalRecordsDir returns the completion-record subtree of the fixture
+// repository's reserved space.
+func branchLocalRecordsDir(root string) string {
+	return filepath.Join(branchLocalSpaceDir(root), "records")
+}
+
+// branchLocalRecordDir returns the completion-record directory of one
+// revision at one commit in the fixture repository's reserved space.
+func branchLocalRecordDir(root, revision, commit string) string {
+	return filepath.Join(branchLocalRecordsDir(root), filepath.FromSlash(revision), commit)
+}
 
 type branchHubRevision struct {
 	sha   string
@@ -322,12 +348,12 @@ func TestLocalBranchVariantsUseRevisionDirectories(t *testing.T) {
 		"4.00bpw": "branch-a-weights",
 		"5.00bpw": "branch-b-weights",
 	} {
-		payloadDir := filepath.Join(repoRoot, BranchVariantPayloadDir, revision)
+		payloadDir := branchLocalPayloadDir(root, revision)
 		body, err := os.ReadFile(filepath.Join(payloadDir, "model.safetensors"))
 		if err != nil || string(body) != want {
 			t.Errorf("%s local file = %q err=%v", revision, body, err)
 		}
-		manifest := readBranchFixtureManifest(t, filepath.Join(repoRoot, BranchVariantMetadataDir, revision, revisions[revision].sha, ManifestFilename))
+		manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, revisions[revision].sha), ManifestFilename))
 		assertBranchFixtureManifest(t, manifest, revision, revisions[revision].sha)
 		for _, file := range manifest.Files {
 			if file.Blob != "" {
@@ -339,6 +365,11 @@ func TestLocalBranchVariantsUseRevisionDirectories(t *testing.T) {
 		// overwritten by the branch payload.
 		if _, err := os.Stat(filepath.Join(repoRoot, revision)); !os.IsNotExist(err) {
 			t.Errorf("%s local payload used the revision-named directory (err=%v)", revision, err)
+		}
+		// The reserved space lives outside the ordinary repository tree, so
+		// the two never share a path.
+		if PathInside(repoRoot, payloadDir) {
+			t.Errorf("%s local payload %q is inside the repository tree %q", revision, payloadDir, repoRoot)
 		}
 	}
 	body, err := os.ReadFile(filepath.Join(repoRoot, "model.safetensors"))
@@ -371,7 +402,7 @@ func TestLocalBranchVariantSkippedLFSManifestOmitsBlob(t *testing.T) {
 
 	// The expected destination already exists with the LFS content, so the
 	// download takes the skip path and records the file from it.
-	payloadDir := filepath.Join(root, branchFixtureRepo, BranchVariantPayloadDir, revision)
+	payloadDir := branchLocalPayloadDir(root, revision)
 	target := filepath.Join(payloadDir, "model.safetensors")
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		t.Fatal(err)
@@ -393,7 +424,7 @@ func TestLocalBranchVariantSkippedLFSManifestOmitsBlob(t *testing.T) {
 		t.Fatal("local branch download did not take the skip path")
 	}
 
-	manifest := readBranchFixtureManifest(t, filepath.Join(root, branchFixtureRepo, BranchVariantMetadataDir, revision, revisions[revision].sha, ManifestFilename))
+	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, revisions[revision].sha), ManifestFilename))
 	if !manifest.BranchVariant || manifest.Branch != revision || len(manifest.Files) != 1 {
 		t.Fatalf("local skipped manifest = %+v", manifest)
 	}
@@ -442,14 +473,413 @@ func TestBranchVariantRequiresResolvedCommitBeforeWriting(t *testing.T) {
 	cacheRoot := t.TempDir()
 	cfg := Settings{CacheDir: cacheRoot, Endpoint: hub.URL, Verify: "size"}
 
-	err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: "4.00bpw", BranchVariant: true}, cfg, nil)
-	if err == nil || !strings.Contains(err.Error(), "resolved commit") {
-		t.Fatalf("unresolved-commit branch download error = %v", err)
-	}
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: "4.00bpw", BranchVariant: true}, cfg, func(ev ProgressEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+	assertBranchVariantUnresolvedCommitFailure(t, err, events, "4.00bpw")
 	cache, _ := cfg.BuildHFCache()
 	repoDir, _ := cache.Repo(branchFixtureRepo, RepoTypeModel)
 	if _, statErr := os.Stat(repoDir.Path()); !os.IsNotExist(statErr) {
 		t.Fatalf("branch download wrote cache state before resolving commit: %v", statErr)
+	}
+}
+
+// assertBranchVariantUnresolvedCommitFailure asserts the shared failure
+// contract of a branch variant whose commit was not resolved: the job fails
+// with the resolved-commit refusal, the failure is reported as an error event
+// rather than a done event, and the refusal reaches the job outcome as the
+// returned error. Both storage modes answer the same way, so the assertion is
+// shared by the HF-cache and the local test.
+func assertBranchVariantUnresolvedCommitFailure(t *testing.T, err error, events []ProgressEvent, revision string) {
+	t.Helper()
+	want := fmt.Sprintf("branch variant %q requires a resolved commit from the Hub", revision)
+	if err == nil {
+		t.Fatal("branch variant without a resolved commit reported success")
+	}
+	if err.Error() != want {
+		t.Fatalf("branch variant error = %q, want %q", err, want)
+	}
+	errorEvent := false
+	for _, ev := range events {
+		switch ev.Event {
+		case "done":
+			t.Fatal("branch variant without a resolved commit reported done")
+		case "error":
+			errorEvent = true
+			if ev.Message != want {
+				t.Errorf("error event message = %q, want %q", ev.Message, want)
+			}
+		}
+	}
+	if !errorEvent {
+		t.Fatal("branch variant without a resolved commit did not emit an error progress event")
+	}
+}
+
+// unresolvedBranchHub serves a repository whose revision lookup fails: the
+// revision endpoint answers 404, so the plan cannot resolve a commit and
+// falls back to the revision name, while the tree and raw-file endpoints
+// still serve the branch name. The returned accessor reports the revisions
+// the content requests addressed, so a test can prove which location a
+// download read.
+//
+// The served revision is matched exactly, so a request that addressed any
+// other location gets no content: the fixture can then tell a download that
+// read the branch name from one that read something else.
+func unresolvedBranchHub(t *testing.T, revision string, files map[string]string) (*httptest.Server, func() []string) {
+	t.Helper()
+	var (
+		mu       sync.Mutex
+		readFrom []string
+	)
+	record := func(addressed string) {
+		mu.Lock()
+		readFrom = append(readFrom, addressed)
+		mu.Unlock()
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/revision/"):
+			// The Hub cannot resolve the revision: the plan carries the
+			// revision name where a commit belongs.
+			http.NotFound(w, r)
+		case strings.Contains(path, "/tree/"):
+			addressed := path[strings.Index(path, "/tree/")+len("/tree/"):]
+			if addressed != revision {
+				http.NotFound(w, r)
+				return
+			}
+			record(addressed)
+			names := make([]string, 0, len(files))
+			for name := range files {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			nodes := make([]hfNode, 0, len(names))
+			for _, name := range names {
+				node := hfNode{Type: "file", Path: name, Size: int64(len(files[name]))}
+				nodes = append(nodes, node)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(path, "/raw/"), strings.Contains(path, "/resolve/"):
+			marker := "/raw/"
+			if !strings.Contains(path, marker) {
+				marker = "/resolve/"
+			}
+			rest := path[strings.Index(path, marker)+len(marker):]
+			prefix := revision + "/"
+			if !strings.HasPrefix(rest, prefix) {
+				http.NotFound(w, r)
+				return
+			}
+			record(revision)
+			body, ok := files[strings.TrimPrefix(rest, prefix)]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		default:
+			t.Logf("unexpected unresolved-commit fixture request: %s", r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	return server, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), readFrom...)
+	}
+}
+
+// TestLocalOrdinaryDownloadRefusesReservedOwnerName pins the reserved name:
+// an ordinary local download of a repository whose owner is the app's reserved
+// branch-variant space name must be refused with a clear error instead of
+// writing into the app's own space.
+//
+// The name is reserved for the owner component only: a repository whose NAME
+// is the reserved name lives one level deeper and never collides with the
+// space, so it must still download.
+func TestLocalOrdinaryDownloadRefusesReservedOwnerName(t *testing.T) {
+	const reservedOwner = ".hfdesk-branch-variants"
+	revisions := map[string]branchHubRevision{
+		"main": {
+			sha: "1111111111111111111111111111111111111111",
+			files: map[string]string{
+				"config.json":       `{"model_type":"main"}`,
+				"model.safetensors": "ordinary-main-weights",
+			},
+		},
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+
+	t.Run("reserved owner is refused", func(t *testing.T) {
+		root := t.TempDir()
+		err := Download(context.Background(), Job{Repo: reservedOwner + "/model", Revision: "main"},
+			Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil)
+		if err == nil {
+			t.Fatal("ordinary download with the reserved owner name succeeded")
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("ordinary download error = %v, want the reserved-name refusal", err)
+		}
+		// Nothing was written into the app's own space.
+		if _, statErr := os.Stat(filepath.Join(root, reservedOwner)); !os.IsNotExist(statErr) {
+			t.Fatalf("ordinary download wrote into the reserved space (err=%v)", statErr)
+		}
+	})
+
+	t.Run("reserved name is allowed", func(t *testing.T) {
+		root := t.TempDir()
+		repo := "owner/" + reservedOwner
+		if err := Download(context.Background(), Job{Repo: repo, Revision: "main"},
+			Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil); err != nil {
+			t.Fatalf("ordinary download with the reserved repository name: %v", err)
+		}
+		body, err := os.ReadFile(filepath.Join(root, "owner", reservedOwner, "config.json"))
+		if err != nil || string(body) != `{"model_type":"main"}` {
+			t.Fatalf("ordinary payload = %q err=%v, want the repository's own bytes", body, err)
+		}
+	})
+}
+
+// TestLocalBranchVariantPreservesFormerAppOwnedRepositoryFiles discriminates
+// the layout defect: the app's own trees used to live inside the ordinary
+// repository tree, so a repository whose own tree carried the app's directory
+// names lost those files to a branch-variant download of the same repository.
+// The branch variant now writes only inside the reserved space, so both files
+// survive with their original content.
+func TestLocalBranchVariantPreservesFormerAppOwnedRepositoryFiles(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+	)
+	// The repository's own tree carries files at both of the app's former
+	// directory names.
+	formerPayloadFile := ".hfdesk-variants-payload/" + revision + "/config.json"
+	formerRecordFile := ".hfdesk-variants/" + revision + "/config.json"
+	formerPayloadBytes := `{"model_type":"main","generation":"ordinary-payload"}`
+	formerRecordBytes := `{"model_type":"main","generation":"ordinary-record"}`
+	revisions := map[string]branchHubRevision{
+		"main": {
+			sha: "1111111111111111111111111111111111111111",
+			files: map[string]string{
+				formerPayloadFile:   formerPayloadBytes,
+				formerRecordFile:    formerRecordBytes,
+				"model.safetensors": "ordinary-main-weights",
+			},
+		},
+		revision: {
+			sha: commit,
+			files: map[string]string{
+				"config.json":       `{"model_type":"exl3","bits":4}`,
+				"model.safetensors": "branch-a-weights",
+			},
+		},
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+	repoBase := filepath.Join(root, branchFixtureRepo)
+
+	// The ordinary download writes the repository's own tree, including the
+	// files at the app's former names.
+	downloadBranchFixture(t, cfg, "main")
+	for path, want := range map[string]string{
+		formerPayloadFile: formerPayloadBytes,
+		formerRecordFile:  formerRecordBytes,
+	} {
+		got, err := os.ReadFile(filepath.Join(repoBase, filepath.FromSlash(path)))
+		if err != nil || string(got) != want {
+			t.Fatalf("ordinary file %s = %q err=%v, want %q", path, got, err, want)
+		}
+	}
+
+	// The branch-variant download of the same revision must leave both files
+	// alone.
+	downloadBranchFixture(t, cfg, revision)
+	for path, want := range map[string]string{
+		formerPayloadFile: formerPayloadBytes,
+		formerRecordFile:  formerRecordBytes,
+	} {
+		got, err := os.ReadFile(filepath.Join(repoBase, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatalf("repository file %s was removed by the branch download: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("repository file %s = %q, want %q", path, got, want)
+		}
+	}
+
+	// The branch variant's own payload and completion record are complete in
+	// the reserved space.
+	payload, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "model.safetensors"))
+	if err != nil || string(payload) != "branch-a-weights" {
+		t.Fatalf("branch payload = %q err=%v, want %q", payload, err, "branch-a-weights")
+	}
+	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, commit), ManifestFilename))
+	assertBranchFixtureManifest(t, manifest, revision, commit)
+}
+
+// TestLocalBranchVariantRequiresResolvedCommitBeforeWriting discriminates the
+// unresolved-commit defect in local mode: the resolved-commit requirement was
+// enforced only in HF-cache mode, so a local branch variant whose revision
+// lookup failed kept going, wrote the whole payload, and only then failed —
+// with the revision name where a commit belongs, or with a record path that
+// does not even exist for a revision that contains a slash. The download must
+// fail before it writes anything, and it must leave nothing behind.
+func TestLocalBranchVariantRequiresResolvedCommitBeforeWriting(t *testing.T) {
+	for _, revision := range []string{"4.00bpw", "exl/4_25"} {
+		t.Run(revision, func(t *testing.T) {
+			hub, _ := unresolvedBranchHub(t, revision, map[string]string{
+				"config.json":       `{"model_type":"exl3","bits":4}`,
+				"model.safetensors": "branch-a-weights",
+			})
+			defer hub.Close()
+			root := t.TempDir()
+			cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+			job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
+
+			// The fixture produces exactly the condition under test: a
+			// healthy plan whose commit is the unresolved revision name.
+			plan, err := PlanRepo(context.Background(), job, cfg)
+			if err != nil {
+				t.Fatalf("PlanRepo: %v", err)
+			}
+			if plan.CommitResolved || plan.Commit != revision {
+				t.Fatalf("plan commit = %q resolved=%v, want the unresolved revision name %q", plan.Commit, plan.CommitResolved, revision)
+			}
+			if len(plan.Items) == 0 {
+				t.Fatal("plan has no items, the fixture cannot prove a download would have written a payload")
+			}
+
+			var (
+				mu     sync.Mutex
+				events []ProgressEvent
+			)
+			err = Download(context.Background(), job, cfg, func(ev ProgressEvent) {
+				mu.Lock()
+				events = append(events, ev)
+				mu.Unlock()
+			})
+			assertBranchVariantUnresolvedCommitFailure(t, err, events, revision)
+
+			// Nothing is left behind: no payload, no completion record and no
+			// directory created for the variant.
+			repoBase := filepath.Join(root, branchFixtureRepo)
+			if _, statErr := os.Stat(repoBase); !os.IsNotExist(statErr) {
+				t.Fatalf("branch download created the variant directory (err=%v)", statErr)
+			}
+			if _, statErr := os.Stat(branchLocalSpaceDir(root)); !os.IsNotExist(statErr) {
+				t.Fatalf("branch download created the reserved space (err=%v)", statErr)
+			}
+		})
+	}
+}
+
+// TestLocalBranchVariantWithSlashRevisionRecordsResolvedCommit pins the local
+// completion record of a branch variant whose revision contains a slash: the
+// record is keyed by the resolved commit, so it lives at
+// <base>/<revision>/<commit>/hfd.yaml and the revision name never stands in
+// for the commit.
+func TestLocalBranchVariantWithSlashRevisionRecordsResolvedCommit(t *testing.T) {
+	const (
+		revision = "exl/4_25"
+		commit   = "4444444444444444444444444444444444444444"
+	)
+	revisions := map[string]branchHubRevision{
+		revision: {
+			sha: commit,
+			files: map[string]string{
+				"config.json":       `{"model_type":"exl3","bits":4}`,
+				"model.safetensors": "exl-branch-weights",
+			},
+		},
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+
+	if err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil); err != nil {
+		t.Fatalf("local branch download of a slash revision: %v", err)
+	}
+
+	repoBase := filepath.Join(root, branchFixtureRepo)
+	space, err := NewBranchVariantLocalSpace(root, branchFixtureRepo)
+	if err != nil {
+		t.Fatalf("NewBranchVariantLocalSpace: %v", err)
+	}
+	recordDir, err := space.RecordDir(revision, commit)
+	if err != nil {
+		t.Fatalf("RecordDir: %v", err)
+	}
+	if want := branchLocalRecordDir(root, revision, commit); recordDir != want {
+		t.Fatalf("completion record dir = %q, want %q", recordDir, want)
+	}
+	manifest := readBranchFixtureManifest(t, filepath.Join(recordDir, ManifestFilename))
+	assertBranchFixtureManifest(t, manifest, revision, commit)
+
+	// The revision name must not stand in for the commit in the record path.
+	if _, err := os.Stat(filepath.Join(branchLocalRecordsDir(root), "exl", "4_25", revision, ManifestFilename)); !os.IsNotExist(err) {
+		t.Fatalf("completion record was keyed by the revision name (err=%v)", err)
+	}
+
+	// The payload sits beside the record, in the app-owned payload tree.
+	body, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "model.safetensors"))
+	if err != nil || string(body) != "exl-branch-weights" {
+		t.Fatalf("slash-revision payload = %q err=%v, want %q", body, err, "exl-branch-weights")
+	}
+	// The reserved space lives outside the ordinary repository tree.
+	if PathInside(repoBase, branchLocalSpaceDir(root)) {
+		t.Fatalf("reserved space %q is inside the repository tree %q", branchLocalSpaceDir(root), repoBase)
+	}
+}
+
+// TestOrdinaryDownloadSucceedsWithoutResolvedCommit pins the preserved
+// ordinary path: an ordinary download never requires a resolved commit. The
+// revision lookup fails here, so the plan carries the branch name and the
+// download reads the branch name, exactly as before.
+func TestOrdinaryDownloadSucceedsWithoutResolvedCommit(t *testing.T) {
+	const revision = "main"
+	hub, readFrom := unresolvedBranchHub(t, revision, map[string]string{
+		"config.json": `{"model_type":"main"}`,
+	})
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+	job := Job{Repo: branchFixtureRepo, Revision: revision}
+
+	plan, err := PlanRepo(context.Background(), job, cfg)
+	if err != nil {
+		t.Fatalf("PlanRepo ordinary: %v", err)
+	}
+	if plan.CommitResolved || plan.Commit != revision {
+		t.Fatalf("ordinary plan commit = %q resolved=%v, want the unresolved branch name %q", plan.Commit, plan.CommitResolved, revision)
+	}
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("ordinary download without a resolved commit: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(root, branchFixtureRepo, "config.json"))
+	if err != nil || string(body) != `{"model_type":"main"}` {
+		t.Fatalf("ordinary payload = %q err=%v, want %q", body, err, `{"model_type":"main"}`)
+	}
+	// The download addressed the branch name, not a commit.
+	for _, read := range readFrom() {
+		if read != revision {
+			t.Fatalf("ordinary download read %q, want the branch name %q", read, revision)
+		}
 	}
 }
 
@@ -694,12 +1124,12 @@ func TestLocalBranchVariantManifestDoesNotOverwriteRepositoryFile(t *testing.T) 
 		t.Fatalf("local branch download: %v", err)
 	}
 
-	payloadDir := filepath.Join(root, branchFixtureRepo, BranchVariantPayloadDir, revision)
+	payloadDir := branchLocalPayloadDir(root, revision)
 	payload, err := os.ReadFile(filepath.Join(payloadDir, ManifestFilename))
 	if err != nil || string(payload) != repositoryManifest {
 		t.Fatalf("payload hfd.yaml = %q err=%v, want repository content %q", payload, err, repositoryManifest)
 	}
-	manifestPath := filepath.Join(root, branchFixtureRepo, BranchVariantMetadataDir, revision, commit, ManifestFilename)
+	manifestPath := filepath.Join(branchLocalRecordDir(root, revision, commit), ManifestFilename)
 	if PathInside(payloadDir, manifestPath) {
 		t.Fatalf("completion manifest %q is inside the payload tree %q", manifestPath, payloadDir)
 	}
@@ -730,11 +1160,15 @@ func TestBranchVariantManifestDirKeysByRevisionAndCommit(t *testing.T) {
 	}
 
 	localBase := t.TempDir()
-	localGot, err := BranchVariantLocalManifestDir(localBase, revision, commit)
+	localSpace, err := NewBranchVariantLocalSpace(localBase, branchFixtureRepo)
 	if err != nil {
-		t.Fatalf("BranchVariantLocalManifestDir: %v", err)
+		t.Fatalf("NewBranchVariantLocalSpace: %v", err)
 	}
-	localWant := filepath.Join(localBase, BranchVariantMetadataDir, "exl", "4_25", commit)
+	localGot, err := localSpace.RecordDir(revision, commit)
+	if err != nil {
+		t.Fatalf("RecordDir: %v", err)
+	}
+	localWant := branchLocalRecordDir(localBase, revision, commit)
 	if localGot != localWant || !PathInside(localBase, localGot) {
 		t.Fatalf("local manifest dir = %q, want %q inside base", localGot, localWant)
 	}
@@ -743,7 +1177,7 @@ func TestBranchVariantManifestDirKeysByRevisionAndCommit(t *testing.T) {
 		if _, err := BranchVariantManifestDir(repoDir, bad, commit); err == nil {
 			t.Errorf("unsafe revision %q accepted", bad)
 		}
-		if _, err := BranchVariantLocalManifestDir(localBase, bad, commit); err == nil {
+		if _, err := localSpace.RecordDir(bad, commit); err == nil {
 			t.Errorf("unsafe local revision %q accepted", bad)
 		}
 	}
@@ -847,9 +1281,12 @@ func TestLocalBranchVariantInvalidationFailureFailsBeforePayload(t *testing.T) {
 	if err := os.MkdirAll(repoBase, 0755); err != nil {
 		t.Fatal(err)
 	}
-	// A regular file where the app-owned metadata directory belongs makes the
+	// A regular file where the app-owned records directory belongs makes the
 	// invalidation helper fail.
-	if err := os.WriteFile(filepath.Join(repoBase, BranchVariantMetadataDir), []byte("blocked"), 0644); err != nil {
+	if err := os.MkdirAll(branchLocalSpaceDir(root), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(branchLocalSpaceDir(root), "records"), []byte("blocked"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -872,7 +1309,7 @@ func TestLocalBranchVariantInvalidationFailureFailsBeforePayload(t *testing.T) {
 	if !errorEvent {
 		t.Fatal("failed branch variant did not emit an error progress event")
 	}
-	if _, statErr := os.Stat(filepath.Join(repoBase, BranchVariantPayloadDir)); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(branchLocalPayloadDir(root, revision)); !os.IsNotExist(statErr) {
 		t.Fatalf("payload directory was created after invalidation failure: %v", statErr)
 	}
 }
@@ -949,7 +1386,7 @@ func TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit(t *testing.T
 	if err != nil || string(ordinaryBody) != "main-branch-bytes" {
 		t.Errorf("ordinary payload = %q err=%v, want the branch-name bytes %q", ordinaryBody, err, "main-branch-bytes")
 	}
-	branchBody, err := os.ReadFile(filepath.Join(root, branchFixtureRepo, BranchVariantPayloadDir, branchRevision, "config.json"))
+	branchBody, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, branchRevision), "config.json"))
 	if err != nil || string(branchBody) != "branch-commit-bytes" {
 		t.Errorf("branch payload = %q err=%v, want the commit bytes %q", branchBody, err, "branch-commit-bytes")
 	}
@@ -1008,8 +1445,8 @@ func TestLocalBranchVariantPayloadDoesNotOverwriteOrdinaryDownload(t *testing.T)
 	}
 
 	// The branch payload carries the branch's own bytes, in the app-owned
-	// payload directory.
-	branchBody, err := os.ReadFile(filepath.Join(root, branchFixtureRepo, BranchVariantPayloadDir, revision, "config.json"))
+	// reserved space.
+	branchBody, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "config.json"))
 	if err != nil || string(branchBody) != branchBytes {
 		t.Fatalf("branch payload = %q err=%v, want %q", branchBody, err, branchBytes)
 	}
@@ -1043,24 +1480,28 @@ func TestLocalBranchVariantPayloadAndCompletionRecordLocations(t *testing.T) {
 	}
 
 	repoBase := filepath.Join(root, branchFixtureRepo)
-	payloadDir, err := BranchVariantLocalPayloadDir(repoBase, revision)
+	space, err := NewBranchVariantLocalSpace(root, branchFixtureRepo)
 	if err != nil {
-		t.Fatalf("BranchVariantLocalPayloadDir: %v", err)
+		t.Fatalf("NewBranchVariantLocalSpace: %v", err)
 	}
-	if want := filepath.Join(repoBase, BranchVariantPayloadDir, revision); payloadDir != want {
+	payloadDir, err := space.PayloadDir(revision)
+	if err != nil {
+		t.Fatalf("PayloadDir: %v", err)
+	}
+	if want := branchLocalPayloadDir(root, revision); payloadDir != want {
 		t.Fatalf("payload dir = %q, want %q", payloadDir, want)
 	}
 	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
 		t.Fatalf("payload file: %v", err)
 	}
 
-	// The completion record stays in the metadata tree, outside the payload
+	// The completion record stays in the records tree, outside the payload
 	// tree, and both trees have different parents.
-	recordDir, err := BranchVariantLocalManifestDir(repoBase, revision, commit)
+	recordDir, err := space.RecordDir(revision, commit)
 	if err != nil {
-		t.Fatalf("BranchVariantLocalManifestDir: %v", err)
+		t.Fatalf("RecordDir: %v", err)
 	}
-	if want := filepath.Join(repoBase, BranchVariantMetadataDir, revision, commit); recordDir != want {
+	if want := branchLocalRecordDir(root, revision, commit); recordDir != want {
 		t.Fatalf("completion record dir = %q, want %q", recordDir, want)
 	}
 	if PathInside(payloadDir, recordDir) || PathInside(recordDir, payloadDir) {
@@ -1068,14 +1509,14 @@ func TestLocalBranchVariantPayloadAndCompletionRecordLocations(t *testing.T) {
 	}
 	manifest := readBranchFixtureManifest(t, filepath.Join(recordDir, ManifestFilename))
 	assertBranchFixtureManifest(t, manifest, revision, commit)
-	if want := filepath.ToSlash(filepath.Join(branchFixtureRepo, BranchVariantPayloadDir, revision)); manifest.RepoPath != want {
+	if want := filepath.ToSlash(filepath.Join(BranchVariantLocalSpaceName, "owner", "example-EXL3-model", "payload", revision)); manifest.RepoPath != want {
 		t.Errorf("completion record repo path = %q, want %q", manifest.RepoPath, want)
 	}
 
 	// The completion-record lookup reports record directories only.
-	dirs, err := BranchVariantManifestDirs(repoBase, revision)
+	dirs, err := space.RecordDirs(revision)
 	if err != nil {
-		t.Fatalf("BranchVariantManifestDirs: %v", err)
+		t.Fatalf("RecordDirs: %v", err)
 	}
 	if len(dirs) != 1 || dirs[0] != recordDir {
 		t.Fatalf("completion record dirs = %v, want [%q]", dirs, recordDir)
@@ -1086,10 +1527,15 @@ func TestLocalBranchVariantPayloadAndCompletionRecordLocations(t *testing.T) {
 		}
 	}
 
+	// The reserved space lives outside the ordinary repository tree.
+	if PathInside(repoBase, space.Path()) {
+		t.Fatalf("reserved space %q is inside the repository tree %q", space.Path(), repoBase)
+	}
+
 	// The payload path owner rejects a revision that cannot become a safe
 	// path component sequence.
 	for _, bad := range []string{"", ".", "..", "../x", "a/../../b", "a//b", `a\b`, "/abs"} {
-		if _, err := BranchVariantLocalPayloadDir(repoBase, bad); err == nil {
+		if _, err := space.PayloadDir(bad); err == nil {
 			t.Errorf("unsafe revision %q accepted", bad)
 		}
 	}
@@ -1101,6 +1547,9 @@ func TestLocalBranchVariantPayloadAndCompletionRecordLocations(t *testing.T) {
 // metadata tree was deleted by a branch-variant download of the same
 // repository. The invalidation must remove the app's own completion records
 // and nothing else.
+//
+// The repository file keeps the app's former directory name on purpose: it is
+// the shape of content the invalidation used to prune.
 func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 	const (
 		revision      = "4.00bpw"
@@ -1110,9 +1559,9 @@ func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 		ordinaryBytes = `{"model_type":"main"}`
 	)
 	revisions := map[string]branchHubRevision{
-		// The ordinary tree carries a file inside the app-owned metadata
-		// directory, so the ordinary download writes it next to the
-		// app-owned completion records.
+		// The ordinary tree carries a file inside a directory named like the
+		// app's former completion-record tree, so the ordinary download writes
+		// it inside the repository directory.
 		"main": {
 			sha: "1111111111111111111111111111111111111111",
 			files: map[string]string{
@@ -1136,18 +1585,18 @@ func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 	ordinaryPath := filepath.Join(repoBase, filepath.FromSlash(ordinaryFile))
 
 	// The ordinary download writes the repository's own tree into the
-	// repository directory, including the file inside the app-owned metadata
-	// directory.
+	// repository directory, including the file inside the app's former
+	// completion-record directory name.
 	downloadBranchFixture(t, cfg, "main")
 	body, err := os.ReadFile(ordinaryPath)
 	if err != nil || string(body) != ordinaryBytes {
 		t.Fatalf("ordinary file = %q err=%v, want %q", body, err, ordinaryBytes)
 	}
 
-	// The first branch-variant download publishes a completion record beside
-	// the repository's own file.
+	// The first branch-variant download publishes a completion record in the
+	// app-owned reserved space.
 	downloadBranchFixture(t, cfg, revision)
-	staleRecord := filepath.Join(repoBase, BranchVariantMetadataDir, revision, firstCommit, ManifestFilename)
+	staleRecord := filepath.Join(branchLocalRecordDir(root, revision, firstCommit), ManifestFilename)
 	if _, err := os.Stat(staleRecord); err != nil {
 		t.Fatalf("first completion record: %v", err)
 	}
@@ -1172,7 +1621,7 @@ func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 	if _, err := os.Stat(staleRecord); !os.IsNotExist(err) {
 		t.Fatalf("stale completion record survived the invalidation (err=%v)", err)
 	}
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoBase, BranchVariantMetadataDir, revision, secondCommit, ManifestFilename))
+	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, secondCommit), ManifestFilename))
 	if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != secondCommit {
 		t.Fatalf("completion record = %+v, want the second commit", manifest)
 	}
@@ -1181,21 +1630,24 @@ func TestLocalBranchVariantInvalidationKeepsRepositoryContent(t *testing.T) {
 // TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords
 // discriminates the third local invalidation defect: a record directory name
 // was treated as proof that the hfd.yaml inside it is a completion record, so
-// a repository whose own tree carries a file at the app's record path lost
-// that file to a branch-variant download of the same repository. The name
-// only selects a candidate: the content decides whether the file is this
-// variant's record, and a foreign file is left completely untouched.
+// a file that carried the app's record path lost that file to a
+// branch-variant download of the same repository. The name only selects a
+// candidate: the content decides whether the file is this variant's
+// completion record, and a foreign file is left completely untouched.
+//
+// The reserved space is app-owned and lives outside the ordinary repository
+// tree, so the files are planted in the space directly: the contract under
+// test is the content check, not how the files got there.
 func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.T) {
 	const (
 		revision    = "4.00bpw"
 		commit      = "2222222222222222222222222222222222222222"
 		otherCommit = "3333333333333333333333333333333333333333"
 	)
-	// The repository's own tree carries files at the app's own record paths:
-	// one that is not a manifest at all, one that is a real completion record
-	// of another repository, and one at the record path of this variant's own
-	// commit.
-	notAManifest := "# repository-owned hfd.yaml\nnot a completion record\n"
+	// The space carries files at the app's own record paths: one that is not
+	// a manifest at all, one that is a real completion record of another
+	// repository, and one at the record path of this variant's own commit.
+	notAManifest := "# foreign hfd.yaml\nnot a completion record\n"
 	foreignRecord := &DownloadManifest{
 		Version:       "1.0",
 		Type:          "model",
@@ -1223,11 +1675,11 @@ func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.
 	}
 	otherRepoManifest := string(foreignRecordBytes)
 	foreignFiles := map[string]string{
-		BranchVariantMetadataDir + "/" + revision + "/" + otherCommit + "/" + ManifestFilename: notAManifest,
-		BranchVariantMetadataDir + "/" + revision + "/docs/" + ManifestFilename:                otherRepoManifest,
-		BranchVariantMetadataDir + "/" + revision + "/" + commit + "/" + ManifestFilename:      notAManifest,
+		filepath.Join("records", revision, otherCommit, ManifestFilename): notAManifest,
+		filepath.Join("records", revision, "docs", ManifestFilename):      otherRepoManifest,
+		filepath.Join("records", revision, commit, ManifestFilename):      notAManifest,
 	}
-	foreignAtOwnRecordPath := BranchVariantMetadataDir + "/" + revision + "/" + commit + "/" + ManifestFilename
+	foreignAtOwnRecordPath := filepath.Join("records", revision, commit, ManifestFilename)
 
 	revisions := map[string]branchHubRevision{
 		"main": {
@@ -1245,22 +1697,20 @@ func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.
 			},
 		},
 	}
-	for path, body := range foreignFiles {
-		revisions["main"].files[path] = body
-	}
 	hub := fakeBranchVariantHub(t, revisions)
 	defer hub.Close()
 	root := t.TempDir()
 	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
-	repoBase := filepath.Join(root, branchFixtureRepo)
+	spaceDir := branchLocalSpaceDir(root)
 
-	// The ordinary download writes the repository's own tree into the
-	// repository directory, including the files at the app's record paths.
-	downloadBranchFixture(t, cfg, "main")
+	// The foreign files sit at the app's own record paths inside the space.
 	for path, body := range foreignFiles {
-		got, err := os.ReadFile(filepath.Join(repoBase, filepath.FromSlash(path)))
-		if err != nil || string(got) != body {
-			t.Fatalf("ordinary file %s = %q err=%v, want %q", path, got, err, body)
+		full := filepath.Join(spaceDir, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -1268,34 +1718,32 @@ func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.
 	// records before it writes any payload byte.
 	downloadBranchFixture(t, cfg, revision)
 
-	// The repository's own files at the app's record paths survive the
-	// invalidation with their original content.
+	// The foreign files at the app's record paths survive the invalidation
+	// with their original content.
 	for path, body := range foreignFiles {
 		if path == foreignAtOwnRecordPath {
 			// This one is the record path of the variant's own commit, so the
 			// variant's own record replaces it below.
 			continue
 		}
-		got, err := os.ReadFile(filepath.Join(repoBase, filepath.FromSlash(path)))
+		got, err := os.ReadFile(filepath.Join(spaceDir, path))
 		if err != nil {
-			t.Fatalf("repository file %s was removed by the invalidation: %v", path, err)
+			t.Fatalf("foreign file %s was removed by the invalidation: %v", path, err)
 		}
 		if string(got) != body {
-			t.Fatalf("repository file %s = %q, want %q", path, got, body)
+			t.Fatalf("foreign file %s = %q, want %q", path, got, body)
 		}
 	}
 
 	// The variant's own record is present and correct at its record path.
-	manifest := readBranchFixtureManifest(t, filepath.Join(repoBase, filepath.FromSlash(foreignAtOwnRecordPath)))
+	manifest := readBranchFixtureManifest(t, filepath.Join(spaceDir, foreignAtOwnRecordPath))
 	assertBranchFixtureManifest(t, manifest, revision, commit)
 }
 
 // TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords pins the
-// decision table of the invalidation's content check. The app-owned trees live
-// inside the repository directory, so the repository's own tree can carry
-// files at the record paths: the record directory name only selects a
-// candidate, and the content decides whether the file is this variant's
-// completion record.
+// decision table of the invalidation's content check. The record directory
+// name only selects a candidate, and the content decides whether the file is
+// this variant's completion record.
 func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testing.T) {
 	const (
 		revision = "4.00bpw"
@@ -1318,17 +1766,21 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 	}
 
 	base := t.TempDir()
-	revisionDir := filepath.Join(base, BranchVariantMetadataDir, revision)
+	space, err := NewBranchVariantLocalSpace(base, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionDir := filepath.Join(branchLocalRecordsDir(base), revision)
 	// Every candidate lives in a commit-shaped directory under the revision
 	// directory, so the name rule alone cannot tell them apart.
-	ownRecordDir, err := BranchVariantLocalManifestDir(base, revision, commit)
+	ownRecordDir, err := space.RecordDir(revision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := newRecord(repo, revision, commit).Write(ownRecordDir); err != nil {
 		t.Fatal(err)
 	}
-	wrongCommitDir, err := BranchVariantLocalManifestDir(base, revision, "3333333333333333333333333333333333333333")
+	wrongCommitDir, err := space.RecordDir(revision, "3333333333333333333333333333333333333333")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1340,7 +1792,7 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 	if _, err := newRecord(repo, "5.00bpw", commit).Write(wrongRevisionDir); err != nil {
 		t.Fatal(err)
 	}
-	wrongRepoDir, err := BranchVariantLocalManifestDir(base, revision, "4444444444444444444444444444444444444444")
+	wrongRepoDir, err := space.RecordDir(revision, "4444444444444444444444444444444444444444")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1352,7 +1804,7 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 	if err := os.MkdirAll(plainDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	plainBody := []byte("# repository-owned hfd.yaml\nnot a completion record\n")
+	plainBody := []byte("# foreign hfd.yaml\nnot a completion record\n")
 	if err := os.WriteFile(filepath.Join(plainDir, ManifestFilename), plainBody, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1362,8 +1814,8 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 		t.Fatal(err)
 	}
 
-	if err := InvalidateBranchVariantLocalManifests(base, revision, repo); err != nil {
-		t.Fatalf("InvalidateBranchVariantLocalManifests: %v", err)
+	if err := space.InvalidateRecords(revision); err != nil {
+		t.Fatalf("InvalidateRecords: %v", err)
 	}
 
 	// The variant's own record is gone, and its empty record directory is
@@ -1395,7 +1847,7 @@ func TestInvalidateBranchVariantLocalManifestsRemovesOnlyItsOwnRecords(t *testin
 // TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent covers the
 // intermediate components of the app-owned tree: a symlinked revision
 // directory or record directory would redirect the completion records and the
-// payload writes outside the repository, so the download must fail before
+// payload writes outside the reserved space, so the download must fail before
 // anything is removed or written.
 func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 	const (
@@ -1426,12 +1878,12 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 	cases := []struct {
 		name     string
 		revision string
-		// link is the path below the repository base that is a symlink.
+		// link is the path below the reserved space that is a symlink.
 		link []string
 	}{
-		{name: "revision directory", revision: revision, link: []string{BranchVariantMetadataDir, revision}},
-		{name: "revision component", revision: multiRev, link: []string{BranchVariantMetadataDir, "exl"}},
-		{name: "record directory", revision: revision, link: []string{BranchVariantMetadataDir, revision, commit}},
+		{name: "revision directory", revision: revision, link: []string{"records", revision}},
+		{name: "revision component", revision: multiRev, link: []string{"records", "exl"}},
+		{name: "record directory", revision: revision, link: []string{"records", revision, commit}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1441,12 +1893,11 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 				t.Fatal(err)
 			}
 			root := t.TempDir()
-			repoBase := filepath.Join(root, branchFixtureRepo)
-			link := filepath.Join(append([]string{repoBase}, tc.link...)...)
+			link := filepath.Join(append([]string{branchLocalSpaceDir(root)}, tc.link...)...)
 			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			// The symlink points outside the repository.
+			// The symlink points outside the reserved space.
 			if err := os.Symlink(external, link); err != nil {
 				t.Skipf("symlink creation is not permitted on this platform: %v", err)
 			}
@@ -1476,7 +1927,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 			}
 			mu.Unlock()
 
-			// Nothing outside the repository was removed or written.
+			// Nothing outside the reserved space was removed or written.
 			entries, readErr := os.ReadDir(external)
 			if readErr != nil {
 				t.Fatal(readErr)
@@ -1489,7 +1940,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 				t.Fatalf("external tree entries = %v, want only keep.txt", names)
 			}
 			// The payload was not written either.
-			if _, statErr := os.Stat(filepath.Join(repoBase, BranchVariantPayloadDir)); !os.IsNotExist(statErr) {
+			if _, statErr := os.Stat(filepath.Join(branchLocalSpaceDir(root), "payload")); !os.IsNotExist(statErr) {
 				t.Fatalf("payload directory was created after the unsafe-layout refusal (err=%v)", statErr)
 			}
 		})
@@ -1499,7 +1950,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 // TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory covers the
 // payload side of the app-owned tree check: a symlinked revision directory
 // inside the payload tree would redirect the payload writes outside the
-// repository, so the download must refuse before anything is written and
+// reserved space, so the download must refuse before anything is written and
 // leave the external target untouched.
 func TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory(t *testing.T) {
 	const (
@@ -1524,13 +1975,12 @@ func TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory(t *testing.T
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	repoBase := filepath.Join(root, branchFixtureRepo)
-	payloadTree := filepath.Join(repoBase, BranchVariantPayloadDir)
+	payloadTree := filepath.Join(branchLocalSpaceDir(root), "payload")
 	if err := os.MkdirAll(payloadTree, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// The revision directory inside the payload tree is a symlink to a
-	// directory outside the repository.
+	// directory outside the reserved space.
 	if err := os.Symlink(external, filepath.Join(payloadTree, revision)); err != nil {
 		t.Skipf("symlink creation is not permitted on this platform: %v", err)
 	}
@@ -1560,8 +2010,8 @@ func TestLocalBranchVariantRefusesSymlinkedPayloadRevisionDirectory(t *testing.T
 	}
 	mu.Unlock()
 
-	// Nothing outside the repository was written: the external target keeps
-	// exactly the content it had.
+	// Nothing outside the reserved space was written: the external target
+	// keeps exactly the content it had.
 	entries, readErr := os.ReadDir(external)
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -2088,7 +2538,7 @@ func TestBranchVariantFailsWhenSnapshotEntryCannotBeCreatedAfterSharedBlobComple
 // TestLocalBranchVariantRefusesSymlinkedAppOwnedTree discriminates the
 // security defect: os.RemoveAll resolves an intermediate symlink, so a
 // symlinked app-owned tree made the cleanup delete a directory outside the
-// repository, and the payload writes landed outside it too.
+// reserved space, and the payload writes landed outside it too.
 func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
 	const (
 		revision = "4.00bpw"
@@ -2099,7 +2549,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
 	hub := fakeBranchVariantHub(t, revisions)
 	defer hub.Close()
 
-	for _, tree := range []string{BranchVariantMetadataDir, BranchVariantPayloadDir} {
+	for _, tree := range []string{branchVariantLocalRecordsDirName, branchVariantLocalPayloadDirName} {
 		t.Run(tree, func(t *testing.T) {
 			external := t.TempDir()
 			keepDir := filepath.Join(external, revision)
@@ -2111,13 +2561,13 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
 				t.Fatal(err)
 			}
 			root := t.TempDir()
-			repoBase := filepath.Join(root, branchFixtureRepo)
-			if err := os.MkdirAll(repoBase, 0o755); err != nil {
+			spaceDir := branchLocalSpaceDir(root)
+			if err := os.MkdirAll(spaceDir, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			// The app-owned tree is a symlink to a directory outside the
-			// repository.
-			if err := os.Symlink(external, filepath.Join(repoBase, tree)); err != nil {
+			// reserved space.
+			if err := os.Symlink(external, filepath.Join(spaceDir, tree)); err != nil {
 				t.Skipf("symlink creation is not permitted on this platform: %v", err)
 			}
 
@@ -2143,7 +2593,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
 			}
 			mu.Unlock()
 
-			// Nothing outside the repository was removed or written.
+			// Nothing outside the reserved space was removed or written.
 			if _, statErr := os.Stat(keep); statErr != nil {
 				t.Fatalf("external file was removed through the symlink: %v", statErr)
 			}
@@ -2180,7 +2630,7 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedTree(t *testing.T) {
 //
 // The revision that reaches the check is validated before the call, so this
 // is the last line of defense for a component that would otherwise leave the
-// repository. The escape target exists in these cases, so a check that
+// reserved space. The escape target exists in these cases, so a check that
 // followed the component would report the layout as safe.
 func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 	// Each case gets its own base so the cases cannot influence each other.
@@ -2189,7 +2639,7 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 		root := t.TempDir()
 		base = filepath.Join(root, "repo")
 		outside = filepath.Join(root, "outside")
-		for _, dir := range []string{filepath.Join(base, BranchVariantMetadataDir), outside} {
+		for _, dir := range []string{filepath.Join(base, branchVariantLocalRecordsDirName), outside} {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -2199,7 +2649,7 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 
 	t.Run("parent component", func(t *testing.T) {
 		base, _ := newBase(t)
-		err := ensureLocalBranchVariantTree(base, []string{BranchVariantMetadataDir, "..", "..", "outside"})
+		err := ensureLocalBranchVariantTree(base, []string{branchVariantLocalRecordsDirName, "..", "..", "outside"})
 		if err == nil {
 			t.Fatal("app-owned tree check accepted a component that leaves the base")
 		}
@@ -2210,7 +2660,7 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 
 	t.Run("absolute component", func(t *testing.T) {
 		base, outside := newBase(t)
-		err := ensureLocalBranchVariantTree(base, []string{BranchVariantMetadataDir, outside})
+		err := ensureLocalBranchVariantTree(base, []string{branchVariantLocalRecordsDirName, outside})
 		if err == nil {
 			t.Fatal("app-owned tree check accepted an absolute component")
 		}
@@ -2223,10 +2673,10 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 	// symlinked component is still refused on the resolved path.
 	t.Run("symlinked component", func(t *testing.T) {
 		base, outside := newBase(t)
-		if err := os.Symlink(outside, filepath.Join(base, BranchVariantMetadataDir, "exl")); err != nil {
+		if err := os.Symlink(outside, filepath.Join(base, branchVariantLocalRecordsDirName, "exl")); err != nil {
 			t.Skipf("symlink creation is not permitted on this platform: %v", err)
 		}
-		err := ensureLocalBranchVariantTree(base, []string{BranchVariantMetadataDir, "exl"})
+		err := ensureLocalBranchVariantTree(base, []string{branchVariantLocalRecordsDirName, "exl"})
 		if err == nil {
 			t.Fatal("app-owned tree check accepted a symlinked component")
 		}
@@ -2239,7 +2689,7 @@ func TestEnsureLocalBranchVariantTreeRefusesEscapingComponent(t *testing.T) {
 	// the downloader creates the tree.
 	t.Run("missing component", func(t *testing.T) {
 		base, _ := newBase(t)
-		if err := ensureLocalBranchVariantTree(base, []string{BranchVariantMetadataDir, "exl", "4_25"}); err != nil {
+		if err := ensureLocalBranchVariantTree(base, []string{branchVariantLocalRecordsDirName, "exl", "4_25"}); err != nil {
 			t.Fatalf("error = %v, want a missing component to be accepted", err)
 		}
 	})

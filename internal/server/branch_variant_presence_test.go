@@ -25,6 +25,17 @@ import (
 const presenceRepo = "owner/example-EXL3-model"
 const presenceRevision = "4.00bpw"
 
+// presenceLocalSpace returns the app-owned local branch-variant space of the
+// presence fixture repository under root.
+func presenceLocalSpace(t *testing.T, root string) hfdownloader.BranchVariantLocalSpace {
+	t.Helper()
+	space, err := hfdownloader.NewBranchVariantLocalSpace(root, presenceRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return space
+}
+
 func writePresenceRepo(t *testing.T, root, revision string) *hfdownloader.RepoDir {
 	t.Helper()
 	commit := "2222222222222222222222222222222222222222"
@@ -81,8 +92,8 @@ func writePresenceRepo(t *testing.T, root, revision string) *hfdownloader.RepoDi
 func writeLocalPresenceVariant(t *testing.T, root string) string {
 	t.Helper()
 	const commit = "2222222222222222222222222222222222222222"
-	repoBase := filepath.Join(root, presenceRepo)
-	variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, presenceRevision)
+	space := presenceLocalSpace(t, root)
+	variantDir, err := space.PayloadDir(presenceRevision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,9 +121,9 @@ func writeLocalPresenceVariant(t *testing.T, root string) string {
 		}
 		manifest.Files = append(manifest.Files, hfdownloader.ManifestFile{Name: name, Size: int64(len(body))})
 	}
-	// The completion record lives outside the payload tree, keyed by revision
-	// and commit.
-	manifestDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, presenceRevision, commit)
+	// The completion record lives in the app-owned records tree of the
+	// reserved space, keyed by revision and commit.
+	manifestDir, err := space.RecordDir(presenceRevision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +422,8 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 		t.Fatalf("local branch download: %v", err)
 	}
 
-	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(filepath.Join(root, presenceRepo), revision)
+	space := presenceLocalSpace(t, root)
+	payloadDir, err := space.PayloadDir(revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +431,7 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 	if err != nil || string(payload) != repoManifest {
 		t.Fatalf("payload hfd.yaml = %q err=%v, want repository content", payload, err)
 	}
-	manifestDir, err := hfdownloader.BranchVariantLocalManifestDir(filepath.Join(root, presenceRepo), revision, commit)
+	manifestDir, err := space.RecordDir(revision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,15 +453,174 @@ func TestBranchVariantLocalDownloadPreservesRepositoryManifestAndReportsPresence
 	}
 }
 
-// writeLocalPresenceRecord writes one local completion record under
-// <root>/<repo>/.hfdesk-variants/<revision>/<commit> and optionally the payload
-// files it should describe, which live in the app-owned payload directory
-// <root>/<repo>/.hfdesk-variants-payload/<revision>. listed is the manifest
-// file set, so a test can list a file that the payload does not contain.
+// TestBranchVariantLocalRoundTripUsesReservedSpace pins the local round trip
+// of a branch variant: the payload and the completion record live in the
+// app-owned reserved space outside the ordinary repository tree, neither is
+// reachable at a repository-relative path, and the presence lookup reports
+// the variant as downloaded with the reserved payload directory as its
+// destination root.
+func TestBranchVariantLocalRoundTripUsesReservedSpace(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+	)
+	files := map[string]string{
+		"config.json":       `{"model_type":"exl3","bits":4}`,
+		"model.safetensors": "local-branch-weights",
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": commit})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			nodes := make([]map[string]any, 0, len(files))
+			for name, body := range files {
+				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			body, ok := files[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	root := t.TempDir()
+	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{
+		Repo:          presenceRepo,
+		Revision:      revision,
+		BranchVariant: true,
+	}, hfdownloader.Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil); err != nil {
+		t.Fatalf("local branch download: %v", err)
+	}
+
+	// The reserved space holds the payload and the completion record.
+	spaceDir := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, presenceRepo)
+	payloadDir := filepath.Join(spaceDir, "payload", revision)
+	recordDir := filepath.Join(spaceDir, "records", revision, commit)
+	body, err := os.ReadFile(filepath.Join(payloadDir, "model.safetensors"))
+	if err != nil || string(body) != "local-branch-weights" {
+		t.Fatalf("branch payload = %q err=%v, want %q", body, err, "local-branch-weights")
+	}
+	if _, err := os.Stat(filepath.Join(recordDir, hfdownloader.ManifestFilename)); err != nil {
+		t.Fatalf("completion record: %v", err)
+	}
+
+	// Neither is reachable at a repository-relative path.
+	repoBase := filepath.Join(root, presenceRepo)
+	for _, rel := range []string{
+		revision,
+		filepath.Join(".hfdesk-variants-payload", revision),
+		filepath.Join(".hfdesk-variants", revision),
+	} {
+		if _, err := os.Stat(filepath.Join(repoBase, rel)); !os.IsNotExist(err) {
+			t.Errorf("branch variant wrote %q inside the repository tree (err=%v)", rel, err)
+		}
+	}
+
+	// The presence lookup reports the variant as downloaded, with the
+	// reserved payload directory as the destination root.
+	s := newTestServerWithConfig(t, Config{LocalDir: root})
+	w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
+	}
+	var got branchVariantPresence
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
+		t.Fatalf("presence = %+v", got)
+	}
+	if got.StorageMode != "local" || got.DestinationRoot != payloadDir {
+		t.Fatalf("presence destination = %+v, want the payload dir %q", got, payloadDir)
+	}
+}
+
+// TestLocalCacheScanExcludesBranchVariantReservedSpace pins the scan
+// exclusion: the app-owned reserved space is a top-level entry of a local
+// root, so the local cache browser must not report it as an owner and must
+// not list anything inside it as a repository, while a normal repository in
+// the same root is still listed.
+//
+// The exclusion applies to every place that walks a local root's top level:
+// the browser scan, the single-repository lookup and the selection list.
+func TestLocalCacheScanExcludesBranchVariantReservedSpace(t *testing.T) {
+	root := t.TempDir()
+	// A normal repository in the same root.
+	normal := filepath.Join(root, "owner", "model")
+	if err := os.MkdirAll(normal, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(normal, "model.gguf"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The reserved space, holding a branch-variant payload that looks like a
+	// repository to the scan.
+	space := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, "owner", "model", "payload", "4.00bpw")
+	if err := os.MkdirAll(space, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(space, "model.gguf"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	repos, err := scanLocalCachedRepos(cacheDir, root, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]bool{}
+	for _, repo := range repos {
+		listed[repo.Repo] = true
+	}
+	if !listed["owner/model"] {
+		t.Fatalf("local scan did not list the normal repository: %v", listed)
+	}
+	for _, repo := range repos {
+		if repo.Owner == hfdownloader.BranchVariantLocalSpaceName {
+			t.Errorf("local scan reported the reserved space as an owner: %+v", repo)
+		}
+		if strings.HasPrefix(repo.Repo, hfdownloader.BranchVariantLocalSpaceName+"/") {
+			t.Errorf("local scan listed a repository inside the reserved space: %+v", repo)
+		}
+	}
+
+	// The single-repository lookup must not resolve anything inside the
+	// reserved space either.
+	if _, err := findLocalCachedRepo(cacheDir, root, nil, nil, hfdownloader.BranchVariantLocalSpaceName+"/owner", false); !os.IsNotExist(err) {
+		t.Fatalf("single-repository lookup resolved the reserved space (err=%v)", err)
+	}
+
+	// The selection list must not offer a local location for the reserved
+	// owner either.
+	cfg := Config{LocalDir: root, CacheDir: cacheDir}
+	for _, loc := range cacheSelectionLocations(cfg, hfdownloader.BranchVariantLocalSpaceName+"/owner") {
+		if loc.kind == "local" {
+			t.Errorf("selection list offered a local location for the reserved owner: %+v", loc)
+		}
+	}
+}
+
+// writeLocalPresenceRecord writes one local completion record in the
+// app-owned reserved space
+// <root>/.hfdesk-branch-variants/<owner>/<repo>/records/<revision>/<commit>
+// and optionally the payload files it should describe, which live in the
+// app-owned payload tree
+// <root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>. listed is
+// the manifest file set, so a test can list a file that the payload does not
+// contain.
 func writeLocalPresenceRecord(t *testing.T, root, revision, commit string, completedAt time.Time, listed, payload map[string]string) string {
 	t.Helper()
-	repoBase := filepath.Join(root, presenceRepo)
-	variantDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	space := presenceLocalSpace(t, root)
+	variantDir, err := space.PayloadDir(revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +659,7 @@ func writeLocalPresenceRecord(t *testing.T, root, revision, commit string, compl
 		manifest.Files = append(manifest.Files, hfdownloader.ManifestFile{Name: name, Size: int64(len(body))})
 		manifest.TotalSize += int64(len(body))
 	}
-	manifestDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, revision, commit)
+	manifestDir, err := space.RecordDir(revision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -737,7 +908,8 @@ func TestBranchVariantLocalPresenceReportsPayloadDestination(t *testing.T) {
 	}
 
 	repoBase := filepath.Join(root, presenceRepo)
-	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	space := presenceLocalSpace(t, root)
+	payloadDir, err := space.PayloadDir(revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,8 +920,8 @@ func TestBranchVariantLocalPresenceReportsPayloadDestination(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(repoBase, revision)); !os.IsNotExist(err) {
 		t.Fatalf("branch payload used a repository-relative directory (err=%v)", err)
 	}
-	// The completion record stays in the metadata tree.
-	recordDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, revision, commit)
+	// The completion record stays in the records tree of the reserved space.
+	recordDir, err := space.RecordDir(revision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,7 +1029,7 @@ func TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile(t *testing.T)
 	if err := hfdownloader.Download(context.Background(), job, cfg, nil); err != nil {
 		t.Fatalf("download A: %v", err)
 	}
-	payload := filepath.Join(root, presenceRepo, hfdownloader.BranchVariantPayloadDir, revision, "config.json")
+	payload := filepath.Join(presenceLocalSpace(t, root).Path(), "payload", revision, "config.json")
 	if body, err := os.ReadFile(payload); err != nil || string(body) != configA {
 		t.Fatalf("payload after A = %q err=%v, want %q", body, err, configA)
 	}
@@ -873,7 +1045,7 @@ func TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile(t *testing.T)
 	if err != nil || string(body) != configB {
 		t.Fatalf("payload after B = %q err=%v, want commit B bytes %q", body, err, configB)
 	}
-	manifestDir, err := hfdownloader.BranchVariantLocalManifestDir(filepath.Join(root, presenceRepo), revision, commitB)
+	manifestDir, err := presenceLocalSpace(t, root).RecordDir(revision, commitB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -952,11 +1124,12 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 	}
 
 	repoBase := filepath.Join(root, presenceRepo)
-	payloadDir, err := hfdownloader.BranchVariantLocalPayloadDir(repoBase, revision)
+	space := presenceLocalSpace(t, root)
+	payloadDir, err := space.PayloadDir(revision)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(repoBase, hfdownloader.BranchVariantPayloadDir, "exl", "4_25"); payloadDir != want {
+	if want := filepath.Join(space.Path(), "payload", "exl", "4_25"); payloadDir != want {
 		t.Fatalf("payload dir = %q, want %q", payloadDir, want)
 	}
 	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
@@ -967,11 +1140,11 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 		t.Fatalf("branch payload used a repository-relative directory (err=%v)", err)
 	}
 
-	recordDir, err := hfdownloader.BranchVariantLocalManifestDir(repoBase, revision, commit)
+	recordDir, err := space.RecordDir(revision, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(repoBase, hfdownloader.BranchVariantMetadataDir, "exl", "4_25", commit); recordDir != want {
+	if want := filepath.Join(space.Path(), "records", "exl", "4_25", commit); recordDir != want {
 		t.Fatalf("completion record dir = %q, want %q", recordDir, want)
 	}
 	manifest, err := hfdownloader.ReadManifest(filepath.Join(recordDir, hfdownloader.ManifestFilename))
