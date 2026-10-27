@@ -926,11 +926,13 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // verifyRunningExecutable waits until the supervisor reports the unit as
 // running with the given program.
 //
-// The check is the effective one: it asks the supervisor for the state and the
-// ExecStart of the unit, not for the unit file that was just written. A
-// registration that points at the new executable proves nothing while the old
-// process still runs, so the installation only succeeds when the supervisor
-// runs the new program.
+// The check is the effective one for this platform: it asks the supervisor for
+// the state and the ExecStart of the loaded unit. systemctl show reports the
+// configuration of the unit that was written and reloaded, not the image of the
+// process that runs it. A registration that points at the new executable
+// therefore proves nothing while the old process still runs; the installation
+// succeeds only when the supervisor reports the reloaded unit active with the
+// new program, after the restart was requested.
 //
 // The wait is bounded by the shutdown budget of the service layer and the
 // context of the installation: an instance that does not come up within it is
