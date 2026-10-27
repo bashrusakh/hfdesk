@@ -852,9 +852,27 @@ Notes:
   touched. If that invalidation fails, the download fails without touching the
   payload. A local re-download that fails or is cancelled after that
   invalidation reports `missing` instead of complete.
+  A local branch-variant transfer stages its bytes in the app-owned,
+  commit-scoped staging area
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/staging/<revision>/<commit>/`
+  and publishes them into the payload directory afterwards. The staging area
+  is transient: it holds the partial bytes of one transfer (`.part`,
+  `.part-NN`, `.parts.json`) until they are verified, and the verified file is
+  then moved into
+  `<root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>/<path>`
+  with an atomic rename, so the payload path never holds a partially written
+  file and the payload directory holds only the variant's own file names.
+  Because the staging area is keyed by the resolved commit, a partial left
+  behind by an interrupted transfer belongs to exactly one commit: a transfer
+  of a moved branch starts from zero instead of resuming another commit's
+  bytes, while a retry of the same commit resumes its own partial. The
+  staging area lives inside the reserved space, so it is excluded from the
+  ordinary local repository scan like the rest of that space, and it is
+  verified like the other app-owned trees.
   A local re-download re-fetches hashless/non-LFS files instead of trusting size
-  equality, so a moved branch cannot retain same-size stale bytes; LFS files
-  continue to use their known SHA.
+  equality, and the commit-scoped staging area keeps a moved branch from
+  resuming another commit's bytes, so a moved branch cannot retain same-size
+  stale bytes; LFS files continue to use their known SHA.
 - A destination folder override must be valid for the selected storage mode and remain within its storage root; invalid values are rejected with `400` before the job is admitted.
 - `cacheDir` and global `localDir` are server-controlled.
 - Per-request `localDir` is accepted only where explicitly supported by server configuration.

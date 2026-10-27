@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ const BranchVariantMetadataDir = ".hfdesk-variants"
 //
 //	<root>/.hfdesk-branch-variants/<owner>/<repo>/payload/<revision>/
 //	<root>/.hfdesk-branch-variants/<owner>/<repo>/records/<revision>/<commit>/hfd.yaml
+//	<root>/.hfdesk-branch-variants/<owner>/<repo>/staging/<revision>/<commit>/
 //
 // The space lives OUTSIDE the ordinary repository tree on purpose. The
 // ordinary downloader writes whatever the repository tree contains and
@@ -51,11 +53,13 @@ const BranchVariantMetadataDir = ".hfdesk-variants"
 // own space.
 const BranchVariantLocalSpaceName = ".hfdesk-branch-variants"
 
-// branchVariantLocalPayloadDirName and branchVariantLocalRecordsDirName are
-// the two subtrees of the app-owned local branch-variant space.
+// branchVariantLocalPayloadDirName, branchVariantLocalRecordsDirName and
+// branchVariantLocalStagingDirName are the three subtrees of the app-owned
+// local branch-variant space.
 const (
 	branchVariantLocalPayloadDirName = "payload"
 	branchVariantLocalRecordsDirName = "records"
+	branchVariantLocalStagingDirName = "staging"
 )
 
 // IsBranchVariantReservedName reports whether name is the reserved app-owned
@@ -98,6 +102,7 @@ type BranchVariantLocalSpace struct {
 	space   string
 	payload string
 	records string
+	staging string
 }
 
 // NewBranchVariantLocalSpace returns the app-owned local branch-variant space
@@ -133,6 +138,10 @@ func NewBranchVariantLocalSpace(root, repo string) (BranchVariantLocalSpace, err
 	if err != nil {
 		return BranchVariantLocalSpace{}, fmt.Errorf("resolve branch variant records directory: %w", err)
 	}
+	staging, err := SafeJoin(space, branchVariantLocalStagingDirName)
+	if err != nil {
+		return BranchVariantLocalSpace{}, fmt.Errorf("resolve branch variant staging directory: %w", err)
+	}
 	return BranchVariantLocalSpace{
 		root:    rootAbs,
 		repo:    repo,
@@ -141,6 +150,7 @@ func NewBranchVariantLocalSpace(root, repo string) (BranchVariantLocalSpace, err
 		space:   space,
 		payload: payload,
 		records: records,
+		staging: staging,
 	}, nil
 }
 
@@ -177,6 +187,83 @@ func (space BranchVariantLocalSpace) RecordDir(revision, commit string) (string,
 		return "", fmt.Errorf("invalid branch variant commit %q", commit)
 	}
 	return SafeJoin(space.records, filepath.Join(revision, commit))
+}
+
+// stagingDir returns the commit-scoped staging directory of one revision
+// inside the space: <space>/staging/<revision>/<commit>.
+//
+// The staging directory is app-owned and transient. It holds the bytes of one
+// transfer until they are verified and published into the payload directory.
+// Its identity is the revision and the resolved commit, so the partial of an
+// interrupted transfer belongs to exactly one commit: a transfer of a moved
+// branch starts from zero instead of resuming another commit's bytes, and a
+// retry of the same commit finds and resumes its own partial.
+//
+// Every level of the path is a single safe component: the revision is a
+// validated component sequence (see ValidBranchVariantRevision) and the
+// commit is a plain name (see safeCommitName).
+func (space BranchVariantLocalSpace) stagingDir(revision, commit string) (string, error) {
+	if !ValidBranchVariantRevision(revision) {
+		return "", fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	if !safeCommitName(commit) {
+		return "", fmt.Errorf("invalid branch variant commit %q", commit)
+	}
+	dir, err := SafeJoin(space.staging, revision)
+	if err != nil {
+		return "", err
+	}
+	return SafeJoin(dir, commit)
+}
+
+// stagingPath returns the commit-scoped staging path of one file of one
+// revision: <space>/staging/<revision>/<commit>/<name>.
+//
+// The name is derived from the file's relative path, so the staging path is
+// deterministic for the same (revision, commit, relative path) and a retry of
+// the same commit resumes its own partial file. The relative path itself is
+// never a path component of the staging path (see
+// branchVariantStagingFileName), so a repository file name can neither
+// collide with a staging file nor escape the staging directory.
+func (space BranchVariantLocalSpace) stagingPath(revision, commit, relPath string) (string, error) {
+	dir, err := space.stagingDir(revision, commit)
+	if err != nil {
+		return "", err
+	}
+	return SafeJoin(dir, branchVariantStagingFileName(relPath))
+}
+
+// ensureStagingTree verifies that every component of the commit-scoped
+// staging tree is a real directory inside the local root and never a
+// symlink, so a staging write cannot be redirected outside the reserved
+// space (see ensureLocalBranchVariantTree).
+//
+// The staging tree is app-owned like the payload and record trees, so it
+// carries the same per-component check. A missing component is not unsafe:
+// nothing below it can exist yet, and the downloader creates the tree.
+func (space BranchVariantLocalSpace) ensureStagingTree(revision, commit string) error {
+	if !ValidBranchVariantRevision(revision) {
+		return fmt.Errorf("invalid branch variant revision %q", revision)
+	}
+	if !safeCommitName(commit) {
+		return fmt.Errorf("invalid branch variant commit %q", commit)
+	}
+	components := append(space.treeComponents(branchVariantLocalStagingDirName, revision), commit)
+	return ensureLocalBranchVariantTree(space.root, components)
+}
+
+// branchVariantStagingFileName returns the single path component that names
+// one file's staging file inside a commit-scoped staging directory.
+//
+// The relative path is hashed instead of naming the file: the staging area
+// holds one file per repository path, and a repository path can carry
+// separators and characters that are not valid in a path component on every
+// platform. The digest keeps the name one safe component and keeps distinct
+// paths distinct, so paths such as "a/b_c" and "a_b/c" never share a staging
+// file.
+func branchVariantStagingFileName(relPath string) string {
+	sum := sha256.Sum256([]byte(relPath))
+	return "f-" + hex.EncodeToString(sum[:])
 }
 
 // RecordDirs lists the existing completion-record directories of one revision

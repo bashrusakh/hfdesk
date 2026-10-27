@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -57,8 +59,9 @@ type branchHubRevision struct {
 
 // branchHubBodyServer serves the raw bytes of one file. It returns true when
 // it served the response, so the fixture's default one-shot body write is
-// skipped. A test uses it to control when and how a body is delivered.
-type branchHubBodyServer func(w http.ResponseWriter, rel, body string) bool
+// skipped. A test uses it to control when and how a body is delivered, and
+// to honour the request's Range header.
+type branchHubBodyServer func(w http.ResponseWriter, r *http.Request, rel, body string) bool
 
 // fakeBranchVariantHub serves the minimal Hub API used by the downloader:
 // revision metadata, recursive tree listings, and raw file bytes.
@@ -143,7 +146,7 @@ func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision, 
 				return
 			}
 			for _, serve := range bodyServers {
-				if serve(w, parts[1], body) {
+				if serve(w, r, parts[1], body) {
 					return
 				}
 			}
@@ -2918,7 +2921,7 @@ func TestBranchVariantConcurrentRevisionsAtOneCommitUseSeparateStagingFiles(t *t
 	cacheRoot := t.TempDir()
 	blobsDir := branchFixtureRepoDir(t, cacheRoot).BlobsDir()
 	gate := newBranchOverlapGate(2)
-	hub := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, gotRel, gotBody string) bool {
+	hub := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, r *http.Request, gotRel, gotBody string) bool {
 		if gotRel != rel {
 			return false
 		}
@@ -2992,5 +2995,506 @@ func TestBranchVariantConcurrentRevisionsAtOneCommitUseSeparateStagingFiles(t *t
 	// No staging file is left behind.
 	if leftover := branchStagingFiles(blobsDir); len(leftover) != 0 {
 		t.Errorf("staging files were left behind: %v", leftover)
+	}
+}
+
+// --- Commit-scoped local branch-variant transfer ---
+
+// branchRangeBodyServer serves the requested byte range of a file body the
+// way a resumable client expects: a Range request answers 206 with the
+// Content-Range of the requested window, so the client appends the bytes
+// instead of restarting from zero.
+//
+// An interruptAfter of zero or more aborts the connection after that many
+// bytes of the window. That is what an interrupted transfer looks like to
+// the client: the bytes it received stay on disk in its partial file, and
+// the transfer fails. A negative interruptAfter serves the whole window.
+func branchRangeBodyServer(interruptAfter int) branchHubBodyServer {
+	return func(w http.ResponseWriter, r *http.Request, rel, body string) bool {
+		if r.Method == http.MethodHead {
+			// A HEAD carries no body: the multipart path issues one to
+			// resolve the file size before it starts the parts.
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			return true
+		}
+		rangeHeader := r.Header.Get("Range")
+		window, err := branchRangeWindow(rangeHeader, body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+			return true
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(window)))
+		if rangeHeader != "" {
+			start, _, _ := strings.Cut(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+			from, _ := strconv.Atoi(start)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, from+len(window)-1, len(body)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		if interruptAfter >= 0 && interruptAfter < len(window) {
+			if _, err := io.WriteString(w, window[:interruptAfter]); err != nil {
+				return true
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// Abort the connection: the client sees a truncated body and
+			// keeps the bytes it already received.
+			panic(http.ErrAbortHandler)
+		}
+		_, _ = io.WriteString(w, window)
+		return true
+	}
+}
+
+// branchRangeWindow returns the bytes a "bytes=<start>[-<end>]" range header
+// selects. An absent header selects the whole file.
+func branchRangeWindow(header, body string) (string, error) {
+	if header == "" {
+		return body, nil
+	}
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return "", fmt.Errorf("unsupported range header %q", header)
+	}
+	startText, endText, hasEnd := strings.Cut(spec, "-")
+	start, err := strconv.Atoi(startText)
+	if err != nil || start < 0 || start > len(body) {
+		return "", fmt.Errorf("unsupported range header %q", header)
+	}
+	end := len(body)
+	if hasEnd {
+		last, err := strconv.Atoi(endText)
+		if err != nil || last < start || last >= len(body) {
+			return "", fmt.Errorf("unsupported range header %q", header)
+		}
+		end = last + 1
+	}
+	return body[start:end], nil
+}
+
+// branchRangeRecorder records the Range headers of the requests a fixture
+// served, so a test can tell a resumed transfer from one that started over.
+type branchRangeRecorder struct {
+	mu     sync.Mutex
+	ranges []string
+}
+
+func (rec *branchRangeRecorder) record(header string) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	rec.ranges = append(rec.ranges, header)
+}
+
+func (rec *branchRangeRecorder) list() []string {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]string(nil), rec.ranges...)
+}
+
+// branchTreeFiles lists every file below dir, with paths relative to dir in
+// slash form, sorted.
+func branchTreeFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	files := make([]string, 0)
+	err := filepath.WalkDir(dir, func(p string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+// branchSpaceFile is one file in the app-owned reserved space of the fixture
+// repository.
+type branchSpaceFile struct {
+	// rel is the file's path relative to the reserved space, in slash form.
+	rel string
+	// size is the file's length in bytes.
+	size int64
+}
+
+// branchSpaceFiles lists every file in the fixture repository's reserved
+// space. The space is app-owned, so the listing shows exactly what the
+// download left behind.
+func branchSpaceFiles(t *testing.T, root string) []branchSpaceFile {
+	t.Helper()
+	space := branchLocalSpaceDir(root)
+	files := make([]branchSpaceFile, 0)
+	for _, rel := range branchTreeFiles(t, space) {
+		info, err := os.Stat(filepath.Join(space, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("stat reserved space file %s: %v", rel, err)
+		}
+		files = append(files, branchSpaceFile{rel: rel, size: info.Size()})
+	}
+	return files
+}
+
+// branchSpacePartials returns the partial artifacts (.part, .part-NN and
+// .parts.json) the download left in the reserved space.
+func branchSpacePartials(t *testing.T, root string) []branchSpaceFile {
+	t.Helper()
+	partials := make([]branchSpaceFile, 0)
+	for _, file := range branchSpaceFiles(t, root) {
+		base := path.Base(file.rel)
+		if strings.HasSuffix(base, ".part") || strings.HasSuffix(base, ".parts.json") || strings.Contains(base, ".part-") {
+			partials = append(partials, file)
+		}
+	}
+	return partials
+}
+
+// TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommit discriminates
+// the commit-mixing defect: the local branch-variant payload directory is
+// keyed by revision only, so the partial an interrupted transfer left behind
+// belonged to whatever commit that transfer read. The next transfer of a
+// moved branch resumed it and published a file holding the first commit's
+// bytes followed by the second commit's bytes. The length was unchanged, a
+// hashless file has no digest to check, and the completion record reported
+// the variant as complete.
+func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommit(t *testing.T) {
+	const (
+		revision     = "4.00bpw"
+		firstCommit  = "2222222222222222222222222222222222222222"
+		secondCommit = "4444444444444444444444444444444444444444"
+		firstBytes   = "AAAAAAAA"
+		secondBytes  = "BBBBBBBB"
+	)
+	revisions := map[string]branchHubRevision{
+		revision:    {sha: firstCommit, files: map[string]string{"config.json": firstBytes}},
+		firstCommit: {sha: firstCommit, files: map[string]string{"config.json": firstBytes}},
+	}
+	// The first transfer is interrupted after four bytes, so its partial
+	// stays on disk exactly as a failed, cancelled or interrupted transfer
+	// leaves it.
+	hub := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(4))
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size", Retries: 0}
+	job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
+
+	if err := Download(context.Background(), job, cfg, nil); err == nil {
+		t.Fatal("interrupted branch variant reported success")
+	}
+	// The fixture is closed before the revision map changes, so no request
+	// can observe the move.
+	hub.Close()
+
+	partials := branchSpacePartials(t, root)
+	if len(partials) != 1 {
+		t.Fatalf("interrupted transfer left %d partial artifacts, want one: %+v", len(partials), partials)
+	}
+	if partials[0].size != 4 {
+		t.Fatalf("interrupted transfer left %d bytes, want 4", partials[0].size)
+	}
+
+	// The branch moves to another commit whose file has the same length and
+	// different bytes.
+	revisions[revision] = branchHubRevision{sha: secondCommit, files: map[string]string{"config.json": secondBytes}}
+	revisions[secondCommit] = branchHubRevision{sha: secondCommit, files: map[string]string{"config.json": secondBytes}}
+	moved := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(-1))
+	defer moved.Close()
+	cfg.Endpoint = moved.URL
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("download of the moved branch: %v", err)
+	}
+
+	// The published file holds the moved branch's bytes and nothing else.
+	body, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "config.json"))
+	if err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	if string(body) != secondBytes {
+		t.Fatalf("payload = %q, want the moved branch's bytes %q", body, secondBytes)
+	}
+}
+
+// TestLocalBranchVariantRetryResumesItsOwnCommitPartial pins the preserved
+// resume: an interrupted transfer retried for the same commit continues its
+// own partial instead of fetching the file from zero, and the published file
+// holds exactly that commit's bytes.
+//
+// The retry is bound to the same commit, so the partial of that commit is
+// the only partial it may resume.
+func TestLocalBranchVariantRetryResumesItsOwnCommitPartial(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+		body     = "AAAAAAAA"
+	)
+	revisions := map[string]branchHubRevision{
+		revision: {sha: commit, files: map[string]string{"config.json": body}},
+		commit:   {sha: commit, files: map[string]string{"config.json": body}},
+	}
+	hub := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(4))
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size", Retries: 0}
+	job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
+
+	if err := Download(context.Background(), job, cfg, nil); err == nil {
+		t.Fatal("interrupted branch variant reported success")
+	}
+	hub.Close()
+
+	// The retry of the same commit asks for the remaining bytes only: the
+	// partial of this commit is reused.
+	recorder := &branchRangeRecorder{}
+	retry := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, r *http.Request, rel, gotBody string) bool {
+		recorder.record(r.Header.Get("Range"))
+		return branchRangeBodyServer(-1)(w, r, rel, gotBody)
+	})
+	defer retry.Close()
+	cfg.Endpoint = retry.URL
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("retry of the interrupted transfer: %v", err)
+	}
+
+	want := fmt.Sprintf("bytes=%d-%d", 4, len(body)-1)
+	ranges := recorder.list()
+	if len(ranges) != 1 || ranges[0] != want {
+		t.Fatalf("retry range headers = %v, want exactly [%q]", ranges, want)
+	}
+	got, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "config.json"))
+	if err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("payload = %q, want %q", got, body)
+	}
+}
+
+// TestLocalBranchVariantPayloadHoldsOnlyTheVariantFiles pins the local layout
+// of a successful branch-variant download: the payload directory holds
+// exactly the variant's files at their repository-relative paths, the
+// completion record sits in the record tree, and the transfer leaves no
+// staging or partial artifact behind.
+func TestLocalBranchVariantPayloadHoldsOnlyTheVariantFiles(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+	)
+	files := map[string]string{
+		"config.json":       `{"model_type":"exl3","bits":4}`,
+		"model.safetensors": "branch-a-weights",
+		"nested/dir.json":   "nested-bytes",
+	}
+	revisions := map[string]branchHubRevision{
+		revision: {sha: commit, files: files},
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+
+	if err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}, cfg, nil); err != nil {
+		t.Fatalf("local branch download: %v", err)
+	}
+
+	// The payload directory holds exactly the variant's files.
+	payload := branchLocalPayloadDir(root, revision)
+	wantPayload := []string{"config.json", "model.safetensors", "nested/dir.json"}
+	gotPayload := branchTreeFiles(t, payload)
+	if len(gotPayload) != len(wantPayload) {
+		t.Fatalf("payload files = %v, want %v", gotPayload, wantPayload)
+	}
+	for i, name := range wantPayload {
+		if gotPayload[i] != name {
+			t.Fatalf("payload files = %v, want %v", gotPayload, wantPayload)
+		}
+	}
+	for name, want := range files {
+		got, err := os.ReadFile(filepath.Join(payload, filepath.FromSlash(name)))
+		if err != nil || string(got) != want {
+			t.Fatalf("payload file %s = %q err=%v, want %q", name, got, err, want)
+		}
+	}
+
+	// The completion record is in the record tree, outside the payload tree.
+	recordPath := filepath.Join(branchLocalRecordDir(root, revision, commit), ManifestFilename)
+	manifest := readBranchFixtureManifest(t, recordPath)
+	if !manifest.BranchVariant || manifest.Repo != branchFixtureRepo ||
+		manifest.Branch != revision || manifest.Commit != commit {
+		t.Fatalf("completion record identity = %+v", manifest)
+	}
+	if manifest.CompletedAt.IsZero() || manifest.TotalFiles != len(files) || len(manifest.Files) != len(files) {
+		t.Fatalf("completion record completion = at %v total %d files %d", manifest.CompletedAt, manifest.TotalFiles, len(manifest.Files))
+	}
+	if PathInside(payload, recordPath) {
+		t.Fatalf("completion record %q is inside the payload tree %q", recordPath, payload)
+	}
+
+	// The transfer left no staging or partial artifact behind: the space
+	// holds the payload files and the completion record only.
+	for _, file := range branchSpaceFiles(t, root) {
+		switch {
+		case strings.HasPrefix(file.rel, "payload/"+revision+"/"):
+		case file.rel == "records/"+revision+"/"+commit+"/"+ManifestFilename:
+		default:
+			t.Errorf("reserved space holds %q after the download, want only the payload files and the completion record", file.rel)
+		}
+	}
+}
+
+// TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts is the
+// multipart counterpart of the commit-mixing defect: a file above the
+// multipart threshold is assembled from .part-NN parts and a .parts.json
+// layout, and those artifacts are commit-scoped as well. The parts of an
+// interrupted transfer of one commit must not be resumed by a transfer of
+// another commit, or the assembled file holds two commits' bytes.
+func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts(t *testing.T) {
+	const (
+		revision     = "4.00bpw"
+		firstCommit  = "2222222222222222222222222222222222222222"
+		secondCommit = "4444444444444444444444444444444444444444"
+		firstBytes   = "AAAAAAAAAAAAAAAA"
+		secondBytes  = "BBBBBBBBBBBBBBBB"
+	)
+	firstSum := sha256.Sum256([]byte(firstBytes))
+	secondSum := sha256.Sum256([]byte(secondBytes))
+	firstEntry := branchHubRevision{
+		sha:   firstCommit,
+		files: map[string]string{"model.safetensors": firstBytes},
+		lfs: map[string]hfLfsInfo{
+			"model.safetensors": {Oid: hex.EncodeToString(firstSum[:]), Size: int64(len(firstBytes))},
+		},
+	}
+	secondEntry := branchHubRevision{
+		sha:   secondCommit,
+		files: map[string]string{"model.safetensors": secondBytes},
+		lfs: map[string]hfLfsInfo{
+			"model.safetensors": {Oid: hex.EncodeToString(secondSum[:]), Size: int64(len(secondBytes))},
+		},
+	}
+	revisions := map[string]branchHubRevision{
+		revision:    firstEntry,
+		firstCommit: firstEntry,
+	}
+	// The parts of the multipart transfer are interrupted after four bytes
+	// each, so the part files stay on disk exactly as an interrupted
+	// transfer leaves them.
+	hub := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(4))
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{
+		OutputDir:          root,
+		Endpoint:           hub.URL,
+		Verify:             "size",
+		Retries:            0,
+		Concurrency:        2,
+		MultipartThreshold: "1B",
+	}
+	job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
+
+	if err := Download(context.Background(), job, cfg, nil); err == nil {
+		t.Fatal("interrupted multipart branch variant reported success")
+	}
+	hub.Close()
+
+	// The interrupted multipart transfer left its part files behind.
+	partials := branchSpacePartials(t, root)
+	if len(partials) < 2 {
+		t.Fatalf("interrupted multipart transfer left %d partial artifacts, want the parts of both windows: %+v", len(partials), partials)
+	}
+
+	// The branch moves to another commit whose file has the same length and
+	// different bytes.
+	revisions[revision] = secondEntry
+	revisions[secondCommit] = secondEntry
+	moved := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(-1))
+	defer moved.Close()
+	cfg.Endpoint = moved.URL
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("download of the moved branch: %v", err)
+	}
+
+	// The published file holds the moved branch's bytes and nothing else.
+	body, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, revision), "model.safetensors"))
+	if err != nil {
+		t.Fatalf("payload file: %v", err)
+	}
+	if string(body) != secondBytes {
+		t.Fatalf("payload = %q, want the moved branch's bytes %q", body, secondBytes)
+	}
+}
+
+// TestOrdinaryLocalDownloadKeepsItsPartialBesideTheFinalFile pins the
+// preserved ordinary local download: its partial stays next to the file it
+// publishes, the retry resumes it, and the ordinary download writes nothing
+// into the app-owned branch-variant space.
+func TestOrdinaryLocalDownloadKeepsItsPartialBesideTheFinalFile(t *testing.T) {
+	const (
+		revision = "main"
+		commit   = "1111111111111111111111111111111111111111"
+		body     = "AAAAAAAA"
+	)
+	revisions := map[string]branchHubRevision{
+		revision: {sha: commit, files: map[string]string{"config.json": body}},
+		commit:   {sha: commit, files: map[string]string{"config.json": body}},
+	}
+	hub := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(4))
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size", Retries: 0}
+	job := Job{Repo: branchFixtureRepo, Revision: revision}
+
+	if err := Download(context.Background(), job, cfg, nil); err == nil {
+		t.Fatal("interrupted ordinary download reported success")
+	}
+	hub.Close()
+
+	// The ordinary partial sits next to the file it publishes.
+	partial := filepath.Join(root, branchFixtureRepo, "config.json.part")
+	info, err := os.Stat(partial)
+	if err != nil {
+		t.Fatalf("ordinary partial: %v", err)
+	}
+	if info.Size() != 4 {
+		t.Fatalf("ordinary partial holds %d bytes, want 4", info.Size())
+	}
+	// The ordinary download writes nothing into the app-owned space.
+	if _, err := os.Stat(branchLocalSpaceDir(root)); !os.IsNotExist(err) {
+		t.Fatalf("ordinary download created the reserved space (err=%v)", err)
+	}
+
+	// The retry resumes the partial and publishes the file.
+	recorder := &branchRangeRecorder{}
+	retry := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, r *http.Request, rel, gotBody string) bool {
+		recorder.record(r.Header.Get("Range"))
+		return branchRangeBodyServer(-1)(w, r, rel, gotBody)
+	})
+	defer retry.Close()
+	cfg.Endpoint = retry.URL
+
+	if err := Download(context.Background(), job, cfg, nil); err != nil {
+		t.Fatalf("retry of the interrupted ordinary download: %v", err)
+	}
+	want := fmt.Sprintf("bytes=%d-%d", 4, len(body)-1)
+	ranges := recorder.list()
+	if len(ranges) != 1 || ranges[0] != want {
+		t.Fatalf("ordinary retry range headers = %v, want exactly [%q]", ranges, want)
+	}
+	got, err := os.ReadFile(filepath.Join(root, branchFixtureRepo, "config.json"))
+	if err != nil || string(got) != body {
+		t.Fatalf("ordinary payload = %q err=%v, want %q", got, err, body)
 	}
 }

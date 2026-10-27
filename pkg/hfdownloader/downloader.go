@@ -419,6 +419,15 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			if err := space.InvalidateRecords(job.Revision); err != nil {
 				return failBranchVariant(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
 			}
+			// The transfer stages its bytes in the app-owned staging tree
+			// before it publishes them into the payload directory. The
+			// staging tree is app-owned like the payload and record trees,
+			// so it carries the same per-component check: a symlinked
+			// component would redirect the transfer outside the reserved
+			// space. It is verified before any payload byte is written.
+			if err := space.ensureStagingTree(job.Revision, plan.Commit); err != nil {
+				return failBranchVariant(fmt.Errorf("unsafe branch variant layout: %w", err))
+			}
 		}
 	}
 
@@ -549,6 +558,11 @@ LOOP:
 			}
 
 			var dst string
+			// publishPath is the file's final path in the payload tree. It
+			// differs from dst only for a local branch variant, which stages
+			// the transfer in the commit-scoped staging area and publishes
+			// the verified bytes afterwards.
+			var publishPath string
 			var skipCheck func() (bool, string, error)
 
 			if useHFCache {
@@ -646,7 +660,7 @@ LOOP:
 				}
 				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
 				// output directory via path traversal.
-				safeDst, err := SafeJoin(base, finalRel)
+				publishPath, err = SafeJoin(base, finalRel)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
 					setFatalErr(fatal)
@@ -656,7 +670,28 @@ LOOP:
 					}
 					return
 				}
-				dst = safeDst
+				if job.BranchVariant {
+					// The payload directory is keyed by revision only, so a
+					// partial left behind there by an interrupted transfer
+					// belongs to whatever commit that transfer read. Resuming
+					// it after the branch moved would publish a file holding
+					// two commits' bytes. The transfer therefore writes into
+					// the commit-scoped staging path and publishes the
+					// verified bytes into the payload path afterwards.
+					stagingPath, err := localSpace.stagingPath(job.Revision, plan.Commit, finalRel)
+					if err != nil {
+						fatal := fmt.Errorf("resolve branch variant staging path: %w", err)
+						setFatalErr(fatal)
+						select {
+						case errCh <- fatal:
+						default:
+						}
+						return
+					}
+					dst = stagingPath
+				} else {
+					dst = publishPath
+				}
 				skipCheck = func() (bool, string, error) {
 					// A branch variant is pinned to the newly planned commit.
 					// Without a content SHA, equal size cannot prove the payload
@@ -666,7 +701,10 @@ LOOP:
 					if job.BranchVariant && it.SHA256 == "" {
 						return false, "", nil
 					}
-					return shouldSkipLocalCtx(fileCtx, it, dst)
+					// The skip is decided on the published file: it is the
+					// file the variant's payload holds, and its content hash
+					// is what proves it belongs to the planned commit.
+					return shouldSkipLocalCtx(fileCtx, it, publishPath)
 				}
 			}
 
@@ -846,6 +884,20 @@ LOOP:
 				}
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			} else {
+				if job.BranchVariant {
+					// The verified bytes are published into the payload
+					// directory now: the rename is atomic, so the payload
+					// path never holds a partially written file, and the
+					// payload directory keeps only the variant's own file
+					// names.
+					if err := publishBranchVariantFile(dst, publishPath); err != nil {
+						select {
+						case errCh <- fmt.Errorf("publish branch variant file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
 				finalSHA256 = it.SHA256
 			}
 
@@ -1013,6 +1065,24 @@ func branchVariantStagingName(revision, commit string, item PlanItem) string {
 	}
 	sum := sha256.Sum256([]byte(revision + "\x00" + item.RelativePath))
 	return "tmp-" + commit + "-" + hex.EncodeToString(sum[:])
+}
+
+// publishBranchVariantFile moves the verified staging file at src into the
+// variant's payload path at dst.
+//
+// The rename is atomic, so the payload path never holds a partially written
+// file: a reader sees either the previous file or the complete new one. The
+// destination directory is created first, because the repository's own file
+// names decide how deep the payload tree is.
+//
+// The staging file is bound to one commit (see BranchVariantLocalSpace), so
+// the bytes published here are the bytes of the planned commit and of no
+// other.
+func publishBranchVariantFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
 }
 
 // branchVariantSharedBlobWaitTimeout bounds how long a branch-variant file
