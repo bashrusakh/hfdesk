@@ -327,14 +327,14 @@ branch as a selectable item:
 
 ```json
 {
-  "id": "exl-branch:4.00bpw",
-  "label": "4.00bpw",
+  "id": "exl-branch:4.00bpw-h6",
+  "label": "4.00bpw-h6",
   "category": "quantization",
-  "revision": "4.00bpw",
+  "revision": "4.00bpw-h6",
   "branch_variant": true,
   "method": "exl3",
   "bits_per_weight": 4,
-  "head_bits": 5,
+  "head_bits": 6,
   "recommended": true
 }
 ```
@@ -342,13 +342,20 @@ branch as a selectable item:
 `revision` is the branch to download, `branch_variant` distinguishes it from an
 ordinary revision-backed selection, and `bits_per_weight`/`head_bits` describe
 the branch metadata when it is available. One branch is marked `recommended`.
+The per-branch metadata lookups are bounded. A branch whose quant method
+follows from the repository name or the main configuration is always listed; a
+branch whose method can only be established from its own branch metadata is
+listed only when the lookup reached it, so a slow Hub can return fewer branches
+than the repository has refs. The discovery warning below covers the
+uncertainty of the main tree's file roles, not this truncation.
+
 `recommended_download` then names that branch and asks for the whole branch
 without file filters:
 
 ```json
 {
   "repo": "owner/name",
-  "revision": "4.00bpw",
+  "revision": "4.00bpw-h6",
   "branchVariant": true
 }
 ```
@@ -522,7 +529,8 @@ selection.
 
 Quantized models expose a `quantized` projection in the response (also for
 quantization-only repositories that have a root `quantization_config.json` but
-no root architecture config):
+no root architecture config, and for repositories whose `config.json` carries a
+nested `quantization_config` object):
 
 ```json
 "quantized": {
