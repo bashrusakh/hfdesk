@@ -215,23 +215,6 @@ func observeStagingOSLockHolder(path string) (stagingLockHolderKind, error) {
 // lock, instead of inferring it from a sleep.
 var stagingOwnershipContentionHook func(staging string)
 
-// acquireStagingOwnershipLockCtx takes the exclusive ownership lock for
-// staging with the default contention window.
-//
-// A PROVEN live owner is reported at once (errStagingOwnershipBusy): the
-// staging file belongs to that writer, and the caller must not take it over.
-// The blob key's ownership protocol needs a different shape - it WAITS for
-// the live owner - and uses acquireStagingOwnershipLockWaiting for that.
-//
-// onWait is called when a contended attempt is about to block (never on the
-// free fast path). claimStaging uses it to return the item's
-// MaxActiveDownloads slot for the duration of the wait (see download_slot.go);
-// the lock is still acquired exactly as before, and a nil onWait is the
-// historical behavior.
-func acquireStagingOwnershipLockCtx(ctx context.Context, staging string, onWait func()) (*stagingOwnershipLock, error) {
-	return acquireStagingOwnershipLockWithinMode(ctx, staging, stagingOwnershipAcquireWait, false, onWait)
-}
-
 // acquireStagingOwnershipLockWithin takes the exclusive ownership lock for
 // staging, waiting out transient contention within a bounded, context-aware
 // window.
@@ -269,24 +252,25 @@ func acquireStagingOwnershipLockWithin(ctx context.Context, staging string, wait
 //
 // acquireStagingOwnershipLockWithin reports a proven live writer immediately
 // (errStagingOwnershipBusy), because a caller that merely wants to skip a
-// file must not block on it. The blob key's ownership protocol needs the
-// opposite: the file is NOT present while a live owner holds the key, so the
-// caller waits for that owner - bounded and context-aware - and re-evaluates
-// the key afterwards instead of reporting a success it cannot back.
+// file must not block on it. The destination ownership domain needs the
+// opposite: the file is NOT present while a live owner holds the domain, so
+// the caller waits for that owner - bounded and context-aware - and
+// re-evaluates the destination afterwards instead of reporting a success it
+// cannot back.
 //
 // The lock is never taken over: a live owner keeps it for as long as its
 // process and open handle live, so the wait ends in an error, not in a
 // preemption.
 //
 // onWait is called when the acquisition is about to block on the contended
-// lock. The download path uses it to return the item's MaxActiveDownloads slot
-// for the duration of the wait (see download_slot.go); it is called only on a
-// contended attempt, so the free fast path never releases anything. A nil
-// onWait is the historical behavior.
+// lock. The destination-domain acquisition uses it to return the item's
+// MaxActiveDownloads slot for the duration of the wait (see download_slot.go);
+// it is called only on a contended attempt, so the free fast path never
+// releases anything. A nil onWait is the historical behavior.
 //
 // The outcomes are:
 //
-//   - the lock is acquired: the caller owns the key;
+//   - the lock is acquired: the caller owns the domain;
 //   - the budget expires while a PROVEN live owner still holds the lock:
 //     errStagingOwnershipBusy (the owner is still there);
 //   - the budget expires while the holder could not be classified:
@@ -301,8 +285,8 @@ func acquireStagingOwnershipLockWaiting(ctx context.Context, staging string, wai
 // tolerateLiveOwner selects what a PROVEN exclusive holder means: with it
 // false (the skip-oriented acquisition) the holder is reported at once as
 // errStagingOwnershipBusy; with it true the holder is waited out until the
-// budget expires, which is what the blob key's ownership protocol needs (the
-// file is not present while the owner holds the key).
+// budget expires, which is what the destination ownership domain needs (the
+// file is not present while the owner holds the domain).
 //
 // onWait is called on every contended attempt, before the acquisition blocks,
 // so the download path can return the item's MaxActiveDownloads slot for the

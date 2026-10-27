@@ -62,27 +62,17 @@ func TestNegativeControlExclusiveObserverInventsALiveWriter(t *testing.T) {
 	}
 
 	f := newContentionDownloadFixture(t)
-	// A peer that holds the ownership lock for the whole run, exactly like a
-	// concurrent observer of the historical implementation.
-	release := make(chan struct{})
-	peerReady := make(chan struct{})
-	go func() {
-		own, err := acquireStagingOwnershipLock(f.staging)
-		if err != nil {
-			return
-		}
-		close(peerReady)
-		<-release
-		own.release()
-	}()
-	select {
-	case <-peerReady:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the peer never took the ownership lock")
-	}
+	// The budget is what turns a false exclusive observation into the
+	// actionable live-owner verdict; the behavior under test is the
+	// classification, not the duration.
+	shortBlobOwnershipWait(t, 250*time.Millisecond)
+	// A peer that holds the lock the way a real status probe does (shared, not
+	// exclusive) for the whole run. The faulty observer below mistakes its own
+	// failed exclusive attempt for another writer and invents a live owner.
+	peer := startStagingProbeHolder(t, f.staging, probeHoldShared)
+	defer peer.release()
 
 	out := f.runDownload(t, context.Background())
-	close(release)
 
 	if len(out.skips) != 0 {
 		t.Fatalf("the negative control did not reproduce the invented live writer: the job reported a successful skip: %v", out.skips)

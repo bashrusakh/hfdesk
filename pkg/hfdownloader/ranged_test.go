@@ -209,7 +209,7 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 	it := PlanItem{RelativePath: "ooo.bin", URL: srv.URL + "/ooo.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: nRanges, Retries: 1, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -317,7 +317,7 @@ func TestRangedMultipart_RejectsBadContentRange(t *testing.T) {
 			it := PlanItem{RelativePath: "cr.bin", URL: srv.URL + "/cr.bin", Size: total, AcceptRanges: true}
 			cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-			_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+			_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 			if err == nil {
 				t.Fatal("download succeeded despite a bad Content-Range; the body must be rejected")
 			}
@@ -378,7 +378,7 @@ func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 
 		it := PlanItem{RelativePath: "short.bin", URL: srv.URL + "/short.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if err == nil {
 			t.Fatal("download succeeded despite a short body")
 		}
@@ -429,7 +429,7 @@ func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 
 		it := PlanItem{RelativePath: "over.bin", URL: srv.URL + "/over.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if err == nil {
 			t.Fatal("download succeeded despite an oversized body")
 		}
@@ -523,7 +523,7 @@ func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testi
 
 			it := PlanItem{RelativePath: "chunked-over.bin", URL: srv.URL + "/chunked-over.bin", Size: total, AcceptRanges: true}
 			cfg := Settings{Concurrency: 1, Retries: retries, StallTimeout: "0", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "size"}
-			_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+			_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 			if err == nil {
 				t.Fatal("oversized chunked ranged body was accepted and published")
 			}
@@ -579,7 +579,7 @@ func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
 	it := PlanItem{RelativePath: "resume-missing.bin", URL: srv.URL + "/resume-missing.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 3, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 		it := PlanItem{RelativePath: "sparse.bin", URL: srv.URL + "/sparse.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 3, Retries: 0, StallTimeout: "0"}
 
-		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
 
@@ -674,7 +674,7 @@ func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 		it := PlanItem{RelativePath: "nometa.bin", URL: srv.URL + "/nometa.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
 		if len(*gotRanges) == 0 {
@@ -713,7 +713,7 @@ func TestRangedMultipart_ConcurrencyChangePreservesCommitted(t *testing.T) {
 	it := PlanItem{RelativePath: "conc.bin", URL: srv.URL + "/conc.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -899,7 +899,7 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 		cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "sha256"}
 
 		hashPassCount.Store(0)
-		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
@@ -941,7 +941,7 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 		cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "sha256"}
 
 		hashPassCount.Store(0)
-		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
+		verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {})
 		if err != nil {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
@@ -974,7 +974,10 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(blob), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	opts := multipartOpts{Staging: blob + ".incomplete", Publish: blob, ContentAddressed: true}
+	// Both claimants race the SAME blob key, so each acquires its own hold of
+	// the destination domain: the in-process slot serializes them.
+	key := blob
+	lockSrc := filepath.Join(filepath.Dir(blob), "tmp-"+filepath.Base(blob))
 
 	var mu sync.Mutex
 	rangeGets := map[string]int{}
@@ -1016,6 +1019,12 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 1, StallTimeout: "0"}
 
 	run := func() (bool, error) {
+		domain, derr := acquireBlobDomain(context.Background(), key, lockSrc)
+		if derr != nil {
+			return false, derr
+		}
+		defer domain.release()
+		opts := multipartOpts{Staging: blob + ".incomplete", Publish: blob, ContentAddressed: true, Domain: domain}
 		return downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, blob, opts, func(ProgressEvent) {})
 	}
 	done := make(chan struct{})
@@ -1078,11 +1087,8 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
 		t.Fatal(err)
 	}
-	// The live owner holds the OS ownership lock for its whole interval.
-	hold, _ := acquireStagingOwnershipLock(staging)
-	if hold != nil {
-		defer hold.release()
-	}
+	// The record is UNFENCED and its owner is a live foreign process, so the
+	// claim refuses it: no free lock may turn it into a take-over.
 
 	// The size HEAD must succeed for the download to reach the claim; the
 	// body requests must never be reached (the claim refuses first).
@@ -1097,7 +1103,7 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	defer srv.Close()
 
 	it := PlanItem{RelativePath: "foreign.bin", URL: srv.URL + "/foreign.bin", Size: total, AcceptRanges: true}
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0}, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if !errors.Is(err, errBlobIncompleteOwned) {
 		t.Fatalf("error = %v, want errBlobIncompleteOwned for a live foreign owner", err)
 	}
@@ -1131,7 +1137,7 @@ func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
 	it := PlanItem{RelativePath: "dead.bin", URL: srv.URL + "/dead.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -1178,7 +1184,7 @@ func TestRangedMultipart_LongRetryWaitKeepsClaimFresh(t *testing.T) {
 	}
 	done := make(chan runResult, 1)
 	go func() {
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		done <- runResult{err}
 	}()
 
@@ -1296,12 +1302,9 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The live owner holds the OS ownership lock; the fresh record is its
-		// diagnostic identity, not the fence.
-		hold, _ := acquireStagingOwnershipLock(staging)
-		if hold != nil {
-			defer hold.release()
-		}
+		// The record is UNFENCED and its owner cannot be proven dead, so the
+		// claim refuses it: a fresh (heartbeatted) record is protected by its
+		// identity rule, independently of any free lock.
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodHead {
@@ -1314,7 +1317,7 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		defer srv.Close()
 
 		it := PlanItem{RelativePath: "hb.bin", URL: srv.URL + "/hb.bin", Size: total, AcceptRanges: true}
-		_, err = downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0}, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err = downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, errBlobIncompleteOwned) {
 			t.Fatalf("error = %v, want errBlobIncompleteOwned for a live owner with a fresh (heartbeatted) record and a stale payload", err)
 		}
@@ -1343,7 +1346,7 @@ func TestRangedMultipart_ClaimHeartbeatBoundary(t *testing.T) {
 		it := PlanItem{RelativePath: "hb.bin", URL: srv.URL + "/hb.bin", Size: total, AcceptRanges: true}
 		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
 
-		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); !errors.Is(err, errBlobIncompleteOwned) {
+		if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); !errors.Is(err, errBlobIncompleteOwned) {
 			t.Fatalf("unfenced predecessor error = %v, want owned/busy", err)
 		}
 		after, readErr := os.ReadFile(staging)
@@ -1480,7 +1483,7 @@ func TestRangedMultipart_StrictHashSurvivesOverflowRetry(t *testing.T) {
 
 	var maxProgress atomic.Int64
 	hashPassCount.Store(0)
-	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ev ProgressEvent) {
+	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ev ProgressEvent) {
 		if ev.Event != "file_progress" {
 			return
 		}

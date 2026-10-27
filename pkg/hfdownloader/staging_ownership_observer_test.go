@@ -19,9 +19,9 @@ package hfdownloader
 //   - only a real lifetime writer takes the exclusive lock;
 //   - with observers only, a claim must never report a live writer.
 //
-// The concurrent cases deliberately bypass the per-path stagingOwners
-// registry (which serializes same-process claims) so the OS lock is the only
-// exclusion in play, exactly as it is across processes.
+// The concurrent cases deliberately bypass the in-process destination-domain
+// slot so the OS lock is the only exclusion in play, exactly as it is across
+// processes.
 
 import (
 	"context"
@@ -558,9 +558,20 @@ func runContentionChild(t *testing.T) {
 	}
 
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), Size: int64(cfg.Size), LFS: true}
-	state, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, cfg.MetaPath, it,
-		Job{Repo: "o/r"}, "commit123", true, Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false)
-	if err != nil {
+	// The child owns the destination's domain exactly like an item goroutine
+	// does; the domain is the only cross-process fence now.
+	domain, derr := acquireBlobDomain(context.Background(), flatDomainKey(cfg.Publish), flatDomainLockSrc(cfg.Publish))
+	if derr != nil {
+		if errors.Is(derr, errStagingOwnershipBusy) {
+			writeResult(contentionChildResult{Owned: true})
+			return
+		}
+		writeResult(contentionChildResult{Other: true, Err: derr.Error()})
+		return
+	}
+	defer domain.release()
+	if _, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, cfg.MetaPath, it,
+		Job{Repo: "o/r"}, "commit123", true, Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false, domain); err != nil {
 		if errors.Is(err, errBlobIncompleteOwned) {
 			writeResult(contentionChildResult{Owned: true})
 			return
@@ -568,8 +579,7 @@ func runContentionChild(t *testing.T) {
 		writeResult(contentionChildResult{Other: true, Err: err.Error()})
 		return
 	}
-	// Hold the claim briefly so the peers genuinely contend.
+	// Hold the domain briefly so the peers genuinely contend.
 	time.Sleep(time.Duration(cfg.HoldMS) * time.Millisecond)
-	state.release()
 	writeResult(contentionChildResult{})
 }

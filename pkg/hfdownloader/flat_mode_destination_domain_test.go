@@ -30,7 +30,6 @@ package hfdownloader
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -178,20 +177,12 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	t.Helper()
 	const total = 4_096
 	full := rangedTestPayload(total)
-	sha := singleTestSHA(full)
 	hub := newFlatModeGatedHubWithRevision(t, full, "model.bin", true, resolveRev)
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 
-	// The excluded writer must not wait the production budget: the behavior
-	// under test is the exclusion, not the duration.
-	shortBlobOwnershipWait(t, 250*time.Millisecond)
-
-	// Record every ownership-domain acquisition of the run. In flat mode the
-	// MULTIPART route does not take the domain (its staging claim takes the
-	// same lock file), so the acquisition count says which of the two
-	// writers went through the domain and which one was excluded by the
-	// claim.
+	// Record every ownership-domain acquisition of the run. Both routes take
+	// the ONE destination domain at item level, so both writers appear here.
 	var (
 		mu       sync.Mutex
 		acquired []string
@@ -213,67 +204,31 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	// The owner is inside the transfer, so it holds the destination's domain.
 	hub.awaitPayloadEntered(t)
 
-	// The probe is installed before the writer starts: the hook is a
-	// package-level variable.
-	contended := installDomainContentionProbe(t)
+	// The second writer is started before the owner releases the domain. It
+	// must WAIT for the domain (never take it over) instead of transferring or
+	// running its HEAD.
+	contended := installBlobDomainContentionProbe(t)
 	writerResult := make(chan flatModeOutcome, 1)
 	go func() {
 		writerResult <- runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, writerThreshold))
 	}()
-
-	var writer flatModeOutcome
+	awaitContention(t, contended, "the destination's ownership domain")
 	select {
-	case <-contended:
-		// The writer really met the contended lock.
-	case writer = <-writerResult:
-		// The writer already finished. The exclusion must be proven, not
-		// inferred, so the contention is checked before the outcome is
-		// accepted.
-		select {
-		case <-contended:
-		default:
-			t.Fatalf("the writer finished without observing the contended ownership lock (err=%v)", writer.err)
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("neither the contention nor the writer's completion was observed")
+	case writer := <-writerResult:
+		t.Fatalf("the second writer finished while the owner still held the destination (err=%v)", writer.err)
+	default:
 	}
-
-	select {
-	case writer = <-writerResult:
-	case <-time.After(60 * time.Second):
-		t.Fatal("the excluded writer did not finish")
+	if got := hub.payloads.Load(); got != 1 {
+		t.Errorf("payload requests while the owner holds the domain = %d, want only the owner's one", got)
 	}
-
-	// The item fails with the actionable live-owner error.
-	if writer.err == nil {
-		t.Fatalf("the excluded writer reported success although a live owner holds the destination (skips=%v, done=%v)",
-			writer.skips, writer.done)
-	}
-	if !errors.Is(writer.err, errBlobOwnedByLiveWriter) {
-		t.Errorf("the excluded writer's error = %v, want the actionable live-owner error", writer.err)
-	}
-	if !strings.Contains(writer.err.Error(), sha) {
-		t.Errorf("the excluded writer's error = %v, want the blob key %s in the message", writer.err, sha)
-	}
-	if !strings.Contains(writer.err.Error(), "is being downloaded by another process") ||
-		!strings.Contains(writer.err.Error(), "try again later") {
-		t.Errorf("the excluded writer's error = %v, want the actionable live-owner message", writer.err)
-	}
-	// A live owner means the file is NOT present: a skip or a file_done
-	// would report a success the output directory does not have.
-	if len(writer.skips) != 0 {
-		t.Errorf("skips = %v, want none: the file is not present while the live owner holds the destination", writer.skips)
-	}
-	if len(writer.done) != 0 {
-		t.Errorf("file_done events = %v, want none: the file is not present", writer.done)
-	}
-	// The excluded writer transferred nothing: the destination did not exist
-	// when it was excluded.
 	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
-		t.Errorf("the excluded writer created the destination, stat err=%v", serr)
+		t.Errorf("the destination exists while the owner still holds the domain, stat err=%v", serr)
 	}
 
-	// The owner publishes the exact bytes.
+	// The owner publishes the exact bytes; only then may the waiting writer
+	// obtain the destination. A flat destination has no published
+	// content-addressed target to re-check, so the waiting writer downloads
+	// the file itself (never concurrently with the owner).
 	hub.open()
 	var owner flatModeOutcome
 	select {
@@ -285,19 +240,25 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 		t.Fatalf("the owner failed: %v", owner.err)
 	}
 	assertExactFile(t, dst, full)
-	// Only the owner transferred the payload.
-	if got := hub.payloads.Load(); got != 1 {
-		t.Errorf("payload requests = %d, want exactly the owner's one: the excluded writer transferred bytes", got)
+
+	var writer flatModeOutcome
+	select {
+	case writer = <-writerResult:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the waiting writer did not finish after the owner released the destination")
 	}
-	// Exactly ONE of the two writers went through the destination's domain.
-	// In flat mode the multipart route does not take it - its staging claim
-	// takes the same lock file - so the count names the single-request
-	// writer of the pair.
+	if writer.err != nil {
+		t.Fatalf("the waiting writer failed: %v", writer.err)
+	}
+	assertExactFile(t, dst, full)
+
+	// Both writers used the ONE flat destination domain: the model has no
+	// route-private ownership fence any more.
 	mu.Lock()
 	got := append([]string(nil), acquired...)
 	mu.Unlock()
-	if len(got) != 1 {
-		t.Errorf("ownership-domain acquisitions = %v, want exactly one: the multipart route must not take the destination's domain", got)
+	if len(got) != 2 {
+		t.Errorf("ownership-domain acquisitions = %v, want both writers to use the one destination domain", got)
 	}
 	for _, key := range got {
 		if !strings.HasPrefix(key, flatDomainKeyPrefix) {
@@ -371,16 +332,15 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 	assertExactFile(t, dst, full)
 }
 
-// TestDownloadFlatModeUnknownSizeHandoffTakesTheDestinationDomain pins that
-// the multipart route's hand-off to the single-request path holds the
-// destination's domain.
+// TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain pins that the
+// multipart route's hand-off to the single-request path keeps the ONE
+// destination domain the item already holds, instead of taking a second lock.
 //
-// The hand-off happens when the size stays unknown after the HEAD. The
-// multipart route's claim - the OTHER holder of the destination's lock - is
-// never reached there, so the hand-off must take the domain itself: without
-// it the transfer would run with no ownership lock at all, and two writers of
-// the same flat destination would race over the same payload.
-func TestDownloadFlatModeUnknownSizeHandoffTakesTheDestinationDomain(t *testing.T) {
+// The hand-off happens when the size stays unknown after the HEAD. Under the
+// one-domain model the item acquired the domain before the HEAD, so the
+// hand-off must neither re-acquire it (a second exclusive open of the same
+// file would contend with itself) nor run without it.
+func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
@@ -427,8 +387,8 @@ func TestDownloadFlatModeUnknownSizeHandoffTakesTheDestinationDomain(t *testing.
 	}
 	defer func() { blobDomainAcquire = oldAcquire }()
 
-	// The threshold selects the multipart route, and the hand-off inside it
-	// is the only place the domain can be taken.
+	// The threshold selects the multipart route; the item-level acquisition is
+	// the only place the domain is taken.
 	res := runFlatModeDownload(context.Background(), flatModeSettings(out, srv.URL, "0"))
 	if res.err != nil {
 		t.Fatalf("Download: %v", res.err)

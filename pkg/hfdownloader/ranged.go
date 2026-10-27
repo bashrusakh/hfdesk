@@ -170,82 +170,25 @@ var (
 	errStagingPayloadSize = errors.New("staging payload size does not match the expected size")
 )
 
-// stagingOwners is the in-process exclusion registry keyed by staging file
-// path. It closes the same-process half of the CheckBlob/claim TOCTOU
-// window: CheckBlob deliberately reports a staging record carrying our own
-// PID as take-over-able (an earlier run of this process has no running
-// writer and must be resumable), so the registry is what distinguishes that
-// case from a concurrently running goroutine of this process. Each entry's
-// channel is closed when the owning download returns; a claimant that finds
-// a busy entry waits for the owner and then re-evaluates from scratch. The
-// entry records the owning process instance token so the registry and the
-// on-disk record describe the same ownership identity.
-type stagingOwnerEntry struct {
-	done     chan struct{}
-	instance string
-}
-
-var (
-	stagingOwnersMu sync.Mutex
-	stagingOwners   = map[string]*stagingOwnerEntry{}
-)
-
-// stagingClaimActive reports whether this process currently has a live claim
-// on the staging path. Cleanup helpers consult it before removing anything.
-func stagingClaimActive(staging string) bool {
-	stagingOwnersMu.Lock()
-	entry, busy := stagingOwners[staging]
-	stagingOwnersMu.Unlock()
-	return busy && entry.instance == processInstanceToken
-}
-
-// removeStagingArtifactsIfUnclaimed removes a staging payload/meta pair only
-// when no live claim remains. The liveness decision is re-made under the OS
-// ownership lock and local metadata gate, so a writer that claimed (or was
-// taken over) between the pre-check and the removal is not disturbed. A busy
-// OS lock is a live owner (even a suspended one whose heartbeat went stale)
-// and skips the removal. Best-effort: a skipped or failed removal is logged
-// and never turns into a hard cleanup error.
-func removeStagingArtifactsIfUnclaimed(staging, metaPath string) {
-	// Cheap pre-check: an active in-process claim cannot be removed.
-	if stagingClaimActive(staging) {
-		log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
-		return
-	}
-	// Fast path: a destination that never had ranged staging has nothing to
-	// remove, and taking the ownership lock would create a persistent lock file
-	// beside it for no reason. Removing nothing is safe even if a claim starts
-	// immediately afterwards.
+// removeStagingArtifactsIfUnowned removes a staging payload/record pair only
+// while its record proves that no live writer remains. The caller must hold
+// the DESTINATION's ownership domain for the whole operation: that domain is
+// the fence every current-version writer of the destination holds, so once the
+// caller has it no other writer can be using the pair.
+//
+// The record check remains necessary for state written outside that domain: a
+// record that was never fenced is preserved unless same-host process evidence
+// proves its owner dead, and an unreadable record is preserved too. A fenced
+// record is removable because its writer could only be alive while holding the
+// very domain the caller holds.
+//
+// Best-effort: a skipped or failed removal is logged and never turns into a
+// hard cleanup error.
+func removeStagingArtifactsIfUnowned(staging, metaPath string) {
+	// Fast path: nothing to remove, and no gate has to be taken.
 	if stagingArtifactsAbsent(staging, metaPath) {
 		return
 	}
-	own, oerr := acquireStagingOwnershipLockWithin(context.Background(), staging, stagingLockCleanupWait)
-	if errors.Is(oerr, errStagingOwnershipBusy) {
-		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
-		return
-	}
-	if oerr != nil {
-		log.Printf("warning: skip cleanup of staging file %s: staging ownership lock unavailable: %v", staging, oerr)
-		return
-	}
-	defer own.release()
-
-	removeStagingArtifactsIfUnclaimedLocked(staging, metaPath)
-}
-
-// removeStagingArtifactsIfUnclaimedLocked is the body of
-// removeStagingArtifactsIfUnclaimed for a caller that ALREADY holds the
-// staging pair's lifetime ownership lock.
-//
-// The caller must NOT take that lock again: an exclusive lock belongs to the
-// open file description, so a second exclusive open of the same lock file
-// conflicts even inside one process. The acquisition would therefore report
-// the caller's OWN hold as a live owner and skip the removal.
-//
-// The flat/output-mode cleanup needs exactly this: there the destination's
-// ownership domain lock and the staging pair's lock are the SAME file
-// (<destination>.incomplete.lock).
-func removeStagingArtifactsIfUnclaimedLocked(staging, metaPath string) {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
 		log.Printf("warning: skip cleanup of staging file %s: local metadata gate unavailable: %v", staging, err)
@@ -253,17 +196,12 @@ func removeStagingArtifactsIfUnclaimedLocked(staging, metaPath string) {
 	}
 	defer lock.release()
 
-	// Re-check under the lock: a claim may have started after the pre-check.
-	if stagingClaimActive(staging) {
-		log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
-		return
-	}
 	meta, err := readStagingMeta(metaPath)
 	switch {
 	case err == nil:
-		// A free OS lock proves termination only for writers that used this
-		// lock. Legacy/unfenced records remain protected unless same-host PID
-		// evidence proves their owner dead.
+		// A record written under the ownership-domain fence belongs to a
+		// writer that cannot be alive while this caller holds the domain.
+		// An unfenced record is not proven dead by that fact alone.
 		if !meta.LockFenced && !stagingOwnerProvablyDead(meta) && !stagingOwnerIsSelf(meta) {
 			log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
 			return
@@ -336,21 +274,15 @@ type multipartOpts struct {
 	// back to the single-path temp destination instead; the caller must then
 	// pass that temp through the normal cache-store owner.
 	DirectBlobPublished *bool
-	// Domain is the ownership domain of the content-addressed blob key this
-	// item publishes to. The caller holds it for the whole operation on that
-	// key. The publication needs it for the domain-exclusive placement tier
-	// (a filesystem without hard links), where the existence check and the
-	// placement are only exclusive to the domain while it is held.
+	// Domain is the ownership domain of the destination this item transfers
+	// to. It is REQUIRED: the caller (the item goroutine) holds it for the
+	// whole operation - the skip decision, the HEAD, the claim, the transfer,
+	// the publication, the store and the cancel cleanup - and it is the only
+	// ownership fence of the destination. The multipart claim verifies that
+	// this domain covers its staging path and mutates the record under it; it
+	// takes no second lock. A nil or non-covering domain fails the claim
+	// closed, so no transfer can run unowned.
 	Domain *blobDomain
-	// FlatDomain names the ownership domain of a flat/output-mode
-	// destination. The MULTIPART route takes that domain's lifetime lock
-	// through its staging claim, so the caller must NOT take it a second
-	// time for the same item. The one hand-off that needs it is the fall-back
-	// to the single-request path when the size stays unknown: that hand-off
-	// happens BEFORE the claim, so the domain is still free there and the
-	// receiving route must take it - without it the transfer would run with
-	// no ownership lock at all.
-	FlatDomain *flatDestinationDomain
 }
 
 // stagingClaimState is what a successful claim produced.
@@ -365,235 +297,104 @@ type stagingClaimState struct {
 	// known-digest proof gate; the run must prove before publication regardless
 	// of the current mode (except Verify="none").
 	proofPending bool
-	// release deregisters the in-process ownership slot and releases the OS
-	// ownership lock; the caller must invoke it exactly once when the
-	// download returns.
-	release func()
-	// own is the required held OS-level lifetime ownership lock.
-	own *stagingOwnershipLock
-	// osExclusive reports that own fences the whole interval, so a fresh
-	// foreign record is a crash remnant rather than a live writer.
-	osExclusive bool
 }
 
-// claimStaging establishes exclusive ownership of the staging file.
+// claimStaging establishes exclusive ownership of the staging record.
 //
-// Exclusion combines local reservation/metadata serialization with the
-// cross-process lifetime OS fence:
+// The EXCLUSION is not this function's job: the caller already holds the
+// destination's ownership domain (blobDomain), which is the single lifetime
+// fence every writer of the destination takes - in this process and in every
+// other one. The claim verifies that the held domain covers staging and fails
+// closed otherwise; it never takes an OS lock and never registers a second
+// in-process owner.
 //
-//   - in-process: the stagingOwners registry serializes downloads inside
-//     this process (including two plan items that share one blob SHA);
-//   - OS-level: the persistent <staging>.lock is taken exclusively and held
-//     for the whole ownership interval. The acquisition waits out transient
-//     contention (a read-only status probe shares the lock file briefly), so a
-//     probe in flight does not read as an owner. A PROVEN exclusive holder is
-//     a live owner (even one that stopped heartbeating while suspended), so
-//     the caller reports it as owned with errBlobIncompleteOwned and never
-//     takes it over. A crashed owner's lock is released by the kernel at
-//     death, so takeover is safe only after the old process is gone. If the
-//     platform/filesystem cannot supply the lock, the operation fails closed;
+// What the claim adds on top of that fence:
+//
 //   - record transitions: the per-path in-process metadata gate serializes
-//     local read-modify-write operations. Current-version foreign processes
-//     cannot reach them without first acquiring the lifetime OS lock. A
-//     non-fenced legacy record is retained unless its same-host owner is proven
-//     dead.
+//     local read-modify-write operations. While the destination domain is
+//     held no competing writer exists, so the gate is intra-item
+//     serialization, not exclusion;
+//   - the record's identity and durability: the atomic complete-record
+//     install, the take-over rules for fenced and unfenced records, and the
+//     version-4-only resume rule.
 //
 // A take-over preserves the record's committed ranges only when the record is
 // a fully normalized, identity-matching versioned record AND its staging payload
-// exists at the expected logical size. The evaluate/remove/create sequence
-// runs under both gates, so one claimant cannot displace another. contentAddressed
-// marks the publish target as a known blob digest, the only destination whose
-// existence proves completion. commitPinned is the CURRENT plan's pinned
-// identity: the record's own flag must agree with it before any staged byte
-// may be inherited.
-//
-// A claim is a WAIT, not a transfer. When the item's context carries its
-// MaxActiveDownloads slot notice (see download_slot.go and the item goroutine
-// in downloader.go), the claim returns that slot for the duration of EVERY
-// wait it can perform - the in-process staging owner, the cross-process
-// lifetime OS lock and the local metadata gate - and takes it back before it
-// returns a claim the caller will transfer under. A failed claim keeps the
-// slot returned, exactly like a failed domain acquisition: no claim reaches
-// the caller, so the item reports the error instead of transferring.
-func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool) (state *stagingClaimState, err error) {
+// exists at the expected logical size. contentAddressed marks the publish
+// target as a known blob digest, the only destination whose existence proves
+// completion. commitPinned is the CURRENT plan's pinned identity: the record's
+// own flag must agree with it before any staged byte may be inherited.
+func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool, domain *blobDomain) (state *stagingClaimState, err error) {
+	// The claim is only as good as the fence it was given: a missing,
+	// released or non-covering domain means this writer does not own the
+	// destination, so mutating its record or payload would be an unowned
+	// operation. Fail closed before touching anything.
+	if !domain.coversStaging(staging) {
+		return nil, fmt.Errorf("refuse to claim staging %s: the held destination ownership domain does not cover it", staging)
+	}
 	// Durable proof gate: a fresh claim for a known-digest mode starts with
 	// ProofPending set, and a take-over preserves the record's flag (or adds it
 	// when the current mode/item still needs the proof). The claim write is
 	// therefore durable before any transfer or proof starts.
 	proofMode := it.SHA256 != "" && (cfg.Verify == "sha256" || cfg.Verify == "etag")
 
-	// One idempotent wait signal for the WHOLE claim: once the slot has been
-	// returned it stays returned across retry rounds, and the final success or
-	// error path below decides whether it is taken back. The deferred
-	// finalizer is the only place that reacquires it, so a claim can never
-	// reach the caller without the item's slot held.
-	notice := downloadSlotWaitNoticeFromContext(ctx)
-	waiting := false
-	beginWait := func() {
-		if notice == nil || waiting {
-			return
-		}
-		waiting = true
-		notice.beginWait()
-	}
-	defer func() {
-		if !waiting {
-			return
-		}
-		if state == nil || err != nil {
-			// The claim FAILED, so no claim reaches the caller and the item is
-			// about to report the error instead of transferring. The slot must
-			// stay returned: re-taking it here would make an actionable
-			// failure wait for an unrelated transfer. The lease's deferred
-			// release is a no-op while the slot is returned.
-			if state != nil {
-				state.release()
-				state = nil
-			}
-			return
-		}
-		if !notice.endWait() {
-			// The item's context ended while it waited, so the slot cannot be
-			// taken back. A claim handed out here would let the caller
-			// transfer without a slot: release it and report the
-			// cancellation.
-			state.release()
-			state = nil
-			if err == nil {
-				err = ctx.Err()
-			}
-		}
-	}()
-
 	for round := 0; round < 8; round++ {
 		// A content-addressed blob may have been published while we were
-		// getting here (or while we waited for the in-process owner above).
-		// Re-checked every round because a waited-for owner often publishes
-		// just before waking us. An arbitrary destination is never completion
-		// proof here: the caller's authoritative skip check already declined it.
+		// getting here. Re-checked every round because a waited-for owner
+		// often publishes just before waking us. An arbitrary destination is
+		// never completion proof here: the caller's authoritative skip check
+		// already declined it.
 		if contentAddressed {
 			if _, err := os.Stat(publish); err == nil {
 				return nil, errBlobAlreadyComplete
 			}
 		}
 
-		// In-process exclusion.
-		stagingOwnersMu.Lock()
-		entry, busy := stagingOwners[staging]
-		if !busy {
-			entry = &stagingOwnerEntry{done: make(chan struct{}), instance: processInstanceToken}
-			stagingOwners[staging] = entry
-		}
-		stagingOwnersMu.Unlock()
-		if busy {
-			// The in-process owner is busy, so this claim is about to wait
-			// for it: return the item's download slot for the wait.
-			beginWait()
-			select {
-			case <-entry.done:
-				// Owner finished: re-evaluate (publish may now exist).
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-
-		// OS-level exclusion for the whole ownership interval. This is the
-		// fence the record lease cannot provide; it must be acquired before
-		// the record is evaluated so a suspended predecessor can never resume
-		// writing after we take its record over.
-		//
-		// The acquisition observes the lock non-owningly and waits out
-		// transient contention: a read-only status probe touches the same
-		// lock file briefly, and on Unix a probe's shared lock makes this
-		// exclusive acquisition fail even though no writer exists. Only a
-		// PROVEN exclusive holder is a live owner (even one that stopped
-		// heartbeating while suspended); it is never taken over, and the
-		// caller reports it as owned instead of displacing it. An
-		// unresolvable contention is an actionable failure, never a
-		// successful skip.
-		//
-		// beginWait is passed as the acquisition's onWait: a contended
-		// attempt is about to wait, so the item returns its slot for it. The
-		// free fast path never calls it.
-		own, oerr := acquireStagingOwnershipLockCtx(ctx, staging, beginWait)
-		osExclusive := oerr == nil
-		if oerr != nil {
-			stagingOwnersMu.Lock()
-			delete(stagingOwners, staging)
-			stagingOwnersMu.Unlock()
-			close(entry.done)
-			if errors.Is(oerr, errStagingOwnershipBusy) {
-				// A proven live writer owns this staging file.
-				return nil, errBlobIncompleteOwned
-			}
-			if cerr := ctx.Err(); cerr != nil {
-				return nil, cerr
-			}
-			return nil, fmt.Errorf("cannot safely claim ranged staging %s: lifetime ownership lock acquisition failed: %w", staging, oerr)
-		}
-		release := func() {
-			// Release the OS lock before waking an in-process waiter: the
-			// waiter re-evaluates from scratch (and would otherwise observe
-			// this process's own lock as busy and skip a finished file).
-			own.release()
-			stagingOwnersMu.Lock()
-			delete(stagingOwners, staging)
-			stagingOwnersMu.Unlock()
-			close(entry.done)
-		}
-
-		// Local record-transition serialization; the lifetime OS lock already excludes other current-version processes.
+		// Local record-transition serialization. The destination domain
+		// already excludes every other writer of this destination.
 		lock := &stagingStateLock{path: stagingLockPath(metaPath)}
-		if lerr := lock.acquireWithWait(ctx, stagingLockWait, beginWait); lerr != nil {
-			release()
+		if lerr := lock.acquire(ctx, stagingLockWait); lerr != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return nil, cerr
 			}
 			if errors.Is(lerr, errStagingLockBusy) {
-				// Another process is mid-transition on this record; for this
-				// run the staging file is owned.
+				// Another mutation of this record did not finish; no claim
+				// can be established for this run.
 				return nil, errBlobIncompleteOwned
 			}
 			return nil, lerr
 		}
-		// Assign to the NAMED return instead of shadowing it: the deferred
-		// finalizer needs the exact claim it must slot-gate or release.
 		var retry bool
 		var cerr error
-		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, osExclusive, proofMode)
+		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, proofMode)
 		lock.release()
 		if cerr != nil {
-			release()
 			return nil, cerr
 		}
 		if retry {
-			release()
 			continue
 		}
-		state.release = release
-		state.own = own
-		state.osExclusive = osExclusive
 		return state, nil
 	}
 	return nil, fmt.Errorf("could not claim staging file %s: claim did not converge", staging)
 }
 
 // claimStagingLocked performs one evaluate/transition pass while the caller
-// holds the staging metadata gate and (when osExclusive) the OS ownership
-// lock. retry=true asks the caller to re-evaluate after discarding unusable
-// state or after losing an exclusive create to an older writer that does not
-// participate in the lock.
-func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, osExclusive, proofMode bool) (*stagingClaimState, bool, error) {
+// holds the staging metadata gate and the destination's ownership domain.
+// retry=true asks the caller to re-evaluate after discarding unusable state or
+// after losing an exclusive create to an older writer that does not
+// participate in the domain.
+func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, proofMode bool) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit, commitPinned)
 		// A fresh known-digest mode claim persists the durable proof gate in
 		// its very first record write, before any transfer can start. The
-		// ownership mode is persisted too, so CheckBlob can use a free OS lock
-		// as the authoritative no-writer signal on supported platforms.
+		// record is fenced by the destination ownership domain the caller
+		// holds, so CheckBlob can use a free domain lock as the authoritative
+		// no-writer signal on supported platforms.
 		meta.ProofPending = proofMode
-		meta.LockFenced = osExclusive
+		meta.LockFenced = true
 		return createStagingClaim(metaPath, meta)
 	}
 	if rerr != nil {
@@ -609,9 +410,9 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	}
 	var meta IncompleteMeta
 	if json.Unmarshal(raw, &meta) != nil {
-		// Unreadable record. With the OS ownership lock held, no live
-		// current-version writer can be mid-claim: every current writer creates
-		// this record while holding the lifetime lock. An unreadable legacy
+		// Unreadable record. With the destination ownership domain held, no
+		// live current-version writer can be mid-claim: every current writer
+		// creates this record while holding that domain. An unreadable legacy
 		// record cannot establish that its owner is dead, regardless of age.
 		//
 		// The refusal is reported as an UNPROVEN owner, not as a live one: no
@@ -645,9 +446,9 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// Only the CURRENT record version is resumable. A record from any other
 	// format - including a branch-only version-3 record whose legacy_migrated
 	// flag described bytes imported from a pre-#140 partial - is obsolete
-	// state: it is discarded here, under the lifetime ownership lock and the
-	// metadata gate, and the transfer starts from zero. The version is never
-	// silently ignored.
+	// state: it is discarded here, under the destination ownership domain and
+	// the metadata gate, and the transfer starts from zero. The version is
+	// never silently ignored.
 	if meta.Version != stagingMetaVersion {
 		downloadLog.Warn("discarding a staging record from an unsupported format; re-downloading from zero",
 			"staging", staging,
@@ -669,8 +470,9 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	// Preserve the durable gate or add it for the current known-digest mode.
 	take.ProofPending = meta.ProofPending || proofMode
 	// Record the ownership mode of THIS claim, not the predecessor's: the
-	// current process holds the required OS lifetime lock.
-	take.LockFenced = osExclusive
+	// caller holds the destination's ownership domain, which fences the whole
+	// interval.
+	take.LockFenced = true
 	if err := writeStagingMetaFile(metaPath, &take); err != nil {
 		return nil, false, err
 	}
@@ -692,8 +494,8 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 //   - when the filesystem cannot create hard links at all, an atomic rename of
 //     the staged file to metaPath. A rename does replace an existing target, so
 //     it is used only after confirming that no record is present, and it is
-//     safe because the lifetime ownership lock and the local metadata gate
-//     exclude every foreign mutator for the whole transition.
+//     safe because the destination ownership domain and the local metadata
+//     gate exclude every foreign mutator for the whole transition.
 //
 // The staged file is created with O_EXCL, so it is always a fresh inode. A
 // staged path left behind by an interrupted operation is therefore never
@@ -1114,33 +916,6 @@ func removeStagingArtifactsLocked(staging, metaPath string) {
 	}
 }
 
-// removeStagingArtifacts acquires the OS ownership lock (non-blocking) and
-// the local metadata gate and removes a staging pair unconditionally. It is used
-// only by the explicit-cancel cleanup helper after the caller has established
-// that the claim is not (or is no longer) a live owner's; a busy ownership lock
-// skips the removal. A cancel/hash-discard of our own claim uses
-// removeStagingArtifactsOwned instead.
-func removeStagingArtifacts(staging, metaPath string) {
-	own, oerr := acquireStagingOwnershipLockWithin(context.Background(), staging, stagingLockCleanupWait)
-	if errors.Is(oerr, errStagingOwnershipBusy) {
-		log.Printf("warning: skip cleanup of staging file %s: a live owner holds the staging lock", staging)
-		return
-	}
-	if oerr != nil {
-		log.Printf("warning: skip cleanup of staging file %s: staging ownership lock unavailable: %v", staging, oerr)
-		return
-	}
-	defer own.release()
-
-	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
-	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
-		log.Printf("warning: skip cleanup of staging file %s: local metadata gate unavailable: %v", staging, err)
-		return
-	}
-	defer lock.release()
-	removeStagingArtifactsLocked(staging, metaPath)
-}
-
 // readStagingMeta loads the staging record. It returns an error for a
 // missing or unparseable record.
 func readStagingMeta(metaPath string) (*IncompleteMeta, error) {
@@ -1379,22 +1154,18 @@ type stagingDownload struct {
 	// record always describes the current claim.
 	startedAt time.Time
 
-	// own is the OS-level ownership lock held for the whole download
-	// interval. osExclusive reports that own
-	// fences the interval, so publish requires it to still be held.
-	own         *stagingOwnershipLock
-	osExclusive bool
-
 	// contentAddressed marks pub as blobs/<known-sha>, whose existence alone
 	// proves completion. Publish must not overwrite it if another writer
 	// (single path, legacy tmp-<sha>+store, another staging family) published
 	// the blob while this transfer was in flight.
 	contentAddressed bool
 
-	// domain is the ownership domain of the blob key pub belongs to. It is
-	// held for the whole download, so the publication's existence decision
-	// and the placement that follows it cannot be overtaken by another
-	// writer of the same key.
+	// domain is the ownership domain of the destination this download stages
+	// for. The item holds it for the whole download - through the claim, the
+	// transfer, the publication and the cancel cleanup - so the publication's
+	// existence decision and the placement that follows it cannot be overtaken
+	// by another writer, and the claim can trust the fence instead of taking a
+	// second lock.
 	domain *blobDomain
 
 	// partCtx is the part-scoped cancellable context, stored so every
@@ -1458,6 +1229,14 @@ type hashWriter interface {
 	Sum([]byte) []byte
 }
 
+// fenced reports whether this download still holds the destination's
+// ownership domain (and therefore its lifetime OS lock). Every record this
+// run writes is fenced by that domain; a released domain means the interval
+// this run believed it owned was handed back, so nothing may be published.
+func (d *stagingDownload) fenced() bool {
+	return d.domain.lockHeld()
+}
+
 // flushMeta persists the current range state atomically.
 func (d *stagingDownload) flushMeta() error {
 	d.metaMu.Lock()
@@ -1476,7 +1255,7 @@ func (d *stagingDownload) flushMetaLocked() error {
 	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
 	meta.ProofPending = d.proofPending
-	meta.LockFenced = d.osExclusive
+	meta.LockFenced = d.fenced()
 	if d.ranges != nil {
 		if !normalizeRangesInPlace(d.ranges, d.it.Size) {
 			return fmt.Errorf("staging metadata flush: invalid range layout for %s", d.it.RelativePath)
@@ -1634,8 +1413,8 @@ func (d *stagingDownload) poisonStagingLocked() {
 }
 
 // poisonStagingIfOwned poisons the payload only while the claim is still owned
-// under the metadata gate. The caller already holds the OS ownership lock, so no current-version
-// successor can exist. If the metadata gate is unavailable,
+// under the metadata gate. The caller already holds the destination ownership
+// domain, so no current-version successor can exist. If the metadata gate is unavailable,
 // the poison is skipped: the durable ProofPending flag already prevents the
 // unproven bytes from being published.
 func (d *stagingDownload) poisonStagingIfOwned() {
@@ -1732,7 +1511,7 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 		return nil, err
 	}
 	fresh := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
-	fresh.LockFenced = d.osExclusive
+	fresh.LockFenced = d.fenced()
 	if _, retry, err := createStagingClaim(d.meta, fresh); err != nil {
 		return nil, err
 	} else if retry {
@@ -1880,30 +1659,17 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		if opts.DirectBlobPublished != nil {
 			*opts.DirectBlobPublished = false
 		}
-		// The hand-off to the single-request path happens BEFORE this route
-		// claims the staging, so a flat destination's ownership domain is
-		// still free here. The receiving route must take it: without it the
-		// transfer would run with no ownership lock at all, and two writers
-		// of the same flat destination would race over the same payload.
-		if opts.FlatDomain != nil {
-			dom, derr := blobDomainAcquire(ctx, opts.FlatDomain.key, opts.FlatDomain.lockSrc)
-			if derr != nil {
-				if errors.Is(derr, errStagingOwnershipBusy) {
-					// A PROVEN live owner holds the destination: the file is
-					// NOT present, so the item fails with the actionable
-					// live-owner error instead of racing that owner.
-					return false, errBlobIncompleteOwned
-				}
-				return false, fmt.Errorf("acquire the ownership domain of %s: %w", dst, derr)
-			}
-			defer dom.release()
-		}
 		// The size is unknown, so the single-request path is the only one
-		// that can transfer this item. It applies the same identity rule as
-		// every other single-request transfer: bytes are inherited only when
-		// the identity sidecar proves they belong to this exact object.
+		// that can transfer this item. The item already holds the
+		// destination's ownership domain - the same domain this route would
+		// need - so the hand-off simply keeps holding it; it must not take a
+		// second lock (that would conflict with itself).
+		//
+		// The single path applies the same identity rule as every other
+		// single-request transfer: bytes are inherited only when the identity
+		// sidecar proves they belong to this exact object.
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst,
-			singleOpts{Commit: opts.Commit, CommitPinned: opts.CommitPinned}, emit)
+			singleOpts{Commit: opts.Commit, CommitPinned: opts.CommitPinned, Domain: opts.Domain}, emit)
 	}
 
 	stg := opts.Staging
@@ -1916,17 +1682,16 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 	metaPath := stg + ".meta"
 
-	// Claim the staging file exclusively: the in-process registry, the
-	// OS-level ownership lock held for the whole interval, the local metadata
-	// gate, and atomic complete-record installation. A live owner — including a suspended
-	// one that stopped heartbeating — short-circuits the file to a skip in the
-	// caller; only a content-addressed publish target is treated as already
-	// complete.
-	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed)
+	// Claim the staging record under the destination domain the item already
+	// holds: the claim verifies that the domain covers the staging path, then
+	// performs its record transitions under the local metadata gate. A live
+	// owner - including a suspended one that stopped heartbeating - cannot
+	// exist while this item holds the domain; only a content-addressed publish
+	// target is treated as already complete.
+	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain)
 	if err != nil {
 		return false, err
 	}
-	defer state.release()
 
 	d := &stagingDownload{
 		ctx:              ctx,
@@ -1944,8 +1709,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		commitPinned:     opts.CommitPinned,
 		startedAt:        time.Now().UTC(),
 		proofPending:     state.proofPending,
-		own:              state.own,
-		osExclusive:      state.osExclusive,
 		contentAddressed: opts.ContentAddressed,
 		domain:           opts.Domain,
 	}
@@ -2418,8 +2181,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 //
 // Publication is claim-checked. The rename happens only while this process
 // still owns the staging pair: the record is re-read under the metadata gate
-// (the take-over serialization point) and the OS ownership lock must still be
-// held for the same interval. A missing or foreign record returns
+// (the take-over serialization point) and the destination ownership domain
+// must still be held for the same interval. A missing or foreign record returns
 // errStagingClaimLost and leaves the staging payload untouched for its actual
 // owner; nothing is renamed. This closes the window where a writer whose claim
 // was taken over (or whose record was removed) could still publish a foreign
@@ -2481,10 +2244,10 @@ func (d *stagingDownload) publish() error {
 	}
 	defer lock.release()
 
-	// Ownership re-read under the metadata gate. On an OS-lock platform the
-	// lock itself must still be held: losing it would mean the interval this
+	// Ownership re-read under the metadata gate. The destination's ownership
+	// domain must still be held: losing it would mean the interval this
 	// process believed it owned was already handed to a successor.
-	if d.osExclusive && !d.own.held() {
+	if !d.fenced() {
 		return errStagingClaimLost
 	}
 	if !claimRecordOwnedLocked(d.meta) {

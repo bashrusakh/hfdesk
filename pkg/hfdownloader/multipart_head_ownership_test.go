@@ -155,12 +155,14 @@ func TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial(t *testing.T) 
 	}
 }
 
-// TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter reproduces the
-// live-writer failure: a single-request writer holds the flat destination's
-// domain with an empty `.part` inside a blocked payload transfer while a second
-// (multipart) writer of the SAME destination fails its HEAD. The fail-fast must
-// not unlink the live writer's partial or sidecar, and that writer must publish
-// successfully once it is released.
+// TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter pins the
+// live-writer half of route ownership: a single-request writer holds the flat
+// destination's domain with an empty `.part` inside a blocked payload transfer
+// while a second (multipart) writer of the SAME destination runs. Under the
+// one-domain model the second writer is excluded at the destination domain
+// BEFORE its HEAD, so the stronger guarantee holds: it never reaches the
+// fail-fast, never unlinks the live writer's partial or sidecar, and the live
+// writer publishes successfully once it is released.
 func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -170,6 +172,8 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 	hub := newCrossRouteHeadHub(t, full, "model.bin", true)
+	// The excluded writer must not wait the production budget.
+	shortBlobOwnershipWait(t, 250*time.Millisecond)
 
 	// Writer 1: the single-request route (a threshold above the item size),
 	// held inside its payload GET.
@@ -200,37 +204,45 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Fatalf("fixture precondition: writer 1's partial is %d bytes, want the empty staging file", partBefore.Size())
 	}
 
-	// Writer 2: the multipart route of the SAME flat destination. Its HEAD is
-	// a permanent 404, so it fails fast while writer 1 owns the destination.
-	res := runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, "0"))
-	if res.err == nil {
-		t.Fatalf("the permanent HEAD failure did not fail the item (skips=%v done=%v)", res.skips, res.done)
+	// Writer 2: the multipart route of the SAME flat destination. Writer 1
+	// holds the destination's domain, so writer 2 waits for it and must not
+	// run its HEAD or touch the live writer's partial in the meantime.
+	contended := installBlobDomainContentionProbe(t)
+	writer2 := make(chan flatModeOutcome, 1)
+	go func() {
+		writer2 <- runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, "0"))
+	}()
+	awaitContention(t, contended, "the live single-route writer's destination domain")
+	select {
+	case res := <-writer2:
+		t.Fatalf("the second writer finished while the live owner still held the destination (err=%v)", res.err)
+	default:
 	}
-	if !errors.Is(res.err, ErrNotFound) {
-		t.Errorf("multipart writer error = %v, want ErrNotFound", res.err)
+	if got := hub.headCalls.Load(); got != 0 {
+		t.Errorf("HEAD calls = %d, want 0: the waiting writer must not run its HEAD", got)
 	}
-	if hub.headCalls.Load() == 0 {
-		t.Fatal("no HEAD was issued: the multipart writer under test did not run")
+	if got := hub.gets.Load(); got != 1 {
+		t.Errorf("payload GETs = %d, want only writer 1's transfer while it holds the destination", got)
 	}
 
 	// The live writer's artifacts were not unlinked, and are byte-identical.
 	partAfter, serr := os.Stat(dst + ".part")
 	if serr != nil {
-		t.Fatalf("the multipart fail-fast unlinked the live single-route writer's partial: %v", serr)
+		t.Fatalf("the waiting writer unlinked the live single-route writer's partial: %v", serr)
 	}
 	if partAfter.Size() != 0 {
 		t.Errorf("live partial size = %d bytes, want the untouched empty file", partAfter.Size())
 	}
 	sidecarAfter, serr := os.ReadFile(singlePartIdentityPath(dst))
 	if serr != nil {
-		t.Fatalf("the multipart fail-fast unlinked the live single-route writer's identity sidecar: %v", serr)
+		t.Fatalf("the waiting writer unlinked the live single-route writer's identity sidecar: %v", serr)
 	}
 	if !bytes.Equal(sidecarBefore, sidecarAfter) {
 		t.Errorf("the live writer's identity sidecar changed:\nbefore=%s\nafter=%s", sidecarBefore, sidecarAfter)
 	}
 
 	// Release writer 1: it publishes its own bytes. Its publication renames
-	// the very `.part` the fail-fast used to unlink, so this is the
+	// the very `.part` the old fail-fast used to unlink, so this is the
 	// end-to-end proof that its staging inode survived.
 	hub.open()
 	var published flatModeOutcome
@@ -240,10 +252,24 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Fatal("writer 1 did not finish after the gate opened")
 	}
 	if published.err != nil {
-		t.Fatalf("writer 1 failed after the multipart HEAD failure: %v", published.err)
+		t.Fatalf("writer 1 failed after the multipart writer waited: %v", published.err)
 	}
 	assertExactFile(t, dst, full)
+
+	// Writer 2 now owns the destination and runs its permanent-404 HEAD; it
+	// must fail without transferring and without disturbing the published
+	// file.
+	var second flatModeOutcome
+	select {
+	case second = <-writer2:
+	case <-time.After(60 * time.Second):
+		t.Fatal("writer 2 did not finish after writer 1 released the destination")
+	}
+	if !errors.Is(second.err, ErrNotFound) {
+		t.Errorf("multipart writer error = %v, want ErrNotFound", second.err)
+	}
 	if got := hub.gets.Load(); got != 1 {
 		t.Errorf("payload GETs = %d, want exactly writer 1's one transfer", got)
 	}
+	assertExactFile(t, dst, full)
 }

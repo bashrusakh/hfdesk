@@ -159,7 +159,7 @@ func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 			cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
 
 			if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
-				multipartOpts{Commit: rangedSeedCommit, CommitPinned: tc.planPinned}, func(ProgressEvent) {}); err != nil {
+				withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: tc.planPinned}), func(ProgressEvent) {}); err != nil {
 				t.Fatalf("downloadMultipart: %v", err)
 			}
 
@@ -193,7 +193,7 @@ func TestRangedResumeKeepsAPinnedMatchingIdentity(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
 
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
-		multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -331,7 +331,7 @@ func TestNegativeControlRangedResumeIgnoresThePinnedFlag(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
 
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
-		multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 

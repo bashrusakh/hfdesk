@@ -58,17 +58,11 @@ var stagingStateGates = struct {
 func stagingLockPath(metaPath string) string { return metaPath + stagingLockSuffix }
 
 // acquire waits at most wait for the local gate, while honoring cancellation.
+// It performs one non-blocking attempt first, so the free fast path never
+// blocks. The gate is intra-item state: while a destination's ownership domain
+// is held, no other writer of the same destination exists to contend with, so
+// the acquisition carries no download-slot signal (see download_slot.go).
 func (l *stagingStateLock) acquire(ctx context.Context, wait time.Duration) error {
-	return l.acquireWithWait(ctx, wait, nil)
-}
-
-// acquireWithWait is acquire with an onWait signal. It performs one
-// non-blocking attempt first, so the FREE fast path never signals anything,
-// and calls onWait only when the gate is actually held by another local writer
-// and this acquisition is about to block. The download path uses it to return
-// the item's MaxActiveDownloads slot for the duration of the wait (see
-// download_slot.go); a nil onWait is the historical behavior.
-func (l *stagingStateLock) acquireWithWait(ctx context.Context, wait time.Duration, onWait func()) error {
 	if wait <= 0 {
 		wait = stagingLockWait
 	}
@@ -80,15 +74,12 @@ func (l *stagingStateLock) acquireWithWait(ctx context.Context, wait time.Durati
 	}
 	gate.refs++
 	stagingStateGates.Unlock()
-	// Free fast path: take the gate without ever announcing a wait.
+	// Free fast path.
 	select {
 	case gate.ch <- struct{}{}:
 		l.gate = gate
 		return nil
 	default:
-	}
-	if onWait != nil {
-		onWait()
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -139,7 +130,7 @@ func claimRecordOwnedLocked(metaPath string) bool {
 
 // removeOwnedStagingLocked removes the record and its payload only while the
 // record still names this process instance. The caller holds the transition
-// lock and the staging ownership lock for the pair. It returns false (removing
+// lock and the DESTINATION's ownership domain. It returns false (removing
 // nothing) when the claim moved elsewhere.
 func removeOwnedStagingLocked(staging, metaPath string) bool {
 	if !claimRecordOwnedLocked(metaPath) {
@@ -152,9 +143,11 @@ func removeOwnedStagingLocked(staging, metaPath string) bool {
 // removeStagingArtifactsOwned acquires the metadata gate and removes the
 // pair only if the record still names this process instance. Owner-side
 // discard paths (hash mismatch) use it so a writer that lost a stale claim
-// cannot delete the new owner's data. The caller must already hold the staging
-// ownership lock for the pair; re-acquiring a lock this process already holds
-// on the same file would self-conflict, so this helper never takes it.
+// cannot delete the new owner's data. The caller must already hold the
+// DESTINATION's ownership domain, whose lifetime lock fences the pair; the
+// metadata gate is the only lock this helper takes, because the domain is a
+// different lock (and, in flat/output mode, the same file the domain already
+// holds: re-taking it here would self-conflict).
 func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {

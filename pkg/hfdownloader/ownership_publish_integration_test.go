@@ -358,7 +358,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	cacheDir := t.TempDir()
 	blobsDir := blobDirFor(t, cacheDir)
 	sharedBlob := filepath.Join(blobsDir, sharedSHA)
-	sharedStaging := filepath.Join(blobsDir, sharedSHA+".incomplete")
 
 	release := make(chan struct{})
 	var releaseOnce, startedOnce sync.Once
@@ -406,9 +405,10 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		StallTimeout:       "0",
 	}
 
-	// A live owner (this test) holds the shared blob key's ownership domain
-	// and its staging, so both same-SHA paths WAIT for the domain while the
-	// blob is still absent.
+	// A live owner (this test) holds the shared blob key's ownership domain,
+	// so both same-SHA paths WAIT for the domain while the blob is still
+	// absent. Under the one-destination-domain model the domain IS the
+	// ownership fence; the record needs no separate claim to block them.
 	repo, err := NewHFCache(cacheDir, time.Minute).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -418,23 +418,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		t.Fatalf("pre-claim shared domain: %v", err)
 	}
 	defer domain.release()
-	state, err := claimStaging(context.Background(), sharedStaging, sharedBlob, sharedStaging+".meta",
-		PlanItem{RelativePath: "a/model.bin", Size: total, SHA256: sharedSHA},
-		Job{Repo: "owner/model"}, "commit123", true, cfg, true)
-	if err != nil {
-		t.Fatalf("pre-claim shared staging: %v", err)
-	}
-	f, err := os.OpenFile(sharedStaging, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		state.release()
-		t.Fatal(err)
-	}
-	if err := f.Truncate(total); err != nil {
-		f.Close()
-		state.release()
-		t.Fatal(err)
-	}
-	f.Close()
 
 	// The in-process contention hook proves that the same-SHA paths really
 	// wait for the domain instead of proceeding.
@@ -465,7 +448,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	case <-started:
 	case <-time.After(10 * time.Second):
 		releaseOnce.Do(func() { close(release) })
-		state.release()
 		t.Fatal("the blocker transfer never started")
 	}
 	// Both same-SHA paths are waiting for the ownership domain.
@@ -474,7 +456,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		case <-waiting:
 		case <-time.After(30 * time.Second):
 			releaseOnce.Do(func() { close(release) })
-			state.release()
 			t.Fatal("the same-SHA paths did not wait for the ownership domain")
 		}
 	}
@@ -483,10 +464,8 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	// then is the blocker released so Download can finish.
 	if err := os.WriteFile(sharedBlob, shared, 0o644); err != nil {
 		releaseOnce.Do(func() { close(release) })
-		state.release()
 		t.Fatal(err)
 	}
-	state.release()
 	domain.release()
 	releaseOnce.Do(func() { close(release) })
 

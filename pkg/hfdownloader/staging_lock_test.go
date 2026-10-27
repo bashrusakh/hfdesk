@@ -214,7 +214,9 @@ type stagingTakeoverChild struct {
 }
 
 // TestStagingTakeoverChildProcess is the re-executed contender used by
-// TestClaimStagingConcurrentTakeover. It is skipped in an ordinary test run.
+// TestClaimStagingConcurrentTakeover. It acquires the destination's ownership
+// domain exactly like an item goroutine, then runs the multipart route under
+// it. It is skipped in an ordinary test run.
 func TestStagingTakeoverChildProcess(t *testing.T) {
 	if os.Getenv(stagingTakeoverChildEnv) != "1" {
 		t.Skip("helper process for TestClaimStagingConcurrentTakeover")
@@ -239,15 +241,24 @@ func TestStagingTakeoverChildProcess(t *testing.T) {
 	}
 
 	it := PlanItem{RelativePath: "takeover.bin", URL: cfg.URL, Size: cfg.Size, AcceptRanges: true}
-	opts := multipartOpts{Staging: cfg.Staging, Publish: cfg.Publish}
-	_, derr := downloadMultipart(context.Background(), http.DefaultClient, "", Job{Repo: "o/r"},
-		Settings{Concurrency: cfg.Concurrency, Retries: 0, StallTimeout: "0"}, it, cfg.Dst, opts, func(ProgressEvent) {})
-
+	key, lockSrc := testDomainIdentity(cfg.Dst)
+	domain, derr := acquireBlobDomain(context.Background(), key, lockSrc)
 	res := stagingTakeoverChildResult{Index: cfg.Index, Instance: processInstanceToken}
 	if derr != nil {
 		res.Err = derr.Error()
-		if errors.Is(derr, errBlobIncompleteOwned) {
+		if errors.Is(derr, errStagingOwnershipBusy) {
 			res.Owned = true
+		}
+	} else {
+		defer domain.release()
+		opts := multipartOpts{Staging: cfg.Staging, Publish: cfg.Publish, Domain: domain}
+		_, derr = downloadMultipart(context.Background(), http.DefaultClient, "", Job{Repo: "o/r"},
+			Settings{Concurrency: cfg.Concurrency, Retries: 0, StallTimeout: "0"}, it, cfg.Dst, opts, func(ProgressEvent) {})
+		if derr != nil {
+			res.Err = derr.Error()
+			if errors.Is(derr, errBlobIncompleteOwned) {
+				res.Owned = true
+			}
 		}
 	}
 	data, merr := json.Marshal(res)
@@ -260,9 +271,12 @@ func TestStagingTakeoverChildProcess(t *testing.T) {
 }
 
 // TestClaimStagingConcurrentTakeover races several real OS processes for one
-// stale staging record. The transition lock must admit exactly one writer; the
-// losers back off as errBlobIncompleteOwned, never delete or replace the
-// winner's claim record, and no range is fetched twice.
+// stale staging record. The destination's ownership domain must admit exactly
+// one writer at a time: the contenders serialize on it, the winner takes the
+// stale record over and publishes, and every later contender obtains the
+// destination afterwards and publishes its own exact bytes. At no point does a
+// contender observe a false live-owner verdict, and the stale record is never
+// left behind.
 func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	if os.Getenv(stagingTakeoverChildEnv) == "1" {
 		t.Skip("child process")
@@ -395,28 +409,10 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		t.Fatal(werr)
 	}
 
-	// Losers exit promptly. The winner is parked in a blocked range body, so
-	// wait for all but one result, then observe the winner's takeover before
-	// releasing the server. A loser can report before the winner's claim is
-	// durable, so reading the record immediately would still show the stale
-	// seed and look like a loser replaced the winner.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		done := 0
-		for _, p := range resultPaths {
-			if _, serr := os.Stat(p); serr == nil {
-				done++
-			}
-		}
-		if done >= contenders-1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for early contenders: %d of %d results present", done, contenders)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
+	// The contenders serialize on the destination's ownership domain: ONE of
+	// them holds it and is parked in a blocked range body, while the others
+	// wait for it (never take it over). Observe the winner's takeover of the
+	// stale record before releasing the server.
 	// Poll the record until the takeover replaces the stale seed. The winner
 	// is blocked in a range body, so the claimed record is stable here; the
 	// remove/recreate window and a partially written claim are expected states.
@@ -478,11 +474,12 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		}
 	}
 
-	var (
-		winners  []stagingTakeoverChildResult
-		losers   int
-		unexpect []stagingTakeoverChildResult
-	)
+	// Every contender must complete: the one-destination-domain protocol
+	// serializes them instead of refusing the losers, so each later contender
+	// re-obtains the destination after the previous one releases it. No
+	// contender may observe a false live-owner verdict.
+	var unexpect []stagingTakeoverChildResult
+	delivered := 0
 	for _, p := range resultPaths {
 		data, rerr := os.ReadFile(p)
 		if rerr != nil {
@@ -492,45 +489,32 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		if err := json.Unmarshal(data, &res); err != nil {
 			t.Fatalf("contender result %s: %v", filepath.Base(p), err)
 		}
-		switch {
-		case res.Err == "":
-			winners = append(winners, res)
-		case res.Owned:
-			losers++
-		default:
+		if res.Err != "" || res.Owned {
 			unexpect = append(unexpect, res)
+			continue
 		}
+		delivered++
 	}
 	if len(unexpect) != 0 {
-		t.Errorf("contenders failed for a reason other than a lost claim: %+v", unexpect)
+		t.Errorf("contenders failed although the destination domain serializes them: %+v", unexpect)
 	}
-	if len(winners) != 1 {
-		t.Fatalf("takeover produced %d writers, want exactly 1 (results: winners=%+v losers=%d)", len(winners), winners, losers)
-	}
-	if losers != contenders-1 {
-		t.Errorf("%d contenders backed off as owned; want %d", losers, contenders-1)
-	}
-	if winners[0].Instance != claimMeta.Instance {
-		t.Errorf("the winner's claim record was replaced by a loser: recorded instance %q, winner %q",
-			claimMeta.Instance, winners[0].Instance)
+	if delivered != contenders {
+		t.Fatalf("%d contenders completed a delivery, want all %d", delivered, contenders)
 	}
 
-	// Every range was fetched exactly once by the single writer.
-	want := buildRangeLayout(total, concurrency)
-	wantSet := map[string]bool{}
-	for _, r := range want {
-		wantSet[fmt.Sprintf("bytes=%d-%d", r.Start, r.End)] = true
+	// The stale seed was replaced by a current claim during the takeover, and
+	// no contender published the garbage seed bytes.
+	if _, serr := os.Stat(metaPath); serr == nil {
+		t.Errorf("the staging record survived the contenders' successful publications")
+	}
+	if got := buildRangeLayout(total, concurrency); len(got) != concurrency {
+		t.Fatalf("test layout has %d ranges, want %d", len(got), concurrency)
 	}
 	mu.Lock()
 	got := append([]string(nil), ranges...)
 	mu.Unlock()
-	if len(got) != len(wantSet) {
-		t.Errorf("fetched %d ranges (%v); want exactly %d", len(got), got, len(wantSet))
-	}
-	for _, rh := range got {
-		if !wantSet[rh] {
-			t.Errorf("unexpected range %q; want one of %v", rh, wantSet)
-		}
+	if len(got) == 0 || len(got)%concurrency != 0 {
+		t.Errorf("fetched %d ranges (%v); want whole-transfer batches per serialized contender", len(got), got)
 	}
 	assertExactFile(t, dst, full)
 	for _, p := range []string{staging, metaPath, stagingLockPath(metaPath)} {

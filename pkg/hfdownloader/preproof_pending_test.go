@@ -228,7 +228,7 @@ func TestStagingProofPendingForcesReproofInSizeMode(t *testing.T) {
 
 			hashPassCount.Store(0)
 			verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, pub,
-				multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
+				withTestDomain(t, pub, multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {})
 			if len(*gotRanges) != 0 {
 				t.Errorf("all-Done record issued %v; the proof alone should run", *gotRanges)
 			}
@@ -299,7 +299,7 @@ func TestStagingProofSuccessClearsPendingDurably(t *testing.T) {
 
 	hashPassCount.Store(0)
 	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, pub,
-		multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
+		withTestDomain(t, pub, multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("publish over a non-empty directory unexpectedly succeeded")
 	}
@@ -322,7 +322,7 @@ func TestStagingProofSuccessClearsPendingDurably(t *testing.T) {
 	}
 	hashPassCount.Store(0)
 	verified, err = downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, pub,
-		multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
+		withTestDomain(t, pub, multipartOpts{Staging: staging, Publish: pub, Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("size resume of a proven record: %v", err)
 	}

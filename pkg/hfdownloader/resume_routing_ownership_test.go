@@ -118,11 +118,8 @@ func TestClaimStaging_FallbackLiveOwnerIsNotTakenOver(t *testing.T) {
 		t.Fatal(err)
 	}
 	it := PlanItem{RelativePath: "fallback.bin", Size: total, LFS: true, SHA256: sha}
-	state, err := claimStaging(context.Background(), staging, pub, metaPath, it, Job{Repo: "o/r"}, "commit123", true,
-		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false)
-	if state != nil {
-		state.release()
-	}
+	_, err = claimStaging(context.Background(), staging, pub, metaPath, it, Job{Repo: "o/r"}, "commit123", true,
+		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false, acquireTestDomain(t, pub))
 	if !errors.Is(err, errBlobIncompleteOwned) {
 		t.Fatalf("claim of a fallback record with a live foreign owner = %v, want errBlobIncompleteOwned", err)
 	}
@@ -172,11 +169,10 @@ func TestClaimStaging_LockFencedFreeLockIsTakenOver(t *testing.T) {
 	}
 	it := PlanItem{RelativePath: "fenced.bin", Size: total, LFS: true, SHA256: sha}
 	state, err := claimStaging(context.Background(), staging, pub, metaPath, it, Job{Repo: "o/r"}, "commit123", true,
-		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false)
+		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false, acquireTestDomain(t, pub))
 	if err != nil {
 		t.Fatalf("lock-fenced record with a free lock must be take-over-able: %v", err)
 	}
-	defer state.release()
 	if state.fresh {
 		t.Error("take-over reported a fresh claim")
 	}

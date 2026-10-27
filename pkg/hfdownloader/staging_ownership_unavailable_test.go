@@ -62,12 +62,16 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = claimStaging(t.Context(), staging, filepath.Join(dir, "published"), metaPath,
-		PlanItem{RelativePath: "payload", Size: int64(len(payload))}, Job{Repo: "o/r"}, "commit", true, Settings{}, false)
-	if !errors.Is(err, lockErr) || !strings.Contains(err.Error(), "ownership") {
-		t.Fatalf("claim error = %v, want actionable ownership failure", err)
+	// The destination's domain cannot be acquired, so the item fails HERE
+	// before it writes any payload.
+	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(filepath.Join(dir, "payload")),
+		flatDomainLockSrc(filepath.Join(dir, "payload"))); !errors.Is(derr, lockErr) || !strings.Contains(derr.Error(), "ownership") {
+		t.Fatalf("domain acquisition error = %v, want actionable ownership failure", derr)
 	}
-	removeStagingArtifactsIfUnclaimed(staging, metaPath)
+	// A cleanup that cannot hold the destination's domain removes nothing.
+	if err := CleanupJobPartFiles(Settings{OutputDir: dir}, []string{filepath.Join(dir, "payload")}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
 	gotPayload, err := os.ReadFile(staging)
 	if err != nil || string(gotPayload) != string(payload) {
 		t.Fatalf("cleanup changed payload: %q, %v", gotPayload, err)
@@ -267,8 +271,9 @@ func TestCheckBlobProvenOwnerAndStaleRemainDistinct(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A proven live owner: the lifetime lock is held exclusively.
-	own, err := acquireStagingOwnershipLock(staging)
+	// A proven live owner: the destination domain's lifetime lock is held
+	// exclusively.
+	own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,8 +327,10 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
-	// A real writer holds the lifetime lock for the whole run.
-	own, err := acquireStagingOwnershipLock(repo.IncompletePath(sha))
+	// A real writer holds the destination domain's lifetime lock for the whole
+	// run. The item's bounded domain acquisition then reports the live owner.
+	shortBlobOwnershipWait(t, 250*time.Millisecond)
+	own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,8 +352,6 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 
 	cfg := Settings{
 		CacheDir: cacheDir, Endpoint: srv.URL, Concurrency: 1, MaxActiveDownloads: 1,
-		// The multipart route is the one that claims the blob key's staging
-		// file, so the live owner's lock is the fence under test.
 		MultipartThreshold: "0", Verify: "size", Retries: 0, StallTimeout: "0",
 	}
 	var skips []string

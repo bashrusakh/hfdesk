@@ -117,11 +117,7 @@ func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
 			if err := os.WriteFile(staging, payload, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			own, oerr := acquireStagingOwnershipLock(staging)
-			if oerr != nil {
-				t.Fatalf("acquire ownership lock: %v", oerr)
-			}
-			defer own.release()
+			domain := acquireTestDomain(t, pub)
 
 			record := tc.record
 			if record == nil {
@@ -147,15 +143,14 @@ func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
 			}
 
 			d := &stagingDownload{
-				ctx:         context.Background(),
-				dst:         pub,
-				stg:         staging,
-				pub:         pub,
-				meta:        staging + ".meta",
-				it:          PlanItem{RelativePath: "x.bin", Size: total},
-				ranges:      tc.live,
-				osExclusive: own != nil,
-				own:         own,
+				ctx:    context.Background(),
+				dst:    pub,
+				stg:    staging,
+				pub:    pub,
+				meta:   staging + ".meta",
+				it:     PlanItem{RelativePath: "x.bin", Size: total},
+				ranges: tc.live,
+				domain: domain,
 			}
 
 			err := d.publish()
@@ -198,11 +193,7 @@ func TestStagingPublishRefusesShortPayload(t *testing.T) {
 	if err := os.WriteFile(staging, short, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	own, oerr := acquireStagingOwnershipLock(staging)
-	if oerr != nil {
-		t.Fatalf("acquire ownership lock: %v", oerr)
-	}
-	defer own.release()
+	domain := acquireTestDomain(t, pub)
 
 	// The record and the live layout both claim a COMPLETE transfer.
 	layout := completeRangeLayout(total, 1)
@@ -222,15 +213,14 @@ func TestStagingPublishRefusesShortPayload(t *testing.T) {
 	}
 
 	d := &stagingDownload{
-		ctx:         context.Background(),
-		dst:         pub,
-		stg:         staging,
-		pub:         pub,
-		meta:        staging + ".meta",
-		it:          PlanItem{RelativePath: "x.bin", Size: total},
-		ranges:      layout,
-		osExclusive: own != nil,
-		own:         own,
+		ctx:    context.Background(),
+		dst:    pub,
+		stg:    staging,
+		pub:    pub,
+		meta:   staging + ".meta",
+		it:     PlanItem{RelativePath: "x.bin", Size: total},
+		ranges: layout,
+		domain: domain,
 	}
 	err := d.publish()
 	if !errors.Is(err, errStagingPayloadSize) {
@@ -266,11 +256,7 @@ func TestStagingPublishAcceptsCompleteLayout(t *testing.T) {
 	if err := os.WriteFile(staging, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	own, oerr := acquireStagingOwnershipLock(staging)
-	if oerr != nil {
-		t.Fatalf("acquire ownership lock: %v", oerr)
-	}
-	defer own.release()
+	domain := acquireTestDomain(t, pub)
 
 	layout := completeRangeLayout(total, 1)
 	meta := IncompleteMeta{
@@ -289,15 +275,14 @@ func TestStagingPublishAcceptsCompleteLayout(t *testing.T) {
 	}
 
 	d := &stagingDownload{
-		ctx:         context.Background(),
-		dst:         pub,
-		stg:         staging,
-		pub:         pub,
-		meta:        staging + ".meta",
-		it:          PlanItem{RelativePath: "x.bin", Size: total},
-		ranges:      layout,
-		osExclusive: own != nil,
-		own:         own,
+		ctx:    context.Background(),
+		dst:    pub,
+		stg:    staging,
+		pub:    pub,
+		meta:   staging + ".meta",
+		it:     PlanItem{RelativePath: "x.bin", Size: total},
+		ranges: layout,
+		domain: domain,
 	}
 	if err := d.publish(); err != nil {
 		t.Fatalf("publish of a complete layout: %v", err)

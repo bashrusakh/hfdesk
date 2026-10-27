@@ -189,7 +189,7 @@ func BenchmarkRangedFinalization(b *testing.B) {
 				hashPassBytes.Store(0)
 
 				start := time.Now()
-				if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+				if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(b, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 					b.Fatalf("downloadMultipart: %v", err)
 				}
 				elapsed := time.Since(start)

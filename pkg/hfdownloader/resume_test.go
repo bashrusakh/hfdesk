@@ -263,7 +263,7 @@ func TestDownloadMultipart_OldMultipartArtifactsAreNotResumed(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: 4, Retries: 0, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
@@ -345,7 +345,7 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 		mu.Unlock()
 	}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, multipartOpts{}, emit); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), emit); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 

@@ -267,9 +267,7 @@ func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 
 	// Shrink the acquisition window so the test does not wait the production
 	// bound; the behavior under test is the classification, not the duration.
-	restore := stagingOwnershipAcquireWait
-	stagingOwnershipAcquireWait = 300 * time.Millisecond
-	defer func() { stagingOwnershipAcquireWait = restore }()
+	shortBlobOwnershipWait(t, 300*time.Millisecond)
 
 	// Prove the contention really happened while the probe held the lock.
 	contended := make(chan struct{})
@@ -361,70 +359,6 @@ func TestDownload_CancellationWhileWaitingForOwnershipIsPrompt(t *testing.T) {
 	}
 }
 
-// TestClaimStaging_LiveOwnerIsStillRecognizedWithoutWaiting pins the genuine
-// owner behavior: a proven live writer must be reported as a live owner (and
-// the caller skips) promptly, without waiting out the acquisition window.
-func TestClaimStaging_LiveOwnerIsStillRecognizedWithoutWaiting(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	const total = 4_096
-	full := rangedTestPayload(total)
-	sha := singleTestSHA(full)
-	dir := t.TempDir()
-	staging := filepath.Join(dir, "owned.bin.incomplete")
-	metaPath := staging + ".meta"
-	pub := filepath.Join(dir, "owned.bin")
-
-	// A real owner holds the lock exclusively for the whole interval.
-	owner, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer owner.release()
-
-	// Give the lock file its persistent presence with the owner already
-	// holding it.
-	if err := os.WriteFile(staging, full, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := IncompleteMeta{
-		PID: os.Getpid(), Instance: "other-instance", Host: processHostname,
-		StartedAt: time.Now().UTC(), Size: total, SHA256: sha, Version: stagingMetaVersion,
-		Repo: "o/r", Commit: "commit123", Path: "owned.bin",
-		Ranges: buildRangeLayout(total, 1), LockFenced: true,
-	}
-	if err := writeStagingMeta(metaPath, &meta); err != nil {
-		t.Fatal(err)
-	}
-
-	// Widen the acquisition window: a live owner must be recognized from the
-	// native classification, not by timing out the window.
-	restore := stagingOwnershipAcquireWait
-	stagingOwnershipAcquireWait = 30 * time.Second
-	defer func() { stagingOwnershipAcquireWait = restore }()
-
-	start := time.Now()
-	state, err := claimStaging(context.Background(), staging, pub, metaPath,
-		PlanItem{RelativePath: "owned.bin", Size: total, LFS: true, SHA256: sha},
-		Job{Repo: "o/r"}, "commit123", true, Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false)
-	elapsed := time.Since(start)
-	if state != nil {
-		state.release()
-	}
-	if !errors.Is(err, errBlobIncompleteOwned) {
-		t.Fatalf("claim error = %v, want errBlobIncompleteOwned for a live owner", err)
-	}
-	if elapsed > 5*time.Second {
-		t.Errorf("a live owner took %v to be recognized; the classification must not wait out the window", elapsed)
-	}
-	// The owner's staging must be untouched.
-	assertExactFile(t, staging, full)
-	if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
-		t.Errorf("the live owner's staging was published, stat err=%v", serr)
-	}
-}
-
 // TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess is the
 // stress case: a continuous stream of status probes runs against repeated
 // claims. The invariant is that no claim ever reports "another live writer
@@ -438,27 +372,18 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
-	const total = 4_096
-	full := rangedTestPayload(total)
-	sha := singleTestSHA(full)
 	dir := t.TempDir()
-	staging := filepath.Join(dir, "stress.bin.incomplete")
-	metaPath := staging + ".meta"
 	pub := filepath.Join(dir, "stress.bin")
-	if err := os.WriteFile(staging, full, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := IncompleteMeta{
-		PID: os.Getpid(), Instance: "stress-instance", Host: processHostname,
-		StartedAt: time.Now().UTC(), Size: total, SHA256: sha, Version: stagingMetaVersion,
-		Repo: "o/r", Commit: "commit123", Path: "stress.bin",
-		Ranges: buildRangeLayout(total, 1), LockFenced: true,
-	}
-	if err := writeStagingMeta(metaPath, &meta); err != nil {
-		t.Fatal(err)
-	}
+	staging := flatDomainLockSrc(pub)
 
-	// Probes run continuously against the lock file.
+	// Give the domain lock its persistent presence so the probes can open it.
+	own, err := acquireStagingOwnershipLock(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own.release()
+
+	// Probes run continuously against the destination domain lock.
 	stop := make(chan struct{})
 	var probes sync.WaitGroup
 	probes.Add(1)
@@ -487,27 +412,23 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	}
 	defer func() { stagingOwnershipContentionHook = restoreHook }()
 
-	it := PlanItem{RelativePath: "stress.bin", Size: total, LFS: true, SHA256: sha}
-	job := Job{Repo: "o/r"}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-
 	// Keep the contention window short so the stress finishes quickly; the
 	// behavior under test is the classification, not the duration.
-	restoreWait := stagingOwnershipAcquireWait
-	stagingOwnershipAcquireWait = 200 * time.Millisecond
-	defer func() { stagingOwnershipAcquireWait = restoreWait }()
+	shortBlobOwnershipWait(t, 200*time.Millisecond)
 
-	// Repeated claims under continuous probe pressure. None of them may
-	// report a live owner: no writer exists in this test.
+	// Repeated destination-domain acquisitions under continuous probe
+	// pressure. None of them may report a live owner: no writer exists in this
+	// test, and a shared reader is not a writer.
+	key, lockSrc := flatDomainKey(pub), flatDomainLockSrc(pub)
 	var falseSkips int
 	var uncertain int
 	for i := 0; i < 60; i++ {
-		state, err := claimStaging(context.Background(), staging, pub, metaPath, it, job, "commit123", true, cfg, false)
-		if state != nil {
-			state.release()
+		domain, err := acquireBlobDomain(context.Background(), key, lockSrc)
+		if err == nil {
+			domain.release()
 			continue
 		}
-		if errors.Is(err, errBlobIncompleteOwned) {
+		if errors.Is(err, errStagingOwnershipBusy) {
 			falseSkips++
 			continue
 		}
@@ -515,9 +436,7 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 			uncertain++
 			continue
 		}
-		if err != nil {
-			t.Fatalf("claim %d: %v", i, err)
-		}
+		t.Fatalf("acquisition %d: %v", i, err)
 	}
 	close(stop)
 	probes.Wait()

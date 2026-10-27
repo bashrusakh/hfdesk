@@ -22,16 +22,23 @@ package hfdownloader
 // The domain has two layers:
 //
 //   - an in-process slot, so two goroutines of one process never own the same
-//     blob key at the same time (the single-request route's partial
+//     destination at the same time (the single-request route's partial
 //     blobs/tmp-<sha>.part is shared by every writer of that key);
 //   - the lifetime OS ownership lock on the persistent sibling
 //     blobs/tmp-<sha>.lock, so a writer in another process cannot own the
-//     same blob key either.
+//     same destination either.
 //
 // The lock file is the sibling of the item's cache destination, so it needs no
 // new artifact name: every ".lock" entry is already persistent, never
 // unlinked, and excluded from cache statistics, listings, mirrors and cache
 // deletion.
+//
+// This domain is the ONLY ownership fence of a destination. The item takes it
+// ONCE, after its pre-download skip decision and before the HEAD/claim, and
+// holds it through the claim, the transfer, the publication, the cache store
+// and the cancel cleanup. The multipart staging claim does not take a second
+// lock of its own: it verifies that the domain it receives covers its staging
+// path and trusts that fence (see claimStaging).
 //
 // A PATH-DERIVED cache destination (an item without a supplied digest, whose
 // staging name is derived from its relative path) is staged under a
@@ -176,10 +183,16 @@ var blobDomainOwners = struct {
 	m map[string]*blobDomainEntry
 }{m: map[string]*blobDomainEntry{}}
 
-// blobDomain is a held ownership domain of one blob key.
+// blobDomain is a held ownership domain of one destination.
 type blobDomain struct {
-	// key is the domain identity: the content-addressed blob path.
+	// key is the domain identity: the content-addressed blob path for a cache
+	// destination, or the destination itself for a flat/output-mode one.
 	key string
+	// dest is the destination whose multipart staging names this domain
+	// covers: blobs/tmp-<name> for a cache destination (which covers
+	// blobs/tmp-<name>.incomplete and blobs/<name>.incomplete), or the
+	// <destination>.incomplete staging name for a flat one.
+	dest string
 	// lock is the held lifetime OS ownership lock.
 	lock *stagingOwnershipLock
 	// entry is the in-process slot this holder owns.
@@ -375,7 +388,7 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 		close(entry.done)
 		return nil, err
 	}
-	return &blobDomain{key: key, lock: lock, entry: entry}, nil
+	return &blobDomain{key: key, dest: dst, lock: lock, entry: entry}, nil
 }
 
 // blobDomainAcquire is the domain acquisition seam. It is a package variable
@@ -516,22 +529,40 @@ func (d *blobDomain) holdsBlobKey(key string) bool {
 	return filepath.Clean(d.key) == filepath.Clean(key)
 }
 
-// holdsStagingLock reports whether this holder owns the lifetime ownership
-// lock of the staging pair named by staging.
+// coversStaging reports whether this held domain owns the multipart staging
+// path of its destination.
 //
-// It is the check the flat/output-mode paths need: there the destination's
-// domain lock and the staging pair's lock are the SAME file
-// (<destination>.incomplete.lock), so a removal that took that lock again
-// would report the caller's OWN hold as a live owner and skip the removal.
+// The claim uses it as its fail-closed precondition: it receives the held
+// domain instead of taking a lock of its own, so it must prove that the fence
+// it was given really covers the staging pair it is about to mutate. A
+// released, missing or foreign domain covers nothing.
 //
-// In HF cache mode the two are different files (blobs/tmp-<name>.lock vs
-// blobs/tmp-<name>.incomplete.lock), so the answer is false there and the
-// ordinary claim-checked removal applies.
-func (d *blobDomain) holdsStagingLock(staging string) bool {
-	if d == nil || d.released || d.lock == nil || staging == "" {
+// A cache destination blobs/tmp-<name> stages either at
+// blobs/tmp-<name>.incomplete (the single-request destination's multipart
+// staging) or at blobs/<name>.incomplete (the blob-keyed staging of a
+// content-addressed item), so both forms belong to the one domain. A
+// flat/output-mode domain's destination IS its multipart staging name
+// (<destination>.incomplete), which is also the source of its lifetime lock.
+func (d *blobDomain) coversStaging(staging string) bool {
+	if d == nil || d.released || d.dest == "" || staging == "" {
 		return false
 	}
-	return d.lock.path == stagingOwnershipLockPath(staging)
+	clean := filepath.Clean(staging)
+	if clean == filepath.Clean(d.dest) {
+		return true
+	}
+	if strings.HasPrefix(d.key, flatDomainKeyPrefix) {
+		return false
+	}
+	return clean == filepath.Clean(d.dest+".incomplete") ||
+		clean == filepath.Clean(d.key+".incomplete")
+}
+
+// lockHeld reports whether this domain still holds its lifetime OS ownership
+// lock. It is the liveness check of the publication: a domain that was
+// released (or never acquired a lock) no longer fences the destination.
+func (d *blobDomain) lockHeld() bool {
+	return d != nil && !d.released && d.lock != nil && d.lock.held()
 }
 
 // release drops the domain: the OS lock is closed and the in-process slot is

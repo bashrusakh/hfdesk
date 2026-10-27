@@ -96,7 +96,7 @@ func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
-	if own, err := acquireStagingOwnershipLock(staging); err != nil {
+	if own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha)); err != nil {
 		t.Fatal(err)
 	} else {
 		own.release()

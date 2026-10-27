@@ -9,6 +9,7 @@ package hfdownloader
 // while its own (same process instance) staging remains removable.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,7 +42,8 @@ func TestRemoveStagingArtifacts_MetaFirstFailurePreservesPayload(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(metaPath, "child"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	removeStagingArtifacts(staging, metaPath)
+	acquireTestDomain(t, filepath.Join(tmpDir, "x"))
+	removeStagingArtifactsIfUnowned(staging, metaPath)
 	if _, err := os.Stat(staging); err != nil {
 		t.Fatalf("payload was removed after the record removal failed: %v", err)
 	}
@@ -49,7 +51,7 @@ func TestRemoveStagingArtifacts_MetaFirstFailurePreservesPayload(t *testing.T) {
 	if err := os.RemoveAll(metaPath); err != nil {
 		t.Fatal(err)
 	}
-	removeStagingArtifacts(staging, metaPath)
+	removeStagingArtifactsIfUnowned(staging, metaPath)
 	if _, err := os.Stat(staging); !os.IsNotExist(err) {
 		t.Errorf("payload survived a successful metadata removal, stat err=%v", err)
 	}
@@ -76,10 +78,10 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			`{"pid":%d,"instance":"foreign-live-instance","host":%q,"size":%d,"version":%d,"repo":"o/r","path":"x.bin","ranges":[{"start":0,"end":%d,"committed":0,"done":false}]}`,
 			os.Getppid(), host, total, stagingMetaVersion, total-1)
 		writeRawStagingMeta(t, metaPath, raw)
-		// A live owner holds the OS-level ownership lock for its whole
-		// interval; cleanup must treat that (not a heartbeat heuristic) as the
-		// authoritative ownership signal.
-		hold, _ := acquireStagingOwnershipLock(staging)
+		// A live owner holds the destination's ownership-domain lock for its
+		// whole interval; cleanup must treat that (not a heartbeat heuristic)
+		// as the authoritative ownership signal.
+		hold, _ := acquireStagingOwnershipLock(dst)
 		if hold != nil {
 			defer hold.release()
 		}
@@ -154,17 +156,17 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		entry := &stagingOwnerEntry{done: make(chan struct{}), instance: processInstanceToken}
-		stagingOwnersMu.Lock()
-		stagingOwners[staging] = entry
-		stagingOwnersMu.Unlock()
-		defer func() {
-			stagingOwnersMu.Lock()
-			if cur, ok := stagingOwners[staging]; ok && cur == entry {
-				delete(stagingOwners, staging)
-			}
-			stagingOwnersMu.Unlock()
-		}()
+		// A live in-process writer holds the destination's ownership domain.
+		// The cleanup's own domain acquisition must report that live owner
+		// instead of removing the pair.
+		key, keyed := cacheDstDomainKey(dst)
+		if !keyed {
+			t.Fatalf("the cache destination %s has no ownership-domain key", dst)
+		}
+		owner, derr := blobDomainAcquire(context.Background(), key, dst)
+		if derr != nil {
+			t.Fatalf("acquire the live in-process domain: %v", derr)
+		}
 
 		if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
 			t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -175,10 +177,8 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			}
 		}
 
-		// Once the claim is released, the same fixtures are removable.
-		stagingOwnersMu.Lock()
-		delete(stagingOwners, staging)
-		stagingOwnersMu.Unlock()
+		// Once the domain is released, the same fixtures are removable.
+		owner.release()
 		if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
 			t.Fatalf("CleanupJobPartFiles after release: %v", err)
 		}

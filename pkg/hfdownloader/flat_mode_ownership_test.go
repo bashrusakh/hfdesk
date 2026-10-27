@@ -145,8 +145,8 @@ func TestDownloadFlatModeMultipartRouteKeepsPersistentOwnershipLock(t *testing.T
 // TestDownloadFlatModeMultipartRouteExcludesSecondWriter pins the exclusion
 // itself: a second writer of the same flat destination on the multipart route
 // fails with the actionable live-owner error while a PROVEN live owner holds
-// the staging lock, and it neither creates, overwrites nor corrupts the
-// destination.
+// the destination's domain, and it neither creates, overwrites nor corrupts
+// the destination.
 //
 // Both destination states are covered, because they are different failure
 // modes: the excluded writer must not CREATE the destination it was not
@@ -192,8 +192,11 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 		}
 	}
 
-	// The live owner holds the multipart route's lifetime OS ownership lock
-	// for the whole interval.
+	// The live owner holds the destination's one lifetime OS ownership lock
+	// (the multipart staging name's persistent sibling) for the whole
+	// interval. The excluded writer waits out its bounded budget and fails
+	// with the actionable live-owner error.
+	shortBlobOwnershipWait(t, 250*time.Millisecond)
 	owner, err := acquireStagingOwnershipLock(dst + ".incomplete")
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +211,7 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 
 	select {
 	case <-contended:
-		// The claim really hit the contended lock.
+		// The writer really hit the contended destination domain.
 	case res := <-result:
 		// The download already finished. The exclusion must be proven, not
 		// inferred, so the contention is checked before the outcome is
@@ -219,7 +222,7 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 			t.Fatalf("the download finished without observing the contended ownership lock (err=%v)", res.err)
 		}
 	case <-time.After(60 * time.Second):
-		t.Fatal("the claim never observed the contended ownership lock")
+		t.Fatal("the writer never observed the contended destination domain")
 	}
 
 	var res flatModeOutcome

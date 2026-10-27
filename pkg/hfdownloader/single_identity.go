@@ -62,6 +62,12 @@ type singleOpts struct {
 	// exact expected byte count, and it is NOT part of the object identity
 	// (inheritableBy ignores it). A fresh identity carries it false.
 	FramingComplete bool
+	// Domain is the destination ownership domain the item already holds. The
+	// single-request route never acquires it; it only needs it for the
+	// explicit-cancel cleanup, which must remove the route's partial
+	// artifacts under the destination's fence. A nil domain means no fence is
+	// held, and the cancel cleanup leaves the artifacts alone.
+	Domain *blobDomain
 }
 
 // singlePartIdentity is the recorded identity of a single-request partial.

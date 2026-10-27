@@ -297,7 +297,7 @@ func TestDownloadMultipart_StalledPartRecoversAndAssembles(t *testing.T) {
 		BackoffMax:     "20ms",
 	}
 
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	got, err := os.ReadFile(dst)
@@ -437,7 +437,7 @@ func TestDownloadMultipart_StalledPartsSurfaceStallError(t *testing.T) {
 		BackoffMax:     "10ms",
 	}
 
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected an error when every part stalls")
 	}
@@ -616,7 +616,7 @@ func TestDownloadMultipart_HeadRetryAfterHonored(t *testing.T) {
 	}
 
 	start := time.Now()
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -684,7 +684,7 @@ func TestDownloadMultipart_HeadThrottledBudgetExhausted(t *testing.T) {
 		StallTimeout:   "0",
 	}
 
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if !errors.Is(err, ErrRateLimited) {
 		t.Errorf("error = %v, want ErrRateLimited (the exhausted transient error)", err)
 	}
@@ -777,7 +777,7 @@ func TestDownloadMultipart_HeadBodyClosedBeforeTransfer(t *testing.T) {
 	it := PlanItem{RelativePath: "headclose.bin", URL: srv.URL + "/headclose.bin", Size: int64(len(full)), AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 2, StallTimeout: "0"}
 
-	if _, err := downloadMultipart(context.Background(), httpc, "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), httpc, "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	if !closedWhenFirstGET.Load() {
@@ -916,7 +916,7 @@ func TestDownloadMultipart_FailFast(t *testing.T) {
 			t.Fatal(err)
 		}
 		it := PlanItem{RelativePath: "h.bin", URL: srv.URL + "/h.bin", Size: 10_000, AcceptRanges: true}
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4}, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("error = %v, want ErrUnauthorized", err)
 		}
@@ -956,7 +956,7 @@ func TestDownloadMultipart_FailFast(t *testing.T) {
 			t.Fatal(err)
 		}
 		it := PlanItem{RelativePath: "p.bin", URL: srv.URL + "/p.bin", Size: 10_000, AcceptRanges: true}
-		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 5}, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 5}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("error = %v, want ErrNotFound", err)
 		}
@@ -1496,7 +1496,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 			{Start: 0, End: 49_999},
 			{Start: 50_000, End: 99_999, Committed: 499},
 		}, full)
-	opts := multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}
+	opts := multipartOpts{Commit: rangedSeedCommit, CommitPinned: true, Domain: acquireTestDomain(t, dst)}
 
 	it := PlanItem{RelativePath: "pa.bin", URL: srv.URL + "/pa.bin", Size: 100_000, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 5, BackoffInitial: "5ms", BackoffMax: "10ms", StallTimeout: "0"}
@@ -1581,7 +1581,7 @@ func TestDownloadMultipart_NonRetryablePartStopsSiblings(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 100000, AcceptRanges: true}, dst, multipartOpts{}, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 100000, AcceptRanges: true}, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
 		t.Fatalf("error = %v, want original HTTP 400 APIError", err)
@@ -1714,10 +1714,12 @@ func TestDownloadSingle_InternalAbortPreservesResumablePartial(t *testing.T) {
 		cfg := Settings{Retries: 5, BackoffInitial: "5s", BackoffMax: "5s", StallTimeout: "0"}
 		cfg.CleanupPartialsOnCancel = func() bool { return true }
 
+		opts := singleTestIdentity
+		opts.Domain = acquireTestDomain(t, dst)
 		done := make(chan error, 1)
 		go func() {
 			it := PlanItem{RelativePath: "keep.bin", URL: "http://127.0.0.1:1/keep.bin", Size: 100_000}
-			done <- downloadSingleErr(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {})
+			done <- downloadSingleErr(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
 		}()
 
 		// Give the goroutine time to fail its first attempt and enter the
@@ -2122,7 +2124,7 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		done <- derr
 	}()
 
@@ -2322,7 +2324,7 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		done <- derr
 	}()
 
@@ -2402,7 +2404,7 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 
 		it := PlanItem{RelativePath: "fin.bin", URL: srv.URL + "/fin.bin", Size: 20_000, AcceptRanges: true}
 		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
-			multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, emit)
+			withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), emit)
 		if err == nil {
 			t.Fatal("expected a cancellation error")
 		}

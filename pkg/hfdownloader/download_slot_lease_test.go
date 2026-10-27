@@ -14,11 +14,11 @@ package hfdownloader
 // contended item takes its slot back before the acquisition returns a domain
 // it will transfer under.
 //
-// The cases drive the real Download path, so they cover the three item-path
-// acquisitions (the cache destination's domain, the flat destination's domain
-// and the flat-mode hand-off inside downloadMultipart) and the two waits the
-// domain acquisition can perform (the in-process slot and the cross-process
-// lifetime OS lock). The synchronization is deterministic: the test holds the
+// The cases drive the real Download path, so they cover the item-level
+// destination-domain acquisition of both modes (cache and flat) and the two
+// waits it can perform (the in-process slot and the cross-process lifetime OS
+// lock). The flat unknown-size hand-off keeps the domain the item already
+// holds, so it is covered as the same one acquisition, not a second one. The synchronization is deterministic: the test holds the
 // destination's domain itself, and the payload/`file_done` signals of the
 // OTHER file prove that the job proceeded. No sleep decides the outcome.
 
@@ -446,11 +446,11 @@ func assertOwnershipContractLinksMissing(t *testing.T, cacheDir, rel string) {
 	}
 }
 
-// TestDownloadSlotLeaseFlatModeUnknownSizeHandoff covers the THIRD item-path
-// acquisition: the flat-mode hand-off inside downloadMultipart, where an item
-// whose size stays unknown after HEAD takes the destination's domain before it
-// hands over to the single-request path. The wait must yield the slot there
-// too, so the other file of the limit-1 job still transfers.
+// TestDownloadSlotLeaseFlatModeUnknownSizeHandoff covers the flat-mode
+// unknown-size hand-off: the item waits for its destination domain before the
+// HEAD, and the hand-off to the single-request path keeps that same domain.
+// The wait must yield the slot there too, so the other file of the limit-1 job
+// still transfers.
 func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -681,14 +681,14 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 	}
 }
 
-// slotNoticeRecorder records the lease signals of a domain acquisition or a
-// staging claim.
+// slotNoticeRecorder records the lease signals of a destination-domain
+// acquisition.
 type slotNoticeRecorder struct {
 	mu     sync.Mutex
 	begins int
 	ends   int
 	// began is closed on the FIRST beginWait when the test installed it. It is
-	// the deterministic "the acquisition/claim is now waiting" signal; tests
+	// the deterministic "the acquisition is now waiting" signal; tests
 	// that only count signals leave it nil.
 	began chan struct{}
 }

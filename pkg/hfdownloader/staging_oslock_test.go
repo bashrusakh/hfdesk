@@ -17,12 +17,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,7 +88,7 @@ func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lock, err := acquireStagingOwnershipLock(staging)
+	lock, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +118,7 @@ func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
 // under test are unchanged: an owned, complete record still publishes.
 func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 	payload := []byte("someone else's payload")
-	makeDownload := func(t *testing.T) (*stagingDownload, string, string, *stagingOwnershipLock) {
+	makeDownload := func(t *testing.T) (*stagingDownload, string, string) {
 		t.Helper()
 		dir := t.TempDir()
 		staging := filepath.Join(dir, "x.incomplete")
@@ -129,27 +126,22 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 		if err := os.WriteFile(staging, payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		own, oerr := acquireStagingOwnershipLock(staging)
-		if oerr != nil {
-			t.Fatalf("acquire ownership lock: %v", oerr)
-		}
+		domain := acquireTestDomain(t, pub)
 		d := &stagingDownload{
-			ctx:         context.Background(),
-			dst:         pub,
-			stg:         staging,
-			pub:         pub,
-			meta:        staging + ".meta",
-			it:          PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
-			ranges:      completeRangeLayout(int64(len(payload)), 1),
-			osExclusive: own != nil,
-			own:         own,
+			ctx:    context.Background(),
+			dst:    pub,
+			stg:    staging,
+			pub:    pub,
+			meta:   staging + ".meta",
+			it:     PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
+			ranges: completeRangeLayout(int64(len(payload)), 1),
+			domain: domain,
 		}
-		return d, staging, pub, own
+		return d, staging, pub
 	}
 
 	t.Run("foreign record", func(t *testing.T) {
-		d, staging, pub, own := makeDownload(t)
-		defer own.release()
+		d, staging, pub := makeDownload(t)
 		foreign := IncompleteMeta{
 			PID:       os.Getpid(),
 			Instance:  "another-process-instance",
@@ -176,8 +168,7 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 	})
 
 	t.Run("missing record", func(t *testing.T) {
-		d, staging, pub, own := makeDownload(t)
-		defer own.release()
+		d, staging, pub := makeDownload(t)
 		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
 			t.Fatalf("publish with a missing record = %v, want errStagingClaimLost", err)
 		}
@@ -190,8 +181,7 @@ func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 	})
 
 	t.Run("owned record still publishes", func(t *testing.T) {
-		d, staging, pub, own := makeDownload(t)
-		defer own.release()
+		d, staging, pub := makeDownload(t)
 		ours := IncompleteMeta{
 			PID:       os.Getpid(),
 			Instance:  processInstanceToken,
@@ -273,9 +263,16 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), URL: "http://127.0.0.1:1/lock.bin", Size: cfg.Size, AcceptRanges: true}
 	job := Job{Repo: "o/r"}
 	metaPath := cfg.Staging + ".meta"
-	state, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, metaPath, it, job, cfg.Commit, true,
-		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false)
-	if err != nil {
+	// The child owns the destination's domain for the whole interval, exactly
+	// like an item goroutine does; the claim trusts that domain.
+	domain, derr := acquireBlobDomain(context.Background(), flatDomainKey(cfg.Publish), cfg.Staging)
+	if derr != nil {
+		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: derr.Error()})
+		return
+	}
+	defer domain.release()
+	if _, err := claimStaging(context.Background(), cfg.Staging, cfg.Publish, metaPath, it, job, cfg.Commit, true,
+		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, false, domain); err != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
 		return
 	}
@@ -353,7 +350,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 		return
 	}
 	_ = os.Remove(metaPath)
-	state.release()
+	domain.release()
 	writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{})
 }
 
@@ -388,10 +385,11 @@ func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.
 }
 
 // TestStagingOSLockHeldByLiveProcessBlocksTakeover is the real-process form of
-// B3(i)/(iii): a helper holds the OS ownership lock while its record looks
-// stale-looking (aged mtime), so only lifetime ownership can refuse takeover.
-// The second claimant must back off as errBlobIncompleteOwned and leave the
-// staging untouched; once the helper is released it completes and publishes.
+// B3(i)/(iii): a helper holds the destination's ownership domain while its
+// record looks stale-looking (aged mtime), so only the lifetime lock can refuse
+// takeover. A second acquisition must report the proven live owner as busy and
+// leave the staging untouched; once the helper is released it completes and
+// publishes.
 func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) == "1" {
 		t.Skip("child process")
@@ -408,16 +406,6 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	dst := filepath.Join(dir, "lock.bin")
 	staging := dst + ".incomplete"
 	metaPath := staging + ".meta"
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", strconv.Itoa(total))
-			w.Header().Set("Accept-Ranges", "bytes")
-			return
-		}
-		http.Error(w, "body must not be requested while the live owner holds the lock", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
 
 	cfg := stagingOSLockChildConfig{
 		Mode:       "hold",
@@ -467,18 +455,21 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	it := PlanItem{RelativePath: "lock.bin", URL: srv.URL + "/lock.bin", Size: total, AcceptRanges: true}
-	_, claimErr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
-		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, it, dst,
-		multipartOpts{Commit: commit, CommitPinned: true}, func(ProgressEvent) {})
-	if !errors.Is(claimErr, errBlobIncompleteOwned) {
+	// The destination's domain is held by the helper, so a second writer must
+	// not take it over. The bounded acquisition reports the PROVEN live owner
+	// as busy after its wait budget.
+	shortBlobOwnershipWait(t, 250*time.Millisecond)
+	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(dst), flatDomainLockSrc(dst)); !errors.Is(derr, errStagingOwnershipBusy) {
 		_ = cmd.Process.Kill()
-		t.Fatalf("second claimant error = %v, want errBlobIncompleteOwned while the OS lock is held", claimErr)
+		t.Fatalf("second claimant error = %v, want errStagingOwnershipBusy while the OS lock is held", derr)
 	}
 	// Cleanup must observe the same held lifetime fence; stale diagnostics do
 	// not authorize deleting a suspended owner's payload or metadata.
-	removeStagingArtifactsIfUnclaimed(staging, metaPath)
-	// The claimant must not have touched the owner's staging or record.
+	if err := CleanupJobPartFiles(Settings{OutputDir: dir}, []string{dst}); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("cleanup of a live owner's destination: %v", err)
+	}
+	// The second claimant must not have touched the owner's staging or record.
 	stagingAfter, err := os.ReadFile(staging)
 	if err != nil {
 		t.Fatalf("live owner's staging disappeared: %v", err)
@@ -576,7 +567,7 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 	start := time.Now()
 	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"},
 		Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}, it, dst,
-		multipartOpts{Commit: commit, CommitPinned: true}, func(ProgressEvent) {}); err != nil {
+		withTestDomain(t, dst, multipartOpts{Commit: commit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("takeover after the holder died: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

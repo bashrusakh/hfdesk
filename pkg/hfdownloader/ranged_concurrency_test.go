@@ -221,7 +221,7 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 
 				done := make(chan error, 1)
 				go func() {
-					_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}, func(ProgressEvent) {})
+					_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {})
 					done <- err
 				}()
 
@@ -350,7 +350,7 @@ func TestRangedMultipart_ParallelOverflowInvalidationIsRaceFree(t *testing.T) {
 	it := PlanItem{RelativePath: relPath, URL: srv.URL + "/" + relPath, Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: workers, Retries: 1, StallTimeout: "0", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "size"}
 
-	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("oversized chunked ranged bodies were accepted and published")
 	}
@@ -436,7 +436,7 @@ func TestRangedMultipart_SequentialOverflowKeepsSingleFinalHash(t *testing.T) {
 	cfg := Settings{Concurrency: 1, Retries: 2, StallTimeout: "0", BackoffInitial: "1ms", BackoffMax: "1ms", Verify: "sha256"}
 
 	hashPassCount.Store(0)
-	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {})
+	verified, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v (a valid retry after an overflow must verify and publish)", err)
 	}

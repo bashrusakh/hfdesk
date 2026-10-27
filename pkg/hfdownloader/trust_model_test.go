@@ -184,7 +184,7 @@ func TestDownloadMultipart_TempDestinationIsNotCompletion(t *testing.T) {
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "x.bin", URL: srv.URL + "/x.bin", Size: total, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		if errors.Is(err, errBlobAlreadyComplete) {
 			t.Fatalf("claim treated a leftover tmp destination as a complete blob")
 		}
@@ -304,7 +304,7 @@ func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 	done := make(chan error, 1)
 	hashPassCount.Store(0)
 	go func() {
-		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, multipartOpts{Commit: "c1", CommitPinned: true}, func(ev ProgressEvent) {
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: "c1", CommitPinned: true}), func(ev ProgressEvent) {
 			if ev.Event == "file_finalizing" && once.CompareAndSwap(false, true) {
 				close(reached)
 			}

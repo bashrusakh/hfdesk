@@ -546,7 +546,7 @@ func TestDownloadSingle_CancelAtFinalizeBeforeRename(t *testing.T) {
 			defer cancel()
 			cfg := Settings{Verify: "none", Retries: 0, StallTimeout: "0", CleanupPartialsOnCancel: func() bool { return cleanup }}
 			it := PlanItem{RelativePath: "cancel-finalize.bin", URL: srv.URL, Size: size}
-			_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ev ProgressEvent) {
+			_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Domain: acquireTestDomain(t, dst)}, func(ev ProgressEvent) {
 				if ev.Event == "file_finalizing" {
 					cancel()
 				}
@@ -705,7 +705,9 @@ func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) 
 				armed:    true,
 			}
 			hashPassCount.Store(0)
-			verified, err := finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
+			finOpts := pinnedSingleIdentity()
+			finOpts.Domain = acquireTestDomain(t, dst)
+			verified, err := finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, finOpts, emit)
 			if !errors.Is(err, context.Canceled) || verified {
 				t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
 			}
@@ -782,7 +784,9 @@ func TestDownloadSingle_CancelDuringProofRemovesPartial(t *testing.T) {
 	}
 	defer func() { singleProofStartHook = nil }()
 
-	verified, err := downloadSingle(ctx, http.DefaultClient, "", job, cfg, it, dst, singleTestIdentity,
+	proofOpts := singleTestIdentity
+	proofOpts.Domain = acquireTestDomain(t, dst)
+	verified, err := downloadSingle(ctx, http.DefaultClient, "", job, cfg, it, dst, proofOpts,
 		func(ProgressEvent) {})
 
 	if !proofStarted {

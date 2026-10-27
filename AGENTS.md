@@ -258,6 +258,13 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   existing content-addressed blob. The domain lock file is
   persistent, is never unlinked, and is excluded from cache statistics,
   listings, mirrors and cache deletion like every other `.lock` artifact.
+  The domain is acquired ONCE per item, after the pre-download skip decision
+  and before the HEAD/claim, and held through the claim, transfer, publication,
+  store and cancel cleanup; it is released when the item returns. This is the
+  ONLY ownership fence of the destination: the multipart staging claim receives
+  the held domain, verifies that it covers the claim's staging path, and fails
+  closed when it does not. It takes no second OS lock and registers no second
+  in-process owner.
 - EVERY CACHE DESTINATION OWNS ONE OWNERSHIP DOMAIN, NOT ONLY THE
   CONTENT-ADDRESSED ONES. The domain is keyed on the DESTINATION name and is
   the SAME identity for the writer and the cleanup:
@@ -300,38 +307,40 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   The legacy/output (flat) mode has no `blobs/`-style internal identity, so it
   borrows the MULTIPART staging name for the destination's ONE domain: the
   domain key is the destination path, and the domain's lifetime lock is the
-  persistent sibling `<destination>.incomplete.lock` — the very lock the
-  MULTIPART route's staging claim already takes. That lock file is a zero-byte
-  artifact next to the user's model file and is never unlinked, and NO new
-  artifact name appears next to the user's model file. The SINGLE-REQUEST
-  route holds that same domain while it transfers, so ONE lock file excludes
-  every pair of writers of the same flat destination: single-vs-single,
-  single-vs-multipart and multipart-vs-multipart. THE DEADLOCK RULE: the
-  domain is taken at the download level ONLY for the route that does not take
-  it internally — the MULTIPART route's claim takes
-  `<destination>.incomplete.lock` from inside the multipart transfer, and an
-  exclusive lock conflicts even within one process, so taking it a second
-  time would make the writer contend with ITSELF. The MULTIPART route
-  therefore keeps relying on its staging claim; the hand-off to the
-  single-request path (the size stays unknown) takes the domain THERE,
-  because that hand-off happens BEFORE the claim. A concurrent second writer
-  of the same flat destination is therefore EXCLUDED, and how its exclusion
-  surfaces depends on the route it is on: a MULTIPART writer's staging claim
-  reports the contended lock at once with the actionable live-owner error
-  ("blob <sha> is being downloaded by another process; try again later"), while
-  a SINGLE-REQUEST writer WAITS for the domain (bounded, context-aware) and
-  only fails with that same actionable error when the wait is exhausted - if the
-  owner releases the domain it proceeds and downloads the file itself, instead
-  of racing, which is safer than the
-  pre-#140 behavior, where two processes wrote the same `.part-NN` payload
-  files and could publish a silently corrupt model. A flat destination whose
-  ownership domain cannot be acquired (the OS lock is unsupported, denied, or
-  the filesystem failed) fails the item BEFORE it writes any payload, exactly
-  like cache mode: that is the fail-closed consequence of the flat route
-  owning a domain. And because the single-request route takes that domain,
-  EVERY flat single-request download leaves the persistent zero-byte
+  persistent sibling `<destination>.incomplete.lock`. That lock file is a
+  zero-byte artifact next to the user's model file and is never unlinked, and
+  NO new artifact name appears next to the user's model file. The SAME domain
+  is acquired ONCE at item level for EVERY route (cache single, cache
+  multipart, flat single, flat multipart), after the skip decision and before
+  the HEAD/claim, and held through the claim, transfer, publication, store and
+  cancel cleanup. ONE lock file therefore excludes every pair of writers of the
+  same flat destination: single-vs-single, single-vs-multipart,
+  multipart-vs-multipart and cleanup-vs-any-writer. The multipart staging claim
+  does NOT take a second lock: it verifies that the held domain covers its
+  staging path (a missing, released or non-covering domain fails the claim
+  closed), performs its record transitions under the intra-item metadata gate,
+  and records `LockFenced`. The earlier "deadlock rule" (skip the item-level
+  acquisition for the multipart route so it would not contend with its own
+  claim) existed only because the claim took the same lock file; with one
+  acquisition there is no self-conflict and no route-specific exception, and
+  the unknown-size hand-off to the single-request path keeps the domain the
+  item already holds instead of taking it a second time.
+  A concurrent second writer of the same flat destination WAITS for the
+  domain — bounded by the ownership budget for a cross-process owner, by the
+  item's context for an in-process holder — and never takes it over. When the
+  owner still holds it at the budget's end, the item fails with the actionable
+  live-owner error ("blob <sha> is being downloaded by another process; try
+  again later"); when the owner releases it, the writer obtains the file itself
+  (a flat destination has no published content-addressed target to re-check),
+  instead of racing it, which is safer than the pre-#140 behavior, where two
+  processes wrote the same `.part-NN` payload files and could publish a
+  silently corrupt model. A flat destination whose ownership domain cannot be
+  acquired (the OS lock is unsupported, denied, or the filesystem failed) fails
+  the item BEFORE it writes any payload, exactly like cache mode: that is the
+  fail-closed consequence of every route owning a domain. And because every
+  route takes that domain, EVERY flat download leaves the persistent zero-byte
   `<destination>.incomplete.lock` next to the file, even when no multipart
-  transfer ran: the shared domain/staging lock is created by the domain
+  transfer ran: the shared domain/staging lock is created by the item-level
   acquisition, not by a multipart transfer.
 - JOB CONTRACT: "job completed successfully" MUST mean the requested files are
   present AND reachable at their snapshot/friendly paths. A file owned by
@@ -365,30 +374,29 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the effective budget is 5 MINUTES); it is a package-level knob, not a user
   setting, and the in-process slot wait is bounded by the job's context only
   (its holder is a goroutine of this process that finishes or is cancelled).
-  Cancellation stays prompt. Neither a DESTINATION-DOMAIN waiter nor a
-  MULTIPART STAGING CLAIM waiter holds a `MaxActiveDownloads` slot: the slot
-  is a per-item lease that the ownership-domain acquisition (the in-process
-  slot wait and the cross-process OS-lock wait alike) AND the multipart
-  staging claim (the in-process staging owner, the cross-process staging OS
-  lock and the local metadata gate) return for the duration of every wait and
-  take back before they return a domain/claim the caller will transfer under.
-  The slot therefore bounds concurrent TRANSFERS, not waiters, so the other
-  files of the job proceed while one item waits — a low limit no longer keeps
-  the transfer budget from starting the files that could transfer. Waiters do
-  not consume transfer slots (any number of items may wait) while the
-  configured limit still bounds concurrent transfers. A contended item that
-  has acquired its domain or claim may wait to take its slot back, and that
-  wait cannot deadlock: an item never blocks on a domain or claim while
-  holding a slot, and two contenders for one key cannot both hold its
-  domain/claim. A FAILED claim keeps the slot returned (no claim reaches the
-  caller, so the item reports the error instead of transferring), exactly
-  like a failed domain acquisition. Waiting items are still goroutines bounded
-  by the job's file set, and the slot is reacquired before the transfer. The
-  claim's waits and budgets are unchanged: an in-process claimant waits for
-  the current owner bounded by the item's context, a PROVEN live cross-process
-  owner is reported at once with the actionable ownership error, transient
-  cross-process contention is waited out within `stagingOwnershipAcquireWait`
-  (5s), and the local metadata gate is waited out within `stagingLockWait`.
+  Cancellation stays prompt. A DESTINATION-DOMAIN waiter does not hold a
+  `MaxActiveDownloads` slot: the slot is a per-item lease that the
+  ownership-domain acquisition (the in-process slot wait and the cross-process
+  OS-lock wait alike) returns for the duration of every wait and takes back
+  before it returns a domain the caller will transfer under. The multipart
+  claim performs no ownership wait of its own any more (it runs under the held
+  domain and only takes the intra-item metadata gate), so it does not move the
+  slot. The slot therefore bounds concurrent TRANSFERS, not waiters, so the
+  other files of the job proceed while one item waits — a low limit no longer
+  keeps the transfer budget from starting the files that could transfer.
+  Waiters do not consume transfer slots (any number of items may wait) while
+  the configured limit still bounds concurrent transfers. A contended item
+  that has acquired its domain may wait to take its slot back, and that wait
+  cannot deadlock: an item never blocks on a domain while holding a slot, and
+  two contenders for one destination cannot both hold its domain. A FAILED
+  acquisition keeps the slot returned (no domain reaches the caller, so the
+  item reports the error instead of transferring). Waiting items are still
+  goroutines bounded by the job's file set, and the slot is reacquired before
+  the transfer. The acquisition's waits and budgets are unchanged: an
+  in-process contender waits for the current owner bounded by the item's
+  context, a cross-process PROVEN live owner is waited out until the ownership
+  budget expires and is then reported with the actionable ownership error, and
+  the local metadata gate is waited out within `stagingLockWait`.
   What the operator sees:
   the item stays in progress (no progress events are emitted while it waits,
   so its byte counter does not move), and when a budget expires or a live
@@ -437,13 +445,22 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   (safe) even when the cancelling job also had bytes for it. A legacy/output-mode
   destination has no `blobs/`-style internal identity, so its cleanup derives
   the SAME domain identity the writer holds: the destination's domain lock is
-  the persistent sibling `<destination>.incomplete.lock`, the very lock the
-  MULTIPART route's staging claim takes. Its artifacts are removed only while
-  that domain is held, so a cancelled job cannot delete another live job's
-  `.part`/`.incomplete`/`.meta` for the same path. The versioned staging pair
-  is still claim-checked, and the single `.part`, the obsolete pre-#140
-  `.part-NN` parts and `.parts.json` are removed as before. The persistent
-  `<destination>.incomplete.lock` of the multipart route is never unlinked.
+  the persistent sibling `<destination>.incomplete.lock`. Its artifacts are
+  removed only while that domain is held, so a cancelled job cannot delete
+  another live job's `.part`/`.incomplete`/`.meta` for the same path.
+  Because the domain is the only fence, the cleanup entry points are collapsed:
+  ONE owner-checked removal runs while the caller holds the domain and the
+  metadata gate (`removeStagingArtifactsLocked`, used by the claim transitions,
+  the publication and the cancel cleanup), and ONE record-checked removal takes
+  the metadata gate and deletes only a pair that no live owner can be using
+  (`removeStagingArtifactsIfUnowned`, used by the external cleanup paths). The
+  old `removeStagingArtifacts`/`...IfUnclaimed`/`...IfUnclaimedLocked` variants
+  and the in-process claim registry existed only to work around the claim's
+  second lock and its self-conflict, and are gone. A cache `dst` with no
+  derivable domain is skipped with a warning instead of removing unowned
+  artifacts. The versioned staging pair is still record-checked, and the single
+  `.part`, the obsolete pre-#140 `.part-NN` parts and `.parts.json` are removed
+  as before. The persistent `<destination>.incomplete.lock` is never unlinked.
 - A content-addressed publication has TWO tiers, and they guarantee different
   things. The tier is chosen by the FILESYSTEM, not by the operating system.
   - ATOMIC NO-REPLACE (a filesystem that can create hard links): place the
@@ -468,16 +485,23 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   publishes normally, and the two tiers differ in strength, not in
   availability.
 - The ownership check reports three outcomes and never guesses: a PROVEN live
-  owner (the lock is held exclusively) is `BlobDownloading` and the caller
+  owner (the DESTINATION DOMAIN's lock is held exclusively) is
+  `BlobDownloading` and the caller
   MUST NOT skip the item — the file is not present while the owner holds it, so
-  the item waits for the blob key's ownership domain and re-checks the
+  the item waits for the destination's ownership domain and re-checks the
   published target (see the job contract above); a PROVABLY dead owner is
   `BlobStale` and may be resumed; an UNKNOWN ownership state (the probe failed,
   or the platform cannot represent the lock) is `BlobOwnershipUnknown` plus an
   error wrapping `ErrBlobOwnershipUnknown`, and the caller surfaces the
   failure. An unknown state must never become a successful skip: the job would
   report completion with the blob still missing. The incomplete payload is
-  preserved.
+  preserved. `CheckBlob` probes `blobs/tmp-<sha>.lock`, the destination domain
+  lock that every writer of the destination holds. It does not probe the
+  obsolete `<staging>.lock` of earlier branch-only builds: no current writer
+  takes it, and treating it as ownership would report a live writer that does
+  not exist. A free domain lock plus a lock-fenced record is stale; a free
+  domain lock plus an unfenced record is not stale either - the record is
+  preserved, and the claim refuses it with the unproven-ownership error.
 - AN UNPROVEN STAGING RECORD IS NOT "ANOTHER LIVE WRITER". A staging record
   that was written without the lock fence (`LockFenced == false`, which no
   released version ever wrote) or that cannot be read/parsed is refused by the
@@ -495,25 +519,39 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   recovery is deliberately absent, so the operator removes the staging pair
   (`<staging>` and `<staging>.meta`, e.g. `blobs/<sha>.incomplete` and
   `blobs/<sha>.incomplete.meta`) and retries; the download then starts from
-  zero. Never remove the persistent `<staging>.lock`, and never remove a
+  zero. Never remove the destination's persistent domain lock
+  (`blobs/tmp-<sha>.lock` for a cache destination, `<destination>.incomplete.lock`
+  for a flat one), and never remove a
   staging pair whose owner is a PROVEN live owner — that owner is still
   writing to it.
-- Ownership is an OS-level exclusive lock on the persistent `<staging>.lock`
-  (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share `CreateFile`), acquired
-  before the claim transition and held through transfer, hashing and
-  publish/cleanup. A busy lock is a live owner (the claim reports it as owned
-  and the caller fails the item with the actionable live-owner error, the
-  cleanup skips, `CheckBlob` reports downloading); a crashed process releases
-  it at death, and a suspended owner keeps it — there is deliberately no
-  takeover while it is alive. A free lock is authoritative only for a record
-  written under it (`LockFenced`). An unfenced record is protected unless
+- Ownership is an OS-level exclusive lock on the persistent DESTINATION
+  DOMAIN lock (Unix `flock(LOCK_EX|LOCK_NB)`, Windows exclusive-share
+  `CreateFile`), acquired ONCE at item level before the HEAD/claim and held
+  through transfer, hashing, publish/store and cancel cleanup. A busy lock is a
+  live owner (the item waits for it and, when the budget expires, fails with
+  the actionable live-owner error; the cleanup skips; `CheckBlob` reports
+  downloading); a crashed process releases it at death, and a suspended owner
+  keeps it — there is deliberately no takeover while it is alive. A free lock is
+  authoritative only for a record written under it (`LockFenced`). An unfenced
+  record is protected unless
   its same-host owner is provably dead; age, ambiguous host/PID identity, or a
-  free new lock does not prove that an older writer cannot resume. If the lifetime lock cannot
-  be acquired (unsupported, denied, or filesystem error), fail the operation
-  before mutating claims or payloads and preserve partials; this is an
-  operation-time safety error, not a permanent platform-support policy. Keep
-  the ownership lock file: never unlink it (that would let two processes own
-  different inodes).
+  free new lock does not prove that an older writer cannot resume. If the
+  domain lock cannot be acquired (unsupported, denied, or filesystem error),
+  fail the operation before mutating claims or payloads and preserve partials;
+  this is an operation-time safety error, not a permanent platform-support
+  policy. Keep the domain lock file: never unlink it (that would let two
+  processes own different inodes).
+  The claim itself takes NO OS lock. It trusts the held domain, which is why a
+  second `<staging>.lock` fence is not only redundant but harmful: in flat mode
+  it was literally the same file as the domain lock, and the writer would
+  contend with itself. The record's `LockFenced` flag is therefore written from
+  the held domain (`true` for every current claim and take-over).
+  MIXED-VERSION WRITERS ARE INTENTIONALLY UNSUPPORTED. A branch-only build that
+  still held `<staging>.lock` instead of the destination domain is not
+  supported: such a writer's record is either an old/unsupported format (S0
+  discards it) or an unfenced v4 record (refused as unproven and preserved),
+  and no current code competes for its obsolete lock. Do not reintroduce a
+  compatibility path for it.
 - Before routing an item to the single-request path, detect usable CURRENT
   multipart resume state: a valid version-4 `<staging>.incomplete`/`.meta`
   pair (including the blob-keyed LFS pair). A ranged-capable item keeps the
@@ -527,10 +565,11 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   and claim-checked; the pre-#140 family is removed by the single-path success
   cleanup.
 - Serialize current-process record transitions with the per-staging metadata
-  mutex while the lifetime OS lock excludes foreign current-version mutators.
+  mutex; the destination ownership domain (held by the item) excludes foreign
+  current-version mutators and makes the gate intra-item state.
   Never recover a transition by age or unlink a lock that a suspended holder may
   still own. Re-read claim identity before mutation; cleanup and publish require
-  the lifetime capability, and publish checks cancellation immediately before
+  the held domain, and publish checks cancellation immediately before
   rename. A missing or foreign record is refused, never renamed.
 - Install a claim record only as a complete, valid document, atomically and
   without replacing a record that already appeared. Stage it in a sibling temp
@@ -681,24 +720,23 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
   the item fails with an actionable error, and the job's status is failed, not
   completed — see the downloader correctness rules for the ownership protocol.
   The wait budget is 5 minutes, and the wait runs inside the item's goroutine.
-  Neither a DESTINATION-DOMAIN waiter nor a MULTIPART STAGING CLAIM waiter
-  holds one of the job's `MaxActiveDownloads` slots: the slot is a per-item
-  lease returned for the duration of every ownership-domain wait (in-process
-  and cross-process alike) AND every multipart staging-claim wait (the
-  in-process staging owner, the cross-process staging OS lock and the local
-  metadata gate), and taken back before the acquisition/claim returns, so the
-  slot bounds concurrent TRANSFERS rather than waiters. Other files of the job
+  A DESTINATION-DOMAIN waiter does not hold one of the job's
+  `MaxActiveDownloads` slots: the slot is a per-item lease returned for the
+  duration of every ownership-domain wait (in-process and cross-process
+  alike) and taken back before the acquisition returns, so the
+  slot bounds concurrent TRANSFERS rather than waiters. The multipart claim
+  takes no ownership wait of its own any more (it runs under the held domain
+  and only takes the intra-item metadata gate), so it does not move the slot.
+  Other files of the job
   therefore proceed while one item waits, even with a low limit; waiters do
   not consume transfer slots, while concurrent transfers still obey the
-  configured limit. A failed claim keeps the slot returned, exactly like a
-  failed domain acquisition. Waiting items are still goroutines bounded by the
-  job's file set, and the claim takes its slot back before the transfer; the
-  claim's own waits and budgets are unchanged (an in-process claimant waits
-  for the current owner bounded by the item's context; a PROVEN live
-  cross-process owner is reported at once with the actionable ownership
-  error; transient cross-process contention is waited out within
-  `stagingOwnershipAcquireWait`, 5s; the local metadata gate within
-  `stagingLockWait`). What the
+  configured limit. A failed acquisition keeps the slot returned. Waiting
+  items are still goroutines bounded by the
+  job's file set; the acquisition's waits and budgets are unchanged (an
+  in-process contender waits for the current owner bounded by the item's
+  context; a cross-process PROVEN live owner is waited out until the ownership
+  budget expires and is then reported with the actionable ownership error; the
+  local metadata gate within `stagingLockWait`). What the
   operator sees: the item stays in progress (no progress events are emitted
   while it waits, so its byte counter does not move), and when a budget
   expires or a live owner is reported the item fails with the actionable

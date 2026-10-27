@@ -355,7 +355,7 @@ type IncompleteMeta struct {
 	// still carries the flag forces the proof on the next claim regardless of
 	// the current Verify mode (including "size") whenever the item has a known
 	// digest and Verify is not "none", so a crash mid-proof, a mismatch whose
-	// cleanup could not take the transition lock, or a later mode change cannot
+	// cleanup could not take the destination domain, or a later mode change cannot
 	// turn unproven all-Done ranges into a publishable blob. "none" is the
 	// explicit no-hash opt-out. On a mismatch the flag stays set and the
 	// payload is poisoned (truncated) in addition. The single-request path has
@@ -427,10 +427,11 @@ func (s BlobStatus) String() string {
 //
 // The result distinguishes three ownership outcomes, and never guesses:
 //
-//   - a PROVEN live owner (the persistent <staging>.lock is held exclusively)
-//     is reported as BlobDownloading. The caller must NOT skip the item: the
-//     file is not present while that owner holds the key, so the caller waits
-//     for the blob key's ownership domain and re-checks the published
+//   - a PROVEN live owner (the persistent destination domain lock
+//     blobs/tmp-<sha>.lock is held exclusively) is reported as
+//     BlobDownloading. The caller must NOT skip the item: the file is not
+//     present while that owner holds the key, so the caller waits for the
+//     blob key's ownership domain and re-checks the published
 //     content-addressed target afterwards;
 //   - a PROVABLY dead owner (a free lock plus a lock-fenced record, or
 //     same-host process evidence that the recorded owner is gone) is reported
@@ -443,11 +444,15 @@ func (s BlobStatus) String() string {
 //     unproven claim that turns into a successful download with the blob
 //     still missing.
 //
-// A held OS-level staging ownership lock (the persistent <staging>.lock) means
-// a live writer owns the staging file and is reported as BlobDownloading before
-// any record heuristic: a suspended owner can stop heartbeating and still
-// resume writing through an open handle, so the lock, not the lease, decides
-// liveness wherever it is supported.
+// A held OS-level DESTINATION-domain ownership lock (the persistent
+// blobs/tmp-<sha>.lock) means a live writer owns the destination and is
+// reported as BlobDownloading before any record heuristic: a suspended owner
+// can stop heartbeating and still resume writing through an open handle, so the
+// lock, not the lease, decides liveness wherever it is supported. A free lock
+// plus a lock-fenced record proves the current-version owner is gone. A free
+// lock plus an UNFENCED record is not stale: no live owner is proven either, so
+// the record is preserved, and the claim refuses it with the unproven-ownership
+// error rather than taking it over.
 func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) {
 	blobPath := r.BlobPath(sha256)
 	incompletePath := r.IncompletePath(sha256)
@@ -467,12 +472,27 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobMissing, nil, fmt.Errorf("stat incomplete file: %w", err)
 	}
 
-	// A busy OS ownership lock is the authoritative "a live writer owns this
-	// staging file" signal. It covers a suspended owner whose heartbeat went
-	// stale (and which could still resume writing through an open handle) and
-	// an in-process download whose record looks take-over-able. The probe never
-	// blocks, never creates the lock file, and releases immediately.
-	busy, probeErr := stagingOwnershipStatusProbe(incompletePath)
+	// A busy destination ownership lock is the authoritative "a live writer
+	// owns this destination" signal. It covers a suspended owner whose
+	// heartbeat went stale (and which could still resume writing through an
+	// open handle) and an in-process download whose record looks
+	// take-over-able. The probe never blocks, never creates the lock file, and
+	// releases immediately.
+	//
+	// The probed lock is the DESTINATION DOMAIN's: blobs/tmp-<sha>.lock. That
+	// is the fence every writer of this destination holds for its whole
+	// operation (both routes and the cache store), so it is the only lock a
+	// status query may interpret. The obsolete <staging>.lock of earlier
+	// branch-only builds is deliberately not consulted: no current writer
+	// takes it, and treating it as ownership would report a live writer that
+	// does not exist.
+	domainDst, derr := r.blobDomainDst(sha256)
+	if derr != nil {
+		meta, _ := r.readIncompleteMeta(metaPath)
+		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot resolve the ownership domain of the incomplete download %s: %w",
+			ErrBlobOwnershipUnknown, incompletePath, derr)
+	}
+	busy, probeErr := stagingOwnershipStatusProbe(domainDst)
 	if probeErr == nil && busy {
 		// A PROVEN live writer owns this staging file.
 		return BlobDownloading, nil, nil
