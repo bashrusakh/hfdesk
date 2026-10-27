@@ -1158,14 +1158,19 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 	// The presence lookup reports the revision as downloaded, with the
 	// payload directory as the destination root.
 	s := newTestServerWithConfig(t, Config{LocalDir: root})
-	w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
+	presence := func() branchVariantPresence {
+		t.Helper()
+		w := cacheRequest(t, s, "GET", "/api/cache/"+presenceRepo+"?branchVariant=true&revision="+revision, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("presence status = %d body=%s", w.Code, w.Body.String())
+		}
+		var got branchVariantPresence
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
 	}
-	var got branchVariantPresence
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
+	got := presence()
 	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
 		t.Fatalf("presence = %+v", got)
 	}
@@ -1183,5 +1188,23 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 	}
 	if !manifest.BranchVariant || manifest.Branch != revision || manifest.Commit != commit {
 		t.Fatalf("completion record after the re-download = %+v", manifest)
+	}
+	// The re-download republishes exactly one record for the revision: the
+	// invalidation removed the prior record before the new one was written,
+	// so the revision does not accumulate records.
+	recordDirs, err := space.RecordDirs(revision)
+	if err != nil {
+		t.Fatalf("RecordDirs: %v", err)
+	}
+	if len(recordDirs) != 1 || recordDirs[0] != recordDir {
+		t.Fatalf("completion records for %q = %v, want exactly [%q]", revision, recordDirs, recordDir)
+	}
+	// The revision is still reported as downloaded after the re-download.
+	got = presence()
+	if !got.Downloaded || got.DownloadStatus != "complete" || got.Commit != commit {
+		t.Fatalf("presence after the re-download = %+v", got)
+	}
+	if got.StorageMode != "local" || got.DestinationRoot != payloadDir {
+		t.Fatalf("presence destination after the re-download = %+v, want the payload dir %q", got, payloadDir)
 	}
 }

@@ -129,8 +129,14 @@ func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([
 
 	// Seed every candidate whose method is already established from the
 	// repository/main metadata. Optional lookups may enrich or disqualify an
-	// item, but exhausting the sizing budget or an optional lookup error must
-	// not truncate this visible branch set. A non-empty main method wins even
+	// item. A seeded candidate keeps its seeded row (with a zero size) when
+	// the sizing budget is exhausted or an optional lookup fails, so those
+	// failures never truncate the seeded part of the visible branch set. A
+	// candidate whose method can only be established from its own branch
+	// metadata has no seed: it is exposed only when the bounded lookup
+	// visited it and the branch metadata established the method, so a
+	// candidate the lookup never visited is dropped and the visible branch
+	// set is truncated by the budget. A non-empty main method wins even
 	// when it is EXL evidence (mainMethodKnown is only true for a recognized
 	// non-EXL negative); the repository name is only a fallback when the main
 	// method is empty and not a known non-EXL negative.

@@ -1589,6 +1589,154 @@ func TestJobDestinationBaseUsesModeSpecificRepositoryRules(t *testing.T) {
 	}
 }
 
+// TestLocalBranchVariantDestinationIsReservedPayloadDir pins the server's
+// model of a local branch variant's writable destination.
+//
+// A local branch variant does not write into the ordinary repository tree:
+// the downloader writes the branch payload into the app-owned reserved space.
+// The server must model the same directory, resolved through the space that
+// owns that layout, and the planned write entries must be the plan's relative
+// paths under it, which is where the downloader writes them.
+func TestLocalBranchVariantDestinationIsReservedPayloadDir(t *testing.T) {
+	const (
+		repo     = "owner/model"
+		revision = "4.00bpw"
+	)
+	files := map[string]string{
+		"config.json":       `{"model_type":"exl3","bits":4}`,
+		"model.safetensors": "branch-weights",
+	}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": "2222222222222222222222222222222222222222"})
+		case strings.Contains(r.URL.Path, "/tree/"):
+			nodes := make([]map[string]any, 0, len(files))
+			for name, body := range files {
+				nodes = append(nodes, map[string]any{"type": "file", "path": name, "size": len(body)})
+			}
+			_ = json.NewEncoder(w).Encode(nodes)
+		case strings.Contains(r.URL.Path, "/raw/"):
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			body, ok := files[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	root := t.TempDir()
+	job := &Job{
+		OutputDir:     root,
+		LocalDir:      root,
+		Flat:          true,
+		Repo:          repo,
+		Revision:      revision,
+		BranchVariant: true,
+	}
+
+	space, err := hfdownloader.NewBranchVariantLocalSpace(root, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDir, err := space.PayloadDir(revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, "owner", "model", "payload", revision); payloadDir != want {
+		t.Fatalf("fixture payload dir = %q, want %q", payloadDir, want)
+	}
+	if got := jobDestinationBase(job); got != payloadDir {
+		t.Fatalf("local branch variant destination = %q, want the reserved payload dir %q", got, payloadDir)
+	}
+	// The ordinary repository tree is not this job's destination.
+	if got := jobDestinationBase(job); got == filepath.Join(root, repo) {
+		t.Fatalf("local branch variant destination = the ordinary repository dir %q", got)
+	}
+	// The manager's own snapshot of the job (the descriptor the write-decision
+	// protocol consults for a queued job) must model the same destination.
+	if bases := jobWritableBases(jobFromDecision(decisionJob(job))); len(bases) != 1 || bases[0] != payloadDir {
+		t.Fatalf("descriptor writable bases = %v, want [%q]", bases, payloadDir)
+	}
+
+	plan := hfdownloader.Plan{Items: []hfdownloader.PlanItem{
+		{RelativePath: "config.json"},
+		{RelativePath: "model.safetensors"},
+	}}
+	entries, complete := jobPlannedWriteEntries(job, plan)
+	if !complete {
+		t.Fatal("planned write entries were reported incomplete")
+	}
+	wantEntries := []string{
+		filepath.Join(payloadDir, "config.json"),
+		filepath.Join(payloadDir, "model.safetensors"),
+	}
+	if !reflect.DeepEqual(entries, wantEntries) {
+		t.Fatalf("planned write entries = %v, want %v", entries, wantEntries)
+	}
+
+	// The downloader writes exactly those paths, so the model names the
+	// directory the payload really lands in.
+	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{
+		Repo:          repo,
+		Revision:      revision,
+		BranchVariant: true,
+	}, hfdownloader.Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, nil); err != nil {
+		t.Fatalf("local branch download: %v", err)
+	}
+	for _, entry := range entries {
+		if _, err := os.Stat(entry); err != nil {
+			t.Fatalf("planned write entry %q was not written by the downloader: %v", entry, err)
+		}
+	}
+}
+
+// TestLocalBranchVariantQueuedJobBlocksOnlyItsPayloadSpace pins the
+// conflict side of the corrected destination model: a queued local branch
+// variant may write only inside the reserved payload space, so a deletion
+// inside that space is refused, while a deletion of the ordinary repository
+// tree is not blocked by this job.
+func TestLocalBranchVariantQueuedJobBlocksOnlyItsPayloadSpace(t *testing.T) {
+	const (
+		repo     = "owner/model"
+		revision = "4.00bpw"
+	)
+	root := t.TempDir()
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	job := &Job{
+		ID:            "branch-variant",
+		Repo:          repo,
+		Revision:      revision,
+		BranchVariant: true,
+		OutputDir:     root,
+		LocalDir:      root,
+		Flat:          true,
+		Status:        JobStatusQueued,
+	}
+	m.jobs[job.ID] = job
+	// Fence the scheduler so the queued job stays queued: the test observes
+	// the reservation decision, not a running download.
+	m.Quiesce()
+
+	payloadTarget := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, "owner", "model", "payload", revision, "model.safetensors")
+	if release, ok := m.reserveSelectedGGUF([]string{payloadTarget}); ok {
+		release()
+		t.Fatal("a queued local branch variant did not block a deletion inside its payload space")
+	}
+	ordinaryTarget := filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")
+	release, ok := m.reserveSelectedGGUF([]string{ordinaryTarget})
+	if !ok {
+		t.Fatal("a queued local branch variant blocked a deletion of the ordinary repository tree")
+	}
+	release()
+}
+
 func TestInvalidRestoredHFRepoCannotResumeRetryOrDispatch(t *testing.T) {
 	srv := newTestServer(t)
 	m := srv.jobs

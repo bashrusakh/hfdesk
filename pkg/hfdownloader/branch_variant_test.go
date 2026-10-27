@@ -1314,6 +1314,52 @@ func TestLocalBranchVariantInvalidationFailureFailsBeforePayload(t *testing.T) {
 	}
 }
 
+// TestLocalBranchVariantRefusesNonDirectoryRecordSlot covers the record slot
+// of the app-owned tree: a regular file where a record directory belongs makes
+// the completion record unwritable, so the download must be refused at the
+// invalidation, before any payload byte is written.
+func TestLocalBranchVariantRefusesNonDirectoryRecordSlot(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+	)
+	hub := fakeBranchVariantHub(t, branchFixtureRevisions())
+	defer hub.Close()
+	root := t.TempDir()
+	// A regular file occupies the record slot of this revision's commit.
+	recordSlot := filepath.Join(branchLocalRecordDir(root, revision, commit))
+	if err := os.MkdirAll(filepath.Dir(recordSlot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordSlot, []byte("blocked"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var done, errorEvent bool
+	err := Download(context.Background(), Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true},
+		Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}, func(ev ProgressEvent) {
+			switch ev.Event {
+			case "done":
+				done = true
+			case "error":
+				errorEvent = true
+			}
+		})
+	if err == nil || !strings.Contains(err.Error(), "unsafe branch variant layout") {
+		t.Fatalf("non-directory record slot error = %v, want the unsafe-layout refusal", err)
+	}
+	if done {
+		t.Fatal("failed branch variant still reported done")
+	}
+	if !errorEvent {
+		t.Fatal("failed branch variant did not emit an error progress event")
+	}
+	// The failure happened before the payload was written.
+	if _, statErr := os.Stat(branchLocalPayloadDir(root, revision)); !os.IsNotExist(statErr) {
+		t.Fatalf("payload directory was created after the unsafe-layout refusal: %v", statErr)
+	}
+}
+
 // TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit pins the
 // commit-pinning scope: only a branch variant reads the tree and the file
 // bytes at the resolved commit. An ordinary download keeps addressing the
@@ -1737,6 +1783,116 @@ func TestLocalBranchVariantInvalidationKeepsForeignCompletionRecords(t *testing.
 
 	// The variant's own record is present and correct at its record path.
 	manifest := readBranchFixtureManifest(t, filepath.Join(spaceDir, foreignAtOwnRecordPath))
+	assertBranchFixtureManifest(t, manifest, revision, commit)
+}
+
+// TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile is
+// the end-to-end form of the invalidation's content rule: an ordinary
+// download of the same repository and a local branch-variant download of one
+// revision must leave every file that is not the app's own completion record
+// untouched.
+//
+// Two foreign files are in play. The repository's own tree carries a file at
+// the app's former record path, so the ordinary download writes it into the
+// ordinary repository directory. The app-owned records tree carries a file at
+// the record path of a commit that is not this variant's own, holding a
+// complete manifest of another repository: only its identity separates it
+// from a record of this variant.
+//
+// A removal that trusted the record directory's name would delete that second
+// file. The name only selects a candidate: the content decides, through the
+// shared record contract.
+func TestLocalBranchVariantInvalidationKeepsForeignRecordAndRepositoryFile(t *testing.T) {
+	const (
+		revision     = "4.00bpw"
+		commit       = "2222222222222222222222222222222222222222"
+		otherCommit  = "3333333333333333333333333333333333333333"
+		ordinaryFile = ".hfdesk-variants/4.00bpw/" + otherCommit + "/" + ManifestFilename
+		ordinaryBody = "# the repository's own hfd.yaml\nnot a completion record\n"
+	)
+	revisions := map[string]branchHubRevision{
+		"main": {
+			sha: "1111111111111111111111111111111111111111",
+			files: map[string]string{
+				ordinaryFile:        ordinaryBody,
+				"model.safetensors": "ordinary-main-weights",
+			},
+		},
+		revision: {
+			sha: commit,
+			files: map[string]string{
+				"config.json":       `{"model_type":"exl3","bits":4}`,
+				"model.safetensors": "branch-a-weights",
+			},
+		},
+	}
+	hub := fakeBranchVariantHub(t, revisions)
+	defer hub.Close()
+	root := t.TempDir()
+	cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
+
+	// The ordinary download writes the repository's own tree, including the
+	// file at the app's former record path.
+	downloadBranchFixture(t, cfg, "main")
+	ordinaryPath := filepath.Join(root, branchFixtureRepo, filepath.FromSlash(ordinaryFile))
+	body, err := os.ReadFile(ordinaryPath)
+	if err != nil || string(body) != ordinaryBody {
+		t.Fatalf("ordinary file = %q err=%v, want %q", body, err, ordinaryBody)
+	}
+
+	// The app-owned records tree carries a file at the record path of another
+	// commit: a complete manifest, but of another repository. The reserved
+	// space is app-owned and lives outside the ordinary repository tree, so
+	// the file is planted in the space directly.
+	foreign := &DownloadManifest{
+		Version:       "1.0",
+		Type:          "model",
+		Repo:          "owner/other-model",
+		Branch:        revision,
+		Commit:        otherCommit,
+		BranchVariant: true,
+		StartedAt:     time.Now().UTC(),
+		CompletedAt:   time.Now().UTC(),
+		TotalFiles:    1,
+		Files:         []ManifestFile{{Name: "config.json", Size: 12}},
+	}
+	foreignPath, err := foreign.Write(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignBytes, err := os.ReadFile(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignRecordPath := filepath.Join(branchLocalRecordDir(root, revision, otherCommit), ManifestFilename)
+	if err := os.MkdirAll(filepath.Dir(foreignRecordPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreignRecordPath, foreignBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The branch-variant download invalidates the revision's prior completion
+	// records before it writes any payload byte.
+	downloadBranchFixture(t, cfg, revision)
+
+	// The foreign file at the app's own record path survives the invalidation
+	// with its original bytes.
+	got, err := os.ReadFile(foreignRecordPath)
+	if err != nil {
+		t.Fatalf("foreign record file was removed by the invalidation: %v", err)
+	}
+	if string(got) != string(foreignBytes) {
+		t.Fatalf("foreign record file = %q, want %q", got, foreignBytes)
+	}
+	// The repository's own file at the app's former record path survives the
+	// branch-variant download too.
+	body, err = os.ReadFile(ordinaryPath)
+	if err != nil || string(body) != ordinaryBody {
+		t.Fatalf("ordinary file after the branch download = %q err=%v, want %q", body, err, ordinaryBody)
+	}
+	// The variant's own record is present and correct.
+	manifest := readBranchFixtureManifest(t, filepath.Join(branchLocalRecordDir(root, revision, commit), ManifestFilename))
 	assertBranchFixtureManifest(t, manifest, revision, commit)
 }
 

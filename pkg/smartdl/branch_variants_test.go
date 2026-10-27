@@ -1592,6 +1592,7 @@ func TestBranchVariantRevisionShape(t *testing.T) {
 		{revision: "4_25", valid: true},
 		{revision: "SC_6.00bpw_H6_V6", valid: true},
 		{revision: "exl/4_25", valid: true},
+		{revision: "4.00bpw-h6", valid: true},
 		{revision: "main", valid: false},
 		{revision: "master", valid: false},
 		{revision: "v1.0", valid: false},
@@ -1604,6 +1605,11 @@ func TestBranchVariantRevisionShape(t *testing.T) {
 		{revision: "../4_25", valid: false},
 		{revision: "exl/../4_25", valid: false},
 		{revision: "4.00bpw/.", valid: false},
+		// The digits must touch "bpw", and an N_M shape must be the whole
+		// final component: a name that separates them is not a branch shape.
+		{revision: "4_625-bpw-h6", valid: false},
+		{revision: "6_0-bpw-h6", valid: false},
+		{revision: "4_25-bpw-h6", valid: false},
 	} {
 		t.Run(tc.revision, func(t *testing.T) {
 			if got := BranchVariantRevisionShape(tc.revision); got != tc.valid {

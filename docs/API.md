@@ -349,12 +349,13 @@ without file filters:
 {
   "repo": "owner/name",
   "revision": "4.00bpw",
-  "dataset": false,
-  "filters": [],
-  "exactMatch": false,
   "branchVariant": true
 }
 ```
+
+That is the whole body: a branch variant is unfiltered and model-only, so the
+empty `dataset`, `filters` and `exactMatch` fields are omitted from the JSON
+rather than sent as empty values.
 
 GGUF, APEX, MTP, mmproj, and lineage behavior is unchanged.
 
@@ -784,15 +785,20 @@ Notes:
 - `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
   `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
   must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
-  rejected with `400`. The revision must have the analyzer's branch shape (a
-  `bpw` token or a bitrate-shaped `N_M` final component) and must also be a
-  valid completion-manifest path component sequence: slash-separated, with no
-  empty, `.`, or `..` component, no backslash or control characters, and no
-  component longer than 255 bytes. A branch variant also requires the Hub
-  revision lookup to resolve the branch to a commit, because the commit is
-  what keys the stored artifact: the per-commit snapshot tree in HF cache mode
-  and the completion record in both modes. When the lookup yields no commit,
-  the job fails with
+  rejected with `400`. The revision must have the analyzer's branch shape and
+  must also be a valid completion-manifest path component sequence:
+  slash-separated, with no empty, `.`, or `..` component, no backslash or
+  control characters, and no component longer than 255 bytes. The branch shape
+  is either a bitrate token whose digits are immediately followed by `bpw`
+  (for example `4.00bpw` or `SC_6.00bpw_H6_V6`, optionally with a head-bits
+  token such as `-h6`; the digits must touch `bpw`, so `4_625-bpw-h6` is not a
+  recognized branch shape), or a final path component of exactly the form
+  `N_M` (for example `4_25` or `exl/4_25`; a component that merely starts with
+  `N_M`, such as `4_25-bpw-h6`, is not recognized). A branch variant also
+  requires the Hub revision lookup to resolve the branch to a commit, because
+  the commit is what keys the stored artifact: the per-commit snapshot tree in
+  HF cache mode and the completion record in both modes. When the lookup yields
+  no commit, the job fails with
   `branch variant "<revision>" requires a resolved commit from the Hub`. The
   same failure applies in both storage modes, and it happens before anything
   is written to disk: no payload file, no completion record, and no directory
@@ -841,10 +847,11 @@ Notes:
   that is not complete. After a local branch-variant
   plan succeeds and before any payload byte changes, the download invalidates
   the revision's prior local completion records: the app's own
-  `records/<revision>/<commit>/hfd.yaml` records and nothing else, never the
-  payload and never any other content. If that invalidation fails, the
-  download fails without touching the payload. A failed or cancelled local
-  re-download therefore reports `missing` instead of complete.
+  `records/<revision>/<commit>/hfd.yaml` records. A file at the same path that
+  is not one of those records is left untouched, and the payload is never
+  touched. If that invalidation fails, the download fails without touching the
+  payload. A local re-download that fails or is cancelled after that
+  invalidation reports `missing` instead of complete.
   A local re-download re-fetches hashless/non-LFS files instead of trusting size
   equality, so a moved branch cannot retain same-size stale bytes; LFS files
   continue to use their known SHA.

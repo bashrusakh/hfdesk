@@ -283,7 +283,11 @@ func branchVariantManifestDir(base, revision, commit string) (string, error) {
 // would make the removal reach outside the space and would make the payload
 // writes land outside it too, so an unsafe layout is refused before anything
 // is removed or written. A missing tree is not unsafe: the first download
-// creates it.
+// creates it. A record slot occupied by something that is not a directory is
+// refused the same way as a symlinked one: the app-owned tree must be a real
+// directory at every level the invalidation walks, because the completion
+// record is written into that slot at the end of the download and would fail
+// there, after the payload was already written.
 func (space BranchVariantLocalSpace) InvalidateRecords(revision string) error {
 	if !ValidBranchVariantRevision(revision) {
 		return fmt.Errorf("invalid branch variant revision %q", revision)
@@ -327,8 +331,12 @@ func (space BranchVariantLocalSpace) InvalidateRecords(revision string) error {
 			return fmt.Errorf("unsafe branch variant layout: %s is a symbolic link", recordDir)
 		}
 		if !info.IsDir() {
-			// Not a record directory: leave it alone, do not traverse it.
-			continue
+			// Not a record directory: the app-owned tree must be a real
+			// directory at every level it walks. A regular file in a record
+			// slot would make the completion record written at the end of the
+			// download fail, so the download is refused here, before any
+			// payload byte is written.
+			return fmt.Errorf("unsafe branch variant layout: %s is not a directory", recordDir)
 		}
 		if err := removeBranchVariantCompletionRecord(filepath.Join(recordDir, ManifestFilename), space.repo, revision, entry.Name()); err != nil {
 			return err
@@ -461,7 +469,8 @@ func ensureLocalBranchVariantTree(base string, components []string) error {
 // name a completion record directory, using the one name rule the completion
 // record layout is keyed by: a plain, non-escaping commit name. The callers
 // decide what to do with an entry that is not a plain directory: the presence
-// lookup ignores it, and the invalidation refuses a symlinked one.
+// lookup ignores it, and the invalidation refuses it unless it is a real
+// directory.
 func branchVariantRecordEntries(entries []os.DirEntry) []os.DirEntry {
 	records := make([]os.DirEntry, 0, len(entries))
 	for _, entry := range entries {
