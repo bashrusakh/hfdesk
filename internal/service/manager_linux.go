@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
@@ -71,6 +72,11 @@ const (
 // layer.
 type systemdManager struct {
 	scope Scope
+	// restartWait overrides the bounded wait for a restarted instance to
+	// run the new executable. It is zero in production, where the wait is
+	// the shutdown budget of the service layer; a test drives the failure
+	// of a restart without waiting for the whole budget.
+	restartWait time.Duration
 }
 
 // newPlatformManager returns the systemd manager of the given scope.
@@ -599,9 +605,20 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 
 // Install registers the service with the supervisor.
 //
-// The installation validates first, writes the unit file atomically,
-// reloads the supervisor and enables the unit for the boot of the scope. It
-// never starts the instance: starting is an explicit, separate command.
+// The installation validates first, merges its options with an existing
+// registration, writes the unit file atomically, reloads the supervisor and
+// enables the unit for the boot of the scope.
+//
+// An installation that replaces a registration keeps every setting the
+// request did not name: the registration describes the instance that runs,
+// and a reinstall with a new binary must not reset its bind address, its
+// paths, its cache layout or its account to the defaults of the scope. The
+// executable always comes from the request.
+//
+// A reinstalled instance that was running before is restarted and verified:
+// a registration alone does not switch the running process. An instance that
+// was stopped, and a first installation, are never started: starting is an
+// explicit, separate command.
 //
 // A machine-wide instance runs as the dedicated service account of the
 // platform. The account is validated before anything is created: the
@@ -609,12 +626,35 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // a model or a cache tree.
 //
 // A failure after the unit file was written rolls the unit file back, so an
-// installation never leaves a half configured unit behind. A failure removes
-// the directories the installation created as well, so a failed attempt
-// leaves the machine as it was.
-func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error {
+// installation never leaves a half configured unit behind. A failure after
+// the restart of a running instance restores the previous registration and
+// starts the previous instance again. A failure removes the directories the
+// installation created as well, so a failed attempt leaves the machine as it
+// was.
+//
+// The returned options are the registration as written: the merged options of
+// a reinstall, or the request of a first installation. A caller reports them
+// instead of the request, so a preserved setting is never displayed as the
+// default it was not reset to.
+func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
+	// The registration of the scope is read before anything is decided:
+	// an installation over an existing registration must merge with what
+	// the instance really runs with, and it must know whether the instance
+	// has to be brought up again.
+	path, err := m.unitPath()
+	if err != nil {
+		return InstallOptions{}, err
+	}
+	content, existed, err := readUnitFile(path)
+	if err != nil {
+		return InstallOptions{}, err
+	}
+	if existed {
+		opts = mergeInstallOptions(opts, registrationOptions(parseUnit(string(content)), opts.Scope))
+	}
+
 	if err := ValidateInstallOptions(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// A path with a control character would end up in the unit file
 	// literally, and a newline in it would split the unit into another
@@ -622,7 +662,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 	// root requirement, before any directory is created and before the
 	// unit file is written: a refused installation leaves nothing behind.
 	if err := validateUnitPaths(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// A machine-wide instance must not adopt the state of the user who
 	// runs the install command. The check runs before the root
@@ -630,7 +670,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 	// file is written: a refused installation leaves nothing behind, and
 	// every platform reports the same reason for the same command line.
 	if err := m.checkSystemPaths(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// The account of a machine-wide instance is a rule of the scope and
 	// not a privilege of the process, so it is validated the same way:
@@ -639,16 +679,27 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 	// nothing behind.
 	account, err := m.serviceAccount(opts)
 	if err != nil {
-		return err
+		return opts, err
 	}
 	if err := m.checkServiceAccountAccess(opts, account); err != nil {
-		return err
+		return opts, err
 	}
 	// The root requirement is checked before any directory is created: a
 	// permission error of the machine wide directories is a much less
 	// readable answer than the real reason.
 	if err := m.requireRoot("an installation"); err != nil {
-		return err
+		return opts, err
+	}
+	// The state of the replaced registration is read before the unit file
+	// is written: only a running instance is restarted, a stopped one has
+	// to stay stopped.
+	previous := previousRegistration{path: path, content: content, existed: existed}
+	if existed {
+		running, err := m.registrationRunning(ctx)
+		if err != nil {
+			return opts, err
+		}
+		previous.running = running
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -666,16 +717,78 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 		// before it failed: they are removed again, so a failed attempt
 		// leaves the machine as it was.
 		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+		return opts, err
 	}
 	// The installation owns the directories it created from here on: a
 	// failure removes them again, so a failed installation never leaves
 	// the directories of the instance behind.
-	if err := m.register(ctx, opts, account, created); err != nil {
+	if err := m.register(ctx, opts, account, created, previous); err != nil {
 		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+		return opts, err
 	}
-	return nil
+	return opts, nil
+}
+
+// previousRegistration is the registration an installation replaces.
+type previousRegistration struct {
+	// path is the path of the unit file of the scope.
+	path string
+	// content is the unit file that was there, empty when there was none.
+	content []byte
+	// existed reports whether the scope had a registration at all.
+	existed bool
+	// running reports whether the instance ran before the installation.
+	// Only such an instance is restarted; an absent content never carries
+	// this flag.
+	running bool
+}
+
+// registrationOptions returns the installation options a unit registers.
+//
+// The values come from the argument vector and the identity directives of the
+// unit, so an installation over an existing registration keeps what the
+// instance really runs with instead of what a command line would default to.
+func registrationOptions(unit parsedUnit, scope Scope) InstallOptions {
+	opts := InstallOptions{
+		Scope:      scope,
+		Executable: unit.ExecStart,
+		Listen:     unit.listen(),
+		Paths:      unit.paths(),
+		CacheDir:   unit.flagValue("--cache-dir"),
+		HubDir:     unit.flagValue("--hub-dir"),
+		LocalDir:   unit.flagValue("--local-dir"),
+	}
+	// A user scope unit names no account: it runs as the user of the
+	// session, and an account of the request never applies to it.
+	if scope == ScopeSystem {
+		opts.ServiceUser = unit.User
+	}
+	return opts
+}
+
+// registrationRunning reports whether the supervisor runs the registered
+// unit.
+//
+// A unit the supervisor does not know does not run either: the unit file is
+// there, but the supervisor has not picked it up, which is the state an
+// installation repairs with its daemon-reload.
+//
+// Any other failure of the supervisor is reported: an installation that
+// cannot tell whether the instance runs cannot promise to bring it back, and
+// it refuses before it changes the registration.
+func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) {
+	out, err := m.runSystemctl(ctx, "show", unitName,
+		"--property=LoadState", "--property=ActiveState", "--property=SubState")
+	if err != nil {
+		if isUnitAbsent(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("service: the state of the installed unit %s could not be determined, the registration was not changed: %w", unitName, err)
+	}
+	state := parseSystemdShow(out).State
+	// A starting instance already runs: it is about to reach the running
+	// state, and a reinstall has to switch it to the new program as well.
+	return state == StateRunning || state == StateStarting, nil
 }
 
 // register writes the registration of the instance and hands it to the
@@ -686,7 +799,14 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) error
 // restored and the directories the installation created are removed by the
 // caller, so a failed installation leaves no half configured unit and no
 // empty directories behind.
-func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string) error {
+//
+// A replaced registration that was running is restarted and verified. A
+// registration alone does not switch the process that already runs: systemd
+// keeps executing the old program until the unit is restarted. A failure of
+// that restart or of the verification restores the previous registration and
+// starts the previous instance again, so the machine never keeps a
+// registration it failed to put into service.
+func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) error {
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
@@ -700,23 +820,187 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	if err != nil {
 		return err
 	}
-	path, err := m.unitPath()
-	if err != nil {
-		return err
-	}
 
-	previous, existed, err := readUnitFile(path)
-	if err != nil {
-		return err
-	}
-	if err := writeUnitFile(path, unit); err != nil {
+	if err := writeUnitFile(previous.path, unit); err != nil {
 		return err
 	}
 	if err := m.reloadAndEnable(ctx); err != nil {
-		m.rollbackUnit(ctx, path, previous, existed)
+		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
 		return err
 	}
+	if !previous.running {
+		// A first installation and a stopped instance stay stopped:
+		// starting is an explicit, separate command.
+		return nil
+	}
+	if err := m.restartAndVerify(ctx, opts.Executable); err != nil {
+		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
+			return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be restored: %v)", err, restoreErr)
+		}
+		return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err)
+	}
 	return nil
+}
+
+// restorePreviousRegistration restores the registration an installation
+// replaced and the running state it had.
+//
+// The unit file is restored and the supervisor is reloaded first, so the
+// restart below starts the previous program rather than the new one. The
+// restored file is read back before the restart: a caller is only told that
+// the previous registration was restored when the file really holds it again.
+//
+// The restore is best effort and never replaces the original failure: a
+// failed restore is reported with the outcome of the restore, so a caller
+// never sees an unqualified failure for a registration that was restored and
+// never a success for one that was not.
+func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previous previousRegistration) error {
+	// The caller may have cancelled the context, the previous registration
+	// still has to be put back into service.
+	cleanup := context.WithoutCancel(ctx)
+	m.rollbackUnit(cleanup, previous.path, previous.content, previous.existed)
+	if err := verifyRestoredUnit(previous); err != nil {
+		return err
+	}
+	if !previous.running {
+		return nil
+	}
+	if _, err := m.runSystemctl(cleanup, "restart", unitName); err != nil {
+		return fmt.Errorf("the previous instance could not be started again: %w", err)
+	}
+	return nil
+}
+
+// verifyRestoredUnit checks that the unit file holds the registration an
+// installation replaced again.
+//
+// The rollback writes the file and reloads the supervisor, and both are best
+// effort: the file is read back, so the outcome of the restore is a fact and
+// not an assumption.
+func verifyRestoredUnit(previous previousRegistration) error {
+	content, existed, err := readUnitFile(previous.path)
+	if err != nil {
+		return fmt.Errorf("the restored unit file could not be read back: %w", err)
+	}
+	switch {
+	case !previous.existed && existed:
+		return fmt.Errorf("the unit file of the failed installation is still there: %s", previous.path)
+	case previous.existed && !existed:
+		return fmt.Errorf("the unit file %s is gone", previous.path)
+	case previous.existed && !bytes.Equal(content, previous.content):
+		return fmt.Errorf("the unit file %s does not hold the previous registration", previous.path)
+	}
+	return nil
+}
+
+// restartAndVerify restarts the unit and verifies that the supervisor runs the
+// new executable.
+//
+// The restart is what switches a running instance to the new program: the
+// unit file was reloaded, but the process that is already running keeps the
+// image it was started from.
+func (m *systemdManager) restartAndVerify(ctx context.Context, executable string) error {
+	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
+		return fmt.Errorf("service: restart %s: %w", unitName, err)
+	}
+	return m.verifyRunningExecutable(ctx, executable)
+}
+
+// restartPollInterval is the interval between two checks whether a restarted
+// instance runs the new executable.
+const restartPollInterval = 100 * time.Millisecond
+
+// restartVerifyWait returns the bounded wait for a restarted instance to run
+// the new executable.
+//
+// The wait is the shutdown budget of the service layer: a restart waits for
+// the orderly shutdown of the old instance before the new one is started, so
+// the new program cannot be reported earlier than that.
+func (m *systemdManager) restartVerifyWait() time.Duration {
+	if m.restartWait > 0 {
+		return m.restartWait
+	}
+	return ShutdownBudget
+}
+
+// verifyRunningExecutable waits until the supervisor reports the unit as
+// running with the given program.
+//
+// The check is the effective one: it asks the supervisor for the state and the
+// ExecStart of the unit, not for the unit file that was just written. A
+// registration that points at the new executable proves nothing while the old
+// process still runs, so the installation only succeeds when the supervisor
+// runs the new program.
+//
+// The wait is bounded by the shutdown budget of the service layer and the
+// context of the installation: an instance that does not come up within it is
+// a failed installation, not a success that is reported from the registration
+// alone.
+func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable string) error {
+	budget := m.restartVerifyWait()
+	deadline := time.Now().Add(budget)
+	detail := "the supervisor did not report a state"
+	for {
+		out, err := m.runSystemctl(ctx, "show", unitName,
+			"--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=ExecStart")
+		if err != nil {
+			detail = err.Error()
+		} else {
+			show := parseSystemdShow(out)
+			path := execStartPath(out)
+			if show.State == StateRunning && path == executable {
+				return nil
+			}
+			detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(restartPollInterval):
+		}
+	}
+}
+
+// execStartPath returns the program path of the ExecStart property of the
+// supervisor.
+//
+// The supervisor reports the property as a structure:
+//
+//	ExecStart={ path=/usr/local/bin/hfdesk ; argv[]=/usr/local/bin/hfdesk ... }
+//
+// The "path=" field is the program the supervisor really executes. A property
+// that is absent, empty or names no path yields an empty string.
+func execStartPath(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.TrimSpace(key) != "ExecStart" {
+			continue
+		}
+		_, rest, ok := strings.Cut(strings.TrimSpace(value), "path=")
+		if !ok {
+			return ""
+		}
+		for _, end := range []string{" ; argv[]=", "; argv[]=", " ;", " }"} {
+			if i := strings.Index(rest, end); i >= 0 {
+				return trimExecStartPath(rest[:i])
+			}
+		}
+		return trimExecStartPath(strings.TrimSuffix(rest, "}"))
+	}
+	return ""
+}
+
+// trimExecStartPath returns the program path of a property value without the
+// quoting a path with spaces carries.
+func trimExecStartPath(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 // preflight rejects an installation the supervisor could not run: a missing
@@ -1497,6 +1781,9 @@ type parsedUnit struct {
 	ExecArgs []string
 	// WorkingDirectory is the working directory of the unit.
 	WorkingDirectory string
+	// User is the account a machine-wide unit runs as. A user scope unit
+	// names no account, so the value is empty there.
+	User string
 	// Environment holds the environment variables of the unit.
 	Environment map[string]string
 }
@@ -1567,6 +1854,10 @@ func parseUnit(content string) parsedUnit {
 		case "WorkingDirectory":
 			if words := splitSystemdWords(value); len(words) > 0 {
 				unit.WorkingDirectory = words[0]
+			}
+		case "User":
+			if words := splitSystemdWords(value); len(words) > 0 {
+				unit.User = words[0]
 			}
 		case "Environment":
 			for _, word := range splitSystemdWords(value) {

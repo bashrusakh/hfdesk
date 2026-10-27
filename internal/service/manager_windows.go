@@ -13,6 +13,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"github.com/bashrusakh/hfdesk/internal/pe"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
@@ -97,6 +100,23 @@ const (
 	// scmStopPollInterval is the pause between two checks of the state of
 	// the instance.
 	scmStopPollInterval = 200 * time.Millisecond
+
+	// scmVerifyTimeout bounds the wait for a restarted instance to run the
+	// registered program.
+	//
+	// The wait is the shared budget of the service layer: a restart waits
+	// for the orderly shutdown of the previous instance before the new one
+	// is started, so the new program cannot be reported earlier than that.
+	scmVerifyTimeout = ShutdownBudget
+
+	// scmVerifyPollInterval is the pause between two checks of a restarted
+	// instance.
+	scmVerifyPollInterval = 200 * time.Millisecond
+
+	// scmMaxImagePathLength bounds the buffer of the image path of a process.
+	// The path of a program is far below it; the bound keeps a platform that
+	// keeps asking for a larger buffer from looping forever.
+	scmMaxImagePathLength = 32 * 1024
 )
 
 // scmManager drives the service control manager of HFDesk.
@@ -131,10 +151,18 @@ func newPlatformManager(scope Scope) (Manager, error) {
 
 // Install registers the instance with the service control manager.
 //
-// The installation validates the options, prepares the directories of the
-// instance, restricts the access to them, checks the directories the
-// installation reuses, registers the service and registers the event log
-// source of the instance.
+// The installation reads the registration of the instance, validates the
+// effective options, prepares the directories of the instance, restricts the
+// access to them, checks the directories the installation reuses, writes the
+// registration and registers the event log source of the instance.
+//
+// The registration is read before anything is changed: an installation over an
+// existing registration keeps every setting the request did not name, because
+// the registration describes the instance that runs and a reinstall with a new
+// binary must not reset its bind address, its paths or its cache layout to the
+// defaults of the scope. The program of the registration always comes from the
+// request: an installation is the only way a new binary reaches the
+// registration.
 //
 // The state of the instance is restricted before the registration is
 // written: every directory the installation created carries the restrictive
@@ -156,24 +184,50 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // A service that is registered already is not registered a second time:
 // its registration is updated instead, so the instance keeps its identity.
 //
-// An installation never starts the instance: starting is an explicit,
-// separate command.
+// An instance that ran before the installation is restarted and verified: a
+// registration alone does not switch the running process, because the process
+// keeps the image it was started from. The installation only succeeds when the
+// instance runs the registered program in a process that is not the one it ran
+// in before. An instance that was stopped, broken or absent, and a first
+// installation, are never started: starting is an explicit, separate command.
 //
-// Every failure of the installation happens before the registration is
-// written, so a failed installation never leaves a half-configured service
-// behind. A failure removes the directories the installation created as
-// well, so a refused attempt leaves the machine as it was: the directories
-// it created are removed while they are still empty, and a directory that
-// existed before is never touched.
-func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
+// The registration carries the failure recovery of the platform, so the service
+// control manager restarts an instance that ends without reporting its stop. An
+// explicit stop is never turned into a restart.
+//
+// A failure after the registration was written restores the previous
+// registration. A failure after the restart of a running instance stops the
+// instance the failed installation started, restores the previous registration
+// and brings the previous instance back; only a verified restart is reported as
+// one, so the machine never keeps a registration that names another program than
+// the process that runs and the caller never reads a success for a start that
+// was not proven. A failed first installation removes the registration it
+// created and the directories the installation created, so a refused attempt
+// leaves the machine as it was: the directories it created are removed while
+// they are still empty, and a directory that existed before is never touched.
+//
+// The returned options are the registration as written: the merged options of a
+// reinstall, or the request of a first installation.
+func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
+	// The registration is read before a directory is created: the merge of
+	// the request needs the settings the instance runs with, and only an
+	// instance that ran before is restarted.
+	previous, err := scmPreviousRegistration(opts.Scope)
+	if err != nil {
+		return opts, err
+	}
+	if previous.present {
+		opts = mergeInstallOptions(opts, previous.options)
+	}
+
 	if err := ValidateInstallOptions(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// The elevation requirement is checked before a directory is created:
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := requireElevated("an installation"); err != nil {
-		return err
+		return opts, err
 	}
 	// The paths the installation is about to create are remembered before
 	// they are created, so the installation knows which of them it owns.
@@ -193,7 +247,7 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 		// The preparation may have created some of the directories
 		// before it failed: they are removed again, so a failed attempt
 		// leaves the machine as it was.
-		return fail(err)
+		return opts, fail(err)
 	}
 	// The state of the instance is restricted before the reused
 	// directories are checked: the directories the instance creates
@@ -206,40 +260,23 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 	// path happens before the first descriptor is changed, so a refused
 	// installation leaves every descriptor of the machine as it was.
 	if err := restrictInstanceState(opts, snapshot); err != nil {
-		return fail(err)
+		return opts, fail(err)
 	}
 	if err := m.preflight(opts); err != nil {
-		return fail(err)
+		return opts, fail(err)
 	}
 
 	manager, err := mgr.Connect()
 	if err != nil {
-		return fail(fmt.Errorf("service: connect to the service control manager: %w", err))
+		return opts, fail(fmt.Errorf("service: connect to the service control manager: %w", err))
 	}
 	defer manager.Disconnect()
 
-	config := buildSCMConfig(opts)
-	handle, err := manager.OpenService(ServiceName)
-	switch {
-	case err == nil:
-		// The service is registered already. The registration is
-		// updated instead of a second one being created, so the
-		// instance keeps its identity and the status keeps describing
-		// one service.
-		defer handle.Close()
-		if err := handle.UpdateConfig(config); err != nil {
-			return fail(fmt.Errorf("service: update the registration of %s: %w", ServiceName, err))
-		}
-		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
-		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
-	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
-		handle, err = manager.CreateService(ServiceName, opts.Executable, config, RunArgs(opts)...)
-		if err != nil {
-			return fail(fmt.Errorf("service: register %s: %w", ServiceName, err))
-		}
-		defer handle.Close()
-	default:
-		return fail(fmt.Errorf("service: open the registration of %s: %w", ServiceName, err))
+	// The registration is written and put into service. A failure restores
+	// the previous registration, so the caller never keeps a registration
+	// the installation failed to put into service.
+	if err := m.register(ctx, manager, opts, previous); err != nil {
+		return opts, fail(err)
 	}
 
 	// The event log source carries the diagnostics of the instance. A
@@ -250,7 +287,709 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) error {
 		log.Printf("service: the event log source of %s was not registered: %v", ServiceName, err)
 		logEvent(eventLogWarning, fmt.Sprintf("hfdesk: the event log source of %s was not registered: %v", ServiceName, err))
 	}
+	return opts, nil
+}
+
+// previousSCMRegistration is the registration an installation replaces.
+//
+// It is read before the installation changes anything: the merge of the request
+// needs the settings the instance runs with, a restart needs the process the
+// instance ran in, and a failed installation needs the registration it has to
+// put back.
+type previousSCMRegistration struct {
+	// present reports whether the instance was registered at all.
+	present bool
+	// options are the installation options the registration carries. They
+	// are the values a request that names nothing keeps.
+	options InstallOptions
+	// running reports whether the instance ran before the installation.
+	running bool
+	// processID is the process the service control manager reported for the
+	// running instance, zero when it reported none.
+	processID uint32
+	// config is the full configuration of the registration, read before the
+	// installation changes it. It is what a failed installation writes back.
+	config mgr.Config
+}
+
+// scmPreviousRegistration reads the registration the installation replaces.
+//
+// The registration is read with the rights a status needs, so an ordinary shell
+// learns whether the instance is installed and what it runs with. A registration
+// the caller may not look at is reported as the elevation requirement it is:
+// the installation needs the rights of the machine either way.
+//
+// An absent registration is not an error: it is the state a first installation
+// replaces, and a first installation starts from the request alone.
+func scmPreviousRegistration(scope Scope) (previousSCMRegistration, error) {
+	facts, err := scmLookupRegistration(ServiceName)
+	if err != nil {
+		// A registration the caller may not look at is reported as the
+		// elevation requirement of the installation and not of a status:
+		// the message has to name the command the user runs.
+		if state, stateErr := scmRegistrationStateOf(); stateErr == nil && state == scmRegistrationUnreadable {
+			return previousSCMRegistration{}, scmElevationRequired("an installation")
+		}
+		return previousSCMRegistration{}, err
+	}
+	if !facts.present {
+		return previousSCMRegistration{}, nil
+	}
+	return previousSCMRegistration{
+		present:   true,
+		options:   scmRegistrationOptions(facts.commandLine, scope),
+		running:   scmInstanceRan(facts.present, facts.state),
+		processID: facts.processID,
+	}, nil
+}
+
+// scmRegistrationOptions returns the installation options a registration
+// carries: the program of the command line, the bind address, the runtime paths
+// and the cache layout.
+//
+// The values come from the command line of the registration, so an installation
+// over an existing registration keeps what the instance really runs with
+// instead of what a request would default to.
+//
+// A command line that cannot be read records no setting: the options are empty
+// then, and the merge falls back to the defaults of the request. An installation
+// is the way a damaged registration is repaired, so it never fails over one.
+//
+// No field is marked explicit: a registration names the values the instance runs
+// with, and it never overrides an explicit field of the request. The account is
+// not part of the registration either: the instance runs as the built-in
+// LocalService account, which has no name of its own to record.
+func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
+	registration, err := parseSCMCommandLine(commandLine)
+	if err != nil {
+		log.Printf("service: the command line of the registration of %s cannot be read (%v), the request applies", ServiceName, err)
+		registration = scmRegistration{}
+	}
+	return InstallOptions{
+		Scope:      scope,
+		Executable: registration.executable,
+		Listen:     registration.listen(),
+		Paths:      registration.paths(),
+		CacheDir:   registration.cacheDir(),
+		HubDir:     registration.flagValue("--hub-dir"),
+		LocalDir:   registration.flagValue("--local-dir"),
+	}
+}
+
+// register writes the registration of the instance and puts it into service.
+//
+// The registration is created when the instance is not registered, and it is
+// updated otherwise: a second registration never exists, so the instance keeps
+// its identity and the status keeps describing one service.
+//
+// The directories of the instance are already created when the function is
+// called. A failure after the registration was written restores the previous
+// registration: the caller removes the directories the installation created, so
+// a failed installation leaves no half configured service and no empty
+// directories behind.
+//
+// A replaced registration that was running is restarted and verified. A
+// registration alone does not switch the process that already runs, so a
+// failure of that restart or of the verification stops the instance the
+// installation started, restores the previous registration, brings the previous
+// program back into service and verifies it: the machine never keeps a
+// registration the installation failed to put into service.
+func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) error {
+	config := buildSCMConfig(opts)
+	handle, err := manager.OpenService(ServiceName)
+	created := false
+	switch {
+	case err == nil:
+		// The service is registered already: the registration is updated
+		// instead of a second one being created.
+	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
+		handle, err = manager.CreateService(ServiceName, opts.Executable, config, RunArgs(opts)...)
+		if err != nil {
+			return fmt.Errorf("service: register %s: %w", ServiceName, err)
+		}
+		created = true
+		// A first installation replaces nothing: a failed one removes the
+		// registration it created instead of restoring one.
+		previous = previousSCMRegistration{}
+	default:
+		return fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
+	}
+	defer handle.Close()
+
+	if !created {
+		// The configuration of the registration is read before it is
+		// changed, so a failure after the write can put it back as it was.
+		previousConfig, err := handle.Config()
+		if err != nil {
+			return fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
+		}
+		if !previous.present {
+			// The registration appeared between the read-only lookup and
+			// this handle: it is the registration the installation
+			// replaces, and its state decides whether it has to be
+			// restarted.
+			status, err := handle.Query()
+			if err != nil {
+				return scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+			}
+			previous.present = true
+			previous.running = scmInstanceRan(true, status.State)
+			previous.processID = status.ProcessId
+		}
+		previous.config = previousConfig
+
+		if err := handle.UpdateConfig(config); err != nil {
+			return fmt.Errorf("service: update the registration of %s: %w", ServiceName, err)
+		}
+		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
+		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
+	}
+
+	// The failure recovery is part of the registration: a service the machine
+	// never restarts after a crash is not the instance that was asked for.
+	if err := configureSCMRecovery(handle); err != nil {
+		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRegistration,
+			fmt.Errorf("service: configure the failure recovery of %s: %w", ServiceName, err))
+	}
+
+	if !previous.running {
+		// A first installation and an instance that was not running stay
+		// stopped: starting is an explicit, separate command.
+		return nil
+	}
+
+	// The instance ran before the installation, so it has to run the new
+	// program afterwards. The graceful stop completes before the new process
+	// is started, so the two instances never compete for the bind address.
+	if err := m.stopService(ctx, handle); err != nil {
+		// The instance could not be stopped. The registration is put back
+		// and the instance is left alone: an installation never fights a
+		// running instance.
+		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRegistration,
+			fmt.Errorf("service: stop the running instance of %s: %w", ServiceName, err))
+	}
+	check, err := m.startAndVerify(ctx, handle, opts.Executable, previous.processID)
+	if err != nil {
+		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRestart,
+			fmt.Errorf("service: the installation did not put the new executable into service: %w", err))
+	}
+	if check != scmImageVerified {
+		// The handle of the running process was refused, so the image of the
+		// process could not be read. The instance runs and the registration
+		// carries the program; the installation reports exactly that and
+		// never claims that the image was compared.
+		message := fmt.Sprintf("hfdesk: %s runs the registered program %s, the image of the process was not readable from the shell of the installation", ServiceName, opts.Executable)
+		log.Printf("service: %s", message)
+		logEvent(eventLogWarning, message)
+	}
 	return nil
+}
+
+// scmRollbackMode tells a rollback how much of the previous installation to put
+// back.
+type scmRollbackMode int
+
+const (
+	// scmRollbackRegistration writes the previous registration back and nothing
+	// else. It is the rollback of a failure that never touched the running
+	// instance: the process that runs keeps the image it was started from.
+	scmRollbackRegistration scmRollbackMode = iota
+	// scmRollbackRestart stops the instance the failed installation started,
+	// writes the previous registration back and brings the previous program of
+	// a running instance back into service.
+	scmRollbackRestart
+)
+
+// rollbackInstallation restores the registration a failed installation replaced.
+//
+// The failure of the installation is the error the caller gets; the outcome of
+// the restore is reported next to it, so a caller never sees an unqualified
+// failure for a registration that was restored and never a success for one that
+// was not.
+//
+// The running instance is only touched when the installation had switched it: a
+// failure that happens while it still runs leaves it alone. The restart rollback
+// is the exception that keeps the two descriptions together: it stops the
+// instance the failed installation started before the previous registration is
+// written back, so the registration and the process that runs never describe
+// different programs.
+//
+// The restore runs on a context that is not cancelled by the caller: an
+// interrupted installation still has to put the machine back the way it was.
+func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, mode scmRollbackMode, failure error) error {
+	if mode == scmRollbackRestart && previous.present && previous.running {
+		// The installation switched the running instance, so the rollback has
+		// to switch it back: the registration and the process that runs are
+		// described by one outcome and never by two.
+		return m.rollbackRestart(ctx, handle, previous, failure)
+	}
+	if err := restoreSCMRegistration(handle, previous); err != nil {
+		return fmt.Errorf("%w (the registration of the failed installation could not be put back: %v)", failure, err)
+	}
+	if !previous.present {
+		// The failed installation created the registration: there was no
+		// previous one to restore, and the registration is removed again.
+		return fmt.Errorf("%w (the registration of the failed installation was removed)", failure)
+	}
+	return fmt.Errorf("%w (the previous registration was restored, the running instance was not restarted)", failure)
+}
+
+// scmRestartRollback is what the restart rollback of a failed installation
+// proved about the machine.
+//
+// The facts are what the rollback observed and not what it attempted: a
+// sentence composed from them never claims more than the rollback can prove.
+// The registration and the process that runs are only described together: a
+// rollback that cannot prove that the instance of the failed installation
+// stopped never claims that the previous registration was restored, because a
+// registration that names one program while another one runs describes the
+// machine wrongly.
+type scmRestartRollback struct {
+	// stopped reports whether the instance the failed installation started
+	// was proven to be stopped.
+	stopped bool
+	// restored reports whether the previous registration is in place again.
+	restored bool
+	// programKnown reports whether the restored registration names the
+	// program the previous instance ran.
+	programKnown bool
+	// started reports whether the instance was started again and the start
+	// was accepted.
+	started bool
+	// verified reports whether the running process was proven to be the
+	// previous program, in a process that is none of the processes of the
+	// failed attempt.
+	verified bool
+}
+
+// scmRestartRollbackSentence returns the sentence that reports the proven
+// outcome of a restart rollback next to the failure of the installation.
+//
+// The sentence is composed from the facts and from the reason of the step that
+// did not reach its goal. It is the only place the outcome of a restart
+// rollback is described, so a caller reads no sentence for a state the rollback
+// did not reach: the claim that the previous instance was started again is made
+// for a verified rollback only, and a start that could not be proven reports
+// what was proven instead.
+func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string {
+	switch {
+	case !facts.stopped:
+		// The instance of the failed installation was not proven to be
+		// stopped. Its registration is kept: it is the registration that
+		// describes the program of the process that runs, and restoring the
+		// previous one now would leave a registration that names another
+		// program than the one that runs.
+		return fmt.Sprintf("the registration of the failed installation was kept because the instance it started was not proven to be stopped: %s: the previous registration was not restored", reason)
+	case !facts.restored:
+		return fmt.Sprintf("the instance of the failed installation was stopped, but the previous registration could not be put back: %s", reason)
+	case !facts.programKnown:
+		// The restored registration carries a command line that cannot be
+		// read, so there is no program to start: the rollback reports the
+		// registration and the state of the instance and never claims a
+		// start it did not make.
+		return fmt.Sprintf("the instance of the failed installation was stopped and the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
+	case !facts.started:
+		// The start was refused, or it was accepted and the instance never
+		// proved to run the previous program. Neither is a claim about the
+		// program that runs: the reason names what was observed.
+		return fmt.Sprintf("the instance of the failed installation was stopped and the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
+	case !facts.verified:
+		return "the instance of the failed installation was stopped and the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
+	default:
+		return "the instance of the failed installation was stopped, the previous registration was restored and the previous instance was started again"
+	}
+}
+
+// rollbackRestart stops the instance of the failed installation, restores the
+// previous registration and brings the previous instance back into service.
+//
+// The instance of the failed installation is stopped before the previous
+// registration is written back. The registration alone does not switch the
+// process that runs, so a restored registration would describe another program
+// than the running one until the instance is stopped. The stop is a clean no-op
+// for an instance that does not run, and it is bounded by the shared budget of
+// the service layer like every other stop of the manager.
+//
+// A stop that does not reach its goal leaves the machine as the failed
+// installation left it: the registration of the failed installation is kept,
+// because its instance may still run and the two describe the same program
+// then, and the sentence says exactly that instead of claiming a rollback.
+//
+// The previous program is started again only when the restored registration
+// names it. A command line that cannot be read names no program: the rollback
+// reports the restored registration and the stopped instance instead of
+// starting an instance it cannot name.
+//
+// The restart is only reported as a success when it was verified: the image of
+// the running process was compared with the previous program, and the process
+// is none of the ones the failed attempt ran in.
+func (m *scmManager) rollbackRestart(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, failure error) error {
+	// The caller may have cancelled the context, the machine still has to be
+	// put back the way it was.
+	cleanup := context.WithoutCancel(ctx)
+	facts := scmRestartRollback{}
+	report := func(reason string) error {
+		return fmt.Errorf("%w (%s)", failure, scmRestartRollbackSentence(facts, reason))
+	}
+
+	// The process of the failed attempt is read before it is stopped: the
+	// verification below excludes it, so a process the rollback did not start
+	// is never taken for the previous instance.
+	failedProcessID := scmRunningProcessID(handle)
+
+	if err := m.stopService(cleanup, handle); err != nil {
+		return report(err.Error())
+	}
+	facts.stopped = true
+
+	if err := restoreSCMRegistration(handle, previous); err != nil {
+		return report(err.Error())
+	}
+	facts.restored = true
+
+	executable := scmConfigExecutable(previous.config)
+	if executable == "" {
+		return report("")
+	}
+	facts.programKnown = true
+
+	check, err := m.startAndVerify(cleanup, handle, executable, previous.processID, failedProcessID)
+	if err != nil {
+		return report(err.Error())
+	}
+	facts.started = true
+	facts.verified = check == scmImageVerified
+	return report("")
+}
+
+// scmRunningProcessID returns the process of the running instance, zero when the
+// service control manager reports none.
+//
+// The process is read before a rollback stops the instance of the failed
+// installation, so the verification of the restart can tell it apart from the
+// instance the rollback starts. A state that cannot be read names no process
+// either: the stop that follows reports the refusal.
+func scmRunningProcessID(handle *mgr.Service) uint32 {
+	status, err := handle.Query()
+	if err != nil {
+		return 0
+	}
+	return status.ProcessId
+}
+
+// restoreSCMRegistration puts the registration back that a failed installation
+// replaced.
+//
+// A registration of a first installation is removed: there was none before it,
+// and a failed installation leaves nothing behind.
+//
+// A replaced registration is written back with its full configuration, and the
+// configuration is read back afterwards. A caller is only told that the previous
+// registration was restored when it really holds it again.
+func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistration) error {
+	if !previous.present {
+		if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return fmt.Errorf("service: remove the registration of %s: %w", ServiceName, err)
+		}
+		return nil
+	}
+	if err := handle.UpdateConfig(previous.config); err != nil {
+		return fmt.Errorf("service: write the previous registration of %s back: %w", ServiceName, err)
+	}
+	config, err := handle.Config()
+	if err != nil {
+		return fmt.Errorf("service: read the restored registration of %s back: %w", ServiceName, err)
+	}
+	if !scmSameRegistration(config.BinaryPathName, previous.config.BinaryPathName) {
+		return fmt.Errorf("service: the registration of %s does not hold the previous command line again", ServiceName)
+	}
+	return nil
+}
+
+// scmConfigExecutable returns the program of a registration configuration.
+//
+// A command line that cannot be read names no program: the caller then has no
+// program to compare and reports the running state alone.
+func scmConfigExecutable(config mgr.Config) string {
+	registration, err := parseSCMCommandLine(config.BinaryPathName)
+	if err != nil {
+		return ""
+	}
+	return registration.executable
+}
+
+// scmSameRegistration reports whether two command lines register the same
+// program with the same arguments.
+//
+// The program of a command line is compared by scmSameExecutablePath, so a
+// command line the platform stored in another case or with another spelling of
+// the path is the same registration. The arguments are compared as they are: an
+// argument is the value the instance runs with, and the platform never rewrites
+// one.
+func scmSameRegistration(got, want string) bool {
+	gotRegistration, gotErr := parseSCMCommandLine(got)
+	wantRegistration, wantErr := parseSCMCommandLine(want)
+	if gotErr != nil || wantErr != nil {
+		// A command line that cannot be read is compared as it is written:
+		// nothing about it can be proven.
+		return got == want
+	}
+	if !scmSameExecutablePath(gotRegistration.executable, wantRegistration.executable) {
+		return false
+	}
+	return slices.Equal(gotRegistration.args, wantRegistration.args)
+}
+
+// scmSameExecutablePath reports whether two paths name the same program.
+//
+// The comparison is made on the cleaned paths and without regard to the case:
+// the service control manager, the process and the request name the same program
+// in the case and the spelling they store. A path that is empty names no program
+// at all, so it is never the same as another path.
+func scmSameExecutablePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// scmInstanceRan reports whether the instance of a registration ran before an
+// installation.
+//
+// A registration that is not there does not run. An instance that reports the
+// running state runs, and so does one that is still starting: it is about to
+// report the running state, and an installation has to switch it to the new
+// program as well.
+//
+// An instance that is stopping already reached its wanted state on its own: an
+// installation leaves it alone instead of starting it again, so a service the
+// user stopped is never brought back by an installation. An instance that is
+// stopped does not run either, whatever ended it, and neither does a broken
+// registration or a paused instance the manager does not support.
+func scmInstanceRan(present bool, state svc.State) bool {
+	if !present {
+		return false
+	}
+	switch state {
+	case svc.Running, svc.StartPending:
+		return true
+	default:
+		return false
+	}
+}
+
+// scmImageCheck is how much of the running instance an installation could prove.
+type scmImageCheck int
+
+const (
+	// scmImageUnverified means the service control manager reports the instance
+	// as running and the registration carries the program, but the image of the
+	// running process could not be read: the platform refused its handle.
+	scmImageUnverified scmImageCheck = iota
+	// scmImageVerified means the running process really is the registered
+	// program.
+	scmImageVerified
+)
+
+// startAndVerify starts the instance and verifies that it runs the given
+// program in a process that is not one of the excluded ones.
+func (m *scmManager) startAndVerify(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
+	if err := handle.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return scmImageUnverified, scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, err))
+	}
+	return m.verifyRunningExecutable(ctx, handle, executable, exclude...)
+}
+
+// verifyRunningExecutable waits until the instance runs the given program in a
+// process that is not one of the excluded ones.
+//
+// The check is the effective one: the service control manager reports the process
+// of the running instance, and the image of that process is compared with the
+// program. A registration that carries the program proves nothing while a
+// process of the attempt that just failed still runs, so the process has to
+// differ from every excluded process as well.
+//
+// The wait is bounded by the shutdown budget of the service layer and by the
+// context of the installation: an instance that does not come up within it is a
+// failed installation, not a success that is reported from the registration
+// alone.
+func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
+	deadline := time.Now().Add(scmVerifyTimeout)
+	detail := "the service control manager did not report the instance as running"
+	for {
+		status, err := handle.Query()
+		switch {
+		case err != nil:
+			detail = fmt.Sprintf("the state of %s cannot be read: %v", ServiceName, err)
+		case status.State != svc.Running:
+			detail = fmt.Sprintf("the service control manager reports the state %v", status.State)
+		case status.ProcessId == 0:
+			detail = "the service control manager reports no process of the running instance"
+		case scmProcessExcluded(exclude, status.ProcessId):
+			// A process of the attempt still runs: the program of the
+			// registration is not in service yet.
+			detail = fmt.Sprintf("the process %d that ran before the attempt still runs", status.ProcessId)
+		default:
+			settled, check, reason := scmReadRunningImage(handle, status.ProcessId, executable)
+			if settled {
+				return check, nil
+			}
+			detail = reason
+		}
+		if !time.Now().Before(deadline) {
+			return scmImageUnverified, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyTimeout, detail)
+		}
+		select {
+		case <-ctx.Done():
+			return scmImageUnverified, ctx.Err()
+		case <-time.After(scmVerifyPollInterval):
+		}
+	}
+}
+
+// scmProcessExcluded reports whether a process is one the verification must not
+// accept as the running instance.
+//
+// A process identifier of zero names no process: the manager reports it for an
+// instance that does not run, and it never excludes another process. The list of
+// excluded processes can carry it, because the caller passes the process the
+// service control manager reported even when it reported none.
+func scmProcessExcluded(exclude []uint32, processID uint32) bool {
+	if processID == 0 {
+		return false
+	}
+	return slices.Contains(exclude, processID)
+}
+
+// scmReadRunningImage reads the image of the running process and compares it with
+// the program the registration carries.
+//
+// The first result reports whether the observation settles the question: the
+// process runs the program, or the image of the process cannot be read and the
+// evidence that is left proves what it can. The second result is the proof the
+// installation has, the third one is the reason a look did not settle the
+// question.
+//
+// The image of a process of another account can be refused to the shell of the
+// installation. The wait then accepts the evidence it has: the service control
+// manager reports the running state and the registration carries the program.
+// The caller is told that the image was not compared, so it never claims more
+// than that.
+func scmReadRunningImage(handle *mgr.Service, processID uint32, executable string) (bool, scmImageCheck, string) {
+	if executable == "" {
+		// The program is unknown: there is nothing the image of the process
+		// could be compared with, so the installation reports the running
+		// state alone.
+		return true, scmImageUnverified, ""
+	}
+	image, err := queryProcessImageName(processID)
+	switch {
+	case err == nil:
+		if scmSameExecutablePath(image, executable) {
+			return true, scmImageVerified, ""
+		}
+		return false, scmImageUnverified, fmt.Sprintf("the running process %d runs %q and not %q", processID, image, executable)
+	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
+		pointsAt, err := scmRegistrationPointsAt(handle, executable)
+		if err != nil {
+			return false, scmImageUnverified, fmt.Sprintf("the registration of %s cannot be read back: %v", ServiceName, err)
+		}
+		if pointsAt {
+			return true, scmImageUnverified, ""
+		}
+		return false, scmImageUnverified, fmt.Sprintf("the registration of %s does not carry the program %q", ServiceName, executable)
+	default:
+		return false, scmImageUnverified, fmt.Sprintf("the image of the running process %d cannot be read: %v", processID, err)
+	}
+}
+
+// scmRegistrationPointsAt reports whether the registration of the instance
+// carries the given program.
+//
+// The command line is read from the service control manager and not from the
+// configuration the installation wrote, so the answer describes the registration
+// that is really there.
+func scmRegistrationPointsAt(handle *mgr.Service, executable string) (bool, error) {
+	commandLine, err := queryServiceCommandLine(handle.Handle)
+	if err != nil {
+		return false, err
+	}
+	registration, err := parseSCMCommandLine(commandLine)
+	if err != nil {
+		return false, nil
+	}
+	return scmSameExecutablePath(registration.executable, executable), nil
+}
+
+// queryProcessImageName returns the image of a process.
+//
+// The handle of the process asks for the least right that reads its image: the
+// right to query the limited information of the process. The manager never opens
+// a process with the rights that would let it change one.
+func queryProcessImageName(processID uint32) (string, error) {
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, processID)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(handle)
+
+	size := uint32(windows.MAX_PATH)
+	for {
+		buffer := make([]uint16, size)
+		length := size
+		err := windows.QueryFullProcessImageName(handle, 0, &buffer[0], &length)
+		if err == nil {
+			return windows.UTF16ToString(buffer[:length]), nil
+		}
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+			return "", err
+		}
+		// The image path of a program can be longer than the buffer: the
+		// buffer grows until the path fits.
+		if length > size {
+			size = length
+		} else {
+			size *= 2
+		}
+		if size > scmMaxImagePathLength {
+			return "", err
+		}
+	}
+}
+
+// scmRecoveryActions returns the failure recovery of the instance.
+//
+// The platform restarts an instance that ended without reporting its stop. The
+// first failure is followed by a restart after five seconds, the second one after
+// thirty seconds and every further one after sixty seconds: the delay grows, so a
+// program that cannot come up is not restarted in a tight loop.
+func scmRecoveryActions() []mgr.RecoveryAction {
+	return []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
+	}
+}
+
+// scmRecoveryResetPeriod is the time after which the platform forgets the
+// failures of the instance, in seconds: one day.
+const scmRecoveryResetPeriod uint32 = 24 * 60 * 60
+
+// configureSCMRecovery configures the failure recovery of the registration.
+//
+// The recovery is the crash recovery of the instance and not its lifecycle: the
+// platform performs an action of the list only for an instance that ended without
+// reporting its stop. An explicit stop reports the stopped state, so the platform
+// never turns it into a restart.
+//
+// The "restart on non-crash failures" switch of the platform stays off: it would
+// turn the failed start of a misconfigured instance into a restart loop, and a
+// service that cannot start is reported to the user instead.
+//
+// A recovery that cannot be configured is a failed installation: a service the
+// machine never restarts after a crash is not the instance that was asked for.
+func configureSCMRecovery(handle *mgr.Service) error {
+	return handle.SetRecoveryActions(scmRecoveryActions(), scmRecoveryResetPeriod)
 }
 
 // scmInstallDirs returns the directories an installation creates, in the
@@ -614,6 +1353,9 @@ type scmRegistrationFacts struct {
 	state svc.State
 	// exitCode is the exit code the instance ended with.
 	exitCode uint32
+	// processID is the process of the running instance, zero when the
+	// service control manager reports none.
+	processID uint32
 	// commandLine is the command line the registration carries.
 	commandLine string
 }
@@ -654,8 +1396,9 @@ func scmLookupRegistration(name string) (scmRegistrationFacts, error) {
 	}
 	defer windows.CloseServiceHandle(handle)
 
-	var query windows.SERVICE_STATUS
-	if err := windows.QueryServiceStatus(handle, &query); err != nil {
+	var query windows.SERVICE_STATUS_PROCESS
+	var needed uint32
+	if err := windows.QueryServiceStatusEx(handle, windows.SC_STATUS_PROCESS_INFO, (*byte)(unsafe.Pointer(&query)), uint32(unsafe.Sizeof(query)), &needed); err != nil {
 		return facts, scmLookupError(fmt.Sprintf("query the state of %s", name), err)
 	}
 	commandLine, err := queryServiceCommandLine(handle)
@@ -666,6 +1409,10 @@ func scmLookupRegistration(name string) (scmRegistrationFacts, error) {
 	facts.present = true
 	facts.state = svc.State(query.CurrentState)
 	facts.exitCode = query.Win32ExitCode
+	// The process of the running instance is part of the state: an
+	// installation that restarts an instance has to know the process it
+	// replaces before it changes the registration.
+	facts.processID = query.ProcessId
 	facts.commandLine = commandLine
 	return facts, nil
 }
@@ -1039,7 +1786,8 @@ func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) 
 }
 
 // preflight rejects an installation the service control manager could not
-// run: an unusable executable, an invalid bind address or a directory the
+// run: an unusable executable, an executable that is not a Windows program of
+// the architecture of this process, an invalid bind address or a directory the
 // account of the instance cannot reach.
 //
 // The preflight runs before the registration is written, so a rejected
@@ -1056,10 +1804,65 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %q is not a regular file", opts.Executable)
 	}
+	if err := preflightExecutableImage(opts.Executable); err != nil {
+		return err
+	}
 	if _, _, err := ParseListen(opts.Listen); err != nil {
 		return err
 	}
 	return preflightDataPaths(opts)
+}
+
+// preflightExecutableImage rejects an executable the service control manager
+// of this machine could not run.
+//
+// The platform starts the registered image itself, so the header of the file is
+// the only place the installation can learn what it is about to register: a
+// truncated download, a file that is not a program at all and a binary of
+// another architecture are refused here, before the registration is written
+// and before a running instance is stopped.
+//
+// An architecture this installation does not compare is still required to name
+// a PE image: only the architectures HFDesk ships have a comparison.
+func preflightExecutableImage(executable string) error {
+	return preflightExecutableImageFor(executable, runtime.GOARCH)
+}
+
+// preflightExecutableImageFor is preflightExecutableImage for the named
+// architecture of the process.
+//
+// The architecture is a parameter so the comparison can be checked without a
+// machine of every architecture of the platform.
+func preflightExecutableImageFor(executable, arch string) error {
+	machine, err := pe.Machine(executable)
+	if err != nil {
+		return fmt.Errorf("service: executable %q is not a Windows executable: %w", executable, err)
+	}
+	want, known := scmProcessMachine(arch)
+	if !known {
+		return nil
+	}
+	if machine != want {
+		return fmt.Errorf("service: executable %q is built for another architecture: the image is machine 0x%04X and this process is %s (0x%04X)", executable, machine, arch, want)
+	}
+	return nil
+}
+
+// scmProcessMachine returns the machine type of an image that runs on the given
+// architecture of the process.
+//
+// The machine types are the ones HFDesk ships a program for. An architecture
+// without a value is not compared by the installation: the program is then
+// only required to be a PE image.
+func scmProcessMachine(arch string) (machine uint16, known bool) {
+	switch arch {
+	case "amd64":
+		return pe.MachineAMD64, true
+	case "arm64":
+		return pe.MachineARM64, true
+	default:
+		return 0, false
+	}
 }
 
 // The service identity of the instance is the account the registration runs

@@ -135,12 +135,49 @@ type Status struct {
 	Detail string
 }
 
+// InstallFieldSet marks the fields of an InstallOptions that a request set
+// explicitly.
+//
+// An installation that replaces an existing registration keeps every value
+// the request did not name: the registration holds the settings the instance
+// really runs with, and a reinstall must not reset them to the defaults of
+// the scope. A field that is not marked is a default of the request and only
+// applies when the existing registration has no value of its own.
+//
+// The executable is not part of the set. The program of a registration
+// always comes from the current request, because an installation is the only
+// way a new binary reaches the registration.
+type InstallFieldSet struct {
+	// Listen marks a bind address the request named.
+	Listen bool
+	// Config marks a config file the request named.
+	Config bool
+	// StateDir marks a state directory the request named.
+	StateDir bool
+	// LogDir marks a log directory the request named.
+	LogDir bool
+	// CacheDir marks a cache root the request named.
+	CacheDir bool
+	// HubDir marks a hub directory the request named, or the hub directory
+	// a named cache root resolved to (<cache>/hub): that directory is the
+	// value the request asked for, not a default of the scope.
+	HubDir bool
+	// LocalDir marks an output directory the request named.
+	LocalDir bool
+	// ServiceUser marks a service account the request named.
+	ServiceUser bool
+}
+
 // InstallOptions describes one service installation.
 type InstallOptions struct {
 	// Scope is the installation scope.
 	Scope Scope
 	// Executable is the absolute path of the hfdesk binary.
 	Executable string
+	// Explicit marks the fields the request named itself. See
+	// InstallFieldSet: an unmarked field never overrides the value of an
+	// existing registration.
+	Explicit InstallFieldSet
 	// Listen is the host:port to bind.
 	Listen string
 	// Paths are the absolute config/state/log paths of the instance.
@@ -163,6 +200,79 @@ type InstallOptions struct {
 	// the supervisor starts the instance with, and the installation
 	// refuses to register an instance whose account does not exist.
 	ServiceUser string
+}
+
+// DefaultInstallOptions returns the options of an installation that names
+// nothing: the default listen address, the default runtime paths and the
+// default cache layout of the scope.
+//
+// No field is marked explicit, so an installation that replaces an existing
+// registration keeps every setting of it. A caller without a command line (a
+// desktop host that installs the service it ships with) therefore asks for
+// "the defaults, nothing named" and never resets a registration it does not
+// know.
+//
+// A scope the platform does not have yields empty paths: ValidateInstallOptions
+// refuses the installation before anything is written.
+func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
+	opts := InstallOptions{
+		Scope:      scope,
+		Executable: executable,
+		Listen:     DefaultListen,
+	}
+	paths, err := DefaultPaths(scope)
+	if err != nil {
+		return opts
+	}
+	opts.Paths = paths
+	opts.CacheDir, opts.HubDir = DefaultCacheDirs(scope, paths)
+	return opts
+}
+
+// mergeInstallOptions returns the effective options of an installation over
+// an existing registration.
+//
+// An explicitly named field of the request wins. An unmarked field keeps the
+// value of the existing registration when that registration names one;
+// otherwise the default of the request applies, which is what makes a first
+// installation behave exactly like the request says.
+//
+// The existing options are the ones a registration is read into. A value the
+// registration does not record is empty, so an unmarked request field falls
+// back to its own default and a registration that never named a value can
+// never erase one.
+//
+// The executable always comes from the request: it is the program the
+// installation was invoked for, and the only field a reinstall is expected to
+// change. The scope comes from the request as well; the registration of the
+// other scope is a different registration and is never merged.
+func mergeInstallOptions(requested, existing InstallOptions) InstallOptions {
+	merged := requested
+	if !requested.Explicit.Listen && existing.Listen != "" {
+		merged.Listen = existing.Listen
+	}
+	if !requested.Explicit.Config && existing.Paths.ConfigFile != "" {
+		merged.Paths.ConfigFile = existing.Paths.ConfigFile
+	}
+	if !requested.Explicit.StateDir && existing.Paths.StateDir != "" {
+		merged.Paths.StateDir = existing.Paths.StateDir
+	}
+	if !requested.Explicit.LogDir && existing.Paths.LogDir != "" {
+		merged.Paths.LogDir = existing.Paths.LogDir
+	}
+	if !requested.Explicit.CacheDir && existing.CacheDir != "" {
+		merged.CacheDir = existing.CacheDir
+	}
+	if !requested.Explicit.HubDir && existing.HubDir != "" {
+		merged.HubDir = existing.HubDir
+	}
+	if !requested.Explicit.LocalDir && existing.LocalDir != "" {
+		merged.LocalDir = existing.LocalDir
+	}
+	if !requested.Explicit.ServiceUser && existing.ServiceUser != "" {
+		merged.ServiceUser = existing.ServiceUser
+	}
+	return merged
 }
 
 // DefaultServiceUser returns the default account a machine-wide instance
@@ -221,8 +331,18 @@ func SupportsNamedServiceAccount() bool {
 // semantics and the validation; the platform implementations own the
 // supervisor details.
 type Manager interface {
-	// Install registers the service with the platform supervisor.
-	Install(ctx context.Context, opts InstallOptions) error
+	// Install registers the service with the platform supervisor and
+	// returns the effective installation.
+	//
+	// The returned options are the installation as it was written: an
+	// installation that updates an existing registration reports what the
+	// instance runs with instead of what the request asked for, and a
+	// platform whose installation replaces the registration wholesale
+	// returns the request. The error is the failure of the installation: the
+	// returned options describe no effective installation then and must not
+	// be reported as one, whatever registration the failed attempt left
+	// behind.
+	Install(ctx context.Context, opts InstallOptions) (InstallOptions, error)
 	// Uninstall removes the registration of the service.
 	Uninstall(ctx context.Context) error
 	// Start starts the registered service.
